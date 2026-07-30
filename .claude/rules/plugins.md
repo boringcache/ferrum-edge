@@ -201,7 +201,11 @@ on a native-gRPC request.
 - Default path must remain byte-for-byte identical and zero allocation when no schema is configured.
 - Metadata redaction must apply for renamed metadata and flattened metadata too.
 - `transaction_log_schema` is global-only and constructed first during plugin-cache rebuild so later plugins can resolve `schema_ref`.
-- Non-shipping plugins such as `prometheus_metrics`, `api_chargeback`, and `transaction_debugger` reject `schema:` and `schema_ref:`.
+- `prometheus_metrics` still rejects `schema:` / `schema_ref:` — its label names are baked into the time-series store.
+- `SchemaCapabilities.family` (`RecordFamily`) selects the field inventory. Non-summary families: `api_chargeback` (the `/charges` per-proxy billing row), `api_chargeback_sink` (the exported `ChargeEvent`), `transaction_debugger` (its own HTTP/stream/WS diagnostic names). A family rejects, with a plugin- and field-specific diagnostic, whatever it cannot express: `summary_type`, `timestamp_format`, and `metadata` for the two chargeback families, `order` for the chargeback report (sorted `serde_json::Map` document), `backend_host` for charge events, and every derived kind but `summary_kind` for the billing row.
+- Projection applies only at the externally emitted representation. It must never reach billing identity, charge accounting, registry/accumulator/snapshot keys, Prometheus labels, or spool ownership.
+- `api_chargeback`'s projection governs the one process-global render cache, so `validate_composition` requires every enabled instance to agree on `schema` / `schema_ref` exactly like the other shared tunables.
+- `api_chargeback_sink` projects at `write_json_each_row`, the single funnel for the ClickHouse INSERT body and the durable spool artifact. `charge_body_byte_bound` must keep adding the precomputed per-row projection surcharge so the retained-byte reservation still precedes serialization.
 - Field-registry drift is covered by `tests/integration/log_schema_registry_tests.rs`.
 
 ## Centralized Rate Limiting

@@ -518,6 +518,69 @@ fn plugin_cache_threads_stable_config_id_into_soap_replay_scope() {
     );
 }
 
+fn identity_soap_plugin_config(id: &str, proxy_id: &str) -> PluginConfig {
+    let mut plugin = make_plugin_config(
+        id,
+        "soap_ws_security",
+        PluginScope::Proxy,
+        Some(proxy_id),
+        true,
+    );
+    plugin.config = json!({
+        "timestamp": {"require": false},
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordText",
+            "credentials": [{"username": id, "password": "secret"}]
+        }
+    });
+    plugin
+}
+
+#[test]
+fn soap_composition_rejects_two_identity_instances_in_both_auth_modes() {
+    for auth_mode in [AuthMode::Single, AuthMode::Multi] {
+        let mut proxy = make_proxy("soap", "/soap", vec!["soap-a", "soap-b"]);
+        proxy.auth_mode = auth_mode;
+        let config = make_config(
+            vec![proxy],
+            vec![
+                identity_soap_plugin_config("soap-a", "soap"),
+                identity_soap_plugin_config("soap-b", "soap"),
+            ],
+        );
+
+        let errors = ferrum_edge::plugins::soap_ws_security::validate_composition(&config)
+            .expect_err("an auth chain must not admit two SOAP message gates");
+        let joined = errors.join("; ");
+        assert!(joined.contains("soap-a"), "{joined}");
+        assert!(joined.contains("soap-b"), "{joined}");
+        assert!(joined.contains("sole authentication mechanism"), "{joined}");
+    }
+}
+
+#[test]
+fn soap_composition_rejects_other_auth_plugins_in_both_auth_modes() {
+    for auth_mode in [AuthMode::Single, AuthMode::Multi] {
+        let mut proxy = make_proxy("soap", "/soap", vec!["key", "soap"]);
+        proxy.auth_mode = auth_mode;
+        let config = make_config(
+            vec![proxy],
+            vec![
+                make_plugin_config("key", "key_auth", PluginScope::Proxy, Some("soap"), true),
+                identity_soap_plugin_config("soap", "soap"),
+            ],
+        );
+
+        let errors = ferrum_edge::plugins::soap_ws_security::validate_composition(&config)
+            .expect_err("another auth mechanism must not bypass the SOAP message gate");
+        let joined = errors.join("; ");
+        assert!(joined.contains("soap"), "{joined}");
+        assert!(joined.contains("key"), "{joined}");
+        assert!(joined.contains("sole authentication mechanism"), "{joined}");
+    }
+}
+
 fn plugin_client_with_ca(ca_path: &str) -> PluginHttpClient {
     use ferrum_edge::config::types::DEFAULT_NAMESPACE;
     use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};
@@ -3395,6 +3458,27 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
     assert!(candidate.contains("is_security_composition_candidate_plugin("));
     assert!(candidate.contains("security_composition_capabilities("));
     assert!(candidate.contains("ServerlessSecurityCompositionPlugin"));
+    let candidate_names_start = source
+        .find("const SECURITY_COMPOSITION_PLUGIN_NAMES")
+        .expect("security-composition candidate allowlist must exist");
+    let candidate_names_end = source[candidate_names_start..]
+        .find("];")
+        .map(|offset| candidate_names_start + offset)
+        .expect("security-composition candidate allowlist must terminate");
+    let candidate_names = &source[candidate_names_start..candidate_names_end];
+    assert!(
+        candidate_names.contains("\"soap_ws_security\""),
+        "candidate construction must include SOAP so custom auth capabilities cannot bypass its sole-auth gate"
+    );
+    let effective_chain_start = source
+        .find("fn validate_plugin_security_composition(")
+        .expect("effective-chain security validator must exist");
+    let effective_chain = &source[effective_chain_start..start];
+    assert!(
+        effective_chain.contains("plugin.name() == \"soap_ws_security\"")
+            && effective_chain.contains("plugin.is_auth_plugin()"),
+        "effective-chain validation must derive authentication participation from constructed capabilities"
+    );
     assert!(candidate.contains("validate_plugin_security_composition(&merged)"));
     assert!(candidate.contains("validate_plugin_security_composition(plugins)"));
 }

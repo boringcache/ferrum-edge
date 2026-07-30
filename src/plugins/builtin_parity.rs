@@ -225,9 +225,9 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "soap_ws_security",
         classification: BuiltinPluginClassification::Public,
         priority: 1500,
-        active_phases: "before_proxy",
+        active_phases: "authenticate, before_proxy, on_final_request_body",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
-        protocol_rationale: "SOAP XML body parsing (text/xml, application/soap+xml)",
+        protocol_rationale: "SOAP XML body parsing (text/xml, application/soap+xml, application/xml, application/xop+xml, MTOM multipart/related)",
     },
     BuiltinPluginParityMeta {
         name: "access_control",
