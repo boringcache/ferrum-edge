@@ -3280,7 +3280,7 @@ async fn request_mirror_cache_construction_preserves_plugin_config_id() {
 }
 
 #[test]
-fn serverless_body_egress_rejects_request_body_transform_composition() {
+fn serverless_finalized_body_egress_allows_request_body_transform_composition() {
     let mut transform_cases = vec![
         (
             "body-transform",
@@ -3337,14 +3337,11 @@ fn serverless_body_egress_rejects_request_body_transform_composition() {
             ],
         );
 
-        let error = match PluginCache::new(&config) {
-            Ok(_) => panic!("serverless body egress plus {transform_name} must fail closed"),
-            Err(error) => error,
-        };
-        assert!(
-            error.contains("request-body") || error.contains("validation"),
-            "transform={transform_name}, got: {error}"
-        );
+        PluginCache::new(&config).unwrap_or_else(|error| {
+            panic!(
+                "serverless finalized-body egress plus {transform_name} must be admitted: {error}"
+            )
+        });
     }
 }
 
@@ -9395,6 +9392,31 @@ fn test_waf_sets_needs_final_request_body_context_capability() {
         caps.has(PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT),
         "WAF plugin must set NEEDS_FINAL_REQUEST_BODY_CONTEXT so the proxy \
          passes a mutable RequestContext into on_final_request_body hooks"
+    );
+}
+
+#[test]
+fn test_priority_override_preserves_finalized_request_policy_capability() {
+    let mut waf = make_plugin_config_with_json(
+        "ps1",
+        "waf",
+        json!({}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    waf.priority_override = Some(2081);
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["ps1"])], vec![waf]);
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let waf = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "waf")
+        .expect("WAF plugin is cached");
+
+    assert!(
+        waf.enforces_finalized_request_policy(),
+        "priority_override must not hide a final request-body validator from the \
+         legacy pre-finalization egress composition gate"
     );
 }
 

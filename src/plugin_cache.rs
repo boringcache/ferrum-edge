@@ -526,6 +526,9 @@ impl Plugin for PriorityOverridePlugin {
     fn egresses_request_body_before_finalization(&self) -> bool {
         self.inner.egresses_request_body_before_finalization()
     }
+    fn enforces_finalized_request_policy(&self) -> bool {
+        self.inner.enforces_finalized_request_policy()
+    }
     fn dispatches_finalized_request_egress(&self) -> bool {
         self.inner.dispatches_finalized_request_egress()
     }

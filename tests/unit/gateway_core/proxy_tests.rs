@@ -3492,6 +3492,14 @@ fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch
         egress_sites[0] > first_final_hook,
         "no egress site may precede the first final request-body hook pass"
     );
+    assert!(
+        handler
+            .matches("finalized_request_rejection_phase(rejected_by_egress)")
+            .count()
+            >= 3,
+        "ordinary, terminal, and native-gRPC egress rejections must retain the \
+         finalized_request_egress transaction phase"
+    );
 
     // The no-buffering fallback is the only unguarded-by-final-hooks site, and
     // it must be conditioned on this request having no buffered finalization.

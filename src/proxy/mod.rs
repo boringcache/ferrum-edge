@@ -23616,9 +23616,11 @@ async fn handle_proxy_request_inner(
             // accepted it. `hook_headers` carries the synthetic `:path` used by
             // the body hooks, so the immutable snapshot handed to the phase is
             // the outbound header map instead.
+            let mut rejected_by_egress = false;
             if matches!(final_body_result, PluginResult::Continue)
                 && capabilities.has(PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS)
             {
+                let egress_start = Instant::now();
                 let egress_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
                 let egress = run_finalized_request_egress_hooks(
                     &plugins,
@@ -23634,6 +23636,8 @@ async fn handle_proxy_request_inner(
                     egress.backend_header_overlay,
                     &state.mesh_egress_strip_baggage_keys,
                 );
+                plugin_execution_ns += egress_start.elapsed().as_nanos() as u64;
+                rejected_by_egress = !matches!(egress.result, PluginResult::Continue);
                 final_body_result = egress.result;
             }
             match final_body_result {
@@ -23667,6 +23671,16 @@ async fn handle_proxy_request_inner(
                         &mut ctx,
                         grpc_web_response_content_type,
                         &normalized,
+                    )
+                    .await;
+                    log_rejected_request_with_path(
+                        &plugins,
+                        &ctx,
+                        normalized.http_status.as_u16(),
+                        start_time,
+                        finalized_request_rejection_phase(rejected_by_egress),
+                        plugin_execution_ns,
+                        Some(&original_request_path),
                     )
                     .await;
                     record_request(&state, normalized.http_status.as_u16());
