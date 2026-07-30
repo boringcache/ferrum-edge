@@ -1879,7 +1879,10 @@ async fn query_predicate_matches_on_the_forwarded_query() {
         dispatch(&query_rule_plugin(), &mut ctx).await,
         PluginResult::Continue
     ));
-    assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("privileged"));
+    assert_eq!(
+        ctx.route_override_upstream_id.as_deref(),
+        Some("privileged")
+    );
 }
 
 #[tokio::test]
@@ -1968,7 +1971,10 @@ async fn empty_segments_do_not_make_a_query_ambiguous() {
         dispatch(&query_rule_plugin(), &mut ctx).await,
         PluginResult::Continue
     ));
-    assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("privileged"));
+    assert_eq!(
+        ctx.route_override_upstream_id.as_deref(),
+        Some("privileged")
+    );
 }
 
 #[tokio::test]
@@ -2018,8 +2024,10 @@ async fn query_predicate_reads_the_credential_stripped_query() {
     }))
     .expect("valid config");
     let mut ctx = ctx_with_query("token=secret");
-    ctx.metadata
-        .insert("auth.strip_query_param.token".to_string(), "true".to_string());
+    ctx.metadata.insert(
+        "auth.strip_query_param.token".to_string(),
+        "true".to_string(),
+    );
     match dispatch(&plugin, &mut ctx).await {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 404),
         other => panic!("expected the unmatched 404, got {other:?}"),

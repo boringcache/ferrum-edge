@@ -165,7 +165,10 @@ fn canonical_query_flags_identical_value_duplicate() {
 fn canonical_query_flags_percent_encoded_duplicate_alias() {
     // `a` and `%61` are the same decoded name, so this is one duplicate
     // rather than two distinct parameters.
-    assert_eq!(ambiguities("a=1&%61=2"), vec![QueryAmbiguity::DuplicateName]);
+    assert_eq!(
+        ambiguities("a=1&%61=2"),
+        vec![QueryAmbiguity::DuplicateName]
+    );
     // `a%20b` and `a+b` decode to DIFFERENT names under RFC 3986 ("a b" vs
     // "a+b") but to the SAME name under form-urlencoded decoding. That is
     // precisely the differential, and the literal-plus classification is what
@@ -486,7 +489,10 @@ fn canonical_policy_view_ignores_a_divergent_materialized_map() {
     // the shared map and H3 puts `%2Fadmin`. Neither reaches policy.
     let mut h1 = ctx_for("resource=%2Fadmin");
     h1.materialize_query_params();
-    assert_eq!(h1.query_params.get("resource").map(String::as_str), Some("/admin"));
+    assert_eq!(
+        h1.query_params.get("resource").map(String::as_str),
+        Some("/admin")
+    );
 
     let mut h3 = ctx_for("resource=%2Fadmin");
     h3.materialize_query_params_raw();

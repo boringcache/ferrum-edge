@@ -204,7 +204,9 @@ impl CanonicalQuery {
                 Ok(name) => name.into_owned(),
                 Err(_) => {
                     record(&mut ambiguities, QueryAmbiguity::NonUtf8Name);
-                    percent_decode_str(raw_name).decode_utf8_lossy().into_owned()
+                    percent_decode_str(raw_name)
+                        .decode_utf8_lossy()
+                        .into_owned()
                 }
             };
             let value = match percent_decode_str(raw_value).decode_utf8() {
