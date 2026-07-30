@@ -270,7 +270,7 @@ impl DeliveryTaskSettlement {
     }
 }
 
-fn invoke_delivery_callback(
+pub(crate) fn invoke_delivery_callback(
     callback: &DeliveryCallback,
     outcome: DispatchSettle,
     channel_type: &'static str,

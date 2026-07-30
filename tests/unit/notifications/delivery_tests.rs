@@ -193,7 +193,7 @@ async fn semaphore_exhaustion_increments_backpressure_and_skips_send() {
             ..DeliveryRetryPolicy::DEFAULT
         },
         "test",
-        None,
+        Some(Arc::new(|_| panic!("callback panic must be contained"))),
     );
     assert!(!admitted);
     assert_eq!(metrics.channel_snapshot("webhook").backpressure_dropped, 1);

@@ -21,8 +21,7 @@ use crate::plugins::utils::http_client::PluginHttpClient;
 
 use super::channels::NotificationChannel;
 pub use super::generation::DeliveryCallback;
-use super::generation::{DispatchGeneration, DispatchSettle};
-use super::metrics::global as global_metrics;
+use super::generation::{DispatchGeneration, DispatchSettle, invoke_delivery_callback};
 use super::notification::Notification;
 use super::outcome::{DeliveryAttempt, FailureClass};
 
@@ -142,7 +141,9 @@ pub fn dispatch_one(
     let permit = match Arc::clone(&sem).try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            global_metrics().record_backpressure_dropped(channel_type);
+            generation
+                .metrics()
+                .record_backpressure_dropped(channel_type);
             warn!(
                 source = log_source,
                 channel = %channel.name(),
@@ -152,7 +153,7 @@ pub fn dispatch_one(
             if let Some(cb) = on_settle.as_ref() {
                 // Backpressure is not a delivery attempt; surface as abandoned
                 // so callers that reserved pending state can roll it back.
-                cb(DispatchSettle::Abandoned);
+                invoke_delivery_callback(cb, DispatchSettle::Abandoned, channel_type);
             }
             return false;
         }
