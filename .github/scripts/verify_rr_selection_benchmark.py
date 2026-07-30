@@ -4,31 +4,20 @@
 Criterion fixture contract (see tests/performance/mesh/benches/rr_selection.rs):
   - Each measured custom iteration runs ITERATIONS_PER_THREAD selections per
     worker thread (currently 50_000).
-  - The gated comparison uses PARALLEL_THREADS workers for both:
-      * `sharded`: RoundRobin selection seam using the production
-        thread-to-shard ticket selector
-      * `shared`: the same target-selection seam with every worker pinned to
-        shard zero
+  - The 1-thread case therefore performs 50_000 selections per iteration.
+  - The 8-thread case performs 8 * 50_000 selections per iteration.
   - Multi-thread samples reuse a long-lived barrier-synchronized worker pool;
     Criterion's mean is the wall time from barrier release until every worker
     completes the selection loop, not thread spawn/join overhead.
   - Criterion's mean point estimate is elapsed wall-clock nanoseconds for that
     whole custom iteration (not ns/selection).
-  - A diagnostic 1-thread sharded sample is recorded for logs only.
 
-Contended advantage (same Criterion invocation, equal element counts):
+Throughput speedup is therefore:
 
-  advantage = shared_wall_ns / sharded_wall_ns
+  speedup = (PARALLEL_THREADS * serial_ns) / parallel_ns
 
-A production path that has regressed to one shared counter line collapses this
-toward 1.0x (sharded ≈ shared). Healthy CachePadded sharding keeps the shared
-control slower while both sides perform the same atomic ticket, modulo, target
-lookup, and Arc clone work, clearing the hosted floor. The sharded side also
-executes the production thread-local shard lookup; only the control pins its
-shard choice.
-Absolute 1-thread vs N-thread speedup is intentionally not gated: hosted
-runners and 2-target Arc refcount concentration made that ratio swing from
-~1.50x to 0.44x without an RR code change.
+A single shared `AtomicU64` on a 2-target RR upstream collapses this toward
+1.0x (or below); sharded CachePadded counters clear the hosted floor.
 """
 
 from __future__ import annotations
@@ -40,7 +29,7 @@ from pathlib import Path
 
 
 TARGET_COUNT = 2
-PARALLEL_THREADS = 4
+PARALLEL_THREADS = 8
 HOSTED_CONTENTION_FLOOR = 1.10
 # Must match tests/performance/mesh/benches/rr_selection.rs
 ITERATIONS_PER_THREAD = 50_000
@@ -50,41 +39,47 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Verify hosted RoundRobin selection Criterion results. "
-            "Gates same-shard RoundRobin wall time over distinct-shard "
-            "RoundRobin wall time under identical worker counts and work."
+            "Speedup units: parallel_throughput / serial_throughput, where "
+            f"each custom iteration wall time covers "
+            f"{ITERATIONS_PER_THREAD} selections per thread."
         )
     )
     parser.add_argument("--criterion-root", type=Path, required=False)
     parser.add_argument(
-        "--min-contended-advantage",
+        "--min-parallel-speedup",
         type=float,
         required=False,
         help=(
-            "Minimum (shared_wall_ns / sharded_wall_ns) required to pass. "
-            "Both walls cover the same "
-            f"{PARALLEL_THREADS} * {ITERATIONS_PER_THREAD} selections."
+            "Minimum (8-thread throughput / 1-thread throughput) required to "
+            "pass. Throughput normalizes Criterion wall time by element count "
+            f"({PARALLEL_THREADS} * serial_ns / parallel_ns)."
         ),
     )
     parser.add_argument(
         "--self-test",
         action="store_true",
-        help="Run synthetic unit checks for the advantage formula and exit.",
+        help="Run synthetic unit checks for the speedup formula and exit.",
     )
     return parser.parse_args()
 
 
-def contended_advantage(sharded_ns: float, shared_ns: float) -> float:
-    """Return shared/sharded wall ratio for equal-work samples."""
-    if sharded_ns <= 0 or shared_ns <= 0:
+def throughput_speedup(serial_ns: float, parallel_ns: float, parallel_threads: int) -> float:
+    """Return parallel/serial selection throughput from Criterion wall times."""
+    if serial_ns <= 0 or parallel_ns <= 0 or parallel_threads < 1:
         raise ValueError(
-            f"invalid timing inputs sharded_ns={sharded_ns} shared_ns={shared_ns}"
+            f"invalid timing inputs serial_ns={serial_ns} parallel_ns={parallel_ns} "
+            f"parallel_threads={parallel_threads}"
         )
-    return shared_ns / sharded_ns
+    return (parallel_threads * serial_ns) / parallel_ns
 
 
-def mean_point_estimate(criterion_root: Path, label: str) -> float:
+def mean_point_estimate(criterion_root: Path, targets: int, threads: int) -> float:
     estimates_path = (
-        criterion_root / "rr_selection" / label / "new" / "estimates.json"
+        criterion_root
+        / "rr_selection"
+        / f"{targets}_targets_{threads}_threads"
+        / "new"
+        / "estimates.json"
     )
     try:
         estimates = json.loads(estimates_path.read_text(encoding="utf-8"))
@@ -102,39 +97,26 @@ def mean_point_estimate(criterion_root: Path, label: str) -> float:
 def self_test() -> int:
     failures: list[str] = []
 
-    got = contended_advantage(100.0, 100.0)
+    got = throughput_speedup(100.0, 100.0, PARALLEL_THREADS)
+    if not math.isclose(got, float(PARALLEL_THREADS)):
+        failures.append(f"perfect scaling expected {PARALLEL_THREADS}.0, got {got}")
+
+    got = throughput_speedup(100.0, 100.0 * PARALLEL_THREADS, PARALLEL_THREADS)
     if not math.isclose(got, 1.0):
-        failures.append(f"identical walls expected 1.0 advantage, got {got}")
+        failures.append(f"serialized path expected 1.0, got {got}")
 
-    got = contended_advantage(100.0, 200.0)
-    if not math.isclose(got, 2.0):
-        failures.append(f"shared twice as slow expected 2.0, got {got}")
+    naive = 100.0 / 100.0
+    correct = throughput_speedup(100.0, 100.0, PARALLEL_THREADS)
+    if math.isclose(naive, correct):
+        failures.append("naive wall-ratio must differ from throughput speedup under equal wall time")
 
-    # Naive parallel/serial wall ratio must NOT be the gate: equal walls under
-    # N× work look like perfect scaling, which is the opposite of this check.
-    if math.isclose(contended_advantage(100.0, 100.0), float(PARALLEL_THREADS)):
-        failures.append("contended advantage must not equal parallel thread count")
-
-    if contended_advantage(100.0, 100.0) >= HOSTED_CONTENTION_FLOOR:
+    if throughput_speedup(100.0, 800.0, 8) >= HOSTED_CONTENTION_FLOOR:
         failures.append(
-            f"regressed shared≈sharded 1.0x must stay below the "
-            f"{HOSTED_CONTENTION_FLOOR:.2f} hosted floor"
+            f"serialized 1.0x must stay below the {HOSTED_CONTENTION_FLOOR:.2f} hosted floor"
         )
-    if contended_advantage(100.0, 200.0) < HOSTED_CONTENTION_FLOOR:
+    if throughput_speedup(100.0, 400.0, 8) < HOSTED_CONTENTION_FLOOR:
         failures.append(
-            f"2.0x shared/sharded advantage must clear the "
-            f"{HOSTED_CONTENTION_FLOOR:.2f} hosted floor"
-        )
-
-    # Absolute 1-vs-N collapse must not be sufficient to fail by itself once
-    # the equal-work control still shows sharding wins.
-    absolute_collapse = (PARALLEL_THREADS * 100.0) / 900.0  # ~0.44x style
-    if absolute_collapse >= HOSTED_CONTENTION_FLOOR:
-        failures.append("synthetic absolute collapse fixture must stay below 1.10")
-    if contended_advantage(100.0, 150.0) < HOSTED_CONTENTION_FLOOR:
-        failures.append(
-            "equal-work 1.50x shared/sharded advantage must still clear the floor "
-            "even when absolute 1-vs-N speedup would look collapsed"
+            f"2.0x throughput must clear the {HOSTED_CONTENTION_FLOOR:.2f} hosted floor"
         )
 
     if failures:
@@ -144,8 +126,7 @@ def self_test() -> int:
 
     print(
         "RR verifier self-test passed "
-        f"(contended advantage = shared_wall_ns / sharded_wall_ns; "
-        f"{PARALLEL_THREADS}-thread equal-work control)."
+        f"(throughput speedup = {PARALLEL_THREADS} * serial_wall_ns / parallel_wall_ns)."
     )
     return 0
 
@@ -155,62 +136,40 @@ def main() -> int:
     if args.self_test:
         return self_test()
 
-    if args.criterion_root is None or args.min_contended_advantage is None:
-        print(
-            "::error::--criterion-root and --min-contended-advantage "
-            "are required unless --self-test"
-        )
+    if args.criterion_root is None or args.min_parallel_speedup is None:
+        print("::error::--criterion-root and --min-parallel-speedup are required unless --self-test")
         return 2
 
     failures: list[str] = []
 
-    if args.min_contended_advantage <= 1:
-        failures.append("--min-contended-advantage must be greater than 1")
-
-    sharded_label = f"{TARGET_COUNT}_targets_sharded_{PARALLEL_THREADS}_threads"
-    shared_label = f"{TARGET_COUNT}_targets_shared_{PARALLEL_THREADS}_threads"
-    serial_label = f"{TARGET_COUNT}_targets_sharded_1_threads"
+    if args.min_parallel_speedup <= 1:
+        failures.append("--min-parallel-speedup must be greater than 1")
 
     try:
-        sharded_ns = mean_point_estimate(args.criterion_root, sharded_label)
-        shared_ns = mean_point_estimate(args.criterion_root, shared_label)
-        advantage = contended_advantage(sharded_ns, shared_ns)
+        serial_ns = mean_point_estimate(args.criterion_root, TARGET_COUNT, 1)
+        parallel_ns = mean_point_estimate(args.criterion_root, TARGET_COUNT, PARALLEL_THREADS)
+        speedup = throughput_speedup(serial_ns, parallel_ns, PARALLEL_THREADS)
     except ValueError as error:
         failures.append(str(error))
-        advantage = None
-        sharded_ns = shared_ns = 0.0
+        speedup = None
+        serial_ns = parallel_ns = 0.0
 
-    if advantage is not None:
-        elements = ITERATIONS_PER_THREAD * PARALLEL_THREADS
+    if speedup is not None:
+        serial_elements = ITERATIONS_PER_THREAD
+        parallel_elements = ITERATIONS_PER_THREAD * PARALLEL_THREADS
         print(
             f"{TARGET_COUNT}_targets: "
-            f"sharded_{PARALLEL_THREADS}_threads wall={sharded_ns:.2f} ns / {elements} selections, "
-            f"shared_{PARALLEL_THREADS}_threads wall={shared_ns:.2f} ns / {elements} selections, "
-            f"contended_advantage={advantage:.2f}x (= shared_wall / sharded_wall), "
-            f"gate=required"
+            f"1_thread wall={serial_ns:.2f} ns / {serial_elements} selections, "
+            f"{PARALLEL_THREADS}_threads wall={parallel_ns:.2f} ns / {parallel_elements} selections, "
+            f"throughput_speedup={speedup:.2f}x "
+            f"(= {PARALLEL_THREADS} * serial_wall / parallel_wall)"
         )
-        if advantage < args.min_contended_advantage:
+        if speedup < args.min_parallel_speedup:
             failures.append(
-                f"{TARGET_COUNT}_targets contended advantage {advantage:.2f}x "
-                f"below floor {args.min_contended_advantage:.2f}x "
-                "(same-shard RR should remain slower than distinct-shard RR "
-                "under identical selection work; collapse near 1.0x means the "
-                "production counter design no longer provides shard isolation)"
+                f"{TARGET_COUNT}_targets throughput speedup {speedup:.2f}x "
+                f"below floor {args.min_parallel_speedup:.2f}x "
+                "(shared AtomicU64 cache-line bounce typically collapses near 1.0x)"
             )
-
-        # Diagnostic absolute speedup for log continuity; never gated.
-        try:
-            serial_ns = mean_point_estimate(args.criterion_root, serial_label)
-            absolute = (PARALLEL_THREADS * serial_ns) / sharded_ns
-            print(
-                f"{TARGET_COUNT}_targets diagnostic: "
-                f"1_thread wall={serial_ns:.2f} ns / {ITERATIONS_PER_THREAD} selections, "
-                f"absolute_throughput_speedup={absolute:.2f}x "
-                f"(= {PARALLEL_THREADS} * serial_wall / sharded_parallel_wall), "
-                f"gate=diagnostic-only"
-            )
-        except ValueError as error:
-            print(f"::warning::diagnostic serial sample unavailable: {error}")
 
     if failures:
         for failure in failures:
@@ -219,8 +178,7 @@ def main() -> int:
 
     print(
         "RR selection benchmark is within hosted contention guardrails "
-        f"(same-shard vs distinct-shard RR at {PARALLEL_THREADS} "
-        "threads; absolute 1-thread/N-thread speedup is diagnostic-only)."
+        "(throughput speedup normalizes Criterion wall time by element count)."
     )
     return 0
 

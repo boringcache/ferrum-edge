@@ -1,26 +1,10 @@
 //! Concurrent RoundRobin selection microbenchmark for hosted CI (#2947).
 //!
-//! Detects reintroduction of a single shared RR counter by comparing, in the
-//! **same Criterion invocation** under the same barrier-synchronized worker
-//! shape:
-//!
-//! - `sharded`: the RoundRobin selection seam using the production
-//!   thread-to-shard ticket selector
-//! - `shared`: the same target-selection seam with every worker deliberately
-//!   pinned to shard zero
-//!
-//! The gate is `shared_wall_ns / sharded_wall_ns` (equal element counts), not
-//! absolute 1-thread vs N-thread speedup. Hosted runners vary in core count and
-//! scheduling; the old 1-vs-8 absolute speedup on a 2-target fixture also
-//! concentrated Arc refcount traffic onto two lines and was observed to swing
-//! from ~1.50x to 0.44x without an RR code change. Both sides of this comparison
-//! now execute the same atomic ticket, modulo, target lookup, and Arc clone
-//! operations. The sharded side additionally performs the production
-//! thread-local shard lookup; the control pins only its shard choice.
-//!
-//! Thread count matches the WRR contention bench (4) so the gate is calibrated
-//! to typical GitHub-hosted vCPU counts rather than oversubscribing an 8-wide
-//! pool on a 2–4 core runner.
+//! Guards the sharded / CachePadded RR selection counters: a 2-target upstream
+//! must keep multi-thread throughput clearly above a single shared `AtomicU64`
+//! contention floor. Fixture contract matches the WRR contention bench pattern
+//! (long-lived barrier-synchronized workers; Criterion custom-iteration wall
+//! time covers `threads * ITERATIONS_PER_THREAD` selections).
 
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -30,18 +14,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use ferrum_edge::_test_support::{
-    select_round_robin_for_test, select_round_robin_from_shard_for_test,
-};
 use ferrum_edge::config::types::{LoadBalancerAlgorithm, UpstreamTarget};
 use ferrum_edge::load_balancer::LoadBalancer;
 
 /// Issue #2947 regression fixture: small healthy set where an unsharded counter
-/// is the throughput ceiling, and where Arc clones concentrate on two targets.
+/// is the throughput ceiling.
 const TARGET_COUNT: usize = 2;
-/// Parallel workers for the gated equal-work comparison (matches WRR hosted
-/// calibration; avoids 8-wide oversubscription on 2–4 vCPU runners).
-const PARALLEL_THREADS: usize = 4;
+const THREAD_COUNTS: [usize; 2] = [1, 8];
 const ITERATIONS_PER_THREAD: usize = 50_000;
 
 fn make_targets(n: usize) -> Vec<UpstreamTarget> {
@@ -58,33 +37,23 @@ fn make_targets(n: usize) -> Vec<UpstreamTarget> {
         .collect()
 }
 
-fn run_production_rr_selections(lb: &LoadBalancer, iterations: usize) {
+fn run_selections(lb: &LoadBalancer, iterations: usize) {
     for _ in 0..iterations {
-        black_box(select_round_robin_for_test(lb));
+        black_box(lb.select("", None));
     }
 }
 
-fn run_fixed_shard_rr_selections(lb: &LoadBalancer, shard: usize, iterations: usize) {
-    for _ in 0..iterations {
-        black_box(select_round_robin_from_shard_for_test(lb, shard));
-    }
-}
-
-fn measure_parallel_batches<F, M>(threads: usize, batches: u64, make_body: M) -> Duration
-where
-    F: FnMut() + Send + 'static,
-    M: Fn(usize) -> F,
-{
+fn measure_parallel_batches(lb: &Arc<LoadBalancer>, threads: usize, batches: u64) -> Duration {
     let start_line = Arc::new(Barrier::new(threads + 1));
     let end_line = Arc::new(Barrier::new(threads + 1));
     let stop = Arc::new(AtomicBool::new(false));
 
     let mut handles = Vec::with_capacity(threads);
-    for worker in 0..threads {
+    for _ in 0..threads {
+        let lb = Arc::clone(lb);
         let start_line = Arc::clone(&start_line);
         let end_line = Arc::clone(&end_line);
         let stop = Arc::clone(&stop);
-        let mut body = make_body(worker);
         handles.push(thread::spawn(move || {
             loop {
                 start_line.wait();
@@ -92,7 +61,7 @@ where
                     end_line.wait();
                     break;
                 }
-                body();
+                run_selections(&lb, ITERATIONS_PER_THREAD);
                 end_line.wait();
             }
         }));
@@ -128,56 +97,31 @@ fn bench_rr_selection(c: &mut Criterion) {
         &fixture,
         None,
     ));
-    for shard in 0..PARALLEL_THREADS {
-        run_fixed_shard_rr_selections(&lb, shard, 512);
+    run_selections(&lb, 2_048);
+
+    for threads in THREAD_COUNTS {
+        group.throughput(Throughput::Elements(
+            (ITERATIONS_PER_THREAD * threads) as u64,
+        ));
+        group.bench_function(
+            format!("{TARGET_COUNT}_targets_{threads}_threads"),
+            |b| {
+                b.iter_custom(|iters| {
+                    if threads == 1 {
+                        let mut total = Duration::ZERO;
+                        for _ in 0..iters {
+                            let started = Instant::now();
+                            run_selections(&lb, ITERATIONS_PER_THREAD);
+                            total += started.elapsed();
+                        }
+                        total
+                    } else {
+                        measure_parallel_batches(&lb, threads, iters)
+                    }
+                });
+            },
+        );
     }
-    run_production_rr_selections(&lb, 2_048);
-
-    let elements = (ITERATIONS_PER_THREAD * PARALLEL_THREADS) as u64;
-    group.throughput(Throughput::Elements(elements));
-
-    // Production sharded path under contention.
-    group.bench_function(
-        format!("{TARGET_COUNT}_targets_sharded_{PARALLEL_THREADS}_threads"),
-        |b| {
-            b.iter_custom(|iters| {
-                let lb = Arc::clone(&lb);
-                measure_parallel_batches(PARALLEL_THREADS, iters, move |_| {
-                    let lb = Arc::clone(&lb);
-                    move || run_production_rr_selections(&lb, ITERATIONS_PER_THREAD)
-                })
-            });
-        },
-    );
-
-    // Deliberately contended baseline: identical selection work, one shard.
-    group.bench_function(
-        format!("{TARGET_COUNT}_targets_shared_{PARALLEL_THREADS}_threads"),
-        |b| {
-            b.iter_custom(|iters| {
-                let lb = Arc::clone(&lb);
-                measure_parallel_batches(PARALLEL_THREADS, iters, move |_| {
-                    let lb = Arc::clone(&lb);
-                    move || run_fixed_shard_rr_selections(&lb, 0, ITERATIONS_PER_THREAD)
-                })
-            });
-        },
-    );
-
-    // Diagnostic-only serial sample for log continuity (not gated).
-    group.throughput(Throughput::Elements(ITERATIONS_PER_THREAD as u64));
-    group.bench_function(format!("{TARGET_COUNT}_targets_sharded_1_threads"), |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                let started = Instant::now();
-                run_production_rr_selections(&lb, ITERATIONS_PER_THREAD);
-                total += started.elapsed();
-            }
-            total
-        });
-    });
-
     group.finish();
 }
 

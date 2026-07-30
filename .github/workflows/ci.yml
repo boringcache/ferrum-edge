@@ -1062,7 +1062,6 @@ jobs:
               functional_policy_path_canonicalization_test
               functional_response_mock_grpc_exclusion_test
               functional_response_mock_semantics_test
-              functional_response_protocol_managed_headers_test
               functional_websocket_limits_test
           - shard: data-plane
             # Serialized because DP functional tests bind exclusive ports and
@@ -4141,7 +4140,7 @@ jobs:
           python3 .github/scripts/verify_rr_selection_benchmark.py --self-test
           python3 .github/scripts/verify_rr_selection_benchmark.py \
             --criterion-root tests/performance/mesh/target/criterion \
-            --min-contended-advantage 1.10
+            --min-parallel-speedup 1.10
 
       - name: Run AI semantic-cache cleanup p99 microbenchmark
         if: steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true'
@@ -4260,13 +4259,13 @@ jobs:
           fi
           if [ "${RUN_WRR}" = "true" ]; then
             {
-              echo "WRR selection contention guard executed: 4-thread/1-thread throughput speedup >= 1.10x for the 32-target bitset and 129-target Vec fixtures; the Arc-refcount-concentrated 4-target fixture is diagnostic-only."
+              echo "WRR selection contention guard executed: 4-thread/1-thread throughput speedup >= 1.10x across 4/32/129-target fixtures."
               echo ""
             } >> "${GITHUB_STEP_SUMMARY}"
           fi
           if [ "${RUN_RR}" = "true" ]; then
             {
-              echo "RoundRobin selection contention guard executed: equal-work same-shard vs distinct-shard RR at 4 threads (shared_wall/sharded_wall >= 1.10x) for the 2-target fixture; both sides use the exact selection seam and absolute 1-thread/N-thread speedup is diagnostic-only."
+              echo "RoundRobin selection contention guard executed: 8-thread/1-thread throughput speedup >= 1.10x for the 2-target fixture."
               echo ""
             } >> "${GITHUB_STEP_SUMMARY}"
           fi

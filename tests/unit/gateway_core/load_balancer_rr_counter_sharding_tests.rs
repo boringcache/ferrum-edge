@@ -2,13 +2,9 @@
 //! LeastLatency warm-up / locality-distribute selection counters are sharded
 //! and cache-line padded (reusing the WRR shard mechanism).
 //!
-//! Hosted CI runs `tests/performance/mesh/benches/rr_selection.rs` with
-//! `.github/scripts/verify_rr_selection_benchmark.py`: an equal-work 4-thread
-//! same-shard control versus the production thread-to-shard RoundRobin ticket
-//! selector on the 2-target fixture. Both use the same target-selection seam;
-//! absolute 1-thread/N-thread speedup is diagnostic-only.
-//! These unit tests guard layout, selection parity, and the hosted gate's
-//! measurement contract.
+//! Hosted CI runs `tests/performance/mesh/benches/rr_selection.rs` (2-target
+//! RR at 1 vs 8 threads) with `.github/scripts/verify_rr_selection_benchmark.py`
+//! for the contention floor. These unit tests guard layout and selection parity.
 
 use chrono::Utc;
 use crossbeam_utils::CachePadded;
@@ -87,68 +83,6 @@ fn upstream_with_locality_lb(
         created_at: now,
         updated_at: now,
     }
-}
-
-#[test]
-fn rr_contention_bench_uses_production_selector_and_fixed_shard_control() {
-    // The hosted gate must compare the actual production ticket selector
-    // against deliberately contended same-shard RR through the same target
-    // selection seam — not explicit test shards on both sides, and not absolute
-    // 1-thread vs N-thread speedup on a variable runner (observed 1.50x→0.44x).
-    let bench = std::fs::read_to_string("tests/performance/mesh/benches/rr_selection.rs")
-        .expect("rr_selection bench must be readable from crate root");
-    let verifier = std::fs::read_to_string(".github/scripts/verify_rr_selection_benchmark.py")
-        .expect("RR verifier must be readable from crate root");
-    let source = std::fs::read_to_string("src/load_balancer.rs")
-        .expect("load_balancer.rs must be readable from crate root");
-    let production_probe = source
-        .split_once("pub(crate) fn select_round_robin_for_test(")
-        .and_then(|(_, rest)| {
-            rest.split_once("/// One RoundRobin pick driven by an explicit counter shard.")
-        })
-        .map(|(body, _)| body)
-        .expect("production RR benchmark probe must remain present");
-
-    assert!(
-        bench.contains("select_round_robin_for_test")
-            && bench.contains("select_round_robin_from_shard_for_test")
-            && bench.contains("run_production_rr_selections")
-            && bench.contains("run_fixed_shard_rr_selections(&lb, 0"),
-        "RR bench must compare the production selector against a fixed-shard control"
-    );
-    assert!(
-        !bench.contains("move |worker|"),
-        "the sharded side must not assign explicit test shards per worker"
-    );
-    assert!(
-        production_probe.contains("selection_counter_ticket(&self.rr_counter)"),
-        "the sharded benchmark probe must use the production thread-to-shard ticket selector"
-    );
-    assert!(
-        bench.contains("PARALLEL_THREADS: usize = 4")
-            || bench.contains("const PARALLEL_THREADS: usize = 4"),
-        "RR contended comparison must use 4 threads (hosted vCPU calibration)"
-    );
-    assert!(
-        !bench.contains("THREAD_COUNTS: [usize; 2] = [1, 8]"),
-        "RR gate must not depend on the flaky 1-vs-8 absolute speedup thread matrix"
-    );
-    assert!(
-        verifier.contains("contended_advantage")
-            && verifier.contains("shared_wall_ns / sharded_wall_ns")
-            && verifier.contains("diagnostic-only")
-            && verifier.contains("--min-contended-advantage"),
-        "RR verifier must gate shared/sharded advantage and keep absolute speedup diagnostic"
-    );
-    assert!(
-        verifier.contains("PARALLEL_THREADS = 4")
-            && verifier.contains("HOSTED_CONTENTION_FLOOR = 1.10"),
-        "RR verifier thread count and floor must stay aligned with the bench"
-    );
-    assert!(
-        !verifier.contains("speedup = (PARALLEL_THREADS * serial_ns) / parallel_ns"),
-        "RR verifier must not document the old absolute parallel/serial throughput gate"
-    );
 }
 
 #[test]

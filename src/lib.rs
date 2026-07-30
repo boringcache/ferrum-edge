@@ -6328,13 +6328,6 @@ pub mod _test_support {
         lb.selection_counter_phases_for_test()
     }
 
-    /// One RoundRobin pick driven by the production thread-to-shard selector.
-    pub fn select_round_robin_for_test(
-        lb: &crate::load_balancer::LoadBalancer,
-    ) -> Option<Arc<crate::config::types::UpstreamTarget>> {
-        lb.select_round_robin_for_test()
-    }
-
     /// One RoundRobin pick driven by an explicit counter shard.
     pub fn select_round_robin_from_shard_for_test(
         lb: &crate::load_balancer::LoadBalancer,
