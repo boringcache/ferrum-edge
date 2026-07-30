@@ -1577,7 +1577,9 @@ fn recovery_healthy_to_active_emits_trigger() {
     assert_eq!(outcome, LifecycleOutcome::Trigger);
     assert!(matches!(
         gate.current_state(1, "p", 0),
-        Some(RuleState::PendingTrigger { reserved_at_ms: 1_000 })
+        Some(RuleState::PendingTrigger {
+            reserved_at_ms: 1_000
+        })
     ));
     gate.settle_trigger_success(1, "p", 0, 1_000, 1_000);
     assert_eq!(

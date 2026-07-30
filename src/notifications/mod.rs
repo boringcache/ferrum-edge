@@ -45,4 +45,4 @@ pub use metrics::{
 #[allow(unused_imports)]
 pub use notification::{EventAction, Notification, NotificationField, Severity};
 #[allow(unused_imports)]
-pub use outcome::{DeliveryAttempt, FailureClass, CHANNEL_TYPES};
+pub use outcome::{CHANNEL_TYPES, DeliveryAttempt, FailureClass};

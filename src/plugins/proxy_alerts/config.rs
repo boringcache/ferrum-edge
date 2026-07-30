@@ -13,8 +13,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde_json::{Map, Value};
 
-use crate::notifications::{NotificationChannel, Severity, channels::parse_channels};
 use crate::notifications::dispatch::DeliveryRetryPolicy;
+use crate::notifications::{NotificationChannel, Severity, channels::parse_channels};
 use crate::plugins::DisconnectCause;
 use crate::retry::ErrorClass;
 use crate::util::unknown_keys::{near_miss_for_missing_key, reject_unknown_keys};

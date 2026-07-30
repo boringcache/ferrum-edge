@@ -234,12 +234,7 @@ pub fn render_prometheus() -> String {
     out
 }
 
-fn render_counter_family(
-    out: &mut String,
-    name: &str,
-    help: &str,
-    values: &[AtomicU64; 5],
-) {
+fn render_counter_family(out: &mut String, name: &str, help: &str, values: &[AtomicU64; 5]) {
     out.push_str(&format!("# HELP {name} {help}\n"));
     out.push_str(&format!("# TYPE {name} counter\n"));
     for (i, kind) in CHANNEL_TYPES.iter().enumerate() {

@@ -50,7 +50,10 @@ impl DeliveryRetryPolicy {
     /// full jitter in `[0, capped]` (same strategy as the batching logger).
     pub fn backoff_delay(self, attempt: u32) -> Duration {
         const MAX_TOKIO_SLEEP_MS: u64 = 60_000;
-        let base_ms = self.base_delay.as_millis().min(u128::from(MAX_TOKIO_SLEEP_MS)) as u64;
+        let base_ms = self
+            .base_delay
+            .as_millis()
+            .min(u128::from(MAX_TOKIO_SLEEP_MS)) as u64;
         let cap_ms = self
             .max_delay
             .as_millis()

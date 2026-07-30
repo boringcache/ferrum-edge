@@ -143,12 +143,7 @@ impl CooldownGate {
             return;
         };
         if let Some(atomic) = per_generation.get_cloned(&ownership_generation) {
-            let _ = atomic.compare_exchange(
-                reserved_at_ms,
-                0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            let _ = atomic.compare_exchange(reserved_at_ms, 0, Ordering::AcqRel, Ordering::Acquire);
         }
     }
 
@@ -221,9 +216,15 @@ pub enum RuleState {
     /// Trigger accepted for dispatch but delivery has not settled yet.
     /// Suppresses duplicate Trigger admissions until success (→ Active) or
     /// failure/abandon (→ Healthy, cooldown released).
-    PendingTrigger { reserved_at_ms: u64 },
-    Active { fired_at_ms: u64 },
-    Recovering { left_threshold_at_ms: u64 },
+    PendingTrigger {
+        reserved_at_ms: u64,
+    },
+    Active {
+        fired_at_ms: u64,
+    },
+    Recovering {
+        left_threshold_at_ms: u64,
+    },
     /// Resolve accepted for dispatch but delivery has not settled yet.
     /// Suppresses duplicate Resolve admissions until success (→ Healthy) or
     /// failure/abandon (→ Recovering, so the next healthy sample can retry).

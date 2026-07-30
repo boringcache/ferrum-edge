@@ -633,10 +633,7 @@ impl EmailChannel {
         extras: &HashMap<String, String>,
         http: &PluginHttpClient,
     ) -> Result<(), String> {
-        match self
-            .dispatch_classified(notification, extras, http)
-            .await
-        {
+        match self.dispatch_classified(notification, extras, http).await {
             crate::notifications::outcome::DeliveryAttempt::Success => Ok(()),
             crate::notifications::outcome::DeliveryAttempt::Failed { message, .. } => Err(message),
         }
@@ -649,9 +646,7 @@ impl EmailChannel {
         extras: &HashMap<String, String>,
         http: &PluginHttpClient,
     ) -> crate::notifications::outcome::DeliveryAttempt {
-        use crate::notifications::outcome::{
-            DeliveryAttempt, FailureClass, classify_smtp_failure,
-        };
+        use crate::notifications::outcome::{DeliveryAttempt, FailureClass, classify_smtp_failure};
         let message = match self.build_message(notification, extras) {
             Ok(m) => m,
             Err(e) => {

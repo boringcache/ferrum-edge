@@ -538,17 +538,18 @@ impl ProxyAlerts {
             }
             return;
         }
-        let (left_threshold_at_ms, recovery_reserved_at_ms) = match self
-            .recovery
-            .current_state(rule.id(), proxy_id, ownership_generation)
-        {
-            Some(RuleState::PendingResolve {
-                left_threshold_at_ms,
-                reserved_at_ms,
-            }) => (left_threshold_at_ms, reserved_at_ms),
-            Some(RuleState::PendingTrigger { reserved_at_ms }) => (now_ms, reserved_at_ms),
-            _ => (now_ms, now_ms),
-        };
+        let (left_threshold_at_ms, recovery_reserved_at_ms) =
+            match self
+                .recovery
+                .current_state(rule.id(), proxy_id, ownership_generation)
+            {
+                Some(RuleState::PendingResolve {
+                    left_threshold_at_ms,
+                    reserved_at_ms,
+                }) => (left_threshold_at_ms, reserved_at_ms),
+                Some(RuleState::PendingTrigger { reserved_at_ms }) => (now_ms, reserved_at_ms),
+                _ => (now_ms, now_ms),
+            };
         let notification = render::build_notification(rule, observation, sample, event_action, now);
         let extras = render::build_webhook_vars(rule, observation, sample, event_action, now);
         let notification = Arc::new(notification);
@@ -587,8 +588,7 @@ impl ProxyAlerts {
         match Arc::clone(&self.dispatch_sem).try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
-                crate::notifications::metrics::global()
-                    .record_backpressure_dropped(channel_type);
+                crate::notifications::metrics::global().record_backpressure_dropped(channel_type);
                 warn!(
                     plugin = "proxy_alerts",
                     channel = %channel_name,

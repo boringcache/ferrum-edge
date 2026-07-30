@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use ferrum_edge::notifications::channels::{NotificationChannel, parse_channels};
 use ferrum_edge::notifications::channels::email::{SmtpFailure, SmtpPhase};
+use ferrum_edge::notifications::channels::{NotificationChannel, parse_channels};
 use ferrum_edge::notifications::dispatch::{DeliveryRetryPolicy, dispatch_one};
 use ferrum_edge::notifications::generation::{DispatchGeneration, DispatchSettle};
 use ferrum_edge::notifications::metrics::DeliveryMetrics;
@@ -69,7 +69,12 @@ async fn read_request_headers(socket: &mut TcpStream) {
 
 async fn spawn_status_sequence_server(
     statuses: Vec<u16>,
-) -> (SocketAddr, Arc<AtomicUsize>, Arc<Notify>, tokio::task::JoinHandle<()>) {
+) -> (
+    SocketAddr,
+    Arc<AtomicUsize>,
+    Arc<Notify>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let count = Arc::new(AtomicUsize::new(0));
@@ -83,9 +88,8 @@ async fn spawn_status_sequence_server(
             read_request_headers(&mut socket).await;
             server_count.fetch_add(1, Ordering::SeqCst);
             server_notify.notify_waiters();
-            let body = format!(
-                "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            );
+            let body =
+                format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             socket.write_all(body.as_bytes()).await.unwrap();
         }
     });
@@ -205,8 +209,7 @@ async fn semaphore_exhaustion_increments_backpressure_and_skips_send() {
 async fn transient_retry_then_success() {
     let metrics = Arc::new(DeliveryMetrics::new());
     let generation = DispatchGeneration::with_metrics(7, Arc::clone(&metrics));
-    let (addr, count, notify, server) =
-        spawn_status_sequence_server(vec![503, 200]).await;
+    let (addr, count, notify, server) = spawn_status_sequence_server(vec![503, 200]).await;
     let sem = Arc::new(Semaphore::new(1));
     let channel = webhook_channel_to(format!("http://{addr}/notify"));
     let settled = Arc::new(tokio::sync::Mutex::new(None));
@@ -235,9 +238,12 @@ async fn transient_retry_then_success() {
 
     wait_for_count(&count, &notify, 2).await;
     server.await.unwrap();
-    timeout(Duration::from_secs(2), generation.wait_drain(Duration::from_secs(2)))
-        .await
-        .unwrap();
+    timeout(
+        Duration::from_secs(2),
+        generation.wait_drain(Duration::from_secs(2)),
+    )
+    .await
+    .unwrap();
     // Allow callback task to land.
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(*settled.lock().await, Some(DispatchSettle::Succeeded));
@@ -287,9 +293,12 @@ async fn permanent_failure_does_not_retry() {
         "permanent 401 must not be retried"
     );
     drop(server);
-    timeout(Duration::from_secs(2), generation.wait_drain(Duration::from_secs(2)))
-        .await
-        .unwrap();
+    timeout(
+        Duration::from_secs(2),
+        generation.wait_drain(Duration::from_secs(2)),
+    )
+    .await
+    .unwrap();
     let snap = metrics.channel_snapshot("webhook");
     assert_eq!(snap.attempted, 1);
     assert_eq!(snap.failed_permanent, 1);
@@ -339,14 +348,9 @@ async fn proxy_alerts_failed_trigger_releases_cooldown_and_pending_state() {
     .expect("pending trigger should settle");
 
     assert!(
-        plugin.cooldowns.try_acquire(
-            0,
-            "ferrum|p1",
-            0,
-            60_000,
-            monotonic_now_ms(),
-            0,
-        ),
+        plugin
+            .cooldowns
+            .try_acquire(0, "ferrum|p1", 0, 60_000, monotonic_now_ms(), 0,),
         "failed trigger must release cooldown"
     );
     let _ = server;
@@ -394,14 +398,9 @@ async fn proxy_alerts_successful_trigger_commits_active_and_cooldown() {
     .expect("successful trigger should become Active");
 
     assert!(
-        !plugin.cooldowns.try_acquire(
-            0,
-            "ferrum|p1",
-            0,
-            60_000,
-            monotonic_now_ms(),
-            0,
-        ),
+        !plugin
+            .cooldowns
+            .try_acquire(0, "ferrum|p1", 0, 60_000, monotonic_now_ms(), 0,),
         "successful trigger must consume cooldown"
     );
 }
