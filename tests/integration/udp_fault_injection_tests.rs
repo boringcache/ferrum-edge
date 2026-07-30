@@ -339,6 +339,16 @@ async fn udp_stream_rejection_precedes_first_datagram_fault_delay() {
         .await
         .expect("rejected setup must not retain a fault-delay worker")
         .expect("UDP listener task must shut down cleanly");
+
+    // The listener task does not await detached session-setup workers. A
+    // worker still parked in the old datagram-first ordering retains its
+    // `Arc<UdpSocket>` for the full injected delay even though `join` above
+    // has returned. Requiring an immediate same-port bind therefore proves
+    // the rejected setup worker itself exited before the fault hook.
+    let rebound = UdpSocket::bind(gateway_addr)
+        .await
+        .expect("rejected setup must release the frontend UDP socket");
+    drop(rebound);
 }
 
 async fn echo_round_trip(
