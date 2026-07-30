@@ -669,6 +669,40 @@ impl ProxyAlerts {
     pub fn dispatch_in_flight_for_test(&self) -> usize {
         self.dispatch_generation.in_flight()
     }
+
+    /// Current recovery state for deterministic external delivery tests.
+    #[doc(hidden)]
+    pub fn recovery_state_for_test(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+    ) -> Option<RuleState> {
+        self.recovery
+            .current_state(rule_id, proxy_id, ownership_generation)
+    }
+
+    /// Try to reserve one cooldown seat for deterministic external tests.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_acquire_cooldown_for_test(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        channel_id: u32,
+        cooldown_ms: u64,
+        now_ms: u64,
+        ownership_generation: u64,
+    ) -> bool {
+        self.cooldowns.try_acquire(
+            rule_id,
+            proxy_id,
+            channel_id,
+            cooldown_ms,
+            now_ms,
+            ownership_generation,
+        )
+    }
 }
 
 /// Coordinates fan-out settle across every channel admitted for one lifecycle

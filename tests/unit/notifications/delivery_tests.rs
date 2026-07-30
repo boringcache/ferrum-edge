@@ -332,7 +332,7 @@ async fn proxy_alerts_failed_trigger_releases_cooldown_and_pending_state() {
 
     timeout(Duration::from_secs(3), async {
         loop {
-            match plugin.recovery.current_state(0, "ferrum|p1", 0) {
+            match plugin.recovery_state_for_test(0, "ferrum|p1", 0) {
                 Some(RuleState::PendingTrigger { .. }) => {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -348,9 +348,14 @@ async fn proxy_alerts_failed_trigger_releases_cooldown_and_pending_state() {
     .expect("pending trigger should settle");
 
     assert!(
-        plugin
-            .cooldowns
-            .try_acquire(0, "ferrum|p1", 0, 60_000, monotonic_now_ms(), 0,),
+        plugin.try_acquire_cooldown_for_test(
+            0,
+            "ferrum|p1",
+            0,
+            60_000,
+            monotonic_now_ms(),
+            0,
+        ),
         "failed trigger must release cooldown"
     );
     let _ = server;
@@ -386,7 +391,7 @@ async fn proxy_alerts_successful_trigger_commits_active_and_cooldown() {
     timeout(Duration::from_secs(3), async {
         loop {
             if matches!(
-                plugin.recovery.current_state(0, "ferrum|p1", 0),
+                plugin.recovery_state_for_test(0, "ferrum|p1", 0),
                 Some(RuleState::Active { .. })
             ) {
                 break;
@@ -398,9 +403,14 @@ async fn proxy_alerts_successful_trigger_commits_active_and_cooldown() {
     .expect("successful trigger should become Active");
 
     assert!(
-        !plugin
-            .cooldowns
-            .try_acquire(0, "ferrum|p1", 0, 60_000, monotonic_now_ms(), 0,),
+        !plugin.try_acquire_cooldown_for_test(
+            0,
+            "ferrum|p1",
+            0,
+            60_000,
+            monotonic_now_ms(),
+            0,
+        ),
         "successful trigger must consume cooldown"
     );
 }
