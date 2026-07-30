@@ -485,6 +485,50 @@ async fn reserve_mesh_ports() -> MeshPorts {
     }
 }
 
+/// Reserve gateway ports in the namespace where the subprocess will bind them.
+///
+/// A host-namespace `:0` reservation cannot see an established/TIME_WAIT socket
+/// in an isolated pod namespace. The live two-cluster fixture probes from its
+/// source namespace before starting every source gateway, so the kernel could
+/// already have assigned that probe the same numeric ephemeral port selected
+/// later in the host namespace. Binding `0.0.0.0:port` in the target namespace
+/// detects that collision before the gateway is spawned.
+#[cfg(target_os = "linux")]
+fn reserve_mesh_ports_in_netns(pid: u32) -> Result<MeshPorts, String> {
+    run_in_live_netns(pid, || {
+        let mut held = Vec::new();
+        let mut reserve = || -> Result<u16, String> {
+            for _ in 0..FIXTURE_BIND_ATTEMPTS {
+                let listener = std::net::TcpListener::bind(("0.0.0.0", 0))
+                    .map_err(|error| format!("reserve mesh port in pod netns: {error}"))?;
+                let port = listener
+                    .local_addr()
+                    .map_err(|error| format!("read pod-netns mesh port: {error}"))?
+                    .port();
+                let inserted = used_mesh_ports()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(port);
+                held.push(listener);
+                if inserted {
+                    return Ok(port);
+                }
+            }
+            Err(format!(
+                "no unique pod-netns mesh port after {FIXTURE_BIND_ATTEMPTS} attempts"
+            ))
+        };
+
+        Ok(MeshPorts {
+            inbound: reserve()?,
+            outbound: reserve()?,
+            hbone: reserve()?,
+            egress: reserve()?,
+            east_west: reserve()?,
+        })
+    })
+}
+
 struct MeshGatewaySpawnOptions<'a> {
     cp_addr: SocketAddr,
     ports: MeshPorts,
@@ -10437,6 +10481,24 @@ struct LiveTwoClusterFixture {
 #[cfg(target_os = "linux")]
 impl LiveTwoClusterFixture {
     async fn start() -> Result<Self, String> {
+        const START_ATTEMPTS: usize = 3;
+
+        let mut failures = Vec::new();
+        for attempt in 1..=START_ATTEMPTS {
+            match Self::start_once().await {
+                Ok(fixture) => return Ok(fixture),
+                Err(error) => {
+                    failures.push(format!("attempt {attempt}: {error}"));
+                }
+            }
+        }
+        Err(format!(
+            "live two-cluster fixture exhausted {START_ATTEMPTS} fresh setup attempts:\n{}",
+            failures.join("\n")
+        ))
+    }
+
+    async fn start_once() -> Result<Self, String> {
         let source = LiveVethPod::spawn_indexed(20)?;
         let east_west = LiveVethPod::spawn_indexed(21)?;
         let destination = LiveVethPod::spawn_indexed(22)?;
@@ -10465,11 +10527,11 @@ impl LiveTwoClusterFixture {
         let temp_ambient_destination =
             TempDir::new().map_err(|e| format!("ambient dest tempdir: {e}"))?;
 
-        let ports_sidecar_destination = reserve_mesh_ports().await;
+        let ports_sidecar_destination = reserve_mesh_ports_in_netns(destination.pod.pid())?;
         let sidecar_destination_inbound = ports_sidecar_destination.inbound;
-        let ports_ambient_destination = reserve_mesh_ports().await;
+        let ports_ambient_destination = reserve_mesh_ports_in_netns(destination.pod.pid())?;
         let ambient_destination_hbone = ports_ambient_destination.hbone;
-        let ports_east_west = reserve_mesh_ports().await;
+        let ports_east_west = reserve_mesh_ports_in_netns(east_west.pod.pid())?;
         let east_west_port = ports_east_west.east_west;
 
         let cp_sidecar_destination = start_static_mesh_cp_on(
@@ -10635,7 +10697,7 @@ impl LiveTwoClusterFixture {
         )
         .await;
 
-        let ports_sidecar_source = reserve_mesh_ports().await;
+        let ports_sidecar_source = reserve_mesh_ports_in_netns(source.pod.pid())?;
         let sidecar_inbound = ports_sidecar_source.inbound;
         let sidecar_outbound = ports_sidecar_source.outbound;
         let mut sidecar_env =
@@ -10689,7 +10751,7 @@ impl LiveTwoClusterFixture {
             },
         );
 
-        let ports_unfederated = reserve_mesh_ports().await;
+        let ports_unfederated = reserve_mesh_ports_in_netns(source.pod.pid())?;
         let unfederated_outbound = ports_unfederated.outbound;
         let unfederated_source = live_xc_spawn_gateway(
             &temp_unfederated_source,
@@ -10708,7 +10770,7 @@ impl LiveTwoClusterFixture {
             },
         );
 
-        let ports_wrong_td = reserve_mesh_ports().await;
+        let ports_wrong_td = reserve_mesh_ports_in_netns(source.pod.pid())?;
         let wrong_td_outbound = ports_wrong_td.outbound;
         let wrong_td_source = live_xc_spawn_gateway(
             &temp_wrong_td_source,
@@ -10723,7 +10785,7 @@ impl LiveTwoClusterFixture {
             },
         );
 
-        let ports_missing_sni = reserve_mesh_ports().await;
+        let ports_missing_sni = reserve_mesh_ports_in_netns(source.pod.pid())?;
         let missing_sni_outbound = ports_missing_sni.outbound;
         let missing_sni_source = live_xc_spawn_gateway(
             &temp_missing_sni_source,
