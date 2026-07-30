@@ -542,11 +542,15 @@ impl Plugin for RequestTransformer {
         // to plugins via `mem::take`, which both breaks the gateway-wide
         // "ctx.headers is the original inbound headers" invariant and (on
         // some paths) silently drops route-level header writes.
-        !self.header_rules.is_empty() || self.apply_route_overrides
+        self.rules_enabled && (!self.header_rules.is_empty() || self.apply_route_overrides)
     }
 
     fn modifies_request_body(&self) -> bool {
-        !self.body_rules.is_empty()
+        // The gate is immutable for this plugin generation, so a disabled
+        // instance can safely drop the config-time buffering capability too.
+        // Otherwise the kill-switch would still retain every request body even
+        // though no phase can consume or transform it.
+        self.rules_enabled && !self.body_rules.is_empty()
     }
 
     async fn before_proxy(

@@ -1577,9 +1577,9 @@ fn test_request_transformer_gate_key_does_not_bind_response_transformer() {
 // Regression for finding #64: when the RTDS overlay disables the scope, the
 // transform is a no-op, so `should_buffer_response_body` must NOT pin the
 // response into the buffered path (otherwise a disabled transform still buffers
-// a large non-SSE response until the max-response-body limit and 502s). The
-// cache-level `requires_response_body_buffering` upper bound stays true since
-// it cannot consult request-time overlay state.
+// a large non-SSE response until the max-response-body limit and 502s). The gate
+// is immutable for this plugin generation, so the cache-level capability must
+// agree too.
 #[tokio::test]
 async fn test_response_transformer_disabled_overlay_skips_response_buffering() {
     let body_rule_plugin = |resolved: Option<bool>| {
@@ -1603,8 +1603,7 @@ async fn test_response_transformer_disabled_overlay_skips_response_buffering() {
     ctx.headers
         .insert("accept".to_string(), "application/json".to_string());
 
-    // ── Generation named no gate → default_enabled=true → still buffers. The
-    //    cache-level upper bound is unconditional on rule shape either way.
+    // ── Generation named no gate → default_enabled=true → still buffers.
     let enabled = body_rule_plugin(None);
     assert!(enabled.requires_response_body_buffering());
     assert!(
@@ -1616,7 +1615,10 @@ async fn test_response_transformer_disabled_overlay_skips_response_buffering() {
     //    buffer, and must not transform either. The two answers come from the
     //    same immutable field, so they cannot disagree (GHSA-83rc-23c9-3g9x).
     let disabled = body_rule_plugin(Some(false));
-    assert!(disabled.requires_response_body_buffering());
+    assert!(
+        !disabled.requires_response_body_buffering(),
+        "a disabled generation must not advertise a cache-level buffering capability"
+    );
     assert!(
         !disabled.should_buffer_response_body(&ctx),
         "a disabled gate must not pin the response into the buffered path"
@@ -1627,6 +1629,13 @@ async fn test_response_transformer_disabled_overlay_skips_response_buffering() {
             .await
             .is_none(),
         "the phase that would have consumed the buffer must agree it is disabled"
+    );
+    assert!(
+        matches!(
+            disabled.response_trailer_policy(),
+            ferrum_edge::plugins::ResponseTrailerPolicy::None
+        ),
+        "a disabled generation must not drop backend trailers"
     );
 }
 
@@ -1643,7 +1652,10 @@ async fn test_response_transformer_default_disabled_skips_response_buffering() {
     }))
     .unwrap();
 
-    assert!(plugin.requires_response_body_buffering());
+    assert!(
+        !plugin.requires_response_body_buffering(),
+        "a default-disabled generation must not advertise buffering"
+    );
 
     let mut ctx = make_ctx();
     ctx.headers

@@ -1533,6 +1533,36 @@ async fn test_request_transformer_ignores_live_process_global_gate_mutations() {
     runtime_overlay::reset_for_test();
 }
 
+#[test]
+fn test_request_transformer_disabled_generation_drops_mutation_and_buffering_capabilities() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Sanitized", "value": "yes"},
+            {"operation": "remove", "target": "body", "key": "secret"}
+        ],
+        "runtime_overlay_scope": "gated",
+        "runtime_overlay_resolved_enabled": false
+    }))
+    .unwrap();
+
+    assert!(
+        !plugin.modifies_request_headers(),
+        "a disabled generation must not force request-header cloning"
+    );
+    assert!(
+        !plugin.modifies_request_body(),
+        "a disabled generation has no request-body transform"
+    );
+    assert!(
+        !plugin.requires_request_body_buffering(),
+        "a disabled generation must not advertise request buffering"
+    );
+    assert!(
+        !plugin.should_buffer_request_body(&make_ctx()),
+        "request-time buffering must agree with the immutable disabled gate"
+    );
+}
+
 #[tokio::test]
 async fn test_request_transformer_rejects_non_boolean_resolved_gate() {
     let err = RequestTransformer::new(&json!({

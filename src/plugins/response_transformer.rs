@@ -831,7 +831,10 @@ impl Plugin for ResponseTransformer {
     }
 
     fn requires_response_body_buffering(&self) -> bool {
-        !self.body_rules.is_empty()
+        // `rules_enabled` is immutable for this generation, so a disabled
+        // instance has no body hook to schedule and need not advertise the
+        // cache-level buffering capability.
+        self.rules_enabled && !self.body_rules.is_empty()
     }
 
     fn may_modify_response_content_type(
@@ -1094,7 +1097,15 @@ impl Plugin for ResponseTransformer {
     /// buffered path that forwards backend trailers drops the whole trailer
     /// section instead of guessing which names are governed.
     fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
-        super::ResponseTrailerPolicy::Unbounded
+        if self.rules_enabled {
+            super::ResponseTrailerPolicy::Unbounded
+        } else {
+            // A fully disabled generation runs no response-header rules,
+            // including request-time route overrides. Publishing an unbounded
+            // policy here would still drop every backend trailer even though
+            // the transformer is supposed to be a complete no-op.
+            super::ResponseTrailerPolicy::None
+        }
     }
 
     async fn after_proxy(
