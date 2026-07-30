@@ -3825,15 +3825,24 @@ async fn spool_enabled_high_water_diversion_is_durable_and_distinct_from_drops()
         0
     );
 
-    // Wait briefly for the async spool write to land on disk.
-    for _ in 0..100_000 {
-        if disk_owned_bytes(temp.path()) > 0 {
-            break;
+    // The delivery worker persists through spawn_blocking. A fixed number of
+    // yield_now calls can expire before that pool schedules the write when the
+    // full unit suite is saturating the hosted runner, even though the durable
+    // handoff is healthy. Wait on the actual filesystem postcondition with a
+    // bounded wall-clock deadline instead.
+    let owned_bytes = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let owned_bytes = disk_owned_bytes(temp.path());
+            if owned_bytes > 0 {
+                break owned_bytes;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::task::yield_now().await;
-    }
+    })
+    .await
+    .expect("durable high-water spool write timed out");
     assert!(
-        disk_owned_bytes(temp.path()) > 0,
+        owned_bytes > 0,
         "high-water diversion must leave durable owned spool bytes"
     );
 
