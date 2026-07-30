@@ -46,16 +46,20 @@ use crate::plugins::chargeback::pricing::{
     PricingConfig, checked_add_charge, checked_mul_quantity, require_finite_charge,
 };
 use crate::plugins::chargeback::{bounded_billing_identity, bounded_display};
+use crate::plugins::utils::log_schema::{
+    DerivedKind, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView, SummarySchema,
+    TimestampFormat, resolve_schema,
+};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Closed top-level config key set for `api_chargeback` admission.
 ///
-/// Source of truth: keys read by [`ApiChargeback::new`] and
-/// [`PricingConfig::from_config`]. `schema` / `schema_ref` are intentionally
-/// excluded — they are rejected with a dedicated non-shipping-plugin error
-/// before unknown-key screening.
+/// Source of truth: keys read by [`ApiChargeback::new`],
+/// [`PricingConfig::from_config`], and the `/charges` render projection.
 pub const API_CHARGEBACK_CONFIG_KEYS: &[&str] = &[
     "currency",
+    "schema",
+    "schema_ref",
     "pricing_tiers",
     "bandwidth_pricing",
     "stream_connection_pricing",
@@ -185,6 +189,21 @@ pub(crate) fn publish_active_proxy_names(config: &crate::config::types::GatewayC
         );
     }
     registry.set_active_proxy_names(names);
+}
+
+/// After an accepted generation is installed, publish the absence of a
+/// `/charges` render projection when no enabled `api_chargeback` remains.
+///
+/// Instance `commit_background_tasks` publishes a schema while at least one
+/// instance exists; a generation with zero instances has no plugin callback,
+/// so without this the previous projection would keep projecting retained
+/// rows. Does not claim [`CHARGEBACK_REGISTRY`] when it was never created,
+/// and never runs during candidate construction/validation.
+pub(crate) fn publish_render_schema_absence() {
+    let Some(registry) = CHARGEBACK_REGISTRY.get() else {
+        return;
+    };
+    registry.configure_render_schema(None);
 }
 
 fn escape_label_value(value: &str) -> String {
@@ -757,6 +776,7 @@ pub fn validate_composition(
                 return Err(errors);
             }
         };
+        let reference_projection = render_projection_config(&reference.config);
         for sibling in enabled.iter().skip(1) {
             match SharedRegistryTunables::from_config(&sibling.config) {
                 Ok(tunables) if tunables == reference_tunables => {}
@@ -773,6 +793,17 @@ pub fn validate_composition(
                     sibling.id
                 )),
             }
+            // The `/charges` projection governs one process-global render
+            // cache, exactly like the tunables above, so every enabled instance
+            // must resolve to the same 'schema' / 'schema_ref'.
+            if render_projection_config(&sibling.config) != reference_projection {
+                errors.push(format!(
+                    "api_chargeback '/charges' render projection must match across all enabled \
+                     instances (one process-global render cache serves them all); '{}' disagrees \
+                     with '{}'. Align 'schema' / 'schema_ref'",
+                    reference.id, sibling.id
+                ));
+            }
         }
     }
 
@@ -781,6 +812,14 @@ pub fn validate_composition(
     } else {
         Err(errors)
     }
+}
+
+/// The `/charges` render-projection configuration of one plugin config.
+///
+/// Compared verbatim across enabled instances so a disagreement is caught at
+/// admission rather than by whichever instance committed last.
+fn render_projection_config(config: &Value) -> (Option<&Value>, Option<&Value>) {
+    (config.get("schema"), config.get("schema_ref"))
 }
 
 /// Sentinel `status_code` for stream sessions and WebSocket-disconnect
@@ -817,12 +856,21 @@ pub struct ChargebackRegistry {
     /// Advances whenever `active_proxy_names` is replaced. Render caches carry
     /// this generation so an overlapping reload cannot publish stale labels.
     proxy_metadata_generation: AtomicU64,
+    /// Advances whenever the published `/charges` render projection changes.
+    /// JSON cache entries carry this so a render that snapped a prior schema
+    /// cannot repopulate the cache after a schema transition.
+    render_schema_generation: AtomicU64,
     /// Cached render output with timestamp and proxy-metadata generation.
     prometheus_cache: ArcSwap<Option<(Instant, u64, String)>>,
-    json_cache: ArcSwap<Option<(Instant, u64, String)>>,
+    /// Cached JSON document tagged with proxy-metadata and projection
+    /// generations. One document must use one schema snapshot.
+    json_cache: ArcSwap<Option<(Instant, u64, u64, String)>>,
     render_cache_ttl_secs: AtomicU64,
     stale_entry_ttl_nanos: AtomicU64,
     cache_invalidation_min_age_nanos: AtomicU64,
+    /// Compiled `/charges` billing-row projection published by the accepted
+    /// generation. Read-only on the render path behind a lock-free `ArcSwap`.
+    render_schema: ArcSwap<Option<Arc<SummarySchema>>>,
     cleanup_interval_seconds: AtomicU64,
     cleanup_interval_changed: tokio::sync::Notify,
     /// Guards against spawning duplicate background cleanup tasks.
@@ -872,6 +920,7 @@ impl ChargebackRegistry {
             shard_amount,
             active_proxy_names: ArcSwap::from_pointee(HashMap::new()),
             proxy_metadata_generation: AtomicU64::new(0),
+            render_schema_generation: AtomicU64::new(0),
             prometheus_cache: ArcSwap::from_pointee(None),
             json_cache: ArcSwap::from_pointee(None),
             render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
@@ -879,6 +928,7 @@ impl ChargebackRegistry {
             cache_invalidation_min_age_nanos: AtomicU64::new(
                 DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS,
             ),
+            render_schema: ArcSwap::from_pointee(None),
             cleanup_interval_seconds: AtomicU64::new(0),
             cleanup_interval_changed: tokio::sync::Notify::new(),
             cleanup_task_started: AtomicBool::new(false),
@@ -947,6 +997,27 @@ impl ChargebackRegistry {
             cache_invalidation_min_age_ms.saturating_mul(1_000_000),
             Ordering::Relaxed,
         );
+    }
+
+    /// Publish the accepted generation's `/charges` render projection.
+    ///
+    /// Separate from [`Self::configure`] because it is the only shared knob
+    /// whose change must drop the cached document. It runs once per accepted
+    /// generation, never on the render path. An inline `schema:` compiles a
+    /// fresh `Arc` per instance, so this invalidates whenever a projection is
+    /// involved at all rather than trying to prove two compiled schemas
+    /// equivalent; the unprojected default path never invalidates. Projection
+    /// generation advances with every invalidation so an in-flight
+    /// [`Self::render_json`] that snapped the prior schema cannot store its
+    /// document back into `json_cache`.
+    pub fn configure_render_schema(&self, render_schema: Option<Arc<SummarySchema>>) {
+        let had_projection = self.render_schema.load().is_some();
+        let has_projection = render_schema.is_some();
+        self.render_schema.store(Arc::new(render_schema));
+        if had_projection || has_projection {
+            self.render_schema_generation.fetch_add(1, Ordering::AcqRel);
+            self.json_cache.store(Arc::new(None));
+        }
     }
 
     /// Start or reconfigure the background task that periodically evicts stale
@@ -1534,6 +1605,55 @@ impl ChargebackRegistry {
         self.shard_amount
     }
 
+    /// Current proxy-metadata generation carried by render caches.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn proxy_metadata_generation_for_tests(&self) -> u64 {
+        self.proxy_metadata_generation.load(Ordering::Acquire)
+    }
+
+    /// Current `/charges` projection generation carried by the JSON cache.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn render_schema_generation_for_tests(&self) -> u64 {
+        self.render_schema_generation.load(Ordering::Acquire)
+    }
+
+    /// Attempt to publish a JSON document into the render cache under the given
+    /// generation tags. Returns whether the store was accepted.
+    ///
+    /// Mirrors the generation-guarded store path in [`Self::render_json`] so
+    /// tests can prove a render started under a prior schema cannot repopulate
+    /// the cache after a schema transition without relying on timing sleeps.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn try_store_json_cache_for_tests(
+        &self,
+        metadata_generation: u64,
+        schema_generation: u64,
+        output: String,
+    ) -> bool {
+        if self.proxy_metadata_generation.load(Ordering::Acquire) != metadata_generation
+            || self.render_schema_generation.load(Ordering::Acquire) != schema_generation
+        {
+            return false;
+        }
+        self.json_cache.store(Arc::new(Some((
+            Instant::now(),
+            metadata_generation,
+            schema_generation,
+            output,
+        ))));
+        if self.proxy_metadata_generation.load(Ordering::Acquire) == metadata_generation
+            && self.render_schema_generation.load(Ordering::Acquire) == schema_generation
+        {
+            true
+        } else {
+            self.json_cache.store(Arc::new(None));
+            false
+        }
+    }
+
     fn maybe_invalidate_caches(&self) {
         let min_age_nanos = self
             .cache_invalidation_min_age_nanos
@@ -1938,12 +2058,18 @@ impl ChargebackRegistry {
     ///
     /// Returns `Err` when any monetary field would be non-finite; callers must
     /// return an explicit error response rather than serializing JSON `null`.
+    ///
+    /// Cached documents are tagged with both proxy-metadata and projection
+    /// generations. A render that snapped a prior schema (or prior proxy-name
+    /// snapshot) can never repopulate the cache after those generations advance.
     pub fn render_json(&self) -> Result<String, String> {
         let ttl_secs = self.render_cache_ttl_secs.load(Ordering::Relaxed);
         let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
+        let schema_generation = self.render_schema_generation.load(Ordering::Acquire);
         let cached = self.json_cache.load();
-        if let Some((generated_at, cached_generation, ref output)) = **cached
-            && cached_generation == metadata_generation
+        if let Some((generated_at, cached_meta_gen, cached_schema_gen, ref output)) = **cached
+            && cached_meta_gen == metadata_generation
+            && cached_schema_gen == schema_generation
             && generated_at.elapsed().as_secs() < ttl_secs
         {
             return Ok(output.clone());
@@ -1954,16 +2080,22 @@ impl ChargebackRegistry {
 
         loop {
             let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
+            let schema_generation = self.render_schema_generation.load(Ordering::Acquire);
             let output = self.render_json_uncached()?;
-            if self.proxy_metadata_generation.load(Ordering::Acquire) != metadata_generation {
+            if self.proxy_metadata_generation.load(Ordering::Acquire) != metadata_generation
+                || self.render_schema_generation.load(Ordering::Acquire) != schema_generation
+            {
                 continue;
             }
             self.json_cache.store(Arc::new(Some((
                 Instant::now(),
                 metadata_generation,
+                schema_generation,
                 output.clone(),
             ))));
-            if self.proxy_metadata_generation.load(Ordering::Acquire) == metadata_generation {
+            if self.proxy_metadata_generation.load(Ordering::Acquire) == metadata_generation
+                && self.render_schema_generation.load(Ordering::Acquire) == schema_generation
+            {
                 return Ok(output);
             }
             self.json_cache.store(Arc::new(None));
@@ -1972,6 +2104,10 @@ impl ChargebackRegistry {
 
     pub fn render_json_uncached(&self) -> Result<String, String> {
         let active_proxy_names = self.active_proxy_names.load();
+        // One lock-free snapshot for the whole document so a concurrent reload
+        // cannot project half the rows under a different schema.
+        let render_schema_guard = self.render_schema.load();
+        let render_schema: Option<&Arc<SummarySchema>> = (**render_schema_guard).as_ref();
         // Nested structure: consumer -> proxy -> {protocol, by_status, stream, bandwidth}.
         //
         // Currency is carried per proxy (it is a property of the recording
@@ -2169,31 +2305,45 @@ impl ChargebackRegistry {
                     _ => ProtocolFamily::Http.label(),
                 };
 
-                let mut proxy_obj = serde_json::json!({
-                    "proxy_id": proxy_id,
-                    "namespace": proxy_namespace.as_ref(),
-                    "proxy_name": agg.proxy_name,
-                    "currency": agg.currency.as_ref(),
-                    "protocol_family": protocol_family,
-                    "total_calls": proxy_total_calls,
-                    "total_charges": proxy_total_charges,
-                    "by_status": serde_json::Value::Object(status_objects),
-                    "bandwidth": {
+                // Always emit the stream sub-object when stream activity exists,
+                // regardless of whether an HTTP entry shares the proxy_id, so the
+                // visible breakdown reconciles with the totals (finding #75).
+                let stream_object = agg.has_stream.then(|| {
+                    serde_json::json!({
+                        "connections": agg.stream_connections,
+                        "connection_charges": stream_charges,
+                    })
+                });
+                let row = ChargebackProxyRow {
+                    proxy_id,
+                    namespace: proxy_namespace.as_ref(),
+                    proxy_name: &agg.proxy_name,
+                    currency: agg.currency.as_ref(),
+                    protocol_family,
+                    total_calls: proxy_total_calls,
+                    total_charges: proxy_total_charges,
+                    by_status: serde_json::Value::Object(status_objects),
+                    bandwidth: serde_json::json!({
                         "bytes_sent": agg.bytes_sent,
                         "bytes_received": agg.bytes_received,
                         "charge_sent": bw_sent,
                         "charge_received": bw_received,
-                    },
-                });
-                // Always emit the stream sub-object when stream activity exists,
-                // regardless of whether an HTTP entry shares the proxy_id, so the
-                // visible breakdown reconciles with the totals (finding #75).
-                if agg.has_stream {
-                    proxy_obj["stream"] = serde_json::json!({
-                        "connections": agg.stream_connections,
-                        "connection_charges": stream_charges,
-                    });
-                }
+                    }),
+                    stream: stream_object,
+                };
+                // No schema configured: emit the native row exactly as before,
+                // with no projection machinery and no extra allocation beyond
+                // the row itself.
+                let proxy_obj = match render_schema {
+                    None => row.to_native_json(),
+                    Some(schema) => serde_json::to_value(SchemaView {
+                        summary: &row,
+                        schema: schema.as_ref(),
+                    })
+                    .map_err(|error| {
+                        format!("api_chargeback: failed to project charges row: {error}")
+                    })?,
+                };
 
                 let output_key = if proxy_id_counts.get(proxy_id.as_str()).copied().unwrap_or(0) > 1
                 {
@@ -2289,6 +2439,129 @@ impl ChargebackRegistry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `/charges` billing-row projection
+// ---------------------------------------------------------------------------
+
+/// One rendered per-proxy billing row inside the `/charges` document.
+///
+/// This is `api_chargeback`'s externally documented representation boundary.
+/// The registry entry key, the billing identity, the charge accounting, and the
+/// Prometheus label sets are all computed before this row exists and are never
+/// touched by projection — only the rendered JSON row is projected.
+///
+/// `by_status`, `bandwidth`, and `stream` are pre-built nested objects: they can
+/// be renamed, omitted, or reordered as whole members, but their inner keys are
+/// not part of the schema surface.
+pub(crate) struct ChargebackProxyRow<'a> {
+    pub(crate) proxy_id: &'a str,
+    pub(crate) namespace: &'a str,
+    pub(crate) proxy_name: &'a str,
+    pub(crate) currency: &'a str,
+    pub(crate) protocol_family: &'static str,
+    pub(crate) total_calls: u64,
+    pub(crate) total_charges: f64,
+    pub(crate) by_status: Value,
+    pub(crate) bandwidth: Value,
+    /// Present only when the row carries stream activity.
+    pub(crate) stream: Option<Value>,
+}
+
+impl<'a> ChargebackProxyRow<'a> {
+    /// The unprojected row, byte-for-byte identical to the pre-schema
+    /// rendering. Taken whenever no schema is configured.
+    fn to_native_json(&self) -> Value {
+        let mut object = serde_json::json!({
+            "proxy_id": self.proxy_id,
+            "namespace": self.namespace,
+            "proxy_name": self.proxy_name,
+            "currency": self.currency,
+            "protocol_family": self.protocol_family,
+            "total_calls": self.total_calls,
+            "total_charges": self.total_charges,
+            "by_status": self.by_status,
+            "bandwidth": self.bandwidth,
+        });
+        if let Some(stream) = &self.stream {
+            object["stream"] = stream.clone();
+        }
+        object
+    }
+}
+
+impl<'a> SchemaSerializable for ChargebackProxyRow<'a> {
+    fn owns_native(&self, source: &str) -> bool {
+        crate::plugins::utils::log_schema::CHARGEBACK_REPORT_FIELDS
+            .iter()
+            .any(|field| field.name == source)
+    }
+
+    fn serialize_native<S>(
+        &self,
+        source: &'static str,
+        out_key: &str,
+        _ts_format: TimestampFormat,
+        map: &mut S,
+    ) -> Result<(), S::Error>
+    where
+        S: serde::ser::SerializeMap,
+    {
+        match source {
+            "proxy_id" => map.serialize_entry(out_key, self.proxy_id),
+            "namespace" => map.serialize_entry(out_key, self.namespace),
+            "proxy_name" => map.serialize_entry(out_key, self.proxy_name),
+            "currency" => map.serialize_entry(out_key, self.currency),
+            "protocol_family" => map.serialize_entry(out_key, self.protocol_family),
+            "total_calls" => map.serialize_entry(out_key, &self.total_calls),
+            "total_charges" => map.serialize_entry(out_key, &self.total_charges),
+            "by_status" => map.serialize_entry(out_key, &self.by_status),
+            "bandwidth" => map.serialize_entry(out_key, &self.bandwidth),
+            // Mirrors the native rendering: absent unless the row carries
+            // stream activity.
+            "stream" => match &self.stream {
+                Some(stream) => map.serialize_entry(out_key, stream),
+                None => Ok(()),
+            },
+            _ => Ok(()),
+        }
+    }
+
+    fn serialize_derived<S>(
+        &self,
+        kind: DerivedKind,
+        out_key: &str,
+        map: &mut S,
+    ) -> Result<bool, S::Error>
+    where
+        S: serde::ser::SerializeMap,
+    {
+        match kind {
+            DerivedKind::SummaryKind => {
+                map.serialize_entry(out_key, "chargeback_proxy")?;
+                Ok(true)
+            }
+            // Every other kind is rejected at compile time for this family: a
+            // billing row aggregates many transactions and has no single
+            // status, backend, or outcome.
+            _ => Ok(false),
+        }
+    }
+
+    fn serialize_metadata<S>(
+        &self,
+        _policy: &MetadataPolicy,
+        _emitted: &mut std::collections::HashSet<String>,
+        _map: &mut S,
+    ) -> Result<(), S::Error>
+    where
+        S: serde::ser::SerializeMap,
+    {
+        // Billing rows carry no metadata map; the compiler rejects a `metadata`
+        // policy for this family.
+        Ok(())
+    }
+}
+
 pub struct ApiChargeback {
     registry: Arc<ChargebackRegistry>,
     pricing: PricingConfig,
@@ -2296,6 +2569,11 @@ pub struct ApiChargeback {
     /// records so multiple instances never misattribute one another's charges
     /// (finding #24).
     scope: InstanceScope,
+    /// Compiled `/charges` billing-row projection resolved at construction.
+    /// Like the other render tunables this governs one process-global render
+    /// cache, so [`validate_composition`] requires every enabled instance to
+    /// agree on it. `None` keeps the `/charges` document byte-for-byte.
+    render_schema: Option<Arc<SummarySchema>>,
     /// Process-global registry knobs resolved at construction and applied only
     /// once this instance's generation is accepted.
     tunables: SharedRegistryTunables,
@@ -2334,12 +2612,11 @@ impl ApiChargeback {
         let object = config
             .as_object()
             .ok_or_else(|| "api_chargeback: config must be an object".to_string())?;
-        if config.get("schema").is_some() || config.get("schema_ref").is_some() {
-            return Err("api_chargeback: 'schema' / 'schema_ref' is not supported \
-                 (transaction-log schema customization applies only to log-shipping plugins; \
-                 see docs/plugins.md)"
-                .to_string());
-        }
+        // Compile / resolve once here — never on the `/charges` render path.
+        // `schema_ref` keeps the global-first lifecycle and fails closed for a
+        // missing or incompatible named definition.
+        let render_schema =
+            resolve_schema(config, "api_chargeback", SchemaCapabilities::API_CHARGEBACK)?;
         reject_unknown_keys(
             object,
             "config",
@@ -2396,7 +2673,15 @@ impl ApiChargeback {
             pricing,
             scope,
             tunables,
+            render_schema,
         })
+    }
+
+    /// The compiled `/charges` render projection this instance resolved.
+    #[doc(hidden)]
+    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
+    pub fn render_schema(&self) -> Option<&Arc<SummarySchema>> {
+        self.render_schema.as_ref()
     }
 
     /// Shard count the process-global entry map was built with when this
@@ -2439,6 +2724,8 @@ impl Plugin for ApiChargeback {
             self.tunables.max_entries,
             self.tunables.max_retained_bytes,
         );
+        self.registry
+            .configure_render_schema(self.render_schema.clone());
         self.registry
             .start_cleanup_task(self.tunables.cleanup_interval_seconds);
     }

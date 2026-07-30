@@ -23,15 +23,42 @@ struct MySqlFixture {
     pool: sqlx::AnyPool,
 }
 
+/// Bound transient Docker image-transfer/start failures without turning a
+/// deterministic fixture failure into an unbounded CI retry.
+async fn start_mysql_container(password: &str) -> Result<ContainerAsync<GenericImage>, BoxError> {
+    const START_ATTEMPTS: u32 = 3;
+
+    for attempt in 1..=START_ATTEMPTS {
+        match GenericImage::new("mysql", "8.4")
+            .with_exposed_port(3306.tcp())
+            .with_env_var("MYSQL_ROOT_PASSWORD", password)
+            .with_env_var("MYSQL_ROOT_HOST", "%")
+            .with_env_var("MYSQL_DATABASE", "ferrum")
+            .start()
+            .await
+        {
+            Ok(container) => return Ok(container),
+            Err(error) => {
+                if attempt == START_ATTEMPTS {
+                    return Err(format!(
+                        "MySQL container failed to start after {START_ATTEMPTS} attempts: {error}"
+                    )
+                    .into());
+                }
+                eprintln!(
+                    "MySQL container start attempt {attempt}/{START_ATTEMPTS} failed; retrying: {error}"
+                );
+                tokio::time::sleep(Duration::from_secs(u64::from(attempt))).await;
+            }
+        }
+    }
+
+    Err("MySQL container start retry loop did not execute".into())
+}
+
 async fn start_mysql() -> Result<MySqlFixture, BoxError> {
     const PASSWORD: &str = "ferrum-mysql-test-password";
-    let container = GenericImage::new("mysql", "8.4")
-        .with_exposed_port(3306.tcp())
-        .with_env_var("MYSQL_ROOT_PASSWORD", PASSWORD)
-        .with_env_var("MYSQL_ROOT_HOST", "%")
-        .with_env_var("MYSQL_DATABASE", "ferrum")
-        .start()
-        .await?;
+    let container = start_mysql_container(PASSWORD).await?;
     let port = container.get_host_port_ipv4(3306.tcp()).await?;
     let url = format!("mysql://root:{PASSWORD}@127.0.0.1:{port}/ferrum");
 
