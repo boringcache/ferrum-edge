@@ -263,6 +263,6 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 - Grafana dashboards: `charts/ferrum-mesh/dashboards/*.json`
 - Families with `bundled: documented_only` are intentionally exported without a chart alert/dashboard yet; adding a query requires updating both the chart artifact and this inventory classification.
 
-External (non-Ferrum) metrics referenced by bundled alerts — for example `apiserver_admission_webhook_rejection_count` — are allowlisted in the contract validator and are outside this inventory.
+Chart-reference validation scans Ferrum-owned tokens (`ferrum_…`, `chargeback_sink_…`) plus an explicit allowlist of external (non-Ferrum) metrics referenced by bundled alerts — currently `apiserver_admission_webhook_rejection_count`. Allowlisted names are outside this inventory, and CI fails closed on a stale entry (allowlisted but no longer referenced by the charts) or on an entry that shadows an inventoried family. Other non-Ferrum metric names in bundled queries are not scanned; adding one requires an allowlist entry to keep this record complete.
 
 Hosted CI validates chart metric references with `.github/scripts/validate_prometheus_metric_contract.py`, renders the enabled Helm `PrometheusRule`, extracts its rule groups, and runs `promtool check rules` against the exact rendered expressions. Operators may run the same check against a rendered PrometheusRule in their own cluster tooling.

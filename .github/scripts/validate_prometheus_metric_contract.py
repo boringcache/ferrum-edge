@@ -64,7 +64,15 @@ TYPE_LITERAL_RE = re.compile(
     r"# TYPE\s+(ferrum_[a-z0-9_]+|chargeback_sink_[a-z0-9_]+)\s+"
     r"(counter|gauge|histogram|summary)\b"
 )
-METRIC_TOKEN_RE = re.compile(r"\b(?:ferrum_[a-z0-9_]+|chargeback_sink_[a-z0-9_]+)\b")
+# Ferrum-owned prefixes plus the literal external names we deliberately admit,
+# so the allowlist below is actually exercised rather than being unreachable
+# behind a Ferrum-only token pattern.
+METRIC_TOKEN_RE = re.compile(
+    "|".join(
+        [r"\b(?:ferrum_[a-z0-9_]+|chargeback_sink_[a-z0-9_]+)\b"]
+        + [rf"\b{re.escape(name)}\b" for name in sorted(EXTERNAL_ALLOWLIST)]
+    )
+)
 METRIC_NAME_RE = re.compile(r"^(?:ferrum_|chargeback_sink_)[a-z0-9_]+$")
 LABEL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SUBSYSTEM_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -108,6 +116,11 @@ def extract_rust_string_literal_contents(text: str) -> list[str]:
     Skips line/block comments so identifiers and prose cannot be mistaken for
     exported ``# TYPE`` declarations. Handles ordinary ``"…"`` strings (with
     escapes and line continuations) and raw strings ``r#"…"#``.
+
+    Rust char literals are skipped whole. ``'"'`` would otherwise open a phantom
+    string, invert "code" and "string" for the rest of the file, and silently
+    drop every later ``# TYPE`` literal — turning this fail-closed inventory
+    gate into a silent pass.
     """
     out: list[str] = []
     i = 0
@@ -124,6 +137,18 @@ def extract_rust_string_literal_contents(text: str) -> list[str]:
             if nxt == "*":
                 end = text.find("*/", i + 2)
                 i = n if end < 0 else end + 2
+                continue
+        if ch == "'":
+            # `'\''`, `'\\'`, `'\u{2192}'` … escaped forms; the closing quote is
+            # the next `'` at or after i+3. Lifetimes (`'a`, `'static`, `'_`)
+            # match neither branch and fall through to a plain advance.
+            if i + 1 < n and text[i + 1] == "\\":
+                end = text.find("'", i + 3)
+                if end >= 0:
+                    i = end + 1
+                    continue
+            elif i + 2 < n and text[i + 2] == "'":
+                i += 3
                 continue
         if ch == "r" and i + 1 < n and text[i + 1] in "#\"":
             j = i + 1
@@ -354,6 +379,22 @@ def validate_bundled(root: Path, items: list[dict]) -> None:
     if unknown:
         fail("Bundled query unknown family", ", ".join(unknown))
 
+    # The allowlist records deliberate non-Ferrum references. Keep it honest:
+    # a stale entry (its alert deleted) or an entry that is really a Ferrum
+    # family must not sit here unnoticed.
+    stale = sorted(EXTERNAL_ALLOWLIST.difference(referenced))
+    if stale:
+        fail(
+            "Stale external metric allowlist entry",
+            f"{', '.join(stale)} no longer referenced by bundled alerts/dashboards",
+        )
+    inventoried = sorted(EXTERNAL_ALLOWLIST.intersection(by_name))
+    if inventoried:
+        fail(
+            "External allowlist shadows an inventoried family",
+            ", ".join(inventoried),
+        )
+
     for item in items:
         name = item["name"]
         is_ref = name in referenced
@@ -416,6 +457,21 @@ def validate_source_type_literals(root: Path, items: list[dict]) -> None:
         fail(
             "TYPE literal scanner regression",
             "mutation sentinel unexpectedly present in inventory",
+        )
+    # A Rust char literal holding a quote must not desynchronize the string
+    # tracker and mask a later `# TYPE` literal in the same file.
+    char_literal_source = (
+        "fn scan(ch: char) { if ch == '\"' { return; } }\n"
+        'output.push_str("# TYPE ferrum_after_char_literal_total counter\\n");\n'
+    )
+    char_literal_types: dict[str, set[str]] = {}
+    for literal in extract_rust_string_literal_contents(char_literal_source):
+        for match in TYPE_LITERAL_RE.finditer(literal):
+            char_literal_types.setdefault(match.group(1), set()).add(match.group(2))
+    if "ferrum_after_char_literal_total" not in char_literal_types:
+        fail(
+            "TYPE literal scanner regression",
+            "a Rust char literal containing a quote masked a later # TYPE literal",
         )
     # Comment/identifier noise must not be treated as an export.
     noise = (

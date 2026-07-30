@@ -371,7 +371,13 @@ fn ferrum_metric_names_in_text(
                 i += 1;
             }
             let token = &text[start..i];
-            if token.starts_with("ferrum_") || token.starts_with("chargeback_sink_") {
+            // Ferrum-owned prefixes plus the literal external names we
+            // deliberately admit, so the allowlist is actually exercised
+            // rather than being unreachable behind a Ferrum-only prefix test.
+            if token.starts_with("ferrum_")
+                || token.starts_with("chargeback_sink_")
+                || BUNDLED_EXTERNAL_METRIC_ALLOWLIST.contains(&token)
+            {
                 names.insert(normalize_family_name(token, contract));
             }
             continue;
@@ -432,6 +438,23 @@ fn extract_rust_string_literal_contents(text: &str) -> Vec<String> {
                     i += 1;
                 }
                 i = (i + 2).min(bytes.len());
+                continue;
+            }
+        }
+        if bytes[i] == b'\'' {
+            // Rust char literal. `'"'` would otherwise open a phantom string,
+            // invert "code" and "string" for the rest of the file, and silently
+            // drop every later `# TYPE` literal — turning this fail-closed
+            // inventory gate into a silent pass. Lifetimes (`'a`, `'static`,
+            // `'_`) match neither branch and fall through to a plain advance.
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                let from = (i + 3).min(bytes.len());
+                if let Some(rel) = bytes[from..].iter().position(|&b| b == b'\'') {
+                    i = from + rel + 1;
+                    continue;
+                }
+            } else if i + 2 < bytes.len() && bytes[i + 2] == b'\'' {
+                i += 3;
                 continue;
             }
         }
@@ -682,10 +705,20 @@ fn representative_exposition() -> String {
 fn prometheus_metric_contract_is_sorted_unique_and_well_formed() {
     let contract = load_contract();
     assert!(!contract.is_empty(), "contract must not be empty");
-    let names: Vec<_> = contract.keys().cloned().collect();
+    // Assert over the array order in the file. `load_contract` returns a
+    // BTreeMap, so asserting over its keys would be sorted by construction and
+    // could never fail. Uniqueness is already enforced there on insert.
+    let contract_value: Value =
+        serde_json::from_str(PROMETHEUS_METRIC_CONTRACT_JSON).expect("contract JSON parses");
+    let file_order: Vec<&str> = contract_value
+        .as_array()
+        .expect("contract JSON is an array")
+        .iter()
+        .map(|item| item["name"].as_str().expect("name"))
+        .collect();
     assert!(
-        names.windows(2).all(|w| w[0] < w[1]),
-        "contract family names must be strictly sorted"
+        file_order.windows(2).all(|w| w[0] < w[1]),
+        "docs/prometheus_metric_contract.json family names must be strictly sorted"
     );
     for fam in contract.values() {
         assert!(
@@ -910,18 +943,33 @@ fn bundled_prometheus_rule_metric_refs_are_inventoried_or_allowlisted() {
     let allow: BTreeSet<&str> = BUNDLED_EXTERNAL_METRIC_ALLOWLIST.iter().copied().collect();
     let names = ferrum_metric_names_in_text(BUNDLED_PROMETHEUS_RULE_TEMPLATE, &contract);
     let mut unknown = Vec::new();
-    for name in names {
+    for name in &names {
         if allow.contains(name.as_str()) {
             continue;
         }
-        if !contract.contains_key(&name) {
-            unknown.push(name);
+        if !contract.contains_key(name) {
+            unknown.push(name.clone());
         }
     }
     assert!(
         unknown.is_empty(),
         "PrometheusRule references unknown Ferrum families: {unknown:?}"
     );
+
+    // The allowlist records deliberate non-Ferrum references. Keep it honest:
+    // a stale entry (its alert deleted) or an entry that is really a Ferrum
+    // family must not sit here unnoticed.
+    for external in BUNDLED_EXTERNAL_METRIC_ALLOWLIST {
+        assert!(
+            names.contains(*external),
+            "stale external metric allowlist entry: {external} is no longer \
+             referenced by the bundled PrometheusRule"
+        );
+        assert!(
+            !contract.contains_key(*external),
+            "external allowlist shadows an inventoried family: {external}"
+        );
+    }
 }
 
 #[test]
@@ -937,6 +985,9 @@ fn bundled_grafana_dashboard_metric_refs_are_inventoried() {
     let mut unknown = Vec::new();
     for dash in DASHBOARDS {
         for name in ferrum_metric_names_in_text(dash, &contract) {
+            if BUNDLED_EXTERNAL_METRIC_ALLOWLIST.contains(&name.as_str()) {
+                continue;
+            }
             if !contract.contains_key(&name) {
                 unknown.push(name);
             }
@@ -1092,6 +1143,22 @@ fn production_type_literal_scanner_has_mutation_and_noise_regressions() {
     assert!(
         type_literals_in_rust_source(noise).is_empty(),
         "comment/identifier noise must not be treated as exported # TYPE literals"
+    );
+
+    // A Rust char literal holding a quote must not desynchronize the string
+    // tracker and mask a later `# TYPE` literal in the same file.
+    let char_literal_source = r##"
+        fn scan(ch: char) { if ch == '"' { return; } }
+        output.push_str("# TYPE ferrum_after_char_literal_total counter\n");
+    "##;
+    let detected_after_char_literal = type_literals_in_rust_source(char_literal_source);
+    assert!(
+        detected_after_char_literal.contains_key("ferrum_after_char_literal_total"),
+        "a Rust char literal containing a quote masked a later # TYPE literal"
+    );
+    assert!(
+        !contract.contains_key("ferrum_after_char_literal_total"),
+        "char-literal sentinel must not be present in the inventory"
     );
 }
 
