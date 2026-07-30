@@ -179,6 +179,28 @@ pub mod _test_support {
         ctx.mcp_trusted_tool_name_rewrite.is_none()
     }
 
+    /// Whether a routed `tools/call` pinned a private outputSchema validator.
+    pub fn mcp_validate_tool_result_is_some_for_test(ctx: &crate::plugins::RequestContext) -> bool {
+        ctx.mcp_validate_tool_result.is_some()
+    }
+
+    /// Whether two contexts hold the same pinned outputSchema validator Arc
+    /// (pointer equality). Used to prove compatibility clones and in-flight
+    /// requests keep the dispatch-time snapshot.
+    pub fn mcp_validate_tool_result_ptr_eq_for_test(
+        left: &crate::plugins::RequestContext,
+        right: &crate::plugins::RequestContext,
+    ) -> bool {
+        match (
+            left.mcp_validate_tool_result.as_ref(),
+            right.mcp_validate_tool_result.as_ref(),
+        ) {
+            (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     /// Read-only view of the private aggregate-batch upstream-dispatch guard.
     /// Intentionally has no setter: tests must prove the guard cannot be forged
     /// from public metadata, so nothing outside `mcp_gateway` may set it.
@@ -1588,6 +1610,28 @@ pub mod _test_support {
         content_type: &str,
     ) -> Result<String, String> {
         crate::plugins::soap_ws_security::decode_soap_xml_body_for_test(bytes, content_type)
+    }
+
+    /// Frame an MTOM/XOP `multipart/related` package with the strict MIME
+    /// parser and return the selected root part as `(body, content_type)`, or
+    /// the fail-closed decode class.
+    pub fn soap_extract_mtom_root_part_for_test(
+        bytes: &[u8],
+        boundary: &str,
+        start: Option<&str>,
+    ) -> Result<(Vec<u8>, String), &'static str> {
+        crate::plugins::soap_ws_security::extract_mtom_root_part_for_test(bytes, boundary, start)
+    }
+
+    /// Media-type classification for a built plugin, as a stable string:
+    /// `"xml"` / `"xop"` / `"mtom"` for a governed representation,
+    /// `"pass_through"`, or `"reject:<status>:<class>"`.
+    pub fn soap_classify_request_for_test(
+        config: &serde_json::Value,
+        content_type: Option<&str>,
+    ) -> Result<String, String> {
+        let plugin = crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?;
+        Ok(plugin.classify_request_for_tests(content_type))
     }
 
     /// Exact replay-state observation for deterministic external tests.

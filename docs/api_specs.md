@@ -38,19 +38,24 @@ The autodetection heuristic is best-effort; the full parser produces a precise e
 
 ### YAML type-coercion caution
 
-YAML's implicit type coercion can produce surprising results when the gateway serialises the document to JSON for internal processing:
+Ferrum follows the YAML scalar resolution used by `serde_yaml`: YAML 1.2-style
+booleans and explicit base prefixes, while legacy YAML 1.1 spellings remain
+strings:
 
 | YAML literal | JSON value | Why it matters |
 |---|---|---|
-| `010` | `8` | Octal integer — YAML 1.1 treats leading-zero integers as octal |
-| `1:30` | `90` | Sexagesimal integer — YAML 1.1 treats `N:M` as `N*60 + M` |
-| `yes`, `no`, `on`, `off`, `true`, `false` | boolean | YAML 1.1 boolean aliases; `yes` becomes JSON `true` |
+| `0o10` | `8` | Octal integers require the explicit `0o` prefix |
+| `010`, `1:30` | string | Legacy octal and sexagesimal YAML 1.1 forms are not coerced |
+| `yes`, `no`, `on`, `off` | string | Legacy YAML 1.1 boolean aliases are not coerced |
+| `true`, `false` | boolean | YAML 1.2 boolean spellings are coerced |
+| `200:` as a mapping key | `"200"` key | Number and boolean mapping keys take their JSON object-key spelling, so unquoted status codes are accepted |
+| `18446744073709551616`, `1e400`, `.inf`, `.nan` | rejected (400) | Values outside the exact JSON `i64`/`u64` range, and non-finite numbers, are not silently rounded or restyled |
 
 **Recommendation**: quote strings that look like numbers or boolean words in YAML specs to preserve them as strings:
 
 ```yaml
 info:
-  version: "010"   # → JSON string "010", not integer 8
+  version: "010"   # Quoting remains the clearest way to state string intent
 x-ferrum-proxy:
   backend_port: 443  # numeric — no quotes needed
 ```
@@ -242,7 +247,7 @@ The following are rejected at parse time with a 400 error:
 
 **Body size limit**: controlled by `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25). Returns 413 when exceeded.
 
-**YAML alias expansion**: Ferrum rejects parsed YAML documents that exceed the expanded node budget, but `serde_yaml` performs alias expansion while parsing. Keep YAML submissions to trusted operator workflows; use JSON for very large generated specs or when you need the tightest memory bound.
+**YAML alias expansion**: YAML anchors and aliases are composed through a libyaml event graph and expanded deterministically under shared budgets (expanded nodes, nesting depth, alias references, a 32 MiB fail-closed upper bound on the compact JSON representation including string/key escaping, and expansion work) with cycle, undefined-alias, duplicate-anchor, and duplicate-mapping-key detection. Expansion fails closed with field-specific diagnostics and never admits exponential alias bombs. JSON and YAML submissions share the same post-parse expanded-node cap so autodetection cannot weaken admission. Keep extremely large generated specs in JSON when you need the simplest wire form; modular YAML with finite alias reuse is supported. Expansion also fails closed on a non-core or local YAML tag, a non-finite number, an integer outside the exact JSON `i64`/`u64` range, and a mapping key that has no JSON object-key spelling (null, sequence, or mapping); scalar number and boolean keys keep their stringified spelling so unquoted status codes stay valid.
 
 **MongoDB caveat**: the BSON document limit is 16 MiB. Since spec content is gzip-compressed before storage, a spec up to approximately 14–15 MiB compressed fits within the limit. Operators with larger specs should use a SQL backend (PostgreSQL, MySQL, or SQLite).
 
