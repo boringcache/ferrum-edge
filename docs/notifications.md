@@ -174,7 +174,23 @@ dispatch(
 );
 ```
 
-`dispatch` is fire-and-forget: each channel send runs on its own `tokio::spawn` under the supplied semaphore. When permits are exhausted alerts are dropped with a `warn!` rather than queued — alert storms during a partial channel outage should be visible, not buffered. Each caller owns its own `Semaphore` so dispatch budgets do not interact across subsystems.
+`dispatch` is fire-and-forget: each channel send runs on a detached task admitted through the process observability delivery registry under the supplied semaphore. When permits are exhausted alerts are dropped with a `warn!` (and `ferrum_notification_delivery_backpressure_dropped_total`) rather than queued — alert storms during a partial channel outage should be visible, not buffered. Each caller owns its own `Semaphore` so dispatch budgets do not interact across subsystems.
+
+Transient transport/HTTP failures (408/429/5xx, connect/timeout) retry inside the same task with a bounded, jittered backoff while holding the permit. Permanent failures (other 4xx, egress denials) fail immediately. Process shutdown drains in-flight sends under the shared observability budget; abandoned sends increment `ferrum_notification_delivery_abandoned_at_deadline_total{channel_type=…}`.
+
+### Delivery metrics (bounded cardinality)
+
+Authenticated `/metrics` exports these families, labeled only by the fixed `channel_type` set (`slack` / `teams` / `discord` / `webhook` / `email`) — never by operator channel name:
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `ferrum_notification_delivery_attempted_total` | counter | Tasks admitted past the semaphore |
+| `ferrum_notification_delivery_succeeded_total` | counter | Final success (after retries) |
+| `ferrum_notification_delivery_failed_transient_total` | counter | Exhausted retries on transient failures |
+| `ferrum_notification_delivery_failed_permanent_total` | counter | Permanent failures |
+| `ferrum_notification_delivery_backpressure_dropped_total` | counter | Semaphore exhaustion drops |
+| `ferrum_notification_delivery_abandoned_at_deadline_total` | counter | Cancelled on reload retirement or shutdown deadline |
+| `ferrum_notification_delivery_in_flight` | gauge | Currently executing sends (including backoff) |
 
 ## Reusing the layer from a non-plugin caller
 

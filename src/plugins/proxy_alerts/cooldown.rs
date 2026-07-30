@@ -122,6 +122,26 @@ impl CooldownGate {
         }
     }
 
+    /// Clear a previously acquired cooldown so a failed delivery does not
+    /// silently consume the window. No-op when the slot is already clear.
+    pub fn release(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        channel_id: u32,
+        ownership_generation: u64,
+    ) {
+        let Some(per_proxy) = self.last_sent.get(&(rule_id, channel_id)) else {
+            return;
+        };
+        let Some(per_generation) = per_proxy.get(proxy_id) else {
+            return;
+        };
+        if let Some(atomic) = per_generation.get_cloned(&ownership_generation) {
+            atomic.store(0, Ordering::Release);
+        }
+    }
+
     /// Drop cooldown rows for proxies absent from `active_proxy_generations`
     /// or whose stored generation does not match the published incarnation.
     ///
@@ -188,15 +208,23 @@ impl CooldownGate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleState {
     Healthy,
+    /// Trigger accepted for dispatch but delivery has not settled yet.
+    /// Suppresses duplicate Trigger admissions until success (→ Active) or
+    /// failure/abandon (→ Healthy, cooldown released).
+    PendingTrigger { reserved_at_ms: u64 },
     Active { fired_at_ms: u64 },
     Recovering { left_threshold_at_ms: u64 },
+    /// Resolve accepted for dispatch but delivery has not settled yet.
+    /// Suppresses duplicate Resolve admissions until success (→ Healthy) or
+    /// failure/abandon (→ Recovering, so the next healthy sample can retry).
+    PendingResolve { left_threshold_at_ms: u64 },
 }
 
 /// Outcome of evaluating a single observation against the recovery state
 /// machine. The dispatch loop translates this into zero or one notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleOutcome {
-    /// Healthy → Active. Caller should dispatch a `Trigger` notification
+    /// Healthy → PendingTrigger. Caller should dispatch a `Trigger` notification
     /// (subject to cooldown).
     Trigger,
     /// Active → Active. Caller MAY dispatch a re-trigger if its cooldown
@@ -205,8 +233,8 @@ pub enum LifecycleOutcome {
     StillActive,
     /// Active → Recovering. No notification.
     EnteringRecovery,
-    /// Recovering → Healthy. Caller should dispatch a `Resolve` notification
-    /// (no cooldown applies — recovery events are always one-shot).
+    /// Recovering → PendingResolve. Caller should dispatch a `Resolve`
+    /// notification (no cooldown applies — recovery events are always one-shot).
     Resolve,
     /// Recovering → Active (re-breach inside the resolved window). No
     /// notification — the rule is still considered alerting.
@@ -337,12 +365,17 @@ impl RecoveryGate {
     ) -> LifecycleOutcome {
         match (*state, breach) {
             (RuleState::Healthy, true) => {
-                *state = RuleState::Active {
-                    fired_at_ms: now_ms,
+                *state = RuleState::PendingTrigger {
+                    reserved_at_ms: now_ms,
                 };
                 LifecycleOutcome::Trigger
             }
             (RuleState::Healthy, false) => LifecycleOutcome::Quiet,
+            // PendingTrigger holds the seat until delivery settles. A continued
+            // breach stays quiet (no duplicate dispatch); a clear while pending
+            // stays pending so a late success still lands on Active, and a late
+            // failure rolls back to Healthy via [`Self::settle_trigger`].
+            (RuleState::PendingTrigger { .. }, _) => LifecycleOutcome::Quiet,
             (RuleState::Active { .. }, true) => LifecycleOutcome::StillActive,
             (RuleState::Active { .. }, false) if recovery_ms == 0 => {
                 *state = RuleState::Healthy;
@@ -365,7 +398,9 @@ impl RecoveryGate {
                     LifecycleOutcome::Quiet
                 } else if let Some(elapsed) = now_ms.checked_sub(left_threshold_at_ms) {
                     if elapsed >= recovery_ms {
-                        *state = RuleState::Healthy;
+                        *state = RuleState::PendingResolve {
+                            left_threshold_at_ms,
+                        };
                         LifecycleOutcome::Resolve
                     } else {
                         LifecycleOutcome::Quiet
@@ -380,8 +415,8 @@ impl RecoveryGate {
                 }
             }
             (RuleState::Recovering { .. }, true) if recovery_ms == 0 => {
-                *state = RuleState::Active {
-                    fired_at_ms: now_ms,
+                *state = RuleState::PendingTrigger {
+                    reserved_at_ms: now_ms,
                 };
                 LifecycleOutcome::Trigger
             }
@@ -391,7 +426,105 @@ impl RecoveryGate {
                 };
                 LifecycleOutcome::Reactivate
             }
+            // PendingResolve holds the seat until delivery settles.
+            (RuleState::PendingResolve { .. }, true) => {
+                // Re-breach while resolve is in flight: cancel the pending
+                // resolve by returning to Active (delivery settle will no-op
+                // if state is no longer PendingResolve).
+                *state = RuleState::Active {
+                    fired_at_ms: now_ms,
+                };
+                LifecycleOutcome::Reactivate
+            }
+            (RuleState::PendingResolve { .. }, false) => LifecycleOutcome::Quiet,
         }
+    }
+
+    /// Commit a successful Trigger delivery: PendingTrigger → Active.
+    ///
+    /// No-op when the state is no longer PendingTrigger (e.g. retired
+    /// generation or a concurrent Reactivate path).
+    pub fn settle_trigger_success(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+        fired_at_ms: u64,
+    ) {
+        let per_generation = self.per_proxy_generations(rule_id, proxy_id);
+        let _ = per_generation.with_mut(
+            ownership_generation,
+            || RuleState::Healthy,
+            |state| {
+                if matches!(state, RuleState::PendingTrigger { .. }) {
+                    *state = RuleState::Active { fired_at_ms };
+                }
+                LifecycleOutcome::Quiet
+            },
+        );
+    }
+
+    /// Roll back a failed/abandoned Trigger: PendingTrigger → Healthy.
+    pub fn settle_trigger_failure(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+    ) {
+        let per_generation = self.per_proxy_generations(rule_id, proxy_id);
+        let _ = per_generation.with_mut(
+            ownership_generation,
+            || RuleState::Healthy,
+            |state| {
+                if matches!(state, RuleState::PendingTrigger { .. }) {
+                    *state = RuleState::Healthy;
+                }
+                LifecycleOutcome::Quiet
+            },
+        );
+    }
+
+    /// Commit a successful Resolve delivery: PendingResolve → Healthy.
+    pub fn settle_resolve_success(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+    ) {
+        let per_generation = self.per_proxy_generations(rule_id, proxy_id);
+        let _ = per_generation.with_mut(
+            ownership_generation,
+            || RuleState::Healthy,
+            |state| {
+                if matches!(state, RuleState::PendingResolve { .. }) {
+                    *state = RuleState::Healthy;
+                }
+                LifecycleOutcome::Quiet
+            },
+        );
+    }
+
+    /// Roll back a failed/abandoned Resolve: PendingResolve → Recovering.
+    pub fn settle_resolve_failure(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+        left_threshold_at_ms: u64,
+    ) {
+        let per_generation = self.per_proxy_generations(rule_id, proxy_id);
+        let _ = per_generation.with_mut(
+            ownership_generation,
+            || RuleState::Healthy,
+            |state| {
+                if matches!(state, RuleState::PendingResolve { .. }) {
+                    *state = RuleState::Recovering {
+                        left_threshold_at_ms,
+                    };
+                }
+                LifecycleOutcome::Quiet
+            },
+        );
     }
 
     /// Returns the current state for the given (rule, proxy, generation)

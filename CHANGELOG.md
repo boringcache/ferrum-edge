@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `proxy_alerts` / notification delivery now expose bounded-cardinality
+  Prometheus delivery metrics (`attempted` / `succeeded` /
+  `failed_transient` / `failed_permanent` / `backpressure_dropped` /
+  `abandoned_at_deadline` / `in_flight`, labeled only by fixed
+  `channel_type`), classify transport/HTTP outcomes into permanent vs
+  transient failures with a bounded jittered retry budget, track dispatch
+  tasks per plugin generation (reload stops admission and cooperatively
+  cancels; process shutdown drains via the shared observability delivery
+  budget), and commit Trigger/Resolve cooldown + incident state only after
+  a defined delivery settle (`PendingTrigger` / `PendingResolve`). See
+  `docs/proxy_alerts.md` and `docs/notifications.md` (#2448).
+
 ### Security
 
 - Plugin egress no longer inherits ambient proxy configuration

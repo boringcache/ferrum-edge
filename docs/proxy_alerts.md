@@ -18,6 +18,9 @@ This plugin is a lightweight in-gateway alerting surface — useful when you wan
   "default_window_seconds": 60,
   "default_resolved_window_seconds": 300,
   "max_concurrent_dispatches": 8,
+  "max_delivery_retries": 2,
+  "delivery_retry_base_ms": 100,
+  "delivery_retry_max_ms": 2000,
 
   "quiet_hours_utc": [
     { "from": "23:00", "to": "06:00", "weekdays": [0, 6] }
@@ -74,6 +77,9 @@ Unknown properties are rejected at the top level and within quiet-hours, recover
 | `default_window_seconds` | `60` | Per-rule fallback for `window_seconds`; must be in `[5, 3600]`. |
 | `default_resolved_window_seconds` | `300` | Per-rule fallback for `recovery.resolved_window_seconds`; must be in `[5, 86400]`. |
 | `max_concurrent_dispatches` | `8` | Bounded-concurrency semaphore for outbound notifications (`>= 1`). When exhausted, alerts are dropped with a `warn!` rather than queued. |
+| `max_delivery_retries` | `2` | Re-attempts after the initial send for **transient** failures only (`0..=8`). Retries hold the dispatch permit and never enqueue extra work. |
+| `delivery_retry_base_ms` | `100` | Initial jittered backoff between transient retries (`[10, 60000]`). |
+| `delivery_retry_max_ms` | `2000` | Cap for exponential jittered backoff (`[10, 60000]`, must be `>= delivery_retry_base_ms`). |
 | `quiet_hours_utc` | `[]` | Optional UTC time-of-day windows where `Trigger` alerts are suppressed (without consuming the cooldown). Omit the field for no quiet hours; `null` is rejected. `Resolve` events still fire so operators don't miss recovery during off hours. |
 
 ### Quiet hours
@@ -255,5 +261,9 @@ Use `$$` for a literal `$`. Unknown placeholders are passed through unchanged.
 - Per-rule `enabled: false` entries are skipped before rule validation, so operators can keep draft/disabled rules alongside at least one active rule without breaking the active alert set. Configurations with no active rules are rejected. Present non-boolean `enabled` values (plugin or rule scope) and wrongly typed optional scalars such as `min_request_count` are rejected rather than coerced to active defaults.
 - `*_env` channel fields read `std::env::var()` at construction so the gateway's secret resolver (`_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP`) handles materialization without ever placing secrets in DB/file config. Reference the unsuffixed variable in plugin config: for example set `FERRUM_ALERTS_SLACK_WEBHOOK_VAULT=secret/data/ferrum/slack#url`, then configure `"webhook_url_env": "FERRUM_ALERTS_SLACK_WEBHOOK"` after startup materializes the base env var.
 - Sensitive metadata (`Authorization`, `Cookie`, etc.) is auto-redacted at `TransactionSummary` serialize time per the standard logger redaction. Notification template variables only expose named scalars (`${observed}`, `${rule_name}`, …) — there is no raw `${metadata}` hook, so the redaction layer cannot be bypassed via a template.
-- When the dispatch semaphore (`max_concurrent_dispatches`) is exhausted, alerts are dropped with a `warn!` rather than queued, and the rule/proxy/channel cooldown is not consumed. Operators investigating a backpressure event should grep `plugin=proxy_alerts` in their logs.
+- When the dispatch semaphore (`max_concurrent_dispatches`) is exhausted, alerts are dropped with a `warn!` rather than queued, the rule/proxy/channel cooldown is not consumed, and `ferrum_notification_delivery_backpressure_dropped_total{channel_type=…}` increments. Operators investigating a backpressure event should scrape that counter (or grep `plugin=proxy_alerts` in their logs).
+- **Delivery outcomes**: each admitted send is classified as success, transient failure (408/429/5xx, connect/timeout), or permanent failure (other 4xx / config faults). Transient failures retry inside the same task with jittered exponential backoff up to `max_delivery_retries` while holding the semaphore permit — never an unbounded queue, never blocking the `log()` hook.
+- **Cooldown / incident state**: Trigger and Resolve reserve a `PendingTrigger` / `PendingResolve` seat when a dispatch is admitted. Cooldown is armed at admission and **released on failure/abandon**; incident state commits to `Active` / `Healthy` only after at least one channel settles successfully. A failed Trigger therefore does not silently consume cooldown or permanently mark Active; a failed Resolve returns to `Recovering` so the next healthy sample can retry.
+- **Generation drain**: every `proxy_alerts` instance owns a dispatch generation. Reload/`Drop` stops admitting and cooperatively cancels in-flight sends for that generation. Tasks are also admitted into the process `observability_delivery` registry so graceful shutdown drains them under `FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS`; sends still outstanding at the deadline increment `ferrum_notification_delivery_abandoned_at_deadline_total`.
+- **Delivery SLO / alerting guidance**: treat notification delivery as a best-effort side channel with a soft SLO of “≥ 99% of admitted Trigger/Resolve sends succeed within the retry budget under healthy channel endpoints.” Alert when `rate(ferrum_notification_delivery_failed_transient_total[5m])` or `failed_permanent` stays elevated, when `backpressure_dropped` is non-zero during an incident window, or when `abandoned_at_deadline` increments on shutdown/reload. Prefer paging on the underlying proxy anomaly (`prometheus_metrics` / external Alertmanager) and use these counters to detect “alerting is itself broken.”
 - **Tuning `max_concurrent_dispatches`**: default `8` is conservative — alert storms during a partial channel outage should be visible (drops trigger warnings) rather than buffered. Deployments fanning out to many channels (e.g., Slack + Teams + PagerDuty + Discord simultaneously breaching) may want to bump this to 16-32.
