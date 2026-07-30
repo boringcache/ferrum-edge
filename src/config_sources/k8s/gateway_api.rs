@@ -1119,51 +1119,29 @@ fn cross_kind_route_conflicts(entries: &[CrossKindRouteEntry]) -> Vec<GatewayApi
         }
     }
 
-    // Project the per-listener losses back onto the route's own conflict keys.
-    // Those keys carry the *literal* originating parentRef — the identity route
-    // status, materialized-parent accounting, and losing-match suppression all
-    // key on — so the loss is expressed at the finest granularity a key can
-    // express: one `(parentRef, hostname)` claim.
+    // Project a per-listener loss back onto every conflict key of the losing
+    // route. Ferrum's HTTP-family proxies are not listener scoped, so retaining
+    // a second parentRef would also retain the proxy on the listener where the
+    // route lost. Gateway API also defines this as whole-Route arbitration,
+    // rather than arbitration of individual parentRefs.
     let mut conflicts = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
-        let mut keys_by_claim: BTreeMap<(&str, &str), Vec<&GatewayApiRouteConflictKey>> =
-            BTreeMap::new();
+        // BTreeMap iteration gives a deterministic winner when a route loses
+        // to different routes on different listeners.
+        let Some(winner) = losses
+            .iter()
+            .filter(|((route_index, _), _)| *route_index == index)
+            .min_by(|((_, left), _), ((_, right), _)| left.cmp(right))
+            .map(|(_, winner)| winner.clone())
+        else {
+            continue;
+        };
         for key in &entry.keys {
-            keys_by_claim
-                .entry((key.parent_ref.as_str(), key.hostname.as_str()))
-                .or_default()
-                .push(key);
-        }
-        for ((parent_ref, hostname), keys) in keys_by_claim {
-            // One wildcard parentRef can reach several listeners while emitting
-            // a single shared conflict key, and the materialized route is
-            // port-agnostic, so a claim kept because it won on listener B would
-            // still serve traffic on listener A, where Gateway API forbids the
-            // HTTPRoute/GRPCRoute merge. The representation cannot express
-            // "accepted on B only", so the whole claim is withdrawn on the
-            // first loss.
-            //
-            // The reported winner is the accepted opposite-kind Route on the
-            // lowest-ordered listener the claim lost on. `listeners_for`
-            // returns an ordered set and per-listener arbitration is greedy
-            // over a total `(creationTimestamp, namespace, name, kind)` order,
-            // so the choice is deterministic and independent of the order the
-            // objects arrived in.
-            let listeners = entry.listeners_for(parent_ref, hostname);
-            let Some(winner) = listeners
-                .iter()
-                .find_map(|listener| losses.get(&(index, listener.clone())))
-                .cloned()
-            else {
-                continue;
-            };
-            for key in keys {
-                conflicts.push(GatewayApiRouteConflict {
-                    key: key.clone(),
-                    winner: winner.clone(),
-                    loser: entry.candidate.resource.clone(),
-                });
-            }
+            conflicts.push(GatewayApiRouteConflict {
+                key: key.clone(),
+                winner: winner.clone(),
+                loser: entry.candidate.resource.clone(),
+            });
         }
     }
     conflicts
@@ -9324,6 +9302,64 @@ mod tests {
             );
             assert!(result.config.validate_unique_listen_paths().is_ok());
         }
+    }
+
+    /// A separate allowed parentRef must not let a route retain its
+    /// port-agnostic proxy after it loses cross-kind arbitration elsewhere.
+    #[test]
+    fn a_multi_parent_route_losing_on_one_listener_is_withdrawn_whole() {
+        let gateway = cross_kind_gateway(serde_json::json!([
+            {
+                "name": "shared",
+                "port": 80,
+                "protocol": "HTTP",
+                "allowedRoutes": {
+                    "namespaces": {"from": "All"},
+                    "kinds": [{"kind": "HTTPRoute"}, {"kind": "GRPCRoute"}]
+                }
+            },
+            {
+                "name": "grpc-only",
+                "port": 8080,
+                "protocol": "HTTP",
+                "allowedRoutes": {
+                    "namespaces": {"from": "All"},
+                    "kinds": [{"kind": "GRPCRoute"}]
+                }
+            }
+        ]));
+        let http_route = cross_kind_http_route(
+            serde_json::json!({"name": "edge", "sectionName": "shared"}),
+            None,
+        );
+        let mut grpc_route = cross_kind_grpc_route(
+            serde_json::json!({"name": "edge", "sectionName": "shared"}),
+            serde_json::json!({"method": "SayHello"}),
+        );
+        grpc_route.spec["parentRefs"] = serde_json::json!([
+            {"name": "edge", "sectionName": "shared"},
+            {"name": "edge", "sectionName": "grpc-only"}
+        ]);
+
+        let result = translate_k8s_objects(&[gateway, http_route, grpc_route], options())
+            .expect("translation succeeds");
+
+        assert!(
+            !result
+                .config
+                .proxies
+                .iter()
+                .any(|proxy| proxy.backend_port == 50051),
+            "the losing multi-parent GRPCRoute must contribute no proxy"
+        );
+        assert!(
+            !result
+                .config
+                .upstreams
+                .iter()
+                .any(|upstream| upstream.targets.iter().any(|target| target.port == 50051)),
+            "the losing multi-parent GRPCRoute must contribute no upstream"
+        );
     }
 
     /// An explicit `null` is malformed operator input, not an omitted field.
