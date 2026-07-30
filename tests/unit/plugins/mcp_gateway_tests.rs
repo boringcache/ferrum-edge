@@ -3975,8 +3975,7 @@ async fn aggregate_total_catalog_outage_is_negative_cached() {
     let (_, first, _) = tools_list_with_metadata(&plugin, &session_id, 106).await;
     assert_eq!(first["error"]["code"], -32006);
     for request_id in 107..=109 {
-        let (_, cached, _) =
-            tools_list_with_metadata(&plugin, &session_id, request_id).await;
+        let (_, cached, _) = tools_list_with_metadata(&plugin, &session_id, request_id).await;
         assert_eq!(cached["error"]["code"], -32006);
     }
     assert_eq!(tool_requests.load(Ordering::SeqCst), 1);
