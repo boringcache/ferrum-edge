@@ -244,7 +244,9 @@ framing.
 > path. See **[docs/log_schema.md](log_schema.md)** for the full
 > reference, including the per-plugin caveats (statsd's tag-name
 > mapping, Kafka partition keys, Loki labels, WebSocket-disconnect
-> entries).
+> entries). `api_chargeback`, `api_chargeback_sink`, and
+> `transaction_debugger` accept the same contract against their own
+> record families.
 
 ### `stdout_logging`
 
@@ -1538,10 +1540,14 @@ WebSocket upgrades produce the ordinary HTTP handshake transaction diagnostic an
 | `max_request_body_bytes` | Integer | `1024` | Request capture budget in bytes (1–8192). Requires `log_request_body: true` |
 | `max_response_body_bytes` | Integer | `1024` | Response capture budget in bytes (1–8192). Requires `log_response_body: true` |
 | `redacted_body_fields` | String[] | `[]` | Additional body field names (case-insensitive, ≤128 chars) to redact. Requires one of the capture switches |
+| `schema` | Object | *(none)* | Inline projection for the terminal diagnostic records (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref` |
+| `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
 **Built-in redacted headers**: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `api-key`, `x-api-key`, `x-goog-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, `www-authenticate`, `x-forwarded-authorization`
 
-The configuration object is closed: any key outside the table above is rejected. `schema` and `schema_ref` retain their specialized unsupported-schema error. Capture budgets outside `1..=8192` are rejected rather than clamped, `null` is rejected for every field, and a budget or `redacted_body_fields` without its capture switch is rejected as inert configuration.
+The configuration object is closed: any key outside the table above is rejected. Capture budgets outside `1..=8192` are rejected rather than clamped, `null` is rejected for every field, and a budget or `redacted_body_fields` without its capture switch is rejected as inert configuration.
+
+`schema` / `schema_ref` project the terminal diagnostic records emitted on the `transaction_debug` target. The field inventory is this plugin's own — `outcome`, `method`, `path`, `status`, `rejection_phase`, `latency_plugin_ms`, `latency_gw_overhead_ms`, `metadata`, and the rest of the names in the default records — not the transaction-summary names, so a summary-only name such as `request_user_agent` is rejected with a field-specific diagnostic. With a schema configured the plugin emits one `record` field carrying the projected JSON document instead of the individual `tracing` fields; with none configured the default records are byte-for-byte unchanged. Body capture samples are never part of the projection. See [docs/log_schema.md](log_schema.md).
 
 ### `correlation_id`
 
@@ -1787,6 +1793,8 @@ are HTTP/gRPC only).
 | `cleanup_interval_seconds` | Integer | `300` | How often (seconds) a background task evicts entries idle longer than `stale_entry_ttl_seconds`. Set to `0` to disable the periodic cleanup task. Process-global: every enabled instance must use the same value. Reloading updates, disables, or re-enables the singleton task without retaining the prior interval |
 | `max_entries` | Integer | `100000` | Hard ceiling on retained billing rows (complete registry entry keys) in the shared registry. One principal can occupy many slots because keys also include proxy, status, protocol family, currency, namespace, and prices. A new row beyond the ceiling is folded into the internal `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1` aggregate row instead of being dropped (per-identity attribution lost; invoice totals preserved). Must be `> 0` — there is no unlimited mode. Process-global: every enabled instance must use the same value |
 | `max_retained_bytes` | Integer | `67108864` | Hard ceiling on estimated retained registry bytes, covering ordinary billing rows and aggregate overflow rows together. Must be `> 0`. Process-global: every enabled instance must use the same value |
+| `schema` | Object | *(none)* | Inline projection for the `/charges` per-proxy billing row (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref`. Process-global: every enabled instance must resolve to the same projection |
+| `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
 **Admin endpoint:** `GET /charges` requires a valid admin JWT in
 `Authorization: Bearer <token>`. Chargeback output can contain customer and
@@ -1874,7 +1882,18 @@ status with aggregate totals), and process-wide aggregate Prometheus metrics
 under `/metrics`. See
 [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) for DDL,
 configuration, OpenAPI/runtime admission layers, spool sizing, replay, the
-ownership/claim protocol, and reconciliation guidance. Each spool is partitioned
+ownership/claim protocol, and reconciliation guidance.
+
+`schema` / `schema_ref` project the exported charge-event record — the
+JSONEachRow row delivered to ClickHouse and the durable spool artifact that
+replays it. Renaming a field renames the column the row inserts into, so the
+target table must agree — including its sort key, which is what makes replay
+idempotent (see [docs/log_schema.md](log_schema.md)). `summary_type`,
+`timestamp_format`, the `metadata`
+policy, and the `backend_host` derived kind are rejected for this surface.
+Pricing, accumulator identities, and snapshot keys are unaffected. See [docs/log_schema.md](log_schema.md).
+
+Each spool is partitioned
 by a non-secret owner identity (plugin config id, Ferrum namespace/ledger,
 ClickHouse endpoint/database/table, node id), so sibling instances can never
 replay, delete, or dead-letter each other's billing records. Set
@@ -2374,9 +2393,44 @@ Non-loopback plaintext `ldap://` endpoints are rejected by default because LDAP 
 
 Validates WS-Security headers in SOAP XML envelopes. Supports UsernameToken authentication (PasswordText and PasswordDigest), X.509 certificate signature verification, SAML 2.0 assertion validation with XMLDSIG signature verification, timestamp freshness checks, and nonce replay protection.
 
-The plugin buffers request bodies with SOAP content types (`text/xml`, `application/soap+xml`, `application/xml`) as raw bytes and decodes supported XML character encodings before parsing the `wsse:Security` header. Supported encodings are UTF-8 and UTF-16 (little- and big-endian). Encoding is resolved from an optional BOM and the `Content-Type` `charset` parameter; a BOM, charset, and XML declaration must agree, `charset=utf-16` without an endian BOM is rejected as ambiguous, and malformed or truncated byte sequences fail closed. Unsupported charsets return HTTP `415`; conflicting or malformed encodings return HTTP `415`/`400` respectively. Diagnostics never log the request body or credentials. The original wire bytes are forwarded unchanged to the backend so signature and representation semantics stay intact. Non-SOAP requests pass through untouched.
+The plugin buffers governed SOAP request bodies as raw bytes and decodes supported XML character encodings before parsing the `wsse:Security` header. Supported encodings are UTF-8 and UTF-16 (little- and big-endian). Encoding is resolved from an optional BOM and the `Content-Type` `charset` parameter; a BOM, charset, and XML declaration must agree, `charset=utf-16` without an endian BOM is rejected as ambiguous, and malformed or truncated byte sequences fail closed. Unsupported charsets return HTTP `415`; conflicting or malformed encodings return HTTP `415`/`400` respectively. Diagnostics never log the request body or credentials. The original wire bytes are forwarded unchanged to the backend so signature and representation semantics stay intact.
 
-When a co-located `compression` plugin has `decompress_request: true`, configured gzip/Brotli request decoding runs in the shared pre-`before_proxy` body-normalization phase so this plugin validates the same size-bounded plaintext the backend receives. Malformed or over-limit compressed bodies are rejected before WS-Security runs; `Content-Encoding` / stale `Content-Length` are stripped only after successful decode.
+#### Which requests are governed
+
+Media types are parsed **structurally** — `type/subtype` plus RFC 9110 parameters — and matched by exact essence. They are never substring-matched: a `multipart/form-data; boundary=application/xml` request is not a SOAP request, and a SOAP envelope labelled `application/octet-stream` is not exempt from policy.
+
+| `content_type.mode` | Behaviour |
+|---|---|
+| `strict` *(default)* | Every request on this proxy is a governed SOAP request. A missing Content-Type returns `415`, an unsupported media type returns `415`, and a malformed one returns `400` — all before backend dispatch. |
+| `mixed_route` | Only requests whose media type is a recognized SOAP representation are governed; everything else passes through the SOAP policy. This is the explicit opt-out for proxies that intentionally serve mixed traffic. A malformed media-type label still fails closed in this mode, because an unparsable label cannot be proven non-SOAP. With an identity-establishing configuration the pass-through still reaches the authentication chain and is answered `401` — see [Phase, identity, and composition](#phase-identity-and-composition). |
+
+Recognized SOAP representations are `text/xml` (SOAP 1.1), `application/soap+xml` (SOAP 1.2), `application/xml`, `application/xop+xml`, and MTOM/XOP `multipart/related` whose `type` parameter names one of the XOP/SOAP root essences. For MTOM the gateway locates the root part (by `start`, else the first part), validates **that part's** envelope, and never reads, decodes, or validates attachment payloads. Set `content_type.allow_mtom: false` to declare that this route does not accept MTOM at all; a SOAP-bearing multipart then returns `415` instead of streaming past the policy.
+
+**MTOM package framing is strict, because the parser decides which bytes are the envelope.** Any package shape a conforming backend parser would frame differently is a gateway/backend representation split, so it fails closed rather than being resolved by a rule the backend need not share. The whole package is framed and every part parsed *before* a root is selected, so no ambiguity later in the package is missed by an early return. Specifically:
+
+- Boundary delimiter *lines* are recognized only at the start of the body or immediately after a CRLF, with exact CRLF framing and no RFC 2046 transport padding. A `--boundary` sequence anywhere else — in the preamble, in a header value, inside an attachment payload, inside the envelope itself — is payload, exactly as it is for a conforming parser.
+- Exactly one close-delimiter (`--boundary--`) must be present, and the epilogue after it must not contain the boundary token at all.
+- Part headers must be US-ASCII with exact CRLF line endings, must not use obsolete folded continuation lines, must be well-formed `token: value` pairs, and may carry at most one `Content-Type`, one `Content-ID`, and one `Content-Transfer-Encoding` each.
+- `Content-ID` values must be unique across the package (RFC 2387) and must not be blank. When `start` is supplied, exactly one part may match it.
+- The root part must itself declare a SOAP/XOP essence and must not declare a re-encoding `Content-Transfer-Encoding` (anything other than `7bit`/`8bit`/`binary`).
+- Bounds are fail-closed: at most 64 parts, at most 8 KiB and 32 lines of headers per part, and a ceiling on boundary-shaped candidates examined per package.
+
+**X.509 signatures and MTOM/XOP are mutually exclusive.** Ferrum implements no WS-Security attachment-signature transform, so for a XOP representation the digest it verifies covers the `xop:Include` element rather than the attachment octets that element stands for — an attacker-selected attachment present during validation would never be detected. When `x509_signature.enabled` is `true`, MTOM/XOP `multipart/related` **and** bare `application/xop+xml` are therefore refused with `415` before dispatch, and an explicit `content_type.allow_mtom: true` alongside an enabled `x509_signature` is refused at config admission. `username_token` and `saml` keep accepting MTOM/XOP: those mechanisms authenticate *who sent the message*, and neither claims integrity over attachment octets.
+
+#### Phase, identity, and composition
+
+A configuration that establishes a principal — `username_token`, `x509_signature`, or `saml` — is an **authentication plugin**. It buffers the body before the authenticate phase, validates the message there, and publishes the SOAP principal as `RequestContext.authenticated_identity` together with a namespace-correct `identified_consumer` (a Consumer is matched by identity only when it belongs to the matched proxy's namespace). `access_control`, consumer-scoped `rate_limiting`, logging, retries, and chargeback therefore all observe one authoritative SOAP identity instead of running before it exists. The published principal is the UsernameToken username, the SAML Subject `NameID`, or — for an X.509-only policy — the stable string `x509:sha256:<lowercase-hex-fingerprint>` of the matched trusted certificate; register that string as a Consumer username/id to map it.
+
+A **timestamp-only** configuration proves freshness and nothing about the caller. It establishes no principal, is not an authentication plugin (so it never turns an ordinary request into "Authentication required"), and keeps validating in `before_proxy`. The two phases are selected by configuration and never both run, so a message is never validated twice.
+
+Because authentication now precedes the shared buffered-body normalization phase, two compositions are rejected at config admission (file-mode startup fails, Admin validation returns `400`, a DP/reload keeps the last known good generation):
+
+- An identity-establishing instance alongside any other authentication plugin (including a second identity-establishing `soap_ws_security` instance), in either auth mode. Both modes stop after the first mechanism establishes an identity; single-auth also makes the first rejection terminal, while multi-auth can let a later success override an earlier rejection. Any of those outcomes can skip or ignore a mandatory WS-Security message gate. Disable the other authentication mechanisms on that proxy.
+- An identity-establishing instance alongside `compression` with `decompress_request: true`. The gateway would validate the encoded bytes rather than the plaintext the backend parses. Decompress upstream, or disable `decompress_request` on that proxy.
+
+As a runtime backstop for every other transform (including custom plugins), an identity-establishing instance records the SHA-256 of the exact validated representation and re-checks it in `on_final_request_body` before backend dispatch; a message whose bytes changed after validation is refused with `500` rather than forwarded. A timestamp-only instance does **not** bind the representation: it authenticates nobody, claims no integrity over the Body, and runs in `before_proxy` rather than ahead of body normalization, so it stays composable with request-body transformers such as `request_transformer` body rules.
+
+**Both `mixed_route` and `reject_missing_security_header: false` still reach the authentication chain.** An identity-establishing instance is the proxy's *sole* authentication mechanism, so a request it passes through — a non-SOAP media type on a `mixed_route` proxy, or a governed envelope carrying no `wsse:Security` header under `reject_missing_security_header: false` — leaves the chain with no identity and is answered with `401 {"error":"Authentication required"}` rather than forwarded anonymously. Both options remain pass-throughs for the *SOAP policy*, not for the proxy: use them with a timestamp-only instance, or put anonymous and SOAP-authenticated traffic on separate proxies.
 
 > **XMLDSIG canonicalization support.** Both the WS-Security X.509 and SAML signature paths apply Exclusive XML Canonicalization (`xml-exc-c14n#`) to `<SignedInfo>` and referenced elements, including `InclusiveNamespaces PrefixList`. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n. Unsupported canonicalization or transform algorithms fail closed; inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported.
 
@@ -2384,7 +2438,9 @@ When a co-located `compression` plugin has `decompress_request: true`, configure
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `reject_missing_security_header` | bool | `true` | Reject SOAP requests that lack a WS-Security header |
+| `reject_missing_security_header` | bool | `true` | Reject SOAP requests that lack a WS-Security header. This governs an *absent header only*: on a governed representation, malformed XML, unsupported or ambiguous envelope structure, and XML parsing-budget failures always reject with `400` regardless of this setting |
+| `content_type.mode` | String | `strict` | `strict` (every request on this proxy is governed) or `mixed_route` (only recognized SOAP media types are governed) |
+| `content_type.allow_mtom` | bool | `true` | Accept MTOM/XOP `multipart/related` packaging and validate its SOAP root part. `false` rejects SOAP-bearing multipart with `415`. Must not be explicitly `true` when `x509_signature.enabled` is `true` (refused at admission); XOP representations are refused with `415` under an enabled `x509_signature` regardless |
 | `timestamp.require` | bool | `true` | Require a `wsu:Timestamp` element in the Security header. Controls whether the element may be *absent*; a Timestamp that **is** present is always validated |
 | `timestamp.max_age_seconds` | u64 | `300` | Maximum age of the `Created` timestamp before rejection (`1`–`86400`) |
 | `timestamp.require_expires` | bool | `false` | Require an `Expires` element in the Timestamp |
@@ -2400,15 +2456,18 @@ When a co-located `compression` plugin has `decompress_request: true`, configure
 | `x509_signature.trusted_certs` | String[] | `[]` | PEM file paths of trusted signing certificates |
 | `x509_signature.allowed_algorithms` | String[] | `["rsa-sha256"]` | Allowed signature algorithms (`rsa-sha256`, `rsa-sha1`) |
 | `x509_signature.allowed_digest_algorithms` | String[] | `["sha256"]` | Allowed Reference digest algorithms (`sha256`, `sha1`). Independent of `allowed_algorithms` |
-| `x509_signature.require_signed_timestamp` | bool | `true` | Require the Timestamp to be included in the signature |
+| `x509_signature.require_signed_timestamp` | bool | `true` | Require a `wsu:Timestamp` to be present **and** covered by the signature. Requires `timestamp.require: true`; the contradictory pairing is rejected at admission |
 | `saml.enabled` | bool | `false` | Enable SAML 2.0 assertion validation (XMLDSIG signature-first) |
 | `saml.trusted_issuers` | String[] | `[]` | Trusted SAML Issuer URIs (required when enabled) |
 | `saml.trusted_signing_certs` | String[] | `[]` | PEM file paths of trusted IdP signing certs, matched by SHA-256 fingerprint (required when enabled) |
 | `saml.allowed_signature_algorithms` | String[] | `["rsa-sha256"]` | Allowed SAML signature algorithms (`rsa-sha256`, `rsa-sha1`) |
 | `saml.allowed_digest_algorithms` | String[] | `["sha256"]` | Allowed SAML Reference digest algorithms (`sha256`, `sha1`). Independent of `allowed_signature_algorithms` |
-| `saml.audience` | String | *(none)* | Optional SAML AudienceRestriction value (non-empty string when present) |
+| `saml.audience` | String | *(required when enabled)* | Service-specific `AudienceRestriction/Audience` value every accepted assertion must name |
+| `saml.recipient` | String | *(required when enabled)* | Service-specific `SubjectConfirmationData/@Recipient` value every accepted assertion must name |
+| `saml.max_assertion_lifetime_seconds` | u64 | `300` | Maximum permitted `Conditions/@NotOnOrAfter − @NotBefore` span (`1`–`86400`). Both instants are mandatory |
+| `saml.allowed_subject_confirmation_methods` | String[] | `["urn:oasis:names:tc:SAML:2.0:cm:bearer"]` | Accepted `SubjectConfirmation/@Method` URIs. Only `bearer` is implemented; `holder-of-key` is rejected at admission because the confirmation key is not bound to the message signature |
 | `saml.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for SAML `NotBefore` / `NotOnOrAfter` (`0`–`3600`) |
-| `nonce.replay_scope` | String | *(required for PasswordDigest)* | `process` or `shared`. No default — see [PasswordDigest replay scope](#passworddigest-replay-scope) |
+| `nonce.replay_scope` | String | *(required for PasswordDigest and for SAML)* | `process` or `shared`. No default — see [PasswordDigest replay scope](#passworddigest-replay-scope) |
 | `nonce.max_cache_size` | u64 | `100000` | Maximum retained nonce cache entries; a full cache of unexpired nonces rejects new claims rather than evicting them (`1`–`1000000`) |
 | `nonce.max_encoded_length` | u64 | `512` | Maximum encoded `wsse:Nonce` length, checked before Base64 decoding (`16`–`4096`) |
 | `nonce.max_total_cache_bytes` | u64 | `67108864` | Maximum total retained nonce-key UTF-8 payload bytes, counted once per shared immutable key allocation; must be ≥ `nonce.max_encoded_length` (`4096`–`1073741824`) |
@@ -2428,6 +2487,44 @@ The root object and every nested fixed-shape object (`timestamp`, `username_toke
 Because construction now returns an error for these inputs, the plugin's `FailClosed` registration takes effect: file-mode startup fails, Admin validation returns HTTP `400`, and a DP/reload keeps the last known good generation instead of quietly enforcing a weaker policy.
 
 UsernameToken credential failures (unknown username, wrong PasswordText, or wrong PasswordDigest) return the same HTTP `401` status, headers, and generic body (`{"error":"WS-Security: invalid credentials"}`). Client responses and warning logs do not include the supplied username or password/digest verification detail; operational telemetry uses the stable failure class `username_token_invalid_credentials`. Lookup misses still execute PasswordText or PasswordDigest verification against process-local dummy material so work is equalized with known principals. Structural token or policy failures (missing elements, password-type mismatch, nonce replay) remain distinct. Apply an authentication rate-limit policy as defense in depth against online guessing.
+
+#### Signature ordering and XML work bounds
+
+Both signature paths settle **trust before work**. The presented certificate's SHA-256 fingerprint must match configured trust material, and `SignatureValue` must verify over the canonicalized `SignedInfo`, before a single attacker-selected `<Reference>` is resolved, canonicalized, or digested. Trust is a fixed-size comparison and `SignedInfo` is a small bounded subtree, so an untrusted or forged signature is refused after constant work regardless of how the References are shaped.
+
+On top of that ordering:
+
+- Duplicate Reference URIs are rejected. The X.509 Reference ceiling is **8**; SAML accepts exactly one Reference, targeting the enclosing assertion's own id.
+- One bounded id index is built per message after the structure is settled, replacing a full-envelope scan per Reference. The independent raw start-tag scan is likewise a single pass covering every referenced id at once.
+- Every canonicalization is charged against an aggregate per-message byte budget of `2 × decoded body length` (floor 64 KiB), counting both the source subtree walked and the canonical bytes emitted. An over-budget message is refused before the work is done.
+
+#### X.509 must protect the backend-visible Body
+
+Structural selection is namespace-qualified and positional, not by local name:
+
+- Exactly one SOAP `Envelope` in a known envelope namespace (SOAP 1.1 or 1.2) as the document root, with at most one `Header` and exactly one `Body` as its direct children **in that same namespace** and in that order. No other element may be a direct child of `Envelope`.
+- Exactly one `wsse:Security` header targeting this receiver — no `actor`/`role`, or `next`/`ultimateReceiver` — as a direct child of that `Header`. Headers addressed to another intermediary are left alone; two targeting this receiver is an error.
+- A second namespace-correct `Envelope`/`Header`/`Body` anywhere in the document, or a `wsse:Security` anywhere outside the `Header`, is rejected. Those are the wrapping shapes that make the gateway and a tolerant backend resolve different elements.
+
+When `x509_signature.enabled` is true, a valid signature is **not sufficient**: a Reference must resolve uniquely to the namespace-correct `Body` the backend will consume. A trusted signature covering only the Timestamp no longer authorizes a rewritten operation. Referenced elements must also resolve inside the Security header or inside that Body, and a referenced id must be unique under both the entity-decoded DOM view and the raw start-tag scan, which covers `wsu:Id`, any prefixed `Id`, bare `Id`, `xml:id`, `ID`, and `id`.
+
+`x509_signature.require_signed_timestamp: true` (the default) now **rejects a message with no Timestamp** rather than passing vacuously, and pairing it with `timestamp.require: false` is refused at admission as a contradiction.
+
+#### SAML assertions are bearer values
+
+A signed assertion carries nothing that changes between presentations, and the outer WS-Security Timestamp it travels beside is not covered by its signature — so an attacker can remint that Timestamp and replay the assertion indefinitely. Accepting one therefore requires all of the following, in order, after signature verification and issuer trust:
+
+1. **Bounded validity.** `Conditions` is mandatory, and so are both `NotBefore` and `NotOnOrAfter`. The window must be non-empty and no wider than `saml.max_assertion_lifetime_seconds`, and the current instant must fall inside it (± `saml.clock_skew_seconds`).
+2. **Service audience.** At least one `AudienceRestriction` must be present, and **every** `AudienceRestriction` must name `saml.audience` — each one is a conjunct, so a second restriction naming only another relying party invalidates the assertion here.
+3. **Supported subject confirmation.** Exactly one `SubjectConfirmation` whose `Method` is in `saml.allowed_subject_confirmation_methods` must be acceptable. Its `SubjectConfirmationData` must name `saml.recipient` as `Recipient`, carry its own `NotOnOrAfter` (honoured with skew), honour `NotBefore` when present, and **omit** `InResponseTo` — there is no SAML request in a WS-Security bearer flow to correlate one against, and a value the gateway cannot check must not be silently ignored.
+4. **Authoritative principal.** Exactly one namespace-correct, nonblank Subject `NameID` must resolve before replay state is consumed. An otherwise valid assertion that authenticates nobody fails with `401` without burning its assertion id.
+5. **Single use.** The assertion id, bound to its issuer, is claimed atomically in the scope declared by `nonce.replay_scope`, which is therefore **required whenever `saml.enabled` is true**. `OneTimeUse` needs no special case because every accepted assertion is claimed exactly once; a replay backend outage fails closed like every other replay decision.
+
+Assertion claims are retained for the same fixed **93 601-second** horizon as PasswordDigest nonces, which provably dominates `max_assertion_lifetime_seconds` (86400) + 2 × `clock_skew_seconds` (3600) — the widest span any admissible SAML policy can accept one unchanged assertion over. No reload generation can therefore expire a claim while a later generation would still accept the assertion.
+
+**Cross-replica scope is exactly what you declare.** `process` is a single-replica assertion and makes **no** cross-replica claim: with more than one replica, one captured assertion can be spent once per replica. Multi-replica SAML deployments must use `replay_scope: shared` with `sync_mode: "redis"`. Shared claim keys are `SHA-256("…|issuer\0assertion-id")` in lowercase hex — never the issuer or the assertion id — so no credential-adjacent value reaches a Redis keyspace, `MONITOR`, `SLOWLOG`, or the Redis client's error logs.
+
+Rejections never echo the issuer, audience, recipient, subject, assertion id, or any assertion text node; every SAML rejection logs the fixed failure class `saml` with no assertion content. Client bodies do name the *reason* for the rejection, and for the unsupported-algorithm / unsupported-transform / unbound-prefix classes that reason includes the rejected algorithm URI, element name, or namespace prefix taken from the caller's own signature block — attacker-supplied structural labels, never credential-adjacent values.
 
 #### UsernameToken — PasswordDigest
 
@@ -2473,13 +2570,13 @@ max created_max_age_seconds (86400) + 2 × max created_clock_skew_seconds (3600)
 - `nonce.cache_ttl_seconds` **has been removed**. It could no longer shorten effective retention, and an accepted-but-inert knob would misdescribe the guarantee, so it is rejected as an unknown key rather than silently ignored. Per the build-out policy there is no compatibility shim: a PasswordDigest policy that still sets it must drop the key before the generation is accepted.
 - A `PasswordText` or timestamp-only policy never populates replay state, so none of this costs it anything.
 
-**Sizing.** The cost is paid in capacity, not in security. Under `replay_scope: process`, size `nonce.max_cache_size` / `nonce.max_total_cache_bytes` for peak authenticated PasswordDigest rate × 93 601 s. The defaults (`100000` entries / `67108864` bytes) sustain roughly **1 authenticated PasswordDigest request per second**; the `1000000`-entry ceiling sustains roughly **10 per second**. A higher sustained rate needs `replay_scope: shared`, where retention is Redis's memory cost rather than the gateway's. Under-provisioning surfaces as fail-closed `401` rejections — never as a silent replay window, because a live claim is never evicted to make room.
+**Sizing.** The cost is paid in capacity, not in security. Under `replay_scope: process`, size `nonce.max_cache_size` / `nonce.max_total_cache_bytes` for peak authenticated PasswordDigest rate × 93 601 s — plus peak accepted SAML assertion rate when `saml.enabled` is true, because accepted assertion-id claims share the same bounded process map for the same horizon (each charges a fixed 64-byte SHA-256 hex claim key). The defaults (`100000` entries / `67108864` bytes) sustain roughly **1 authenticated PasswordDigest request per second**; the `1000000`-entry ceiling sustains roughly **10 per second**. A higher sustained rate needs `replay_scope: shared`, where retention is Redis's memory cost rather than the gateway's. Under-provisioning surfaces as fail-closed `401` rejections — never as a silent replay window, because a live claim is never evicted to make room.
 
 **Across reload generations and replicas.** Every generation, in either scope, expires entries against the same constant, so no generation can expire, refresh, or under-protect another's claim in either direction. Under `shared`, `SET NX` declining to rewrite an existing key's TTL is now exactly correct rather than a limitation: whichever replica or generation wrote that key already gave it the full horizon.
 
 #### PasswordDigest replay scope
 
-`nonce.replay_scope` is **required** whenever `username_token.enabled` is true and `password_type` is `PasswordDigest`, and it has no default. A gateway cannot observe how many replicas serve a proxy, so the deployment shape is an explicit operator declaration rather than a silent assumption:
+`nonce.replay_scope` is **required** whenever `username_token.enabled` is true and `password_type` is `PasswordDigest`, and whenever `saml.enabled` is true. It has no default. A gateway cannot observe how many replicas serve a proxy, so the deployment shape is an explicit operator declaration rather than a silent assumption:
 
 | Value | Guarantee | Requirements |
 |---|---|---|
@@ -2504,7 +2601,7 @@ Replay state is bounded and only ever populated by a caller that has already pro
 - The encoded `wsse:Nonce` is length-checked against `nonce.max_encoded_length` **before** Base64 decoding, so an oversized nonce is never decoded and never retained.
 - One canonical (trimmed) form feeds both the digest input and the replay-cache key, so the two derivations cannot drift apart.
 - A nonce is inserted only *after* its PasswordDigest verifies, so an unknown user or a wrong password cannot poison or evict a victim's replay entry.
-- The cache is capped on entries (`nonce.max_cache_size`) and on retained key UTF-8 payload bytes (`nonce.max_total_cache_bytes`). Each logical nonce has one immutable string allocation shared by the expected-O(1) lookup map and an exact `BTreeMap` age index; the byte cap counts that payload once, while hash/tree node and reference-count control-block overhead is bounded by the entry cap.
+- The cache is capped on entries (`nonce.max_cache_size`) and on retained key UTF-8 payload bytes (`nonce.max_total_cache_bytes`). Each logical nonce has one immutable string allocation shared by the expected-O(1) lookup map and an exact `BTreeMap` age index; the byte cap counts that payload once, while hash/tree node and reference-count control-block overhead is bounded by the entry cap. Accepted SAML assertion-id claims live in the same map under a separate internal claim-kind namespace — so an attacker-chosen nonce can never burn an assertion claim or the reverse — and count against both caps; the internal namespacing prefix itself is not charged.
 - **A claimed nonce is never evicted while it is still inside its retention window.** At either cap the age index is walked from its oldest end and only entries *proven expired* are reclaimed; the walk stops at the first still-live entry, because everything newer is live too. There is no forced eviction of live entries, no lookup-map scan, and no stale FIFO. Reclamation is charged against an explicit 64-entry maintenance budget per request (independent of `max_cache_size`), which keeps per-request work constant while the two hard caps keep memory bounded.
 - **Capacity exhaustion fails closed.** When bounded expiry reclamation cannot free both entry and byte room — or the maintenance budget runs out, or state is poisoned/inconsistent, or checked accounting fails — the request is rejected with HTTP `401` and the nonce is *not* recorded. Replay protection degrades into refusal, never into silently unprotecting an already-claimed nonce. A rejected claim never removes a live entry; any expired entries already reclaimed within the bounded budget stay removed, allowing safe retries to converge after enough state has expired. Size `nonce.max_cache_size` and `nonce.max_total_cache_bytes` for peak authenticated PasswordDigest rate × the fixed 93 601-second retention horizon; under-provisioning them now surfaces as `401` rejections rather than as a quiet replay window.
 - Entry/byte admission, expiry reclamation, and accounting share one narrow mutex held only for those security-state updates (encoded-length checks and all credential/XML/base64/crypto work stay outside), so concurrent PasswordDigest claims cannot overshoot either hard cap and exactly one concurrent claim of the same nonce can win — including same-key races, where an in-TTL hit is a replay without a new reservation.
@@ -2601,11 +2698,13 @@ The plugin cryptographically verifies the SAML assertion's `<Signature>` element
 
 1. Locate `<Signature>` inside the assertion (`401` if absent). The plugin also rejects requests carrying more than one `<Assertion>` inside the WS-Security block.
 2. Resolve the signing algorithm and confirm it is in `allowed_signature_algorithms`.
-3. Verify each `<Reference>` digest against the assertion with its own `<Signature>` element removed (XMLDSIG enveloped-signature transform). The digest algorithm must be in `allowed_digest_algorithms`. At least one Reference must target the enclosing Assertion ID.
-4. Match the signing certificate from `KeyInfo/X509Data/X509Certificate` against `trusted_signing_certs` by SHA-256 fingerprint of the full DER. This is leaf-cert trust — operators supply the IdP's actual signing certificate(s) as published in IdP metadata, not a CA.
-5. Verify `<SignatureValue>` over the `<SignedInfo>` bytes using the matched cert's RSA public key.
-6. Validate `Issuer` (must match one of `trusted_issuers`), `NotBefore` / `NotOnOrAfter` (with `clock_skew_seconds` tolerance), and `Audience` (when `audience` is configured).
-7. Extract the Subject `NameID` into `ctx.metadata["soap_ws_saml_subject"]` so downstream plugins (ACL, rate limiting, logging) can consume the SAML identity.
+3. Match the signing certificate from `KeyInfo/X509Data/X509Certificate` against `trusted_signing_certs` by SHA-256 fingerprint of the full DER. This is leaf-cert trust — operators supply the IdP's actual signing certificate(s) as published in IdP metadata, not a CA.
+4. Verify `<SignatureValue>` over the canonicalized `<SignedInfo>` bytes using the matched cert's RSA public key.
+5. **Only then** verify the single `<Reference>` digest against the assertion with its own `<Signature>` element removed (XMLDSIG enveloped-signature transform). The digest algorithm must be in `allowed_digest_algorithms`, and the Reference must target the enclosing Assertion ID.
+6. Validate `Issuer` (must match one of `trusted_issuers`), the mandatory bounded `Conditions` window, the service `Audience`, and the `SubjectConfirmation` / `Recipient` binding — see [SAML assertions are bearer values](#saml-assertions-are-bearer-values).
+7. Resolve exactly one namespace-correct, nonblank Subject `NameID`. An enabled SAML policy is an authentication plugin whose principal *is* the `NameID`, so an assertion that satisfies every binding but names nobody is rejected with `401` — **before** step 8, so a principal-less assertion consumes no replay state and cannot spend a legitimate assertion's id. An absent, blank, or duplicated `NameID` all fail closed.
+8. Claim the assertion id for single use in the declared `nonce.replay_scope`.
+9. Publish that Subject `NameID` as the request principal (`authenticated_identity`, plus a namespace-correct `identified_consumer`) and mirror it into `ctx.metadata["soap_ws_saml_subject"]`.
 
 ```yaml
 plugin_name: soap_ws_security
@@ -2621,12 +2720,18 @@ config:
     allowed_digest_algorithms:
       - sha256
     audience: https://my-service.example.com
+    recipient: https://my-service.example.com/ws
+    max_assertion_lifetime_seconds: 300
     clock_skew_seconds: 300
+  nonce:
+    # Required for SAML: assertion ids are claimed for single use.
+    # Use `shared` (with sync_mode: redis) for more than one replica.
+    replay_scope: process
   timestamp:
     require: true
 ```
 
-Both `trusted_issuers` and `trusted_signing_certs` are required when `saml.enabled: true`. A missing or unreadable signing cert is a fatal startup error. Rotating an IdP signing cert requires updating `trusted_signing_certs` and restarting the gateway (no live reload). `allowed_signature_algorithms` and `allowed_digest_algorithms` are independent — the defaults reject SHA-1 in either position; add `rsa-sha1` / `sha1` only to interoperate with legacy IdPs.
+`trusted_issuers`, `trusted_signing_certs`, `audience`, `recipient`, and `nonce.replay_scope` are all required when `saml.enabled: true`. A missing or unreadable signing cert is a fatal startup error. Rotating an IdP signing cert requires updating `trusted_signing_certs` and restarting the gateway (no live reload). `allowed_signature_algorithms` and `allowed_digest_algorithms` are independent — the defaults reject SHA-1 in either position; add `rsa-sha1` / `sha1` only to interoperate with legacy IdPs.
 
 #### Combined Configuration
 
@@ -2660,7 +2765,7 @@ config:
 
 **Metadata:** On successful UsernameToken authentication, the plugin sets `ctx.metadata["soap_ws_username"]` to the authenticated username. On successful SAML assertion validation, it sets `ctx.metadata["soap_ws_saml_subject"]` to the Subject `NameID`. Both are available to downstream plugins and logging.
 
-**Namespace prefix agnostic:** The plugin matches XML elements by local name, so it works regardless of namespace prefix conventions (`wsse:`, `WSSE:`, `sec:`, `soap:`, `s:`, etc.).
+**Namespace prefix agnostic, namespace URI strict:** Element *prefixes* are irrelevant (`wsse:`, `WSSE:`, `sec:`, `soap:`, `s:` all work), but element *namespace URIs* are enforced. `Envelope`/`Header`/`Body` must be in a SOAP envelope namespace, `Security`/`UsernameToken`/`Username`/`Password`/`Nonce`/`BinarySecurityToken` in the WS-Security secext namespace, `Timestamp`/`Created`/`Expires`/`wsu:Id` in the WS-Security utility namespace, `Signature`/`SignedInfo`/`Reference`/`Transforms`/`KeyInfo` in the XMLDSIG namespace, and `Assertion`/`Issuer`/`Conditions`/`Subject`/`SubjectConfirmation`/`NameID` in the SAML 2.0 assertion namespace. An element that merely shares a local name is not a candidate.
 
 ---
 
@@ -3847,7 +3952,7 @@ Gzip and Brotli codec CPU (request decode and response encode) runs on a bounded
 - Removes `Content-Length` after compression (the gateway recalculates it from the compressed body)
 - After an actual compression body transform, the shared body-transform lifecycle removes representation-integrity metadata that described the uncompressed origin bytes — `Content-Digest`, `Repr-Digest`, legacy `Digest`, and `Content-MD5` (case-insensitive), along with other content-bound validators such as weak `ETag` / `Last-Modified`. Those fields are preserved when compression is skipped, negotiation declines, the body is ineligible, or the transform returns `None`. Gateway `Content-Encoding` and `Vary: Accept-Encoding` remain. On buffered H1/H2/H3 paths, trailer integrity fields are handled the same way as other stale application trailers after a rewrite: native H3 drops backend trailers once the body is rewritten, and buffered gRPC retires application trailers (including digests) while preserving reserved terminal status metadata
 - Forces response body buffering on proxies where this plugin is enabled
-- When `decompress_request` is enabled, supported gzip/brotli request coding lists are decoded in the shared pre-`before_proxy` normalization phase (H1/H2 and native H3) so earlier body consumers such as `soap_ws_security` inspect validated plaintext; the same plaintext is what later request-body hooks and the backend receive, and the forwarded request has `Content-Encoding` and `Content-Length` removed only after successful decode. OWS-tolerant ordered lists decode in reverse application order; malformed/unsupported members fail closed. On the rare buffered fallback that validates without a mutable body view, validated plaintext is staged on the request context before headers are stripped so the later transform cannot forward compressed bytes without encoding metadata
+- When `decompress_request` is enabled, supported gzip/brotli request coding lists are decoded in the shared pre-`before_proxy` normalization phase (H1/H2 and native H3) so `before_proxy` body consumers inspect validated plaintext (an identity-establishing `soap_ws_security` instance authenticates earlier still, in the `authenticate` phase, and composing the two on one proxy is rejected at admission); the same plaintext is what later request-body hooks and the backend receive, and the forwarded request has `Content-Encoding` and `Content-Length` removed only after successful decode. OWS-tolerant ordered lists decode in reverse application order; malformed/unsupported members fail closed. On the rare buffered fallback that validates without a mutable body view, validated plaintext is staged on the request context before headers are stripped so the later transform cannot forward compressed bytes without encoding metadata
 - `remove_accept_encoding` only mutates the backend request when the instance still has at least one usable response codec after process-wide gates
 - Request `Cache-Control: no-transform` skips gateway response compression but does not disable configured request decompression; client-controlled `no-transform` is not honored as an opt-out from upload normalization or body-inspection hooks
 - Strong origin `ETag` validators are preserved by skipping compression; when a weak-ETag response is compressed, the shared body-transform lifecycle removes that upstream validator because the client-visible bytes changed
