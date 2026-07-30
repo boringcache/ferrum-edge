@@ -58,7 +58,6 @@ async fn finalized_egress(
     result
 }
 
-
 struct LegacyAuthorizePlugin;
 
 #[async_trait::async_trait]

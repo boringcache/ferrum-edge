@@ -3513,9 +3513,9 @@ fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch
         .split("pub(crate) fn request_body_requirements_before_authenticate(")
         .next()
         .expect("shared final-body applicability helper must remain bounded");
-    assert!(helper.contains(
-        "terminal_dispatch |= has_finalized_request_egress && requires_buffering;"
-    ));
+    assert!(
+        helper.contains("terminal_dispatch |= has_finalized_request_egress && requires_buffering;")
+    );
 
     // HTTP/3 reaches the same boundary after its own terminal finalization.
     let h3 = include_str!("../../../src/http3/server.rs");

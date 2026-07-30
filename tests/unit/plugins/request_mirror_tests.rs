@@ -357,7 +357,11 @@ async fn max_in_flight_drop_emits_explicit_mirror_result() {
 
     let mut first = make_ctx_with_proxy_timeout(30_000);
     let mut first_headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.finalized_egress(&mut first, &mut first_headers).await);
+    plugin_utils::assert_continue(
+        plugin
+            .finalized_egress(&mut first, &mut first_headers)
+            .await,
+    );
 
     let mut dropped = make_ctx_with_proxy_timeout(30_000);
     let mut dropped_headers = HashMap::new();
@@ -1772,13 +1776,21 @@ async fn mesh_shadow_uses_rewritten_authority_and_explicit_mirror_path_wins() {
         Some("internal.example.com:8443")
     );
     plugin_utils::assert_continue(route_mirror.finalized_egress(&mut ctx, &mut headers).await);
-    plugin_utils::assert_continue(explicit_mirror.finalized_egress(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(
+        explicit_mirror
+            .finalized_egress(&mut ctx, &mut headers)
+            .await,
+    );
     assert_eq!(ctx.mirror_result_rxs.len(), 2);
 
     let mut exact_ctx = make_ctx_with_proxy();
     exact_ctx.path = "/legacy".to_string();
     let mut exact_headers = HashMap::from([("host".to_string(), "public.example.com".to_string())]);
-    plugin_utils::assert_continue(route.finalized_egress(&mut exact_ctx, &mut exact_headers).await);
+    plugin_utils::assert_continue(
+        route
+            .finalized_egress(&mut exact_ctx, &mut exact_headers)
+            .await,
+    );
     assert_eq!(
         exact_ctx.route_override_path.as_deref(),
         Some("/exact-shadow")
@@ -3473,7 +3485,11 @@ async fn retained_body_budget_drops_when_exhausted_and_releases_on_completion() 
     let mut first = make_ctx_with_proxy();
     first.request_body_bytes = Some(body.clone());
     let mut first_headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.finalized_egress(&mut first, &mut first_headers).await);
+    plugin_utils::assert_continue(
+        plugin
+            .finalized_egress(&mut first, &mut first_headers)
+            .await,
+    );
 
     // Wait until the first mirror is in-flight and holding the body lease.
     let release = tokio::time::timeout(std::time::Duration::from_secs(1), gate_rx.recv())
@@ -3488,7 +3504,11 @@ async fn retained_body_budget_drops_when_exhausted_and_releases_on_completion() 
     let mut second = make_ctx_with_proxy();
     second.request_body_bytes = Some(body);
     let mut second_headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.finalized_egress(&mut second, &mut second_headers).await);
+    plugin_utils::assert_continue(
+        plugin
+            .finalized_egress(&mut second, &mut second_headers)
+            .await,
+    );
     let dropped = second
         .collect_mirror_result()
         .await
@@ -4073,7 +4093,11 @@ async fn mirror_metrics_track_dispatch_completion_and_timeout() {
     .unwrap();
     let mut ctx2 = make_ctx_with_proxy_timeout(0);
     let mut headers2 = HashMap::new();
-    plugin_utils::assert_continue(stuck_plugin.finalized_egress(&mut ctx2, &mut headers2).await);
+    plugin_utils::assert_continue(
+        stuck_plugin
+            .finalized_egress(&mut ctx2, &mut headers2)
+            .await,
+    );
     let meta = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         ctx2.collect_mirror_result(),
@@ -5623,7 +5647,9 @@ async fn test_finalized_egress_mirrors_transformed_body_not_pretransform_metadat
     );
     let _ = ctx.collect_mirror_result().await;
 
-    let observed = rx.await.expect("mirror destination should observe a request");
+    let observed = rx
+        .await
+        .expect("mirror destination should observe a request");
     assert!(
         observed.contains("{\"keep\":\"yes\"}"),
         "mirror must replay the finalized backend-visible body, got: {observed}"

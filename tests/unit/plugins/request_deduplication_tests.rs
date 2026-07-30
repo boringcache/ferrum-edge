@@ -66,7 +66,6 @@ async fn finalized_egress(
     result
 }
 
-
 /// Stand-in for the effective static response-presentation policy digest a real
 /// request copies from its plugin-cache view. Any fixed 32-byte value works:
 /// the plugin only ever compares it for equality.

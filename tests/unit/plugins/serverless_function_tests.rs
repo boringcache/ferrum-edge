@@ -1128,9 +1128,7 @@ async fn test_terminate_mode_frames_native_grpc_unary_response() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/grpc".to_string());
 
-    let (reject_body, reject_headers) = match plugin
-        .finalized_egress(&mut ctx, &mut headers)
-        .await
+    let (reject_body, reject_headers) = match plugin.finalized_egress(&mut ctx, &mut headers).await
     {
         PluginResult::RejectBinary {
             status_code,
@@ -5565,7 +5563,11 @@ async fn test_finalized_egress_forwards_transformed_body_not_pretransform_metada
     assert!(matches!(result, PluginResult::Continue));
 
     let requests = server.received_requests().await.expect("recorded requests");
-    assert_eq!(requests.len(), 1, "the function must be invoked exactly once");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the function must be invoked exactly once"
+    );
     let payload: Value = serde_json::from_slice(&requests[0].body).expect("JSON payload");
     assert_eq!(
         payload.get("body").and_then(Value::as_str),
