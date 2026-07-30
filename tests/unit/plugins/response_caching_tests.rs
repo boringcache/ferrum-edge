@@ -2727,11 +2727,15 @@ async fn test_max_total_size_exceeded() {
     let _policy_guard = response_cache_replay_policy_guard();
     let plugin = plugin_with_config(json!({
         "max_total_size_bytes": 300,
-        "max_entry_size_bytes": 1048576
+        "max_entry_size_bytes": 1048576,
+        // Keep generated telemetry out of the entry-size fixture. With the
+        // default enabled, `x-cache-status: MISS` contributes another 18
+        // retained bytes and the first entry correctly exceeds this cap.
+        "add_cache_status_header": false
     }));
 
     // Cache a response that takes up most of the total size
-    // Each entry is ~200 bytes body + ~96 bytes overhead = ~296 bytes
+    // Each entry is 200 bytes body + 96 bytes overhead = 296 bytes.
     cache_response(&plugin, "GET", "/api/a", 200, &HashMap::new(), &[b'x'; 200]).await;
 
     // This should fail to cache (would exceed 300-byte total size)
