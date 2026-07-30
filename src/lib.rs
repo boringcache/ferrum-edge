@@ -443,11 +443,21 @@ pub mod _test_support {
 
     /// Exercise the mesh RTDS generation reconciliation boundary without
     /// widening its runtime API beyond the crate.
-    pub fn reconcile_fault_plugin_generations_for_test(
+    pub fn reconcile_runtime_overlay_plugin_generations_for_test(
         candidate: &mut crate::config::types::GatewayConfig,
         previous: &crate::config::types::GatewayConfig,
     ) {
-        crate::modes::mesh::reconcile_fault_plugin_generations(candidate, previous);
+        crate::modes::mesh::reconcile_runtime_overlay_plugin_generations(candidate, previous);
+    }
+
+    /// Bind transformer RTDS gates into a candidate config exactly as mesh slice
+    /// preparation does, so external tests exercise the production binding
+    /// rather than a reimplementation of it (GHSA-83rc-23c9-3g9x).
+    pub fn materialize_transformer_runtime_overlay_for_test(
+        config: &mut crate::config::types::GatewayConfig,
+        overlay: &crate::modes::mesh::config::MeshRuntimeOverlay,
+    ) {
+        crate::modes::mesh::materialize_transformer_runtime_overlay(config, overlay);
     }
 
     /// Return the exact proxy targets used by incremental plugin-cache staging.

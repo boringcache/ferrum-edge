@@ -1394,118 +1394,155 @@ fn test_request_transformer_overlay_gate_parsing() {
     assert_eq!(runtime_overlay::current_gates().gate("public"), None);
 }
 
+/// The gate is resolved from CONFIGURATION, not from live process-global state
+/// (GHSA-83rc-23c9-3g9x). Every case below therefore builds the instance from the
+/// effective config a mesh generation would have produced, and no case touches
+/// the process-global store — which is exactly the property being asserted: a
+/// store mutation cannot reach a constructed instance.
+///
+/// Cross-generation and mid-request barriers live in
+/// `tests/integration/transformer_runtime_overlay_generation_tests.rs`.
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn test_request_transformer_overlay_gate_observable_end_to_end() {
-    // Single test that walks every overlay-gate behaviour serially to
-    // avoid racing the process-global `request_transformer::runtime_overlay`
-    // ArcSwap from parallel test cases.
-    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
-    use ferrum_edge::plugins::request_transformer::runtime_overlay;
-    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+async fn test_request_transformer_overlay_gate_resolves_from_effective_config() {
+    let apply = |config: serde_json::Value| async move {
+        let plugin = RequestTransformer::new(&config).unwrap();
+        let mut headers: HashMap<String, String> = HashMap::new();
+        let result = plugin.before_proxy(&mut make_ctx(), &mut headers).await;
+        assert!(matches!(
+            result,
+            ferrum_edge::plugins::PluginResult::Continue
+        ));
+        headers
+    };
 
-    let plugin = RequestTransformer::new(&json!({
-        "rules": [
-            {"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}
-        ],
+    // ── Case 1: scope set, generation named no gate → default_enabled=true.
+    let headers = apply(json!({
+        "rules": [{"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}],
         "runtime_overlay_scope": "gated",
         "default_enabled": true
     }))
-    .unwrap();
-
-    // ── Case 1: overlay missing → fallback default_enabled=true applies the rule.
-    runtime_overlay::reset_for_test();
-    let mut ctx = make_ctx();
-    let mut headers: HashMap<String, String> = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(
-        result,
-        ferrum_edge::plugins::PluginResult::Continue
-    ));
+    .await;
     assert_eq!(headers.get("x-gated").map(String::as_str), Some("yes"));
 
-    // ── Case 2: overlay says enabled=false → rule short-circuited.
-    let mut fields = HashMap::new();
-    fields.insert(
-        "ferrum.request_transformer.gated.enabled".to_string(),
-        RuntimeValue::Bool(false),
-    );
-    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
-    let mut headers: HashMap<String, String> = HashMap::new();
-    plugin.before_proxy(&mut make_ctx(), &mut headers).await;
+    // ── Case 2: the generation resolved the gate to false → rules suppressed.
+    let headers = apply(json!({
+        "rules": [{"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}],
+        "runtime_overlay_scope": "gated",
+        "default_enabled": true,
+        "runtime_overlay_resolved_enabled": false
+    }))
+    .await;
     assert!(
         !headers.contains_key("x-gated"),
-        "overlay=false must suppress the rule"
+        "a resolved gate of false must suppress the rules"
     );
 
-    // ── Case 3: overlay says enabled=true → rule applies.
-    let mut fields = HashMap::new();
-    fields.insert(
-        "ferrum.request_transformer.gated.enabled".to_string(),
-        RuntimeValue::Bool(true),
-    );
-    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
-    let mut headers: HashMap<String, String> = HashMap::new();
-    plugin.before_proxy(&mut make_ctx(), &mut headers).await;
+    // ── Case 3: the generation resolved the gate to true → rules apply, and it
+    //           OVERRIDES a pessimistic default.
+    let headers = apply(json!({
+        "rules": [{"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}],
+        "runtime_overlay_scope": "gated",
+        "default_enabled": false,
+        "runtime_overlay_resolved_enabled": true
+    }))
+    .await;
     assert_eq!(headers.get("x-gated").map(String::as_str), Some("yes"));
 
-    // ── Case 4: plugin without a scope ignores the overlay entirely.
-    runtime_overlay::reset_for_test();
-    let no_scope_plugin = RequestTransformer::new(&json!({
-        "rules": [
-            {"operation": "add", "target": "header", "key": "X-Plain", "value": "v"}
-        ]
+    // ── Case 4: no scope → always enabled, and a stray resolved value cannot
+    //           gate an instance that never opted in.
+    let headers = apply(json!({
+        "rules": [{"operation": "add", "target": "header", "key": "X-Plain", "value": "v"}],
+        "runtime_overlay_resolved_enabled": false
     }))
-    .unwrap();
-    let mut fields = HashMap::new();
-    fields.insert(
-        "ferrum.request_transformer.gated.enabled".to_string(),
-        RuntimeValue::Bool(false),
-    );
-    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
-    let mut headers: HashMap<String, String> = HashMap::new();
-    no_scope_plugin
-        .before_proxy(&mut make_ctx(), &mut headers)
-        .await;
+    .await;
     assert_eq!(
         headers.get("x-plain").map(String::as_str),
         Some("v"),
         "plugins without runtime_overlay_scope must always apply rules"
     );
 
-    // ── Case 5: default_enabled=false combined with missing overlay
-    //           suppresses rules until the overlay flips them on.
-    runtime_overlay::reset_for_test();
-    let pessimistic_plugin = RequestTransformer::new(&json!({
-        "rules": [
-            {"operation": "add", "target": "header", "key": "X-Pess", "value": "v"}
-        ],
+    // ── Case 5: scope set, no resolved gate, default_enabled=false → suppressed.
+    let headers = apply(json!({
+        "rules": [{"operation": "add", "target": "header", "key": "X-Pess", "value": "v"}],
         "runtime_overlay_scope": "pessimistic",
         "default_enabled": false
     }))
-    .unwrap();
-    let mut headers: HashMap<String, String> = HashMap::new();
-    pessimistic_plugin
-        .before_proxy(&mut make_ctx(), &mut headers)
-        .await;
+    .await;
     assert!(
         !headers.contains_key("x-pess"),
-        "default_enabled=false must suppress when overlay missing"
+        "default_enabled=false must suppress when the generation named no gate"
+    );
+}
+
+/// A mutation of the process-global gate store must NOT change what an
+/// already-constructed instance does. This is the direct regression guard for the
+/// request-time lookup the advisory describes.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn test_request_transformer_ignores_live_process_global_gate_mutations() {
+    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+    use ferrum_edge::plugins::request_transformer::runtime_overlay;
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+    runtime_overlay::reset_for_test();
+
+    // Built from a generation that resolved the gate to TRUE.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}],
+        "runtime_overlay_scope": "gated",
+        "runtime_overlay_resolved_enabled": true
+    }))
+    .unwrap();
+
+    // Publish a CONTRADICTING gate into the live store, as a later accepted
+    // slice would. The instance must not observe it.
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay {
+        fields: HashMap::from([(
+            "ferrum.request_transformer.gated.enabled".to_string(),
+            RuntimeValue::Bool(false),
+        )]),
+    });
+
+    let mut headers: HashMap<String, String> = HashMap::new();
+    plugin.before_proxy(&mut make_ctx(), &mut headers).await;
+    assert_eq!(
+        headers.get("x-gated").map(String::as_str),
+        Some("yes"),
+        "a live store mutation must not reach an already-published instance"
     );
 
-    let mut fields = HashMap::new();
-    fields.insert(
-        "ferrum.request_transformer.pessimistic.enabled".to_string(),
-        RuntimeValue::Bool(true),
-    );
-    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+    // And the same in the other direction.
+    let disabled = RequestTransformer::new(&json!({
+        "rules": [{"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}],
+        "runtime_overlay_scope": "gated",
+        "runtime_overlay_resolved_enabled": false
+    }))
+    .unwrap();
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay {
+        fields: HashMap::from([(
+            "ferrum.request_transformer.gated.enabled".to_string(),
+            RuntimeValue::Bool(true),
+        )]),
+    });
     let mut headers: HashMap<String, String> = HashMap::new();
-    pessimistic_plugin
-        .before_proxy(&mut make_ctx(), &mut headers)
-        .await;
-    assert_eq!(headers.get("x-pess").map(String::as_str), Some("v"));
+    disabled.before_proxy(&mut make_ctx(), &mut headers).await;
+    assert!(
+        !headers.contains_key("x-gated"),
+        "a live store mutation must not enable an instance published as disabled"
+    );
 
     runtime_overlay::reset_for_test();
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_non_boolean_resolved_gate() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [{"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}],
+        "runtime_overlay_scope": "gated",
+        "runtime_overlay_resolved_enabled": "true"
+    }))
+    .err()
+    .expect("a non-boolean resolved gate must be rejected");
+    assert!(err.contains("runtime_overlay_resolved_enabled"), "got: {err}");
 }
 
 // ── Issue #2374: unknown keys, operation-exact fields, HeaderValue admission ──
@@ -2299,32 +2336,22 @@ async fn test_h3_raw_materialized_percent_encoded_query_name_transforms() {
 }
 
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
 async fn test_runtime_disabled_query_rules_preserve_h3_raw_preauth_map() {
-    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
-    use ferrum_edge::plugins::request_transformer::runtime_overlay;
-    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
-    runtime_overlay::reset_for_test();
-
+    // The gate rides the instance's effective config, so a runtime-disabled
+    // instance is one whose generation resolved the gate to false.
     let plugin = RequestTransformer::new(&json!({
         "rules": [
             {"operation": "remove", "target": "query", "key": "token"}
         ],
         "runtime_overlay_scope": "gated",
-        "default_enabled": true
+        "default_enabled": true,
+        "runtime_overlay_resolved_enabled": false
     }))
     .unwrap();
     assert!(
         !plugin.requires_decoded_query_params(),
         "configured (even runtime-gated) query rules must not opt into decoded H3 materialization"
     );
-
-    let mut fields = HashMap::new();
-    fields.insert(
-        "ferrum.request_transformer.gated.enabled".to_string(),
-        RuntimeValue::Bool(false),
-    );
-    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
 
     let mut ctx = make_ctx();
     ctx.set_raw_query_string("tok%65n=secret&keep=1".to_string());
@@ -2346,6 +2373,4 @@ async fn test_runtime_disabled_query_rules_preserve_h3_raw_preauth_map() {
         "runtime-disabled transformer must leave the H3 raw pre-auth map untouched"
     );
     assert!(!ctx.metadata.contains_key("ferrum:query_params_transformed"));
-
-    runtime_overlay::reset_for_test();
 }

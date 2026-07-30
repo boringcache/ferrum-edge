@@ -1437,64 +1437,138 @@ fn test_response_transformer_overlay_gate_parsing_is_namespaced() {
     runtime_overlay::reset_for_test();
 }
 
+/// The gate is resolved from CONFIGURATION, not from live process-global state
+/// (GHSA-83rc-23c9-3g9x). Cross-generation and mid-request barriers live in
+/// `tests/integration/transformer_runtime_overlay_generation_tests.rs`.
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn test_response_transformer_overlay_gate_observable_end_to_end() {
-    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
-    use ferrum_edge::plugins::response_transformer::runtime_overlay;
-    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+async fn test_response_transformer_overlay_gate_resolves_from_effective_config() {
+    let apply = |config: serde_json::Value| async move {
+        let plugin = ResponseTransformer::new(&config).unwrap();
+        let mut headers: HashMap<String, String> = HashMap::new();
+        plugin.after_proxy(&mut make_ctx(), 200, &mut headers).await;
+        headers
+    };
 
-    let plugin = ResponseTransformer::new(&json!({
-        "rules": [
-            {"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}
-        ],
+    // ── Case 1: scope set, generation named no gate → default_enabled=true.
+    let headers = apply(json!({
+        "rules": [{"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}],
         "runtime_overlay_scope": "gated",
         "default_enabled": true
     }))
-    .unwrap();
-
-    // ── Case 1: overlay missing → fallback default_enabled=true applies.
-    runtime_overlay::reset_for_test();
-    let mut ctx = make_ctx();
-    let mut headers: HashMap<String, String> = HashMap::new();
-    plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+    .await;
     assert_eq!(headers.get("x-gated").map(String::as_str), Some("yes"));
 
-    // ── Case 2: overlay says enabled=false → rule short-circuited.
-    let mut fields = HashMap::new();
-    fields.insert(
-        "ferrum.response_transformer.gated.enabled".to_string(),
-        RuntimeValue::Bool(false),
-    );
-    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
-    let mut headers: HashMap<String, String> = HashMap::new();
-    plugin.after_proxy(&mut make_ctx(), 200, &mut headers).await;
+    // ── Case 2: the generation resolved the gate to false → rule suppressed.
+    let headers = apply(json!({
+        "rules": [{"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}],
+        "runtime_overlay_scope": "gated",
+        "default_enabled": true,
+        "runtime_overlay_resolved_enabled": false
+    }))
+    .await;
     assert!(
         !headers.contains_key("x-gated"),
-        "overlay=false must suppress the rule"
+        "a resolved gate of false must suppress the rule"
     );
 
-    // ── Case 3: request_transformer overlay must NOT cross into
-    //           response_transformer state.
+    // ── Case 3: a resolved true overrides a pessimistic default.
+    let headers = apply(json!({
+        "rules": [{"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}],
+        "runtime_overlay_scope": "gated",
+        "default_enabled": false,
+        "runtime_overlay_resolved_enabled": true
+    }))
+    .await;
+    assert_eq!(headers.get("x-gated").map(String::as_str), Some("yes"));
+}
+
+/// A mutation of the process-global response gate store must NOT change what an
+/// already-constructed instance does, in either direction. Direct regression
+/// guard for the request-time lookup the advisory describes.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn test_response_transformer_ignores_live_process_global_gate_mutations() {
+    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+    use ferrum_edge::plugins::response_transformer::runtime_overlay;
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
     runtime_overlay::reset_for_test();
-    let mut fields = HashMap::new();
-    fields.insert(
-        "ferrum.request_transformer.gated.enabled".to_string(),
-        RuntimeValue::Bool(false),
-    );
-    ferrum_edge::plugins::request_transformer::runtime_overlay::apply_overlay(
-        &MeshRuntimeOverlay { fields },
-    );
+
+    let enabled = ResponseTransformer::new(&json!({
+        "rules": [{"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}],
+        "runtime_overlay_scope": "gated",
+        "runtime_overlay_resolved_enabled": true
+    }))
+    .unwrap();
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay {
+        fields: HashMap::from([(
+            "ferrum.response_transformer.gated.enabled".to_string(),
+            RuntimeValue::Bool(false),
+        )]),
+    });
     let mut headers: HashMap<String, String> = HashMap::new();
-    plugin.after_proxy(&mut make_ctx(), 200, &mut headers).await;
+    enabled.after_proxy(&mut make_ctx(), 200, &mut headers).await;
     assert_eq!(
         headers.get("x-gated").map(String::as_str),
         Some("yes"),
-        "request_transformer overlay must not gate response_transformer"
+        "a live store mutation must not reach an already-published instance"
+    );
+
+    let disabled = ResponseTransformer::new(&json!({
+        "rules": [{"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}],
+        "runtime_overlay_scope": "gated",
+        "runtime_overlay_resolved_enabled": false
+    }))
+    .unwrap();
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay {
+        fields: HashMap::from([(
+            "ferrum.response_transformer.gated.enabled".to_string(),
+            RuntimeValue::Bool(true),
+        )]),
+    });
+    let mut headers: HashMap<String, String> = HashMap::new();
+    disabled
+        .after_proxy(&mut make_ctx(), 200, &mut headers)
+        .await;
+    assert!(
+        !headers.contains_key("x-gated"),
+        "a live store mutation must not enable an instance published as disabled"
     );
 
     runtime_overlay::reset_for_test();
-    ferrum_edge::plugins::request_transformer::runtime_overlay::reset_for_test();
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_non_boolean_resolved_gate() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": [{"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}],
+        "runtime_overlay_scope": "gated",
+        "runtime_overlay_resolved_enabled": 1
+    }))
+    .err()
+    .expect("a non-boolean resolved gate must be rejected");
+    assert!(err.contains("runtime_overlay_resolved_enabled"), "got: {err}");
+}
+
+/// The two namespaces stay independent: a `request_transformer` gate key must
+/// never bind a `response_transformer` instance. Asserted on the cold-path
+/// binding, which is now where the separation is enforced.
+#[test]
+fn test_request_transformer_gate_key_does_not_bind_response_transformer() {
+    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+    use ferrum_edge::plugins::response_transformer::runtime_overlay;
+
+    let cross_namespace = MeshRuntimeOverlay {
+        fields: HashMap::from([(
+            "ferrum.request_transformer.gated.enabled".to_string(),
+            RuntimeValue::Bool(false),
+        )]),
+    };
+    assert!(
+        runtime_overlay::scope_gates(&cross_namespace)
+            .get("gated")
+            .is_none(),
+        "a request_transformer key must not appear in the response gate namespace"
+    );
 }
 
 // Regression for finding #64: when the RTDS overlay disables the scope, the
@@ -1504,48 +1578,57 @@ async fn test_response_transformer_overlay_gate_observable_end_to_end() {
 // cache-level `requires_response_body_buffering` upper bound stays true since
 // it cannot consult request-time overlay state.
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
 async fn test_response_transformer_disabled_overlay_skips_response_buffering() {
-    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
-    use ferrum_edge::plugins::response_transformer::runtime_overlay;
-    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
-
-    let plugin = ResponseTransformer::new(&json!({
-        "rules": [
-            {"operation": "rename", "target": "body", "key": "old", "new_key": "new"}
-        ],
-        "runtime_overlay_scope": "gated-buffer",
-        "default_enabled": true
-    }))
-    .unwrap();
-
-    // Cache-level upper bound is unconditional on rule shape.
-    assert!(plugin.requires_response_body_buffering());
+    let body_rule_plugin = |resolved: Option<bool>| {
+        let mut config = json!({
+            "rules": [
+                {"operation": "rename", "target": "body", "key": "old", "new_key": "new"}
+            ],
+            "runtime_overlay_scope": "gated-buffer",
+            "default_enabled": true
+        });
+        if let Some(resolved) = resolved {
+            config
+                .as_object_mut()
+                .expect("object")
+                .insert("runtime_overlay_resolved_enabled".to_string(), json!(resolved));
+        }
+        ResponseTransformer::new(&config).unwrap()
+    };
 
     let mut ctx = make_ctx();
     ctx.headers
         .insert("accept".to_string(), "application/json".to_string());
 
-    // ── Overlay missing → default_enabled=true → still buffers.
-    runtime_overlay::reset_for_test();
+    // ── Generation named no gate → default_enabled=true → still buffers. The
+    //    cache-level upper bound is unconditional on rule shape either way.
+    let enabled = body_rule_plugin(None);
+    assert!(enabled.requires_response_body_buffering());
     assert!(
-        plugin.should_buffer_response_body(&ctx),
+        enabled.should_buffer_response_body(&ctx),
         "enabled transform with body rules should buffer a non-SSE response"
     );
 
-    // ── Overlay disables the scope → transform is a no-op → must NOT buffer.
-    let mut fields = HashMap::new();
-    fields.insert(
-        "ferrum.response_transformer.gated-buffer.enabled".to_string(),
-        RuntimeValue::Bool(false),
-    );
-    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+    // ── Generation resolved the gate to false → transform is a no-op → must NOT
+    //    buffer, and must not transform either. The two answers come from the
+    //    same immutable field, so they cannot disagree (GHSA-83rc-23c9-3g9x).
+    let disabled = body_rule_plugin(Some(false));
+    assert!(disabled.requires_response_body_buffering());
     assert!(
-        !plugin.should_buffer_response_body(&ctx),
-        "disabled overlay must not pin the response into the buffered path"
+        !disabled.should_buffer_response_body(&ctx),
+        "a disabled gate must not pin the response into the buffered path"
     );
-
-    runtime_overlay::reset_for_test();
+    assert!(
+        disabled
+            .transform_response_body(
+                br#"{"old":"v"}"#,
+                Some("application/json"),
+                &HashMap::new()
+            )
+            .await
+            .is_none(),
+        "the phase that would have consumed the buffer must agree it is disabled"
+    );
 }
 
 // Companion to #64 using the static fallback (no overlay state needed): a body
