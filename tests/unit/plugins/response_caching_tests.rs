@@ -2724,6 +2724,7 @@ async fn test_invalidation_disabled() {
 
 #[tokio::test]
 async fn test_max_total_size_exceeded() {
+    let _policy_guard = response_cache_replay_policy_guard();
     let plugin = plugin_with_config(json!({
         "max_total_size_bytes": 300,
         "max_entry_size_bytes": 1048576

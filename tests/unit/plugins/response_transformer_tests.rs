@@ -3,6 +3,7 @@
 use ferrum_edge::_test_support::{
     apply_synthetic_response_body_hooks_for_test,
     discard_grpc_application_trailers_after_body_rewrite_for_test,
+    set_response_presentation_policy_digest_for_test,
     stamp_original_response_metadata_for_test,
     transform_buffered_response_body_with_deadline_full_for_test,
 };
@@ -1962,7 +1963,9 @@ async fn trailer_integrity_fields_retired_after_body_rewrite() {
 /// store the cleaned headers so a later If-None-Match for the origin validator
 /// cannot produce a conditional 304 for the transformed body.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn response_caching_does_not_revalidate_stripped_origin_etag() {
+    let _policy_guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
     let transformer = Arc::new(body_update_plugin()) as Arc<dyn Plugin>;
     let caching = ResponseCaching::new(&json!({
         "ttl_seconds": 60,
@@ -2003,6 +2006,7 @@ async fn response_caching_does_not_revalidate_stripped_origin_etag() {
     let mut store_ctx = make_ctx();
     store_ctx.path = path.to_string();
     store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    set_response_presentation_policy_digest_for_test(&mut store_ctx, Some([0x51; 32]));
     let mut request_headers = HashMap::new();
     assert!(matches!(
         caching
@@ -2028,6 +2032,7 @@ async fn response_caching_does_not_revalidate_stripped_origin_etag() {
     let mut hit_ctx = make_ctx();
     hit_ctx.path = path.to_string();
     hit_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    set_response_presentation_policy_digest_for_test(&mut hit_ctx, Some([0x51; 32]));
     let mut conditional =
         HashMap::from([("if-none-match".to_string(), "\"origin-v1\"".to_string())]);
     match caching.before_proxy(&mut hit_ctx, &mut conditional).await {
