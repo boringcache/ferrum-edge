@@ -1786,11 +1786,7 @@ async fn mesh_shadow_uses_rewritten_authority_and_explicit_mirror_path_wins() {
     let mut exact_ctx = make_ctx_with_proxy();
     exact_ctx.path = "/legacy".to_string();
     let mut exact_headers = HashMap::from([("host".to_string(), "public.example.com".to_string())]);
-    plugin_utils::assert_continue(
-        route
-            .before_proxy(&mut exact_ctx, &mut exact_headers)
-            .await,
-    );
+    plugin_utils::assert_continue(route.before_proxy(&mut exact_ctx, &mut exact_headers).await);
     assert_eq!(
         exact_ctx.route_override_path.as_deref(),
         Some("/exact-shadow")
