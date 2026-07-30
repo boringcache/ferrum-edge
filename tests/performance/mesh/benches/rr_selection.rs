@@ -1,7 +1,7 @@
 //! Concurrent RoundRobin selection microbenchmark for hosted CI (#2947).
 //!
 //! Detects reintroduction of a single shared RR counter by comparing, in the
-//! the **same Criterion invocation** under the same barrier-synchronized worker
+//! **same Criterion invocation** under the same barrier-synchronized worker
 //! shape:
 //!
 //! - `sharded`: the exact RoundRobin selection seam with one explicit
