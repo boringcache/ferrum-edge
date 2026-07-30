@@ -842,22 +842,48 @@ fn valid_tool_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
+#[derive(Clone, Copy)]
+enum ToolArgumentsField {
+    Modern {
+        message_index: usize,
+        tool_index: usize,
+    },
+    Legacy {
+        message_index: usize,
+    },
+}
+
+impl ToolArgumentsField {
+    fn error(self, detail: &str) -> String {
+        match self {
+            Self::Modern {
+                message_index,
+                tool_index,
+            } => format!("messages[{message_index}].tool_calls[{tool_index}] {detail}"),
+            Self::Legacy { message_index } => {
+                format!("messages[{message_index}].function_call {detail}")
+            }
+        }
+    }
+}
+
 fn legacy_tool_use_id(message_index: usize) -> String {
     format!("call_legacy_{message_index}")
 }
 
-fn parse_tool_arguments_object(arguments: &str, field_path: &str) -> Result<Value, String> {
+fn parse_tool_arguments_object(
+    arguments: &str,
+    field: ToolArgumentsField,
+) -> Result<Value, String> {
     if arguments.len() > MAX_TOOL_ARGUMENTS_BYTES {
-        return Err(format!(
-            "{field_path} arguments exceed the maximum allowed size"
-        ));
+        return Err(field.error("arguments exceed the maximum allowed size"));
     }
     let parsed: Value = serde_json::from_str(arguments).map_err(|_| {
         // Field-specific only: never echo argument bytes (may hold credentials).
-        format!("{field_path} arguments are not valid JSON")
+        field.error("arguments are not valid JSON")
     })?;
     if !parsed.is_object() {
-        return Err(format!("{field_path} arguments must encode a JSON object"));
+        return Err(field.error("arguments must encode a JSON object"));
     }
     Ok(parsed)
 }
@@ -923,7 +949,10 @@ fn parse_openai_tool_calls(
             })?;
         let arguments = parse_tool_arguments_object(
             arguments,
-            &format!("messages[{message_index}].tool_calls[{tool_index}]"),
+            ToolArgumentsField::Modern {
+                message_index,
+                tool_index,
+            },
         )?;
         parsed.push(ParsedToolCall {
             id: id.to_string(),
@@ -964,8 +993,10 @@ fn parse_openai_function_call(
         .ok_or_else(|| {
             format!("messages[{message_index}].function_call.arguments must be a JSON string")
         })?;
-    let field_path = format!("messages[{message_index}].function_call");
-    let arguments = parse_tool_arguments_object(arguments, &field_path)?;
+    let arguments = parse_tool_arguments_object(
+        arguments,
+        ToolArgumentsField::Legacy { message_index },
+    )?;
     let id = legacy_tool_use_id(message_index);
     Ok(Some(ParsedToolCall {
         id,
