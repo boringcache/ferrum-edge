@@ -7646,17 +7646,13 @@ fn test_priority_override_delegates_response_trailer_policy() {
     // declaration and its per-request predicate. If the wrapper forgets the
     // latter, the trait's fail-closed default (`true`) would silently drop
     // trailers for a request this WAF instance exempts.
-    let mut waf =
-        enforcing_response_header_waf("waf1", "p1", json!({ "paths": ["/internal/*"] }));
+    let mut waf = enforcing_response_header_waf("waf1", "p1", json!({ "paths": ["/internal/*"] }));
     waf.priority_override = Some(323);
     let config = make_config(vec![make_proxy("p1", "/api", vec!["waf1"])], vec![waf]);
     let cache = PluginCache::new(&config).unwrap();
     let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
     assert!(
-        view.unbounded_response_trailer_policy_applies(&trailer_policy_ctx(
-            "GET",
-            "/api/orders"
-        )),
+        view.unbounded_response_trailer_policy_applies(&trailer_policy_ctx("GET", "/api/orders")),
         "the priority-override wrapper must preserve the governed request arm"
     );
     assert!(
