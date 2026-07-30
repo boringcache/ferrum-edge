@@ -1144,9 +1144,11 @@ shapes and nothing else:
   `-timeout`, `-rss_limit_mb`) is part of the contract. All automation commands
   are inline and cannot be redirected through a repository-supplied script;
   the read-only job necessarily compiles and executes pull-request-authored Rust
-  tests and fuzz targets. Its environment clears both repository sccache wrapper
-  inputs and `RUSTFLAGS`, because the isolated lane installs neither sccache nor
-  the mold linker selected by the root Cargo configuration.
+  tests and fuzz targets. The frozen job installs `protobuf-compiler` before
+  invoking Cargo because the workspace build script requires `protoc`. Its
+  environment clears both repository sccache wrapper inputs and `RUSTFLAGS`,
+  because the isolated lane installs neither sccache nor the mold linker selected
+  by the root Cargo configuration.
 - `FUZZ_WORKFLOW` — the whole of `.github/workflows/fuzz.yml`. A repository
   that has not adopted it may omit it; once the trusted base carries it, a pull
   request may neither remove nor alter it. Whole-file
