@@ -6169,6 +6169,17 @@ pub mod _test_support {
         )
     }
 
+    /// Deterministic `Retry-After` rounding and exponential-backoff helpers
+    /// used by the spec-expose failure-cache tests.
+    pub fn spec_expose_retry_after_seconds_for_test(remaining: Duration) -> u64 {
+        crate::plugins::spec_expose::spec_expose_retry_after_seconds(remaining)
+    }
+
+    /// Return the bounded exponential delay after `previous_failures`.
+    pub fn spec_expose_failure_backoff_seconds_for_test(previous_failures: u32) -> u64 {
+        crate::plugins::spec_expose::spec_expose_failure_backoff_seconds(previous_failures)
+    }
+
     /// Build an email channel with deterministic `*_env` resolution for unit
     /// tests. Production uses [`crate::notifications::channels::EmailChannel::new`]
     /// and real `std::env::var`.
