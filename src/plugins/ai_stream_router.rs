@@ -993,10 +993,8 @@ fn parse_openai_function_call(
         .ok_or_else(|| {
             format!("messages[{message_index}].function_call.arguments must be a JSON string")
         })?;
-    let arguments = parse_tool_arguments_object(
-        arguments,
-        ToolArgumentsField::Legacy { message_index },
-    )?;
+    let arguments =
+        parse_tool_arguments_object(arguments, ToolArgumentsField::Legacy { message_index })?;
     let id = legacy_tool_use_id(message_index);
     Ok(Some(ParsedToolCall {
         id,
