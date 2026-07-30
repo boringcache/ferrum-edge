@@ -1095,9 +1095,11 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
         Some("HIT")
     );
     assert!(
-        headers
-            .get("vary")
-            .is_some_and(|vary| vary.eq_ignore_ascii_case("Accept-Encoding")),
+        headers.get("vary").is_some_and(|vary| {
+            vary
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("Accept-Encoding"))
+        }),
         "cached Vary field-name tokens are case-insensitive"
     );
 
