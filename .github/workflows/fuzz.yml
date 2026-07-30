@@ -1,0 +1,162 @@
+name: Fuzz
+
+# Scheduled/manual sanitizer-backed fuzz lane for issue #2461. This file is
+# byte-frozen by the trusted Cross build policy
+# (.github/scripts/verify_cross_build_policy.py, FUZZ_WORKFLOW): the filename,
+# triggers, permissions, action pins, toolchain and cargo-fuzz versions, target
+# matrix, libFuzzer budgets, and artifact bounds below are the whole contract.
+# A repository that has not adopted this file may omit it. Once the trusted
+# base carries it, a pull request may neither remove it nor change one byte.
+#
+# Deliberate constraints:
+#   * read-only `contents: read` permissions at both workflow and job level,
+#     and no reference to any repository secret anywhere;
+#   * no `pull_request` or `push` trigger, so an untrusted head can never
+#     schedule this lane;
+#   * `workflow_dispatch` takes NO inputs, so there is no caller-chosen target,
+#     tool, command, or time budget;
+#   * the matrix target reaches the shell only through an environment variable
+#     that is re-checked against the literal target list, so no untrusted text
+#     is interpolated into a command;
+#   * every libFuzzer run is bounded in wall time, input length, per-input
+#     timeout, and resident set size;
+#   * crash artifacts are rejected if any path is a symlink or other
+#     non-regular object, then size- and count-bounded BEFORE upload, uploaded
+#     from one fixed path, and expired quickly;
+#   * no Cross toolchain, aarch64 target, unpinned tool install, or release
+#     publication path is reachable from this file.
+
+on:
+  schedule:
+    - cron: '30 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz-sanitized:
+    name: Fuzz sanitizer lane
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    # The repository-root Cargo config selects sccache and host linker flags,
+    # but this isolated fuzz job installs neither sccache nor mold. Disable both
+    # Cargo wrapper inputs and inherited rustflags explicitly.
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+      RUSTFLAGS: ""
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        fuzz_target:
+          - traceparent
+          - config_decode
+          - proxy_protocol
+          - mesh_udp_frame
+          - k8s_crd
+          - plugin_config
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install required build dependency
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2025-07-01
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-sanitized
+
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.1
+
+      - name: Run sanitizer-backed fuzz target
+        working-directory: fuzz
+        env:
+          FUZZ_TARGET: ${{ matrix.fuzz_target }}
+          ASAN_OPTIONS: detect_odr_violation=0:allocator_may_return_null=1
+        run: |
+          set -euo pipefail
+
+          # The matrix is frozen above, so this can only fire if the workflow
+          # itself was tampered with; it costs nothing and keeps the command
+          # line free of any value this shell has not literally approved.
+          case "$FUZZ_TARGET" in
+            traceparent|config_decode|proxy_protocol|mesh_udp_frame|k8s_crd|plugin_config) ;;
+            *)
+              echo "::error::unknown fuzz target" >&2
+              exit 1
+              ;;
+          esac
+
+          mkdir -p "artifacts/$FUZZ_TARGET"
+          cargo fuzz run -s address "$FUZZ_TARGET" -- \
+            -max_total_time=300 \
+            -max_len=65536 \
+            -timeout=5 \
+            -rss_limit_mb=2048 \
+            -artifact_prefix="artifacts/$FUZZ_TARGET/"
+
+      # Bound the crash corpus BEFORE it can be published: an unbounded
+      # artifact path is an exfiltration surface, and a crash input large
+      # enough to carry unrelated process state must be triaged locally.
+      - name: Bound crash artifacts
+        id: bound
+        if: failure()
+        working-directory: fuzz
+        env:
+          FUZZ_TARGET: ${{ matrix.fuzz_target }}
+        run: |
+          set -euo pipefail
+
+          directory="artifacts/$FUZZ_TARGET"
+          if [ ! -d "$directory" ]; then
+            exit 0
+          fi
+          # upload-artifact follows symbolic links by default. Reject the root
+          # path and every descendant unless it is a directory or regular file,
+          # so the fixed upload path cannot escape into unrelated runner state.
+          if [ -L "$directory" ]; then
+            echo "::error::the crash artifact directory must not be a symbolic link" >&2
+            exit 1
+          fi
+          if find "$directory" \( -type l -o \( ! -type d ! -type f \) \) -print -quit | grep -q .; then
+            echo "::error::crash artifacts must contain only directories and regular files" >&2
+            exit 1
+          fi
+          if find "$directory" -type f -size +64k -print -quit | grep -q .; then
+            echo "::error::a crash artifact exceeds 64 KiB; triage and redact it locally" >&2
+            exit 1
+          fi
+          if [ "$(find "$directory" -type f | wc -l | tr -d ' ')" -gt 16 ]; then
+            echo "::error::more than 16 crash artifacts; triage locally before publishing" >&2
+            exit 1
+          fi
+
+      # Publication is gated on the bounding step having SUCCEEDED, not merely
+      # on job failure: a skipped or failed bound must never publish.
+      - name: Upload bounded crash artifacts
+        if: always() && steps.bound.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fuzz-crash-${{ matrix.fuzz_target }}
+          path: fuzz/artifacts/${{ matrix.fuzz_target }}
+          if-no-files-found: ignore
+          retention-days: 7
