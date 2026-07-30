@@ -352,7 +352,13 @@ fn test_resolve_all_env_secrets_vault_error_omits_source_reference() {
 #[test]
 fn test_resolve_all_env_secrets_ignores_non_secret_file_suffix_config() {
     with_env_vars_async(
-        &[("FERRUM_DNS_RESOLVER_HOSTS_FILE", "/path/to/hosts")],
+        &[
+            ("FERRUM_DNS_RESOLVER_HOSTS_FILE", "/path/to/hosts"),
+            (
+                "FERRUM_DP_CP_GRPC_TOKEN_FILE",
+                "/path/to/externally-issued-token",
+            ),
+        ],
         || async {
             let resolved = resolve_all_env_secrets().await.unwrap();
             assert!(resolved.vars.is_empty());
