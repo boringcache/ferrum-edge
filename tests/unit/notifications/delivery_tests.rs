@@ -406,9 +406,12 @@ async fn reload_retirement_drain_times_out_then_settles_abandoned_once() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     // Accept but never respond — keep the dispatch in-flight.
+    let request_started = Arc::new(Notify::new());
+    let request_started_on_server = Arc::clone(&request_started);
     let blocker = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         read_request_headers(&mut socket).await;
+        request_started_on_server.notify_one();
         tokio::time::sleep(Duration::from_secs(30)).await;
     });
 
@@ -439,13 +442,9 @@ async fn reload_retirement_drain_times_out_then_settles_abandoned_once() {
         })),
     ));
 
-    timeout(Duration::from_secs(2), async {
-        while generation.in_flight() == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(Duration::from_secs(2), request_started.notified())
     .await
-    .expect("dispatch should become in-flight");
+    .expect("server must observe the live transport attempt before retirement");
 
     generation.cancel();
     assert!(!generation.is_admitting());
