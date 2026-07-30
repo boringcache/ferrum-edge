@@ -31,6 +31,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use tracing::{debug, warn};
 
+use crate::util::json_dup_keys::{self, JsonScanMemo};
+
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -363,12 +365,151 @@ impl BodyValidator {
         })
     }
 
+    /// Shared implementation of the final backend-visible request-body hooks.
+    ///
+    /// `json_scan_memo` is `Some` on the context-aware hook so the duplicate
+    /// object-member screen of this exact body is shared with the other
+    /// governed plugins running in the same stage, and `None` on the
+    /// context-free hook, where the screen runs standalone.
+    async fn validate_final_request_body(
+        &self,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        json_scan_memo: Option<&mut JsonScanMemo>,
+    ) -> PluginResult {
+        if !self.has_request_validation {
+            return PluginResult::Continue;
+        }
+
+        let content_type = headers
+            .get("content-type")
+            .map(String::as_str)
+            .unwrap_or("");
+
+        if body.is_empty() {
+            return PluginResult::Continue;
+        }
+
+        if !is_grpc_content_type(content_type) {
+            // Only run the JSON/XML branch when JSON or XML validation is
+            // actually configured. A protobuf-only plugin must Continue on
+            // non-grpc content types (the gRPC branch below is the one that
+            // applies to it). `has_request_validation` alone isn't enough —
+            // it's also true for protobuf-only configs, which would otherwise
+            // mis-treat a non-gRPC payload as malformed JSON.
+            let has_json_validation =
+                self.json_validator.is_some() || !self.required_fields.is_empty();
+            if !has_json_validation && !self.has_xml_request_validation {
+                return PluginResult::Continue;
+            }
+
+            if !content_type_matches(&self.content_types, content_type) {
+                return PluginResult::Continue;
+            }
+
+            let body_str = match std::str::from_utf8(body) {
+                Ok(value) => value,
+                Err(_) => {
+                    debug!("body_validator: request body is not valid UTF-8, skipping validation");
+                    return PluginResult::Continue;
+                }
+            };
+
+            // JSON branch matches `before_proxy`: any matching JSON-like body is
+            // screened once request validation is active for this content type,
+            // even when only XML rules (plus `content_types: ["application/json"]`)
+            // activated the plugin — otherwise a request-body transform can
+            // reintroduce duplicate members after the first screen and the final
+            // backend-visible bytes are never checked. `has_json_validation` is
+            // consulted only by the early Continue above so protobuf-only configs
+            // still never treat arbitrary non-gRPC payloads as JSON.
+            let result = if is_json_like_content_type(content_type) {
+                Self::validate_json_body(
+                    body_str,
+                    &self.required_fields,
+                    self.json_validator.as_ref(),
+                    Direction::Request,
+                    json_scan_memo,
+                )
+            } else if is_xml_like_content_type(content_type) && self.has_xml_request_validation {
+                Self::validate_xml_body(
+                    body_str,
+                    &self.required_xml_elements,
+                    self.xml_max_entities,
+                    self.xml_reject_nested_entities,
+                )
+            } else {
+                Ok(())
+            };
+
+            return match result {
+                Ok(()) => PluginResult::Continue,
+                Err(msg) => PluginResult::Reject {
+                    status_code: 400,
+                    body: serde_json::json!({
+                        "error": "Request body validation failed",
+                        "details": msg
+                    })
+                    .to_string(),
+                    headers: HashMap::new(),
+                },
+            };
+        }
+
+        if !self.has_protobuf_request_validation {
+            return PluginResult::Continue;
+        }
+
+        // Resolve gRPC method path from headers (injected by the proxy handler)
+        let grpc_path = headers.get(":path").map(|s| s.as_str()).unwrap_or("");
+        if self.protobuf_dependency_unavailable && self.protobuf_targets.request_applies(grpc_path)
+        {
+            return protobuf_reject(
+                400,
+                "request",
+                "configured protobuf descriptor dependency is unavailable",
+            );
+        }
+        let descriptor = match self.get_request_descriptor(grpc_path) {
+            Some(d) => d,
+            None => {
+                // No descriptor for this method — skip validation
+                debug!(
+                    "body_validator: no protobuf request descriptor for method '{}'",
+                    grpc_path
+                );
+                return PluginResult::Continue;
+            }
+        };
+
+        match self.validate_protobuf_body(body, descriptor) {
+            Ok(()) => PluginResult::Continue,
+            Err(msg) => protobuf_reject(400, "request", &msg),
+        }
+    }
+
     fn validate_json_body(
         body: &str,
         required_fields: &[String],
         json_schema: Option<&CompiledJsonSchema>,
         direction: Direction,
+        json_scan_memo: Option<&mut JsonScanMemo>,
     ) -> Result<(), String> {
+        // Duplicate object member names make the evaluated document and the
+        // forwarded bytes two different documents: `serde_json` keeps the LAST
+        // value while a first-key-wins consumer acts on the first, so a body
+        // that passes required-field and JSON Schema checks here can still
+        // deliver a forbidden value downstream (advisory
+        // `GHSA-c78j-5w9p-cpq6`). Screen before evaluating, and reject rather
+        // than canonicalize — this plugin forwards the original bytes.
+        let ambiguity = match json_scan_memo {
+            Some(memo) => memo.ambiguity_str(body),
+            None => json_dup_keys::str_ambiguity(body),
+        };
+        if let Some(reason) = ambiguity {
+            return Err(reason.to_string());
+        }
+
         // Parse as JSON. `serde_json`'s own 128-level nesting limit bounds the
         // instance depth the compiled validator then walks, so a deeply nested
         // hostile body cannot drive unbounded recursion here.
@@ -2232,13 +2373,6 @@ fn load_protobuf_descriptor_pool_inner(
     })
 }
 
-pub(crate) fn load_protobuf_descriptor_pool(
-    descriptor_path: &str,
-) -> Result<DescriptorPool, String> {
-    load_protobuf_descriptor_pool_inner(descriptor_path)
-        .map_err(ProtobufDescriptorLoadError::into_message)
-}
-
 fn resolve_protobuf_shape(
     shape: &ProtobufShape,
     pool: &DescriptorPool,
@@ -2467,38 +2601,42 @@ impl Plugin for BodyValidator {
             return PluginResult::Continue;
         }
 
+        // The request body lives in `ctx.metadata`, so the shared duplicate-key
+        // memo is moved out for the duration of the borrow and moved back
+        // before this hook returns. Taking it is not a reset: `JsonScanMemo` is
+        // keyed on body digests, so restoring it preserves every verdict.
+        let mut json_scan_memo = std::mem::take(&mut ctx.json_scan_memo);
+
         // Get body from metadata (set by proxy handler if body collection is early)
-        let body = match ctx.metadata.get("request_body") {
-            Some(b) => b.as_str(),
+        let result = match ctx.metadata.get("request_body") {
             None => {
                 // No body available — can't validate
                 debug!("body_validator: no request body available for validation");
-                return PluginResult::Continue;
+                Ok(())
             }
-        };
-
-        if body.is_empty() {
-            return PluginResult::Continue;
-        }
-
-        // Determine validation type
-        let result = if is_json_like_content_type(content_type) {
-            Self::validate_json_body(
+            Some(body) if body.is_empty() => Ok(()),
+            // Determine validation type
+            Some(body) if is_json_like_content_type(content_type) => Self::validate_json_body(
                 body,
                 &self.required_fields,
                 self.json_validator.as_ref(),
                 Direction::Request,
-            )
-        } else if is_xml_like_content_type(content_type) && self.has_xml_request_validation {
-            Self::validate_xml_body(
-                body,
-                &self.required_xml_elements,
-                self.xml_max_entities,
-                self.xml_reject_nested_entities,
-            )
-        } else {
-            Ok(())
+                Some(&mut json_scan_memo),
+            ),
+            Some(body)
+                if is_xml_like_content_type(content_type) && self.has_xml_request_validation =>
+            {
+                Self::validate_xml_body(
+                    body,
+                    &self.required_xml_elements,
+                    self.xml_max_entities,
+                    self.xml_reject_nested_entities,
+                )
+            }
+            Some(_) => Ok(()),
         };
+
+        ctx.json_scan_memo = json_scan_memo;
 
         match result {
             Ok(()) => PluginResult::Continue,
@@ -2522,106 +2660,24 @@ impl Plugin for BodyValidator {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.has_request_validation {
-            return PluginResult::Continue;
-        }
+        self.validate_final_request_body(headers, body, None).await
+    }
 
-        let content_type = headers
-            .get("content-type")
-            .map(String::as_str)
-            .unwrap_or("");
-
-        if body.is_empty() {
-            return PluginResult::Continue;
-        }
-
-        if !is_grpc_content_type(content_type) {
-            // Only run the JSON/XML branch when JSON or XML validation is
-            // actually configured. A protobuf-only plugin must Continue on
-            // non-grpc content types (the gRPC branch below is the one that
-            // applies to it). `has_request_validation` alone isn't enough —
-            // it's also true for protobuf-only configs, which would otherwise
-            // mis-treat a non-gRPC payload as malformed JSON.
-            let has_json_validation =
-                self.json_validator.is_some() || !self.required_fields.is_empty();
-            if !has_json_validation && !self.has_xml_request_validation {
-                return PluginResult::Continue;
-            }
-
-            if !content_type_matches(&self.content_types, content_type) {
-                return PluginResult::Continue;
-            }
-
-            let body_str = match std::str::from_utf8(body) {
-                Ok(value) => value,
-                Err(_) => {
-                    debug!("body_validator: request body is not valid UTF-8, skipping validation");
-                    return PluginResult::Continue;
-                }
-            };
-
-            let result = if is_json_like_content_type(content_type) && has_json_validation {
-                Self::validate_json_body(
-                    body_str,
-                    &self.required_fields,
-                    self.json_validator.as_ref(),
-                    Direction::Request,
-                )
-            } else if is_xml_like_content_type(content_type) && self.has_xml_request_validation {
-                Self::validate_xml_body(
-                    body_str,
-                    &self.required_xml_elements,
-                    self.xml_max_entities,
-                    self.xml_reject_nested_entities,
-                )
-            } else {
-                Ok(())
-            };
-
-            return match result {
-                Ok(()) => PluginResult::Continue,
-                Err(msg) => PluginResult::Reject {
-                    status_code: 400,
-                    body: serde_json::json!({
-                        "error": "Request body validation failed",
-                        "details": msg
-                    })
-                    .to_string(),
-                    headers: HashMap::new(),
-                },
-            };
-        }
-
-        if !self.has_protobuf_request_validation {
-            return PluginResult::Continue;
-        }
-
-        // Resolve gRPC method path from headers (injected by the proxy handler)
-        let grpc_path = headers.get(":path").map(|s| s.as_str()).unwrap_or("");
-        if self.protobuf_dependency_unavailable && self.protobuf_targets.request_applies(grpc_path)
-        {
-            return protobuf_reject(
-                400,
-                "request",
-                "configured protobuf descriptor dependency is unavailable",
-            );
-        }
-        let descriptor = match self.get_request_descriptor(grpc_path) {
-            Some(d) => d,
-            None => {
-                // No descriptor for this method — skip validation
-                debug!(
-                    "body_validator: no protobuf request descriptor for method '{}'",
-                    grpc_path
-                );
-                return PluginResult::Continue;
-            }
-        };
-
-        match self.validate_protobuf_body(body, descriptor) {
-            Ok(()) => PluginResult::Continue,
-            Err(msg) => protobuf_reject(400, "request", &msg),
-        }
+    /// Context-aware variant so the duplicate-key screen of the final
+    /// backend-visible body is shared with every other governed plugin in this
+    /// hook stage (they all receive the same context object).
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        let mut json_scan_memo = std::mem::take(&mut ctx.json_scan_memo);
+        let result = self
+            .validate_final_request_body(headers, body, Some(&mut json_scan_memo))
+            .await;
+        ctx.json_scan_memo = json_scan_memo;
+        result
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -2780,6 +2836,7 @@ impl Plugin for BodyValidator {
                 &self.response_required_fields,
                 self.response_json_validator.as_ref(),
                 Direction::Response,
+                Some(&mut ctx.json_scan_memo),
             )
         } else if is_xml_like_content_type(content_type) && self.has_xml_response_validation {
             Self::validate_xml_body(

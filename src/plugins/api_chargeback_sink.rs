@@ -29,10 +29,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tracing::warn;
@@ -43,6 +43,11 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use super::chargeback::pricing::{ChargeComputation, PricingConfig, require_finite_charge};
 use super::chargeback::{HttpBillingOutcome, http_billing_outcome};
+use super::utils::byte_budget::{
+    GrowableProcessReservation, JSON_STRING_WORST_CASE_EXPANSION, PayloadMaterializationError,
+    ProcessByteReservation, ReservedPayload, RetainedByteCeiling, materialize_reserved_buffer,
+    materialize_reserved_payload, process_ceiling,
+};
 use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
 use super::utils::{
     BatchConfig, BatchingLogger, ByteBudget, ByteLease, DEFAULT_BUFFER_MAX_BYTES,
@@ -54,6 +59,11 @@ use super::utils::{
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
 use crate::observability_delivery::DeliveryWorkerControl;
+use crate::plugins::utils::log_schema::view::status_class;
+use crate::plugins::utils::log_schema::{
+    DerivedKind, FieldSpec, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
+    SummarySchema, TimestampFormat, resolve_schema,
+};
 use tokio::sync::mpsc;
 
 const PLUGIN_NAME: &str = "api_chargeback_sink";
@@ -140,6 +150,66 @@ const SPOOL_MAX_ARTIFACT_BYTES: u64 = HARD_MAX_BUFFER_MAX_BYTES as u64;
 // the upper bound is below the lower one. Prove the ordering at compile time so
 // the replay path can never panic inside the billing process.
 const _: () = assert!(SPOOL_MIN_DECOMPRESSED_BYTES <= SPOOL_MAX_ARTIFACT_BYTES);
+/// Headroom added to `ZSTD_compressBound` for the reserved compression buffer.
+///
+/// `compress_bound` already covers the worst-case incompressible expansion plus
+/// the frame header this build asks for (the one-shot API records the
+/// decompressed size). The slack only guards against a future zstd frame-format
+/// addition; an under-sized buffer would fail closed, never truncate.
+const SPOOL_ZSTD_FRAME_SLACK_BYTES: usize = 4 * 1024;
+/// Decoded representations of one artifact that coexist during replay: the
+/// single decoded text buffer, and the JSONEachRow request body materialized
+/// for the chunk currently in flight. The largest chunk is the whole artifact,
+/// so one extra decoded copy is the exact worst case.
+const SPOOL_REPLAY_DECODED_COPIES: u64 = 2;
+/// Reserved capacity of the 413 split worklist.
+///
+/// The worklist is a depth-first stack of `(start, end)` *line index* ranges. It
+/// used to be allocated (and charged) at one entry per line, even though its
+/// live occupancy is logarithmic — enough to deterministically exhaust the
+/// ceiling for a legitimate high-row-count artifact. The real bound is:
+///
+/// * A pop that 413s pushes exactly two ranges partitioning the popped one, and
+///   `replay_split_len` gives the **left** child `min(batch_size, len / 2)`
+///   rows — never more than `len / 2`.
+/// * The left child is pushed last, so it is popped first. Popping a right
+///   sibling replaces the entry it occupied rather than adding one, so stack
+///   occupancy grows only along a chain of successive *left* descents.
+/// * Each left descent at least halves the row count, so a chain over `N` lines
+///   is at most `ceil(log2(N))` long, plus the root and one pending sibling.
+///
+/// For any `N <= usize::MAX` that is at most `usize::BITS + 2`; the constant
+/// carries extra slack. The stack is allocated at exactly this capacity,
+/// reserved before it exists, and fails closed rather than growing past it — so
+/// the reservation always covers the real allocation.
+const SPOOL_SPLIT_WORKLIST_MAX_ENTRIES: usize = usize::BITS as usize + 4;
+
+/// Peak retained bytes replaying one artifact requires, given the decoded byte
+/// bound replay will reserve and the artifact's line count.
+///
+/// Replay holds, at its peak:
+/// * the single decoded text buffer (`decoded_bound`);
+/// * the line index, one `(start, end)` pair per line;
+/// * the bounded 413 split worklist ([`SPOOL_SPLIT_WORKLIST_MAX_ENTRIES`]);
+/// * one JSONEachRow request body for the chunk in flight, bounded by the
+///   decoded bytes it copies plus one row separator each.
+///
+/// The writer refuses any artifact whose peak exceeds the configured process
+/// ceiling, so an artifact this build publishes is always structurally
+/// replayable under that same ceiling. Ceiling *pressure* stays retryable: the
+/// claim is released and the file replays on a later tick.
+fn spool_replay_peak_bytes(decoded_bound: u64, line_count: usize) -> Option<u64> {
+    let line_count = u64::try_from(line_count).ok()?;
+    let entry_bytes = SPOOL_INDEX_ENTRY_BYTES as u64;
+    decoded_bound
+        .checked_mul(SPOOL_REPLAY_DECODED_COPIES)?
+        // Row separators in the materialized body.
+        .checked_add(line_count)?
+        // The line index.
+        .checked_add(line_count.checked_mul(entry_bytes)?)?
+        // The split worklist.
+        .checked_add((SPOOL_SPLIT_WORKLIST_MAX_ENTRIES as u64).checked_mul(entry_bytes)?)
+}
 /// Bound for the ownership manifest (`spool.meta.json`).
 ///
 /// The manifest is a small fixed-shape record, but it is read *before* this
@@ -147,7 +217,7 @@ const _: () = assert!(SPOOL_MIN_DECOMPRESSED_BYTES <= SPOOL_MAX_ARTIFACT_BYTES);
 /// it is the one managed file a same-UID actor can inflate without first
 /// deriving the owner tag. 64 KiB is orders of magnitude above the real record
 /// and keeps a planted manifest from allocating inside the billing process.
-const SPOOL_MAX_META_BYTES: u64 = 64 * 1024;
+const SPOOL_MAX_META_BYTES: usize = 64 * 1024;
 /// Bound one ClickHouse attempt so the derived cross-process claim lease remains
 /// finite and representable. Ten minutes is already substantially above the
 /// default five-second export timeout.
@@ -246,23 +316,87 @@ impl PendingSnapshotFinalization {
 struct CompactSnapshotRecovery {
     generation: u64,
     plugin_config_id: Arc<str>,
+    /// Serializes the take/write/restore transaction. An empty `events` vector
+    /// is only a durable-success signal while no other retry owns the pending
+    /// set outside the mutex.
+    attempt_lock: Mutex<()>,
     events: Mutex<Vec<ChargeEvent>>,
     retained_bytes: usize,
+    /// Process-wide charge on [`Self::events`], transferred from the Full
+    /// generation's accumulator at compaction and released on drop — that is,
+    /// on durable success, on abandonment, and on process teardown alike.
+    _reservation: GrowableProcessReservation,
     closed_at: Instant,
     spool: Option<Arc<SpoolManager>>,
     metrics: Arc<SinkMetrics>,
 }
 
-impl CompactSnapshotRecovery {
-    fn try_spool(&self) -> bool {
-        let events = {
-            let guard = match self.events.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.clone()
+/// Restores borrowed pending deltas to their [`CompactSnapshotRecovery`] unless
+/// the handoff committed.
+///
+/// Retry must not clone the pending set (an uncharged full-batch copy on every
+/// attempt), and it must not hold the recovery's mutex across the blocking spool
+/// write. Taking ownership for the duration of the attempt satisfies both; this
+/// guard makes the return path unconditional, so a panic or an early return in
+/// between cannot lose a billing delta.
+struct BorrowedPendingDeltas<'a> {
+    recovery: &'a CompactSnapshotRecovery,
+    events: Vec<ChargeEvent>,
+}
+
+impl BorrowedPendingDeltas<'_> {
+    fn events(&self) -> &[ChargeEvent] {
+        &self.events
+    }
+
+    /// Give up ownership after a durable write: nothing is restored.
+    fn commit(mut self) -> usize {
+        let count = self.events.len();
+        self.events = Vec::new();
+        count
+    }
+}
+
+impl Drop for BorrowedPendingDeltas<'_> {
+    fn drop(&mut self) {
+        if self.events.is_empty() {
+            return;
+        }
+        let mut guard = match self.recovery.events.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
         };
-        if events.is_empty() {
+        // A concurrent attempt may have re-published its own set; prepend ours
+        // so ordering across retries stays stable and nothing is discarded.
+        let mut restored = std::mem::take(&mut self.events);
+        restored.append(&mut guard);
+        *guard = restored;
+    }
+}
+
+impl CompactSnapshotRecovery {
+    fn borrow_pending(&self) -> BorrowedPendingDeltas<'_> {
+        let mut guard = match self.events.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        BorrowedPendingDeltas {
+            recovery: self,
+            events: std::mem::take(&mut *guard),
+        }
+    }
+
+    fn try_spool(&self) -> bool {
+        let _attempt_guard = match self.attempt_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Ownership is taken out of the mutex, which is released before any
+        // filesystem work begins. `attempt_lock` remains held until the
+        // borrowed set commits or is restored, so another retry cannot mistake
+        // the temporary empty vector for durable success.
+        let borrowed = self.borrow_pending();
+        if borrowed.events().is_empty() {
             return true;
         }
         let Some(spool) = self.spool.as_ref() else {
@@ -272,7 +406,7 @@ impl CompactSnapshotRecovery {
             );
             return false;
         };
-        if let Err(error) = spool.write_events(&events) {
+        if let Err(error) = spool.write_events(borrowed.events()) {
             self.metrics.spool_available.store(false, Ordering::Release);
             self.metrics.record_failure(
                 FailureReason::Serialize,
@@ -285,11 +419,13 @@ impl CompactSnapshotRecovery {
                 error = %error,
                 "Chargeback sink compact snapshot recovery could not spool pending deltas"
             );
+            // `borrowed` drops here and restores the pending set.
             return false;
         }
+        let delivered = borrowed.commit();
         self.metrics
             .snapshot_emits_total
-            .fetch_add(events.len() as u64, Ordering::Relaxed);
+            .fetch_add(delivered as u64, Ordering::Relaxed);
         true
     }
 }
@@ -490,7 +626,35 @@ async fn finalize_pending_snapshot(pending: &PendingSnapshotFinalization) -> boo
 /// reload or shutdown — can retry after drain. The budget gate is checked
 /// against the current retained estimate *before* any staged overflow is
 /// drained, so a refused compaction never loses events.
+///
+/// Every refusal after preparation restores the staged overflow it borrowed and
+/// leaves the generation's periodic emitter running, so the Full generation is
+/// genuinely retained: it still owns every pending delta exactly once and still
+/// has a live path to durability.
+///
+/// Preparation through publication runs under the generation's `emission_lock`,
+/// the same lock the periodic and final emitters hold across their own
+/// prepare→durable-commit sequence. That makes emission and compaction mutually
+/// exclusive owners of the pending deltas: no emitter can advance the
+/// accumulator baseline in the interval between the deltas compaction prepared
+/// and the moment it publishes them, so the same charge cannot be emitted twice.
 fn compact_snapshot_lifecycle(lifecycle: &SnapshotLifecycle) -> bool {
+    compact_snapshot_lifecycle_measured(lifecycle, None)
+}
+
+/// [`compact_snapshot_lifecycle`] with a test-only override of the *measured*
+/// compact payload size.
+///
+/// Production always passes `None` and measures the real events, so no
+/// production admission decision is relaxed by this parameter. It exists only
+/// so external unit tests can reach the measured-payload-exceeds-projection
+/// branch — which the deliberately conservative projection bound makes
+/// unreachable with honest inputs — and prove that branch keeps the staged
+/// overflow and the generation's retry mechanism.
+fn compact_snapshot_lifecycle_measured(
+    lifecycle: &SnapshotLifecycle,
+    measured_bytes_override: Option<usize>,
+) -> bool {
     // Stop new admissions and require the admitted set to drain before touching
     // full-generation state. `admit()`'s double-checked `accepting` flag means
     // that once we observe `accepting == false`, `in_flight == 0`, and no
@@ -521,12 +685,92 @@ fn compact_snapshot_lifecycle(lifecycle: &SnapshotLifecycle) -> bool {
 
     // Admission is closed and drained; preparing the pending deltas is now
     // race-free against the request path.
-    let Some(events) = lifecycle.prepare_compaction_events() else {
+    //
+    // The remaining race is the generation's own periodic/final emitter, which
+    // is still running: it holds `emission_lock` across its whole
+    // prepare-deltas → durable-spool → advance-baseline sequence. Compaction
+    // therefore takes the same lock *before* it prepares anything and keeps it
+    // until Compact ownership is published and the Full accumulator is cleared.
+    // Aborting the periodic task is not synchronous, so the abort alone cannot
+    // close this window: without the lock an emitter could durably advance the
+    // baseline after compaction snapshotted its deltas, and compaction would
+    // then publish the same deltas a second time.
+    //
+    // Only in-memory work runs under this guard: Full→Compact preparation and
+    // publication perform no filesystem or network I/O.
+    let emission_guard = match lifecycle.emission_lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    // The projection is a second attacker-shaped representation that coexists
+    // with the still-charged accumulator, so it owns its own process-wide
+    // reservation *before* it is built. On refusal the Full generation is
+    // retained untouched, the emission lock is released, and compaction retries
+    // later; nothing is lost.
+    let projection = GrowableProcessReservation::new(process_ceiling());
+    let Some(projection_bound) = lifecycle.delta_projection_bound() else {
+        warn!(
+            plugin = PLUGIN_NAME,
+            generation = lifecycle.generation,
+            "Chargeback sink compaction projection byte bound overflowed; generation retained"
+        );
+        return false;
+    };
+    if !projection.try_grow(projection_bound) {
+        warn!(
+            plugin = PLUGIN_NAME,
+            generation = lifecycle.generation,
+            projection_bound,
+            "Chargeback sink cannot compact failed finalization; {}",
+            PayloadMaterializationError::CeilingExhausted.reason()
+        );
+        return false;
+    }
+    let Some((events, overflow_count, overflow_retained_bytes)) =
+        lifecycle.prepare_compaction_events(&emission_guard)
+    else {
         // Serialize failure: keep the Full generation intact and retry later.
+        // `prepare_compaction_events` already restaged its borrowed overflow.
         return false;
     };
 
-    // Stop the periodic emitter for this generation regardless of outcome.
+    let retained_bytes = measured_bytes_override.unwrap_or_else(|| {
+        events
+            .iter()
+            .map(charge_event_retained_bytes)
+            .fold(0usize, usize::saturating_add)
+    });
+    // Transfer the projection's reservation to the Compact owner and true it up
+    // to the measured retained size. A shortfall is not expected because the
+    // projection bound is conservative, but it must still fail closed: retain
+    // the Full generation and retry later instead of publishing an undercharged
+    // compact recovery.
+    //
+    // This is the last refusal point, so it runs *before* the generation's
+    // periodic emitter is stopped: a refusal must leave both the staged
+    // overflow and the retry mechanism exactly as compaction found them.
+    if retained_bytes <= projection.held() {
+        projection.shrink_by(projection.held().saturating_sub(retained_bytes));
+    } else if !projection.try_grow(retained_bytes.saturating_sub(projection.held())) {
+        warn!(
+            plugin = PLUGIN_NAME,
+            generation = lifecycle.generation,
+            retained_bytes,
+            "Chargeback sink cannot compact failed finalization because its measured recovery payload exceeds the reserved projection; Full generation retained"
+        );
+        // The staged overflow was taken out of the accumulator by preparation
+        // and exists nowhere else; hand it back before dropping `events`.
+        lifecycle.restage_compaction_overflow(events, overflow_count, overflow_retained_bytes);
+        return false;
+    }
+
+    // Past the last refusal point: compaction now commits. Stop the periodic
+    // emitter for this generation. This still runs under `emission_guard`, so
+    // an emitter that was already blocked on the lock (or a blocking worker the
+    // abort cannot cancel) cannot slip between the prepared deltas above and
+    // the publication below; it can only observe the cleared accumulator
+    // afterwards, which yields no events.
     let _ = lifecycle.shutdown_tx.send(true);
     {
         let mut task = match lifecycle.task.lock() {
@@ -541,22 +785,24 @@ fn compact_snapshot_lifecycle(lifecycle: &SnapshotLifecycle) -> bool {
     if events.is_empty() {
         // Nothing pending to hand off; the generation is already durable. Retire
         // it as a successful finalization rather than leaking a Full entry.
+        lifecycle.accumulator.clear_for_compaction();
         lifecycle.finalized.store(true, Ordering::Release);
         unregister_full_snapshot_generation(lifecycle.generation);
+        // Release this generation's emission lock before compacting *other*
+        // generations, so no two emission locks are ever held at once.
+        drop(emission_guard);
         enforce_full_pending_finalization_bound(lifecycle.generation);
         invalidate_status_cache();
         return true;
     }
 
-    let retained_bytes = events
-        .iter()
-        .map(charge_event_retained_bytes)
-        .fold(0usize, usize::saturating_add);
     let recovery = Arc::new(CompactSnapshotRecovery {
         generation: lifecycle.generation,
         plugin_config_id: Arc::clone(&lifecycle.runtime.plugin_config_id),
+        attempt_lock: Mutex::new(()),
         events: Mutex::new(events),
         retained_bytes,
+        _reservation: projection,
         closed_at: Instant::now(),
         spool: lifecycle.runtime.spool.clone(),
         metrics: Arc::clone(&lifecycle.runtime.metrics),
@@ -576,6 +822,11 @@ fn compact_snapshot_lifecycle(lifecycle: &SnapshotLifecycle) -> bool {
     }
     lifecycle.compacted.store(true, Ordering::Release);
     lifecycle.accumulator.clear_for_compaction();
+    // Compact ownership is published and Full state is cleared; from here an
+    // emission can safely run again — it observes an empty accumulator and
+    // emits nothing. Release before compacting other generations so no two
+    // emission locks are ever held at once.
+    drop(emission_guard);
     enforce_full_pending_finalization_bound(lifecycle.generation);
     invalidate_status_cache();
     true
@@ -975,6 +1226,15 @@ pub struct ApiChargebackSinkConfig {
     pub bandwidth_pricing: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_connection_pricing: Option<Value>,
+    /// Inline transaction-log schema projecting the exported charge event.
+    /// Validated and compiled by [`resolve_schema`]; retained here only so the
+    /// `deny_unknown_fields` config struct admits the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Value>,
+    /// Named schema reference resolved against the global
+    /// `transaction_log_schema` registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_ref: Option<String>,
 }
 
 impl Default for ApiChargebackSinkConfig {
@@ -993,6 +1253,8 @@ impl Default for ApiChargebackSinkConfig {
             pricing_tiers: None,
             bandwidth_pricing: None,
             stream_connection_pricing: None,
+            schema: None,
+            schema_ref: None,
         }
     }
 }
@@ -1037,6 +1299,226 @@ pub struct ChargeEvent {
     pub snapshot_id: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Charge-event schema projection
+// ---------------------------------------------------------------------------
+
+/// Worst-case rendered bytes of a derived value for this family.
+///
+/// `backend_host` (the only unbounded derived kind) is rejected at compile time
+/// for the charge-event family, so every derived value is one of the fixed
+/// tokens `"1xx"`…`"other"`, `"ok"` / `"error"`, or `"charge_event"`.
+const MAX_DERIVED_VALUE_BYTES: usize = 24;
+
+/// `"key":value,` framing charged on top of an added member's key and value.
+const JSON_MEMBER_FRAMING_BYTES: usize = 4;
+
+/// A compiled charge-event projection plus the extra worst-case bytes one
+/// projected row costs beyond its native rendering.
+///
+/// The retained-byte reservation for a JSONEachRow body is taken **before** a
+/// single byte is serialized, so the bound has to account for renamed keys and
+/// injected static / derived members up front. The overhead is computed once at
+/// construction — never on a flush path — and a schema whose overhead cannot be
+/// bounded fails closed at construction rather than blowing the reservation
+/// later.
+#[derive(Debug)]
+pub struct ChargeEventProjection {
+    schema: Arc<SummarySchema>,
+    row_overhead_bytes: usize,
+}
+
+impl ChargeEventProjection {
+    fn new(schema: Arc<SummarySchema>) -> Result<Self, String> {
+        let row_overhead_bytes = projection_row_overhead_bytes(&schema).ok_or_else(|| {
+            format!("{PLUGIN_NAME}: schema adds an unboundable number of bytes per exported row")
+        })?;
+        Ok(Self {
+            schema,
+            row_overhead_bytes,
+        })
+    }
+
+    /// The compiled schema. Test-visible so parity assertions can inspect it.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn schema(&self) -> &SummarySchema {
+        &self.schema
+    }
+
+    /// Worst-case extra bytes one projected row costs.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn row_overhead_bytes(&self) -> usize {
+        self.row_overhead_bytes
+    }
+}
+
+/// Resolve and compile a charge-event projection straight from a raw plugin
+/// config. Test-facing mirror of what the constructor does.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn compile_charge_event_projection(
+    config: &Value,
+) -> Result<Option<ChargeEventProjection>, String> {
+    match resolve_schema(config, PLUGIN_NAME, SchemaCapabilities::API_CHARGEBACK_SINK)? {
+        Some(schema) => ChargeEventProjection::new(schema).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Worst-case JSON cost of an output key, assuming maximal escaping.
+fn json_key_bound(key: &str) -> Option<usize> {
+    key.len()
+        .checked_mul(JSON_STRING_WORST_CASE_EXPANSION)?
+        .checked_add(2)
+}
+
+/// Worst-case extra bytes a compiled schema adds to one serialized row.
+///
+/// Omissions and shortened rename targets only shrink the row, so they are
+/// deliberately not credited back — the result is an upper bound.
+fn projection_row_overhead_bytes(schema: &SummarySchema) -> Option<usize> {
+    let mut extra: usize = 0;
+    for spec in &schema.fields {
+        match spec {
+            FieldSpec::Native { out_key, .. } => {
+                extra = extra.checked_add(json_key_bound(out_key)?)?;
+            }
+            FieldSpec::Static { out_key, value } => {
+                let rendered = serde_json::to_string(value).ok()?;
+                extra = extra
+                    .checked_add(json_key_bound(out_key)?)?
+                    .checked_add(rendered.len())?
+                    .checked_add(JSON_MEMBER_FRAMING_BYTES)?;
+            }
+            FieldSpec::Derived { out_key, .. } => {
+                extra = extra
+                    .checked_add(json_key_bound(out_key)?)?
+                    .checked_add(MAX_DERIVED_VALUE_BYTES)?
+                    .checked_add(JSON_MEMBER_FRAMING_BYTES)?;
+            }
+        }
+    }
+    Some(extra)
+}
+
+impl SchemaSerializable for ChargeEvent {
+    fn owns_native(&self, source: &str) -> bool {
+        crate::plugins::utils::log_schema::CHARGE_EVENT_FIELDS
+            .iter()
+            .any(|field| field.name == source)
+    }
+
+    fn serialize_native<S>(
+        &self,
+        source: &'static str,
+        out_key: &str,
+        _ts_format: TimestampFormat,
+        map: &mut S,
+    ) -> Result<(), S::Error>
+    where
+        S: serde::ser::SerializeMap,
+    {
+        // Optional members preserve their native `skip_serializing_if` shape so
+        // a projected row and a native row agree on presence, not just naming.
+        match source {
+            "event_id" => map.serialize_entry(out_key, &self.event_id),
+            "received_at" => map.serialize_entry(out_key, &self.received_at),
+            "node_id" => map.serialize_entry(out_key, &self.node_id),
+            "namespace" => map.serialize_entry(out_key, &self.namespace),
+            "consumer_id" => map.serialize_entry(out_key, &self.consumer_id),
+            "consumer_name" => match &self.consumer_name {
+                Some(value) => map.serialize_entry(out_key, value),
+                None => Ok(()),
+            },
+            "proxy_id" => map.serialize_entry(out_key, &self.proxy_id),
+            "proxy_name" => map.serialize_entry(out_key, &self.proxy_name),
+            "route_id" => match &self.route_id {
+                Some(value) => map.serialize_entry(out_key, value),
+                None => Ok(()),
+            },
+            "status_code" => map.serialize_entry(out_key, &self.status_code),
+            "http_status_code" => match &self.http_status_code {
+                Some(value) => map.serialize_entry(out_key, value),
+                None => Ok(()),
+            },
+            "grpc_status" => match &self.grpc_status {
+                Some(value) => map.serialize_entry(out_key, value),
+                None => Ok(()),
+            },
+            "protocol" => map.serialize_entry(out_key, &self.protocol),
+            "call_count" => map.serialize_entry(out_key, &self.call_count),
+            "charge_call" => map.serialize_entry(out_key, &self.charge_call),
+            "bytes_sent" => map.serialize_entry(out_key, &self.bytes_sent),
+            "bytes_received" => map.serialize_entry(out_key, &self.bytes_received),
+            "charge_bytes_sent" => map.serialize_entry(out_key, &self.charge_bytes_sent),
+            "charge_bytes_received" => map.serialize_entry(out_key, &self.charge_bytes_received),
+            "charge_total" => map.serialize_entry(out_key, &self.charge_total),
+            "currency" => map.serialize_entry(out_key, &self.currency),
+            "pricing_version" => map.serialize_entry(out_key, &self.pricing_version),
+            "request_id" => match &self.request_id {
+                Some(value) => map.serialize_entry(out_key, value),
+                None => Ok(()),
+            },
+            "trace_id" => match &self.trace_id {
+                Some(value) => map.serialize_entry(out_key, value),
+                None => Ok(()),
+            },
+            "snapshot_id" => match &self.snapshot_id {
+                Some(value) => map.serialize_entry(out_key, value),
+                None => Ok(()),
+            },
+            _ => Ok(()),
+        }
+    }
+
+    fn serialize_derived<S>(
+        &self,
+        kind: DerivedKind,
+        out_key: &str,
+        map: &mut S,
+    ) -> Result<bool, S::Error>
+    where
+        S: serde::ser::SerializeMap,
+    {
+        match kind {
+            DerivedKind::StatusClass => {
+                map.serialize_entry(out_key, status_class(self.status_code))?;
+                Ok(true)
+            }
+            DerivedKind::SummaryKind => {
+                map.serialize_entry(out_key, "charge_event")?;
+                Ok(true)
+            }
+            DerivedKind::Outcome => {
+                let is_error =
+                    self.status_code >= 500 || self.grpc_status.is_some_and(|status| status != 0);
+                map.serialize_entry(out_key, if is_error { "error" } else { "ok" })?;
+                Ok(true)
+            }
+            // Rejected at compile time for this family — a charge event has no
+            // backend target to extract a host from.
+            DerivedKind::BackendHost => Ok(false),
+        }
+    }
+
+    fn serialize_metadata<S>(
+        &self,
+        _policy: &MetadataPolicy,
+        _emitted: &mut std::collections::HashSet<String>,
+        _map: &mut S,
+    ) -> Result<(), S::Error>
+    where
+        S: serde::ser::SerializeMap,
+    {
+        // Charge events carry no metadata map; the compiler rejects a
+        // `metadata` policy for this family, so the default `Nested` policy is
+        // the only value that reaches here and it has nothing to emit.
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct SinkSummary {
     mode: SinkMode,
@@ -1078,6 +1560,10 @@ fn worst_case_inter_attempt_delay_ms(
 pub struct ApiChargebackSink {
     pricing: PricingConfig,
     config: Arc<ApiChargebackSinkConfig>,
+    /// Compiled charge-event projection resolved at construction. `None` keeps
+    /// the exported JSONEachRow representation byte-for-byte native with no
+    /// added allocation.
+    projection: Option<Arc<ChargeEventProjection>>,
     node_id: Arc<str>,
     /// Stable plugin-config resource id used for accepted-generation
     /// observability. Production cache supplies `PluginConfig.id`; standalone
@@ -1195,6 +1681,9 @@ impl SnapshotOverflowJob {
         if self.durable {
             return;
         }
+        // Held for the whole restage when the payload had to be copied out of a
+        // shared handle, so the transient copy is never uncharged.
+        let mut clone_reservation: Option<ProcessByteReservation> = None;
         let events = if !self.queued_events.is_empty() {
             std::mem::take(&mut self.queued_events)
                 .into_iter()
@@ -1203,7 +1692,26 @@ impl SnapshotOverflowJob {
         } else if let Some(events) = self.recovery_events.take() {
             match Arc::try_unwrap(events) {
                 Ok(events) => events,
-                Err(events) => events.as_ref().clone(),
+                Err(events) => {
+                    // A blocking write task that panicked or was cancelled can
+                    // still hold the other handle. Cloning is the only way to
+                    // recover the payload, and the clone coexists with it, so
+                    // it is reserved before it is allocated.
+                    let bytes = events
+                        .iter()
+                        .map(charge_event_retained_bytes)
+                        .fold(0usize, usize::saturating_add);
+                    let Some(reservation) = ProcessByteReservation::try_acquire(bytes) else {
+                        self.metrics.record_spool_job_loss(
+                            self.event_count as u64,
+                            "snapshot overflow restage refused by the retained-byte ceiling",
+                        );
+                        self.durable = true;
+                        return;
+                    };
+                    clone_reservation = Some(reservation);
+                    events.as_ref().clone()
+                }
             }
         } else {
             self.metrics.record_failure(
@@ -1214,6 +1722,7 @@ impl SnapshotOverflowJob {
             return;
         };
         stage_overflow_events_or_reject(&self.accumulator, &self.metrics, self.generation, events);
+        drop(clone_reservation);
         self.durable = true;
     }
 }
@@ -1574,14 +2083,39 @@ impl SnapshotLifecycle {
         self.accumulator.retained_bytes() as u64
     }
 
-    fn prepare_compaction_events(&self) -> Option<Vec<ChargeEvent>> {
-        let _emission_guard = match self.emission_lock.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+    /// Conservative process-ceiling bound for the delta projection this
+    /// generation would produce, computed before anything is allocated.
+    fn delta_projection_bound(&self) -> Option<usize> {
+        self.accumulator
+            .delta_projection_bound(snapshot_event_extra_bytes(&self.config, &self.node_id))
+    }
+
+    /// Build the compact payload, returning it with the number of leading
+    /// events that came from staged overflow.
+    ///
+    /// The staged overflow is *taken*, not cloned, so it has no other
+    /// authoritative copy while the returned vector is alive. Every caller path
+    /// that does not reach the compact publication point must hand it back
+    /// through [`Self::restage_compaction_overflow`].
+    ///
+    /// The caller must already hold this generation's `emission_lock` and must
+    /// keep holding it until compaction either publishes these deltas or
+    /// restages them: the prepared set is only race-free against the periodic
+    /// and final emitters for as long as that guard is alive. The guard is
+    /// taken by reference purely as a compile-time witness of that requirement.
+    fn prepare_compaction_events(
+        &self,
+        _emission_guard: &MutexGuard<'_, ()>,
+    ) -> Option<(Vec<ChargeEvent>, usize, usize)> {
         let snapshot_id = new_ulid();
         let received_at = unix_timestamp_nanos();
-        let mut events = self.accumulator.peek_overflow_pending();
+        // Compaction owns the staged overflow going forward, so take it rather
+        // than cloning it: a clone would be a second uncharged full-batch copy
+        // that coexists with the still-staged originals.
+        let taken = self.accumulator.take_overflow_pending();
+        let overflow_count = taken.events.len();
+        let overflow_retained_bytes = taken.retained_bytes;
+        let mut events = taken.events;
         match self.accumulator.prepare_deltas(
             &self.config,
             &self.node_id,
@@ -1590,23 +2124,40 @@ impl SnapshotLifecycle {
         ) {
             Ok(prepared) => {
                 events.extend(prepared.events);
-                // Compaction owns these events going forward; drop staged
-                // overflow so they are not double-emitted if a later compact
-                // retry races a resurrected full lifecycle.
-                if !self.accumulator.peek_overflow_pending().is_empty() {
-                    let _ = self.accumulator.take_overflow_pending();
-                }
-                Some(events)
+                Some((events, overflow_count, overflow_retained_bytes))
             }
             Err(error) => {
                 self.runtime
                     .metrics
                     .record_failure(FailureReason::Serialize, error);
                 // Keep the full generation intact: compacting only the staged
-                // overflow would clear accumulator totals that failed to serialize.
+                // overflow would clear accumulator totals that failed to
+                // serialize. Return the borrowed overflow to bounded staging so
+                // no pending billing delta is lost on this path.
+                self.restage_compaction_overflow(events, overflow_count, overflow_retained_bytes);
                 None
             }
         }
+    }
+
+    /// Give the borrowed staged overflow back to bounded staging.
+    ///
+    /// `SnapshotLifecycle::generation` is `runtime.generation`, so this is the
+    /// same restore the periodic and final emitters use. The byte reservation
+    /// remains continuously charged while the events are borrowed, so restore
+    /// cannot be refused by unrelated process-wide ceiling pressure.
+    fn restage_compaction_overflow(
+        &self,
+        events: Vec<ChargeEvent>,
+        overflow_count: usize,
+        overflow_retained_bytes: usize,
+    ) {
+        restage_borrowed_overflow(
+            &self.accumulator,
+            events,
+            overflow_count,
+            overflow_retained_bytes,
+        );
     }
 
     async fn finalize_attempt(&self, deadline: Instant) -> bool {
@@ -2049,6 +2600,13 @@ struct ClickHouseFlushConfig {
     password: Option<String>,
     timeout: Duration,
     metrics: Arc<SinkMetrics>,
+    /// Retained-byte ceiling the JSONEachRow request body is charged to. The
+    /// queued `ChargeEvent`s already hold a per-instance lease; the serialized
+    /// body is a second attacker-shaped copy that coexists with them.
+    ceiling: &'static RetainedByteCeiling,
+    /// Compiled charge-event projection for the emitted representation.
+    /// `None` keeps the native JSONEachRow rows byte-for-byte.
+    projection: Option<Arc<ChargeEventProjection>>,
 }
 
 #[derive(Clone)]
@@ -2106,13 +2664,17 @@ impl ApiChargebackSink {
         if !raw_config.is_object() {
             return Err(format!("{PLUGIN_NAME}: config must be an object"));
         }
-        if raw_config.get("schema").is_some() || raw_config.get("schema_ref").is_some() {
-            return Err(format!(
-                "{PLUGIN_NAME}: 'schema' / 'schema_ref' is not supported \
-                 (transaction-log schema customization applies only to log-shipping plugins; \
-                 see docs/plugins.md)"
-            ));
-        }
+        // Compile / resolve once here — never on a flush path. `schema_ref`
+        // keeps the global-first lifecycle and fails closed when the named
+        // definition is missing or is not representable for charge events.
+        let projection = match resolve_schema(
+            raw_config,
+            PLUGIN_NAME,
+            SchemaCapabilities::API_CHARGEBACK_SINK,
+        )? {
+            Some(schema) => Some(Arc::new(ChargeEventProjection::new(schema)?)),
+            None => None,
+        };
 
         let plugin_config_id = match plugin_config_id {
             Some(id) if id.trim().is_empty() => {
@@ -2155,6 +2717,7 @@ impl ApiChargebackSink {
         Ok(Self {
             pricing,
             config: Arc::new(config),
+            projection,
             node_id: Arc::<str>::from(resolve_node_id()),
             plugin_config_id,
             ferrum_namespace,
@@ -2207,10 +2770,14 @@ impl ApiChargebackSink {
                 self.config.spool.clone(),
                 owner,
                 generation,
-                Arc::clone(&metrics),
-                STALE_TEMP_AGE_SECS,
-                spool_claim_lease_secs(&self.config),
-                SpoolFsOps::REAL,
+                SpoolManagerOptions {
+                    metrics: Arc::clone(&metrics),
+                    stale_temp_age_secs: STALE_TEMP_AGE_SECS,
+                    claim_lease_secs: spool_claim_lease_secs(&self.config),
+                    fs_ops: SpoolFsOps::REAL,
+                    ceiling: process_ceiling(),
+                    projection: self.projection.clone(),
+                },
             )?))
         } else {
             None
@@ -2224,6 +2791,8 @@ impl ApiChargebackSink {
             password,
             timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
             metrics: Arc::clone(&metrics),
+            ceiling: process_ceiling(),
+            projection: self.projection.clone(),
         };
 
         let snapshot_events_are_pre_spooled = self.config.mode == SinkMode::Snapshot;
@@ -2365,6 +2934,8 @@ impl ApiChargebackSink {
                     password: flush_config.password.clone(),
                     timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
                     metrics: Arc::clone(&runtime.metrics),
+                    ceiling: process_ceiling(),
+                    projection: self.projection.clone(),
                 },
                 self.config.batch.size,
                 self.config.spool.replay_interval_secs,
@@ -2679,6 +3250,86 @@ impl ApiChargebackSink {
         let compacted_after_drain = lifecycle.compacted.load(Ordering::Acquire)
             || compact_recovery_for_generation(lifecycle.generation).is_some();
         Some((refused_while_held, compacted_after_drain))
+    }
+
+    /// Drive Full→Compact with a forced measured-payload overshoot so the
+    /// fail-closed projection-shortfall branch is exercised.
+    ///
+    /// Returns `(compacted, overflow_pending_len, periodic_task_alive)` observed
+    /// after the attempt. A correct refusal reports
+    /// `(false, <what was staged>, true)`: the generation kept the staged
+    /// overflow it borrowed and kept its retry mechanism.
+    #[allow(dead_code)]
+    pub(crate) fn compact_projection_shortfall_for_tests(&self) -> Option<(bool, usize, bool)> {
+        let lifecycle = self.snapshot_lifecycle.get()?;
+        lifecycle.commit();
+        let compacted = compact_snapshot_lifecycle_measured(lifecycle, Some(usize::MAX));
+        let task_alive = {
+            let task = match lifecycle.task.lock() {
+                Ok(task) => task,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            task.is_some()
+        };
+        Some((
+            compacted || compact_recovery_for_generation(lifecycle.generation).is_some(),
+            lifecycle.accumulator.overflow_pending_len(),
+            task_alive,
+        ))
+    }
+
+    /// Prove emission and Full→Compact compaction are mutually exclusive owners
+    /// of a generation's pending deltas.
+    ///
+    /// This holds the generation's emission lock — exactly what
+    /// `emit_periodic_snapshot` / `emit_final_snapshot_to_spool` hold across
+    /// their whole prepare→durable-commit sequence — while a worker thread runs
+    /// the entire compaction sequence. Compaction must not be able to reach its
+    /// commit while that lock is held, and must complete once it is released.
+    ///
+    /// Returns `(blocked_while_emission_held, compacted_after_release)`; the
+    /// correct observation is `(true, true)`. One mutex guards both directions,
+    /// so this equally proves an emission cannot enter compaction's
+    /// prepare→publish interval.
+    #[allow(dead_code)]
+    pub(crate) fn compact_excluded_by_emission_lock_for_tests(
+        &self,
+        hold: Duration,
+    ) -> Option<(bool, bool)> {
+        let lifecycle = Arc::clone(self.snapshot_lifecycle.get()?);
+        lifecycle.commit();
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let emission_guard = match lifecycle.emission_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let worker = std::thread::spawn({
+            let lifecycle = Arc::clone(&lifecycle);
+            let started = Arc::clone(&started);
+            let finished = Arc::clone(&finished);
+            move || {
+                started.store(true, Ordering::Release);
+                let compacted = compact_snapshot_lifecycle(&lifecycle);
+                finished.store(true, Ordering::Release);
+                compacted
+            }
+        });
+        // Only assert on blocking once the worker is actually running, so the
+        // observation is about the lock rather than thread start-up latency.
+        let spin_deadline = Instant::now() + hold;
+        while !started.load(Ordering::Acquire) && Instant::now() < spin_deadline {
+            std::thread::yield_now();
+        }
+        let running = started.load(Ordering::Acquire);
+        std::thread::sleep(hold);
+        let blocked_while_held = running && !finished.load(Ordering::Acquire);
+        drop(emission_guard);
+        let compacted = worker.join().unwrap_or(false);
+        Some((
+            blocked_while_held,
+            compacted || compact_recovery_for_generation(lifecycle.generation).is_some(),
+        ))
     }
 }
 
@@ -3697,12 +4348,138 @@ impl ClickHouseAckIncomplete {
     }
 }
 
+/// Fixed JSONEachRow row framing plus the compile-time field-name set one
+/// serialized charge event costs beyond its own retained strings.
+const CHARGE_ROW_JSON_OVERHEAD_BYTES: usize = 1_024;
+
+/// Conservative upper bound on the JSONEachRow request body for `batch`.
+///
+/// Charge-event strings are raw, so JSON escaping can expand each byte six-fold.
+fn charge_body_byte_bound(
+    batch: &[ChargeEvent],
+    projection: Option<&ChargeEventProjection>,
+) -> Option<usize> {
+    // A projection can only ADD bytes per row (renamed keys, injected static /
+    // derived members). The per-row surcharge is precomputed at construction so
+    // the reservation still precedes serialization.
+    let projection_row_bytes = projection.map_or(0, |p| p.row_overhead_bytes);
+    let mut total = CHARGE_ROW_JSON_OVERHEAD_BYTES;
+    for event in batch {
+        total = total
+            .checked_add(
+                charge_event_retained_bytes(event).checked_mul(JSON_STRING_WORST_CASE_EXPANSION)?,
+            )?
+            .checked_add(CHARGE_ROW_JSON_OVERHEAD_BYTES)?
+            .checked_add(projection_row_bytes)?;
+    }
+    Some(total)
+}
+
+/// Serialize `batch` into the reserved-and-charged JSONEachRow request body.
+///
+/// The queued events still hold their per-instance leases here, so the body is a
+/// second attacker-shaped copy: it is reserved against the retained-byte ceiling
+/// before serialization and stays charged until the request (and every retry
+/// handle taken from it) is gone.
+fn materialize_charge_body(
+    cfg: &ClickHouseFlushConfig,
+    batch: &[ChargeEvent],
+) -> Result<ReservedPayload, String> {
+    materialize_json_each_row(cfg.ceiling, batch, cfg.projection.as_deref())
+}
+
+/// Reject a batch whose charges cannot be represented in JSON before any
+/// attacker-shaped representation of it is allocated.
+fn validate_charge_batch(batch: &[ChargeEvent]) -> Result<(), String> {
+    for event in batch {
+        for (field, value) in [
+            ("charge_call", event.charge_call),
+            ("charge_bytes_sent", event.charge_bytes_sent),
+            ("charge_bytes_received", event.charge_bytes_received),
+            ("charge_total", event.charge_total),
+        ] {
+            require_finite_charge(value, field).map_err(|error| {
+                format!(
+                    "{PLUGIN_NAME}: event '{}' cannot be serialized: {error}",
+                    event.event_id
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Write `batch` as JSONEachRow into `writer` without ever building an
+/// intermediate owned row `String`.
+/// This is the single funnel every externally emitted charge-event
+/// representation goes through — the HTTP INSERT body and the durable spool
+/// artifact alike — so the projection is applied here exactly once. The spool
+/// artifact is a durable copy of the delivery body and is replayed verbatim, so
+/// a file written before a schema change replays under the schema in force when
+/// it was written. Internal identities (`SnapshotEntry` keys, spool ownership,
+/// accumulator keys) never pass through here and are untouched by projection.
+fn write_json_each_row<W: Write>(
+    writer: &mut W,
+    batch: &[ChargeEvent],
+    projection: Option<&ChargeEventProjection>,
+) -> Result<(), String> {
+    for (index, event) in batch.iter().enumerate() {
+        if index > 0 {
+            writer
+                .write_all(b"\n")
+                .map_err(|error| format!("failed to write row separator: {error}"))?;
+        }
+        let result = match projection {
+            None => serde_json::to_writer(&mut *writer, event),
+            Some(projection) => serde_json::to_writer(
+                &mut *writer,
+                &SchemaView {
+                    summary: event,
+                    schema: &projection.schema,
+                },
+            ),
+        };
+        result.map_err(|error| format!("failed to serialize charge event: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Serialize `batch` into a JSONEachRow payload whose allocation is reserved
+/// against `ceiling` before a single byte is written and stays charged for the
+/// payload's whole life.
+///
+/// Every producer of an attacker-shaped JSONEachRow representation — the HTTP
+/// delivery body and the durable spool artifact alike — goes through here, so
+/// no caller can serialize first and measure afterwards.
+fn materialize_json_each_row(
+    ceiling: &'static RetainedByteCeiling,
+    batch: &[ChargeEvent],
+    projection: Option<&ChargeEventProjection>,
+) -> Result<ReservedPayload, String> {
+    validate_charge_batch(batch)?;
+    let bound = charge_body_byte_bound(batch, projection).ok_or_else(|| {
+        format!(
+            "{PLUGIN_NAME}: {}",
+            PayloadMaterializationError::BoundOverflowed.reason()
+        )
+    })?;
+    materialize_reserved_payload(ceiling, bound, |writer| {
+        write_json_each_row(writer, batch, projection)
+    })
+    .map_err(|error| format!("{PLUGIN_NAME}: {}", error.reason()))
+}
+
 async fn send_batch(cfg: &ClickHouseFlushConfig, batch: Vec<ChargeEvent>) -> Result<(), String> {
-    let body = serialize_json_each_row(&batch).inspect_err(|error| {
+    let event_count = batch.len();
+    let body = materialize_charge_body(cfg, &batch).inspect_err(|error| {
         cfg.metrics
             .record_failure(FailureReason::Serialize, error.clone());
     })?;
-    match post_json_each_row(cfg, body, batch.len()).await {
+    // The reserved body is the only representation delivery needs; the events
+    // themselves are released here so peak retention is the queue's leases plus
+    // one bounded body rather than the queue plus per-attempt copies.
+    drop(batch);
+    match post_json_each_row(cfg, body, event_count).await {
         DeliveryOutcome::Delivered => Ok(()),
         other => Err(other.safe_message().to_string()),
     }
@@ -3710,7 +4487,7 @@ async fn send_batch(cfg: &ClickHouseFlushConfig, batch: Vec<ChargeEvent>) -> Res
 
 async fn post_json_each_row(
     cfg: &ClickHouseFlushConfig,
-    body: String,
+    body: ReservedPayload,
     event_count: usize,
 ) -> DeliveryOutcome {
     let start = Instant::now();
@@ -3720,7 +4497,8 @@ async fn post_json_each_row(
     }
     .timeout(cfg.timeout)
     .header(CONTENT_TYPE, "application/json")
-    .body(body);
+    // Refcount handle on the reserved body: no second copy per attempt.
+    .body(body.bytes());
     if let Some(username) = cfg.username.as_deref() {
         request = request.basic_auth(username, cfg.password.clone());
     }
@@ -3934,30 +4712,33 @@ fn replay_split_len(len: usize, batch_size: usize) -> usize {
     preferred.min(len - 1)
 }
 
+/// Serialize `batch` into an owned JSONEachRow `String`.
+///
+/// Production never uses this shape: the resulting `String` outlives any
+/// retained-byte reservation, which is exactly the uncharged materialization
+/// [`materialize_json_each_row`] exists to prevent. External unit tests use it
+/// to build expected wire bytes.
+#[allow(dead_code)]
 pub fn serialize_json_each_row(batch: &[ChargeEvent]) -> Result<String, String> {
-    let mut output = String::new();
-    for (idx, event) in batch.iter().enumerate() {
-        for (field, value) in [
-            ("charge_call", event.charge_call),
-            ("charge_bytes_sent", event.charge_bytes_sent),
-            ("charge_bytes_received", event.charge_bytes_received),
-            ("charge_total", event.charge_total),
-        ] {
-            require_finite_charge(value, field).map_err(|error| {
-                format!(
-                    "{PLUGIN_NAME}: event '{}' cannot be serialized: {error}",
-                    event.event_id
-                )
-            })?;
-        }
-        if idx > 0 {
-            output.push('\n');
-        }
-        let row = serde_json::to_string(event)
-            .map_err(|error| format!("{PLUGIN_NAME}: failed to serialize charge event: {error}"))?;
-        output.push_str(&row);
-    }
-    Ok(output)
+    serialize_json_each_row_projected(batch, None)
+}
+
+/// [`serialize_json_each_row`] under an optional compiled projection.
+///
+/// External unit tests use this to assert that a projected wire representation
+/// matches the operator's schema while the native shape is unchanged.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn serialize_json_each_row_projected(
+    batch: &[ChargeEvent],
+    projection: Option<&ChargeEventProjection>,
+) -> Result<String, String> {
+    validate_charge_batch(batch)?;
+    let mut output: Vec<u8> = Vec::new();
+    write_json_each_row(&mut output, batch, projection)
+        .map_err(|error| format!("{PLUGIN_NAME}: {error}"))?;
+    String::from_utf8(output)
+        .map_err(|error| format!("{PLUGIN_NAME}: failed to serialize charge event: {error}"))
 }
 
 fn classify_reqwest_failure(error: &reqwest::Error) -> FailureReason {
@@ -5152,6 +5933,25 @@ pub struct SpoolManager {
     claim_lease_secs: u64,
     /// Durable-write steps; production always uses [`SpoolFsOps::REAL`].
     fs_ops: SpoolFsOps,
+    /// Retained-byte ceiling every spool-write materialization is charged to.
+    /// Queued events still hold their per-instance export leases while the
+    /// serialized (and optionally compressed) artifact exists, so both are
+    /// attacker-shaped copies that must be reserved before they are built.
+    ceiling: &'static RetainedByteCeiling,
+    /// Charge-event projection applied to the durable artifact.
+    projection: Option<Arc<ChargeEventProjection>>,
+}
+
+struct SpoolManagerOptions {
+    metrics: Arc<SinkMetrics>,
+    stale_temp_age_secs: u64,
+    claim_lease_secs: u64,
+    fs_ops: SpoolFsOps,
+    ceiling: &'static RetainedByteCeiling,
+    /// Projection applied to the durable spool artifact. The spool is a durable
+    /// copy of the delivery body and is replayed verbatim, so it must carry the
+    /// same representation the live INSERT path emits.
+    projection: Option<Arc<ChargeEventProjection>>,
 }
 
 impl SpoolManager {
@@ -5159,10 +5959,7 @@ impl SpoolManager {
         cfg: SpoolSettings,
         owner: SpoolOwner,
         generation: u64,
-        metrics: Arc<SinkMetrics>,
-        stale_temp_age_secs: u64,
-        claim_lease_secs: u64,
-        fs_ops: SpoolFsOps,
+        options: SpoolManagerOptions,
     ) -> Result<Self, String> {
         let namespace_root = build_namespace_root(&cfg.dir, &owner)?;
         Ok(Self {
@@ -5171,20 +5968,41 @@ impl SpoolManager {
             generation,
             namespace_root,
             canonical_root: OnceLock::new(),
-            metrics,
+            metrics: options.metrics,
             last_drop_warn_at: AtomicI64::new(0),
             last_unbound_warn_at: AtomicI64::new(0),
             live_storage_prepared: AtomicBool::new(false),
             write_lock: Mutex::new(()),
-            stale_temp_age_secs,
-            claim_lease_secs,
-            fs_ops,
+            stale_temp_age_secs: options.stale_temp_age_secs,
+            claim_lease_secs: options.claim_lease_secs,
+            fs_ops: options.fs_ops,
+            ceiling: options.ceiling,
+            projection: options.projection,
         })
     }
 
     #[allow(dead_code)] // external unit tests only
     pub fn for_tests(cfg: SpoolSettings, node_id: &str) -> Result<Self, String> {
         Self::for_tests_with_owner(cfg, &default_test_spool_owner_spec(node_id), 1)
+    }
+
+    /// [`Self::for_tests`] bound to a test-owned retained-byte ceiling.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn for_tests_with_ceiling(
+        cfg: SpoolSettings,
+        node_id: &str,
+        ceiling: &'static RetainedByteCeiling,
+    ) -> Result<Self, String> {
+        Self::for_tests_with_owner_faults_ages_and_ceiling(
+            cfg,
+            &default_test_spool_owner_spec(node_id),
+            1,
+            SpoolFsFault::None,
+            0,
+            SPOOL_CLAIM_LEASE_MIN_SECS,
+            ceiling,
+        )
     }
 
     #[doc(hidden)]
@@ -5230,14 +6048,44 @@ impl SpoolManager {
         stale_temp_age_secs: u64,
         claim_lease_secs: u64,
     ) -> Result<Self, String> {
+        Self::for_tests_with_owner_faults_ages_and_ceiling(
+            cfg,
+            spec,
+            generation,
+            fault,
+            stale_temp_age_secs,
+            claim_lease_secs,
+            process_ceiling(),
+        )
+    }
+
+    /// Same as [`Self::for_tests_with_owner_faults_and_ages`] against a
+    /// test-owned retained-byte ceiling, so write-side reservation and refusal
+    /// assertions stay exact while other tests in the same binary reserve
+    /// against the process-global counter.
+    #[doc(hidden)]
+    #[allow(dead_code, clippy::too_many_arguments)] // external unit tests only
+    pub fn for_tests_with_owner_faults_ages_and_ceiling(
+        cfg: SpoolSettings,
+        spec: &SpoolOwnerSpec<'_>,
+        generation: u64,
+        fault: SpoolFsFault,
+        stale_temp_age_secs: u64,
+        claim_lease_secs: u64,
+        ceiling: &'static RetainedByteCeiling,
+    ) -> Result<Self, String> {
         let manager = Self::new(
             cfg,
             spec.to_owner(),
             generation,
-            Arc::new(SinkMetrics::default()),
-            stale_temp_age_secs,
-            claim_lease_secs,
-            SpoolFsOps::REAL,
+            SpoolManagerOptions {
+                metrics: Arc::new(SinkMetrics::default()),
+                stale_temp_age_secs,
+                claim_lease_secs,
+                fs_ops: SpoolFsOps::REAL,
+                ceiling,
+                projection: None,
+            },
         )?;
         // Test callers model a committed/live sink and retain the historical
         // eager startup validation contract. The managed tree is prepared with
@@ -5453,16 +6301,9 @@ impl SpoolManager {
         // model real compression/write/fsync latency without changing the
         // request-path enqueue contract. Snapshot the hook once so AfterWrite
         // cannot observe a different (later-installed) hook than BeforeWrite.
-        let _after_hook = SpoolWriteHookAfterGuard::enter();
+        let _after_hook = SpoolWriteHookAfterGuard::enter(&self.namespace_root);
         self.prepare_live_storage_locked()?;
-        let body = serialize_json_each_row(events)?;
-        if body.len() as u64 > SPOOL_MAX_ARTIFACT_BYTES {
-            return Err(format!(
-                "{PLUGIN_NAME}: serialized spool batch ({} bytes) exceeds the hard per-artifact limit ({SPOOL_MAX_ARTIFACT_BYTES} bytes)",
-                body.len()
-            ));
-        }
-        let bytes = encode_spool_bytes(body.as_bytes(), self.cfg.compression)?;
+        let bytes = self.materialize_spool_artifact(events)?;
         let incoming_len = bytes.len() as u64;
         if incoming_len > SPOOL_MAX_ARTIFACT_BYTES {
             return Err(format!(
@@ -5501,14 +6342,102 @@ impl SpoolManager {
             write_private_file_atomically_with_ops(
                 &tmp_path,
                 &final_path,
-                &bytes,
+                bytes.as_slice(),
                 self.fs_ops,
                 SpoolFinalOwnership::Unique,
             )
         };
         write_result?;
+        // The reservation on the encoded artifact is released only here, after
+        // the blocking write, fsync, and rename have all completed.
+        drop(bytes);
         invalidate_status_cache();
         Ok(final_path)
+    }
+
+    /// Build the durable spool artifact for `events` with every coexisting
+    /// representation reserved against the retained-byte ceiling **before** it
+    /// is allocated.
+    ///
+    /// Two attacker-shaped representations can exist here at once — the
+    /// JSONEachRow text and, under `zstd`, its compressed form — while the
+    /// caller's queued events still hold their per-instance export leases.
+    /// Both are charged; the JSON reservation is released as soon as the
+    /// compressed form owns the bytes, so only one artifact-sized charge
+    /// survives into the blocking durable write.
+    ///
+    /// The artifact is additionally refused unless replaying it would fit under
+    /// the same configured ceiling (see [`spool_replay_peak_bytes`]): writing a
+    /// file this process could never read back is a permanent loss, whereas
+    /// refusing it here is reported through the existing spool-write failure
+    /// accounting.
+    fn materialize_spool_artifact(
+        &self,
+        events: &[ChargeEvent],
+    ) -> Result<ReservedPayload, String> {
+        let json = materialize_json_each_row(self.ceiling, events, self.projection.as_deref())?;
+        let decoded_len = json.len() as u64;
+        if decoded_len > SPOOL_MAX_ARTIFACT_BYTES {
+            return Err(format!(
+                "{PLUGIN_NAME}: serialized spool batch ({decoded_len} bytes) exceeds the hard per-artifact limit ({SPOOL_MAX_ARTIFACT_BYTES} bytes)"
+            ));
+        }
+        let replay_peak = spool_replay_peak_bytes(decoded_len, events.len())
+            .ok_or_else(|| format!("{PLUGIN_NAME}: spool artifact replay byte bound overflowed"))?;
+        let ceiling_max = self.ceiling.max() as u64;
+        if replay_peak > ceiling_max {
+            return Err(format!(
+                "{PLUGIN_NAME}: refusing to spool a {decoded_len}-byte / {}-row artifact whose replay would need {replay_peak} retained bytes under the configured {ceiling_max}-byte process ceiling",
+                events.len()
+            ));
+        }
+        match self.cfg.compression {
+            // The JSON payload is already the artifact: no second copy exists.
+            SpoolCompression::None => Ok(json),
+            SpoolCompression::Zstd => {
+                let bound = zstd::zstd_safe::compress_bound(json.len())
+                    .checked_add(SPOOL_ZSTD_FRAME_SLACK_BYTES)
+                    .ok_or_else(|| {
+                        format!("{PLUGIN_NAME}: spool compression byte bound overflowed")
+                    })?;
+
+                let encoded = materialize_reserved_buffer(self.ceiling, bound, |buffer| {
+                    // One-shot compression records the decompressed size in the
+                    // zstd frame header, which is what replay reserves against
+                    // instead of the ratio heuristic.
+                    zstd::bulk::compress_to_buffer(json.as_slice(), buffer, 0)
+                        .map_err(|error| format!("zstd compression failed: {error}"))
+                })
+                .map_err(|error| {
+                    format!(
+                        "{PLUGIN_NAME}: spool artifact compression failed: {}",
+                        error.reason()
+                    )
+                })?;
+                // Release the JSON charge now that the compressed artifact owns
+                // the only representation the durable write needs.
+                drop(json);
+                Ok(encoded)
+            }
+        }
+    }
+
+    /// Deterministic spool-artifact materialization probe for external tests.
+    ///
+    /// Returns `(encoded_len, ceiling_used_while_artifact_held,
+    /// ceiling_used_after_drop)`. Read `RetainedByteCeiling::high_water` around
+    /// the call to observe the coexisting JSON + compressed peak.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn probe_spool_artifact_materialization_for_tests(
+        &self,
+        events: &[ChargeEvent],
+    ) -> Result<(usize, usize, usize), String> {
+        let artifact = self.materialize_spool_artifact(events)?;
+        let encoded_len = artifact.len();
+        let held = self.ceiling.used();
+        drop(artifact);
+        Ok((encoded_len, held, self.ceiling.used()))
     }
 
     /// Prepare mutable spool state only for a committed generation. Candidate
@@ -5818,7 +6747,10 @@ impl SpoolManager {
             // "already fits" return so the common admission path is untouched,
             // and on a pass that has already paid for a full directory walk.
             if let Some(hook) = snapshot_spool_write_hook_for_tests() {
-                hook(SpoolWriteHookPoint::QuotaInventoryTaken);
+                hook(
+                    SpoolWriteHookPoint::QuotaInventoryTaken,
+                    &self.namespace_root,
+                );
             }
 
             let wall_clock = SystemTime::now();
@@ -7005,7 +7937,33 @@ fn is_spool_owned_file(path: &Path) -> bool {
         || is_spool_inflight_file(path)
 }
 
+/// Unreserved reference encoder for external tests.
+///
+/// Byte-for-byte equivalent to the artifact
+/// [`SpoolManager::materialize_spool_artifact`] publishes — same one-shot zstd
+/// path, so the frame carries the decompressed size — but without the ceiling
+/// reservation that makes the production path safe. Tests use it to predict
+/// on-disk sizes; production must never call it.
+#[allow(dead_code)] // external unit tests only
 fn encode_spool_bytes(bytes: &[u8], compression: SpoolCompression) -> Result<Vec<u8>, String> {
+    match compression {
+        SpoolCompression::Zstd => zstd::bulk::compress(bytes, 0)
+            .map_err(|error| format!("{PLUGIN_NAME}: zstd compression failed: {error}")),
+        SpoolCompression::None => Ok(bytes.to_vec()),
+    }
+}
+
+/// Encode a spool artifact with the *streaming* zstd encoder, which omits the
+/// decompressed size from the frame header.
+///
+/// This is the legacy / foreign-archive shape replay must still accept by
+/// falling back to the ratio clamp; no production path produces it.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn encode_spool_bytes_without_content_size_for_tests(
+    bytes: &[u8],
+    compression: SpoolCompression,
+) -> Result<Vec<u8>, String> {
     match compression {
         SpoolCompression::Zstd => zstd::stream::encode_all(bytes, 0)
             .map_err(|error| format!("{PLUGIN_NAME}: zstd compression failed: {error}")),
@@ -7028,7 +7986,14 @@ pub enum SpoolWriteHookPoint {
     QuotaInventoryTaken,
 }
 
-type SpoolWriteHookForTests = Arc<dyn Fn(SpoolWriteHookPoint) + Send + Sync + 'static>;
+/// The hook carries the namespace root of the [`SpoolManager`] that reached the
+/// point, so a hook installed by one test is inert for every other manager.
+///
+/// The slot is process-global and the test binary runs tests in parallel, so
+/// without that discriminator an unrelated test's eviction or write fires the
+/// installed closure — which is an extra, unaccounted invocation for the test
+/// that owns it, not a bug in the code under test.
+type SpoolWriteHookForTests = Arc<dyn Fn(SpoolWriteHookPoint, &Path) + Send + Sync + 'static>;
 
 fn spool_write_hook_slot() -> &'static Mutex<Option<SpoolWriteHookForTests>> {
     static HOOK: OnceLock<Mutex<Option<SpoolWriteHookForTests>>> = OnceLock::new();
@@ -7037,8 +8002,9 @@ fn spool_write_hook_slot() -> &'static Mutex<Option<SpoolWriteHookForTests>> {
 
 /// Install or clear a process-global hook around spool filesystem writes.
 ///
-/// Tests must clear the hook before finishing (including panic paths) and
-/// serialize against other chargeback-sink tests that publish ACTIVE_SINKS.
+/// Tests must clear the hook before finishing (including panic paths), serialize
+/// against other chargeback-sink tests that publish ACTIVE_SINKS, and ignore
+/// every point whose namespace root is not their own spool.
 #[doc(hidden)]
 #[allow(dead_code)]
 pub fn set_spool_write_hook_for_tests(hook: Option<SpoolWriteHookForTests>) {
@@ -7063,22 +8029,26 @@ fn snapshot_spool_write_hook_for_tests() -> Option<SpoolWriteHookForTests> {
 /// generation has not finished.
 struct SpoolWriteHookAfterGuard {
     hook: Option<SpoolWriteHookForTests>,
+    namespace_root: PathBuf,
 }
 
 impl SpoolWriteHookAfterGuard {
-    fn enter() -> Self {
+    fn enter(namespace_root: &Path) -> Self {
         let hook = snapshot_spool_write_hook_for_tests();
         if let Some(ref hook) = hook {
-            hook(SpoolWriteHookPoint::BeforeWrite);
+            hook(SpoolWriteHookPoint::BeforeWrite, namespace_root);
         }
-        Self { hook }
+        Self {
+            hook,
+            namespace_root: namespace_root.to_path_buf(),
+        }
     }
 }
 
 impl Drop for SpoolWriteHookAfterGuard {
     fn drop(&mut self) {
         if let Some(hook) = self.hook.take() {
-            hook(SpoolWriteHookPoint::AfterWrite);
+            hook(SpoolWriteHookPoint::AfterWrite, &self.namespace_root);
         }
     }
 }
@@ -7092,43 +8062,257 @@ pub fn encode_spool_bytes_for_tests(
     encode_spool_bytes(bytes, compression)
 }
 
-fn decode_spool_file(path: &Path) -> Result<String, String> {
+/// Bytes one `(start, end)` entry of the spool line index or replay worklist
+/// occupies.
+const SPOOL_INDEX_ENTRY_BYTES: usize = 2 * std::mem::size_of::<usize>();
+
+/// Growth step for the bounded spool decode buffer.
+const SPOOL_DECODE_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Why a spool artifact could not be decoded into a charged representation.
+enum SpoolDecodeError {
+    /// The artifact itself is unreadable, oversized, or corrupt. The caller
+    /// quarantines it so an operator can review it.
+    Unreadable(String),
+    /// The retained-byte ceiling refused the artifact *before* it was decoded.
+    /// Nothing is wrong with the file: the caller releases the claim so a later
+    /// tick replays it in order.
+    CeilingExhausted(String),
+}
+
+impl SpoolDecodeError {
+    // Only the external decode test helper flattens the variants; the binary
+    // target does not compile that caller.
+    #[allow(dead_code)]
+    fn into_message(self) -> String {
+        match self {
+            Self::Unreadable(message) | Self::CeilingExhausted(message) => message,
+        }
+    }
+}
+
+/// One decoded spool artifact plus its line index, both charged to the
+/// retained-byte ceiling for exactly as long as they are held.
+///
+/// Rows are never copied out of `text`: chunking, 413 splits, and retries all
+/// address lines by `(start, end)` byte range into the single decoded buffer.
+/// A 256 MiB artifact therefore produces one decoded representation, not one
+/// per worklist level.
+struct ReservedSpoolArtifact {
+    text: String,
+    lines: Vec<(usize, usize)>,
+    /// Charge on the decoded buffer. Reserved before the file is read, shrunk
+    /// to the buffer's real allocation, released on drop.
+    _text_reservation: ProcessByteReservation,
+    /// Charge on the line index. Reserved before the index is allocated.
+    _index_reservation: ProcessByteReservation,
+}
+
+impl ReservedSpoolArtifact {
+    fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Borrow one indexed line. Never panics: an out-of-range or non-boundary
+    /// index is a fixed-label error rather than a slice panic.
+    fn line(&self, index: usize) -> Result<&str, String> {
+        let (start, end) = *self.lines.get(index).ok_or_else(|| {
+            format!("{PLUGIN_NAME}: spool replay line index {index} is out of range")
+        })?;
+        self.text.get(start..end).ok_or_else(|| {
+            format!("{PLUGIN_NAME}: spool replay line index {index} is not a character boundary")
+        })
+    }
+
+    #[allow(dead_code)] // used by the external decode test helper
+    fn into_text(self) -> String {
+        self.text
+    }
+}
+
+/// Visit every non-empty JSONEachRow line of `text` as a `(start, end)` byte
+/// range, matching `str::lines` framing (`\n` separated, trailing `\r`
+/// stripped) without allocating a single row copy.
+fn for_each_spool_line(text: &str, mut visit: impl FnMut(usize, usize)) {
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    while let Some(rest) = bytes.get(start..) {
+        let separator = match rest.iter().position(|byte| *byte == b'\n') {
+            Some(offset) => start.saturating_add(offset),
+            None => bytes.len(),
+        };
+        let mut end = separator;
+        if end > start && bytes.get(end.saturating_sub(1)) == Some(&b'\r') {
+            end -= 1;
+        }
+        if let Some(line) = text.get(start..end)
+            && !line.trim().is_empty()
+        {
+            visit(start, end);
+        }
+        if separator >= bytes.len() {
+            break;
+        }
+        start = separator.saturating_add(1);
+    }
+}
+
+/// Decode one spool artifact into a representation that is charged to `ceiling`
+/// for its whole life.
+///
+/// The decoded upper bound is reserved *before* the file is read, so a process
+/// already at its retained-byte ceiling refuses the artifact instead of
+/// materializing an unbounded owned copy of it.
+fn decode_spool_artifact(
+    path: &Path,
+    ceiling: &'static RetainedByteCeiling,
+) -> Result<ReservedSpoolArtifact, SpoolDecodeError> {
     let file = File::open(path).map_err(|error| {
-        format!(
+        SpoolDecodeError::Unreadable(format!(
             "{PLUGIN_NAME}: failed to open spool file '{}': {error}",
             path.display()
-        )
+        ))
     })?;
     let encoded_len = file
         .metadata()
         .map_err(|error| {
-            format!(
+            SpoolDecodeError::Unreadable(format!(
                 "{PLUGIN_NAME}: failed to stat spool file '{}': {error}",
                 path.display()
-            )
+            ))
         })?
         .len();
     if encoded_len > SPOOL_MAX_ARTIFACT_BYTES {
-        return Err(format!(
+        return Err(SpoolDecodeError::Unreadable(format!(
             "{PLUGIN_NAME}: spool file '{}' exceeds the hard {SPOOL_MAX_ARTIFACT_BYTES}-byte artifact bound",
             path.display()
-        ));
+        )));
     }
-    let decoded = if path
+    let compressed = path
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.contains(".ndjson.zst"))
-    {
-        decode_zstd_bounded(file, spool_decompression_limit(encoded_len), path)?
+        .is_some_and(|name| name.contains(".ndjson.zst"));
+    // An uncompressed artifact decodes to exactly its on-disk size. A compressed
+    // one this build wrote records its decompressed size in the zstd frame
+    // header, which is the *tight* bound replay reserves; only a frame without
+    // one (a foreign or hand-planted archive) falls back to the ratio clamp.
+    let mut file = file;
+    let decoded_bound = if compressed {
+        let ratio_limit = spool_decompression_limit(encoded_len);
+        match read_zstd_frame_content_size(&mut file, path)? {
+            Some(declared) if declared <= SPOOL_MAX_ARTIFACT_BYTES => declared,
+            Some(declared) => {
+                return Err(SpoolDecodeError::Unreadable(format!(
+                    "{PLUGIN_NAME}: spool file '{}' declares a {declared}-byte decoded size above the hard {SPOOL_MAX_ARTIFACT_BYTES}-byte artifact bound",
+                    path.display()
+                )));
+            }
+            None => ratio_limit,
+        }
     } else {
-        read_spool_bytes_bounded(file, SPOOL_MAX_ARTIFACT_BYTES, path)?
+        encoded_len
     };
-    String::from_utf8(decoded).map_err(|error| {
-        format!(
+    let decoded_bound = usize::try_from(decoded_bound).map_err(|_| {
+        SpoolDecodeError::Unreadable(format!(
+            "{PLUGIN_NAME}: spool file '{}' decoded bound exceeds this platform's addressable size",
+            path.display()
+        ))
+    })?;
+    let text_reservation = ceiling.try_acquire(decoded_bound).ok_or_else(|| {
+        SpoolDecodeError::CeilingExhausted(format!(
+            "{PLUGIN_NAME}: spool replay deferred for '{}': {}",
+            path.display(),
+            PayloadMaterializationError::CeilingExhausted.reason()
+        ))
+    })?;
+
+    let decoded = if compressed {
+        decode_zstd_bounded(file, decoded_bound, path).map_err(SpoolDecodeError::Unreadable)?
+    } else {
+        read_spool_bytes_bounded(file, decoded_bound, path).map_err(SpoolDecodeError::Unreadable)?
+    };
+    let text = String::from_utf8(decoded).map_err(|error| {
+        SpoolDecodeError::Unreadable(format!(
             "{PLUGIN_NAME}: spool file '{}' is not valid UTF-8 JSONEachRow: {error}",
             path.display()
-        )
+        ))
+    })?;
+    // Charge only what the buffer really holds; `from_utf8` reuses the `Vec`
+    // allocation, so `capacity` is the true retained size.
+    text_reservation.shrink_to(text.capacity());
+
+    let mut line_count = 0usize;
+    for_each_spool_line(&text, |_, _| line_count = line_count.saturating_add(1));
+    let index_bytes = line_count
+        .checked_mul(SPOOL_INDEX_ENTRY_BYTES)
+        .ok_or_else(|| {
+            SpoolDecodeError::Unreadable(format!(
+                "{PLUGIN_NAME}: spool file '{}' line index byte bound overflowed",
+                path.display()
+            ))
+        })?;
+    let index_reservation = ceiling.try_acquire(index_bytes).ok_or_else(|| {
+        SpoolDecodeError::CeilingExhausted(format!(
+            "{PLUGIN_NAME}: spool replay deferred for '{}': {}",
+            path.display(),
+            PayloadMaterializationError::CeilingExhausted.reason()
+        ))
+    })?;
+    // `with_capacity` plus exactly `line_count` pushes never grows past the
+    // reserved allocation.
+    let mut lines: Vec<(usize, usize)> = Vec::with_capacity(line_count);
+    for_each_spool_line(&text, |start, end| lines.push((start, end)));
+
+    Ok(ReservedSpoolArtifact {
+        text,
+        lines,
+        _text_reservation: text_reservation,
+        _index_reservation: index_reservation,
     })
+}
+
+/// Bytes of a zstd frame prefix that always contain the complete frame header.
+///
+/// A zstd frame header is at most 18 bytes (4-byte magic + 14-byte header).
+const ZSTD_FRAME_HEADER_PROBE_BYTES: usize = 18;
+
+/// Read the declared decompressed size from a zstd frame header, leaving the
+/// file positioned back at byte zero for the streaming decoder.
+///
+/// Returns `Ok(None)` when the frame carries no content size (a foreign archive,
+/// or one produced by a streaming encoder), in which case the caller falls back
+/// to the ratio clamp. A corrupt header is not diagnosed here: the streaming
+/// decoder reports it with its existing quarantine path.
+fn read_zstd_frame_content_size(
+    file: &mut File,
+    path: &Path,
+) -> Result<Option<u64>, SpoolDecodeError> {
+    let seek_error = |error: std::io::Error| {
+        SpoolDecodeError::Unreadable(format!(
+            "{PLUGIN_NAME}: failed to read spool file '{}' frame header: {error}",
+            path.display()
+        ))
+    };
+    let mut header = [0u8; ZSTD_FRAME_HEADER_PROBE_BYTES];
+    let mut filled = 0usize;
+    while filled < header.len() {
+        let Some(spare) = header.get_mut(filled..) else {
+            break;
+        };
+        match file.read(spare) {
+            Ok(0) => break,
+            Ok(read) => filled = filled.saturating_add(read),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(seek_error(error)),
+        }
+    }
+    file.seek(SeekFrom::Start(0)).map_err(seek_error)?;
+    let Some(prefix) = header.get(..filled) else {
+        return Ok(None);
+    };
+    Ok(zstd::zstd_safe::get_frame_content_size(prefix)
+        .ok()
+        .flatten())
 }
 
 /// Decompress one spool record, failing closed past `limit` decoded bytes.
@@ -7144,27 +8328,69 @@ fn spool_decompression_limit(encoded_len: u64) -> u64 {
         .clamp(SPOOL_MIN_DECOMPRESSED_BYTES, SPOOL_MAX_ARTIFACT_BYTES)
 }
 
-fn read_spool_bytes_bounded(reader: impl Read, limit: u64, path: &Path) -> Result<Vec<u8>, String> {
-    let mut decoded = Vec::new();
-    reader
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut decoded)
-        .map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: failed to read spool file '{}': {error}",
-                path.display()
-            )
-        })?;
-    if decoded.len() as u64 > limit {
-        return Err(format!(
-            "{PLUGIN_NAME}: spool file '{}' exceeds its {limit}-byte artifact bound",
+/// Read at most `limit` bytes, growing geometrically but never allocating past
+/// `limit`.
+///
+/// The caller has already reserved `limit` against the retained-byte ceiling, so
+/// the buffer must not overshoot it — which rules out `read_to_end`, whose
+/// amortized growth can allocate roughly twice the bytes actually read.
+fn read_spool_bytes_bounded(
+    mut reader: impl Read,
+    limit: usize,
+    path: &Path,
+) -> Result<Vec<u8>, String> {
+    let read_error = |error: std::io::Error| {
+        format!(
+            "{PLUGIN_NAME}: failed to read spool file '{}': {error}",
             path.display()
-        ));
+        )
+    };
+    let mut decoded: Vec<u8> = Vec::new();
+    let mut filled = 0usize;
+    loop {
+        if filled == decoded.len() {
+            if filled >= limit {
+                // One probe byte past the bound: anything still readable means
+                // the artifact exceeds the reservation, so fail closed.
+                let mut probe = [0u8; 1];
+                return match reader.read(&mut probe) {
+                    Ok(0) => {
+                        decoded.truncate(filled);
+                        Ok(decoded)
+                    }
+                    Ok(_) => Err(format!(
+                        "{PLUGIN_NAME}: spool file '{}' exceeds its {limit}-byte artifact bound",
+                        path.display()
+                    )),
+                    Err(error) => Err(read_error(error)),
+                };
+            }
+            let target = filled
+                .max(SPOOL_DECODE_CHUNK_BYTES)
+                .saturating_mul(2)
+                .min(limit);
+            // `reserve_exact` (not `resize`'s amortized `reserve`) keeps the
+            // real capacity from overshooting `limit`, which is what the caller
+            // reserved: an amortized doubling past the bound would leave the
+            // buffer's true allocation undercharged.
+            decoded.reserve_exact(target.saturating_sub(decoded.len()));
+            decoded.resize(target, 0);
+        }
+        let Some(spare) = decoded.get_mut(filled..) else {
+            break;
+        };
+        match reader.read(spare) {
+            Ok(0) => break,
+            Ok(read) => filled = filled.saturating_add(read),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(read_error(error)),
+        }
     }
+    decoded.truncate(filled);
     Ok(decoded)
 }
 
-fn decode_zstd_bounded(reader: impl Read, limit: u64, path: &Path) -> Result<Vec<u8>, String> {
+fn decode_zstd_bounded(reader: impl Read, limit: usize, path: &Path) -> Result<Vec<u8>, String> {
     let decoder = zstd::stream::read::Decoder::new(reader).map_err(|error| {
         format!(
             "{PLUGIN_NAME}: failed to open spool file '{}' for decompression: {error}",
@@ -7179,15 +8405,156 @@ fn decode_zstd_bounded(reader: impl Read, limit: u64, path: &Path) -> Result<Vec
     })
 }
 
+/// Decode-only helper for external unit tests. The returned `String` outlives
+/// its ceiling reservation, which is exactly why production never uses this
+/// shape: [`decode_spool_artifact`] keeps the charge for the buffer's life.
 #[allow(dead_code)]
 pub fn decode_spool_file_for_tests(path: &Path) -> Result<String, String> {
-    decode_spool_file(path)
+    decode_spool_artifact(path, process_ceiling())
+        .map(ReservedSpoolArtifact::into_text)
+        .map_err(SpoolDecodeError::into_message)
 }
 
 #[doc(hidden)]
 #[allow(dead_code)]
 pub fn spool_artifact_byte_limit_for_tests() -> u64 {
     SPOOL_MAX_ARTIFACT_BYTES
+}
+
+/// Proven peak replay retention for an artifact, exposed so external tests can
+/// assert the writer-side liveness admission bound is the same arithmetic.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn spool_replay_peak_bytes_for_tests(decoded_bound: u64, line_count: usize) -> Option<u64> {
+    spool_replay_peak_bytes(decoded_bound, line_count)
+}
+
+/// Reserved capacity of the 413 split worklist.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn spool_split_worklist_max_entries_for_tests() -> usize {
+    SPOOL_SPLIT_WORKLIST_MAX_ENTRIES
+}
+
+/// Bytes one spool line-index / worklist entry occupies.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn spool_index_entry_bytes_for_tests() -> usize {
+    SPOOL_INDEX_ENTRY_BYTES
+}
+
+/// Deterministic compact-recovery probe for external unit tests.
+///
+/// Builds a [`CompactSnapshotRecovery`] that owns `events` under a reservation
+/// against `ceiling`, runs one retry that cannot reach a spool, and reports
+/// `(reserved_bound, held_after_failed_retry, pending_events_after_failed_retry,
+/// ceiling_used_after_drop)`.
+///
+/// This is the ownership contract compaction relies on: the retry never clones
+/// the pending set, a failed retry restores every pending delta, and the
+/// reservation is released exactly once when the recovery is dropped.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn probe_compact_recovery_retry_for_tests(
+    ceiling: &'static RetainedByteCeiling,
+    events: Vec<ChargeEvent>,
+) -> Result<(usize, usize, usize, usize), String> {
+    let retained_bytes = events
+        .iter()
+        .map(charge_event_retained_bytes)
+        .fold(0usize, usize::saturating_add);
+    let reservation = GrowableProcessReservation::new(ceiling);
+    if !reservation.try_grow(retained_bytes) {
+        return Err(format!(
+            "{PLUGIN_NAME}: {}",
+            PayloadMaterializationError::CeilingExhausted.reason()
+        ));
+    }
+    let recovery = CompactSnapshotRecovery {
+        generation: 1,
+        plugin_config_id: Arc::from("probe"),
+        attempt_lock: Mutex::new(()),
+        events: Mutex::new(events),
+        retained_bytes,
+        _reservation: reservation,
+        closed_at: Instant::now(),
+        // No spool: `try_spool` must fail and restore every pending delta.
+        spool: None,
+        metrics: Arc::new(SinkMetrics::default()),
+    };
+    let durable = recovery.try_spool();
+    if durable {
+        return Err(format!(
+            "{PLUGIN_NAME}: probe expected a failed compact recovery handoff"
+        ));
+    }
+    let held = ceiling.used();
+    let pending = match recovery.events.lock() {
+        Ok(guard) => guard.len(),
+        Err(poisoned) => poisoned.into_inner().len(),
+    };
+    drop(recovery);
+    Ok((retained_bytes, held, pending, ceiling.used()))
+}
+
+/// Opaque compact-recovery handle for deterministic external concurrency tests.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub struct CompactRecoveryProbe {
+    recovery: CompactSnapshotRecovery,
+}
+
+#[allow(dead_code)]
+impl CompactRecoveryProbe {
+    /// Run one synchronous retry through the production take/write/restore path.
+    #[doc(hidden)]
+    pub fn try_spool_for_tests(&self) -> bool {
+        self.recovery.try_spool()
+    }
+
+    /// Pending deltas currently owned by the recovery.
+    #[doc(hidden)]
+    pub fn pending_len_for_tests(&self) -> usize {
+        match self.recovery.events.lock() {
+            Ok(guard) => guard.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
+}
+
+/// Build a compact recovery backed by a real spool for deterministic external
+/// concurrency tests.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn compact_recovery_probe_for_tests(
+    ceiling: &'static RetainedByteCeiling,
+    events: Vec<ChargeEvent>,
+    spool: SpoolManager,
+) -> Result<CompactRecoveryProbe, String> {
+    let retained_bytes = events
+        .iter()
+        .map(charge_event_retained_bytes)
+        .fold(0usize, usize::saturating_add);
+    let reservation = GrowableProcessReservation::new(ceiling);
+    if !reservation.try_grow(retained_bytes) {
+        return Err(format!(
+            "{PLUGIN_NAME}: {}",
+            PayloadMaterializationError::CeilingExhausted.reason()
+        ));
+    }
+    Ok(CompactRecoveryProbe {
+        recovery: CompactSnapshotRecovery {
+            generation: 1,
+            plugin_config_id: Arc::from("concurrency-probe"),
+            attempt_lock: Mutex::new(()),
+            events: Mutex::new(events),
+            retained_bytes,
+            _reservation: reservation,
+            closed_at: Instant::now(),
+            spool: Some(Arc::new(spool)),
+            metrics: Arc::new(SinkMetrics::default()),
+        },
+    })
 }
 
 #[doc(hidden)]
@@ -7212,6 +8579,20 @@ pub async fn replay_spool_once_with_batch_size_for_tests(
     insert_url: &str,
     batch_size: usize,
 ) -> Result<(), String> {
+    replay_spool_once_with_ceiling_for_tests(spool, insert_url, batch_size, process_ceiling()).await
+}
+
+/// Replay one tick against a test-owned retained-byte ceiling, so ownership and
+/// refusal assertions stay exact while other tests in the same binary reserve
+/// against the process-global counter.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub async fn replay_spool_once_with_ceiling_for_tests(
+    spool: &SpoolManager,
+    insert_url: &str,
+    batch_size: usize,
+    ceiling: &'static RetainedByteCeiling,
+) -> Result<(), String> {
     let flush_config = ClickHouseFlushConfig {
         http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
         insert_url: insert_url.to_string(),
@@ -7220,8 +8601,53 @@ pub async fn replay_spool_once_with_batch_size_for_tests(
         password: None,
         timeout: Duration::from_secs(5),
         metrics: Arc::clone(&spool.metrics),
+        ceiling,
+        projection: spool.projection.clone(),
     };
     replay_spool_once(spool, &flush_config, batch_size.max(1)).await
+}
+
+/// Deterministic body-materialization probe for external unit tests.
+///
+/// Returns `(reserved_bound, ceiling_used_while_body_held, ceiling_used_after_drop)`,
+/// or `Err` when the ceiling refused the body before it was serialized.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn probe_charge_body_materialization_for_tests(
+    ceiling: &'static RetainedByteCeiling,
+    batch: &[ChargeEvent],
+) -> Result<(usize, usize, usize), String> {
+    probe_charge_body_materialization_with_projection_for_tests(ceiling, batch, None)
+}
+
+/// [`probe_charge_body_materialization_for_tests`] under a compiled projection,
+/// so a schema's reservation bound can be asserted to still precede — and cover
+/// — the projected serialization.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn probe_charge_body_materialization_with_projection_for_tests(
+    ceiling: &'static RetainedByteCeiling,
+    batch: &[ChargeEvent],
+    projection: Option<Arc<ChargeEventProjection>>,
+) -> Result<(usize, usize, usize), String> {
+    let metrics = Arc::new(SinkMetrics::default());
+    let cfg = ClickHouseFlushConfig {
+        http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
+        insert_url: "http://127.0.0.1/".to_string(),
+        redacted_insert_url: "http://127.0.0.1/redacted".to_string(),
+        username: None,
+        password: None,
+        timeout: Duration::from_secs(1),
+        metrics,
+        ceiling,
+        projection: projection.clone(),
+    };
+    let bound = charge_body_byte_bound(batch, projection.as_deref())
+        .ok_or_else(|| format!("{PLUGIN_NAME}: bound overflowed"))?;
+    let body = materialize_charge_body(&cfg, batch)?;
+    let held = ceiling.used();
+    drop(body);
+    Ok((bound, held, ceiling.used()))
 }
 
 #[doc(hidden)]
@@ -7272,6 +8698,8 @@ pub fn classify_clickhouse_acknowledgement_for_tests(
         password: None,
         timeout: Duration::from_secs(1),
         metrics,
+        ceiling: process_ceiling(),
+        projection: None,
     };
     classify_clickhouse_delivery(
         &cfg,
@@ -7604,9 +9032,24 @@ async fn replay_spool_once(
             }
         };
         let inflight = claim.path().to_path_buf();
-        let body = match decode_spool_file(&inflight) {
-            Ok(body) => body,
-            Err(error) => {
+        let artifact = match decode_spool_artifact(&inflight, flush_config.ceiling) {
+            Ok(artifact) => artifact,
+            Err(SpoolDecodeError::CeilingExhausted(error)) => {
+                // The artifact is fine; the process is at its retained-byte
+                // ceiling. Quarantining here would destroy a healthy record, so
+                // release the claim and stop the tick, exactly as for a
+                // retryable delivery failure.
+                spool
+                    .metrics
+                    .record_failure(FailureReason::Serialize, error.clone());
+                let _guard = spool
+                    .write_lock
+                    .lock()
+                    .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+                spool.release_claim_locked(claim.path())?;
+                return Err(error);
+            }
+            Err(SpoolDecodeError::Unreadable(error)) => {
                 spool
                     .metrics
                     .record_failure(FailureReason::Serialize, error.clone());
@@ -7633,20 +9076,16 @@ async fn replay_spool_once(
                 continue;
             }
         };
-        let lines: Vec<String> = body
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(str::to_owned)
-            .collect();
-        if lines.is_empty() {
+        let line_count = artifact.line_count();
+        if line_count == 0 {
             spool.remove_delivered_claim(claim.path())?;
             continue;
         }
 
-        match replay_spool_lines(spool, &mut claim, flush_config, &lines, batch_size).await {
+        match replay_spool_lines(spool, &mut claim, flush_config, &artifact, batch_size).await {
             Ok(dead_letters) => {
                 if let Err(error) =
-                    finalize_replayed_spool_file(spool, claim.path(), lines.len(), dead_letters)
+                    finalize_replayed_spool_file(spool, claim.path(), line_count, dead_letters)
                 {
                     // Permanent rejection could not publish dead-letter metadata.
                     // Release the claim so the original record remains
@@ -7681,10 +9120,102 @@ async fn replay_spool_once(
     Ok(())
 }
 
-struct DeadLetterChunk {
-    row_count: usize,
-    reason: DeadLetterReason,
-    http_status: Option<u16>,
+/// Lowest HTTP status code the dead-letter tally addresses directly.
+const DEAD_LETTER_STATUS_BASE: u16 = 100;
+/// Number of directly addressed HTTP status codes (100..=999). `http`'s
+/// `StatusCode` admits exactly this range, so the tally is lossless for every
+/// status a real response can carry.
+const DEAD_LETTER_STATUS_SPAN: usize = 900;
+
+/// Fixed-size dead-letter accounting for one replayed artifact.
+///
+/// Replay previously pushed one record per permanently rejected row, so an
+/// artifact with an attacker-controlled row count grew an uncharged `O(rows)`
+/// vector while the decoded artifact, its line index, and a request body were
+/// all still retained. This aggregate is the same size — one counter per
+/// addressable status plus two scalars — no matter how many rows are rejected,
+/// and it preserves the exact per-status row counts the sidecar metadata
+/// records.
+struct DeadLetterTally {
+    payload_too_large_rows: usize,
+    permanent_rows_by_status: Box<[usize; DEAD_LETTER_STATUS_SPAN]>,
+    /// Rows rejected with a status outside the addressable range. Recorded
+    /// without a status rather than dropped.
+    permanent_rows_unclassified: usize,
+}
+
+impl DeadLetterTally {
+    fn new() -> Self {
+        Self {
+            payload_too_large_rows: 0,
+            permanent_rows_by_status: Box::new([0usize; DEAD_LETTER_STATUS_SPAN]),
+            permanent_rows_unclassified: 0,
+        }
+    }
+
+    fn record_payload_too_large(&mut self, rows: usize) {
+        self.payload_too_large_rows = self.payload_too_large_rows.saturating_add(rows);
+    }
+
+    fn record_permanent(&mut self, status: u16, rows: usize) {
+        let slot = status
+            .checked_sub(DEAD_LETTER_STATUS_BASE)
+            .map(usize::from)
+            .and_then(|index| self.permanent_rows_by_status.get_mut(index));
+        match slot {
+            Some(counter) => *counter = counter.saturating_add(rows),
+            None => {
+                self.permanent_rows_unclassified =
+                    self.permanent_rows_unclassified.saturating_add(rows);
+            }
+        }
+    }
+
+    fn rejected_rows(&self) -> usize {
+        self.permanent_rows_by_status
+            .iter()
+            .copied()
+            .fold(self.payload_too_large_rows, usize::saturating_add)
+            .saturating_add(self.permanent_rows_unclassified)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rejected_rows() == 0
+    }
+
+    /// Expand into sidecar metadata rows. Bounded by the addressable status
+    /// span, never by the artifact's row count.
+    fn into_outcomes(self) -> Vec<DeadLetterOutcomeMeta> {
+        let mut outcomes = Vec::new();
+        if self.payload_too_large_rows > 0 {
+            outcomes.push(DeadLetterOutcomeMeta {
+                reason: DeadLetterReason::PayloadTooLarge.as_str(),
+                http_status: Some(413),
+                row_count: self.payload_too_large_rows,
+            });
+        }
+        for (index, row_count) in self.permanent_rows_by_status.iter().copied().enumerate() {
+            if row_count == 0 {
+                continue;
+            }
+            let status = u16::try_from(index)
+                .ok()
+                .and_then(|offset| offset.checked_add(DEAD_LETTER_STATUS_BASE));
+            outcomes.push(DeadLetterOutcomeMeta {
+                reason: DeadLetterReason::PermanentHttp.as_str(),
+                http_status: status,
+                row_count,
+            });
+        }
+        if self.permanent_rows_unclassified > 0 {
+            outcomes.push(DeadLetterOutcomeMeta {
+                reason: DeadLetterReason::PermanentHttp.as_str(),
+                http_status: None,
+                row_count: self.permanent_rows_unclassified,
+            });
+        }
+        outcomes
+    }
 }
 
 /// Deliver spool JSONEachRow lines with status-aware split / dead-letter policy.
@@ -7697,15 +9228,39 @@ async fn replay_spool_lines(
     spool: &SpoolManager,
     claim: &mut SpoolClaimHandle,
     flush_config: &ClickHouseFlushConfig,
-    lines: &[String],
+    artifact: &ReservedSpoolArtifact,
     batch_size: usize,
-) -> Result<Vec<DeadLetterChunk>, String> {
-    let mut dead_letters = Vec::new();
-    let mut stack: Vec<Vec<String>> = vec![lines.to_vec()];
-    while let Some(chunk) = stack.pop() {
-        if chunk.is_empty() {
+) -> Result<DeadLetterTally, String> {
+    let mut tally = DeadLetterTally::new();
+    // The worklist addresses chunks by *line index range*, so neither a chunk
+    // nor a 413 split ever copies a row: every attempt borrows straight out of
+    // the artifact's single decoded buffer.
+    //
+    // Its whole allocation is reserved before it exists, and is now proportional
+    // to real live stack occupancy instead of to the artifact's
+    // attacker-controlled row count — see [`SPOOL_SPLIT_WORKLIST_MAX_ENTRIES`]
+    // for the bound and its proof. Exceeding the bound is a fail-closed
+    // retryable error rather than an unreserved reallocation, so the reservation
+    // can never under-cover the allocation.
+    let line_count = artifact.line_count();
+    let worklist_bytes = SPOOL_SPLIT_WORKLIST_MAX_ENTRIES
+        .checked_mul(SPOOL_INDEX_ENTRY_BYTES)
+        .ok_or_else(|| format!("{PLUGIN_NAME}: spool replay worklist byte bound overflowed"))?;
+    let _worklist_reservation = flush_config
+        .ceiling
+        .try_acquire(worklist_bytes)
+        .ok_or_else(|| {
+            format!(
+                "{PLUGIN_NAME}: spool replay deferred: {}",
+                PayloadMaterializationError::CeilingExhausted.reason()
+            )
+        })?;
+    let mut stack: Vec<(usize, usize)> = Vec::with_capacity(SPOOL_SPLIT_WORKLIST_MAX_ENTRIES);
+    stack.push((0, line_count));
+    while let Some((start, end)) = stack.pop() {
+        let Some(rows) = end.checked_sub(start).filter(|rows| *rows > 0) else {
             continue;
-        }
+        };
         {
             let _guard = spool
                 .write_lock
@@ -7713,69 +9268,91 @@ async fn replay_spool_lines(
                 .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
             spool.renew_claim_locked(claim)?;
         }
-        let body = chunk.join("\n");
-        match post_json_each_row(flush_config, body, chunk.len()).await {
+        let body = materialize_spool_chunk_body(flush_config.ceiling, artifact, start, end)?;
+        match post_json_each_row(flush_config, body, rows).await {
             DeliveryOutcome::Delivered => {}
             DeliveryOutcome::Retryable { message } => return Err(message),
             DeliveryOutcome::PayloadTooLarge { .. } => {
-                if chunk.len() == 1 {
-                    dead_letters.push(DeadLetterChunk {
-                        row_count: 1,
-                        reason: DeadLetterReason::PayloadTooLarge,
-                        http_status: Some(413),
-                    });
+                if rows == 1 {
+                    tally.record_payload_too_large(1);
                 } else {
-                    let split_at = replay_split_len(chunk.len(), batch_size);
-                    let right = chunk[split_at..].to_vec();
-                    let left = chunk[..split_at].to_vec();
+                    if stack.len().saturating_add(2) > SPOOL_SPLIT_WORKLIST_MAX_ENTRIES {
+                        return Err(format!(
+                            "{PLUGIN_NAME}: spool replay split worklist exceeded its reserved {SPOOL_SPLIT_WORKLIST_MAX_ENTRIES}-entry bound"
+                        ));
+                    }
+                    let split_at = start.saturating_add(replay_split_len(rows, batch_size));
                     // Stack: push right first so left is delivered first.
-                    stack.push(right);
-                    stack.push(left);
+                    stack.push((split_at, end));
+                    stack.push((start, split_at));
                 }
             }
             DeliveryOutcome::Permanent { status, .. } => {
-                dead_letters.push(DeadLetterChunk {
-                    row_count: chunk.len(),
-                    reason: DeadLetterReason::PermanentHttp,
-                    http_status: Some(status),
-                });
+                tally.record_permanent(status, rows);
             }
         }
     }
-    Ok(dead_letters)
+    Ok(tally)
+}
+
+/// Serialize the `[start, end)` line range into a reserved-and-charged
+/// JSONEachRow body.
+///
+/// Rows are written verbatim out of the artifact's decoded buffer, so the bound
+/// (row bytes plus one separator each) is exact and no row is ever copied
+/// outside the reserved payload. A ceiling refusal is reported as a retryable
+/// error, which leaves the durable claim untouched for a later tick.
+fn materialize_spool_chunk_body(
+    ceiling: &'static RetainedByteCeiling,
+    artifact: &ReservedSpoolArtifact,
+    start: usize,
+    end: usize,
+) -> Result<ReservedPayload, String> {
+    let mut bound = end.saturating_sub(start);
+    for index in start..end {
+        bound = bound
+            .checked_add(artifact.line(index)?.len())
+            .ok_or_else(|| format!("{PLUGIN_NAME}: spool replay body byte bound overflowed"))?;
+    }
+    materialize_reserved_payload(ceiling, bound, |writer| {
+        for index in start..end {
+            if index > start {
+                writer
+                    .write_all(b"\n")
+                    .map_err(|error| format!("row separator: {error}"))?;
+            }
+            writer
+                .write_all(artifact.line(index)?.as_bytes())
+                .map_err(|error| format!("row: {error}"))?;
+        }
+        Ok(())
+    })
+    .map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: spool replay body was not materialized: {}",
+            error.reason()
+        )
+    })
 }
 
 fn finalize_replayed_spool_file(
     spool: &SpoolManager,
     file: &Path,
     original_row_count: usize,
-    dead_letters: Vec<DeadLetterChunk>,
+    dead_letters: DeadLetterTally,
 ) -> Result<(), String> {
     if dead_letters.is_empty() {
         spool.remove_delivered_claim(file)?;
         return Ok(());
     }
 
-    let rejected_rows: usize = dead_letters.iter().map(|chunk| chunk.row_count).sum();
+    let rejected_rows = dead_letters.rejected_rows();
     if rejected_rows > original_row_count {
         return Err(format!(
             "{PLUGIN_NAME}: dead-letter row count ({rejected_rows}) exceeds source row count ({original_row_count})"
         ));
     }
-    let mut outcomes: Vec<DeadLetterOutcomeMeta> = Vec::new();
-    for chunk in dead_letters {
-        if let Some(existing) = outcomes.iter_mut().find(|outcome| {
-            outcome.reason == chunk.reason.as_str() && outcome.http_status == chunk.http_status
-        }) {
-            existing.row_count = existing.row_count.saturating_add(chunk.row_count);
-        } else {
-            outcomes.push(DeadLetterOutcomeMeta {
-                reason: chunk.reason.as_str(),
-                http_status: chunk.http_status,
-                row_count: chunk.row_count,
-            });
-        }
-    }
+    let outcomes = dead_letters.into_outcomes();
     let meta = DeadLetterMeta {
         rejected_rows,
         outcomes,
@@ -7949,6 +9526,18 @@ struct PreparedSnapshot {
     emitted_totals: Vec<(SnapshotMetadata, u64, SnapshotTotals)>,
 }
 
+/// Staged overflow moved out of the accumulator while its existing byte charge
+/// remains owned by the accumulator.
+///
+/// Keeping the reservation in place closes a loss window: if a spool write
+/// fails, another sink cannot consume this process-ceiling capacity while the
+/// events are borrowed and make restoration of the already-admitted billing
+/// deltas fail.
+struct TakenOverflow {
+    events: Vec<ChargeEvent>,
+    retained_bytes: usize,
+}
+
 #[cfg(test)]
 type CleanupAfterStaleCheckHook = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -7977,9 +9566,20 @@ pub struct SnapshotAccumulator {
     /// single counter so the combined hard ceiling cannot be exceeded even when
     /// they race.
     retained_bytes: AtomicUsize,
+    /// Matching process-wide charge for [`Self::retained_bytes`].
+    ///
+    /// `max_retained_bytes` bounds **one** accumulator; without this the same
+    /// attacker-shaped identity keys and staged overflow could be multiplied by
+    /// the number of configured plugin instances and pending generations before
+    /// anything refused. Every admission grows it before the key or the staged
+    /// event exists, every eviction/drain/clear shrinks it by exactly the same
+    /// amount, and `Drop` releases whatever is still held — so a generation that
+    /// is dropped without an explicit clear cannot leak the charge.
+    process_retained: GrowableProcessReservation,
     overflow_pending: Mutex<Vec<ChargeEvent>>,
-    /// Overflow subset of `retained_bytes`, tracked separately so `take`/`clear`
-    /// release exactly the staged portion from the combined counter.
+    /// Overflow subset of `retained_bytes`, tracked separately so a take can
+    /// transfer logical ownership without releasing the charge, while
+    /// durable commit or clear releases exactly the staged portion.
     overflow_pending_bytes: AtomicUsize,
     /// Async snapshot-overflow jobs that can still re-stage an event after a
     /// durable spool failure. Full→Compact and finalization must wait for these
@@ -8020,6 +9620,24 @@ impl SnapshotAccumulator {
         max_retained_bytes: usize,
         shard_amount: usize,
     ) -> Self {
+        Self::with_limits_shards_and_ceiling(
+            max_entries,
+            max_retained_bytes,
+            shard_amount,
+            process_ceiling(),
+        )
+    }
+
+    /// Build an accumulator whose retained state is charged to an explicit
+    /// ceiling. Production always passes [`process_ceiling`]; external tests
+    /// pass their own leaked ceiling so multi-instance saturation assertions
+    /// stay exact alongside concurrently running tests.
+    pub fn with_limits_shards_and_ceiling(
+        max_entries: usize,
+        max_retained_bytes: usize,
+        shard_amount: usize,
+        ceiling: &'static RetainedByteCeiling,
+    ) -> Self {
         Self {
             entries: DashMap::with_shard_amount(shard_amount),
             last_emitted: DashMap::with_shard_amount(shard_amount),
@@ -8028,6 +9646,7 @@ impl SnapshotAccumulator {
             max_retained_bytes: max_retained_bytes.max(1),
             reserved_entries: AtomicUsize::new(0),
             retained_bytes: AtomicUsize::new(0),
+            process_retained: GrowableProcessReservation::new(ceiling),
             overflow_pending: Mutex::new(Vec::new()),
             overflow_pending_bytes: AtomicUsize::new(0),
             overflow_deliveries_in_flight: AtomicUsize::new(0),
@@ -8067,6 +9686,21 @@ impl SnapshotAccumulator {
         self.retained_bytes()
     }
 
+    /// Bytes this accumulator currently charges to the process-wide ceiling.
+    /// External tests assert it tracks the per-instance counter exactly, so N
+    /// instances cannot multiply past the shared ceiling.
+    #[allow(dead_code)]
+    pub fn process_retained_bytes_for_tests(&self) -> usize {
+        self.process_retained.held()
+    }
+
+    /// Release every process-wide charge as `Drop` would, without consuming the
+    /// accumulator. External tests use it to assert exact release.
+    #[allow(dead_code)]
+    pub fn clear_for_compaction_for_tests(&self) {
+        self.clear_for_compaction();
+    }
+
     /// Reserve one identity slot and its retained bytes against the hard
     /// ceilings before a new key is published. Returns `false` when either
     /// ceiling would be exceeded so the caller durably spools the charge. On a
@@ -8093,18 +9727,31 @@ impl SnapshotAccumulator {
     /// entry insertion and overflow staging so their combined footprint can
     /// never exceed `max_retained_bytes` under concurrency.
     fn try_reserve_bytes(&self, bytes: usize) -> bool {
-        self.retained_bytes
+        // The process ceiling is taken first so a per-instance reservation is
+        // never left held while the shared reservation fails.
+        if !self.process_retained.try_grow(bytes) {
+            return false;
+        }
+        if self
+            .retained_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
                     .filter(|next| *next <= self.max_retained_bytes)
             })
             .is_ok()
+        {
+            true
+        } else {
+            self.process_retained.shrink_by(bytes);
+            false
+        }
     }
 
     /// Release a previously reserved identity slot and its retained bytes.
     fn release_identity(&self, entry_bytes: usize) {
         self.reserved_entries.fetch_sub(1, Ordering::AcqRel);
         self.retained_bytes.fetch_sub(entry_bytes, Ordering::AcqRel);
+        self.process_retained.shrink_by(entry_bytes);
     }
 
     fn clear_for_compaction(&self) {
@@ -8116,6 +9763,10 @@ impl SnapshotAccumulator {
             pending.clear();
         }
         self.overflow_pending_bytes.store(0, Ordering::Release);
+        // Both per-instance counters are now zero, so the whole process-wide
+        // charge belongs to state that no longer exists. `release_all` is
+        // idempotent and saturating, so a later drop cannot double-release.
+        self.process_retained.release_all();
     }
 
     fn record_http(
@@ -8289,8 +9940,9 @@ impl SnapshotAccumulator {
             Err(poisoned) => poisoned.into_inner(),
         };
         pending.push(event);
-        // Track the staged portion of the combined reservation so `take`/`clear`
-        // release exactly these bytes.
+        // Track the staged portion of the combined reservation so take can
+        // transfer ownership and durable commit or clear can release exactly
+        // these bytes.
         self.overflow_pending_bytes
             .fetch_add(bytes, Ordering::AcqRel);
         true
@@ -8301,18 +9953,107 @@ impl SnapshotAccumulator {
         self.stage_overflow_event(event)
     }
 
-    fn take_overflow_pending(&self) -> Vec<ChargeEvent> {
+    /// Deterministic external-test probe for borrowed overflow ownership.
+    ///
+    /// Returns `(taken_events, taken_bytes, held_while_taken,
+    /// competing_byte_admitted, pending_after_restore, held_after_restore)`.
+    /// Tests set `ceiling.max()` to the staged charge before calling this. A
+    /// correct take keeps the ceiling saturated, so the competing byte is
+    /// refused and restoration cannot need a second admission.
+    #[allow(dead_code)]
+    pub fn probe_taken_overflow_ownership_for_tests(
+        &self,
+        ceiling: &'static RetainedByteCeiling,
+    ) -> (usize, usize, usize, bool, usize, usize) {
+        let taken = self.take_overflow_pending();
+        let taken_events = taken.events.len();
+        let taken_bytes = taken.retained_bytes;
+        let held_while_taken = self.process_retained.held();
+        let competing = ceiling.try_acquire(1);
+        let competing_byte_admitted = competing.is_some();
+        drop(competing);
+        self.restore_taken_overflow(taken);
+        (
+            taken_events,
+            taken_bytes,
+            held_while_taken,
+            competing_byte_admitted,
+            self.overflow_pending_len(),
+            self.process_retained.held(),
+        )
+    }
+
+    fn take_overflow_pending(&self) -> TakenOverflow {
         let mut pending = match self.overflow_pending.lock() {
             Ok(pending) => pending,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let drained = std::mem::take(&mut *pending);
-        // Release exactly the staged overflow portion from the combined
-        // retained-byte counter while holding the lock so a concurrent stage
-        // cannot have its bytes released out from under it.
-        let released = self.overflow_pending_bytes.swap(0, Ordering::AcqRel);
-        self.retained_bytes.fetch_sub(released, Ordering::AcqRel);
-        drained
+        TakenOverflow {
+            events: std::mem::take(&mut *pending),
+            // Move the logical ownership out of `overflow_pending`, but keep
+            // both byte reservations charged until durable success commits the
+            // take or failure restores it. A concurrent stage starts a fresh
+            // `overflow_pending_bytes` subtotal without being released by this
+            // take.
+            retained_bytes: self.overflow_pending_bytes.swap(0, Ordering::AcqRel),
+        }
+    }
+
+    /// Commit a successfully persisted overflow take, releasing the reservation
+    /// that stayed charged while the events were outside the accumulator.
+    fn commit_taken_overflow(&self, retained_bytes: usize) {
+        if retained_bytes == 0 {
+            return;
+        }
+        self.retained_bytes
+            .fetch_sub(retained_bytes, Ordering::AcqRel);
+        self.process_retained.shrink_by(retained_bytes);
+    }
+
+    /// Restore a failed overflow take without any new byte admission.
+    ///
+    /// The old events precede concurrently staged ones, preserving retry order.
+    /// Their retained-byte charge never left the accumulator, so restoration
+    /// cannot fail under process-wide ceiling pressure.
+    fn restore_taken_overflow(&self, mut taken: TakenOverflow) {
+        if taken.events.is_empty() {
+            debug_assert_eq!(taken.retained_bytes, 0);
+            return;
+        }
+        let mut pending = match self.overflow_pending.lock() {
+            Ok(pending) => pending,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        taken.events.append(&mut pending);
+        *pending = taken.events;
+        self.overflow_pending_bytes
+            .fetch_add(taken.retained_bytes, Ordering::AcqRel);
+    }
+
+    /// Staged overflow events still awaiting durable handoff.
+    fn overflow_pending_len(&self) -> usize {
+        match self.overflow_pending.lock() {
+            Ok(pending) => pending.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
+
+    /// Conservative process-ceiling bound for the delta projection this
+    /// accumulator would produce right now.
+    ///
+    /// `prepare_deltas` allocates two attacker-shaped copies per live identity —
+    /// the emitted `ChargeEvent` and the `emitted_totals` key clone — on top of
+    /// the entries and staged overflow that are already charged. `per_event_extra`
+    /// covers the per-event fields that come from configuration rather than from
+    /// the accumulator key.
+    fn delta_projection_bound(&self, per_event_extra: usize) -> Option<usize> {
+        let identities = self
+            .entries
+            .len()
+            .checked_add(self.overflow_pending_len())?;
+        self.retained_bytes()
+            .checked_mul(SNAPSHOT_PROJECTION_COPIES)?
+            .checked_add(identities.checked_mul(per_event_extra)?)
     }
 
     // External integration tests exercise the public accumulator contract;
@@ -8372,16 +10113,16 @@ impl SnapshotAccumulator {
         })
     }
 
-    fn peek_overflow_pending(&self) -> Vec<ChargeEvent> {
-        let pending = match self.overflow_pending.lock() {
-            Ok(pending) => pending,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        pending.clone()
+    // Only the external `compute_deltas` test contract still commits a whole
+    // `PreparedSnapshot`; production moves the projection apart and commits the
+    // emitted totals directly.
+    #[allow(dead_code)]
+    fn commit_prepared(&self, prepared: &PreparedSnapshot) {
+        self.commit_emitted_totals(&prepared.emitted_totals);
     }
 
-    fn commit_prepared(&self, prepared: &PreparedSnapshot) {
-        for (key, generation, current) in &prepared.emitted_totals {
+    fn commit_emitted_totals(&self, emitted_totals: &[(SnapshotMetadata, u64, SnapshotTotals)]) {
+        for (key, generation, current) in emitted_totals {
             // Publish the baseline only while this generation is still live so
             // a concurrent eviction cannot leave an orphaned baseline that a
             // later reinsert would mis-subtract, and so we cannot overwrite a
@@ -8614,6 +10355,9 @@ impl SnapshotAccumulator {
         {
             self.reserved_entries.fetch_add(1, Ordering::AcqRel);
             self.retained_bytes.fetch_add(entry_bytes, Ordering::AcqRel);
+            // Keep the process-wide charge in lockstep with the per-instance
+            // counter so a seeded identity releases exactly what it took.
+            let _ = self.process_retained.try_grow(entry_bytes);
         }
         entry.totals.call_count.store(call_count, Ordering::Relaxed);
         entry.revision.fetch_add(1, Ordering::Relaxed);
@@ -8792,6 +10536,15 @@ fn emit_periodic_snapshot(
     };
     let snapshot_id = new_ulid();
     let received_at = unix_timestamp_nanos();
+    // The projection coexists with the still-charged accumulator, so reserve it
+    // before it is built. Refusal is a retryable emission failure: no baseline
+    // is advanced and the next tick retries.
+    let _projection =
+        reserve_delta_projection(accumulator, config, node_id).inspect_err(|error| {
+            runtime
+                .metrics
+                .record_failure(FailureReason::Serialize, error.clone());
+        })?;
     let prepared = match accumulator.prepare_deltas(config, node_id, received_at, &snapshot_id) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -8806,11 +10559,21 @@ fn emit_periodic_snapshot(
             return Err(error);
         }
     };
-    let mut events = accumulator.peek_overflow_pending();
-    let overflow_count = events.len();
-    events.extend(prepared.events.iter().cloned());
+    let PreparedSnapshot {
+        events: delta_events,
+        emitted_totals,
+    } = prepared;
+    // Take the staged overflow instead of cloning it, and move the prepared
+    // deltas rather than copying them: both were previously duplicated into a
+    // third uncharged full-batch vector.
+    let taken = accumulator.take_overflow_pending();
+    let overflow_count = taken.events.len();
+    let overflow_retained_bytes = taken.retained_bytes;
+    let mut events = taken.events;
+    events.extend(delta_events);
     let event_count = events.len();
     if event_count == 0 {
+        accumulator.commit_taken_overflow(overflow_retained_bytes);
         return Ok(0);
     }
     let Some(spool) = runtime.spool.as_ref() else {
@@ -8818,9 +10581,13 @@ fn emit_periodic_snapshot(
         runtime
             .metrics
             .record_failure(FailureReason::Serialize, error.clone());
+        restage_borrowed_overflow(accumulator, events, overflow_count, overflow_retained_bytes);
         return Err(error);
     };
-    if let Err(error) = spool.write_events(&events) {
+    // Bind the result first so the borrow of `events` ends before the failure
+    // arm needs to move them back into bounded staging.
+    let write_result = spool.write_events(&events);
+    if let Err(error) = write_result {
         runtime
             .metrics
             .spool_available
@@ -8835,17 +10602,17 @@ fn emit_periodic_snapshot(
             error = %error,
             "Chargeback sink could not durably spool its periodic snapshot; no baseline was advanced"
         );
+        restage_borrowed_overflow(accumulator, events, overflow_count, overflow_retained_bytes);
         return Err(error);
     }
-    // Snapshot mode requires the spool. Make it the durable commit point before
-    // advancing the accumulator baseline, then enqueue the exact same event IDs
-    // as a low-latency delivery attempt. A reload racing this point can abort the
+    // Snapshot mode requires the spool. It is the durable commit point before
+    // the accumulator baseline advances; the same event IDs are then enqueued as
+    // a low-latency delivery attempt. A reload racing this point can abort the
     // queue worker without losing or double-charging the snapshot: replay is
-    // idempotent on event_id.
-    if overflow_count > 0 {
-        let _ = accumulator.take_overflow_pending();
-    }
-    accumulator.commit_prepared(&prepared);
+    // idempotent on event_id. The staged overflow was already taken above, so
+    // durable success simply keeps it taken.
+    accumulator.commit_taken_overflow(overflow_retained_bytes);
+    accumulator.commit_emitted_totals(&emitted_totals);
     runtime
         .metrics
         .snapshot_emits_total
@@ -8878,6 +10645,21 @@ fn emit_final_snapshot_to_spool(
     };
     let snapshot_id = new_ulid();
     let received_at = unix_timestamp_nanos();
+    let _projection = match reserve_delta_projection(accumulator, config, node_id) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            runtime
+                .metrics
+                .record_failure(FailureReason::Serialize, error.clone());
+            warn!(
+                plugin = PLUGIN_NAME,
+                generation = runtime.generation,
+                error = %error,
+                "Chargeback sink final snapshot could not reserve its projection; generation state retained"
+            );
+            return false;
+        }
+    };
     let prepared = match accumulator.prepare_deltas(config, node_id, received_at, &snapshot_id) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -8893,10 +10675,17 @@ fn emit_final_snapshot_to_spool(
             return false;
         }
     };
-    let mut events = accumulator.peek_overflow_pending();
-    let overflow_count = events.len();
-    events.extend(prepared.events.iter().cloned());
+    let PreparedSnapshot {
+        events: delta_events,
+        emitted_totals,
+    } = prepared;
+    let taken = accumulator.take_overflow_pending();
+    let overflow_count = taken.events.len();
+    let overflow_retained_bytes = taken.retained_bytes;
+    let mut events = taken.events;
+    events.extend(delta_events);
     if events.is_empty() {
+        accumulator.commit_taken_overflow(overflow_retained_bytes);
         return true;
     }
     let Some(spool) = runtime.spool.as_ref() else {
@@ -8904,9 +10693,13 @@ fn emit_final_snapshot_to_spool(
             FailureReason::Serialize,
             "snapshot finalization requires an available spool",
         );
+        restage_borrowed_overflow(accumulator, events, overflow_count, overflow_retained_bytes);
         return false;
     };
-    if let Err(error) = spool.write_events(&events) {
+    // Bind the result first so the borrow of `events` ends before the failure
+    // arm needs to move them back into bounded staging.
+    let write_result = spool.write_events(&events);
+    if let Err(error) = write_result {
         runtime
             .metrics
             .spool_available
@@ -8921,12 +10714,11 @@ fn emit_final_snapshot_to_spool(
             error = %error,
             "Chargeback sink could not durably spool its final snapshot; generation state retained"
         );
+        restage_borrowed_overflow(accumulator, events, overflow_count, overflow_retained_bytes);
         return false;
     }
-    if overflow_count > 0 {
-        let _ = accumulator.take_overflow_pending();
-    }
-    accumulator.commit_prepared(&prepared);
+    accumulator.commit_taken_overflow(overflow_retained_bytes);
+    accumulator.commit_emitted_totals(&emitted_totals);
     runtime
         .metrics
         .snapshot_emits_total
@@ -9252,6 +11044,79 @@ fn stage_overflow_events_or_reject(
         );
     }
     invalidate_status_cache();
+}
+
+/// Reserve the process-ceiling charge for a delta projection **before** it is
+/// built.
+///
+/// The projection (`ChargeEvent`s plus their `emitted_totals` key clones) is an
+/// attacker-shaped copy that coexists with the still-charged accumulator, so it
+/// must own a reservation for its whole life. Refusal is retryable: no baseline
+/// is advanced and nothing is discarded.
+fn reserve_delta_projection(
+    accumulator: &SnapshotAccumulator,
+    config: &ApiChargebackSinkConfig,
+    node_id: &str,
+) -> Result<GrowableProcessReservation, String> {
+    let bound = accumulator
+        .delta_projection_bound(snapshot_event_extra_bytes(config, node_id))
+        .ok_or_else(|| {
+            format!(
+                "{PLUGIN_NAME}: {}",
+                PayloadMaterializationError::BoundOverflowed.reason()
+            )
+        })?;
+    let reservation = GrowableProcessReservation::new(process_ceiling());
+    if !reservation.try_grow(bound) {
+        return Err(format!(
+            "{PLUGIN_NAME}: snapshot delta projection deferred: {}",
+            PayloadMaterializationError::CeilingExhausted.reason()
+        ));
+    }
+    Ok(reservation)
+}
+
+/// Return the leading `overflow_count` events of a borrowed emission set to
+/// bounded overflow staging.
+///
+/// The emission paths take staged overflow rather than cloning it. Every path
+/// that does not reach the durable commit point must give it back, or a pending
+/// billing delta would be silently lost. Prepared deltas beyond `overflow_count`
+/// are intentionally dropped: no baseline was advanced, so they are still held
+/// by the accumulator.
+fn restage_borrowed_overflow(
+    accumulator: &SnapshotAccumulator,
+    mut events: Vec<ChargeEvent>,
+    overflow_count: usize,
+    overflow_retained_bytes: usize,
+) {
+    if overflow_count == 0 {
+        debug_assert_eq!(overflow_retained_bytes, 0);
+        return;
+    }
+    events.truncate(overflow_count);
+    accumulator.restore_taken_overflow(TakenOverflow {
+        events,
+        retained_bytes: overflow_retained_bytes,
+    });
+    invalidate_status_cache();
+}
+
+/// Attacker-shaped copies of one accumulator identity that a delta projection
+/// holds at once: the emitted `ChargeEvent` and the `emitted_totals` key clone.
+const SNAPSHOT_PROJECTION_COPIES: usize = 2;
+/// ULID text length (`event_id`, `snapshot_id`).
+const SNAPSHOT_ULID_TEXT_BYTES: usize = 26;
+
+/// Per-event bytes a projected `ChargeEvent` carries beyond the accumulator key
+/// it is derived from: its own identifiers and the configured currency and
+/// pricing version.
+fn snapshot_event_extra_bytes(config: &ApiChargebackSinkConfig, node_id: &str) -> usize {
+    SNAPSHOT_ULID_TEXT_BYTES
+        .saturating_mul(2)
+        .saturating_add(node_id.len().min(MAX_FIELD_LEN))
+        .saturating_add(config.currency.len())
+        .saturating_add(config.pricing_version.len())
 }
 
 fn snapshot_metadata_retained_bytes(meta: &SnapshotMetadata) -> usize {

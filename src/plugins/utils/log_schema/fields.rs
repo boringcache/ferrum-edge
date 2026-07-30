@@ -6,7 +6,103 @@
 //! Drift between this registry and the structs is caught by the integration
 //! test in `tests/integration/log_schema_registry_tests.rs`.
 
-use super::SummaryType;
+use super::{DerivedKind, SummaryType};
+
+/// The record family a schema is compiled against.
+///
+/// The shared compiler was originally written for the transaction-summary
+/// family only. Three non-shipping plugins emit their own externally visible
+/// record shapes and reuse the identical compile/resolve machinery against
+/// their own field inventory rather than growing divergent mini-projections:
+///
+/// * [`RecordFamily::ChargebackReport`] — the per-proxy billing row inside the
+///   `api_chargeback` `GET /charges` document.
+/// * [`RecordFamily::ChargeEvent`] — the `api_chargeback_sink` JSONEachRow
+///   charge record.
+/// * [`RecordFamily::DebugDiagnostic`] — the `transaction_debugger` terminal
+///   diagnostic records (HTTP, stream, and WebSocket disconnect).
+///
+/// Each family owns its field inventory, whether `summary_type` partitions it,
+/// whether its records carry a metadata map, and which derived kinds are
+/// representable. Everything a family does not support fails closed at compile
+/// time with a plugin- and field-specific diagnostic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RecordFamily {
+    /// `TransactionSummary` / `StreamTransactionSummary` (+ `ws_logging`
+    /// WebSocket-disconnect entries). The historical, default family.
+    #[default]
+    TransactionSummary,
+    /// `api_chargeback` `/charges` per-proxy billing row.
+    ChargebackReport,
+    /// `api_chargeback_sink` exported charge event.
+    ChargeEvent,
+    /// `transaction_debugger` terminal diagnostic record.
+    DebugDiagnostic,
+}
+
+impl RecordFamily {
+    /// Operator-facing label used in compile diagnostics.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::TransactionSummary => "transaction summary",
+            Self::ChargebackReport => "chargeback billing row",
+            Self::ChargeEvent => "chargeback charge event",
+            Self::DebugDiagnostic => "transaction diagnostic",
+        }
+    }
+
+    /// `true` when `summary_type` meaningfully partitions this family's
+    /// records into HTTP-family and stream-family entries.
+    pub const fn uses_summary_type(self) -> bool {
+        matches!(self, Self::TransactionSummary | Self::DebugDiagnostic)
+    }
+
+    /// `true` when explicit output `order` is honored for this family.
+    ///
+    /// [`RecordFamily::ChargebackReport`] rows are members of a
+    /// `serde_json::Map`-backed document that is assembled and re-serialized as
+    /// a whole, so member order is not under the projection's control. Accepting
+    /// an `order` there would silently do nothing, so it is rejected instead.
+    pub const fn supports_order(self) -> bool {
+        !matches!(self, Self::ChargebackReport)
+    }
+
+    /// `true` when `timestamp_format` is meaningful for this family.
+    ///
+    /// The conversion operates on RFC3339 timestamp *strings*. A family with no
+    /// such field has nothing to convert: the chargeback billing row carries no
+    /// timestamp at all, and a charge event's `received_at` is an epoch-
+    /// nanosecond integer whose representation is fixed by the ClickHouse
+    /// column it inserts into. Accepting the key there would either do nothing
+    /// or silently change a column's type, so it is rejected instead.
+    pub const fn supports_timestamp_format(self) -> bool {
+        matches!(self, Self::TransactionSummary | Self::DebugDiagnostic)
+    }
+
+    /// `true` when this family's records carry a `metadata` map, making the
+    /// `metadata` policy (`nested` / `omit` / `flatten`) meaningful.
+    pub const fn has_metadata(self) -> bool {
+        matches!(self, Self::TransactionSummary | Self::DebugDiagnostic)
+    }
+
+    /// `true` when `kind` is representable from this family's records.
+    ///
+    /// A derived kind that has no source field on the family is rejected at
+    /// compile time rather than silently emitting a sentinel: an operator that
+    /// asks for `backend_host` on a charge event (which carries no backend
+    /// target at all) has a configuration error, not a missing value.
+    pub const fn supports_derived(self, kind: DerivedKind) -> bool {
+        match self {
+            Self::TransactionSummary | Self::DebugDiagnostic => true,
+            // Charge events carry a billable status and a gRPC status but no
+            // backend target.
+            Self::ChargeEvent => !matches!(kind, DerivedKind::BackendHost),
+            // A billing row is an aggregate across many transactions: it has
+            // no single status, backend, or outcome.
+            Self::ChargebackReport => matches!(kind, DerivedKind::SummaryKind),
+        }
+    }
+}
 
 /// Optional field families a specific caller opts into.
 ///
@@ -18,11 +114,19 @@ use super::SummaryType;
 /// registry: ws-only names stay rejected in `omit` / `rename` / `order` and
 /// never reserve output keys that would collide with `static_fields` or
 /// flattened metadata.
+///
+/// [`SchemaCapabilities::family`] selects the record family entirely; the
+/// `websocket_disconnect` flag is a family-local opt-in that currently applies
+/// to [`RecordFamily::TransactionSummary`] (`ws_logging`) and
+/// [`RecordFamily::DebugDiagnostic`] (`transaction_debugger`, which also
+/// observes WebSocket disconnects).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SchemaCapabilities {
-    /// Expose the `ws_logging` WebSocket-disconnect field family to `http`
+    /// Expose the WebSocket-disconnect field family to `http`
     /// and `both` summary types.
     pub websocket_disconnect: bool,
+    /// Which record family's field inventory this schema compiles against.
+    pub family: RecordFamily,
 }
 
 impl SchemaCapabilities {
@@ -30,13 +134,47 @@ impl SchemaCapabilities {
     /// the HTTP and stream field families, matching pre-WS behavior.
     pub const BASE: Self = Self {
         websocket_disconnect: false,
+        family: RecordFamily::TransactionSummary,
     };
 
     /// `ws_logging` capability: additionally expose the WebSocket-disconnect
     /// field family to `http` / `both` schemas.
     pub const WS_LOGGING: Self = Self {
         websocket_disconnect: true,
+        family: RecordFamily::TransactionSummary,
     };
+
+    /// `api_chargeback` capability: the `/charges` per-proxy billing row.
+    pub const API_CHARGEBACK: Self = Self {
+        websocket_disconnect: false,
+        family: RecordFamily::ChargebackReport,
+    };
+
+    /// `api_chargeback_sink` capability: the exported charge event.
+    pub const API_CHARGEBACK_SINK: Self = Self {
+        websocket_disconnect: false,
+        family: RecordFamily::ChargeEvent,
+    };
+
+    /// `transaction_debugger` capability: terminal diagnostics for HTTP,
+    /// stream, and WebSocket-disconnect records.
+    pub const TRANSACTION_DEBUGGER: Self = Self {
+        websocket_disconnect: true,
+        family: RecordFamily::DebugDiagnostic,
+    };
+
+    /// The same family without any optional field-family opt-in.
+    ///
+    /// Used by the compiler to decide which native specs are capability-added
+    /// "extension" fields. For [`Self::BASE`] this is the identity, so the
+    /// historical behavior of every non-`ws_logging` logging plugin is
+    /// unchanged.
+    pub const fn without_optional_families(self) -> Self {
+        Self {
+            websocket_disconnect: false,
+            family: self.family,
+        }
+    }
 }
 
 /// Metadata for a single native field on a summary struct.
@@ -355,19 +493,512 @@ pub const WS_DISCONNECT_FIELDS: &[FieldMeta] = &[
     },
 ];
 
+/// Native keys of the `api_chargeback` `/charges` per-proxy billing row, in
+/// emission order.
+///
+/// This is the externally documented representation boundary for
+/// `api_chargeback`: the leaf object under
+/// `consumers.<consumer>.proxies.<key>`. The registry entry key, the billing
+/// identity, and the charge accounting that produce these numbers are
+/// unaffected by projection — only the rendered row is projected.
+///
+/// `by_status`, `bandwidth`, and `stream` are nested objects; they may be
+/// renamed, omitted, or ordered like any other native field, but their inner
+/// keys are not part of the schema surface. `stream` is emitted only when the
+/// row carries stream activity, exactly as in the default rendering.
+pub const CHARGEBACK_REPORT_FIELDS: &[FieldMeta] = &[
+    FieldMeta {
+        name: "proxy_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "namespace",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "proxy_name",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "currency",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "protocol_family",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "total_calls",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "total_charges",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "by_status",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "bandwidth",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "stream",
+        is_timestamp: false,
+    },
+];
+
+/// Native keys of an `api_chargeback_sink` exported charge event, in
+/// declaration order on `ChargeEvent`.
+///
+/// `received_at` is an epoch-nanosecond integer, not an RFC3339 string, and its
+/// representation is fixed by the ClickHouse column it inserts into — so it is
+/// not a `timestamp_format` field and the key itself is rejected for this
+/// family.
+pub const CHARGE_EVENT_FIELDS: &[FieldMeta] = &[
+    FieldMeta {
+        name: "event_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "received_at",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "node_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "namespace",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "consumer_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "consumer_name",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "proxy_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "proxy_name",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "route_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "status_code",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "http_status_code",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "grpc_status",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "protocol",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "call_count",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "charge_call",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "bytes_sent",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "bytes_received",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "charge_bytes_sent",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "charge_bytes_received",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "charge_total",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "currency",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "pricing_version",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "request_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "trace_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "snapshot_id",
+        is_timestamp: false,
+    },
+];
+
+/// Native keys of a `transaction_debugger` HTTP / gRPC terminal diagnostic, in
+/// the order the default (schema-free) `transaction_debug` event emits them.
+pub const DEBUG_HTTP_FIELDS: &[FieldMeta] = &[
+    FieldMeta {
+        name: "outcome",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "namespace",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "timestamp_received",
+        is_timestamp: true,
+    },
+    FieldMeta {
+        name: "client_ip",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "method",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "path",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "status",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "proxy_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "proxy_name",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "backend_target",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "backend_resolved_ip",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "consumer_username",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "auth_method",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "error_class",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "body_error_class",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "response_streamed",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "body_completed",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "client_disconnected",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "bytes_sent",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "bytes_received",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "rejection_phase",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "grpc_status",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "request_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "trace_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "latency_total_ms",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "latency_backend_ttfb_ms",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "latency_backend_total_ms",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "latency_plugin_ms",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "latency_gw_overhead_ms",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "metadata",
+        is_timestamp: false,
+    },
+];
+
+/// Native keys of a `transaction_debugger` stream (TCP/UDP/DTLS) terminal
+/// diagnostic, in default emission order.
+pub const DEBUG_STREAM_FIELDS: &[FieldMeta] = &[
+    FieldMeta {
+        name: "outcome",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "namespace",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "protocol",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "proxy_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "proxy_name",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "client_ip",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "listen_port",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "backend_target",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "backend_resolved_ip",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "consumer_username",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "auth_method",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "connection_error",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "error_class",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "disconnect_direction",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "disconnect_cause",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "duration_ms",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "bytes_sent",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "bytes_received",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "timestamp_connected",
+        is_timestamp: true,
+    },
+    FieldMeta {
+        name: "timestamp_disconnected",
+        is_timestamp: true,
+    },
+    FieldMeta {
+        name: "sni_hostname",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "request_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "trace_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "metadata",
+        is_timestamp: false,
+    },
+];
+
+/// Native keys of a `transaction_debugger` WebSocket-disconnect terminal
+/// diagnostic, in default emission order.
+///
+/// Gated behind [`SchemaCapabilities::websocket_disconnect`] exactly like the
+/// `ws_logging` family, so the WebSocket-only names are extension fields for
+/// `order` completeness and per-entry flatten reservation.
+pub const DEBUG_WS_FIELDS: &[FieldMeta] = &[
+    FieldMeta {
+        name: "outcome",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "namespace",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "proxy_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "proxy_name",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "client_ip",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "listen_port",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "backend_target",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "consumer_username",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "auth_method",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "duration_ms",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "frames_client_to_backend",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "frames_backend_to_client",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "bytes_client_to_backend",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "bytes_backend_to_client",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "disconnect_direction",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "io_side",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "error_class",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "request_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "trace_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "metadata",
+        is_timestamp: false,
+    },
+];
+
 /// The field families visible for `summary_type` under `caps`.
 ///
 /// The WebSocket-disconnect family is appended to the `http` / `both`
 /// families only when the caller opts in via
-/// [`SchemaCapabilities::websocket_disconnect`].
+/// [`SchemaCapabilities::websocket_disconnect`]. Families that do not partition
+/// their records by `summary_type` ignore it entirely — the compiler rejects an
+/// explicit `summary_type` for those families before this is reached.
 fn field_sets(summary_type: SummaryType, caps: SchemaCapabilities) -> Vec<&'static [FieldMeta]> {
+    let (http, stream, ws): (
+        &'static [FieldMeta],
+        &'static [FieldMeta],
+        &'static [FieldMeta],
+    ) = match caps.family {
+        RecordFamily::TransactionSummary => (HTTP_FIELDS, STREAM_FIELDS, WS_DISCONNECT_FIELDS),
+        RecordFamily::DebugDiagnostic => (DEBUG_HTTP_FIELDS, DEBUG_STREAM_FIELDS, DEBUG_WS_FIELDS),
+        RecordFamily::ChargebackReport => return vec![CHARGEBACK_REPORT_FIELDS],
+        RecordFamily::ChargeEvent => return vec![CHARGE_EVENT_FIELDS],
+    };
     let mut sets: Vec<&'static [FieldMeta]> = match summary_type {
-        SummaryType::Http => vec![HTTP_FIELDS],
-        SummaryType::Stream => vec![STREAM_FIELDS],
-        SummaryType::Both => vec![HTTP_FIELDS, STREAM_FIELDS],
+        SummaryType::Http => vec![http],
+        SummaryType::Stream => vec![stream],
+        SummaryType::Both => vec![http, stream],
     };
     if caps.websocket_disconnect && matches!(summary_type, SummaryType::Http | SummaryType::Both) {
-        sets.push(WS_DISCONNECT_FIELDS);
+        sets.push(ws);
     }
     sets
 }

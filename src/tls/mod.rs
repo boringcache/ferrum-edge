@@ -310,6 +310,10 @@ where
                     crate::plugins::mesh::prometheus_helpers::increment_mesh_mtls_handshake_failure(
                         "timeout",
                     );
+                    crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+                        crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundTls,
+                        false,
+                    );
                 }
                 warn!(
                     "Frontend TLS handshake timed out from {} after {}s",
@@ -327,11 +331,23 @@ where
     };
 
     match result {
-        Ok(stream) => Ok(stream),
+        Ok(stream) => {
+            if record_mesh_mtls_metric {
+                crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+                    crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundTls,
+                    true,
+                );
+            }
+            Ok(stream)
+        }
         Err(e) => {
             if record_mesh_mtls_metric {
                 crate::plugins::mesh::prometheus_helpers::increment_mesh_mtls_handshake_failure(
                     "error",
+                );
+                crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+                    crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundTls,
+                    false,
                 );
             }
             warn!("Frontend TLS handshake failed from {}: {}", peer.ip(), e);

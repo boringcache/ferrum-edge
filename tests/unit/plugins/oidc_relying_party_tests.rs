@@ -697,7 +697,7 @@ async fn oidc_multi_auth_preserves_rotated_cookie_when_later_credential_rejects(
         status_code, 401,
         "the later client rejection must still win"
     );
-    assert_eq!(body.as_slice(), br#"{"error":"Invalid API key"}"#);
+    assert_eq!(&body[..], br#"{"error":"Invalid API key"}"#);
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
     assert!(ctx.authenticated_identity_header.is_none());

@@ -8,8 +8,10 @@
 //!   `schema_ref:` resolves correctly through the named-schemas registry.
 //! * The loader's `begin_reload` / `commit_reload` bracket actually
 //!   publishes schemas so dependents can find them.
-//! * Non-shipping plugins (transaction_debugger, prometheus_metrics,
-//!   api_chargeback) reject `schema` / `schema_ref` keys.
+//! * `prometheus_metrics` still rejects `schema` / `schema_ref` (its label
+//!   names are baked into the time-series store), while `api_chargeback`,
+//!   `api_chargeback_sink`, and `transaction_debugger` project their own
+//!   record families and fail closed on shapes those families cannot express.
 //! * `transaction_log_schema` rejects non-global scopes via
 //!   `GatewayConfig::validate_plugin_references`.
 
@@ -481,18 +483,51 @@ fn inline_and_schema_ref_mutually_exclusive() {
 }
 
 #[test]
-fn transaction_debugger_rejects_schema() {
-    let err = create_err(
+fn transaction_debugger_accepts_inline_schema() {
+    create_ok(
         "transaction_debugger",
-        json!({ "schema": { "summary_type": "http" } }),
+        json!({
+            "schema": {
+                "summary_type": "http",
+                "rename": { "proxy_id": "route_id" },
+                "omit": ["latency_gw_overhead_ms"],
+                "static_fields": { "env": "prod" },
+                "derived_fields": [{ "name": "status_group", "kind": "status_class" }],
+                "metadata": { "mode": "flatten", "prefix": "meta_" },
+                "timestamp_format": "epoch_ms"
+            }
+        }),
     );
-    assert!(err.contains("not supported"), "got: {err}");
 }
 
 #[test]
-fn transaction_debugger_rejects_schema_ref() {
-    let err = create_err("transaction_debugger", json!({ "schema_ref": "x" }));
-    assert!(err.contains("not supported"), "got: {err}");
+fn transaction_debugger_schema_rejects_unknown_field_with_diagnostic() {
+    // The diagnostic inventory is the plugin's own: a transaction-summary-only
+    // name is unknown here and must fail closed rather than be ignored.
+    let err = create_err(
+        "transaction_debugger",
+        json!({ "schema": { "summary_type": "http", "omit": ["request_user_agent"] } }),
+    );
+    assert!(
+        err.contains(
+            "transaction_debugger: schema omit references unknown field 'request_user_agent'"
+        ),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn transaction_debugger_rejects_dangling_schema_ref() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    let err = create_err(
+        "transaction_debugger",
+        json!({ "schema_ref": "definitely-not-defined" }),
+    );
+    assert!(
+        err.contains("references unknown schema 'definitely-not-defined'"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -505,12 +540,53 @@ fn prometheus_metrics_rejects_schema() {
 }
 
 #[test]
-fn api_chargeback_rejects_schema() {
-    let err = create_err(
+fn api_chargeback_accepts_inline_schema() {
+    create_ok(
         "api_chargeback",
-        json!({ "schema": { "summary_type": "http" } }),
+        json!({
+            "bandwidth_pricing": { "price_per_byte_sent": 0.000001 },
+            "schema": {
+                "rename": { "proxy_id": "route_id" },
+                "omit": ["by_status"],
+                "static_fields": { "ledger": "prod" },
+                "derived_fields": [{ "name": "record_kind", "kind": "summary_kind" }]
+            }
+        }),
     );
-    assert!(err.contains("not supported"), "got: {err}");
+}
+
+#[test]
+fn api_chargeback_schema_rejects_summary_type_metadata_and_order() {
+    // A billing row is neither an HTTP nor a stream summary, carries no
+    // metadata map, and is emitted as a member of a sorted JSON document.
+    // Each unsupported shape fails closed with its own diagnostic.
+    for (schema, needle) in [
+        (
+            json!({ "summary_type": "http" }),
+            "'summary_type' is not supported",
+        ),
+        (
+            json!({ "metadata": { "mode": "omit" } }),
+            "'metadata' policy is not supported",
+        ),
+        (
+            json!({ "order": ["proxy_id", "*"] }),
+            "'order' is not supported",
+        ),
+        (
+            json!({ "derived_fields": [{ "name": "host", "kind": "backend_host" }] }),
+            "not representable from a chargeback billing row",
+        ),
+    ] {
+        let err = create_err(
+            "api_chargeback",
+            json!({
+                "bandwidth_pricing": { "price_per_byte_sent": 0.000001 },
+                "schema": schema
+            }),
+        );
+        assert!(err.contains(needle), "needle={needle}, got: {err}");
+    }
 }
 
 #[test]
@@ -749,5 +825,199 @@ fn failed_cache_build_does_not_leak_registry_changes() {
     assert!(
         registry::lookup_named("rejected").is_none(),
         "rejected reload's staged schema must NOT leak into the live registry"
+    );
+}
+
+#[test]
+fn non_summary_families_resolve_schema_ref_and_survive_reload() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    registry::begin_reload().expect("reload bracket opens");
+    create_ok(
+        "transaction_log_schema",
+        json!({
+            "schemas": {
+                "portable": { "rename": { "proxy_id": "route_id" } }
+            }
+        }),
+    );
+    registry::commit_reload().expect("reload bracket commits");
+
+    // Both non-summary families recompile the named definition under their own
+    // record family — the shared `proxy_id` name resolves in each.
+    create_ok("transaction_debugger", json!({ "schema_ref": "portable" }));
+    create_ok(
+        "api_chargeback",
+        json!({
+            "bandwidth_pricing": { "price_per_byte_sent": 0.000001 },
+            "schema_ref": "portable"
+        }),
+    );
+
+    // A reload that drops the definition leaves the referrers dangling, and
+    // they fail closed on the next construction.
+    registry::begin_reload().expect("second reload bracket opens");
+    create_ok(
+        "transaction_log_schema",
+        json!({ "schemas": { "other": {} } }),
+    );
+    registry::commit_reload().expect("second reload bracket commits");
+
+    for (plugin, config) in [
+        ("transaction_debugger", json!({ "schema_ref": "portable" })),
+        (
+            "api_chargeback",
+            json!({
+                "bandwidth_pricing": { "price_per_byte_sent": 0.000001 },
+                "schema_ref": "portable"
+            }),
+        ),
+    ] {
+        let err = create_err(plugin, config);
+        assert!(
+            err.contains("references unknown schema 'portable'"),
+            "{plugin}: {err}"
+        );
+    }
+}
+
+#[test]
+fn non_summary_families_reject_a_named_schema_they_cannot_represent() {
+    // A portable definition is authored against the transaction-summary
+    // registry. Recompiling it under another family fails closed on any name
+    // that family does not have, rather than silently dropping the field.
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    registry::begin_reload().expect("reload bracket opens");
+    create_ok(
+        "transaction_log_schema",
+        json!({
+            "schemas": {
+                "summary_only": { "omit": ["request_user_agent"] }
+            }
+        }),
+    );
+    registry::commit_reload().expect("reload bracket commits");
+
+    let err = create_err(
+        "transaction_debugger",
+        json!({ "schema_ref": "summary_only" }),
+    );
+    assert!(
+        err.contains("schema omit references unknown field 'request_user_agent'"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn non_summary_families_participate_in_the_prospective_graph() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    registry::begin_reload().expect("reload bracket opens");
+    registry::commit_reload().expect("reload bracket commits");
+
+    validate_graph(vec![
+        graph_plugin(
+            "debugger",
+            "ferrum",
+            "transaction_debugger",
+            json!({"schema_ref": "prospective"}),
+        ),
+        graph_plugin(
+            "schemas",
+            "ferrum",
+            "transaction_log_schema",
+            json!({"schemas": {"prospective": {}}}),
+        ),
+    ])
+    .expect("a debugger referrer resolves against a prospective definition");
+
+    let errors = validate_graph(vec![graph_plugin(
+        "debugger",
+        "ferrum",
+        "transaction_debugger",
+        json!({"schema_ref": "missing"}),
+    )])
+    .expect_err("a dangling debugger reference is graph-fatal");
+    assert!(
+        errors.iter().any(|error| error.contains("missing")),
+        "{errors:?}"
+    );
+}
+
+/// Minimal `api_chargeback_sink` config the constructor admits: spool disabled
+/// so no on-disk tree is created, one pricing dimension, and a hostname
+/// ClickHouse endpoint that the literal-IP egress screen leaves alone.
+fn sink_config(extra: Value) -> Value {
+    let mut config = json!({
+        "mode": "per_event",
+        "clickhouse": { "url": "https://clickhouse.example:8443" },
+        "spool": { "enabled": false },
+        "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.01 }],
+        "pricing_version": "test-v1",
+        "currency": "USD"
+    });
+    if let Some(object) = extra.as_object() {
+        for (key, value) in object {
+            config[key.as_str()] = value.clone();
+        }
+    }
+    config
+}
+
+/// The charge-event family is the only one whose projected keys are remote
+/// ClickHouse column names, so its `schema_ref` lifecycle is asserted end to
+/// end: a shared definition recompiles under the family, a definition whose
+/// rename target collides with a real charge-event column is rejected instead
+/// of quietly redirecting a value into another column, and a reload that drops
+/// the definition leaves the referrer failing closed.
+///
+/// `summary_only_target` is the collision case: `route_id` is not a
+/// transaction-summary field, so the definition is perfectly valid where it is
+/// authored, but it IS a `ChargeEvent` member (and a ClickHouse column).
+#[test]
+fn charge_event_family_resolves_schema_ref_and_rejects_a_colliding_definition() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    registry::begin_reload().expect("reload bracket opens");
+    create_ok(
+        "transaction_log_schema",
+        json!({
+            "schemas": {
+                "sink_portable": { "rename": { "proxy_id": "gateway_route" } },
+                "summary_only_target": { "rename": { "proxy_id": "route_id" } }
+            }
+        }),
+    );
+    registry::commit_reload().expect("reload bracket commits");
+
+    create_ok(
+        "api_chargeback_sink",
+        sink_config(json!({ "schema_ref": "sink_portable" })),
+    );
+
+    let err = create_err(
+        "api_chargeback_sink",
+        sink_config(json!({ "schema_ref": "summary_only_target" })),
+    );
+    assert!(
+        err.contains("duplicate output key 'route_id' produced by native and native"),
+        "got: {err}"
+    );
+
+    registry::begin_reload().expect("second reload bracket opens");
+    create_ok(
+        "transaction_log_schema",
+        json!({ "schemas": { "other": {} } }),
+    );
+    registry::commit_reload().expect("second reload bracket commits");
+
+    let err = create_err(
+        "api_chargeback_sink",
+        sink_config(json!({ "schema_ref": "sink_portable" })),
+    );
+    assert!(
+        err.contains("references unknown schema 'sink_portable'"),
+        "got: {err}"
     );
 }

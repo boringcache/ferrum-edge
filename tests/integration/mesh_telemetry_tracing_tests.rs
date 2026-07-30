@@ -170,6 +170,7 @@ async fn telemetry_provider_from_mesh_slice_emits_otlp_span() {
         disable_span_reporting: None,
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
+        custom_env_tags: HashMap::new(),
         providers: vec![TracingProvider::OpenTelemetry {
             endpoint: format!("{}/v1/traces", collector.uri()),
         }],
@@ -208,6 +209,7 @@ async fn telemetry_disable_span_reporting_from_mesh_slice_suppresses_export() {
         disable_span_reporting: Some(true),
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
+        custom_env_tags: HashMap::new(),
         providers: vec![TracingProvider::OpenTelemetry {
             endpoint: format!("{}/v1/traces", collector.uri()),
         }],
@@ -252,6 +254,7 @@ async fn telemetry_tracing_mode_client_emits_kind_client_span_on_outbound_listen
         disable_span_reporting: None,
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
+        custom_env_tags: HashMap::new(),
         providers: vec![TracingProvider::OpenTelemetry {
             endpoint: format!("{}/v1/traces", collector.uri()),
         }],
@@ -296,6 +299,7 @@ async fn telemetry_tracing_mode_client_skips_inbound_listener_traffic() {
         disable_span_reporting: None,
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
+        custom_env_tags: HashMap::new(),
         providers: vec![TracingProvider::OpenTelemetry {
             endpoint: format!("{}/v1/traces", collector.uri()),
         }],
@@ -331,6 +335,7 @@ async fn telemetry_tracing_mode_client_and_server_emits_both_directions() {
         disable_span_reporting: None,
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
+        custom_env_tags: HashMap::new(),
         providers: vec![TracingProvider::OpenTelemetry {
             endpoint: format!("{}/v1/traces", collector.uri()),
         }],
@@ -402,6 +407,7 @@ async fn telemetry_tracing_mode_unset_defaults_to_server_only() {
         disable_span_reporting: None,
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
+        custom_env_tags: HashMap::new(),
         providers: vec![TracingProvider::OpenTelemetry {
             endpoint: format!("{}/v1/traces", collector.uri()),
         }],

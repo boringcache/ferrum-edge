@@ -1,3 +1,4 @@
+mod access_log_filter_tests;
 mod admin_enhanced_tls_tests;
 mod admin_listeners_tests;
 mod admin_security_tests;
@@ -7,6 +8,7 @@ mod backend_egress_policy_tests;
 mod batch_atomicity_tests;
 mod conf_file_tests;
 mod config_backup_tests;
+mod config_change_watch_tests;
 mod config_file_loader_tests;
 mod config_migration_tests;
 mod config_types_tests;

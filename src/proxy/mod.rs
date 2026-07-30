@@ -55,6 +55,7 @@ pub mod mesh_udp_capture;
 pub mod mesh_udp_frame;
 pub mod netns_capture;
 pub mod netns_udp_capture;
+pub(crate) mod node_waypoint_ingress_capture;
 pub mod proxy_protocol;
 pub mod sni;
 pub mod stream_error;
@@ -2120,6 +2121,203 @@ fn build_inbound_hbone_relay_proxy(
     ))
 }
 
+/// A captured NodeWaypoint inbound connection resolved against the live slice:
+/// the relay entry to hand to `handle_mesh_tcp_inbound`, plus the
+/// PeerAuthentication posture of the **exact** destination workload.
+///
+/// The two are produced together on purpose. One NodeWaypoint capture listener
+/// serves every enrolled pod on the node, so neither the posture nor the policy
+/// scope may be read from anything listener-wide: both are properties of the
+/// single workload that owns the recovered original destination, and both are
+/// resolved from the SAME `RequestEpoch` load so a slice reload can never pair
+/// one workload's posture with another's scope.
+pub(crate) struct NodeWaypointCaptureDestination {
+    pub(crate) entry: Arc<crate::router_cache::MeshTcpInboundEntry>,
+    /// Effective inbound PeerAuthentication mode for the destination workload
+    /// on the captured app port. `Strict` means direct plaintext must be
+    /// refused even if some other workload on the same port is `Permissive`.
+    pub(crate) mtls_mode: crate::modes::mesh::config::MtlsMode,
+}
+
+/// Resolve a NodeWaypoint connection the eBPF tc ingress redirect steered into
+/// the transparent capture listener (issue #3287) against the live slice.
+///
+/// NodeWaypoint materializes no inbound routes (its inbound surface is the
+/// HBONE relay), so the relay target is synthesized per connection from the
+/// recovered original destination — the direct-plaintext counterpart of
+/// [`build_inbound_hbone_relay_proxy`].
+///
+/// This resolution is **destination-exact and fail-closed**, which the HBONE
+/// relay does not have to be: HBONE authenticates its peer and authorizes with
+/// the destination-scope machinery on the request path, whereas this listener
+/// admits unauthenticated direct plaintext and is therefore the only thing
+/// standing between a node-local peer and the workload. So:
+///
+/// * Resolution runs against the dedicated
+///   [`crate::modes::mesh::config::MeshConfig::node_waypoint_capture_destinations`]
+///   inventory — the CP-authorized set of workloads enrolled on THIS
+///   NodeWaypoint — not the subscription-namespace `workloads` view. Enrolled
+///   pods are routinely in other namespaces, so `workloads` cannot name them;
+///   and the inventory is narrower everywhere else, so it subsumes the HBONE
+///   open-relay guard rather than relaxing it.
+/// * The destination address must match **exactly one** inventory workload, and
+///   that workload must declare the captured port (a port-less workload does not
+///   constrain its address). No match (including the loopback case the HBONE
+///   open-relay guard tolerates), an EMPTY inventory, and divergent matches all
+///   return `None`: without the exact workload there is no PeerAuthentication
+///   posture and no policy scope to enforce, and evaluating another workload's
+///   policy — or defaulting PERMISSIVE because the required policy was filtered
+///   out at the CP — would be worse than refusing.
+/// * The returned [`NodeWaypointCaptureDestination::mtls_mode`] is resolved from
+///   that workload's own namespace/labels via the canonical PeerAuthentication
+///   resolver over the matching capture-policy inventory, never from the
+///   listener-wide per-port table — two pods can share an app port with opposite
+///   postures, and a `Permissive` neighbour must not admit plaintext to a
+///   `Strict` workload, including across namespaces.
+/// * The entry carries that workload's [`crate::modes::mesh::runtime::PolicyScopeCache`]
+///   so stream `mesh_authz` evaluates namespace/selector-scoped policies against
+///   the captured destination instead of failing every connection closed as
+///   `scope_missing`.
+///
+/// The dial is marked `NODE_WAYPOINT_INBOUND_AUTH_MARK` so the pod-veth
+/// `ferrum_tc_inbound` guard admits it as an authorized relay dial, and the
+/// ingress redirect bypasses it as already-relayed instead of steering it back
+/// into the capture listener.
+pub(crate) fn build_node_waypoint_capture_relay_entry(
+    orig_dst: SocketAddr,
+    epoch: &crate::request_epoch::RequestEpoch,
+) -> Option<NodeWaypointCaptureDestination> {
+    let mesh = epoch.config.mesh.as_deref()?;
+    // Stamp destination-authz readiness onto the synthesized entry so
+    // `handle_mesh_tcp_inbound` can fail closed before the backend dial. This
+    // is an O(1) read of a bit the plugin cache precomputed for this
+    // generation — NOT a config-vector or plugin-vector scan: the connect path
+    // must not walk `config.plugin_configs` or the built chain (hot-path
+    // invariant). The bit is true only when the mesh-managed reserved
+    // `__mesh_authz` row is enabled AND its runtime policy is provably in the
+    // prebuilt global TCP chain this relay resolves; an operator-authored
+    // global `mesh_authz` never satisfies it. See
+    // `PluginCacheInner::node_waypoint_destination_authz_ready`.
+    let has_destination_mesh_authz = epoch.plugin_cache.node_waypoint_destination_authz_ready();
+    resolve_node_waypoint_capture_destination(orig_dst, mesh, has_destination_mesh_authz)
+}
+
+/// Slice-only core of [`build_node_waypoint_capture_relay_entry`], split out so
+/// the destination-exactness and PeerAuthentication rules can be pinned without
+/// standing up a full `RequestEpoch`.
+pub(crate) fn resolve_node_waypoint_capture_destination(
+    orig_dst: SocketAddr,
+    mesh: &crate::modes::mesh::config::MeshConfig,
+    has_destination_mesh_authz: bool,
+) -> Option<NodeWaypointCaptureDestination> {
+    let host = orig_dst.ip().to_string();
+    // Resolution runs ONLY against the dedicated NodeWaypoint capture
+    // destination inventory (issue #3287), never `mesh.workloads`. A
+    // NodeWaypoint captures for every ENROLLED pod on its node, and those pods
+    // routinely live in namespaces other than the NodeWaypoint's own, so
+    // `mesh.workloads` — narrowed to the subscription namespace — cannot even
+    // name the destination. The inventory is CP-authorized (scope + bearer `ns`
+    // claim) and keyed on the trusted `Workload.node_waypoint.spiffe_id`, so it
+    // is both wider where it must be and strictly narrower everywhere else.
+    //
+    // This also subsumes the `inbound_hbone_relay_destination_allowed` open-relay
+    // guard the HBONE relay uses, and is strictly stronger: that guard admits any
+    // slice-declared workload address (and loopback), whereas here the address
+    // must belong to a workload THIS NodeWaypoint is enrolled for, and the port
+    // must be one that workload declares. An EMPTY inventory therefore matches
+    // nothing and fails closed — the caller refuses the connection — rather than
+    // resolving a workload with no policy and defaulting PERMISSIVE.
+    //
+    // A workload that declares ports admits only those ports; one that declares
+    // none does not constrain its address (the same rule the HBONE open-relay
+    // guard applies).
+    let owns_destination = |workload: &crate::modes::mesh::config::Workload| {
+        workload.addresses.iter().any(|addr| addr == &host)
+            && (workload.ports.is_empty()
+                || workload
+                    .ports
+                    .iter()
+                    .any(|workload_port| workload_port.port == orig_dst.port()))
+    };
+    // Exactly one workload identity may own the captured address. Duplicate
+    // records for one pod (several services backed by the same workload) are
+    // normal and agree on namespace/labels/SPIFFE, so they collapse to one
+    // scope; genuinely DIVERGENT records are an ambiguity we cannot resolve
+    // safely, and picking the first would silently choose whose policy applies.
+    let mut destination: Option<(
+        &crate::modes::mesh::config::Workload,
+        crate::modes::mesh::runtime::PolicyScopeCache,
+    )> = None;
+    for workload in mesh
+        .node_waypoint_capture_destinations
+        .iter()
+        .filter(|workload| owns_destination(workload))
+    {
+        let candidate = crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload);
+        if let Some((_, existing)) = destination.as_ref() {
+            if existing != &candidate {
+                return None;
+            }
+            continue;
+        }
+        destination = Some((workload, candidate));
+    }
+    let (workload, policy_scope) = destination?;
+    // Canonical PeerAuthentication resolution (WorkloadSelector > Namespace >
+    // MeshWide, port override inside the winner, fail-secure same-tier tie
+    // break) against the DESTINATION workload's authoritative namespace/labels
+    // as the slice declares them. The slice-level `labels_ambiguous` escalation
+    // does not apply here: that guards the DP's inference of its OWN identity,
+    // while these labels come straight off the workload record.
+    //
+    // The candidate set is the dedicated capture inventory, NOT
+    // `mesh.peer_authentications`: the latter is narrowed to this NodeWaypoint's
+    // OWN subscription namespace, so a STRICT PeerAuthentication declared in a
+    // CAPTURED pod's namespace would be absent and this resolver would fall back
+    // to Istio's PERMISSIVE default — admitting direct plaintext exactly where
+    // STRICT forbids it. The capture inventory carries the mesh-wide /
+    // root-namespace, namespace-scoped, and selector-scoped candidates
+    // applicable to the destinations, so precedence and port overrides resolve
+    // identically to how the destination's own sidecar would resolve them.
+    let mtls_mode = crate::modes::mesh::slice::resolve_effective_mtls_mode(
+        &mesh.node_waypoint_capture_peer_authentications,
+        &policy_scope.namespace,
+        &policy_scope.labels,
+        orig_dst.port(),
+    );
+    // Name the relay after the owning workload so the synthesized proxy id,
+    // authorization namespace, and logs identify the real service instead of a
+    // bare address.
+    let route = crate::modes::mesh::config::MeshInboundTcpRoute {
+        match_port: orig_dst.port(),
+        backend_addr: orig_dst,
+        namespace: workload.namespace.clone(),
+        service_name: workload.service_name.clone(),
+        service_fqdn: format!("{host}:{}", orig_dst.port()),
+        // The capture relay never peeks: it is protocol-agnostic by
+        // construction (the captured stream may be HTTP, a server-first binary
+        // protocol, or the application's own TLS), and a pre-dial peek on a
+        // server-first port would park the relay on the handshake clock.
+        tls_inspect: false,
+        first_bytes_inspect: false,
+    };
+    let relay_proxy = Arc::new(crate::modes::mesh::mesh_inbound_tcp_relay_proxy(&route));
+    Some(NodeWaypointCaptureDestination {
+        entry: Arc::new(crate::router_cache::MeshTcpInboundEntry {
+            relay_proxy,
+            backend_addr: orig_dst,
+            service_fqdn: route.service_fqdn,
+            tls_inspect: false,
+            first_bytes_inspect: false,
+            socket_mark: Some(crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK),
+            node_waypoint_policy_scope: Some(Arc::new(policy_scope)),
+            requires_destination_mesh_authz: true,
+            has_destination_mesh_authz,
+        }),
+        mtls_mode,
+    })
+}
+
 #[allow(dead_code)]
 fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
     let headers = req.headers();
@@ -2604,7 +2802,7 @@ fn http2_pool_sender_error_response(
     error!(proxy_id = %proxy.id, error = %msg, "HTTP/2 pool connection failed");
     retry::BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(error_body.into_bytes()),
+        body: ResponseBody::buffered(error_body.into_bytes()),
         headers: HashMap::new(),
         // Derive connection_error from the class so a gateway-side egress denial
         // (DispatchPolicyRejected — a hostname/dns_override that resolves or
@@ -2650,7 +2848,7 @@ pub(crate) fn direct_h2_send_request_error_response_for_class(
 ) -> retry::BackendResponse {
     retry::BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec()),
+        body: ResponseBody::buffered(r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec()),
         headers: HashMap::new(),
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
@@ -2668,7 +2866,7 @@ fn backend_tls_sni_requires_direct_h2_response(
     );
     retry::BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(r#"{"error":"Bad Gateway"}"#.as_bytes().to_vec()),
+        body: ResponseBody::buffered(r#"{"error":"Bad Gateway"}"#.as_bytes().to_vec()),
         headers,
         // reqwest cannot apply per-request backend SNI. Mark this terminal
         // gateway policy response as non-retryable so a 502 retry policy
@@ -4217,7 +4415,9 @@ pub(crate) async fn run_final_request_body_hooks_with_provenance(
 
 pub(crate) struct RejectedResponseParts {
     pub status_code: u16,
-    pub body: Vec<u8>,
+    /// Immutable response bytes. Cached synthetic producers retain `Bytes` and
+    /// this boundary must not force a per-hit `to_vec()` copy.
+    pub body: Bytes,
     pub headers: HashMap<String, String>,
 }
 
@@ -4231,7 +4431,7 @@ pub(crate) fn plugin_result_into_reject_parts(
             headers,
         } => Some(RejectedResponseParts {
             status_code,
-            body: body.into_bytes(),
+            body: Bytes::from(body),
             headers,
         }),
         PluginResult::RejectBinary {
@@ -4240,7 +4440,7 @@ pub(crate) fn plugin_result_into_reject_parts(
             headers,
         } => Some(RejectedResponseParts {
             status_code,
-            body: body.to_vec(),
+            body,
             headers,
         }),
         PluginResult::Continue => None,
@@ -4255,7 +4455,7 @@ fn reject_result_to_backend_response(
         .expect("continue result cannot be converted to a reject");
     retry::BackendResponse {
         status_code: reject.status_code,
-        body: ResponseBody::Buffered(reject.body),
+        body: ResponseBody::buffered(reject.body),
         headers: reject.headers,
         connection_error: false,
         backend_resolved_ip,
@@ -9032,7 +9232,7 @@ impl ProxyState {
         // Incremental database and CP/DP deltas stage plugin caches directly
         // on this async call path. Expand the prospective rebuild scope using
         // the same adaptive-concurrency route-definition logic as cache
-        // staging, validate every MMDB or body-validator descriptor that exact
+        // staging, validate every MMDB or protobuf descriptor that exact
         // scope reconstructs on the blocking pool, then require MMDB cache
         // staging to claim its validated handoff without synchronous file work.
         let prospective_delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
@@ -9050,7 +9250,17 @@ impl ProxyState {
                 &prospective_proxy_rebuilds,
                 prospective_delta.global_plugin_configs_changed,
             );
-        if country_mmdb_preload_required || body_validator_descriptor_preload_required {
+        let ai_response_guard_descriptor_preload_required = self
+            .plugin_cache
+            .ai_response_guard_descriptor_preload_required(
+                &new_config,
+                &prospective_proxy_rebuilds,
+                prospective_delta.global_plugin_configs_changed,
+            );
+        if country_mmdb_preload_required
+            || body_validator_descriptor_preload_required
+            || ai_response_guard_descriptor_preload_required
+        {
             new_config = match crate::config::validation_pipeline::validate_plugin_file_dependencies_off_thread(
                 new_config,
                 crate::config::validation_pipeline::ValidationAction::Warn,
@@ -13947,6 +14157,7 @@ pub(crate) fn create_proxy_socket(
     backlog: i32,
     tcp_fastopen_queue_len: Option<u16>,
     reuse_port: bool,
+    transparent: bool,
 ) -> Result<TcpListener, anyhow::Error> {
     let socket = socket2::Socket::new(
         if addr.is_ipv6() {
@@ -13967,6 +14178,50 @@ pub(crate) fn create_proxy_socket(
     #[cfg(unix)]
     if reuse_port {
         socket.set_reuse_port(true)?;
+    }
+
+    // IP_TRANSPARENT / IPV6_TRANSPARENT for the NodeWaypoint transparent
+    // inbound CAPTURE listener (issue #3287). That listener is the only caller
+    // that passes `transparent = true`.
+    //
+    // The redirect never rewrites addresses: `bpf_sk_assign` hands the packet
+    // to the capture listener with the workload's real `podIP:appPort` intact.
+    // That is what preserves the original destination metadata, but it also
+    // means the accepted socket's local address is NOT configured on this host,
+    // so its replies can only be routed if the socket is transparent (the
+    // kernel needs `FLOWI_FLAG_ANYSRC` to accept a non-local source). Without
+    // this the redirect delivers inbound SYNs and then silently fails to send
+    // SYN-ACKs.
+    //
+    // Set BEFORE bind, and only for the one socket that opts in. A transparent
+    // socket may bind and source addresses this host does not own, so the
+    // capability is deliberately not conferred on a whole class of listeners
+    // (and never on the HBONE or admin listeners) by a process-wide switch.
+    #[cfg(target_os = "linux")]
+    if transparent {
+        use std::os::unix::io::AsRawFd;
+        let fd = socket.as_raw_fd();
+        let result = if addr.is_ipv6() {
+            crate::socket_opts::set_ipv6_transparent(fd)
+        } else {
+            crate::socket_opts::set_ip_transparent(fd)
+        };
+        // Fatal, not a warning: the caller only asks for a transparent bind
+        // when the tc ingress redirect is installed, and a non-transparent
+        // capture listener accepts connections it can never answer.
+        result.map_err(|e| {
+            anyhow::anyhow!(
+                "failed to enable IP_TRANSPARENT on the NodeWaypoint inbound capture listener \
+                 {addr}, which the eBPF tc ingress redirect requires in order to reply \
+                 from captured pod addresses: {e}"
+            )
+        })?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    if transparent {
+        anyhow::bail!(
+            "a transparent listener bind was requested for {addr}, but IP_TRANSPARENT is Linux-only"
+        );
     }
 
     socket.set_nonblocking(true)?;
@@ -14488,7 +14743,7 @@ async fn reject_mesh_inbound_peer_auth_transport_mismatch(
         plugins,
         ctx,
         StatusCode::FORBIDDEN,
-        br#"{"error":"Mesh inbound transport does not satisfy PeerAuthentication for the resolved application port"}"#,
+        Bytes::from_static(br#"{"error":"Mesh inbound transport does not satisfy PeerAuthentication for the resolved application port"}"#),
         HashMap::new(),
         is_grpc_request,
     )
@@ -14611,7 +14866,13 @@ async fn start_proxy_listener_with_tls_source_and_signal(
     };
 
     // Create the first listener — this one validates that the port is available.
-    let first_listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port)?;
+    //
+    // NEVER transparent here. `IP_TRANSPARENT` lets a socket bind and source
+    // addresses that are not configured on this host, so it is granted to
+    // exactly one listener — the NodeWaypoint inbound capture socket, which
+    // opts in explicitly in `proxy::node_waypoint_ingress_capture` — and never
+    // to a whole class of listeners on the strength of a process-wide env var.
+    let first_listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)?;
 
     // Optional connection limit. Shared across all accept threads so the global
     // max_connections limit is enforced regardless of which thread accepted.
@@ -14637,7 +14898,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
 
         // Spawn additional listeners (threads 1..N-1)
         for i in 1..accept_threads {
-            let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port)?;
+            let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)?;
             let state = Arc::clone(&state);
             let tls_source = tls_source.clone();
             let semaphore = conn_semaphore.clone();
@@ -15572,12 +15833,13 @@ async fn log_rejected_request_with_path_and_backend_state(
 fn replace_rejection_with_gateway_deadline(
     ctx: &mut RequestContext,
     status_code: &mut u16,
-    response_body: Option<&mut Vec<u8>>,
+    response_body: Option<&mut Bytes>,
     response_headers: &mut HashMap<String, String>,
 ) {
     *status_code = StatusCode::OK.as_u16();
     if let Some(body) = response_body {
-        body.clear();
+        // Drop any retained shared capacity; do not clear-in-place.
+        *body = Bytes::new();
     }
     ctx.retain_deadline_response_gateway_headers(response_headers);
     grpc_proxy::finalize_grpc_error_response_headers(
@@ -15594,7 +15856,7 @@ const DETACHED_REJECTION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 struct OwnedRejectionHookResult {
     ctx: RequestContext,
     status_code: u16,
-    response_body: Option<Vec<u8>>,
+    response_body: Option<Bytes>,
     response_headers: HashMap<String, String>,
     result: PluginResult,
 }
@@ -15606,7 +15868,7 @@ fn owned_rejection_hook_future(
     plugin: Arc<dyn Plugin>,
     mut ctx: RequestContext,
     status_code: u16,
-    response_body: Option<Vec<u8>>,
+    response_body: Option<Bytes>,
     mut response_headers: HashMap<String, String>,
 ) -> OwnedRejectionHookFuture {
     Box::pin(async move {
@@ -15639,7 +15901,7 @@ fn adopt_owned_rejection_hook_result(
     outcome: OwnedRejectionHookResult,
     ctx: &mut RequestContext,
     status_code: &mut u16,
-    response_body: &mut Option<&mut Vec<u8>>,
+    response_body: &mut Option<&mut Bytes>,
     response_headers: &mut HashMap<String, String>,
 ) -> PluginResult {
     *ctx = outcome.ctx;
@@ -15725,7 +15987,7 @@ async fn run_after_proxy_hooks_on_rejection(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     status_code: &mut u16,
-    mut response_body: Option<&mut Vec<u8>>,
+    mut response_body: Option<&mut Bytes>,
     response_headers: &mut HashMap<String, String>,
 ) {
     ctx.begin_rejection_deadline_response_header_provenance(response_headers);
@@ -15990,7 +16252,7 @@ pub(crate) async fn apply_replaceable_after_proxy_hooks_to_rejection(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     status_code: &mut u16,
-    response_body: &mut Vec<u8>,
+    response_body: &mut Bytes,
     response_headers: &mut HashMap<String, String>,
 ) {
     run_after_proxy_hooks_on_rejection(
@@ -16023,7 +16285,7 @@ fn rebuild_plugin_rejection_response_headers(
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
     reject: RejectedResponseParts,
-) -> Vec<u8> {
+) -> Bytes {
     *response_status = reject.status_code;
     response_headers.clear();
     response_headers.insert("content-type".to_string(), "application/json".to_string());
@@ -16039,7 +16301,7 @@ pub(crate) async fn apply_plugin_rejection_response(
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
     reject: RejectedResponseParts,
-) -> Vec<u8> {
+) -> Bytes {
     let mut body =
         rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
     apply_replaceable_after_proxy_hooks_to_rejection(
@@ -16065,7 +16327,10 @@ pub(crate) async fn apply_plugin_rejection_response(
 /// validator explicitly requires zero-byte inspection) and the same
 /// response-body-buffering capability gate the normal response path uses is
 /// satisfied. Specifically we skip when:
-/// - the request is gRPC (synthetic gRPC bodies are handled as trailers-only),
+/// - the request is gRPC AND this is not the authorized `serverless_function`
+///   native-gRPC terminate representation (every other synthetic gRPC body is
+///   handled as trailers-only, so there is nothing for a body validator to
+///   inspect; see [`authorized_serverless_grpc_terminate_representation`]),
 /// - the status is neither 2xx nor a marked final serverless response,
 /// - the status is 204, 205, or 304 (a body-emitting transform there is
 ///   protocol-incorrect),
@@ -16090,7 +16355,7 @@ pub(crate) async fn apply_plugin_rejection_response(
 /// this body-hook gate.
 ///
 /// [`Plugin::should_buffer_response_body`]: crate::plugins::Plugin::should_buffer_response_body
-fn should_apply_synthetic_response_body_hooks(
+pub(crate) fn should_apply_synthetic_response_body_hooks(
     status_code: u16,
     is_grpc_request: bool,
     response_body: &[u8],
@@ -16099,7 +16364,9 @@ fn should_apply_synthetic_response_body_hooks(
 ) -> bool {
     let governed_synthetic_status = (200..300).contains(&status_code)
         || (ctx.serverless_terminate_response && (200..=599).contains(&status_code));
-    if is_grpc_request
+    let governed_grpc_representation = !is_grpc_request
+        || authorized_serverless_grpc_terminate_representation(status_code, response_body, ctx);
+    if !governed_grpc_representation
         || !governed_synthetic_status
         || crate::plugins::utils::synthetic_response::status_forbids_response_body(status_code)
     {
@@ -16115,6 +16382,44 @@ fn should_apply_synthetic_response_body_hooks(
         return false;
     }
     response_body_plugins_process_body(plugins, ctx)
+}
+
+/// Whether this synthetic response IS the validated `serverless_function`
+/// native-gRPC terminate representation for this request.
+///
+/// This is the sole gRPC short-circuit that puts a real body on the wire, so it
+/// is the sole gRPC short-circuit the shared response-body policy lifecycle can
+/// meaningfully govern. The predicate is deliberately the same request-scoped
+/// provenance the reject writers use, never body shape or reject headers:
+/// - the request must be the native-gRPC flavor the frontend stamped at intake,
+/// - the plugin must have marked a terminate response,
+/// - the status must be the one the contract authored, and
+/// - the bytes must still be the authored frame — which for the status-only
+///   contract shape is the empty frame it authored, so an empty body matches and
+///   a body that the contract never authored does not (that case still has to
+///   clear the explicit zero-byte inspection gate in
+///   [`should_apply_synthetic_response_body_hooks`]).
+///
+/// A body hook that rewrites or replaces these bytes invalidates the
+/// authorization, and the rejection then fails closed in
+/// [`normalize_reject_response_with_provenance`] rather than reaching the wire.
+fn authorized_serverless_grpc_terminate_representation(
+    status_code: u16,
+    response_body: &[u8],
+    ctx: &RequestContext,
+) -> bool {
+    if !ctx.serverless_terminate_response || !ctx.is_native_grpc_request() {
+        return false;
+    }
+    match ctx.serverless_grpc_terminate_frame.as_deref() {
+        Some(authored) => {
+            authored.http_status == status_code && authored.frame.as_ref() == response_body
+        }
+        // Every native-gRPC terminate contract — framed and status-only alike —
+        // stamps the authored representation. No provenance therefore means this
+        // is not the terminate representation at all, and the gate stays closed.
+        None => false,
+    }
 }
 
 /// Whether a response-body-capable plugin phase actually processes THIS
@@ -16161,7 +16466,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     ctx: &mut RequestContext,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut Bytes,
 ) {
     // Mark the context for the duration of this body-hook phase so that storing
     // plugins (e.g. `request_deduplication`) can tell this body is a synthetic
@@ -16279,7 +16584,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
             if let Some(transformed) = transformed {
                 response_headers
                     .insert("content-length".to_string(), transformed.len().to_string());
-                *response_body = transformed;
+                *response_body = Bytes::from(transformed);
                 crate::plugins::finalize_response_body_transformation(
                     plugin.as_ref(),
                     ctx,
@@ -16310,7 +16615,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
                 response_headers,
                 RejectedResponseParts {
                     status_code: 502,
-                    body: br#"{"error":"response redaction failed"}"#.to_vec(),
+                    body: Bytes::from_static(br#"{"error":"response redaction failed"}"#),
                     headers: HashMap::new(),
                 },
             );
@@ -16410,7 +16715,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     ctx: &mut RequestContext,
     status: &mut u16,
     headers: &mut HashMap<String, String>,
-    body: &mut Vec<u8>,
+    body: &mut Bytes,
     is_grpc_request: bool,
     invoke_response_committed: bool,
 ) {
@@ -16502,7 +16807,17 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
             .any(|plugin| plugin.requires_response_committed_hook())
     {
         let status_code = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let normalized = normalize_reject_response(status_code, body, headers, is_grpc_request);
+        // Committed observers must see the response that is actually emitted,
+        // including a serverless terminate framed unary body — otherwise the
+        // hook view and the wire diverge on exactly this path. The `Bytes` clone
+        // is a refcount bump, not a body copy.
+        let normalized = normalize_reject_response_with_provenance(
+            status_code,
+            body.clone(),
+            headers,
+            is_grpc_request,
+            FramedGrpcUnaryProvenance::from_context(ctx),
+        );
         for (index, plugin) in plugins.iter().enumerate() {
             if !plugin.requires_response_committed_hook() {
                 continue;
@@ -16513,7 +16828,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
                 ctx,
                 normalized.http_status.as_u16(),
                 &normalized.headers,
-                &normalized.body,
+                normalized.body.clone(),
                 terminal_gateway_deadline,
             )
             .await
@@ -16529,7 +16844,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
                 plugins[index + 1..].to_vec(),
                 *status,
                 Arc::new(headers.clone()),
-                Arc::new(body.clone()),
+                body.clone(),
             );
             break;
         }
@@ -16557,13 +16872,15 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         headers,
         body.len(),
     ) {
-        *body = Vec::new();
+        // Drop the shared reference (and any uniquely owned allocation) rather
+        // than clearing in place and retaining capacity.
+        *body = Bytes::new();
     }
 }
 
 pub(crate) struct AfterProxyReject {
     pub status_code: u16,
-    pub body: Vec<u8>,
+    pub body: Bytes,
     pub headers: HashMap<String, String>,
 }
 
@@ -16712,9 +17029,14 @@ pub(crate) async fn run_after_proxy_hooks(
 pub(crate) struct NormalizedRejectResponse {
     pub(crate) http_status: StatusCode,
     pub(crate) headers: HashMap<String, String>,
-    pub(crate) body: Vec<u8>,
+    pub(crate) body: Bytes,
     pub(crate) grpc_status: Option<u32>,
     pub(crate) grpc_message: Option<String>,
+    /// When non-empty together with a non-empty `body`, these are emitted as
+    /// HTTP trailers after the unary DATA frame (serverless native-gRPC
+    /// terminate). Ordinary trailers-only rejects leave this empty and keep
+    /// terminal metadata in `headers`.
+    pub(crate) grpc_trailers: HashMap<String, String>,
 }
 
 /// Apply route policy to a gateway-generated plain HTTP response and then
@@ -16833,11 +17155,297 @@ pub(crate) fn map_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
     grpc_proxy::http_reject_status_to_grpc_status(status)
 }
 
-pub(crate) fn normalize_reject_response(
+/// Provenance authorizing a native-gRPC rejection to keep a framed unary DATA
+/// body instead of collapsing to the trailers-only error contract.
+///
+/// The only holder of this authorization is a `serverless_function` terminate
+/// invocation whose function output already passed the plugin's fail-closed
+/// contract validation. Body shape and reject headers are deliberately NOT
+/// provenance: they are reachable by any plugin (including custom plugins) and
+/// partly derived from function/backend input, so trusting them would let an
+/// ordinary rejection reflect an untrusted body onto a native gRPC stream.
+///
+/// Authorization is byte-exact against the frame the plugin authored — and
+/// against the HTTP status it authored alongside it — so a replaceable
+/// `after_proxy` decorator that rewrites the reject body, a response-body
+/// transform that rewrites the frame, and any later unrelated rejection on the
+/// same request all fall back to trailers-only.
+///
+/// Falling back is not by itself safe: the authored reject headers still carry
+/// the contract's `grpc-status`, which is `0` on a successful unary response, so
+/// a plain fallback would emit an empty Trailers-Only *success*. Invalidated
+/// authorization therefore fails closed — see
+/// [`invalidated_grpc_terminate_fail_closed_signal`].
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FramedGrpcUnaryProvenance<'a> {
+    authored: Option<&'a crate::plugins::ServerlessGrpcTerminateFrame>,
+}
+
+impl<'a> FramedGrpcUnaryProvenance<'a> {
+    /// No authorization: framed unary DATA is never preserved.
+    pub(crate) const NONE: Self = Self { authored: None };
+
+    /// Read the request-scoped authorization stamped by `serverless_function`.
+    pub(crate) fn from_context(ctx: &'a RequestContext) -> Self {
+        Self::from_authored_frame(ctx.serverless_grpc_terminate_frame.as_deref())
+    }
+
+    /// Same authorization from a snapshot of the stamped frame, for call sites
+    /// that must release their `ctx` borrow before the write.
+    pub(crate) fn from_authored_frame(
+        authored: Option<&'a crate::plugins::ServerlessGrpcTerminateFrame>,
+    ) -> Self {
+        Self { authored }
+    }
+
+    /// Whether this request holds a terminate authorization at all — framed or
+    /// status-only.
+    ///
+    /// `true` + "the authorized representation was not emitted" is exactly the
+    /// invalidated case that must fail closed rather than fall back to the
+    /// authored (possibly successful) `grpc-status`. The one representation for
+    /// which trailers-only is *not* an invalidation is the unchanged status-only
+    /// contract; see [`Self::intact_status_only_signal`].
+    pub(crate) fn is_authorizing(&self) -> bool {
+        self.authored.is_some()
+    }
+
+    /// The terminal metadata this rejection may emit as trailers, or `None`
+    /// when this rejection is not the authored representation and must stay
+    /// trailers-only.
+    ///
+    /// Both the authored HTTP status and the authored frame bytes must match.
+    /// Requiring the status too is what keeps a *later* rejection from
+    /// inheriting the original successful trailers on a byte coincidence: a
+    /// replacement rejection selects its own status, and the authored status
+    /// (200) is the one the terminate contract itself produced.
+    fn authorized_trailers(
+        &self,
+        status: StatusCode,
+        body: &[u8],
+    ) -> Option<&'a HashMap<String, String>> {
+        let authored = self.authored?;
+        if authored.frame.is_empty() || authored.trailers.is_empty() {
+            return None;
+        }
+        if authored.http_status != status.as_u16() {
+            return None;
+        }
+        (authored.frame.as_ref() == body).then_some(&authored.trailers)
+    }
+
+    /// The COMPLETE authorized terminal metadata for the *status-only*
+    /// terminate contract — the shape that authored no frame and whose correct
+    /// client representation therefore IS trailers-only.
+    ///
+    /// `Some` only while the response is still exactly what the contract
+    /// authored: the authored HTTP status and a still-empty body. Every field
+    /// comes from the authored provenance rather than the reject header map,
+    /// which has been through `after_proxy` decorators, initial-header policy,
+    /// and — since the framed representation now runs it — the shared
+    /// response-body lifecycle. That covers `grpc-status`, an optional
+    /// `grpc-message`, `grpc-status-details-bin`, and the validated custom
+    /// trailers, so restoring this result is what makes the reply immune to
+    /// decorator mutation.
+    ///
+    /// `None` for a framed authorization (it authored DATA, so trailers-only is
+    /// not its representation), for a changed status or a body the contract
+    /// never authored, and for a status-only record whose own `grpc-status` no
+    /// longer parses. Each of those is an invalidation and falls through to
+    /// [`invalidated_grpc_terminate_fail_closed_signal`].
+    fn intact_status_only_signal(
+        &self,
+        status: StatusCode,
+        body: &[u8],
+    ) -> Option<StatusOnlyTerminalMetadata<'a>> {
+        let authored = self.authored?;
+        if !authored.frame.is_empty() || !body.is_empty() {
+            return None;
+        }
+        if authored.http_status != status.as_u16() {
+            return None;
+        }
+        let grpc_status = authored.trailers.get("grpc-status")?.parse::<u32>().ok()?;
+        // `grpc_message` is OPTIONAL in the contract, and omission is carried
+        // through as omission. Substituting a canonical reason here would invent
+        // "Gateway rejected request" for a status-only SUCCESS, and would
+        // override a nonzero contract's deliberate silence just as wrongly.
+        let grpc_message = authored
+            .trailers
+            .get("grpc-message")
+            .map(|message| sanitize_grpc_message(message))
+            .filter(|message| !message.is_empty());
+        // Everything else the contract authored — `grpc-status-details-bin` and
+        // the validated custom trailers — is restored alongside the status.
+        // Sorted so the emitted header block is deterministic regardless of map
+        // iteration order.
+        let mut additional: Vec<(&'a str, &'a str)> = authored
+            .trailers
+            .iter()
+            .filter(|(name, _)| !is_status_or_message_trailer(name.as_str()))
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        additional.sort_unstable();
+        Some(StatusOnlyTerminalMetadata {
+            grpc_status,
+            grpc_message,
+            additional,
+        })
+    }
+
+    /// Whether a trailers-only emitter must evict `name` from the mutable
+    /// reject header map because this request holds terminate authorization.
+    ///
+    /// Covers two things: every name the contract itself authored, and the
+    /// reserved gRPC terminal-metadata namespace whether the contract authored
+    /// it or not. So a decorator can neither replace what the contract
+    /// terminated with, nor inject a `grpc-status-details-bin` the contract
+    /// never authored onto the contract's own status.
+    ///
+    /// On the intact status-only path the authoritative copies are restored
+    /// from [`Self::intact_status_only_signal`] immediately afterwards. On any
+    /// invalidated path nothing is restored: pairing a replacement nonzero
+    /// `grpc-status` with the original contract's `grpc-status-details-bin` (or
+    /// its custom trailers) would describe the successful response the client
+    /// is not receiving.
+    ///
+    /// `grpc-status` and `grpc-message` are already dropped unconditionally by
+    /// every emitter; they are named here so the rule reads complete rather
+    /// than depending on that.
+    ///
+    /// Costs nothing when nothing is authorizing, which is every ordinary gRPC
+    /// rejection.
+    pub(crate) fn evicts_terminal_metadata(&self, name: &str) -> bool {
+        let Some(authored) = self.authored else {
+            return false;
+        };
+        if is_reserved_grpc_terminal_name(name) {
+            return true;
+        }
+        let mut authored_names = authored.trailers.keys();
+        authored_names.any(|authored_name| authored_name.eq_ignore_ascii_case(name))
+    }
+}
+
+/// Terminal names a [`StatusOnlyTerminalMetadata`] carries in its own
+/// `grpc_status` / `grpc_message` fields rather than in `additional`.
+fn is_status_or_message_trailer(name: &str) -> bool {
+    name.eq_ignore_ascii_case("grpc-status") || name.eq_ignore_ascii_case("grpc-message")
+}
+
+/// The reserved gRPC terminal-metadata namespace, matched case-insensitively
+/// because reject header maps are not normalized to lowercase.
+fn is_reserved_grpc_terminal_name(name: &str) -> bool {
+    is_status_or_message_trailer(name) || name.eq_ignore_ascii_case("grpc-status-details-bin")
+}
+
+/// The complete terminal metadata an UNCHANGED status-only
+/// `serverless_function` terminate contract must emit, taken from the validated
+/// authored provenance rather than the mutable reject header map.
+///
+/// This is the one representation shared by the H1/H2 normalizer and the
+/// direct-H3 writer, so a non-terminal response decorator can add initial
+/// response headers but can never alter, drop, or inject contract terminal
+/// metadata on either path.
+pub(crate) struct StatusOnlyTerminalMetadata<'a> {
+    pub(crate) grpc_status: u32,
+    /// `None` when the contract omitted `grpc_message`. Omission is emitted as
+    /// omission — never as an empty field and never as a synthesized reason.
+    pub(crate) grpc_message: Option<String>,
+    /// Authored terminal metadata other than `grpc-status`/`grpc-message`:
+    /// `grpc-status-details-bin` and the validated custom trailers, sorted by
+    /// name. Names are already lowercase.
+    pub(crate) additional: Vec<(&'a str, &'a str)>,
+}
+
+/// The authorized trailers-only signal for an unchanged status-only
+/// `serverless_function` terminate contract, shared by the H1/H2 normalizer and
+/// the direct-H3 writer (which derives its own signal and would otherwise read
+/// the mutable reject header map instead).
+///
+/// Every emitter must consult this BEFORE
+/// [`invalidated_grpc_terminate_fail_closed_signal`]: `Some` is the one case in
+/// which a terminate authorization legitimately produces no DATA, and `None`
+/// means the fail-closed correction applies. Ordering it this way keeps the
+/// carve-out at the call site, so an emitter that forgets it fails closed rather
+/// than silently emitting the contract's `grpc-status`.
+pub(crate) fn status_only_grpc_signal<'a>(
+    framed_unary_provenance: FramedGrpcUnaryProvenance<'a>,
     status: StatusCode,
     body: &[u8],
+) -> Option<StatusOnlyTerminalMetadata<'a>> {
+    framed_unary_provenance.intact_status_only_signal(status, body)
+}
+
+/// The `grpc-message` emitted when a framed serverless-terminate authorization
+/// was invalidated and the gateway had to fail closed.
+pub(crate) const INVALIDATED_GRPC_TERMINATE_MESSAGE: &str =
+    "gateway: authorized gRPC terminate response was invalidated";
+
+/// Fail-closed correction for a native-gRPC rejection that HELD framed
+/// serverless-terminate authorization but is not emitting the authorized
+/// representation (the frame was rewritten, the status changed, or the
+/// representation was replaced by a body-policy rejection).
+///
+/// The authored reject headers carry the contract's own `grpc-status`, which is
+/// `0` for a successful unary response. Falling back to the ordinary
+/// trailers-only derivation would therefore turn a rewritten/replaced success
+/// into an empty Trailers-Only **success** — the client would see
+/// `grpc-status: 0` with no message at all. A rejection that selected its own
+/// status keeps it (`derived_grpc_status` is already nonzero, or the HTTP status
+/// maps to a nonzero code); only a residual OK is replaced.
+///
+/// `http_status_fallback` is the caller's own HTTP→gRPC mapping so the H1/H2 and
+/// H3 emitters stay on their respective tables.
+///
+/// This deliberately knows nothing about the one authorization for which
+/// emitting no DATA is *correct* — the unchanged status-only contract. Callers
+/// resolve that first through [`status_only_grpc_signal`] and only reach
+/// here when it declined, so an emitter that forgets the carve-out fails closed
+/// instead of falling through to the contract's possibly-successful status.
+///
+/// Returns the replacement `(grpc-status, grpc-message)`, or `None` when no
+/// correction is required.
+pub(crate) fn invalidated_grpc_terminate_fail_closed_signal(
+    framed_unary_provenance: FramedGrpcUnaryProvenance<'_>,
+    derived_grpc_status: u32,
+    http_status_fallback: u32,
+) -> Option<(u32, &'static str)> {
+    if !framed_unary_provenance.is_authorizing() {
+        return None;
+    }
+    if derived_grpc_status != grpc_proxy::grpc_status::OK {
+        return None;
+    }
+    let replacement = if http_status_fallback == grpc_proxy::grpc_status::OK {
+        grpc_proxy::grpc_status::INTERNAL
+    } else {
+        http_status_fallback
+    };
+    Some((replacement, INVALIDATED_GRPC_TERMINATE_MESSAGE))
+}
+
+pub(crate) fn normalize_reject_response(
+    status: StatusCode,
+    body: Bytes,
     headers: &HashMap<String, String>,
     is_grpc_request: bool,
+) -> NormalizedRejectResponse {
+    normalize_reject_response_with_provenance(
+        status,
+        body,
+        headers,
+        is_grpc_request,
+        FramedGrpcUnaryProvenance::NONE,
+    )
+}
+
+pub(crate) fn normalize_reject_response_with_provenance(
+    status: StatusCode,
+    body: Bytes,
+    headers: &HashMap<String, String>,
+    is_grpc_request: bool,
+    framed_unary_provenance: FramedGrpcUnaryProvenance<'_>,
 ) -> NormalizedRejectResponse {
     let grpc_web_accept_rejected =
         crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers);
@@ -16853,52 +17461,265 @@ pub(crate) fn normalize_reject_response(
         return NormalizedRejectResponse {
             http_status: status,
             headers: normalized_headers,
-            body: body.to_vec(),
+            body,
             grpc_status: None,
             grpc_message: None,
+            grpc_trailers: HashMap::new(),
         };
     }
 
-    let grpc_status = headers
-        .get("grpc-status")
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or_else(|| map_http_reject_status_to_grpc_status(status));
-    let grpc_message = headers
-        .get("grpc-message")
-        .cloned()
-        .or_else(|| extract_grpc_reject_message(body))
-        .unwrap_or_else(|| grpc_status_reason(grpc_status).to_string());
-    let grpc_message = sanitize_grpc_message(&grpc_message);
+    // Preserve uncompressed unary DATA + terminal metadata ONLY for the
+    // explicitly authorized `serverless_function` terminate result. Every other
+    // rejection — including one whose body happens to look like a gRPC frame and
+    // whose headers claim `application/grpc` + `grpc-status` — falls through to
+    // trailers-only, so an untrusted body is never reflected onto the wire.
+    // `body` is handed over as owned shared `Bytes`, so the authorized frame
+    // reaches the wire without a copy; the trailers-only fall-through below
+    // borrows it and then drops it. The predicates that decide intactness are
+    // shared with H3 reject logging via [`intact_framed_unary_terminate_signal`].
+    if let Some((grpc_status, grpc_message, trailers)) =
+        intact_framed_unary_terminate_signal(framed_unary_provenance, status, &body, headers)
+    {
+        return build_framed_grpc_unary_reject(body, headers, trailers, grpc_status, grpc_message);
+    }
 
+    // Past this point no DATA is emitted. That is correct for exactly one
+    // authorization — the status-only terminate contract, which authored no
+    // frame — and only while that reply is unchanged. For every other holder of
+    // terminate authorization, reaching here means the authored representation
+    // was invalidated (rewritten body, changed status, a body the status-only
+    // contract never authored, or a replacement rejection), and the contract's
+    // `grpc-status: 0` must not survive as an empty Trailers-Only success.
+    let mapped_status = map_http_reject_status_to_grpc_status(status);
+    let status_only = status_only_grpc_signal(framed_unary_provenance, status, &body);
+    let (grpc_status, grpc_message) = match status_only {
+        // The status-only terminate contract authored no frame, so trailers-only
+        // IS its authorized representation, and its own terminal metadata — not
+        // the decorated reject header map — is what the client must see. An
+        // omitted `grpc_message` stays omitted.
+        Some(ref authored) => (authored.grpc_status, authored.grpc_message.clone()),
+        None => {
+            let derived_grpc_status = headers
+                .get("grpc-status")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(mapped_status);
+            let fail_closed = invalidated_grpc_terminate_fail_closed_signal(
+                framed_unary_provenance,
+                derived_grpc_status,
+                mapped_status,
+            );
+            match fail_closed {
+                Some((status_code, message)) => (status_code, Some(message.to_string())),
+                None => {
+                    let message = headers
+                        .get("grpc-message")
+                        .cloned()
+                        .or_else(|| extract_grpc_reject_message(&body))
+                        .unwrap_or_else(|| grpc_status_reason(derived_grpc_status).to_string());
+                    (derived_grpc_status, Some(message))
+                }
+            }
+        }
+    };
+    let grpc_message = grpc_message
+        .map(|message| sanitize_grpc_message(&message))
+        .filter(|message| !message.is_empty());
+
+    // `content-length` is dropped with the terminal metadata: this branch emits
+    // an empty body, so any inbound value describes bytes that are not being
+    // sent. The framed terminate representation now runs the shared
+    // response-body lifecycle, whose transforms set `content-length` on the
+    // reject header map, so a stale value can reach here on the invalidated
+    // path.
     let mut normalized_headers = HashMap::with_capacity(headers.len() + 3);
     for (key, value) in headers {
         if key.eq_ignore_ascii_case("content-type")
             || key.eq_ignore_ascii_case("grpc-status")
             || key.eq_ignore_ascii_case("grpc-message")
+            || key.eq_ignore_ascii_case("content-length")
         {
+            continue;
+        }
+        // No terminal metadata is carried out of the reject header map while a
+        // terminate contract is authorizing — neither the keys it authored nor
+        // a `grpc-status-details-bin` a decorator injected. Intact status-only
+        // restores the authoritative copies from provenance just below; every
+        // invalidated path must emit none of them, so a replacement nonzero
+        // `grpc-status` can never ship beside the original contract's
+        // `grpc-status-details-bin` or its custom trailers.
+        if framed_unary_provenance.evicts_terminal_metadata(key) {
             continue;
         }
         normalized_headers.insert(key.clone(), value.clone());
     }
+    if let Some(ref authored) = status_only {
+        for (name, value) in &authored.additional {
+            normalized_headers.insert((*name).to_string(), (*value).to_string());
+        }
+    }
     normalized_headers.insert("content-type".to_string(), "application/grpc".to_string());
     normalized_headers.insert("grpc-status".to_string(), grpc_status.to_string());
-    if !grpc_message.is_empty() {
-        normalized_headers.insert("grpc-message".to_string(), grpc_message.clone());
+    if let Some(ref message) = grpc_message {
+        normalized_headers.insert("grpc-message".to_string(), message.clone());
     }
 
     NormalizedRejectResponse {
         http_status: StatusCode::OK,
         headers: normalized_headers,
-        body: Vec::new(),
+        body: Bytes::new(),
         grpc_status: Some(grpc_status),
-        grpc_message: Some(grpc_message),
+        grpc_message,
+        grpc_trailers: HashMap::new(),
     }
+}
+
+/// Build the client representation for a rejection that already carries the
+/// authorized `serverless_function` terminate frame: HTTP 200 +
+/// `application/grpc` HEADERS, one uncompressed unary DATA frame, and the
+/// plugin-authored terminal trailers.
+///
+/// `authored_trailers` is the ONLY source of client-visible trailers. Terminal
+/// metadata is deliberately not promoted out of `headers`: that map has been
+/// through `after_proxy` decorators and initial-response-header policy, so it
+/// can hold CORS fields, gateway-managed values, and internal bridge fields
+/// that belong in the HEADERS block (or nowhere) rather than in trailers. Those
+/// headers are preserved in the initial block minus terminal/hop-by-hop names.
+///
+/// Callers must have already obtained `(grpc_status, grpc_message, trailers)`
+/// from [`intact_framed_unary_terminate_signal`] so the owned normalizer and
+/// the borrowed H3 logging path cannot drift on the shared predicates.
+fn build_framed_grpc_unary_reject(
+    body: Bytes,
+    headers: &HashMap<String, String>,
+    authored_trailers: &HashMap<String, String>,
+    grpc_status: u32,
+    grpc_message: Option<String>,
+) -> NormalizedRejectResponse {
+    let mut initial_headers = HashMap::with_capacity(headers.len());
+    for (key, value) in headers {
+        let lower = key.to_ascii_lowercase();
+        // Terminal metadata belongs in the trailers block only; emitting it in
+        // HEADERS too would make the response look Trailers-Only to a client.
+        if lower == "content-type" || authored_trailers.contains_key(&lower) {
+            continue;
+        }
+        // The reserved gRPC terminal-metadata namespace is contract-owned even
+        // for names the contract did not author, so a decorator cannot inject
+        // `grpc-status-details-bin` alongside the contract's own trailers.
+        if grpc_proxy::is_reserved_grpc_terminal_metadata(&lower) {
+            continue;
+        }
+        // Ferrum-owned gRPC-Web bridge fields must never reach a client.
+        if crate::plugins::grpc_web::is_internal_grpc_web_bridge_header(&lower) {
+            continue;
+        }
+        if lower == "connection"
+            || lower == "keep-alive"
+            || lower == "proxy-connection"
+            || lower == "transfer-encoding"
+            || lower == "te"
+            || lower == "trailer"
+            || lower == "upgrade"
+            || lower == "content-length"
+        {
+            continue;
+        }
+        initial_headers.insert(lower, value.clone());
+    }
+    initial_headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    // Emit the same `grpc-message` shape every other gRPC error path emits, so
+    // the terminate contract cannot be the one place an unsanitized status
+    // message reaches the wire.
+    let mut trailers = authored_trailers.clone();
+    match grpc_message {
+        Some(ref message) => {
+            trailers.insert("grpc-message".to_string(), message.clone());
+        }
+        None => {
+            trailers.remove("grpc-message");
+        }
+    }
+
+    NormalizedRejectResponse {
+        http_status: StatusCode::OK,
+        headers: initial_headers,
+        // The authorized frame keeps the caller's allocation identity: the DATA
+        // frame every emitter writes is this same shared buffer, never a copy.
+        body,
+        grpc_status: Some(grpc_status),
+        grpc_message,
+        grpc_trailers: trailers,
+    }
+}
+
+/// Borrowed inspection of whether an authorizing terminate rejection is still
+/// the intact framed unary representation.
+///
+/// Shared by the owned normalizer and H3 reject logging so both agree on
+/// authored HTTP status, byte-exact frame equality, native `content-type`, a
+/// single uncompressed unary frame, terminal status parsing, and message
+/// sanitization — without requiring a full-body copy on the logging path.
+pub(crate) fn intact_framed_unary_terminate_signal<'a>(
+    framed_unary_provenance: FramedGrpcUnaryProvenance<'a>,
+    status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+) -> Option<(u32, Option<String>, &'a HashMap<String, String>)> {
+    let authored_trailers = framed_unary_provenance.authorized_trailers(status, body)?;
+    if body.is_empty() {
+        return None;
+    }
+    let content_type = headers.get("content-type")?;
+    if !backend_dispatch::is_native_grpc_content_type(content_type.as_bytes()) {
+        return None;
+    }
+    if !bytes_are_single_uncompressed_unary_grpc_frame(body) {
+        return None;
+    }
+    let grpc_status = authored_trailers.get("grpc-status")?.parse::<u32>().ok()?;
+    let grpc_message = authored_trailers
+        .get("grpc-message")
+        .map(|message| sanitize_grpc_message(message))
+        .filter(|message| !message.is_empty());
+    Some((grpc_status, grpc_message, authored_trailers))
+}
+
+/// Shared predicate for "this normalized rejection is a framed unary gRPC
+/// response rather than a trailers-only error", plus the terminal trailers that
+/// MUST accompany the DATA frame.
+///
+/// Every emitter (the H1/H2 body builder, the direct-H3 writer, and both H3
+/// cross-protocol writers) reads this one helper so no protocol path can emit
+/// DATA while dropping the mandatory terminal metadata.
+/// The `Bytes` handle is returned (rather than a slice) so an emitter clones the
+/// shared buffer instead of copying the frame out of it.
+pub(crate) fn framed_unary_reject_parts(
+    reject: &NormalizedRejectResponse,
+) -> Option<(&Bytes, &HashMap<String, String>)> {
+    (!reject.body.is_empty() && !reject.grpc_trailers.is_empty())
+        .then_some((&reject.body, &reject.grpc_trailers))
+}
+
+pub(crate) fn bytes_are_single_uncompressed_unary_grpc_frame(body: &[u8]) -> bool {
+    if body.len() < 5 {
+        return false;
+    }
+    // Compression is unsupported on the serverless terminate contract; only
+    // flag byte 0 (uncompressed DATA) is accepted.
+    if body[0] != 0 {
+        return false;
+    }
+    let msg_len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+    // `5 + msg_len` would overflow `usize` on a 32-bit target for a declared
+    // length near `u32::MAX`; a wrapped sum could then match a short body.
+    msg_len.checked_add(5) == Some(body.len())
 }
 
 fn normalized_grpc_deadline_exceeded() -> NormalizedRejectResponse {
     normalize_reject_response(
         StatusCode::OK,
-        &[],
+        Bytes::new(),
         &HashMap::from([
             ("content-type".to_string(), "application/grpc".to_string()),
             (
@@ -16949,7 +17770,7 @@ pub(crate) async fn normalize_grpc_plugin_rejection_with_after_proxy_hooks(
         plugins,
         ctx,
         status,
-        &reject.body,
+        reject.body,
         reject.headers,
         true,
         invoke_response_committed,
@@ -16966,13 +17787,16 @@ fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Re
         &reject.headers,
     );
 
-    let body = if reject.body.is_empty() {
+    let body = if framed_unary_reject_parts(&reject).is_some() {
+        let trailers = grpc_proxy::buffered_grpc_trailers_to_header_map(&reject.grpc_trailers);
+        ProxyBody::buffered_grpc_with_trailers(reject.body, trailers)
+    } else if reject.body.is_empty() {
         // Status-aware empty body: 205 must not advertise Content-Length on H1
         // (Hyper would otherwise synthesize `Content-Length: 0` for ordinary
         // empty Full bodies; 204/304 are already special-cased upstream).
         ProxyBody::empty_for_response_status(reject.http_status.as_u16())
     } else {
-        ProxyBody::full(Bytes::from(reject.body))
+        ProxyBody::full(reject.body)
     };
 
     builder.body(body).unwrap_or_else(|_| {
@@ -17183,7 +18007,7 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
     ctx: &mut RequestContext,
     grpc_web_response_content_type: Option<&str>,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut Bytes,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> StatusCode {
     ctx.mark_gateway_deadline_response_selected();
@@ -17201,7 +18025,7 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
             None,
         );
         *response_headers = response.headers;
-        *response_body = response.body;
+        *response_body = Bytes::from(response.body);
     } else {
         grpc_proxy::finalize_grpc_error_response_headers(
             response_headers,
@@ -17209,7 +18033,7 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
             GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
             initial_response_header_policy_plugins,
         );
-        response_body.clear();
+        *response_body = Bytes::new();
     }
     ctx.sync_deadline_response_terminal_headers(response_headers);
     insert_grpc_error_metadata(
@@ -17335,7 +18159,7 @@ async fn replace_buffered_response_with_representation_error(
     grpc_web_response_content_type: Option<&str>,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut Bytes,
     rejection: crate::plugins::response_representation::RepresentationRejection,
     initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
     apply_reject_after_proxy_hooks: bool,
@@ -17381,7 +18205,7 @@ async fn replace_buffered_response_with_representation_error(
             None,
         );
         *response_headers = response.headers;
-        *response_body = response.body;
+        *response_body = Bytes::from(response.body);
         *response_status = StatusCode::OK.as_u16();
         ctx.sync_deadline_response_terminal_headers(response_headers);
         insert_grpc_error_metadata(
@@ -17404,7 +18228,7 @@ async fn replace_buffered_response_with_representation_error(
             REPRESENTATION_UNINSPECTABLE_MESSAGE,
             &[],
         );
-        response_body.clear();
+        *response_body = Bytes::new();
         *response_status = StatusCode::OK.as_u16();
         ctx.sync_deadline_response_terminal_headers(response_headers);
         insert_grpc_error_metadata(
@@ -17423,8 +18247,9 @@ async fn replace_buffered_response_with_representation_error(
             response_headers,
             RejectedResponseParts {
                 status_code: 502,
-                body: format!(r#"{{"error":"{REPRESENTATION_UNINSPECTABLE_MESSAGE}"}}"#)
-                    .into_bytes(),
+                body: Bytes::from(format!(
+                    r#"{{"error":"{REPRESENTATION_UNINSPECTABLE_MESSAGE}"}}"#
+                )),
                 headers: HashMap::new(),
             },
         );
@@ -17458,7 +18283,7 @@ pub(crate) async fn admit_buffered_response_body_transforms(
     origin: crate::plugins::response_representation::RepresentationOrigin,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut Bytes,
     grpc_web_response_content_type: Option<&str>,
     initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
     apply_reject_after_proxy_hooks: bool,
@@ -17559,7 +18384,7 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     origin: crate::plugins::response_representation::RepresentationOrigin,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut Bytes,
     grpc_web_response_content_type: Option<&str>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> (bool, bool) {
@@ -17624,7 +18449,7 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
         };
         if let Some(transformed) = transformed {
             response_headers.insert("content-length".to_string(), transformed.len().to_string());
-            *response_body = transformed;
+            *response_body = Bytes::from(transformed);
             crate::plugins::finalize_response_body_transformation(
                 plugin.as_ref(),
                 ctx,
@@ -17666,7 +18491,7 @@ fn owned_response_committed_hook_future(
     mut ctx: RequestContext,
     response_status: u16,
     response_headers: Arc<HashMap<String, String>>,
-    response_body: Arc<Vec<u8>>,
+    response_body: Bytes,
 ) -> OwnedResponseCommittedHookFuture {
     Box::pin(async move {
         plugin
@@ -17690,13 +18515,18 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
     ctx: &mut RequestContext,
     response_status: u16,
     response_headers: &HashMap<String, String>,
-    response_body: &[u8],
+    response_body: Bytes,
     terminal_gateway_deadline: bool,
 ) -> Option<OwnedResponseCommittedHookFuture> {
     let deadline = ctx.grpc_deadline_at();
     if !terminal_gateway_deadline && deadline.is_none() {
         plugin
-            .on_response_committed(ctx, response_status, response_headers, response_body)
+            .on_response_committed(
+                ctx,
+                response_status,
+                response_headers,
+                response_body.as_ref(),
+            )
             .await;
         return None;
     }
@@ -17705,7 +18535,7 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
         ctx.clone(),
         response_status,
         Arc::new(response_headers.clone()),
-        Arc::new(response_body.to_vec()),
+        response_body,
     );
     if terminal_gateway_deadline {
         let completed = futures_util::future::poll_fn(|cx| {
@@ -17741,7 +18571,7 @@ pub(crate) fn spawn_detached_response_committed_hooks(
     remaining_plugins: Vec<Arc<dyn Plugin>>,
     response_status: u16,
     response_headers: Arc<HashMap<String, String>>,
-    response_body: Arc<Vec<u8>>,
+    response_body: Bytes,
 ) {
     std::mem::drop(tokio::spawn(async move {
         let cleanup = async move {
@@ -17782,7 +18612,7 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
     ctx: &mut RequestContext,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut Bytes,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> bool {
     let terminal_at_entry = ctx.gateway_deadline_response_selected();
@@ -17796,7 +18626,7 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
             ctx,
             *response_status,
             response_headers,
-            response_body,
+            response_body.clone(),
             terminal_gateway_deadline,
         )
         .await
@@ -17831,7 +18661,7 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
             plugins[index + 1..].to_vec(),
             *response_status,
             Arc::new(response_headers.clone()),
-            Arc::new(response_body.clone()),
+            response_body.clone(),
         );
         return true;
     }
@@ -17860,7 +18690,7 @@ fn build_pre_plugin_reject_response(
 ) -> Response<ProxyBody> {
     let reject = normalize_reject_response(
         status,
-        body,
+        Bytes::copy_from_slice(body),
         headers,
         request_uses_grpc_content_type || grpc_web_response_content_type.is_some(),
     );
@@ -17911,7 +18741,7 @@ async fn build_grpc_web_reject_response(
                 ctx,
                 StatusCode::OK.as_u16(),
                 &translated.headers,
-                &translated.body,
+                Bytes::from(translated.body.clone()),
                 terminal_gateway_deadline,
             )
             .await
@@ -17945,7 +18775,7 @@ async fn build_grpc_web_reject_response(
                 plugins[index + 1..].to_vec(),
                 StatusCode::OK.as_u16(),
                 Arc::new(translated.headers.clone()),
-                Arc::new(translated.body.clone()),
+                Bytes::from(translated.body.clone()),
             );
             break;
         }
@@ -18000,7 +18830,7 @@ async fn run_backend_path_plugins_or_build_reject(
                     plugins,
                     ctx,
                     status,
-                    &plugin_reject.body,
+                    plugin_reject.body.clone(),
                     plugin_reject.headers,
                     is_grpc_request,
                     grpc_web_response_content_type.is_none(),
@@ -18040,7 +18870,7 @@ async fn finalize_reject_response_with_after_proxy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     headers: HashMap<String, String>,
     is_grpc_request: bool,
 ) -> NormalizedRejectResponse {
@@ -18060,13 +18890,13 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     mut headers: HashMap<String, String>,
     is_grpc_request: bool,
     invoke_response_committed: bool,
 ) -> NormalizedRejectResponse {
     let mut response_status = status.as_u16();
-    let mut response_body = body.to_vec();
+    let mut response_body = body;
     let hook_start = Instant::now();
     apply_reject_after_proxy_and_synthetic_body_hooks(
         plugins,
@@ -18091,7 +18921,13 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
         std::sync::atomic::Ordering::Relaxed,
     );
     let status = StatusCode::from_u16(response_status).unwrap_or(status);
-    normalize_reject_response(status, &response_body, &headers, is_grpc_request)
+    normalize_reject_response_with_provenance(
+        status,
+        response_body,
+        &headers,
+        is_grpc_request,
+        FramedGrpcUnaryProvenance::from_context(ctx),
+    )
 }
 
 /// Finalize a terminal request-body read failure before any external operation
@@ -18118,7 +18954,7 @@ async fn finalize_terminal_request_body_read_rejection(
         plugins,
         ctx,
         status,
-        body,
+        Bytes::copy_from_slice(body),
         HashMap::new(),
         is_grpc_request,
     )
@@ -18154,7 +18990,7 @@ async fn handle_backend_admission_rejection(
         plugins,
         ctx,
         StatusCode::from_u16(rejection.status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
-        &rejection.body,
+        rejection.body.clone(),
         rejection.headers,
         is_grpc_request,
         grpc_web_error_content_type.is_none(),
@@ -18197,7 +19033,7 @@ pub(crate) async fn build_finalized_upload_deadline_response(
         plugins,
         ctx,
         deadline.http_status,
-        &deadline.body,
+        deadline.body.clone(),
         deadline.headers,
         true,
         grpc_web_response_content_type.is_none(),
@@ -18268,7 +19104,7 @@ const MISSING_AUTHENTICATION_BODY: &[u8] = br#"{"error":"Authentication required
 
 fn missing_authentication_reject(
     auth_plugins: &[Arc<dyn Plugin>],
-) -> (u16, Vec<u8>, HashMap<String, String>) {
+) -> (u16, Bytes, HashMap<String, String>) {
     let mut headers = HashMap::new();
     // Challenge selection follows configured priority order: mechanisms that
     // do not advertise a challenge are skipped, and the first available
@@ -18278,7 +19114,11 @@ fn missing_authentication_reject(
         .find_map(|plugin| plugin.authentication_challenge())
         .unwrap_or("ferrum-edge");
     headers.insert("WWW-Authenticate".to_string(), challenge.to_string());
-    (401, MISSING_AUTHENTICATION_BODY.to_vec(), headers)
+    (
+        401,
+        Bytes::from_static(MISSING_AUTHENTICATION_BODY),
+        headers,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -18841,7 +19681,7 @@ pub async fn run_authentication_phase(
     auth_plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     consumer_index: &ConsumerIndex,
-) -> Option<(u16, Vec<u8>, HashMap<String, String>)> {
+) -> Option<(u16, Bytes, HashMap<String, String>)> {
     // Mark every configured query credential location before multi-auth can
     // stop at the first successful mechanism. Presence is enough to redact:
     // an invalid token may coexist with a different successful credential and
@@ -18855,8 +19695,8 @@ pub async fn run_authentication_phase(
             // Execute auth plugins; first success stops iteration.
             // Multi-auth success includes external identity auth (e.g. jwks_auth)
             // even when no gateway Consumer record exists.
-            let mut last_reject: Option<(u16, Vec<u8>, HashMap<String, String>)> = None;
-            let mut server_reject: Option<(u16, Vec<u8>, HashMap<String, String>)> = None;
+            let mut last_reject: Option<(u16, Bytes, HashMap<String, String>)> = None;
+            let mut server_reject: Option<(u16, Bytes, HashMap<String, String>)> = None;
             for auth_plugin in auth_plugins {
                 let deadline = ctx.grpc_deadline_at();
                 let auth_result = match crate::plugins::await_grpc_deadline(
@@ -18872,7 +19712,7 @@ pub async fn run_authentication_phase(
                         let Some(reject) = plugin_result_into_reject_parts(reject) else {
                             return Some((
                                 500,
-                                br#"{"error":"Internal error"}"#.to_vec(),
+                                Bytes::from_static(br#"{"error":"Internal error"}"#),
                                 HashMap::new(),
                             ));
                         };
@@ -20025,7 +20865,7 @@ async fn handle_proxy_request_inner(
         reject_headers.insert("allow".to_string(), allow_header.clone());
         let mut reject = normalize_reject_response(
             StatusCode::METHOD_NOT_ALLOWED,
-            br#"{"error":"Method Not Allowed"}"#,
+            Bytes::from_static(br#"{"error":"Method Not Allowed"}"#),
             &reject_headers,
             is_grpc_request,
         );
@@ -20074,7 +20914,7 @@ async fn handle_proxy_request_inner(
         warn!(method = %method, path = %path, "Rejected gRPC request: method must be POST");
         let mut reject = normalize_reject_response(
             StatusCode::BAD_REQUEST,
-            br#"{"error":"gRPC requires POST method"}"#,
+            Bytes::from_static(br#"{"error":"gRPC requires POST method"}"#),
             &EMPTY_HEADERS,
             true,
         );
@@ -20165,7 +21005,7 @@ async fn handle_proxy_request_inner(
                 &plugins,
                 &mut ctx,
                 StatusCode::from_u16(plugin_reject.status_code).unwrap_or(StatusCode::BAD_REQUEST),
-                &plugin_reject.body,
+                plugin_reject.body.clone(),
                 plugin_reject.headers,
                 true,
                 grpc_web_response_content_type.is_none(),
@@ -20231,7 +21071,7 @@ async fn handle_proxy_request_inner(
                         &mut ctx,
                         StatusCode::from_u16(status_code)
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                        &plugin_reject.body,
+                        plugin_reject.body.clone(),
                         plugin_reject.headers,
                         is_grpc_request,
                         grpc_web_response_content_type.is_none(),
@@ -20418,7 +21258,7 @@ async fn handle_proxy_request_inner(
                 &plugins,
                 &mut ctx,
                 StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
-                &body,
+                body,
                 headers,
                 is_grpc_request,
                 grpc_web_response_content_type.is_none(),
@@ -20599,7 +21439,7 @@ async fn handle_proxy_request_inner(
                         &plugins,
                         &mut ctx,
                         StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
-                        &plugin_reject.body,
+                        plugin_reject.body.clone(),
                         plugin_reject.headers,
                         is_grpc_request,
                         grpc_web_response_content_type.is_none(),
@@ -20819,7 +21659,7 @@ async fn handle_proxy_request_inner(
                     &plugins,
                     &mut ctx,
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    &plugin_reject.body,
+                    plugin_reject.body.clone(),
                     plugin_reject.headers,
                     is_grpc_request,
                     grpc_web_response_content_type.is_none(),
@@ -20885,7 +21725,7 @@ async fn handle_proxy_request_inner(
                     &plugins,
                     &mut ctx,
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    &plugin_reject.body,
+                    plugin_reject.body.clone(),
                     plugin_reject.headers,
                     is_grpc_request,
                     grpc_web_response_content_type.is_none(),
@@ -20950,7 +21790,7 @@ async fn handle_proxy_request_inner(
                     &plugins,
                     &mut ctx,
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    &plugin_reject.body,
+                    plugin_reject.body.clone(),
                     plugin_reject.headers,
                     is_grpc_request,
                     grpc_web_response_content_type.is_none(),
@@ -21299,7 +22139,7 @@ async fn handle_proxy_request_inner(
                     &plugins,
                     &mut ctx,
                     status,
-                    &plugin_reject.body,
+                    plugin_reject.body.clone(),
                     plugin_reject.headers,
                     is_grpc_request,
                     grpc_web_response_content_type.is_none(),
@@ -21514,7 +22354,7 @@ async fn handle_proxy_request_inner(
                                 &plugins,
                                 &mut ctx,
                                 status,
-                                &reject.body,
+                                reject.body.clone(),
                                 reject.headers,
                                 is_grpc_request,
                                 grpc_web_response_content_type.is_none(),
@@ -21585,7 +22425,9 @@ async fn handle_proxy_request_inner(
                     &plugins,
                     &mut ctx,
                     StatusCode::SERVICE_UNAVAILABLE,
-                    br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+                    Bytes::from_static(
+                        br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+                    ),
                     HashMap::new(),
                     is_grpc_request,
                 )
@@ -21829,7 +22671,7 @@ async fn handle_proxy_request_inner(
                                 &plugins,
                                 &mut ctx,
                                 status,
-                                &reject.body,
+                                reject.body.clone(),
                                 reject.headers,
                                 is_grpc_request,
                                 grpc_web_response_content_type.is_none(),
@@ -22469,7 +23311,7 @@ async fn handle_proxy_request_inner(
                             &plugins,
                             &mut ctx,
                             status,
-                            &reject.body,
+                            reject.body.clone(),
                             reject.headers,
                             true,
                             grpc_web_response_content_type.is_none(),
@@ -23385,6 +24227,49 @@ async fn handle_proxy_request_inner(
 
                 // after_proxy plugins run on headers only (body is not yet in memory).
                 let mut response_headers: HashMap<String, String> = grpc_streaming.headers;
+                // Response-trailer policy boundary for the NATIVE gRPC STREAMING
+                // relay (GHSA-r78v-rc86-6r86). This is the path the advisory
+                // reproduces: `after_proxy` runs below on the INITIAL header map
+                // only, the HEADERS frame is committed, and the backend's terminal
+                // metadata arrives later through the streaming body — so a
+                // trailer-only `x-internal-debug` would sail past a
+                // `response_transformer` remove/update rule the operator
+                // configured. Captured HERE, on the pristine backend header map,
+                // before any response-header phase runs.
+                //
+                // Only the three RESERVED terminal fields
+                // (`grpc-status` / `grpc-message` / `grpc-status-details-bin`) are
+                // exempt at reconcile time; every other trailer field is gRPC
+                // application metadata and is governed. `content-length` is in the
+                // capture gate because the gRPC deadline strip and the gRPC-Web
+                // translation both remove it below.
+                let grpc_streaming_unbounded_trailer_policy =
+                    capabilities.has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY);
+                // `content-length` is in this gate because the gRPC deadline
+                // strip and the gRPC-Web translation both remove it below.
+                let grpc_streaming_header_phases_can_mutate =
+                    !plugins.is_empty() || response_headers.contains_key("content-length");
+                // No evidence, no declaration, and no fail-closed arm means the
+                // reconciliation is provably a no-op, so the boundary is skipped
+                // entirely and the response pays no header-map clone. This can
+                // only SKIP work the reconciliation would not have done; every
+                // signal that could drop a trailer keeps it installed.
+                let grpc_streaming_trailer_policy_can_act = grpc_streaming_header_phases_can_mutate
+                    || grpc_streaming_unbounded_trailer_policy
+                    || !plugin_cache_view.response_trailer_policy_names().is_empty()
+                    || !plugin_cache_view
+                        .response_trailer_policy_prefixes()
+                        .is_empty();
+                let grpc_streaming_pre_policy_headers =
+                    headers_mod::PrePolicyResponseHeaders::capture_for_streaming(
+                        &response_headers,
+                        headers_mod::ResponseTrailerGovernance {
+                            policy_names: plugin_cache_view.response_trailer_policy_names(),
+                            policy_prefixes: plugin_cache_view.response_trailer_policy_prefixes(),
+                            unbounded: grpc_streaming_unbounded_trailer_policy,
+                        },
+                        grpc_streaming_header_phases_can_mutate,
+                    );
                 let grpc_header_status =
                     grpc_proxy::grpc_status_from_maps(&EMPTY_HEADERS, &response_headers);
                 if let Some(grpc_status) = grpc_header_status {
@@ -23491,7 +24376,7 @@ async fn handle_proxy_request_inner(
                         let normalized = normalize_reject_response(
                             StatusCode::from_u16(reject.status_code)
                                 .unwrap_or(StatusCode::BAD_GATEWAY),
-                            &reject.body,
+                            reject.body.clone(),
                             &reject.headers,
                             true,
                         );
@@ -23813,6 +24698,30 @@ async fn handle_proxy_request_inner(
                 // applies per frame. See `grpc_streaming_response_deadline` —
                 // shared with the mesh-mTLS `StreamingH2` relay so the two
                 // regimes cannot drift.
+                //
+                // Seal the native-gRPC trailer boundary captured before
+                // `after_proxy` ran. `response_headers` above is exactly the map
+                // that went on the wire (this arm writes nothing straight onto the
+                // builder, so `GatewayOwnedResponseHeaders` stays empty). The
+                // governor is owned because the body outlives this handler: the
+                // backend TRAILERS frame is read later, on a different task. It is
+                // consulted only on that single frame — never per DATA frame — and
+                // `TrailerSectionKind::NativeGrpcTerminal` keeps the reserved
+                // status fields intact so the RPC outcome, its trailer-time
+                // classification, and gRPC-Web translation below are unaffected.
+                let mut grpc_streaming_trailer_governor = None;
+                if grpc_streaming_trailer_policy_can_act {
+                    grpc_streaming_trailer_governor =
+                        Some(headers_mod::StreamingResponseTrailerGovernor::new(
+                            response_headers.clone(),
+                            grpc_streaming_pre_policy_headers,
+                            plugin_cache_view.response_trailer_policy_names_shared(),
+                            plugin_cache_view.response_trailer_policy_prefixes_shared(),
+                            headers_mod::GatewayOwnedResponseHeaders::default(),
+                            headers_mod::TrailerSectionKind::NativeGrpcTerminal,
+                            grpc_streaming_unbounded_trailer_policy,
+                        ));
+                }
                 let body = if state.response_buffer_cutoff_bytes == 0
                     && state.max_response_body_size_bytes == 0
                 {
@@ -23821,6 +24730,7 @@ async fn handle_proxy_request_inner(
                         cl,
                         grpc_read_timeout_ms,
                         grpc_total_deadline,
+                        grpc_streaming_trailer_governor.take(),
                     )
                 } else if state.max_response_body_size_bytes > 0 {
                     crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
@@ -23830,6 +24740,7 @@ async fn handle_proxy_request_inner(
                         state.h2_coalesce_target_bytes,
                         grpc_read_timeout_ms,
                         grpc_total_deadline,
+                        grpc_streaming_trailer_governor.take(),
                     )
                 } else {
                     crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
@@ -23838,6 +24749,7 @@ async fn handle_proxy_request_inner(
                         state.h2_coalesce_target_bytes,
                         grpc_read_timeout_ms,
                         grpc_total_deadline,
+                        grpc_streaming_trailer_governor.take(),
                     )
                 };
                 let mut body = body;
@@ -23989,7 +24901,7 @@ async fn handle_proxy_request_inner(
                 let mut response_status = grpc_resp.status;
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
                 let mut response_trailers: HashMap<String, String> = grpc_resp.trailers;
-                let mut response_body = grpc_resp.body;
+                let mut response_body = Bytes::from(grpc_resp.body);
                 if let Some(grpc_status) =
                     grpc_proxy::grpc_status_from_maps(&response_trailers, &response_headers)
                 {
@@ -24132,7 +25044,7 @@ async fn handle_proxy_request_inner(
                         let normalized = normalize_reject_response(
                             StatusCode::from_u16(reject.status_code)
                                 .unwrap_or(StatusCode::BAD_GATEWAY),
-                            &reject.body,
+                            reject.body.clone(),
                             &reject.headers,
                             true,
                         );
@@ -24350,7 +25262,7 @@ async fn handle_proxy_request_inner(
                                     );
                                     response_status = 200;
                                     response_headers = translated.headers;
-                                    response_body = translated.body;
+                                    response_body = Bytes::from(translated.body);
                                     // Same body-framed shape as the gate's
                                     // replacement above: the finalized status
                                     // lives in the trailer frame only.
@@ -24418,16 +25330,18 @@ async fn handle_proxy_request_inner(
                         let content_type = plugin_response_headers
                             .get("content-type")
                             .map(String::as_str);
-                        if crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
-                            &mut response_body,
+                        let mut owned_body = ResponseBody::take_buffered_vec(&mut response_body);
+                        let synced = crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
+                            &mut owned_body,
                             content_type,
                             &response_trailers,
                             http_status,
-                        ) {
-                            plugin_response_headers.insert(
-                                "content-length".to_string(),
-                                response_body.len().to_string(),
-                            );
+                        );
+                        let synced_len = owned_body.len();
+                        ResponseBody::store_buffered_vec(&mut response_body, owned_body);
+                        if synced {
+                            plugin_response_headers
+                                .insert("content-length".to_string(), synced_len.to_string());
                         }
                     }
                     // Retire compatibility-view application trailers only after
@@ -24646,7 +25560,6 @@ async fn handle_proxy_request_inner(
                     &response_headers,
                 );
 
-                let response_body = Bytes::from(response_body);
                 let body = if !response_body.is_empty() && !response_trailers.is_empty() {
                     // Split LF-joined duplicate metadata before HeaderValue
                     // construction — from_str rejects embedded LF and would
@@ -25414,7 +26327,7 @@ async fn handle_proxy_request_inner(
                 );
                 result = retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#
                             .to_vec(),
                     ),
@@ -25806,6 +26719,132 @@ async fn handle_proxy_request_inner(
     // response status is deliberately NOT rewritten.
     let streaming_h2_native_grpc =
         request_uses_grpc_content_type && matches!(&response_body, ResponseBody::StreamingH2(_));
+
+    // Same structural test for the H1/H2 frontend → native-H3 BACKEND streaming
+    // relay. `dispatch_grpc_native_h3` owns gRPC-flavored native-H3 dispatch, so
+    // this is expected to be `false` in practice; it is written as the exact
+    // parallel of the direct-H2 term so a future gRPC-over-`StreamingH3`
+    // dispatch cannot silently land on the plain-response rules, where
+    // `grpc-status` would be governed like ordinary backend metadata.
+    let streaming_h3_native_grpc =
+        request_uses_grpc_content_type && matches!(&response_body, ResponseBody::StreamingH3(_));
+
+    // Response-trailer policy boundary for the PLAIN streaming HTTP/2 relay,
+    // the direct-H2 counterpart of the native-H3 streaming relays (issue
+    // #2941 follow-up), and for the H1/H2 frontend → native-H3 BACKEND relay
+    // (`ResponseBody::StreamingH3`), whose backend TRAILERS frame reaches an
+    // H1 (chunked-trailer) or H2 client through `body::H3FrameSource` after the
+    // very same boundary closed. The initial HEADERS frame is committed before
+    // the backend's trailer section exists, so `after_proxy`, sticky-cookie
+    // injection, and the gateway's own writes have all gone on the wire by the
+    // time a backend TRAILERS frame arrives. Without a boundary there, a
+    // backend trailer repeating a governed field name reintroduces exactly
+    // what a response-header policy removed — for example `security_headers`
+    // with `{"remove": ["x-powered-by"]}` is a NO-OP on the initial header map
+    // when the backend sent `x-powered-by` only as a trailer.
+    //
+    // Native gRPC on this arm (`streaming_h2_native_grpc`, the mesh-mTLS relay)
+    // is ALSO governed, as `TrailerSectionKind::NativeGrpcTerminal`: only
+    // `grpc-status` / `grpc-message` / `grpc-status-details-bin` are
+    // protocol-required and exempt, while the rest of the terminal block is gRPC
+    // application metadata crossing the same policy boundary — the case
+    // GHSA-r78v-rc86-6r86 reports.
+    //
+    // Translated gRPC-Web (`grpc_request_is_web_translated`) is governed too. Its
+    // TERMINAL metadata is adapted into a final DATA frame rather than a TRAILERS
+    // frame, but that only changes the ENCODING, not the boundary: the backend
+    // still speaks native gRPC (the `grpc_web` plugin rewrote the request), and on
+    // a NON-EMPTY streaming response its terminal metadata arrives in a later
+    // TRAILERS frame, long after the header policy ran. Only a genuine
+    // Trailers-Only response carries that metadata in the initial END_STREAM
+    // HEADERS block, where the pristine snapshot and `after_proxy` already
+    // governed it. `GrpcWebStreamingBody` wraps this body from the OUTSIDE
+    // (`into_grpc_web_streaming` below), so the governor installed here
+    // reconciles the trailer frame before the adapter can encode any of it.
+    //
+    // Capture is here, on the PRISTINE backend header map: the gRPC-Web bridge
+    // promotion and every response-header phase below run after this point.
+    let streaming_trailer_policy = if matches!(
+        &response_body,
+        ResponseBody::StreamingH2(_) | ResponseBody::StreamingH3(_)
+    ) {
+        // A translated gRPC-Web response's trailer block IS a native gRPC
+        // terminal section — chosen structurally from the dispatch the gateway
+        // committed to, never from a trailer's own name — so its three reserved
+        // status fields survive and still drive `build_streaming_trailer_data`.
+        let section = if streaming_h2_native_grpc
+            || streaming_h3_native_grpc
+            || grpc_request_is_web_translated
+        {
+            headers_mod::TrailerSectionKind::NativeGrpcTerminal
+        } else {
+            headers_mod::TrailerSectionKind::PlainResponse
+        };
+        let unbounded = capabilities.has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY);
+        // The gateway's builder-only response writes (`via`, `alt-svc`,
+        // `X-Gateway-Error`, `X-Gateway-Upstream-Status`) are wire mutations
+        // exactly like a plugin write, so they count as a header phase for the
+        // capture decision and are folded into the final header VIEW below.
+        // Without that, an auth/logging-only chain would keep the #2941
+        // no-evidence pass-through and still forward a backend `via` trailer
+        // contradicting the `via` the gateway itself put on the wire.
+        let gateway_writes_builder_only_headers = state.alt_svc_header.is_some()
+            || via_header_for_backend_response_body(&state, &response_body).is_some()
+            || upstream_is_fallback
+            || backend_resp.connection_error
+            || response_status >= 500;
+        let header_phases_can_mutate = !plugins.is_empty()
+            || sticky_cookie_needed
+            || gateway_writes_builder_only_headers
+            // The streaming gRPC-deadline strip below removes
+            // `content-length` from the wire map AFTER this capture, so a
+            // backend `content-length` trailer would otherwise reconcile as
+            // absent->absent and re-declare a length the gateway
+            // deliberately dropped. Only reachable with a client gRPC
+            // deadline, i.e. only on the native-gRPC section.
+            || (grpc_request_deadline.is_some() && response_headers.contains_key("content-length"))
+            // The gRPC-Web translation below rewrites the wire header map
+            // after this capture (terminal-metadata take + `content-length`
+            // removal). A request can only be translated when the `grpc_web`
+            // plugin ran, so `!plugins.is_empty()` already covers it; state
+            // it explicitly so the gate cannot silently lose that coupling.
+            || grpc_request_is_web_translated;
+        // Same no-op shortcut the native-gRPC streaming arm above applies. With
+        // no evidence to capture, no config-time declaration, and no
+        // fail-closed arm, every `governed` signal in
+        // `reconcile_backend_trailers_with_response_policy` is statically
+        // false, so the boundary would drop nothing — and installing it would
+        // still cost this response two `HashMap` clones (pre-policy + final
+        // headers) on the streaming hot path. Skipping is safe in one
+        // direction only: it can never suppress a drop the reconciliation
+        // would have made, because every signal that could produce one keeps
+        // the boundary installed. `gateway_owned_headers` needs no term of its
+        // own — every write that sets a bit in it also sets
+        // `gateway_writes_builder_only_headers`.
+        let trailer_policy_can_act = header_phases_can_mutate
+            || unbounded
+            || !plugin_cache_view.response_trailer_policy_names().is_empty()
+            || !plugin_cache_view
+                .response_trailer_policy_prefixes()
+                .is_empty();
+        if !trailer_policy_can_act {
+            None
+        } else {
+            let pre_policy = headers_mod::PrePolicyResponseHeaders::capture_for_streaming(
+                &response_headers,
+                headers_mod::ResponseTrailerGovernance {
+                    policy_names: plugin_cache_view.response_trailer_policy_names(),
+                    policy_prefixes: plugin_cache_view.response_trailer_policy_prefixes(),
+                    unbounded,
+                },
+                header_phases_can_mutate,
+            );
+            Some((pre_policy, section, unbounded))
+        }
+    } else {
+        None
+    };
+
     // Codex r2-2 finding 2: the BUFFERED arm needs the same seeding. A
     // gRPC-flavored buffered response on this path is the mesh-mTLS
     // translated-gRPC-Web arm, whose backend H2 trailers were already folded
@@ -25954,7 +26993,7 @@ async fn handle_proxy_request_inner(
             response_headers
                 .entry("content-type".to_string())
                 .or_insert_with(|| "application/json".to_string());
-            response_body = ResponseBody::Buffered(reject.body);
+            response_body = ResponseBody::buffered(reject.body);
             after_proxy_rejected = true;
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -26088,7 +27127,7 @@ async fn handle_proxy_request_inner(
                 reject,
             )
             .await;
-            response_body = ResponseBody::Buffered(body);
+            response_body = ResponseBody::buffered(body);
             let _ = ctx.take_buffered_initial_response_header_policy();
             mesh_grpc_web_trailer_reconcile = None;
             response_body_rejected = true;
@@ -26144,13 +27183,17 @@ async fn handle_proxy_request_inner(
                 .get(crate::plugins::grpc_web::META_GRPC_WEB_HTTP_STATUS)
                 .and_then(|value| value.parse::<u16>().ok());
             let content_type = response_headers.get("content-type").map(String::as_str);
-            if crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
-                data,
+            let mut owned_body = ResponseBody::take_buffered_vec(data);
+            let synced = crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
+                &mut owned_body,
                 content_type,
                 &trailers,
                 http_status,
-            ) {
-                response_headers.insert("content-length".to_string(), data.len().to_string());
+            );
+            let synced_len = owned_body.len();
+            ResponseBody::store_buffered_vec(data, owned_body);
+            if synced {
+                response_headers.insert("content-length".to_string(), synced_len.to_string());
                 // Mirror H1/H2/H3: after body-framing trailers, retire
                 // trailer-only application metadata from initial headers while
                 // preserving shadowed collisions and reserved terminal keys.
@@ -26210,7 +27253,7 @@ async fn handle_proxy_request_inner(
                 reject,
             )
             .await;
-            response_body = ResponseBody::Buffered(body);
+            response_body = ResponseBody::buffered(body);
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
@@ -26540,6 +27583,79 @@ async fn handle_proxy_request_inner(
         resp_builder = resp_builder.header("via", via.as_str());
     }
 
+    // Seal the streaming trailer boundary captured before the
+    // response-header phases ran — shared by the plain/native-gRPC/translated
+    // gRPC-Web direct-HTTP/2 relay and by the native-HTTP/3 BACKEND relay,
+    // which reach it through `StripHopByHopTrailers` and `H3FrameSource`
+    // respectively. The reconciliation compares the backend's
+    // pre-policy values against the headers the client ACTUALLY received, so
+    // the view handed to the body is `response_headers` plus the four
+    // end-to-end gateway-authored fields the builder above wrote directly
+    // (`X-Gateway-Error`, `X-Gateway-Upstream-Status`, `alt-svc`, `via`). A
+    // builder-only field left out of the view would reconcile as
+    // absent->absent and let a backend trailer of the same name land on the
+    // wire contradicting the gateway's own header.
+    //
+    // Folding those values into the final map alone is not enough ownership:
+    // an exact-value pre-seed (backend already sent the identical string) is
+    // invisible to the mutation witness, the same idempotent-write shape
+    // plugin declarations close. Each field the gateway actually writes on
+    // THIS response is therefore also recorded in `gateway_owned_headers` so
+    // the trailer channel stays governed even when before == after. Fields
+    // the gateway did not write stay off that list and remain ungoverned.
+    //
+    // The drain/overload `connection: close` write above is the one deliberate
+    // omission, and needs no fold or ownership entry: `connection` is
+    // response-direction hop-by-hop, so `strip_response_hop_by_hop_trailers`
+    // has already removed it from the trailer section before the governor
+    // ever runs. It is left out of the capture gate for the same reason — a
+    // name that can never reach the reconciliation cannot decide whether
+    // evidence is needed.
+    //
+    // Ownership: the body outlives this handler, so the governor owns every
+    // input (one final-header clone, the pre-policy snapshot, an `Arc` bump of
+    // the per-reload policy-name and prefix lists, plus the small
+    // per-response builder-owned name list). Built at most once per governed
+    // streaming response; the body wrapper reads it only on the single
+    // TRAILERS frame.
+    let mut streaming_trailer_governor = None;
+    if let Some((pre_policy, section, unbounded)) = streaming_trailer_policy {
+        let mut final_headers = response_headers.clone();
+        let mut gateway_owned_headers = headers_mod::GatewayOwnedResponseHeaders::default();
+        if backend_resp.connection_error {
+            final_headers.insert("x-gateway-error".into(), "connection_failure".into());
+            gateway_owned_headers.insert(headers_mod::GatewayOwnedResponseHeader::GatewayError);
+        } else if response_status == 504 {
+            final_headers.insert("x-gateway-error".into(), "backend_timeout".into());
+            gateway_owned_headers.insert(headers_mod::GatewayOwnedResponseHeader::GatewayError);
+        } else if response_status >= 500 {
+            final_headers.insert("x-gateway-error".into(), "backend_error".into());
+            gateway_owned_headers.insert(headers_mod::GatewayOwnedResponseHeader::GatewayError);
+        }
+        if upstream_is_fallback {
+            final_headers.insert("x-gateway-upstream-status".into(), "degraded".into());
+            gateway_owned_headers
+                .insert(headers_mod::GatewayOwnedResponseHeader::GatewayUpstreamStatus);
+        }
+        if let Some(alt_svc) = state.alt_svc_header.as_ref() {
+            final_headers.insert("alt-svc".into(), alt_svc.to_string());
+            gateway_owned_headers.insert(headers_mod::GatewayOwnedResponseHeader::AltSvc);
+        }
+        if let Some(via) = resp_via {
+            final_headers.insert("via".into(), via.clone());
+            gateway_owned_headers.insert(headers_mod::GatewayOwnedResponseHeader::Via);
+        }
+        streaming_trailer_governor = Some(headers_mod::StreamingResponseTrailerGovernor::new(
+            final_headers,
+            pre_policy,
+            plugin_cache_view.response_trailer_policy_names_shared(),
+            plugin_cache_view.response_trailer_policy_prefixes_shared(),
+            gateway_owned_headers,
+            section,
+            unbounded,
+        ));
+    }
+
     // Build response body: either stream from backend or return buffered data.
     // When FERRUM_ENABLE_STREAMING_LATENCY_TRACKING=true, streaming responses are
     // wrapped with a TrackedBody that records the final transfer time via a shared
@@ -26729,6 +27845,10 @@ async fn handle_proxy_request_inner(
                     grpc_request_deadline,
                     effective_h2_read_timeout_ms,
                 );
+            // The trailer governor moves into exactly one of the four
+            // mutually-exclusive body constructors below, so every direct /
+            // size-limited / coalescing variant of this arm enforces the same
+            // response-trailer policy boundary.
             let body = if state.response_buffer_cutoff_bytes == 0
                 && state.max_response_body_size_bytes == 0
             {
@@ -26737,6 +27857,7 @@ async fn handle_proxy_request_inner(
                     cl,
                     h2_read_timeout_ms,
                     None,
+                    streaming_trailer_governor.take(),
                 )
             } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                 // No Content-Length — enforce response-size limits while
@@ -26749,6 +27870,7 @@ async fn handle_proxy_request_inner(
                     state.h2_coalesce_target_bytes,
                     h2_read_timeout_ms,
                     None,
+                    streaming_trailer_governor.take(),
                 )
             } else if use_passthrough {
                 // Response too large to benefit from coalescing — stream
@@ -26761,6 +27883,7 @@ async fn handle_proxy_request_inner(
                     cl,
                     h2_read_timeout_ms,
                     None,
+                    streaming_trailer_governor.take(),
                 )
             } else {
                 crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
@@ -26769,6 +27892,7 @@ async fn handle_proxy_request_inner(
                     state.h2_coalesce_target_bytes,
                     h2_read_timeout_ms,
                     None,
+                    streaming_trailer_governor.take(),
                 )
             };
             let mut body = if let Some(inspector) = response_inspector {
@@ -26883,6 +28007,12 @@ async fn handle_proxy_request_inner(
             // `method` was moved into the transaction summary above, so read it
             // back from `ctx`; one `Arc<str>` alloc per streaming-H3 response.
             let h3_method: Arc<str> = Arc::from(ctx.method.as_str());
+            // The trailer governor moves into exactly one of the three
+            // mutually-exclusive body constructors below, so every direct /
+            // size-limited / coalescing variant of the native-H3 BACKEND relay
+            // enforces the same response-trailer policy boundary the direct-H2
+            // relay does. `H3FrameSource` applies it on the single TRAILERS
+            // frame, immediately after the hop-by-hop trailer strip.
             let body = if state.response_buffer_cutoff_bytes == 0
                 && state.max_response_body_size_bytes == 0
             {
@@ -26892,6 +28022,7 @@ async fn handle_proxy_request_inner(
                     response_status,
                     backend_content_length,
                     h3_read_timeout_ms,
+                    streaming_trailer_governor.take(),
                 )
             } else if state.max_response_body_size_bytes > 0 {
                 crate::proxy::body::size_limited_streaming_h3_body(
@@ -26904,6 +28035,7 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
                     h3_read_timeout_ms,
+                    streaming_trailer_governor.take(),
                 )
             } else {
                 crate::proxy::body::coalescing_h3_body(
@@ -26915,6 +28047,7 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
                     h3_read_timeout_ms,
+                    streaming_trailer_governor.take(),
                 )
             };
             let mut body = if let Some(inspector) = response_inspector {
@@ -26965,7 +28098,7 @@ async fn handle_proxy_request_inner(
             // Buffered response: body is fully consumed, drop the guard
             // immediately so record_connection_end fires now.
             drop(lb_connection_guard);
-            ProxyBody::full(Bytes::from(data))
+            ProxyBody::full(data)
         }
     };
     let body = if let Some((content_type, initial_terminal_metadata)) = grpc_web_streaming_adapter {
@@ -27635,7 +28768,7 @@ pub(crate) async fn proxy_to_backend_retry(
             error!("Failed to get client from pool for retry: {}", e);
             return retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
                 ),
                 headers: HashMap::new(),
@@ -27652,7 +28785,7 @@ pub(crate) async fn proxy_to_backend_retry(
             warn!("Invalid HTTP method on retry: {}", method);
             return retry::BackendResponse {
                 status_code: 405,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -27823,7 +28956,7 @@ pub(crate) async fn proxy_to_backend_retry(
             // shed.
             return retry::BackendResponse {
                 status_code: 503,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"Upstream pending request queue full"}"#
                         .as_bytes()
                         .to_vec(),
@@ -27901,7 +29034,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 );
                 return retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Backend response body exceeds maximum size"}"#
                             .as_bytes()
                             .to_vec(),
@@ -27987,7 +29120,7 @@ pub(crate) async fn proxy_to_backend_retry(
                     match collected {
                         Ok((resp_body, _)) => retry::BackendResponse {
                             status_code: status,
-                            body: ResponseBody::Buffered(resp_body),
+                            body: ResponseBody::buffered(resp_body),
                             headers: resp_headers,
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
@@ -27995,7 +29128,7 @@ pub(crate) async fn proxy_to_backend_retry(
                         },
                         Err(err_body) => retry::BackendResponse {
                             status_code: 502,
-                            body: ResponseBody::Buffered(err_body),
+                            body: ResponseBody::buffered(err_body),
                             headers: HashMap::new(),
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
@@ -28049,7 +29182,7 @@ pub(crate) async fn proxy_to_backend_retry(
             let error_body = r#"{"error":"Backend unavailable"}"#;
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(error_body.as_bytes().to_vec()),
+                body: ResponseBody::buffered(error_body.as_bytes().to_vec()),
                 headers: HashMap::new(),
                 connection_error: !retry::request_reached_wire(error_class),
                 backend_resolved_ip: resolved_ip.clone(),
@@ -28198,7 +29331,7 @@ fn buffered_backend_response_from_body_read(
     match result {
         Ok(b) => retry::BackendResponse {
             status_code: status,
-            body: ResponseBody::Buffered(b.to_vec()),
+            body: ResponseBody::buffered(b),
             headers: resp_headers,
             connection_error: false,
             backend_resolved_ip: resolved_ip,
@@ -28214,7 +29347,7 @@ fn buffered_backend_response_from_body_read(
             );
             retry::BackendResponse {
                 status_code,
-                body: ResponseBody::Buffered(eager_buffer_body_read_error_body(status_code)),
+                body: ResponseBody::buffered(eager_buffer_body_read_error_body(status_code)),
                 headers: HashMap::new(),
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
@@ -28357,7 +29490,7 @@ pub(crate) fn denied_literal_backend_or_dns_override_canonical(
 fn backend_egress_denied_response(host: &str) -> retry::BackendResponse {
     retry::BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(
+        body: ResponseBody::buffered(
             br#"{"error":"backend address blocked by egress policy"}"#.to_vec(),
         ),
         headers: HashMap::new(),
@@ -28392,7 +29525,7 @@ fn oversized_request_body_dispatch_reject(
         return Some(backend_dispatch_response(
             retry::BackendResponse {
                 status_code: 413,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -28950,7 +30083,7 @@ async fn proxy_to_backend(
                         return backend_dispatch_response(
                             retry::BackendResponse {
                                 status_code: 500,
-                                body: ResponseBody::Buffered(
+                                body: ResponseBody::buffered(
                                     r#"{"error":"Request buffering invariant violated"}"#
                                         .as_bytes()
                                         .to_vec(),
@@ -29075,7 +30208,7 @@ async fn proxy_to_backend(
             return backend_dispatch_response(
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(r#"{"error":"Bad Gateway"}"#.as_bytes().to_vec()),
+                    body: ResponseBody::buffered(r#"{"error":"Bad Gateway"}"#.as_bytes().to_vec()),
                     headers: HashMap::new(),
                     connection_error: true,
                     backend_resolved_ip: resolved_ip.clone(),
@@ -29094,7 +30227,7 @@ async fn proxy_to_backend(
             return backend_dispatch_response(
                 retry::BackendResponse {
                     status_code: 405,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -29230,7 +30363,7 @@ async fn proxy_to_backend(
             return backend_dispatch_response(
                 retry::BackendResponse {
                     status_code: 413,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -29359,7 +30492,7 @@ async fn proxy_to_backend(
                                 retry::BackendResponse {
                                     status_code: 413,
                                     body:
-                                        ResponseBody::Buffered(
+                                        ResponseBody::buffered(
                                             r#"{"error":"Request body exceeds maximum size"}"#
                                                 .as_bytes()
                                                 .to_vec(),
@@ -29407,7 +30540,7 @@ async fn proxy_to_backend(
                             return backend_dispatch_response(
                                 retry::BackendResponse {
                                     status_code: 499,
-                                    body: ResponseBody::Buffered(
+                                    body: ResponseBody::buffered(
                                         r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
                                     ),
                                     headers: HashMap::new(),
@@ -29552,7 +30685,7 @@ async fn proxy_to_backend(
             return backend_dispatch_response(
                 retry::BackendResponse {
                     status_code: 503,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Upstream pending request queue full"}"#
                             .as_bytes()
                             .to_vec(),
@@ -29652,7 +30785,7 @@ async fn proxy_to_backend(
                 return backend_dispatch_response(
                     retry::BackendResponse {
                         status_code: 413,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -29702,7 +30835,7 @@ async fn proxy_to_backend(
                     return backend_dispatch_response(
                         retry::BackendResponse {
                             status_code: 502,
-                            body: ResponseBody::Buffered(
+                            body: ResponseBody::buffered(
                                 r#"{"error":"Backend response body exceeds maximum size"}"#
                                     .as_bytes()
                                     .to_vec(),
@@ -29818,7 +30951,7 @@ async fn proxy_to_backend(
                 match collected {
                     Ok((resp_body, _)) => retry::BackendResponse {
                         status_code: status,
-                        body: ResponseBody::Buffered(resp_body),
+                        body: ResponseBody::buffered(resp_body),
                         headers: resp_headers,
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
@@ -29826,7 +30959,7 @@ async fn proxy_to_backend(
                     },
                     Err(err_body) => retry::BackendResponse {
                         status_code: 502,
-                        body: ResponseBody::Buffered(err_body),
+                        body: ResponseBody::buffered(err_body),
                         headers: HashMap::new(),
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
@@ -29926,7 +31059,7 @@ async fn proxy_to_backend(
                 return backend_dispatch_response(
                     retry::BackendResponse {
                         status_code: 413,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -29963,7 +31096,7 @@ async fn proxy_to_backend(
             let error_body = r#"{"error":"Backend unavailable"}"#;
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(error_body.as_bytes().to_vec()),
+                body: ResponseBody::buffered(error_body.as_bytes().to_vec()),
                 headers: HashMap::new(),
                 connection_error: !retry::request_reached_wire(error_class),
                 backend_resolved_ip: resolved_ip.clone(),
@@ -30672,7 +31805,7 @@ fn build_request_body_too_large_response(
 fn request_body_timeout_backend_response(resolved_ip: Option<String>) -> retry::BackendResponse {
     retry::BackendResponse {
         status_code: StatusCode::REQUEST_TIMEOUT.as_u16(),
-        body: ResponseBody::Buffered(
+        body: ResponseBody::buffered(
             r#"{"error":"Request body read timed out"}"#.as_bytes().to_vec(),
         ),
         headers: HashMap::new(),
@@ -30720,7 +31853,7 @@ fn hbone_pool_error_response(
     );
     retry::BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(error_body.into_bytes()),
+        body: ResponseBody::buffered(error_body.into_bytes()),
         headers: HashMap::new(),
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
@@ -30736,7 +31869,9 @@ fn hbone_hyper_error_response(
     error!(proxy_id = %proxy.id, error = %err, "HBONE tunneled HTTP request failed");
     retry::BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(r#"{"error":"HBONE backend unavailable"}"#.into()),
+        body: ResponseBody::buffered(Bytes::from_static(
+            br#"{"error":"HBONE backend unavailable"}"#,
+        )),
         headers: HashMap::new(),
         connection_error: false,
         backend_resolved_ip: resolved_ip,
@@ -30830,7 +31965,7 @@ fn hbone_response_body_too_large_response(
     }
     retry::BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(
+        body: ResponseBody::buffered(
             r#"{"error":"Backend response body exceeds maximum size"}"#
                 .as_bytes()
                 .to_vec(),
@@ -30863,7 +31998,7 @@ fn hbone_request_body_too_large_response(
     }
     retry::BackendResponse {
         status_code: 413,
-        body: ResponseBody::Buffered(
+        body: ResponseBody::buffered(
             r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
         ),
         headers: HashMap::new(),
@@ -30910,7 +32045,7 @@ fn mesh_grpc_unavailable_response(
     headers.insert("grpc-message".to_string(), message.to_string());
     retry::BackendResponse {
         status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
-        body: ResponseBody::Buffered(Vec::new()),
+        body: ResponseBody::buffered(Vec::new()),
         headers,
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
@@ -30940,7 +32075,7 @@ fn mesh_grpc_deadline_exceeded_response(resolved_ip: Option<String>) -> retry::B
     );
     retry::BackendResponse {
         status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
-        body: ResponseBody::Buffered(Vec::new()),
+        body: ResponseBody::buffered(Vec::new()),
         headers,
         connection_error: false,
         backend_resolved_ip: resolved_ip,
@@ -30992,7 +32127,7 @@ pub(crate) fn client_grpc_deadline_exceeded_response_for_request(
     );
     retry::BackendResponse {
         status_code: StatusCode::OK.as_u16(),
-        body: ResponseBody::Buffered(translated.body),
+        body: ResponseBody::buffered(translated.body),
         headers: translated.headers,
         connection_error: false,
         backend_resolved_ip: resolved_ip,
@@ -31046,7 +32181,7 @@ fn mesh_grpc_response_body_too_large_response(
     );
     retry::BackendResponse {
         status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
-        body: ResponseBody::Buffered(Vec::new()),
+        body: ResponseBody::buffered(Vec::new()),
         headers,
         connection_error: false,
         backend_resolved_ip: resolved_ip,
@@ -31080,7 +32215,7 @@ fn mesh_grpc_response_buffering_refusal_response(
         } else {
             200 // gRPC errors ride HTTP 200 + grpc-status
         },
-        body: ResponseBody::Buffered(Vec::new()),
+        body: ResponseBody::buffered(Vec::new()),
         headers,
         connection_error: false,
         backend_resolved_ip: resolved_ip,
@@ -31140,7 +32275,7 @@ async fn proxy_to_backend_hbone(
         return (
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"HBONE target missing"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -31166,7 +32301,7 @@ async fn proxy_to_backend_hbone(
             return (
                 retry::BackendResponse {
                     status_code: 500,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"HBONE request buffering invariant violated"}"#
                             .as_bytes()
                             .to_vec(),
@@ -31270,7 +32405,7 @@ async fn proxy_to_backend_hbone(
             return (
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Cross-cluster HBONE target missing SNI"}"#
                             .as_bytes()
                             .to_vec(),
@@ -31294,7 +32429,7 @@ async fn proxy_to_backend_hbone(
             return (
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Cross-cluster HBONE target missing trust domain"}"#
                             .as_bytes()
                             .to_vec(),
@@ -31439,7 +32574,7 @@ async fn proxy_to_backend_hbone(
             return (
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Invalid backend URL"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -31483,7 +32618,7 @@ async fn proxy_to_backend_hbone(
             return (
                 retry::BackendResponse {
                     status_code: 405,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -31649,7 +32784,7 @@ async fn proxy_to_backend_hbone(
                 return (
                     retry::BackendResponse {
                         status_code: 504,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -31771,7 +32906,7 @@ async fn proxy_to_backend_hbone(
                 return (
                     retry::BackendResponse {
                         status_code: 504,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -31787,7 +32922,7 @@ async fn proxy_to_backend_hbone(
         (
             retry::BackendResponse {
                 status_code: status,
-                body: ResponseBody::Buffered(body_bytes),
+                body: ResponseBody::buffered(body_bytes),
                 headers: resp_headers,
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
@@ -31842,7 +32977,7 @@ async fn proxy_to_backend_mesh_mtls(
         return (
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"Sidecar mTLS target missing"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -31914,7 +33049,7 @@ async fn proxy_to_backend_mesh_mtls(
             return (
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Cross-cluster mTLS target missing SNI"}"#
                             .as_bytes()
                             .to_vec(),
@@ -31938,7 +33073,7 @@ async fn proxy_to_backend_mesh_mtls(
             return (
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Cross-cluster mTLS target missing trust domain"}"#
                             .as_bytes()
                             .to_vec(),
@@ -31981,7 +33116,7 @@ async fn proxy_to_backend_mesh_mtls(
             return (
                 retry::BackendResponse {
                     status_code: 500,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"mesh mTLS request buffering invariant violated"}"#
                             .as_bytes()
                             .to_vec(),
@@ -32249,7 +33384,7 @@ async fn proxy_to_backend_mesh_mtls(
             return (
                 retry::BackendResponse {
                     status_code: 504,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -32302,7 +33437,7 @@ async fn proxy_to_backend_mesh_mtls(
             return (
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Invalid backend URL"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -32376,7 +33511,7 @@ async fn proxy_to_backend_mesh_mtls(
             return (
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Invalid backend authority"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -32416,7 +33551,7 @@ async fn proxy_to_backend_mesh_mtls(
             return (
                 retry::BackendResponse {
                     status_code: 405,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -32594,7 +33729,7 @@ async fn proxy_to_backend_mesh_mtls(
                 return (
                     retry::BackendResponse {
                         status_code: 504,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -32851,7 +33986,7 @@ async fn proxy_to_backend_mesh_mtls(
                 return (
                     retry::BackendResponse {
                         status_code: 504,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -32908,7 +34043,7 @@ async fn proxy_to_backend_mesh_mtls(
         (
             retry::BackendResponse {
                 status_code: status,
-                body: ResponseBody::Buffered(body_bytes),
+                body: ResponseBody::buffered(body_bytes),
                 headers: resp_headers,
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
@@ -32982,7 +34117,7 @@ async fn proxy_to_backend_http2(
             return (
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Invalid backend URL"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -33047,7 +34182,7 @@ async fn proxy_to_backend_http2(
             return (
                 retry::BackendResponse {
                     status_code: 405,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -33189,7 +34324,7 @@ async fn proxy_to_backend_http2(
         (
             retry::BackendResponse {
                 status_code: 413,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -33215,7 +34350,7 @@ async fn proxy_to_backend_http2(
                 return (
                     retry::BackendResponse {
                         status_code: 413,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -33281,7 +34416,7 @@ async fn proxy_to_backend_http2(
                         return (
                             retry::BackendResponse {
                                 status_code: 504,
-                                body: ResponseBody::Buffered(
+                                body: ResponseBody::buffered(
                                     r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
                                 ),
                                 headers: HashMap::new(),
@@ -33390,7 +34525,7 @@ async fn proxy_to_backend_http2(
                 return (
                     retry::BackendResponse {
                         status_code: 502,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -33424,7 +34559,7 @@ async fn proxy_to_backend_http2(
         return (
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"Backend response body exceeds maximum size"}"#
                         .as_bytes()
                         .to_vec(),
@@ -33492,7 +34627,7 @@ async fn proxy_to_backend_http2(
                 return (
                     retry::BackendResponse {
                         status_code: 502,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Backend response body exceeds maximum size"}"#
                                 .as_bytes()
                                 .to_vec(),
@@ -33510,7 +34645,7 @@ async fn proxy_to_backend_http2(
                 return (
                     retry::BackendResponse {
                         status_code: 502,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Failed to read backend response"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -33530,7 +34665,7 @@ async fn proxy_to_backend_http2(
                 return (
                     retry::BackendResponse {
                         status_code: 504,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -33545,7 +34680,7 @@ async fn proxy_to_backend_http2(
         (
             retry::BackendResponse {
                 status_code: status,
-                body: ResponseBody::Buffered(body_bytes),
+                body: ResponseBody::buffered(body_bytes),
                 headers: resp_headers,
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
@@ -33731,7 +34866,7 @@ async fn proxy_to_backend_http3(
         return (
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     br#"{"error":"backend address blocked by egress policy"}"#.to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -33769,7 +34904,7 @@ async fn proxy_to_backend_http3(
                     return (
                         retry::BackendResponse {
                             status_code: 413,
-                            body: ResponseBody::Buffered(
+                            body: ResponseBody::buffered(
                                 r#"{"error":"Request body exceeds maximum size"}"#
                                     .as_bytes()
                                     .to_vec(),
@@ -33887,7 +35022,7 @@ async fn proxy_to_backend_http3(
                                 retry::BackendResponse {
                                     status_code: 413,
                                     body:
-                                        ResponseBody::Buffered(
+                                        ResponseBody::buffered(
                                             r#"{"error":"Request body exceeds maximum size"}"#
                                                 .as_bytes()
                                                 .to_vec(),
@@ -33912,7 +35047,7 @@ async fn proxy_to_backend_http3(
                             (
                                 retry::BackendResponse {
                                     status_code: 499,
-                                    body: ResponseBody::Buffered(
+                                    body: ResponseBody::buffered(
                                         r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
                                     ),
                                     headers: HashMap::new(),
@@ -33970,7 +35105,7 @@ async fn proxy_to_backend_http3(
                             (
                                 retry::BackendResponse {
                                     status_code: 502,
-                                    body: ResponseBody::Buffered(
+                                    body: ResponseBody::buffered(
                                         r#"{"error":"HTTP/3 backend request failed"}"#
                                             .as_bytes()
                                             .to_vec(),
@@ -34004,7 +35139,7 @@ async fn proxy_to_backend_http3(
                     return (
                         retry::BackendResponse {
                             status_code: 413,
-                            body: ResponseBody::Buffered(
+                            body: ResponseBody::buffered(
                                 r#"{"error":"Request body exceeds maximum size"}"#
                                     .as_bytes()
                                     .to_vec(),
@@ -34030,7 +35165,7 @@ async fn proxy_to_backend_http3(
                         return (
                             retry::BackendResponse {
                                 status_code: 413,
-                                body: ResponseBody::Buffered(
+                                body: ResponseBody::buffered(
                                     r#"{"error":"Request body exceeds maximum size"}"#
                                         .as_bytes()
                                         .to_vec(),
@@ -34077,7 +35212,7 @@ async fn proxy_to_backend_http3(
                         return (
                             retry::BackendResponse {
                                 status_code: 499,
-                                body: ResponseBody::Buffered(
+                                body: ResponseBody::buffered(
                                     r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
                                 ),
                                 headers: HashMap::new(),
@@ -34248,7 +35383,7 @@ async fn proxy_to_backend_http3(
                 (
                     retry::BackendResponse {
                         status_code: 502,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -34378,7 +35513,7 @@ async fn proxy_to_backend_http3(
                 (
                     retry::BackendResponse {
                         status_code: 502,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -34492,7 +35627,7 @@ async fn drain_h3_streaming_response_to_buffered(
     {
         Ok((body, _trailers)) => retry::BackendResponse {
             status_code: status,
-            body: ResponseBody::Buffered(body),
+            body: ResponseBody::buffered(body),
             headers: response_headers,
             connection_error: false,
             backend_resolved_ip: resolved_ip,
@@ -34507,7 +35642,7 @@ async fn drain_h3_streaming_response_to_buffered(
             );
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"Backend response body exceeds maximum size"}"#
                         .as_bytes()
                         .to_vec(),
@@ -34545,7 +35680,7 @@ async fn drain_h3_streaming_response_to_buffered(
             );
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -34570,7 +35705,7 @@ async fn drain_h3_streaming_response_to_buffered(
             );
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"HTTP/3 backend response truncated"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -34707,7 +35842,7 @@ fn h3_response_body_too_large_response(
     }
     retry::BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(
+        body: ResponseBody::buffered(
             r#"{"error":"Backend response body exceeds maximum size"}"#
                 .as_bytes()
                 .to_vec(),
@@ -34749,7 +35884,7 @@ fn declared_response_length_exceeds_limit(
 fn h3_read_timeout_backend_response(resolved_ip: Option<String>) -> retry::BackendResponse {
     retry::BackendResponse {
         status_code: 504,
-        body: ResponseBody::Buffered(r#"{"error":"Backend timeout"}"#.as_bytes().to_vec()),
+        body: ResponseBody::buffered(r#"{"error":"Backend timeout"}"#.as_bytes().to_vec()),
         headers: HashMap::new(),
         connection_error: false,
         backend_resolved_ip: resolved_ip,
@@ -34959,7 +36094,7 @@ async fn proxy_to_backend_http3_retry(
                 );
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -35024,7 +36159,7 @@ async fn proxy_to_backend_http3_retry(
                 );
                 return retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Backend response body exceeds maximum size"}"#
                             .as_bytes()
                             .to_vec(),
@@ -35041,7 +36176,7 @@ async fn proxy_to_backend_http3_retry(
             // frame machinery that is out of scope for issue #1630.
             retry::BackendResponse {
                 status_code: response.status,
-                body: ResponseBody::Buffered(response.body),
+                body: ResponseBody::buffered(response.body),
                 headers: response.headers,
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
@@ -35081,7 +36216,7 @@ async fn proxy_to_backend_http3_retry(
             );
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -36759,7 +37894,7 @@ mod tests {
             HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
         let reject = RejectedResponseParts {
             status_code: 502,
-            body: br#"{"error":"blocked"}"#.to_vec(),
+            body: Bytes::from_static(br#"{"error":"blocked"}"#),
             headers: HashMap::new(),
         };
 
@@ -36781,7 +37916,7 @@ mod tests {
             response_headers.get("x-after-reject").map(String::as_str),
             Some("applied")
         );
-        assert_eq!(body, br#"{"error":"blocked"}"#);
+        assert_eq!(&*body, br#"{"error":"blocked"}"#);
         assert!(!ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY));
     }
 
@@ -36820,7 +37955,7 @@ mod tests {
             ("vary".to_string(), "accept-encoding, Origin".to_string()),
             ("warning".to_string(), "110 stale".to_string()),
         ]);
-        let mut body = b"synthetic success".to_vec();
+        let mut body = Bytes::from_static(b"synthetic success");
 
         apply_reject_after_proxy_and_synthetic_body_hooks(
             &plugins,
@@ -36834,7 +37969,7 @@ mod tests {
         .await;
 
         assert_eq!(status, 503);
-        assert_eq!(body, b"late fail-closed rejection");
+        assert_eq!(&*body, b"late fail-closed rejection");
         assert_eq!(
             headers.get("x-after-reject").map(String::as_str),
             Some("applied"),
@@ -36951,7 +38086,7 @@ mod tests {
             plugins,
             ctx,
             StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::OK),
-            &reject.body,
+            reject.body.clone(),
             reject.headers,
             false,
         )
@@ -36976,7 +38111,7 @@ mod tests {
         let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
 
         assert_eq!(response.http_status, StatusCode::OK);
-        assert_eq!(response.body, body);
+        assert_eq!(&*response.body, body);
     }
 
     #[tokio::test]
@@ -36994,7 +38129,7 @@ mod tests {
         let mut status = 200;
         let mut headers =
             HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-        let mut body = br#"{"secret":"must be inspected"}"#.to_vec();
+        let mut body = Bytes::from_static(br#"{"secret":"must be inspected"}"#);
 
         apply_reject_after_proxy_and_synthetic_body_hooks(
             &plugins,
@@ -37096,7 +38231,7 @@ mod tests {
         let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
 
         assert_eq!(response.http_status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(response.body, b"transformed application response");
+        assert_eq!(&*response.body, b"transformed application response");
         assert!(!response.headers.contains_key("etag"));
         assert!(!response.headers.contains_key("content-digest"));
         assert_eq!(
@@ -37125,7 +38260,7 @@ mod tests {
         let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
 
         assert_eq!(response.http_status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(response.body, b"ordinary gateway rejection");
+        assert_eq!(&*response.body, b"ordinary gateway rejection");
         assert_eq!(
             response.headers.get("etag").map(String::as_str),
             Some("\"gateway-v1\"")
@@ -37743,7 +38878,7 @@ mod tests {
         let mut response_headers = HashMap::new();
         let reject = RejectedResponseParts {
             status_code: 403,
-            body: br#"{"error":"blocked"}"#.to_vec(),
+            body: Bytes::from_static(br#"{"error":"blocked"}"#),
             headers: HashMap::new(),
         };
 
@@ -37767,7 +38902,7 @@ mod tests {
             response_headers.get("x-frame-options").map(String::as_str),
             Some("SAMEORIGIN")
         );
-        assert_eq!(body, br#"{"error":"blocked"}"#);
+        assert_eq!(&*body, br#"{"error":"blocked"}"#);
     }
 
     #[tokio::test]
@@ -37781,7 +38916,7 @@ mod tests {
         );
         let reject = RejectedResponseParts {
             status_code: 403,
-            body: br#"{"error":"Forbidden"}"#.to_vec(),
+            body: Bytes::from_static(br#"{"error":"Forbidden"}"#),
             headers: HashMap::new(),
         };
 
@@ -38131,7 +39266,7 @@ mod tests {
         let ResponseBody::Buffered(body) = resp.body else {
             panic!("SNI direct-H2 rejection should be buffered");
         };
-        assert_eq!(body.as_slice(), br#"{"error":"Bad Gateway"}"#);
+        assert_eq!(&*body, br#"{"error":"Bad Gateway"}"#);
     }
 
     #[test]
@@ -41092,7 +42227,7 @@ mod tests {
         let mk = |connection_error: bool, error_class: Option<retry::ErrorClass>| {
             retry::BackendResponse {
                 status_code: 502,
-                body: retry::ResponseBody::Buffered(Vec::new()),
+                body: retry::ResponseBody::buffered(Vec::new()),
                 headers: HashMap::new(),
                 connection_error,
                 backend_resolved_ip: None,
@@ -41339,7 +42474,7 @@ mod tests {
         let ResponseBody::Buffered(body) = &resp.body else {
             panic!("H3 read-timeout response must be buffered");
         };
-        assert_eq!(body.as_slice(), br#"{"error":"Backend timeout"}"#);
+        assert_eq!(body.as_ref(), br#"{"error":"Backend timeout"}"#);
         assert!(
             !resp.connection_error,
             "post-wire read timeout must not be treated as a connect failure"

@@ -45,7 +45,11 @@ pub mod view;
 // future admin endpoints). The binary itself reaches these through their
 // submodule paths so an `unused_imports` lint would otherwise fire.
 #[allow(unused_imports)]
-pub use fields::{FieldMeta, HTTP_FIELDS, STREAM_FIELDS, SchemaCapabilities, WS_DISCONNECT_FIELDS};
+pub use fields::{
+    CHARGE_EVENT_FIELDS, CHARGEBACK_REPORT_FIELDS, DEBUG_HTTP_FIELDS, DEBUG_STREAM_FIELDS,
+    DEBUG_WS_FIELDS, FieldMeta, HTTP_FIELDS, RecordFamily, STREAM_FIELDS, SchemaCapabilities,
+    WS_DISCONNECT_FIELDS,
+};
 #[allow(unused_imports)]
 pub use view::{SchemaSerializable, SchemaView};
 
@@ -83,7 +87,8 @@ pub struct SummarySchema {
     pub metadata: MetadataPolicy,
     pub timestamp_format: TimestampFormat,
     /// `true` when this schema was compiled under a capability beyond
-    /// [`SchemaCapabilities::BASE`] (i.e. `ws_logging`). Under such a schema a
+    /// [`SchemaCapabilities::BASE`] (i.e. `ws_logging`, or any non-default
+    /// [`RecordFamily`]). Under such a schema a
     /// single `summary_type` (`http` / `both`) is shared by more than one
     /// entry kind (`TransactionSummary` and `WsDisconnectLogEntry`), so
     /// flatten-collision reservation is scoped to the fields the concrete
@@ -142,6 +147,16 @@ pub enum DerivedKind {
 }
 
 impl DerivedKind {
+    /// The operator-facing `kind` token this variant parses from.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::StatusClass => "status_class",
+            Self::BackendHost => "backend_host",
+            Self::SummaryKind => "summary_kind",
+            Self::Outcome => "outcome",
+        }
+    }
+
     fn parse(s: &str) -> Result<Self, String> {
         match s {
             "status_class" => Ok(Self::StatusClass),
@@ -237,6 +252,13 @@ impl SummarySchema {
         }
 
         let summary_type = match raw.get("summary_type") {
+            Some(_) if !caps.family.uses_summary_type() => {
+                return Err(format!(
+                    "{plugin_name}: schema 'summary_type' is not supported for this plugin \
+                     (its records are a {}, not an HTTP/stream transaction summary); remove the key",
+                    caps.family.label()
+                ));
+            }
             Some(Value::String(s)) => SummaryType::parse(s)?,
             None => SummaryType::default(),
             Some(_) => {
@@ -296,10 +318,34 @@ impl SummarySchema {
         let static_fields = parse_static_fields(raw.get("static_fields"), plugin_name)?;
 
         let derived_fields = parse_derived_fields(raw.get("derived_fields"), plugin_name)?;
+        for (name, kind) in &derived_fields {
+            if !caps.family.supports_derived(*kind) {
+                return Err(format!(
+                    "{plugin_name}: schema derived field '{name}' uses kind '{}', which is not \
+                     representable from a {} (no source field); remove it or pick a supported kind",
+                    kind.label(),
+                    caps.family.label()
+                ));
+            }
+        }
 
+        if raw.get("metadata").is_some() && !caps.family.has_metadata() {
+            return Err(format!(
+                "{plugin_name}: schema 'metadata' policy is not supported for this plugin \
+                 (a {} carries no metadata map); remove the key",
+                caps.family.label()
+            ));
+        }
         let metadata = parse_metadata_policy(raw.get("metadata"), plugin_name)?;
 
         let timestamp_format = match raw.get("timestamp_format") {
+            Some(_) if !caps.family.supports_timestamp_format() => {
+                return Err(format!(
+                    "{plugin_name}: schema 'timestamp_format' is not supported for this plugin \
+                     (a {} carries no RFC3339 timestamp field); remove the key",
+                    caps.family.label()
+                ));
+            }
             Some(Value::String(s)) => TimestampFormat::parse(s)?,
             None => TimestampFormat::default(),
             Some(_) => {
@@ -319,7 +365,7 @@ impl SummarySchema {
         // extension set is empty, so every spec is `extension: false` and the
         // per-entry-kind handling below is a no-op — identical to pre-WS.
         let base_field_names: HashSet<&'static str> =
-            fields::fields_for(summary_type, SchemaCapabilities::BASE)
+            fields::fields_for(summary_type, caps.without_optional_families())
                 .into_iter()
                 .map(|f| f.name)
                 .collect();
@@ -390,6 +436,14 @@ impl SummarySchema {
         // ------------------------------------------------------------------
 
         let fields = match raw.get("order") {
+            Some(_) if !caps.family.supports_order() => {
+                return Err(format!(
+                    "{plugin_name}: schema 'order' is not supported for this plugin (a {} is \
+                     emitted as a member of a sorted JSON document, so explicit member order \
+                     cannot be honored); use 'rename' / 'omit' instead",
+                    caps.family.label()
+                ));
+            }
             Some(value) => {
                 let order = parse_string_array(Some(value), plugin_name, "order")?;
                 apply_order(

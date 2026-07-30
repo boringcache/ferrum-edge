@@ -93,7 +93,45 @@ with configured plugin order preserved within each stage. Do not hard-code
 plugin names or change request-side priorities to obtain response representation
 ordering.
 
-Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
+Plugin rejects for `application/grpc` must become trailers-only gRPC errors. The single
+exception is the `serverless_function` terminate contract: a validated function response
+stamps request-scoped provenance (`RequestContext.serverless_grpc_terminate_frame`) that
+authorizes exactly that byte-identical frame to be emitted as HEADERS + one uncompressed
+unary DATA frame + plugin-authored terminal trailers. Reject body shape and reject
+`content-type`/`grpc-status` headers are never provenance, and the terminate contract is
+entered only for the request-scoped native-gRPC flavor the frontend stamps at intake —
+never for a mutable effective `content-type`. Authorization binds the authored HTTP status
+as well as the frame bytes, and that authorized representation — and only it — runs the
+shared synthetic response-body policy lifecycle so configured gRPC response validators are
+not bypassed. Invalidated authorization (rewritten frame, replaced response, changed
+status) FAILS CLOSED: the body is dropped and a residual `grpc-status: 0` is replaced by
+the rejection's own status, or `INTERNAL` — never emitted as an empty Trailers-Only
+success. The status-only shape stamps the same provenance with an EMPTY frame: it can
+never authorize DATA, but while the reply is unchanged (authored status, still-empty body)
+it stays trailers-only and its COMPLETE terminal metadata (`grpc-status`, optional
+`grpc-message`, `grpc-status-details-bin`, validated custom trailers) is restored from the
+authored provenance instead of the decorated reject header map; an omitted `grpc_message`
+stays omitted rather than becoming a synthesized reason. A changed status or an unauthored
+body fails closed identically AND discards every terminal key the contract authored, so a
+replacement error never ships beside the original contract's `grpc-status-details-bin` or
+custom trailers. `grpc_message` is authored as text and emitted percent-encoded per the
+gRPC HTTP mapping, with the 8 KiB wire ceiling measured on the encoded value.
+That per-field ceiling bounds one value; the COMPLETE terminal block
+(`grpc-status`, `grpc-message`, `grpc-status-details-bin`, every custom trailer,
+and `content-type`) carries a separate 16 KiB aggregate budget charged as
+name + value + 32 bytes per field — the HTTP/2 `SETTINGS_MAX_HEADER_LIST_SIZE` /
+HTTP/3 `SETTINGS_MAX_FIELD_SECTION_SIZE` accounting — so 32 individually valid
+8 KiB trailers cannot authorize ~256 KiB of terminal metadata.
+The raw function output is screened with the shared bounded
+`crate::util::json_dup_keys` scanner BEFORE `serde_json::from_slice`: a duplicate
+object member name (byte-identical, escaped-equivalent, or nested inside
+`trailers`) makes the authored terminal metadata parser-dependent, so it fails
+closed under the fixed `invalid_grpc_terminate_response` class with a
+fixed-cardinality reason that never echoes body bytes. Do not add a second
+ad hoc duplicate-key parser here.
+`request_deduplication` is not in this picture at all — it is `HTTP_ONLY_PROTOCOLS` while
+`HttpFlavor::Grpc` selects the `ProxyProtocol::Grpc` plugin view, so it is never effective
+on a native-gRPC request.
 
 ## Request Context And Body Rules
 
@@ -107,7 +145,7 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
 - gRPC uses `GrpcBody::Streaming(Incoming)` when there are no body plugins and no retries; otherwise `Buffered(Full<Bytes>)`.
 - In `before_proxy(ctx, headers)`, read headers from the `headers` parameter, never `ctx.headers`. The handler may have moved headers out of `ctx.headers` when no plugin modifies request headers.
 - `ctx.authenticated_identity` is first-class for rate-limit/cache keys, log summaries, and backend identity header injection.
-- `response_mock` strips a proxy prefix `listen_path` before rule matching, except for root, regex, exact (`=`), and host-only scopes. It supports HTTP and WebSocket upgrade handshakes only (not native gRPC): a match short-circuits the HTTP handshake response and does not mock upgraded frame streams. Native gRPC is excluded because `Reject` normalizes to trailers-only errors that discard configured bodies.
+- `response_mock` strips a proxy prefix `listen_path` before rule matching, except for root, regex, exact (`=`), and host-only scopes. It supports HTTP and WebSocket upgrade handshakes only (not native gRPC): a match short-circuits the HTTP handshake response and does not mock upgraded frame streams. Native gRPC is excluded because `response_mock` has no provenance-authorized framed unary `Reject` contract; only `serverless_function` terminate does.
 
 ## Mesh Authz Plugin
 
@@ -140,15 +178,22 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
 - Default path must remain byte-for-byte identical and zero allocation when no schema is configured.
 - Metadata redaction must apply for renamed metadata and flattened metadata too.
 - `transaction_log_schema` is global-only and constructed first during plugin-cache rebuild so later plugins can resolve `schema_ref`.
-- Non-shipping plugins such as `prometheus_metrics`, `api_chargeback`, and `transaction_debugger` reject `schema:` and `schema_ref:`.
+- `prometheus_metrics` still rejects `schema:` / `schema_ref:` — its label names are baked into the time-series store.
+- `SchemaCapabilities.family` (`RecordFamily`) selects the field inventory. Non-summary families: `api_chargeback` (the `/charges` per-proxy billing row), `api_chargeback_sink` (the exported `ChargeEvent`), `transaction_debugger` (its own HTTP/stream/WS diagnostic names). A family rejects, with a plugin- and field-specific diagnostic, whatever it cannot express: `summary_type`, `timestamp_format`, and `metadata` for the two chargeback families, `order` for the chargeback report (sorted `serde_json::Map` document), `backend_host` for charge events, and every derived kind but `summary_kind` for the billing row.
+- Projection applies only at the externally emitted representation. It must never reach billing identity, charge accounting, registry/accumulator/snapshot keys, Prometheus labels, or spool ownership.
+- `api_chargeback`'s projection governs the one process-global render cache, so `validate_composition` requires every enabled instance to agree on `schema` / `schema_ref` exactly like the other shared tunables.
+- `api_chargeback_sink` projects at `write_json_each_row`, the single funnel for the ClickHouse INSERT body and the durable spool artifact. `charge_body_byte_bound` must keep adding the precomputed per-row projection surcharge so the retained-byte reservation still precedes serialization.
 - Field-registry drift is covered by `tests/integration/log_schema_registry_tests.rs`.
 
 ## Centralized Rate Limiting
 
-- `rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting` support `sync_mode: "redis"`.
+- `rate_limiting`, `graphql`, `grpc_method_router`, `ai_rate_limiter`,
+  `ws_rate_limiting`, and `udp_rate_limiting` support `sync_mode: "redis"`.
 - Shared Redis client lives in `src/plugins/utils/redis_rate_limiter.rs`.
 - Algorithm is two-window weighted with pipelined `INCR`/`GET`/`EXPIRE`; no Lua.
-- Key format is `{prefix}:{rate_key}:{window_index}`. Default prefix is
+- Key format is `{escaped-prefix:escaped-rate-key}:{window_index}` — the braces
+  are a Redis Cluster hash tag so every key of one atomic operation shares a
+  slot; `%`, braces, and `:` are percent-escaped inside it. Default prefix is
   `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` — the config-id component
   isolates independent policies of one plugin type inside a namespace while
   replicas of the same policy keep sharing a budget. An explicit
@@ -159,10 +204,38 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
   TTL/retention math uses the saturating helpers in
   `src/plugins/utils/rate_limit.rs`. Local sliding windows retain a fixed
   `SLIDING_WINDOW_BUCKET_COUNT` (64) aggregate buckets per key — never one
-  timestamp per request. Ordinary HTTP, GraphQL, gRPC method, and UDP
-  rate-limit plugin roots are closed key sets; the AI rate-limit root remains
-  intentionally open and must stay in parity with OpenAPI.
-- Redis outage falls back to in-memory and reconnects in the background.
+  timestamp per request. All six Redis-backed rate-limit plugin roots
+  (`rate_limiting`, `graphql`, `grpc_method_router`, `ai_rate_limiter`,
+  `ws_rate_limiting`, `udp_rate_limiting`) are closed key sets enforced by
+  `reject_unknown_keys` against the plugin's `*_CONFIG_KEYS` allowlist, and each
+  must stay in exact parity with an `additionalProperties: false` OpenAPI
+  schema. A new root key therefore lands in the runtime allowlist,
+  `openapi.yaml`, and `docs/plugins.md` together — none of these roots accepts
+  an undeclared property. Parity is enforced by
+  `rate_limiter_configs_are_closed_and_bounded_in_openapi` and
+  `graphql_config_schema_matches_runtime_validation` in
+  `tests/unit/openapi_yaml_tests.rs`.
+- Redis outage behavior is `redis_failure_policy` (`fail_closed` default,
+  `local_fallback` opt-in); only the opt-in falls back to in-memory. The client
+  reconnects in the background either way. `request_deduplication` expresses the
+  same choice as `on_redis_unavailable` and does NOT accept
+  `redis_failure_policy`; `ai_semantic_cache` has neither.
+- Redis Cluster is NOT supported and is screened, not assumed: `INFO CLUSTER`
+  at connect plus `MOVED`/`ASK`/`CROSSSLOT`/`CLUSTERDOWN`/`TRYAGAIN` reactively.
+  The proactive probe is bounded by `redis_connect_timeout_seconds` (no new
+  key); an unanswered probe is a retryable outage, never proof of Cluster, and
+  its unscreened connection must not carry a policy command.
+  Rejection is terminal for the client — recovery pings must never clear it, and
+  no connection publication, command success, or recovery that completes after
+  the rejection may restore availability (one `EnforcementAvailability` atomic;
+  `publish_reachable` cannot beat `reject_topology`).
+- `ai_rate_limiter` admission only reserves an estimate, so the authoritative
+  post-response reconciliation is also fail-closed: an `enforcement_unavailable`
+  charge on a 2xx returns the same generic 503 as admission. A non-2xx response
+  keeps its status (a failed charge/release there only over-counts).
+- Local and explicit Redis-fallback maps reserve hard cardinality atomically:
+  existing keys retain their active budgets at capacity, while previously unseen
+  keys fail closed until idle-state pruning frees a slot.
 - `redis_username` and `redis_password` plugin fields are honored on plain and TLS code paths and override URL user-info.
 - `rediss://` uses global `FERRUM_TLS_*`.
 

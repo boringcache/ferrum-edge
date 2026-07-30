@@ -523,7 +523,7 @@ async fn h3_grpc_web_reject_commits_final_wire_shape_once_before_log() {
         HttpFlavor::Grpc,
         Some("application/grpc-web-text+proto"),
         StatusCode::FORBIDDEN,
-        br#"{"error":"blocked"}"#,
+        bytes::Bytes::from_static(br#"{"error":"blocked"}"#),
         &reject_headers,
     )
     .await;
@@ -616,7 +616,7 @@ async fn h3_reject_committed_timeout_selects_status_four_and_runs_remaining_hook
                 HttpFlavor::Grpc,
                 grpc_web_content_type,
                 StatusCode::FORBIDDEN,
-                br#"{"error":"blocked"}"#,
+                bytes::Bytes::from_static(br#"{"error":"blocked"}"#),
                 &headers,
             ),
         )
@@ -712,6 +712,14 @@ fn h3_grpc_web_accept_rejection_keeps_http_406_contract() {
     assert!(
         log.contains("reject_headers_mark_accept_not_acceptable("),
         "H3 reject logging must keep Accept negotiation failures as HTTP 406"
+    );
+    assert!(
+        !log.contains("Bytes::copy_from_slice(http_body)"),
+        "H3 reject logging must not full-copy an authorized terminate body merely for metadata"
+    );
+    assert!(
+        log.contains("intact_framed_unary_terminate_signal("),
+        "H3 reject logging must share the borrowed framed-unary predicate with the normalizer"
     );
 }
 

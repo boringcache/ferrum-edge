@@ -1628,6 +1628,7 @@ impl crate::pool::ShareablePoolCreateError for GrpcProxyError {
 
 /// gRPC status codes for gateway-generated errors.
 pub mod grpc_status {
+    pub const OK: u32 = 0;
     pub const UNKNOWN: u32 = 2;
     pub const INVALID_ARGUMENT: u32 = 3;
     pub const DEADLINE_EXCEEDED: u32 = 4;
@@ -1863,7 +1864,7 @@ pub fn grpc_request_body_too_large_backend_response(
     );
     crate::retry::BackendResponse {
         status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
-        body: crate::retry::ResponseBody::Buffered(Vec::new()),
+        body: crate::retry::ResponseBody::buffered(Vec::new()),
         headers,
         connection_error: false,
         backend_resolved_ip: resolved_ip,

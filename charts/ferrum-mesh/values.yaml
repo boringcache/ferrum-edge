@@ -15,6 +15,9 @@ controlPlane:
   grpcPort: 50051
   rbac:
     create: true
+    # Grants get/list/watch (+ status patch) for GatewayClass/Gateway/HTTPRoute/
+    # GRPCRoute/TCPRoute/TLSRoute/ReferenceGrant. TCPRoute live data-plane
+    # conformance is gated by scripts/gateway_api_tcproute_conformance.sh.
     gatewayApi: true
     istio: true
     meshConfig: true
@@ -36,7 +39,10 @@ controlPlane:
     # turn them off with a one-line env override without editing the
     # chart values. Same applies to FERRUM_K8S_WATCH_NAMESPACES: when
     # unset, the controller follows the T2-A CP namespace scope
-    # (FERRUM_CP_NAMESPACES). The chart renders
+    # (FERRUM_CP_NAMESPACES). Multi-namespace scope (`*` or a CSV set)
+    # additionally requires FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH — the
+    # fleet-wide cpDpGrpcJwtSecret alone is rejected (advisory
+    # GHSA-3f2j-wwqw-grmg). The chart renders
     # FERRUM_K8S_CONTROLLER_NAMESPACE to the Helm release namespace unless
     # explicitly overridden here, so managed workload namespace settings do
     # not affect trusted NodeWaypoint discovery.
@@ -106,6 +112,12 @@ controlPlane:
       initialDelaySeconds: 5
       periodSeconds: 10
       override: {}
+  # Operator-supplied mounts (TLS material, CP/DP trust bundle, etc.).
+  # Multi-namespace CP (FERRUM_CP_NAMESPACES=* or a CSV set) requires a real
+  # file at FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH — declaring the path alone is
+  # not enough (advisory GHSA-3f2j-wwqw-grmg).
+  extraVolumes: []
+  extraVolumeMounts: []
 
 injector:
   # Disabled by default: the webhook requires a serving-cert Secret and should
@@ -330,6 +342,39 @@ nodeAgent:
   # than silently dropping all inbound to enrolled pods. Leave empty only for
   # non-NodeWaypoint proxy modes.
   trustedKubeletProbeSourceIps: ""
+  # Node capture interfaces that carry the NodeWaypoint inbound tc INGRESS
+  # redirect (ferrum_tc_ingress_redirect, issue #3287). Comma-separated, e.g.
+  # "eth0" — typically the node uplink, since off-node traffic to a pod is only
+  # visible on a tc ingress hook before routing forwards it.
+  #
+  # Empty (the default) disables the redirect entirely: the capture config
+  # publishes a zero redirect mark, the kernel program returns every packet
+  # untouched, and inbound behavior is exactly as before. Set it to give
+  # enrolled workloads a fully eBPF-owned inbound capture path instead of
+  # node-global iptables REDIRECT semantics.
+  #
+  # NodeWaypoint proxy mode only (a startup error in local_pod mode), and it
+  # requires ambient.enabled=true with ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint:
+  # the redirect fails closed, so without a capture listener on the node it would
+  # drop in-scope inbound traffic. The chart renders this value into BOTH the
+  # node-agent and the ambient DaemonSet, because the mesh proxy reads the same
+  # variable to decide whether to emit its TRANSPARENT INBOUND CAPTURE listener.
+  #
+  # That capture listener binds FERRUM_MESH_INBOUND_LISTEN_ADDR (default
+  # 0.0.0.0:15006) with IP_TRANSPARENT, and is deliberately NOT the HBONE
+  # listener: HBONE terminates authenticated HTTP/2 CONNECT over mesh mTLS,
+  # while captured traffic is ordinary application bytes. Captured plaintext is
+  # admitted only where the live PeerAuthentication posture for the recovered
+  # app port allows it — STRICT still requires verified mesh transport. If you
+  # override ambient.env.FERRUM_MESH_INBOUND_LISTEN_ADDR the chart renders the
+  # same value into the node-agent so the two agree; the address must be a
+  # wildcard with a non-zero port or the node-agent refuses to start.
+  #
+  # Requires iproute2 (`ip`) in the node-agent image and NET_ADMIN, which the
+  # existing tc attachments already need — this adds no new privilege.
+  # Redirection is scoped per packet to an enrolled, opted-in pod address on one
+  # of its declared containerPorts, so unenrolled traffic is never captured.
+  ingressRedirectIfaces: ""
   # Shared host-path directory for the per-pod (uid -> cgroup) registry the
   # node-agent publishes. Consumed by (a) the ambient NodeWaypoint proxy to open
   # per-pod in-netns TCP capture listeners (proxyMode=node_waypoint), and (b) the

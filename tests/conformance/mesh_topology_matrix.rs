@@ -118,7 +118,7 @@ fn topology_node_waypoint() {
         feature = "NodeWaypoint topology",
         status = Status::Supported,
         maturity = Maturity::Experimental,
-        notes = "One HBONE listener serves multiple node-local pods; per-pod policy scoping. Experimental: IPv4 and IPv6 capture are live-gated by the node-waypoint-ebpf-live workflow; secured node-to-node transport and inbound enforcement remain H2 residuals.",
+        notes = "One HBONE listener serves multiple node-local pods; per-pod policy scoping. Experimental: IPv4/IPv6 capture, secured HBONE transport, SPIRE identity, and representative ADR observability counter movement are live-gated; Experimental→Beta/Beta→GA gates live in docs/plans/node_waypoint_transport_adr.md.",
     );
     assert_topology_apply_succeeds(MeshTopology::NodeWaypoint);
 }
@@ -140,7 +140,9 @@ fn topology_east_west_gateway() {
         category = CATEGORY,
         feature = "EastWestGateway topology",
         status = Status::Supported,
-        notes = "SNI-passthrough TCP proxies on 15443 from multi-cluster RemoteCluster entries.",
+        maturity = Maturity::Ga,
+        notes = "SNI-passthrough TCP proxies on 15443 from multi-cluster RemoteCluster entries. \
+                 Live-gated by multicluster.eastwest.* in multicluster-federation (issue #2459).",
     );
     assert_topology_apply_succeeds(MeshTopology::EastWestGateway);
 }

@@ -151,6 +151,7 @@ jobs:
             kind: integration
             filters: |
               integration::k8s_controller_istio_status_tests
+              integration::k8s_controller_status_snapshot_tests
               integration::mesh_telemetry_k8s_provider_lookup_tests
               integration::mesh_telemetry_tracing_tests
               integration::mesh_federation_poller_tests
@@ -172,6 +173,7 @@ jobs:
               integration::grpc_proxy_tests
               integration::scripted_backend_smoke_tests
               integration::dtls_integration_tests
+              integration::udp_fault_injection_tests
               integration::backend_mtls_tests
               integration::backend_tls_san_allow_list_tests
               integration::frontend_tls_live_reload_tests
