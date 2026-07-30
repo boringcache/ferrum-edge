@@ -48,6 +48,8 @@ strings:
 | `010`, `1:30` | string | Legacy octal and sexagesimal YAML 1.1 forms are not coerced |
 | `yes`, `no`, `on`, `off` | string | Legacy YAML 1.1 boolean aliases are not coerced |
 | `true`, `false` | boolean | YAML 1.2 boolean spellings are coerced |
+| `200:` as a mapping key | `"200"` key | Number and boolean mapping keys take their JSON object-key spelling, so unquoted status codes are accepted |
+| `18446744073709551616`, `1e400`, `.inf`, `.nan` | rejected (400) | Values outside the exact JSON `i64`/`u64` range, and non-finite numbers, are not silently rounded or restyled |
 
 **Recommendation**: quote strings that look like numbers or boolean words in YAML specs to preserve them as strings:
 
@@ -245,7 +247,7 @@ The following are rejected at parse time with a 400 error:
 
 **Body size limit**: controlled by `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25). Returns 413 when exceeded.
 
-**YAML alias expansion**: YAML anchors and aliases are composed through a libyaml event graph and expanded deterministically under shared budgets (expanded nodes, nesting depth, alias references, a 32 MiB fail-closed upper bound on the compact JSON representation including string/key escaping, and expansion work) with cycle, undefined-alias, duplicate-anchor, and duplicate-mapping-key detection. Expansion fails closed with field-specific diagnostics and never admits exponential alias bombs. JSON and YAML submissions share the same post-parse expanded-node cap so autodetection cannot weaken admission. Keep extremely large generated specs in JSON when you need the simplest wire form; modular YAML with finite alias reuse is supported.
+**YAML alias expansion**: YAML anchors and aliases are composed through a libyaml event graph and expanded deterministically under shared budgets (expanded nodes, nesting depth, alias references, a 32 MiB fail-closed upper bound on the compact JSON representation including string/key escaping, and expansion work) with cycle, undefined-alias, duplicate-anchor, and duplicate-mapping-key detection. Expansion fails closed with field-specific diagnostics and never admits exponential alias bombs. JSON and YAML submissions share the same post-parse expanded-node cap so autodetection cannot weaken admission. Keep extremely large generated specs in JSON when you need the simplest wire form; modular YAML with finite alias reuse is supported. Expansion also fails closed on a non-core or local YAML tag, a non-finite number, an integer outside the exact JSON `i64`/`u64` range, and a mapping key that has no JSON object-key spelling (null, sequence, or mapping); scalar number and boolean keys keep their stringified spelling so unquoted status codes stay valid.
 
 **MongoDB caveat**: the BSON document limit is 16 MiB. Since spec content is gzip-compressed before storage, a spec up to approximately 14–15 MiB compressed fits within the limit. Operators with larger specs should use a SQL backend (PostgreSQL, MySQL, or SQLite).
 

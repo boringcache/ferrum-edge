@@ -408,6 +408,73 @@ fn escaped_mapping_key_cannot_bypass_byte_budget() {
 }
 
 #[test]
+fn unquoted_numeric_response_code_keys_stringify_like_serde_json() {
+    // OpenAPI YAML routinely leaves status codes unquoted. The pre-bounded-YAML
+    // path stringified scalar mapping keys through `serde_json::to_value`, and
+    // specs admitted that way are already stored (backup restore re-parses
+    // them), so `200:` must still resolve to the `"200"` JSON object key rather
+    // than being rejected as a non-string key.
+    let yaml = format!(
+        concat!(
+            "openapi: '3.1.0'\n",
+            "info:\n",
+            "  title: Numeric Keys\n",
+            "  version: '1.0.0'\n",
+            "x-ferrum-validate: true\n",
+            "paths:\n",
+            "  /orders:\n",
+            "    get:\n",
+            "      responses:\n",
+            "        200:\n",
+            "          description: ok\n",
+            "          content:\n",
+            "            application/json:\n",
+            "              schema:\n",
+            "                type: object\n",
+            "                required: [id]\n",
+            "{}",
+        ),
+        proxy_yaml("numeric-key-proxy")
+    );
+    let (bundle, _) = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap();
+    let validator = bundle
+        .plugins
+        .iter()
+        .find(|plugin| plugin.config["operations"].is_array())
+        .expect("x-ferrum-validate must generate a contract-validation plugin");
+    assert_eq!(
+        validator.config["operations"][0]["responses"]["200"]["application/json"]["required"],
+        json!(["id"]),
+        "an unquoted YAML status code must become the \"200\" JSON object key"
+    );
+}
+
+#[test]
+fn null_and_collection_mapping_keys_still_fail_closed() {
+    let yaml = format!(
+        concat!(
+            "openapi: '3.1.0'\n",
+            "info:\n",
+            "  title: Bad Key\n",
+            "  version: '1.0.0'\n",
+            "? [one, two]\n",
+            ": rejected\n",
+            "{}",
+        ),
+        proxy_yaml("collection-key-proxy")
+    );
+    let err = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ExtractError::InvalidYaml(msg)
+                if msg.contains("representable as JSON object keys")
+        ),
+        "a collection mapping key has no JSON object-key spelling, got {err:?}"
+    );
+}
+
+#[test]
 fn json_and_yaml_literal_parity_without_aliases() {
     let json = json!({
         "openapi": "3.1.0",

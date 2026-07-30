@@ -7,6 +7,7 @@
 //! alias sites, so exponential alias bombs fail closed before allocation grows
 //! unboundedly.
 
+use serde_json::map::Entry;
 use serde_json::{Map, Number, Value};
 use std::collections::{HashMap, HashSet};
 use std::mem::MaybeUninit;
@@ -44,7 +45,7 @@ pub(crate) enum BoundedYamlError {
     AliasReferenceLimitExceeded,
     ExpandedByteLimitExceeded,
     WorkLimitExceeded,
-    NonStringMappingKey,
+    UnrepresentableMappingKey,
     DuplicateMappingKey,
     UnsupportedTag { tag: String },
     EmptyDocument,
@@ -74,8 +75,8 @@ impl BoundedYamlError {
                 "YAML document exceeds expansion work limit; reduce alias reuse or nesting"
                     .to_string()
             }
-            Self::NonStringMappingKey => {
-                "YAML mapping keys must be strings for JSON conversion".to_string()
+            Self::UnrepresentableMappingKey => {
+                "YAML mapping keys must be scalars representable as JSON object keys".to_string()
             }
             Self::DuplicateMappingKey => "YAML mapping contains a duplicate key".to_string(),
             // Tags are supplied by the caller. Keep diagnostics actionable
@@ -549,10 +550,7 @@ fn expand_node_inner(
             let mut saw_merge_spelling = false;
             for (key_id, value_id) in pairs {
                 let key_value = expand_node(document, *key_id, budgets, expanding)?;
-                let key = match key_value {
-                    Value::String(s) => s,
-                    _ => return Err(BoundedYamlError::NonStringMappingKey),
-                };
+                let key = json_object_key(key_value, budgets)?;
                 if (key == "<<" && saw_merge_spelling) || (key != "<<" && map.contains_key(&key)) {
                     return Err(BoundedYamlError::DuplicateMappingKey);
                 }
@@ -576,11 +574,47 @@ fn expand_node_inner(
                     ));
                 };
                 for (k, v) in merge_map {
-                    map.entry(k).or_insert(v);
+                    // Charge the `:` / `,` framing only for a merged pair that
+                    // actually lands in the output, so the byte budget stays a
+                    // true upper bound on the compact JSON encoding.
+                    if let Entry::Vacant(slot) = map.entry(k) {
+                        budgets.charge_bytes(2)?;
+                        slot.insert(v);
+                    }
                 }
             }
             budgets.leave_depth();
             Ok(Value::Object(map))
+        }
+    }
+}
+
+/// Render an expanded YAML mapping key as its JSON object-key text.
+///
+/// The pre-`bounded_yaml` ingestion path converted `serde_yaml::Value` through
+/// `serde_json::to_value`, whose map-key serializer stringifies scalar numbers
+/// and booleans. OpenAPI YAML routinely leaves those keys unquoted
+/// (`responses:` / `200:` / `description: ok`), and specs admitted that way are
+/// already stored, so backup restore re-parses them through this module —
+/// rejecting them here would both break a common idiom and strand existing
+/// rows. Null and collection keys stay rejected exactly as `to_value` rejected
+/// them.
+fn json_object_key(value: Value, budgets: &mut Budgets) -> Result<String, BoundedYamlError> {
+    // A number/bool scalar was charged as its bare JSON text when it expanded;
+    // as a key it also pays the two surrounding quotes. Neither spelling can
+    // contain a character that JSON string escaping would widen.
+    match value {
+        Value::String(text) => Ok(text),
+        Value::Number(number) => {
+            budgets.charge_bytes(2)?;
+            Ok(number.to_string())
+        }
+        Value::Bool(flag) => {
+            budgets.charge_bytes(2)?;
+            Ok(if flag { "true" } else { "false" }.to_string())
+        }
+        Value::Null | Value::Array(_) | Value::Object(_) => {
+            Err(BoundedYamlError::UnrepresentableMappingKey)
         }
     }
 }
