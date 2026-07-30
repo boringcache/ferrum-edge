@@ -68,6 +68,16 @@ const MCP_INVALID_TOOL_RESULT: i64 = -32012;
 const MAX_OUTPUT_SCHEMA_DEPTH: usize = 32;
 /// Maximum JSON nodes admitted while auditing a discovered tool `outputSchema`.
 const MAX_OUTPUT_SCHEMA_NODES: usize = 20_000;
+/// Maximum recursion depth admitted for the *schema* walk that resolves local
+/// `$ref` / `$dynamicRef` targets.
+///
+/// [`MAX_OUTPUT_SCHEMA_DEPTH`] bounds only the raw JSON nesting of the schema
+/// document. A chain of sibling `$defs` that each reference the next is flat in
+/// the document — it costs two nodes and three levels per link — so the nesting
+/// budget alone admits a chain thousands of links long, and following it would
+/// recurse one worker-stack frame per link during catalog construction on the
+/// request path. This budget is what actually bounds that walk.
+const MAX_OUTPUT_SCHEMA_REF_DEPTH: usize = 64;
 const MAX_UPSTREAM_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MCP_STREAMABLE_HTTP_ACCEPT: &str = "application/json, text/event-stream";
 const MCP_TEMPLATE_RESOURCE_URI_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
@@ -5602,7 +5612,8 @@ fn validate_json_schema(validator: &jsonschema::Validator, instance: &Value) -> 
 /// Audit and compile a discovered tool `outputSchema` at catalog construction.
 ///
 /// External `$ref` / `$dynamicRef` targets are refused (the `jsonschema` crate
-/// is built without retrievers). Depth and node budgets bound compile work.
+/// is built without retrievers). Document depth, document node count, and local
+/// reference-resolution depth budgets bound both the audit and compile work.
 fn compile_tool_output_schema(schema: &Value) -> Result<Arc<jsonschema::Validator>, String> {
     if !schema.is_object() && !schema.is_boolean() {
         return Err("outputSchema must be a JSON Schema object or boolean".to_string());
@@ -5619,7 +5630,7 @@ fn audit_output_schema(schema: &Value) -> Result<(), String> {
     let mut nodes = 0usize;
     audit_output_schema_structure(schema, 0, &mut nodes)?;
     let mut visited = HashSet::new();
-    audit_output_schema_node(schema, schema, &mut visited)
+    audit_output_schema_node(schema, schema, 0, &mut visited)
 }
 
 fn audit_output_schema_structure(
@@ -5657,8 +5668,14 @@ fn audit_output_schema_structure(
 fn audit_output_schema_node(
     node: &Value,
     document: &Value,
+    depth: usize,
     visited: &mut HashSet<usize>,
 ) -> Result<(), String> {
+    if depth > MAX_OUTPUT_SCHEMA_REF_DEPTH {
+        return Err(format!(
+            "outputSchema exceeds the {MAX_OUTPUT_SCHEMA_REF_DEPTH}-level schema-walk budget"
+        ));
+    }
     let identity = std::ptr::from_ref(node) as usize;
     if !visited.insert(identity) {
         return Ok(());
@@ -5677,7 +5694,7 @@ fn audit_output_schema_node(
                 ));
             }
             if let Some(target) = local_output_schema_pointer_target(document, reference, key)? {
-                audit_output_schema_node(target, document, visited)?;
+                audit_output_schema_node(target, document, depth + 1, visited)?;
             }
         }
     }
@@ -5701,17 +5718,17 @@ fn audit_output_schema_node(
             "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas" => {
                 if let Some(object) = value.as_object() {
                     for child in object.values() {
-                        audit_output_schema_node(child, document, visited)?;
+                        audit_output_schema_node(child, document, depth + 1, visited)?;
                     }
                 }
             }
             "items" => match value {
                 Value::Array(items) => {
                     for child in items {
-                        audit_output_schema_node(child, document, visited)?;
+                        audit_output_schema_node(child, document, depth + 1, visited)?;
                     }
                 }
-                other => audit_output_schema_node(other, document, visited)?,
+                other => audit_output_schema_node(other, document, depth + 1, visited)?,
             },
             "additionalProperties"
             | "unevaluatedProperties"
@@ -5723,12 +5740,12 @@ fn audit_output_schema_node(
             | "then"
             | "else"
             | "contentSchema" => {
-                audit_output_schema_node(value, document, visited)?;
+                audit_output_schema_node(value, document, depth + 1, visited)?;
             }
             "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
                 if let Some(items) = value.as_array() {
                     for child in items {
-                        audit_output_schema_node(child, document, visited)?;
+                        audit_output_schema_node(child, document, depth + 1, visited)?;
                     }
                 }
             }

@@ -8517,6 +8517,26 @@ fn node_budget_output_schema(property_count: usize) -> Value {
     })
 }
 
+/// A schema whose `$defs` form a chain of local `$ref`s, each pointing at the
+/// next. The document stays flat — three levels and two nodes per link — so it
+/// sits far inside the nesting and node budgets, and only the schema-walk depth
+/// budget can refuse it. Without that budget the audit recurses one stack frame
+/// per link while building the catalog on the request path.
+fn ref_chain_output_schema(links: usize) -> Value {
+    let mut defs = serde_json::Map::new();
+    for index in 0..links {
+        defs.insert(
+            format!("d{index}"),
+            json!({ "$ref": format!("#/$defs/d{}", index + 1) }),
+        );
+    }
+    defs.insert(format!("d{links}"), json!({ "type": "object" }));
+    json!({
+        "$ref": "#/$defs/d0",
+        "$defs": Value::Object(defs)
+    })
+}
+
 fn recursive_local_ref_output_schema() -> Value {
     json!({
         "$defs": {
@@ -8618,6 +8638,10 @@ async fn validate_tool_results_skips_tools_for_output_schema_security_boundaries
         (
             "schema wider than node budget",
             node_budget_output_schema(10_100),
+        ),
+        (
+            "local $ref chain longer than the schema-walk budget",
+            ref_chain_output_schema(512),
         ),
     ];
 
