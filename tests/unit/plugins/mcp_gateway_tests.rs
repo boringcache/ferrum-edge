@@ -1560,6 +1560,32 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
         }
     }))
     .unwrap();
+    let ambiguous_response = br#"{"jsonrpc":"2.0","id":10,"result":{"contents":[{"uri":"file:///project/README.md","text":"read me"}]},"result":{"contents":[]}}"#;
+    let ambiguous_headers = known_json_response_headers(ambiguous_response);
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                ambiguous_response,
+                Some("application/json"),
+                &ambiguous_headers,
+            )
+            .await
+            .is_none()
+    );
+    let (status, rejected, _) = reject_json(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &ambiguous_headers, ambiguous_response)
+            .await,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(rejected["error"]["code"], -32603);
+    assert_eq!(
+        rejected["error"]["message"],
+        "Invalid upstream MCP response"
+    );
+    assert!(!rejected.to_string().contains("file:///project/README.md"));
+
     let mut response_headers = HashMap::from([
         ("content-type".to_string(), "application/json".to_string()),
         (
