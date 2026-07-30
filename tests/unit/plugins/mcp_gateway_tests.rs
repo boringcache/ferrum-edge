@@ -3949,7 +3949,7 @@ async fn aggregate_tools_family_outage_keeps_prompts_healthy_and_recovers_on_ttl
 }
 
 #[tokio::test]
-async fn aggregate_total_catalog_outage_is_cached_until_ttl() {
+async fn aggregate_total_catalog_outage_is_negative_cached() {
     let server = MockServer::start().await;
     let tool_requests = Arc::new(AtomicUsize::new(0));
     let tool_counter = Arc::clone(&tool_requests);
@@ -3962,20 +3962,24 @@ async fn aggregate_total_catalog_outage_is_cached_until_ttl() {
         })
         .mount(&server)
         .await;
-    let config = single_server_family_config(&format!("{}/mcp", server.uri()), true, false, false);
+    let mut config =
+        single_server_family_config(&format!("{}/mcp", server.uri()), true, false, false);
+    // This test proves suppression inside the refresh window. Give the window
+    // ample scheduler headroom so a loaded hosted runner cannot accidentally
+    // turn an "immediate" second request into an expiry test; the neighboring
+    // recovery test owns the separate after-TTL behavior.
+    config["discovery"]["cache_ttl_seconds"] = json!(300);
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
 
     let (_, first, _) = tools_list_with_metadata(&plugin, &session_id, 106).await;
     assert_eq!(first["error"]["code"], -32006);
-    let (_, second, _) = tools_list_with_metadata(&plugin, &session_id, 107).await;
-    assert_eq!(second["error"]["code"], -32006);
+    for request_id in 107..=109 {
+        let (_, cached, _) =
+            tools_list_with_metadata(&plugin, &session_id, request_id).await;
+        assert_eq!(cached["error"]["code"], -32006);
+    }
     assert_eq!(tool_requests.load(Ordering::SeqCst), 1);
-
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    let (_, third, _) = tools_list_with_metadata(&plugin, &session_id, 108).await;
-    assert_eq!(third["error"]["code"], -32006);
-    assert_eq!(tool_requests.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
