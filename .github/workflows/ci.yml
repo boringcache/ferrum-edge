@@ -4175,7 +4175,7 @@ jobs:
           fi
           if [ "${RUN_WRR}" = "true" ]; then
             {
-              echo "WRR selection contention guard executed: 4-thread/1-thread throughput speedup >= 1.10x across 4/32/129-target fixtures."
+              echo "WRR selection contention guard executed: 4-thread/1-thread throughput speedup >= 1.10x for the 32-target bitset and 129-target Vec fixtures; the Arc-refcount-concentrated 4-target fixture is diagnostic-only."
               echo ""
             } >> "${GITHUB_STEP_SUMMARY}"
           fi

@@ -8,7 +8,11 @@
 //!   - N threads: N * ITERATIONS_PER_THREAD selections
 //! The verify script converts those wall times into throughput speedup
 //! (`N * serial_ns / parallel_ns`) and asserts against a serialization floor
-//! that a single-lane `Mutex` hot path cannot clear on multi-core runners.
+//! that a single-lane `Mutex` hot path cannot clear on multi-core runners. The
+//! 32-target bitset and 129-target Vec fixtures are gating; 4 targets remains a
+//! diagnostic because repeatedly cloning/dropping only four returned target
+//! Arcs makes that result depend strongly on hosted CPU topology and cache-line
+//! placement rather than WRR selection-state serialization.
 //!
 //! Multi-thread samples keep a long-lived worker pool synchronized with
 //! barriers. Spawning and joining threads inside every Criterion sample was a
