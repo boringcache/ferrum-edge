@@ -448,8 +448,8 @@ async fn reload_retirement_drain_times_out_then_settles_abandoned_once() {
     ));
 
     timeout(Duration::from_secs(2), request_started.notified())
-    .await
-    .expect("server must observe the live transport attempt before retirement");
+        .await
+        .expect("server must observe the live transport attempt before retirement");
 
     generation.cancel();
     assert!(!generation.is_admitting());
