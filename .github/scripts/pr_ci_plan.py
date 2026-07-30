@@ -579,6 +579,7 @@ HELM_PATTERNS = [
     for pattern in (
         r"^charts/",
         r"^\.github/workflows/ci\.yml$",
+        r"^\.github/scripts/extract_rendered_prometheus_rules\.py$",
         r"^\.github/scripts/validate_prometheus_metric_contract\.py$",
         r"^\.github/actions/",
         r"^docs/prometheus_metric_contract\.json$",
@@ -794,6 +795,11 @@ def self_test() -> int:
         (
             "pull_request",
             [".github/scripts/validate_prometheus_metric_contract.py"],
+            {"run_helm": True},
+        ),
+        (
+            "pull_request",
+            [".github/scripts/extract_rendered_prometheus_rules.py"],
             {"run_helm": True},
         ),
         (
