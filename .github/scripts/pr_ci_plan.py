@@ -544,6 +544,23 @@ FULL_CI_DOCUMENTATION_PATHS = frozenset(
     }
 )
 
+# Vendored-patch lifecycle governance inputs. The fail-closed parity gate that
+# reads them (`scripts/check_vendored_patch_lifecycle.py`, run by the
+# `dependency-audit` job) must keep its `mode == 'full'` guard — that is
+# asserted by .github/scripts/verify_required_ci.py's DIRECT_FULL_CI_JOBS — so a
+# governance-doc-only pull request would otherwise skip the only check that
+# guards these files. They schedule no expensive path-gated suite.
+FULL_CI_GOVERNANCE_PATHS = frozenset(
+    {
+        "docs/dependency-policy.md",
+        "docs/vendored-patch-lifecycle.json",
+    }
+)
+
+# Per-patch retirement plans. The same gate reads each README's path and its
+# dated deliberate-fork reaffirmation text.
+FULL_CI_GOVERNANCE_PREFIXES = ("docs/upstream-",)
+
 # Pull-request-only job gates. Keep these allow-lists narrow: a path must be
 # known to affect the expensive suite before the planner schedules it. An
 # unavailable/empty diff fails closed in select_job_gates() and schedules all
@@ -637,7 +654,12 @@ GATE_CONTROLLER_PATHS = frozenset(
 
 
 def is_lightweight_path(path: str) -> bool:
-    if path.startswith(FULL_CI_PREFIXES) or path in FULL_CI_DOCUMENTATION_PATHS:
+    if (
+        path.startswith(FULL_CI_PREFIXES)
+        or path.startswith(FULL_CI_GOVERNANCE_PREFIXES)
+        or path in FULL_CI_DOCUMENTATION_PATHS
+        or path in FULL_CI_GOVERNANCE_PATHS
+    ):
         return False
     return any(pattern.search(path) for pattern in LIGHTWEIGHT_PATTERNS)
 
@@ -711,6 +733,16 @@ def self_test() -> int:
             ["vendor/tungstenite-0.29.0-ferrum-patched/README.md"],
             "full",
         ),
+        ("pull_request", ["docs/vendored-patch-lifecycle.json"], "full"),
+        ("pull_request", ["docs/dependency-policy.md"], "full"),
+        (
+            "pull_request",
+            [
+                "docs/upstream-h3-patches/"
+                "002-extended-connect-websocket-protocol/README.md"
+            ],
+            "full",
+        ),
         ("pull_request", ["src/proxy/legacy.rs", "notes.md"], "full"),
         ("pull_request", ["src/proxy/mod.rs"], "full"),
         ("pull_request", ["docs/admin_api.md", "Cargo.lock"], "full"),
@@ -757,6 +789,12 @@ def self_test() -> int:
         (
             "pull_request",
             ["docs/admin_api.md"],
+            {name: False for name in JOB_GATE_NAMES},
+        ),
+        # Full CI, but none of the expensive path-gated suites.
+        (
+            "pull_request",
+            ["docs/vendored-patch-lifecycle.json", "docs/dependency-policy.md"],
             {name: False for name in JOB_GATE_NAMES},
         ),
         (
