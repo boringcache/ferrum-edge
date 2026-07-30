@@ -182,6 +182,24 @@ impl Waf {
         self.specials.encoding.is_some() || self.specials.overlong_utf8.is_some()
     }
 
+    fn has_enforcing_response_header_policy(&self) -> bool {
+        if self.config.mode != GlobalMode::Enforce
+            || !self.compiled.response_header_rules_active
+        {
+            return false;
+        }
+        if self.config.scoring.is_some() {
+            return true;
+        }
+        self.compiled.rules.iter().any(|rule| {
+            rule.action == RuleAction::Enforce
+                && matches!(
+                    &rule.target,
+                    self::rules::RuleTarget::ResponseHeaders
+                )
+        })
+    }
+
     fn has_enforcing_response_body_policy(&self) -> bool {
         if self.config.mode != GlobalMode::Enforce {
             return false;
@@ -1196,7 +1214,7 @@ impl Plugin for Waf {
     fn response_trailer_policy(&self) -> ResponseTrailerPolicy<'_> {
         if self.active
             && self.config.response_inspection
-            && self.compiled.response_header_rules_active
+            && self.has_enforcing_response_header_policy()
         {
             // Response-header rules can match any field name or value. Since
             // `after_proxy` cannot inspect native H3 trailers, fail closed by

@@ -1002,6 +1002,75 @@ fn inactive_response_header_inspection_does_not_govern_native_h3_trailers() {
     ));
 }
 
+#[test]
+fn monitor_only_response_header_rules_do_not_drop_native_h3_trailers() {
+    for config in [
+        json!({
+            "mode": "monitor",
+            "include_default_rules": false,
+            "response_inspection": true,
+            "custom_rules": [{
+                "id": "CUSTOM-RESP-HEADER-GLOBAL-MONITOR",
+                "name": "globally monitored response metadata",
+                "category": "custom",
+                "severity": "high",
+                "target": "response_headers",
+                "match_kind": "contains",
+                "pattern": "leak-secret",
+                "action": "enforce"
+            }]
+        }),
+        json!({
+            "mode": "enforce",
+            "include_default_rules": false,
+            "response_inspection": true,
+            "custom_rules": [{
+                "id": "CUSTOM-RESP-HEADER-RULE-MONITOR",
+                "name": "rule-monitored response metadata",
+                "category": "custom",
+                "severity": "high",
+                "target": "response_headers",
+                "match_kind": "contains",
+                "pattern": "leak-secret",
+                "action": "monitor"
+            }]
+        }),
+    ] {
+        let plugin = Waf::new(&config).unwrap();
+
+        assert!(matches!(
+            plugin.response_trailer_policy(),
+            ResponseTrailerPolicy::None
+        ));
+    }
+}
+
+#[test]
+fn response_header_anomaly_scoring_governs_native_h3_trailers() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "response_inspection": true,
+        "scoring": { "enabled": true, "block_threshold": 1 },
+        "custom_rules": [{
+            "id": "CUSTOM-RESP-HEADER-SCORED",
+            "name": "scored response metadata",
+            "category": "custom",
+            "severity": "high",
+            "target": "response_headers",
+            "match_kind": "contains",
+            "pattern": "leak-secret",
+            "action": "monitor"
+        }]
+    }))
+    .unwrap();
+
+    assert!(matches!(
+        plugin.response_trailer_policy(),
+        ResponseTrailerPolicy::Unbounded
+    ));
+}
+
 #[tokio::test]
 async fn response_header_rules_do_not_request_grpc_web_trailer_policy_when_exempt() {
     let plugin = Waf::new(&json!({

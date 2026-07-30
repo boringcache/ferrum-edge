@@ -3998,6 +3998,11 @@ and `global_exemptions.consumers` available to request metadata rules.
 Request-body inspection runs on the final backend-visible body after request
 body transforms. It buffers only matching methods/content types. Response
 inspection is opt-in and can scan response headers and final response bodies.
+On native HTTP/3, a configuration that can enforce response-header policy drops
+the backend trailer section because those fields arrive after inspection and
+cannot be proven safe. Global monitor mode and monitor-action-only response
+header rules preserve trailers. Anomaly scoring counts as enforcing when it can
+block.
 WAF scans raw query pairs even after the proxy has materialized the parsed
 query map, so duplicate keys remain visible before the parsed `HashMap` can
 collapse them; synthetic contexts without a raw query string fall back to
