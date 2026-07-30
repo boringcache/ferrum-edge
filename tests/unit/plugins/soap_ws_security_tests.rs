@@ -529,6 +529,25 @@ fn test_x509_malformed_pem_error_withholds_configured_source() {
     );
 }
 
+#[test]
+fn test_x509_end_marker_before_begin_fails_without_panicking() {
+    let source = "-----END CERTIFICATE-----\n\
+                  -----BEGIN CERTIFICATE-----\n\
+                  U09BUA==\n";
+    let config = json!({
+        "timestamp": { "require": false },
+        "x509_signature": {
+            "enabled": true,
+            "trusted_certs": [source]
+        }
+    });
+
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("misordered PEM markers must fail admission");
+    assert!(err.contains("failed to decode PEM"), "got: {err}");
+}
+
 /// The SAML `trusted_signing_certs` loop carries the same rule.
 #[test]
 fn test_saml_malformed_pem_error_withholds_configured_source() {
@@ -2736,11 +2755,23 @@ fn decode_rejects_unbalanced_charset_quotes() {
     for content_type in [
         "text/xml; charset=\"utf-8",
         "text/xml; charset=utf-8\"",
-        "text/xml; charset='utf-8",
     ] {
         let err = soap_decode_xml_body_for_test(xml.as_bytes(), content_type)
             .expect_err("unbalanced charset quotes must fail closed");
         assert!(err.contains("conflicting or ambiguous"), "got: {err}");
+    }
+}
+
+#[test]
+fn decode_does_not_treat_single_quotes_as_parameter_delimiters() {
+    let xml = wrap_soap(&fresh_timestamp());
+    for content_type in [
+        "text/xml; charset='utf-8'",
+        "text/xml; charset='utf-8",
+    ] {
+        let err = soap_decode_xml_body_for_test(xml.as_bytes(), content_type)
+            .expect_err("a single quote is part of a token, not MIME quoted-string syntax");
+        assert!(err.contains("unsupported character encoding"), "got: {err}");
     }
 }
 
@@ -6979,6 +7010,33 @@ mod advisory_regressions {
         assert_eq!(
             classify(&strict_username_token_config(), Some(content_type)),
             Ok("reject:400:malformed_multipart".to_string())
+        );
+    }
+
+    #[test]
+    fn multipart_parameters_follow_http_quoted_string_rules() {
+        use ferrum_edge::_test_support::soap_classify_request_for_test as classify;
+        let config = strict_username_token_config();
+
+        assert_eq!(
+            classify(
+                &config,
+                Some(
+                    "multipart/related; type='application/xop+xml'; boundary=MIME_boundary"
+                )
+            ),
+            Ok("reject:415:unsupported_media_type".to_string()),
+            "single quotes are token bytes and must not turn a non-matching type into XOP"
+        );
+        assert_eq!(
+            classify(
+                &config,
+                Some(
+                    "multipart/related; type=\"application/xop+xml\"; boundary=MIME boundary"
+                )
+            ),
+            Ok("reject:400:malformed_media_type".to_string()),
+            "a boundary containing spaces must use a double-quoted parameter"
         );
     }
 

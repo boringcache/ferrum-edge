@@ -4933,7 +4933,13 @@ pub fn validate_composition(
                     AuthMode::Multi => "multi",
                 };
                 errors.push(format!(
-                    "soap_ws_security must be the sole authentication mechanism on proxy '{}'                      while auth_mode is '{}': both authentication modes stop after the first                      mechanism establishes an identity, single-auth also makes the first rejection                      terminal, and multi-auth can let a later success override an earlier rejection,                      so one or more WS-Security message gates would be skipped or ignored.                      soap_ws_security: {}; other auth plugins: {}. Disable the other mechanisms                      on this proxy",
+                    "soap_ws_security must be the sole authentication mechanism on proxy '{}' \
+                     while auth_mode is '{}': both authentication modes stop after the first \
+                     mechanism establishes an identity, single-auth also makes the first rejection \
+                     terminal, and multi-auth can let a later success override an earlier rejection, \
+                     so one or more WS-Security message gates would be skipped or ignored. \
+                     soap_ws_security: {}; other auth plugins: {}. Disable the other mechanisms \
+                     on this proxy",
                     proxy.id,
                     auth_mode,
                     identity_soap
@@ -4953,7 +4959,12 @@ pub fn validate_composition(
             .collect();
         if !identity_soap.is_empty() && !decompressors.is_empty() {
             errors.push(format!(
-                "soap_ws_security cannot be composed with compression 'decompress_request' on                  proxy '{}': SOAP identity is established in the authenticate phase, which runs                  before request-body decompression, so the gateway would validate the encoded                  bytes rather than the plaintext the backend parses. soap_ws_security: {};                  compression: {}. Decompress upstream of the gateway, or disable                  decompress_request on this proxy",
+                "soap_ws_security cannot be composed with compression 'decompress_request' on \
+                 proxy '{}': SOAP identity is established in the authenticate phase, which runs \
+                 before request-body decompression, so the gateway would validate the encoded \
+                 bytes rather than the plaintext the backend parses. soap_ws_security: {}; \
+                 compression: {}. Decompress upstream of the gateway, or disable \
+                 decompress_request on this proxy",
                 proxy.id,
                 identity_soap
                     .iter()
@@ -6350,7 +6361,10 @@ fn extract_pem_der(pem: &str) -> Option<Vec<u8>> {
     let end_marker = "-----END CERTIFICATE-----";
 
     let start = pem.find(start_marker)? + start_marker.len();
-    let end = pem.find(end_marker)?;
+    // Search only after the matching BEGIN marker. An attacker-controlled
+    // inline source may contain an earlier END marker; slicing with that
+    // offset would otherwise panic during configuration admission.
+    let end = start + pem.get(start..)?.find(end_marker)?;
 
     let b64 = pem[start..end].replace(char::is_whitespace, "");
     BASE64.decode(b64.as_bytes()).ok()
@@ -6908,7 +6922,7 @@ fn skip_content_type_media_type(content_type: &str) -> Result<&str, SoapBodyDeco
         match bytes[i] {
             b';' => return Ok(&content_type[i..]),
             // Media type tokens are not quoted; a quote here is hostile metadata.
-            b'"' | b'\'' | b'\\' => return Err(SoapBodyDecodeError::ConflictingCharset),
+            b'"' | b'\\' => return Err(SoapBodyDecodeError::ConflictingCharset),
             _ => i += 1,
         }
     }
@@ -6925,11 +6939,21 @@ fn next_content_type_parameter(
 ) -> Result<Option<(&str, &str, &str)>, SoapBodyDecodeError> {
     let bytes = rest.as_bytes();
     let mut i = 0;
-    while i < bytes.len() && (bytes[i] == b';' || bytes[i].is_ascii_whitespace()) {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
     }
     if i >= bytes.len() {
         return Ok(None);
+    }
+    if bytes[i] != b';' {
+        return Err(SoapBodyDecodeError::ConflictingCharset);
+    }
+    i += 1;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] == b';' {
+        return Err(SoapBodyDecodeError::ConflictingCharset);
     }
 
     let name_start = i;
@@ -6941,36 +6965,38 @@ fn next_content_type_parameter(
         return Err(SoapBodyDecodeError::ConflictingCharset);
     }
     let name = &rest[name_start..i];
+    if !name.bytes().all(is_media_type_token_byte) {
+        return Err(SoapBodyDecodeError::ConflictingCharset);
+    }
 
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
     }
     if i >= bytes.len() || bytes[i] != b'=' {
-        // Parameter without a value — ignore and continue after the next ';'.
-        while i < bytes.len() && bytes[i] != b';' {
-            i += 1;
-        }
-        return Ok(Some((name, "", &rest[i..])));
+        return Err(SoapBodyDecodeError::ConflictingCharset);
     }
     i += 1;
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
     }
     if i >= bytes.len() {
-        return Ok(Some((name, "", "")));
+        return Err(SoapBodyDecodeError::ConflictingCharset);
     }
 
-    let (value, after_value) = if bytes[i] == b'"' || bytes[i] == b'\'' {
+    let (value, after_value) = if bytes[i] == b'"' {
         parse_quoted_parameter_value(&rest[i..])?
     } else {
         let value_start = i;
         while i < bytes.len() && bytes[i] != b';' {
-            if matches!(bytes[i], b'"' | b'\'' | b'\\') {
+            if matches!(bytes[i], b'"' | b'\\') {
                 return Err(SoapBodyDecodeError::ConflictingCharset);
             }
             i += 1;
         }
         let raw = rest[value_start..i].trim_end();
+        if raw.is_empty() || !raw.bytes().all(is_media_type_token_byte) {
+            return Err(SoapBodyDecodeError::ConflictingCharset);
+        }
         (raw, &rest[i..])
     };
     Ok(Some((name, value, after_value)))
@@ -6982,7 +7008,7 @@ fn parse_quoted_parameter_value(raw: &str) -> Result<(&str, &str), SoapBodyDecod
         return Err(SoapBodyDecodeError::ConflictingCharset);
     }
     let quote = bytes[0];
-    if quote != b'"' && quote != b'\'' {
+    if quote != b'"' {
         return Err(SoapBodyDecodeError::ConflictingCharset);
     }
     let mut i = 1;

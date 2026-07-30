@@ -3409,6 +3409,22 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
     assert!(candidate.contains("is_security_composition_candidate_plugin("));
     assert!(candidate.contains("security_composition_capabilities("));
     assert!(candidate.contains("ServerlessSecurityCompositionPlugin"));
+    let candidate_names_start = source
+        .find("const SECURITY_COMPOSITION_PLUGIN_NAMES")
+        .expect("security-composition candidate allowlist must exist");
+    let candidate_names_end = source[candidate_names_start..]
+        .find("];")
+        .map(|offset| candidate_names_start + offset)
+        .expect("security-composition candidate allowlist must terminate");
+    let candidate_names = &source[candidate_names_start..candidate_names_end];
+    assert!(
+        candidate_names.contains("\"soap_ws_security\""),
+        "candidate construction must include SOAP so custom auth capabilities cannot bypass its sole-auth gate"
+    );
+    assert!(
+        source.contains("plugin.name() == \"soap_ws_security\" && plugin.is_auth_plugin()"),
+        "effective-chain validation must derive authentication participation from constructed capabilities"
+    );
     assert!(candidate.contains("validate_plugin_security_composition(&merged)"));
     assert!(candidate.contains("validate_plugin_security_composition(plugins)"));
 }

@@ -269,6 +269,31 @@ fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), Stri
 /// cannot preserve the configured enforcement contract.
 fn validate_plugin_security_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
     for protocol in ALL_PROXY_PROTOCOLS {
+        let identity_soap_count = plugins
+            .iter()
+            .filter(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && plugin.name() == "soap_ws_security"
+                    && plugin.is_auth_plugin()
+            })
+            .count();
+        if identity_soap_count > 0 {
+            let auth_plugins: Vec<&str> = plugins
+                .iter()
+                .filter(|plugin| {
+                    plugin.supported_protocols().contains(&protocol) && plugin.is_auth_plugin()
+                })
+                .map(|plugin| plugin.name())
+                .collect();
+            if auth_plugins.len() != 1 {
+                return Err(format!(
+                    "identity-establishing soap_ws_security must be the sole authentication \
+                     mechanism for protocol {protocol:?} on its effective plugin chain; found: {}",
+                    auth_plugins.join(", ")
+                ));
+            }
+        }
+
         let has_hmac = plugins
             .iter()
             .filter(|plugin| plugin.supported_protocols().contains(&protocol))
@@ -2805,6 +2830,7 @@ const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "correlation_id",
     "hmac_auth",
     "request_deduplication",
+    "soap_ws_security",
     "serverless_function",
     "request_transformer",
     "compression",
