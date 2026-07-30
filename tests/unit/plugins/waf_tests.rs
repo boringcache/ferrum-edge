@@ -1,7 +1,8 @@
 use ferrum_edge::_test_support::clone_log_metadata;
 use ferrum_edge::plugins::waf::Waf;
 use ferrum_edge::plugins::{
-    Plugin, PluginFailurePolicy, PluginResult, RequestContext, plugin_failure_policy,
+    Plugin, PluginFailurePolicy, PluginResult, RequestContext, ResponseTrailerPolicy,
+    plugin_failure_policy,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -985,6 +986,192 @@ async fn response_header_rules_request_buffered_grpc_web_trailer_policy() {
     let ctx = ctx("POST", "/grpc.Service/Method");
 
     assert!(plugin.requires_buffered_grpc_web_trailer_policy(&ctx));
+    assert!(matches!(
+        plugin.response_trailer_policy(),
+        ResponseTrailerPolicy::RequestConditionalUnbounded
+    ));
+    assert!(plugin.request_applies_unbounded_response_trailer_policy(&ctx));
+}
+
+#[test]
+fn inactive_response_header_inspection_does_not_govern_native_h3_trailers() {
+    let plugin = Waf::new(&json!({})).unwrap();
+
+    assert!(matches!(
+        plugin.response_trailer_policy(),
+        ResponseTrailerPolicy::None
+    ));
+}
+
+#[test]
+fn monitor_only_response_header_rules_do_not_drop_native_h3_trailers() {
+    for config in [
+        json!({
+            "mode": "monitor",
+            "include_default_rules": false,
+            "response_inspection": true,
+            "custom_rules": [{
+                "id": "CUSTOM-RESP-HEADER-GLOBAL-MONITOR",
+                "name": "globally monitored response metadata",
+                "category": "custom",
+                "severity": "high",
+                "target": "response_headers",
+                "match_kind": "contains",
+                "pattern": "leak-secret",
+                "action": "enforce"
+            }]
+        }),
+        json!({
+            "mode": "enforce",
+            "include_default_rules": false,
+            "response_inspection": true,
+            "custom_rules": [{
+                "id": "CUSTOM-RESP-HEADER-RULE-MONITOR",
+                "name": "rule-monitored response metadata",
+                "category": "custom",
+                "severity": "high",
+                "target": "response_headers",
+                "match_kind": "contains",
+                "pattern": "leak-secret",
+                "action": "monitor"
+            }]
+        }),
+    ] {
+        let plugin = Waf::new(&config).unwrap();
+
+        assert!(matches!(
+            plugin.response_trailer_policy(),
+            ResponseTrailerPolicy::None
+        ));
+    }
+}
+
+#[test]
+fn response_header_anomaly_scoring_governs_native_h3_trailers() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "response_inspection": true,
+        "scoring": { "enabled": true, "block_threshold": 1 },
+        "custom_rules": [{
+            "id": "CUSTOM-RESP-HEADER-SCORED",
+            "name": "scored response metadata",
+            "category": "custom",
+            "severity": "high",
+            "target": "response_headers",
+            "match_kind": "contains",
+            "pattern": "leak-secret",
+            "action": "monitor"
+        }]
+    }))
+    .unwrap();
+
+    assert!(matches!(
+        plugin.response_trailer_policy(),
+        ResponseTrailerPolicy::RequestConditionalUnbounded
+    ));
+    assert!(
+        plugin.request_applies_unbounded_response_trailer_policy(&ctx("GET", "/orders")),
+        "a scoring configuration with no exemptions governs every request"
+    );
+}
+
+/// A `global_exemptions` match means `after_proxy` returns before the
+/// response-header scan, so the WAF inspects nothing for that request and its
+/// trailer fail-closed arm must be inactive — the pre-governance behavior. Same
+/// predicate `requires_buffered_grpc_web_trailer_policy` already uses.
+#[test]
+fn request_exempt_from_waf_keeps_its_backend_trailers() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "response_inspection": true,
+        "global_exemptions": {
+            "paths": ["/internal/*"],
+            "methods": ["OPTIONS"],
+            "ips": ["198.51.100.0/24"],
+            "consumers": ["trusted-partner"]
+        },
+        "custom_rules": [{
+            "id": "CUSTOM-RESP-HEADER-EXEMPT",
+            "name": "blocked response metadata",
+            "category": "custom",
+            "severity": "high",
+            "target": "response_headers",
+            "match_kind": "contains",
+            "pattern": "leak-secret",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    // The config-time declaration stays enforcing — the exemption is decided per
+    // request, never frozen into the cache generation.
+    assert!(matches!(
+        plugin.response_trailer_policy(),
+        ResponseTrailerPolicy::RequestConditionalUnbounded
+    ));
+
+    let governed = ctx("GET", "/orders");
+    assert!(
+        plugin.request_applies_unbounded_response_trailer_policy(&governed),
+        "a non-exempt request must stay governed and fail closed"
+    );
+    assert!(
+        plugin.requires_buffered_grpc_web_trailer_policy(&governed),
+        "the two trailer-policy predicates must agree on a governed request"
+    );
+
+    let by_path = ctx("GET", "/internal/metrics");
+    let by_method = ctx("OPTIONS", "/orders");
+    let mut by_ip = ctx("GET", "/orders");
+    by_ip.client_ip = "198.51.100.7".to_string();
+    // Consumer identity only exists after authentication, which is exactly why
+    // the resolution is deferred to the finalized request context.
+    let mut by_consumer = ctx("GET", "/orders");
+    by_consumer.authenticated_identity = Some("trusted-partner".to_string());
+
+    for exempt in [by_path, by_method, by_ip, by_consumer] {
+        assert!(
+            !plugin.request_applies_unbounded_response_trailer_policy(&exempt),
+            "exempt {} {} must preserve its backend trailers",
+            exempt.method,
+            exempt.path
+        );
+        assert!(
+            !plugin.requires_buffered_grpc_web_trailer_policy(&exempt),
+            "the two trailer-policy predicates must agree on an exempt request"
+        );
+    }
+}
+
+/// Monitor-only configurations never reach the conditional arm at all: they stay
+/// `None` at config time, so an exempt request and a governed request behave
+/// identically and no trailer is ever dropped.
+#[test]
+fn monitor_only_waf_declares_no_conditional_trailer_policy() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "include_default_rules": false,
+        "response_inspection": true,
+        "global_exemptions": { "paths": ["/internal/*"] },
+        "custom_rules": [{
+            "id": "CUSTOM-RESP-HEADER-MONITOR-EXEMPT",
+            "name": "monitored response metadata",
+            "category": "custom",
+            "severity": "high",
+            "target": "response_headers",
+            "match_kind": "contains",
+            "pattern": "leak-secret",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    assert!(matches!(
+        plugin.response_trailer_policy(),
+        ResponseTrailerPolicy::None
+    ));
 }
 
 #[tokio::test]

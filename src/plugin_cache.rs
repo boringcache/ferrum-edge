@@ -638,6 +638,10 @@ impl Plugin for PriorityOverridePlugin {
     fn response_trailer_policy(&self) -> crate::plugins::ResponseTrailerPolicy<'_> {
         self.inner.response_trailer_policy()
     }
+    fn request_applies_unbounded_response_trailer_policy(&self, ctx: &RequestContext) -> bool {
+        self.inner
+            .request_applies_unbounded_response_trailer_policy(ctx)
+    }
     fn may_modify_response_content_type(
         &self,
         ctx: &RequestContext,
@@ -3043,6 +3047,13 @@ impl PluginCapabilities {
     /// closed and drop the whole trailer section rather than reconcile field by
     /// field.
     ///
+    /// UNCONDITIONAL declarations only. A plugin that governs trailers for some
+    /// requests declares `RequestConditionalUnbounded` instead and lands in
+    /// `PluginPhaseData::conditional_unbounded_trailer_policy_plugins`;
+    /// request paths must therefore read
+    /// `PluginCacheRequestView::unbounded_response_trailer_policy_applies`
+    /// rather than testing this bit directly.
+    ///
     /// Bit 15 is the LAST bit of the `u16` backing store. A sixteenth flag must
     /// widen `PluginCapabilities` (to `u32`) rather than shift further; `1 << 16`
     /// would be a const-eval overflow, so the failure is a compile error, not a
@@ -3091,13 +3102,28 @@ pub struct PluginPhaseData {
     /// `ai_stream_router` declares its bounded representation-metadata names
     /// plus the open-ended checksum prefixes; `response_transformer` declares
     /// `Unbounded` because route-override transforms are published at request
-    /// time.
+    /// time; `waf` declares `RequestConditionalUnbounded` because an enforcing
+    /// response-header configuration governs every field name it cannot inspect,
+    /// but only for requests its `global_exemptions` do not exempt.
     pub response_trailer_policy_names: Arc<Vec<String>>,
     /// Case-insensitive ASCII prefixes whose response-header policy also binds
     /// the TRAILER section, unioned from
     /// `Plugin::response_trailer_policy()` `NamesAndPrefixes` declarations.
     /// Empty for every chain that does not own an open-ended family.
     pub response_trailer_policy_prefixes: Arc<Vec<String>>,
+    /// Instances that declared
+    /// `ResponseTrailerPolicy::RequestConditionalUnbounded`, in configured
+    /// priority order.
+    ///
+    /// Their fail-closed arm cannot be folded into
+    /// [`PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY`] because it
+    /// applies per request — `waf` governs trailers it cannot inspect, but a
+    /// `global_exemptions` match means it never runs a response-header scan for
+    /// that request. Precomputing the (almost always empty) contributor list
+    /// here keeps the resolution to a short iteration over already-filtered
+    /// instances instead of a full plugin-chain scan per response, and leaves
+    /// the unconditional bit's zero-cost check untouched.
+    pub conditional_unbounded_trailer_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Final committed-response observers only, in configured priority order.
     pub response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Capability bitset for fast boolean checks.
@@ -3134,6 +3160,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut initial_response_header_policy_names = Vec::new();
     let mut response_trailer_policy_names: Vec<String> = Vec::new();
     let mut response_trailer_policy_prefixes: Vec<String> = Vec::new();
+    let mut conditional_unbounded_trailer_policy_plugins = Vec::new();
     let mut response_committed = Vec::new();
     // Ordered because response header/body rules are not commutative: the same
     // instances in a different order produce a different client-visible
@@ -3213,6 +3240,14 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
             crate::plugins::ResponseTrailerPolicy::Unbounded => {
                 caps |= PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY;
             }
+            // Deliberately NOT folded into the capability bit: the same
+            // fail-closed arm, but only for the requests this instance actually
+            // governs. Resolved per response against the fully populated
+            // request context — see
+            // `PluginCacheRequestView::unbounded_response_trailer_policy_applies`.
+            crate::plugins::ResponseTrailerPolicy::RequestConditionalUnbounded => {
+                conditional_unbounded_trailer_policy_plugins.push(Arc::clone(p));
+            }
         }
         for header in p.request_headers_to_redact() {
             if !request_headers_to_redact
@@ -3271,6 +3306,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         initial_response_header_policy_names: Arc::new(initial_response_header_policy_names),
         response_trailer_policy_names: Arc::new(response_trailer_policy_names),
         response_trailer_policy_prefixes: Arc::new(response_trailer_policy_prefixes),
+        conditional_unbounded_trailer_policy_plugins: Arc::new(
+            conditional_unbounded_trailer_policy_plugins,
+        ),
         response_committed_plugins: Arc::new(response_committed),
         capabilities: PluginCapabilities(caps),
         response_presentation_policy_digest: (!presentation_policy_unprovable)
@@ -4052,6 +4090,21 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    /// Instances whose unbounded trailer policy is request-conditional, for a
+    /// composed `proxy_key` + protocol.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
+    /// proxy ID — see [`Self::protocol_entry`].
+    pub(crate) fn get_conditional_unbounded_trailer_policy_plugins(
+        &self,
+        proxy_key: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_key, protocol)
+            .map(|entry| Arc::clone(&entry.phase.conditional_unbounded_trailer_policy_plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
     /// Response-committed hook plugins for a composed `proxy_key` + protocol.
     ///
     /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
@@ -4187,6 +4240,8 @@ impl PluginCacheInner {
                     .get_response_trailer_policy_names(proxy_key, protocol),
                 response_trailer_policy_prefixes: self
                     .get_response_trailer_policy_prefixes(proxy_key, protocol),
+                conditional_unbounded_trailer_policy_plugins: self
+                    .get_conditional_unbounded_trailer_policy_plugins(proxy_key, protocol),
                 response_committed_plugins: self
                     .get_response_committed_plugins(proxy_key, protocol),
                 response_presentation_policy_digest: self
@@ -4237,6 +4292,9 @@ impl PluginCacheInner {
                 response_trailer_policy_prefixes: Arc::clone(
                     &entry.phase.response_trailer_policy_prefixes,
                 ),
+                conditional_unbounded_trailer_policy_plugins: Arc::clone(
+                    &entry.phase.conditional_unbounded_trailer_policy_plugins,
+                ),
                 response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
                 response_presentation_policy_digest: entry
                     .phase
@@ -4268,6 +4326,7 @@ pub struct PluginCacheRequestView {
     initial_response_header_policy_names: Arc<Vec<String>>,
     response_trailer_policy_names: Arc<Vec<String>>,
     response_trailer_policy_prefixes: Arc<Vec<String>>,
+    conditional_unbounded_trailer_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     response_presentation_policy_digest: Option<[u8; 32]>,
     capabilities: PluginCapabilities,
@@ -4350,6 +4409,35 @@ impl PluginCacheRequestView {
     /// governor. One `Arc` bump, no per-request allocation.
     pub fn response_trailer_policy_prefixes_shared(&self) -> Arc<Vec<String>> {
         Arc::clone(&self.response_trailer_policy_prefixes)
+    }
+
+    /// Whether the fail-closed "drop the whole backend trailer section" arm is
+    /// active for THIS request.
+    ///
+    /// `true` as soon as any instance declared the unconditional
+    /// [`ResponseTrailerPolicy::Unbounded`][crate::plugins::ResponseTrailerPolicy::Unbounded]
+    /// — that check is the precomputed capability bit and costs one `and`. Only
+    /// then does it consult the request-conditional contributors, which is an
+    /// empty slice for every chain that has none, so this is not a plugin-chain
+    /// scan.
+    ///
+    /// Contributors are OR-ed: a request-exempt instance can never suppress
+    /// another plugin's unconditional declaration, nor a second, non-exempt
+    /// instance of its own type.
+    ///
+    /// Call this once the request context is fully populated — request-level
+    /// exemptions may key on the authenticated consumer, which only exists after
+    /// the authentication phase.
+    pub fn unbounded_response_trailer_policy_applies(&self, ctx: &RequestContext) -> bool {
+        if self
+            .capabilities
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY)
+        {
+            return true;
+        }
+        self.conditional_unbounded_trailer_policy_plugins
+            .iter()
+            .any(|plugin| plugin.request_applies_unbounded_response_trailer_policy(ctx))
     }
 
     /// Get the pre-filtered committed-response observer chain.
