@@ -165,6 +165,129 @@ const FORBIDDEN_CONFIG_KEYS: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Shared metadata admission bounds (extraction truncates; restore rejects)
+// ---------------------------------------------------------------------------
+
+/// Maximum UTF-8 byte length for stored `info.title`.
+pub(crate) const MAX_SPEC_TITLE_BYTES: usize = 1024;
+/// Maximum UTF-8 byte length for stored `info.version`.
+pub(crate) const MAX_SPEC_INFO_VERSION_BYTES: usize = 256;
+/// Maximum UTF-8 byte length for stored `info.description`.
+pub(crate) const MAX_SPEC_DESCRIPTION_BYTES: usize = 4096;
+/// Maximum UTF-8 byte length for stored `info.contact.name`.
+pub(crate) const MAX_SPEC_CONTACT_NAME_BYTES: usize = 256;
+/// Maximum UTF-8 byte length for stored `info.contact.email` (RFC 5321).
+pub(crate) const MAX_SPEC_CONTACT_EMAIL_BYTES: usize = 320;
+/// Maximum UTF-8 byte length for stored `info.license.name`.
+pub(crate) const MAX_SPEC_LICENSE_NAME_BYTES: usize = 256;
+/// Maximum UTF-8 byte length for stored license identifier/URL.
+pub(crate) const MAX_SPEC_LICENSE_IDENTIFIER_BYTES: usize = 128;
+/// Maximum UTF-8 byte length for one stored tag name.
+pub(crate) const MAX_SPEC_TAG_BYTES: usize = 128;
+/// Maximum number of stored tag names after sort/dedup.
+pub(crate) const MAX_SPEC_TAGS: usize = 64;
+/// Maximum UTF-8 byte length for one stored server URL.
+pub(crate) const MAX_SPEC_SERVER_URL_BYTES: usize = 2048;
+/// Maximum number of stored server URLs.
+pub(crate) const MAX_SPEC_SERVER_URLS: usize = 32;
+
+/// Return the first character in `tag` that would break SQL `has_tag` LIKE
+/// semantics (`"`, `%`, `_`, or `\`), if any.
+///
+/// Shared by extraction, list-query admission, and restore metadata checks so
+/// the whitelist cannot drift across those paths.
+pub(crate) fn api_spec_tag_forbidden_char(tag: &str) -> Option<char> {
+    tag.chars().find(|c| matches!(c, '"' | '%' | '_' | '\\'))
+}
+
+/// Fail-closed validation of **stored** API-spec metadata bounds.
+///
+/// Extraction truncates oversize source fields to these limits; restore must
+/// reject wire values that exceed them (or violate tag cardinality / sort /
+/// whitelist invariants) so a crafted backup cannot persist metadata that
+/// ordinary POST/PUT ingestion forbids. Error strings intentionally omit the
+/// hostile field values themselves.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_stored_api_spec_metadata(
+    title: Option<&str>,
+    info_version: Option<&str>,
+    description: Option<&str>,
+    contact_name: Option<&str>,
+    contact_email: Option<&str>,
+    license_name: Option<&str>,
+    license_identifier: Option<&str>,
+    tags: &[String],
+    server_urls: &[String],
+) -> Result<(), &'static str> {
+    let within = |value: Option<&str>, max: usize| value.is_none_or(|s| s.len() <= max);
+    if !within(title, MAX_SPEC_TITLE_BYTES) {
+        return Err("title exceeds maximum length");
+    }
+    if !within(info_version, MAX_SPEC_INFO_VERSION_BYTES) {
+        return Err("info_version exceeds maximum length");
+    }
+    if !within(description, MAX_SPEC_DESCRIPTION_BYTES) {
+        return Err("description exceeds maximum length");
+    }
+    if !within(contact_name, MAX_SPEC_CONTACT_NAME_BYTES) {
+        return Err("contact_name exceeds maximum length");
+    }
+    if !within(contact_email, MAX_SPEC_CONTACT_EMAIL_BYTES) {
+        return Err("contact_email exceeds maximum length");
+    }
+    if !within(license_name, MAX_SPEC_LICENSE_NAME_BYTES) {
+        return Err("license_name exceeds maximum length");
+    }
+    if !within(license_identifier, MAX_SPEC_LICENSE_IDENTIFIER_BYTES) {
+        return Err("license_identifier exceeds maximum length");
+    }
+    if tags.len() > MAX_SPEC_TAGS {
+        return Err("tags exceed maximum cardinality");
+    }
+    for tag in tags {
+        if tag.len() > MAX_SPEC_TAG_BYTES {
+            return Err("tag exceeds maximum length");
+        }
+        if api_spec_tag_forbidden_char(tag).is_some() {
+            return Err("tag contains forbidden character");
+        }
+    }
+    // Extraction always sorts + dedups before persist; restore must preserve
+    // that invariant for list/filter surfaces that assume unique membership.
+    for window in tags.windows(2) {
+        if window[0] >= window[1] {
+            return Err("tags must be sorted and de-duplicated");
+        }
+    }
+    if server_urls.len() > MAX_SPEC_SERVER_URLS {
+        return Err("server_urls exceed maximum cardinality");
+    }
+    for url in server_urls {
+        if url.len() > MAX_SPEC_SERVER_URL_BYTES {
+            return Err("server_url exceeds maximum length");
+        }
+    }
+    Ok(())
+}
+
+/// Parse `body` under a **declared** format using the same bounded document
+/// parser as ingestion and return the spec-language version it declares.
+///
+/// This admits JSON/YAML syntax (plus the source-tree node cap and YAML
+/// anchor/alias rejection) and the same root `swagger`/`openapi` version
+/// detection [`extract`] performs, so a document that declares no supported
+/// OpenAPI/Swagger version is rejected. It does **not** extract resources,
+/// re-resolve `$ref`s, or regenerate config — restore must keep historical
+/// backups restorable without replaying extraction.
+pub(crate) fn parse_declared_spec_document_version(
+    body: &[u8],
+    declared_format: SpecFormat,
+) -> Result<String, ExtractError> {
+    let (root, _) = parse_root_document(body, Some(declared_format))?;
+    detect_version(&root)
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -214,13 +337,13 @@ pub fn extract(
         .get("info")
         .and_then(|i| i.get("title"))
         .and_then(|v| v.as_str())
-        .map(|s| truncate_utf8(s, 1024)); // titles are short identifiers
+        .map(|s| truncate_utf8(s, MAX_SPEC_TITLE_BYTES));
 
     let info_version = root
         .get("info")
         .and_then(|i| i.get("version"))
         .and_then(|v| v.as_str())
-        .map(|s| truncate_utf8(s, 256)); // version strings are short
+        .map(|s| truncate_utf8(s, MAX_SPEC_INFO_VERSION_BYTES));
 
     // --- Tier 1 metadata (Wave 5) ----------------------------------------
     let tier1 = extract_spec_metadata(&root, &version);
@@ -240,14 +363,13 @@ pub fn extract(
     // If you change or extend this tag-character whitelist, also update:
     //   src/config/db_loader.rs  — list_api_specs, has_tag branch (comment there)
     //   docs/api_specs.md        — "Tag-name rules" section
+    //   validate_stored_api_spec_metadata — restore admission path
     for tag in &tier1.tags {
-        for ch in ['"', '%', '_', '\\'] {
-            if tag.contains(ch) {
-                return Err(ExtractError::InvalidTagName {
-                    name: tag.clone(),
-                    char: ch,
-                });
-            }
+        if let Some(ch) = api_spec_tag_forbidden_char(tag) {
+            return Err(ExtractError::InvalidTagName {
+                name: tag.clone(),
+                char: ch,
+            });
         }
     }
 
@@ -4195,45 +4317,40 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> String {
 fn extract_spec_metadata(root: &serde_json::Value, version: &str) -> ExtractedMetadata {
     let info = root.get("info");
 
-    // description — truncated to 4096 bytes.
+    // description — truncated to [`MAX_SPEC_DESCRIPTION_BYTES`].
     let description = info
         .and_then(|i| i.get("description"))
         .and_then(|v| v.as_str())
-        .map(|s| truncate_utf8(s, 4096));
+        .map(|s| truncate_utf8(s, MAX_SPEC_DESCRIPTION_BYTES));
 
     // contact.name / email
-    // contact_name  → 256 bytes (human names are short)
-    // contact_email → 320 bytes (RFC 5321 maximum email address length)
+    // contact_name  → [`MAX_SPEC_CONTACT_NAME_BYTES`]
+    // contact_email → [`MAX_SPEC_CONTACT_EMAIL_BYTES`] (RFC 5321 max)
     let contact = info.and_then(|i| i.get("contact"));
     let contact_name = contact
         .and_then(|c| c.get("name"))
         .and_then(|v| v.as_str())
-        .map(|s| truncate_utf8(s, 256));
+        .map(|s| truncate_utf8(s, MAX_SPEC_CONTACT_NAME_BYTES));
     let contact_email = contact
         .and_then(|c| c.get("email"))
         .and_then(|v| v.as_str())
-        .map(|s| truncate_utf8(s, 320));
+        .map(|s| truncate_utf8(s, MAX_SPEC_CONTACT_EMAIL_BYTES));
 
     // license.name / identifier-or-url
-    // license_name       → 256 bytes
-    // license_identifier → 128 bytes (SPDX identifiers are short)
     let license = info.and_then(|i| i.get("license"));
     let license_name = license
         .and_then(|l| l.get("name"))
         .and_then(|v| v.as_str())
-        .map(|s| truncate_utf8(s, 256));
+        .map(|s| truncate_utf8(s, MAX_SPEC_LICENSE_NAME_BYTES));
     let license_identifier = license
         .and_then(|l| {
             // 3.1+ uses `identifier`; fallback to `url`
             l.get("identifier").or_else(|| l.get("url"))
         })
         .and_then(|v| v.as_str())
-        .map(|s| truncate_utf8(s, 128));
+        .map(|s| truncate_utf8(s, MAX_SPEC_LICENSE_IDENTIFIER_BYTES));
 
     // tags — top-level `tags[].name` (both 2.0 and 3.x)
-    // Each tag is truncated at 128 bytes; the list is capped at 64 entries.
-    const MAX_TAG_BYTES: usize = 128;
-    const MAX_TAGS: usize = 64;
     let mut tags: Vec<String> = root
         .get("tags")
         .and_then(|v| v.as_array())
@@ -4241,22 +4358,15 @@ fn extract_spec_metadata(root: &serde_json::Value, version: &str) -> ExtractedMe
             arr.iter()
                 .filter_map(|e| e.get("name"))
                 .filter_map(|v| v.as_str())
-                .map(|s| truncate_utf8(s, MAX_TAG_BYTES))
+                .map(|s| truncate_utf8(s, MAX_SPEC_TAG_BYTES))
                 .collect()
         })
         .unwrap_or_default();
     tags.sort();
     tags.dedup();
-    tags.truncate(MAX_TAGS);
+    tags.truncate(MAX_SPEC_TAGS);
 
-    // server_urls
-    // Each URL is truncated at 2048 bytes; the list is capped at 32 entries.
-    // An unbounded list would allow an operator to store megabytes of URL data
-    // in the metadata columns without triggering the body-size limit (which only
-    // caps the raw spec document).
-    const MAX_SERVER_URL_BYTES: usize = 2048;
-    const MAX_SERVER_URLS: usize = 32;
-
+    // server_urls — bounded so metadata columns cannot eclipse the body cap.
     let server_urls = if version == "2.0" {
         // Swagger 2.0: construct from schemes[] + host + basePath
         let host = root.get("host").and_then(|v| v.as_str()).unwrap_or("");
@@ -4277,10 +4387,10 @@ fn extract_spec_metadata(root: &serde_json::Value, version: &str) -> ExtractedMe
                     .map(|scheme| {
                         truncate_utf8(
                             &format!("{scheme}://{host}{base_path}"),
-                            MAX_SERVER_URL_BYTES,
+                            MAX_SPEC_SERVER_URL_BYTES,
                         )
                     })
-                    .take(MAX_SERVER_URLS)
+                    .take(MAX_SPEC_SERVER_URLS)
                     .collect()
             }
         }
@@ -4293,17 +4403,17 @@ fn extract_spec_metadata(root: &serde_json::Value, version: &str) -> ExtractedMe
                 arr.iter()
                     .filter_map(|e| e.get("url"))
                     .filter_map(|v| v.as_str())
-                    .map(|s| truncate_utf8(s, MAX_SERVER_URL_BYTES))
+                    .map(|s| truncate_utf8(s, MAX_SPEC_SERVER_URL_BYTES))
                     .collect()
             })
             .unwrap_or_default();
-        if raw.len() > MAX_SERVER_URLS {
+        if raw.len() > MAX_SPEC_SERVER_URLS {
             tracing::debug!(
                 "extract_spec_metadata: server_urls has {} entries; truncating to {}",
                 raw.len(),
-                MAX_SERVER_URLS
+                MAX_SPEC_SERVER_URLS
             );
-            raw.into_iter().take(MAX_SERVER_URLS).collect()
+            raw.into_iter().take(MAX_SPEC_SERVER_URLS).collect()
         } else {
             raw
         }

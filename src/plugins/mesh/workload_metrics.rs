@@ -29,7 +29,9 @@ use crate::plugins::otel_tracing::{
     trace_exporters_from_providers, trace_is_sampled, validate_trace_provider_endpoints,
 };
 use crate::plugins::utils::PluginHttpClient;
-use crate::plugins::utils::metadata_redaction::is_sensitive_metadata_key;
+use crate::plugins::utils::metadata_redaction::{
+    is_operator_sensitive_metadata_key, is_sensitive_metadata_key,
+};
 use crate::plugins::{
     ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
     StreamTransactionSummary, TransactionSummary, priority,
@@ -58,6 +60,7 @@ const B3_TRACE_HEADERS: [&str; 6] = [
 const MAX_CUSTOM_TAGS: usize = 32;
 const MAX_CUSTOM_TAG_NAME_BYTES: usize = 128;
 const MAX_CUSTOM_TAG_VALUE_BYTES: usize = 1024;
+const MAX_CUSTOM_ENV_VAR_NAME_BYTES: usize = 256;
 const MAX_METRIC_TAG_VALUE_BYTES: usize = 256;
 
 fn mesh_direction_str(direction: MeshTrafficDirection) -> &'static str {
@@ -187,6 +190,33 @@ impl WorkloadMetrics {
         config: &Value,
         http_client: PluginHttpClient,
     ) -> Result<Self, String> {
+        // Production resolves custom env tags through the real process
+        // environment at construction/reload only.
+        Self::new_with_http_client_and_env_lookup(config, http_client, |key| std::env::var(key))
+    }
+
+    /// Test seam: inject environment lookup outcomes without mutating the
+    /// process environment (Rust 2024 forbids unsynchronized `set_var` under
+    /// the parallel test harness).
+    #[allow(dead_code)]
+    pub(crate) fn new_with_env_lookup_for_test<F>(
+        config: &Value,
+        env_lookup: F,
+    ) -> Result<Self, String>
+    where
+        F: FnMut(&str) -> Result<String, std::env::VarError>,
+    {
+        Self::new_with_http_client_and_env_lookup(config, PluginHttpClient::default(), env_lookup)
+    }
+
+    fn new_with_http_client_and_env_lookup<F>(
+        config: &Value,
+        http_client: PluginHttpClient,
+        env_lookup: F,
+    ) -> Result<Self, String>
+    where
+        F: FnMut(&str) -> Result<String, std::env::VarError>,
+    {
         let workload_spiffe_id = config
             .get("workload_spiffe_id")
             .and_then(Value::as_str)
@@ -248,11 +278,34 @@ impl WorkloadMetrics {
                     .collect()
             })
             .unwrap_or_default();
+        let custom_env_tags: HashMap<String, String> = match config.get("custom_env_tags") {
+            None => HashMap::new(),
+            Some(Value::Object(tags)) => {
+                let mut parsed = HashMap::with_capacity(tags.len());
+                for (key, value) in tags {
+                    let Some(env_var) = value.as_str() else {
+                        return Err(format!(
+                            "workload_metrics: custom_env_tags.{key} must be a string"
+                        ));
+                    };
+                    parsed.insert(key.clone(), env_var.to_string());
+                }
+                parsed
+            }
+            Some(_) => {
+                return Err("workload_metrics: custom_env_tags must be an object".to_string());
+            }
+        };
         let ValidatedCustomTags {
-            custom_tags,
+            mut custom_tags,
             custom_header_tags,
+            custom_env_tags,
             custom_trace_attributes_marker,
-        } = validate_custom_tags(custom_tags, custom_header_tags)?;
+        } = validate_custom_tags(custom_tags, custom_header_tags, custom_env_tags)?;
+        // Resolve Istio environment custom tags from *this* data-plane process
+        // environment at construction/reload — never on the request hot path
+        // and never from a controller-host translation.
+        resolve_custom_env_tags_with(&mut custom_tags, &custom_env_tags, env_lookup)?;
         let ParsedMetricConfig {
             request_count_tag_overrides,
             request_duration_tag_overrides,
@@ -919,6 +972,20 @@ impl Plugin for WorkloadMetrics {
             && ctx.metadata.contains_key(TRACEPARENT_HEADER)
     }
 
+    /// Same contract as `otel_tracing`: the echoed `traceparent` is the
+    /// gateway's, an identical backend echo hides the write from
+    /// observed-mutation reconciliation, and a backend `traceparent` TRAILER
+    /// must not replace it after the fact.
+    fn response_trailer_policy(&self) -> crate::plugins::ResponseTrailerPolicy<'_> {
+        if self.trace_context_enabled() {
+            crate::plugins::ResponseTrailerPolicy::Names(
+                &crate::plugins::TRACEPARENT_RESPONSE_POLICY_NAMES,
+            )
+        } else {
+            crate::plugins::ResponseTrailerPolicy::None
+        }
+    }
+
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         let stamped_direction = ctx.mesh_direction;
         let peer_identity = ctx
@@ -1332,9 +1399,13 @@ pub(crate) fn validate_istio_telemetry_config(
     metrics: Option<&MeshMetricsConfig>,
 ) -> Result<(), String> {
     if let Some(tracing) = tracing {
+        // Structural validation only — do not resolve environment values here.
+        // Controllers and CP translators must not treat host process env as the
+        // target data plane.
         validate_custom_tags(
             tracing.custom_tags.clone(),
             tracing.custom_header_tags.clone(),
+            tracing.custom_env_tags.clone(),
         )?;
         validate_trace_provider_endpoints(&tracing.providers).map_err(|error| {
             format!("workload_metrics: invalid tracing exporter config: {error}")
@@ -1351,16 +1422,19 @@ pub(crate) fn validate_istio_telemetry_config(
 struct ValidatedCustomTags {
     custom_tags: HashMap<String, String>,
     custom_header_tags: HashMap<String, String>,
+    custom_env_tags: HashMap<String, String>,
     custom_trace_attributes_marker: Option<String>,
 }
 
 fn validate_custom_tags(
     custom_tags: HashMap<String, String>,
     custom_header_tags: HashMap<String, String>,
+    custom_env_tags: HashMap<String, String>,
 ) -> Result<ValidatedCustomTags, String> {
     let mut names: Vec<String> = custom_tags
         .keys()
         .chain(custom_header_tags.keys())
+        .chain(custom_env_tags.keys())
         .cloned()
         .collect();
     names.sort();
@@ -1395,12 +1469,350 @@ fn validate_custom_tags(
         normalized_header_tags.insert(name, header_name.as_str().to_string());
     }
 
+    let mut normalized_env_tags = HashMap::with_capacity(custom_env_tags.len());
+    for (name, env_var) in custom_env_tags {
+        validate_env_var_name(&name, &env_var)?;
+        normalized_env_tags.insert(name, env_var);
+    }
+
     let marker = (!names.is_empty()).then(|| names.join(","));
     Ok(ValidatedCustomTags {
         custom_tags,
         custom_header_tags: normalized_header_tags,
+        custom_env_tags: normalized_env_tags,
         custom_trace_attributes_marker: marker,
     })
+}
+
+/// Resolve `custom_env_tags` against a caller-supplied environment lookup.
+///
+/// Production passes `std::env::var`. Tests inject deterministic present,
+/// missing, empty, oversized, and non-Unicode outcomes without mutating the
+/// process environment.
+///
+/// Istio/Envoy semantics: a present variable overrides any literal default in
+/// `custom_tags`; a missing variable keeps the default when one was translated,
+/// otherwise the tag is omitted. Resolved values are deliberately emitted as
+/// custom telemetry metadata, but diagnostics must never include their values.
+fn resolve_custom_env_tags_with<F>(
+    custom_tags: &mut HashMap<String, String>,
+    custom_env_tags: &HashMap<String, String>,
+    mut lookup: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str) -> Result<String, std::env::VarError>,
+{
+    for (tag, env_var) in custom_env_tags {
+        match lookup(env_var) {
+            Ok(value) => {
+                if value.len() > MAX_CUSTOM_TAG_VALUE_BYTES {
+                    return Err(format!(
+                        "workload_metrics: custom env tag '{tag}' resolved value exceeds {MAX_CUSTOM_TAG_VALUE_BYTES} bytes"
+                    ));
+                }
+                custom_tags.insert(tag.clone(), value);
+            }
+            Err(std::env::VarError::NotPresent) => {
+                // Keep any translated defaultValue already in custom_tags;
+                // otherwise omit the tag (Istio/Envoy).
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(format!(
+                    "workload_metrics: custom env tag '{tag}' environment value is not valid UTF-8"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_env_var_name(tag: &str, env_var: &str) -> Result<(), String> {
+    // O(1) length admission before any walk that could inspect hostile input.
+    // Never echo the raw name — it may be credential-bearing.
+    if env_var.len() > MAX_CUSTOM_ENV_VAR_NAME_BYTES {
+        return Err(format!(
+            "workload_metrics: custom tag '{tag}' has invalid environment variable name"
+        ));
+    }
+    if env_var.is_empty() {
+        return Err(format!(
+            "workload_metrics: custom tag '{tag}' has invalid environment variable name"
+        ));
+    }
+    // Credential classifier before any diagnostic that could contain the raw
+    // name, including portable-syntax rejection of credential-shaped spellings
+    // such as `AWS_SECRET-KEY` or `myPassword`.
+    if is_sensitive_environment_variable_name(env_var) {
+        return Err(format!(
+            "workload_metrics: custom tag '{tag}' cannot copy a credential-bearing environment variable"
+        ));
+    }
+    let mut chars = env_var.chars();
+    let Some(first) = chars.next() else {
+        return Err(format!(
+            "workload_metrics: custom tag '{tag}' has invalid environment variable name"
+        ));
+    };
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(format!(
+            "workload_metrics: custom tag '{tag}' has invalid environment variable name"
+        ));
+    }
+    Ok(())
+}
+
+/// Environment names need a stricter credential boundary than log-metadata
+/// keys. In particular, database URLs and access/client identifiers can expose
+/// credentials even though their names intentionally do not match the shared
+/// metadata redaction classifier's narrower `token` rules.
+///
+/// Detection is fail-closed across delimiter, camelCase, and concatenated
+/// spellings via bounded token / known-compound matching — not open-ended
+/// substring search (so `ISTIO_META_CLUSTER_ID` / `FERRUM_REGION` stay allowed
+/// and incidental fragments inside unrelated words are not rejected).
+fn is_sensitive_environment_variable_name(name: &str) -> bool {
+    if is_operator_sensitive_metadata_key(name) {
+        return true;
+    }
+
+    let fingerprint = environment_name_fingerprint(name);
+    if matches!(
+        fingerprint.as_str(),
+        "cache_request_headers_snapshot"
+            | "grpc_web_shadowed_trailers"
+            | "claim_header"
+            | "last_event_id"
+            | "lasteventid"
+    ) || fingerprint.starts_with("claim_header_")
+    {
+        return true;
+    }
+    let segments: Vec<&str> = fingerprint
+        .split('_')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    let mut has_database_source = false;
+    let mut has_location = false;
+    let mut has_client = false;
+    let mut has_id = false;
+
+    for segment in &segments {
+        if is_credential_token(segment) || is_known_credential_compound(segment) {
+            return true;
+        }
+        if segment_embeds_credential_compound(segment) {
+            return true;
+        }
+
+        has_database_source |= is_database_source_token(segment);
+        has_location |= is_location_token(segment);
+        has_client |= *segment == "client";
+        has_id |= *segment == "id";
+    }
+
+    for pair in segments.windows(2) {
+        let collapsed = [pair[0], pair[1]].concat();
+        if is_known_credential_compound(&collapsed) {
+            return true;
+        }
+        if is_database_source_token(pair[0]) && is_location_token(pair[1]) {
+            return true;
+        }
+        if pair[0] == "client" && pair[1] == "id" {
+            return true;
+        }
+    }
+
+    (has_database_source && has_location) || (has_client && has_id)
+}
+
+fn is_credential_token(segment: &str) -> bool {
+    matches!(
+        segment,
+        "secret"
+            | "password"
+            | "passwd"
+            | "token"
+            | "credential"
+            | "credentials"
+            | "key"
+            | "dsn"
+            | "connection"
+            | "authorization"
+            | "bearer"
+            | "cookie"
+            | "csrf"
+    )
+}
+
+fn is_database_source_token(segment: &str) -> bool {
+    matches!(
+        segment,
+        "db" | "database" | "mongo" | "mongodb" | "mysql" | "postgres" | "postgresql" | "redis"
+    )
+}
+
+fn is_location_token(segment: &str) -> bool {
+    matches!(segment, "url" | "uri" | "dsn" | "connection")
+}
+
+/// Known compounds for undelimited / concatenated credential spellings.
+const KNOWN_CREDENTIAL_COMPOUNDS: &[&str] = &[
+    "apikey",
+    "accesskey",
+    "privatekey",
+    "secretkey",
+    "sessiontoken",
+    "accesstoken",
+    "idtoken",
+    "refreshtoken",
+    "bearertoken",
+    "clientid",
+    "clientsecret",
+    "clientkey",
+    "dburl",
+    "dburi",
+    "dbdsn",
+    "databaseurl",
+    "databaseuri",
+    "databasedsn",
+    "databaseconnection",
+    "connectionstring",
+    "mongodburi",
+    "mongouri",
+    "mysqlurl",
+    "postgresurl",
+    "postgresqluri",
+    "postgresqlurl",
+    "redisurl",
+    "redisuri",
+];
+
+fn is_known_credential_compound(segment: &str) -> bool {
+    KNOWN_CREDENTIAL_COMPOUNDS.contains(&segment)
+}
+
+fn contains_known_credential_compound(segment: &str) -> bool {
+    KNOWN_CREDENTIAL_COMPOUNDS.iter().any(|compound| {
+        segment.match_indices(*compound).any(|(offset, _)| {
+            // `clientidentity` is a common non-credential dimension. Do not
+            // reinterpret its leading bytes as the `clientid` compound.
+            *compound != "clientid" || !segment[offset + compound.len()..].starts_with("entity")
+        })
+    })
+}
+
+/// Bounded embedding detection for concatenated forms such as `mysecret`,
+/// `sessiontoken`, or `awssecretkey` without treating short credential words
+/// as arbitrary substrings (`secretion`, `authentication`, `keyboard`).
+fn segment_embeds_credential_compound(segment: &str) -> bool {
+    // Exact credential compounds remain sensitive when a provider prefix or
+    // qualifier is concatenated around them (`AWSACCESSKEYID`,
+    // `AWSSECRETACCESSKEY`, `MYCLIENTSECRETJSON`). These compounds are specific
+    // enough to search as bounded literals; bare `key` / `secret` / `token`
+    // retain the narrower rules below.
+    if contains_known_credential_compound(segment) {
+        return true;
+    }
+
+    // Long credential stems: accept as a suffix (`mysecret`) or when followed
+    // by a known compound trailer (`awssecretkey`). Do not treat an arbitrary
+    // mid-word occurrence as sensitive (`secretion`).
+    const STEMS: &[&str] = &[
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "credential",
+        "credentials",
+    ];
+    const TRAILERS: &[&str] = &[
+        "key", "id", "url", "uri", "dsn", "string", "token", "secret", "value", "json", "file",
+        "path",
+    ];
+
+    for stem in STEMS {
+        if segment.len() <= stem.len() {
+            continue;
+        }
+        if segment.ends_with(stem) {
+            return true;
+        }
+        let mut start = 0;
+        while let Some(rel) = segment[start..].find(stem) {
+            let abs = start + rel;
+            let after = abs + stem.len();
+            let suffix = &segment[after..];
+            if !suffix.is_empty() && TRAILERS.contains(&suffix) {
+                return true;
+            }
+            start = abs + 1;
+        }
+    }
+
+    // Short `key` is too common for open suffixes (`monkey`, `keyboard`); only
+    // known credential prefixes may concatenate with it.
+    const KEY_PREFIXES: &[&str] = &[
+        "api", "access", "private", "secret", "client", "signing", "crypt", "crypto", "aes", "rsa",
+        "ssh", "pgp", "hmac", "jwt",
+    ];
+    if let Some(prefix) = segment.strip_suffix("key")
+        && !prefix.is_empty()
+        && KEY_PREFIXES.contains(&prefix)
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Lowercase fingerprint with non-alnum delimiters collapsed to `_` and
+/// camelCase boundaries split so `AccessToken` / `ClientId` classify.
+fn environment_name_fingerprint(name: &str) -> String {
+    let mut out = String::with_capacity(name.len().saturating_mul(2));
+    let mut prev_kind = FingerprintCharKind::Delimiter;
+
+    for ch in name.chars() {
+        if !ch.is_ascii_alphanumeric() {
+            if prev_kind != FingerprintCharKind::Delimiter && !out.is_empty() {
+                out.push('_');
+            }
+            prev_kind = FingerprintCharKind::Delimiter;
+            continue;
+        }
+
+        let kind = if ch.is_ascii_uppercase() {
+            FingerprintCharKind::Upper
+        } else if ch.is_ascii_digit() {
+            FingerprintCharKind::Digit
+        } else {
+            FingerprintCharKind::Lower
+        };
+
+        if matches!(
+            (prev_kind, kind),
+            (FingerprintCharKind::Lower, FingerprintCharKind::Upper)
+                | (FingerprintCharKind::Digit, FingerprintCharKind::Upper)
+        ) {
+            out.push('_');
+        }
+
+        out.push(ch.to_ascii_lowercase());
+        prev_kind = kind;
+    }
+
+    out
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FingerprintCharKind {
+    Delimiter,
+    Lower,
+    Upper,
+    Digit,
 }
 
 fn validate_custom_tag_name(name: &str) -> Result<(), String> {
@@ -1889,6 +2301,141 @@ mod tests {
                 .map(String::as_str),
             Some("literal,tenant")
         );
+    }
+
+    #[test]
+    fn response_trailer_policy_only_claims_traceparent_when_tracing_can_author_it() {
+        let metrics_only = WorkloadMetrics::new(&json!({})).expect("metrics-only config");
+        assert!(matches!(
+            metrics_only.response_trailer_policy(),
+            crate::plugins::ResponseTrailerPolicy::None
+        ));
+
+        let tracing = WorkloadMetrics::new(&json!({
+            "sampling_percentage": 100.0
+        }))
+        .expect("tracing config");
+        assert!(matches!(
+            tracing.response_trailer_policy(),
+            crate::plugins::ResponseTrailerPolicy::Names(names)
+                if names.len() == 1 && names[0] == "traceparent"
+        ));
+    }
+
+    #[test]
+    fn custom_env_tags_resolve_at_construction_with_istio_missing_semantics() {
+        const ENV_VAR: &str = "FERRUM_TEST_WORKLOAD_METRICS_ENV_TAG";
+
+        let missing = WorkloadMetrics::new_with_env_lookup_for_test(
+            &json!({
+                "custom_tags": {"cluster": "fallback"},
+                "custom_env_tags": {
+                    "cluster": ENV_VAR,
+                    "region": "FERRUM_TEST_WORKLOAD_METRICS_ENV_TAG_ABSENT"
+                }
+            }),
+            |_| Err(std::env::VarError::NotPresent),
+        )
+        .expect("missing env keeps default / omits tag");
+        let mut metadata = HashMap::new();
+        missing.apply_telemetry_metadata(&mut metadata, &HashMap::new());
+        assert_eq!(
+            metadata.get("cluster").map(String::as_str),
+            Some("fallback")
+        );
+        assert!(!metadata.contains_key("region"));
+
+        let present = WorkloadMetrics::new_with_env_lookup_for_test(
+            &json!({
+                "custom_tags": {"cluster": "fallback"},
+                "custom_env_tags": {"cluster": ENV_VAR}
+            }),
+            |name| {
+                if name == ENV_VAR {
+                    Ok("live".to_string())
+                } else {
+                    Err(std::env::VarError::NotPresent)
+                }
+            },
+        )
+        .expect("present env overrides default");
+        let mut metadata = HashMap::new();
+        present.apply_telemetry_metadata(&mut metadata, &HashMap::new());
+        assert_eq!(metadata.get("cluster").map(String::as_str), Some("live"));
+
+        let invalid = WorkloadMetrics::new_with_env_lookup_for_test(
+            &json!({
+                "custom_env_tags": {"cluster": "BAD-NAME"}
+            }),
+            |_| Err(std::env::VarError::NotPresent),
+        );
+        assert!(
+            invalid
+                .err()
+                .expect("invalid env var name")
+                .contains("invalid environment variable name")
+        );
+
+        for env_var in [
+            "FERRUM_ADMIN_JWT_SECRET",
+            "AWS_SESSION_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "AZURE_CLIENT_ID",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "FERRUM_DB_URL",
+            "DATABASE_URL",
+            "MONGODB_URI",
+            "DATABASE_DSN",
+            "DATABASE_CONNECTION_STRING",
+            "AWS_SECRET-KEY",
+            "myPassword",
+            "AccessToken",
+            "sessiontoken",
+            "ClientId",
+        ] {
+            let sensitive = WorkloadMetrics::new_with_env_lookup_for_test(
+                &json!({
+                    "custom_env_tags": {"credential": env_var}
+                }),
+                |_| Err(std::env::VarError::NotPresent),
+            );
+            let error = sensitive.err().expect("sensitive env var name");
+            assert!(
+                error.contains("cannot copy a credential-bearing environment variable"),
+                "expected credential-bearing env rejection, got {error}"
+            );
+            assert!(
+                !error.contains(env_var),
+                "sensitive environment variable name must not be echoed"
+            );
+        }
+
+        for env_var in ["ISTIO_META_CLUSTER_ID", "ISTIO_META_ZONE", "FERRUM_REGION"] {
+            assert!(
+                validate_env_var_name("dimension", env_var).is_ok(),
+                "ordinary telemetry dimension {env_var} must remain allowed"
+            );
+        }
+
+        for invalid in [
+            json!(null),
+            json!([]),
+            json!("ISTIO_META_CLUSTER_ID"),
+            json!({"cluster": 42}),
+        ] {
+            let error = WorkloadMetrics::new_with_env_lookup_for_test(
+                &json!({
+                    "custom_env_tags": invalid
+                }),
+                |_| Err(std::env::VarError::NotPresent),
+            )
+            .err()
+            .expect("invalid custom_env_tags shape must fail closed");
+            assert!(
+                error.contains("custom_env_tags"),
+                "expected field-specific custom_env_tags error, got {error}"
+            );
+        }
     }
 
     #[test]

@@ -15,9 +15,7 @@ use super::update_validation::{
     validate_update_ferrum_version,
 };
 use crate::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
-use crate::grpc::dp_client::{
-    DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, generate_dp_jwt_full,
-};
+use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret};
 use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
 use crate::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
 use crate::modes::mesh::revision::MeshRevisionRejection;
@@ -33,6 +31,11 @@ pub struct NativeMeshClientConfig {
     pub waypoint_name: Option<String>,
     pub labels: HashMap<String, String>,
     pub ambient_udp_source_scoping: bool,
+    /// This DP is a NodeWaypoint whose transparent inbound capture listener
+    /// terminates direct plaintext for enrolled pods on its node (issue #3287),
+    /// so it needs the dedicated cross-namespace capture destination/policy
+    /// inventory. See `MeshSliceRequest::node_waypoint_capture_scoping`.
+    pub node_waypoint_capture_scoping: bool,
     /// Shared CP-failover primary-retry interval
     /// (`FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS`). When > 0 and connected to a
     /// fallback CP after a first slice is installed, the client proactively
@@ -51,6 +54,7 @@ impl NativeMeshClientConfig {
             labels: self.labels.clone(),
             waypoint_name: self.waypoint_name.clone().unwrap_or_default(),
             ambient_udp_source_scoping: self.ambient_udp_source_scoping,
+            node_waypoint_capture_scoping: self.node_waypoint_capture_scoping,
             // Ordinary LOCAL mesh subscription: this data plane talks to its
             // own control plane and presents the distinct, fixed local-mesh
             // JWT audience. The CP rejects both missing audiences (legacy
@@ -221,10 +225,12 @@ async fn connect_mesh_subscribe(
     }
 
     let channel = endpoint.connect().await?;
-    let auth_token = generate_dp_jwt_full(
-        jwt_secret.as_str(),
+    // With an externally issued token (`FERRUM_DP_CP_GRPC_TOKEN_FILE`) the
+    // issuer — not this node — decides the `ns` and `aud` claims, so a mesh
+    // node's token must be minted for the local-mesh subscribe audience by
+    // whatever mints it. See `docs/cp_namespace_tenancy.md`.
+    let auth_token = jwt_secret.mint(
         &config.node_id,
-        jwt_secret.issuer(),
         Some(&config.namespace),
         Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE),
     )?;
@@ -396,6 +402,7 @@ impl std::error::Error for MeshApplyError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grpc::dp_client::generate_dp_jwt_full;
     use crate::modes::mesh::config_consumer::update_validation::MeshUpdateRejectReason;
 
     fn test_client_config() -> NativeMeshClientConfig {
@@ -406,6 +413,7 @@ mod tests {
             waypoint_name: None,
             labels: HashMap::new(),
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
             primary_retry_secs: 0,
         }
     }
@@ -539,6 +547,7 @@ mod tests {
             waypoint_name: None,
             labels: HashMap::new(),
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
             primary_retry_secs: 300,
         };
         assert_eq!(config.primary_retry_secs, 300);

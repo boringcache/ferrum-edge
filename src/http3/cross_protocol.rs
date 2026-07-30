@@ -122,9 +122,11 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER, GrpcResponseKind, proxy_grpc_request_from_bytes,
 };
 use crate::proxy::headers::{
-    apply_response_headers, has_client_response_hop_by_hop_headers,
+    GatewayOwnedResponseHeaders, PrePolicyResponseHeaders, ResponseTrailerGovernance,
+    TrailerSectionKind, apply_response_headers, has_client_response_hop_by_hop_headers,
     is_backend_response_strip_header, parse_connection_listed_headers,
-    strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
+    reconcile_streaming_backend_trailers, strip_client_response_hop_by_hop_headers,
+    strip_response_hop_by_hop_trailers,
 };
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
@@ -219,6 +221,11 @@ where
     pub response_committed_plugins: &'a [Arc<dyn Plugin>],
     pub requires_response_stream_hooks: bool,
     pub sticky_cookie_needed: bool,
+    /// Config-time response-trailer governance, precomputed per reload. Used by
+    /// the STREAMING gRPC relay, whose terminal metadata crosses the
+    /// response-header policy boundary after the initial HEADERS frame is
+    /// already on the wire (GHSA-r78v-rc86-6r86).
+    pub response_trailer_governance: ResponseTrailerGovernance<'a>,
 }
 
 fn record_cross_protocol_connection_start(
@@ -400,7 +407,7 @@ where
             let (mut normalized, mut translated) = normalize_reject_for_client(
                 ctx,
                 http_status,
-                &rejection.body,
+                rejection.body,
                 &headers,
                 matches!(flavor, HttpFlavor::Grpc),
             );
@@ -416,7 +423,7 @@ where
                 write_reject_with_headers(
                     stream,
                     StatusCode::OK,
-                    &translated.body,
+                    Bytes::from(translated.body),
                     &translated.headers,
                     backend_start,
                     bytes_sent,
@@ -428,7 +435,7 @@ where
                 write_reject_with_headers(
                     stream,
                     normalized.http_status,
-                    &normalized.body,
+                    normalized.body,
                     &normalized.headers,
                     backend_start,
                     bytes_sent,
@@ -612,6 +619,7 @@ where
         response_committed_plugins,
         requires_response_stream_hooks,
         sticky_cookie_needed,
+        response_trailer_governance,
     } = request;
     let backend_start = Instant::now();
     let raw_prebuffered_body_bytes = raw_prebuffered_body_bytes.unwrap_or_else(|| {
@@ -757,6 +765,7 @@ where
                 requires_response_body_buffering,
                 response_committed_plugins,
                 sticky_cookie_needed,
+                response_trailer_governance,
             )
             .await
         }
@@ -890,7 +899,7 @@ fn reqwest_error_response_for_cross_protocol(
     };
     crate::retry::BackendResponse {
         status_code: 502,
-        body: crate::retry::ResponseBody::Buffered(error_body.as_bytes().to_vec()),
+        body: crate::retry::ResponseBody::buffered(error_body.as_bytes().to_vec()),
         headers: HashMap::new(),
         // Funnel through `request_reached_wire` instead of
         // `e.is_connect() || e.is_timeout()` — the predicate-pair misses
@@ -1370,7 +1379,7 @@ where
     let (_, translated) = normalize_reject_for_client(
         ctx,
         deadline.http_status,
-        &deadline.body,
+        deadline.body,
         &deadline.headers,
         false,
     );
@@ -1388,7 +1397,7 @@ where
     let write = write_reject_with_headers(
         stream,
         StatusCode::OK,
-        &translated.body,
+        Bytes::from(translated.body),
         &translated.headers,
         backend_start,
         bytes_sent,
@@ -1441,7 +1450,7 @@ where
     let (_, translated) = normalize_reject_for_client(
         ctx,
         deadline.http_status,
-        &deadline.body,
+        deadline.body,
         &deadline.headers,
         false,
     );
@@ -1766,7 +1775,7 @@ where
                         Ok(response) => {
                             let attempt_result = crate::retry::BackendResponse {
                                 status_code: response.status().as_u16(),
-                                body: crate::retry::ResponseBody::Buffered(Vec::new()),
+                                body: crate::retry::ResponseBody::buffered(Vec::new()),
                                 headers: HashMap::new(),
                                 connection_error: false,
                                 backend_resolved_ip: None,
@@ -2614,7 +2623,7 @@ where
         let reject_status =
             StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let (mut normalized, mut translated) =
-            normalize_reject_for_client(ctx, reject_status, &reject.body, &reject.headers, false);
+            normalize_reject_for_client(ctx, reject_status, reject.body, &reject.headers, false);
         run_cross_protocol_reject_committed_hooks(
             response_committed_plugins,
             ctx,
@@ -2627,7 +2636,7 @@ where
             write_reject_with_headers(
                 stream,
                 StatusCode::OK,
-                &translated.body,
+                Bytes::from(translated.body),
                 &translated.headers,
                 backend_start,
                 bytes_sent,
@@ -2637,7 +2646,7 @@ where
             write_reject_with_headers(
                 stream,
                 normalized.http_status,
-                &normalized.body,
+                normalized.body,
                 &normalized.headers,
                 backend_start,
                 bytes_sent,
@@ -2692,7 +2701,7 @@ where
         )
         .await
         {
-            Ok(Ok(body)) => body,
+            Ok(Ok(body)) => bytes::Bytes::from(body),
             Ok(Err((error_body, error_class))) => {
                 record_backend_outcome(
                     state,
@@ -2720,7 +2729,7 @@ where
                     stream,
                     ctx,
                     StatusCode::BAD_GATEWAY,
-                    &error_body,
+                    bytes::Bytes::from(error_body),
                     &empty_headers,
                     backend_start,
                     bytes_sent,
@@ -2855,7 +2864,7 @@ where
                                 "content-length".to_string(),
                                 transformed.len().to_string(),
                             );
-                            response_body = transformed;
+                            response_body = bytes::Bytes::from(transformed);
                             crate::plugins::finalize_response_body_transformation(
                                 plugin.as_ref(),
                                 ctx,
@@ -3011,7 +3020,7 @@ where
         let bytes_streamed = response_body.len() as u64;
         let buffered_write = async {
             if !response_body.is_empty() {
-                stream.send_data(Bytes::from(response_body)).await?;
+                stream.send_data(response_body).await?;
             }
             stream.finish().await
         };
@@ -3453,6 +3462,13 @@ async fn handle_h3_grpc_streaming_response<S>(
     // to classify a resulting response-body error as a CLIENT abort rather than a
     // backend fault (codex P2). `None` on the buffered-request path (no pump).
     frontend_upload_failed: Option<&Arc<AtomicBool>>,
+    // Config-time response-trailer governance. Native gRPC terminal metadata on
+    // this bridge crosses the response-header policy boundary exactly like a
+    // plain streaming relay's trailer section (GHSA-r78v-rc86-6r86); only the
+    // three RESERVED terminal fields are exempt. Applied to BOTH terminal
+    // shapes this bridge can emit: the forwarded TRAILERS frame and the
+    // translated gRPC-Web terminal DATA frame.
+    response_trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: SendStream<Bytes>,
@@ -3530,6 +3546,27 @@ where
                     .collect::<HashSet<String>>()
             });
 
+    // Response-trailer policy boundary for the H3-to-H2 native gRPC STREAMING
+    // bridge (GHSA-r78v-rc86-6r86), used by the forwarded-trailers branch and by
+    // the translated gRPC-Web terminal-frame branch alike. Captured on the
+    // PRISTINE backend header map,
+    // before `after_proxy`, sticky-cookie injection, the gRPC-Web initial
+    // metadata take, and the `content-length` strips below — all of which are on
+    // the wire before the backend's TRAILERS frame is read.
+    //
+    // Same gate as the plain relays: with no plugin able to touch response
+    // headers, no sticky cookie, and no `content-length` for the gateway to
+    // strip, nothing here can mutate a header, so the #2941 pass-through stands.
+    // Hop-by-hop names are stripped from the trailer section before
+    // reconciliation and can never reach it, so they need no gate entry.
+    let grpc_pre_policy_response_headers = PrePolicyResponseHeaders::capture_for_streaming(
+        &streaming.headers,
+        response_trailer_governance,
+        !plugins.is_empty()
+            || sticky_cookie_needed
+            || streaming.headers.contains_key("content-length"),
+    );
+
     // Streaming variant: pool returned a live hyper Incoming. Run
     // after_proxy + sticky cookie on headers BEFORE streaming
     // begins — body-level hooks (`on_response_body`,
@@ -3552,7 +3589,7 @@ where
             ctx,
             PluginResult::RejectBinary {
                 status_code: reject.status_code,
-                body: Bytes::from(reject.body),
+                body: reject.body,
                 headers: reject.headers,
             },
             backend_start,
@@ -3760,11 +3797,55 @@ where
         crate::http3::stream_util::abort_response_stream(stream);
         final_body_completed = false;
     } else if body_completed && let Some(text_mode) = grpc_web_translation_mode {
+        // Translated gRPC-Web. The terminal metadata is adapted into a final
+        // DATA frame instead of a TRAILERS frame, but WHERE it came from decides
+        // whether the response-header policy already saw it:
+        //
+        //   * A genuine Trailers-Only response carries it in the initial
+        //     END_STREAM HEADERS block, which `after_proxy` and the pristine
+        //     snapshot above already governed — `grpc_web_initial_terminal_metadata`
+        //     is that governed view, so it needs nothing more here.
+        //   * A NON-EMPTY streaming response instead delivers it in a later
+        //     TRAILERS frame, long after the header boundary closed. That block
+        //     crosses exactly the boundary GHSA-r78v-rc86-6r86 reports, and the
+        //     gRPC-Web encoding below makes it client-visible just as
+        //     `send_trailers` would — so it gets the SAME reconciliation the
+        //     native trailer-forwarding branch applies, on the same
+        //     request-scoped boundary, before any of it can be encoded.
         let mut collected = grpc_web_initial_terminal_metadata
             .take()
             .unwrap_or_default();
+        let mut pristine_trailer_status = None;
         if let Some(mut trailers) = trailers {
+            // Latch the PRISTINE backend terminal status first, like the native
+            // branch below, so backend health, admission, deadline, and
+            // observability classification are decided by what the backend sent
+            // rather than by anything governance did. Only a VALID numeric
+            // status latches: a malformed or absent one keeps deriving from the
+            // built frame (`build_streaming_trailer_data` maps it from the HTTP
+            // status), so this latch cannot change any existing classification —
+            // the reserved fields are exempt by section, so the two always
+            // agree, and the latch simply makes that independent of governance.
+            pristine_trailer_status = trailers
+                .get("grpc-status")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u32>().ok());
             strip_response_hop_by_hop_trailers(&mut trailers);
+            let removed = reconcile_streaming_backend_trailers(
+                &mut trailers,
+                &streaming.headers,
+                &grpc_pre_policy_response_headers,
+                response_trailer_governance,
+                GatewayOwnedResponseHeaders::default(),
+                TrailerSectionKind::NativeGrpcTerminal,
+            );
+            if removed > 0 {
+                debug!(
+                    removed,
+                    "cross-protocol H3 gRPC-Web streaming: dropped backend trailer application \
+                     metadata governed by response header policy"
+                );
+            }
             collected.clear();
             crate::proxy::grpc_proxy::collect_buffered_grpc_trailers(&trailers, &mut collected);
         }
@@ -3774,7 +3855,7 @@ where
                 streaming.status,
                 text_mode,
             );
-        grpc_trailer_status = Some(terminal_status);
+        grpc_trailer_status = Some(pristine_trailer_status.unwrap_or(terminal_status));
         let terminal_len = terminal_data.len() as u64;
         let terminal_write = if client_deadline_expired {
             crate::http3::stream_util::await_terminal_response_write_before_deadline(
@@ -3837,6 +3918,27 @@ where
         // client through the TRAILERS frame.
         let had_trailers = !trailers.is_empty();
         strip_response_hop_by_hop_trailers(&mut trailers);
+        // Last point where the response-header policy boundary can still bind
+        // this RPC's terminal metadata (GHSA-r78v-rc86-6r86). `grpc_trailer_status`
+        // is already latched from the pristine trailer block above, so backend
+        // health / admission classification is unaffected, and the three reserved
+        // terminal fields are exempt by section — a governed drop can never
+        // truncate the RPC outcome. Runs once, on the trailer frame only.
+        let removed = reconcile_streaming_backend_trailers(
+            &mut trailers,
+            &streaming.headers,
+            &grpc_pre_policy_response_headers,
+            response_trailer_governance,
+            GatewayOwnedResponseHeaders::default(),
+            TrailerSectionKind::NativeGrpcTerminal,
+        );
+        if removed > 0 {
+            debug!(
+                removed,
+                "cross-protocol H3 gRPC streaming: dropped backend trailer application metadata \
+                 governed by response header policy"
+            );
+        }
         if !trailers.is_empty() {
             let trailer_write = if client_deadline_expired {
                 // The timer already selected these canonical status-4 trailers.
@@ -4063,6 +4165,7 @@ async fn dispatch_grpc<S>(
     requires_response_body_buffering: bool,
     response_committed_plugins: &[Arc<dyn Plugin>],
     sticky_cookie_needed: bool,
+    response_trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -4677,7 +4780,7 @@ where
                     ctx,
                     PluginResult::RejectBinary {
                         status_code: reject.status_code,
-                        body: Bytes::from(reject.body),
+                        body: reject.body,
                         headers: reject.headers,
                     },
                     response_committed_plugins,
@@ -4760,7 +4863,7 @@ where
             // trailer-only backend `set-cookie` cannot divert it into the wire
             // trailers.
             let mut response_status = resp.status;
-            let mut response_body = resp.body;
+            let mut response_body = bytes::Bytes::from(resp.body);
             let mut response_trailers = resp.trailers;
             if normalize_response_body_for_inspection(
                 plugins,
@@ -4949,7 +5052,7 @@ where
                     if let Some(transformed) = transformed {
                         plugin_response_headers
                             .insert("content-length".to_string(), transformed.len().to_string());
-                        response_body = transformed;
+                        response_body = bytes::Bytes::from(transformed);
                         crate::plugins::finalize_response_body_transformation(
                             plugin.as_ref(),
                             ctx,
@@ -5069,16 +5172,20 @@ where
                 let content_type = plugin_response_headers
                     .get("content-type")
                     .map(String::as_str);
-                if crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
-                    &mut response_body,
-                    content_type,
-                    &response_trailers,
-                    http_status,
-                ) {
-                    plugin_response_headers.insert(
-                        "content-length".to_string(),
-                        response_body.len().to_string(),
+                let mut owned_body =
+                    crate::retry::ResponseBody::take_buffered_vec(&mut response_body);
+                let synced =
+                    crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
+                        &mut owned_body,
+                        content_type,
+                        &response_trailers,
+                        http_status,
                     );
+                let synced_len = owned_body.len();
+                crate::retry::ResponseBody::store_buffered_vec(&mut response_body, owned_body);
+                if synced {
+                    plugin_response_headers
+                        .insert("content-length".to_string(), synced_len.to_string());
                 }
             }
             // Retire compatibility-view application trailers only after the
@@ -5222,13 +5329,13 @@ where
                 let body_write = if terminal_gateway_deadline {
                     crate::http3::stream_util::await_terminal_response_write_before_deadline(
                         grpc_deadline_at,
-                        stream.send_data(Bytes::from(response_body)),
+                        stream.send_data(response_body),
                     )
                     .await
                 } else {
                     crate::http3::stream_util::await_response_write_before_deadline(
                         grpc_deadline_at,
-                        stream.send_data(Bytes::from(response_body)),
+                        stream.send_data(response_body),
                     )
                     .await
                 };
@@ -5415,6 +5522,7 @@ where
                 // Buffered-request path: the body was fully drained + size-checked
                 // before dispatch, so there is no streaming pump / client-abort flag.
                 None,
+                response_trailer_governance,
             )
             .await
         }
@@ -5546,6 +5654,7 @@ pub(crate) async fn dispatch_grpc_streaming(
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
     backend_admission_plugins: &[Arc<dyn Plugin>],
     sticky_cookie_needed: bool,
+    response_trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error> {
     let mut stream = stream;
     let current_target = upstream_target.cloned().map(Arc::new);
@@ -5780,6 +5889,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 backend_url,
                 final_backend_resolved_ip.clone(),
                 Some(&frontend_upload_failed),
+                response_trailer_governance,
             )
             .await
         }
@@ -5950,7 +6060,7 @@ async fn apply_buffered_plain_plugin_reject(
     reject: PluginResult,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut bytes::Bytes,
 ) {
     let Some(mut reject) = crate::proxy::plugin_result_into_reject_parts(reject) else {
         warn!("buffered plain reject helper received a non-reject plugin result");
@@ -5982,7 +6092,7 @@ async fn apply_buffered_grpc_plugin_reject(
     reject: PluginResult,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut bytes::Bytes,
     response_trailers: &mut HashMap<String, String>,
 ) {
     let Some(mut reject) = crate::proxy::plugin_result_into_reject_parts(reject) else {
@@ -6000,10 +6110,22 @@ async fn apply_buffered_grpc_plugin_reject(
     .await;
     let normalized = normalize_h3_grpc_reject(
         StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
-        &reject.body,
+        reject.body,
         &headers,
     );
     apply_h3_grpc_reject_metadata(ctx, &normalized);
+    // A rejection here replaces the backend response wholesale, so the backend's
+    // trailers must not survive.
+    //
+    // This helper is the response-BODY reject path: it runs only after a backend
+    // response was received, whereas `serverless_function` terminate
+    // short-circuits in `before_proxy` before any backend dispatch. A framed
+    // unary terminate representation can therefore never arrive here, and
+    // `normalize_h3_grpc_reject` deliberately carries no framed provenance — so
+    // the normalized rejection is always trailers-only and the clear is
+    // unconditional. Every caller immediately follows with
+    // `select_buffered_grpc_terminal_response`, which clears again from the
+    // gateway-authored header view.
     *response_status = normalized.http_status.as_u16();
     *response_headers = normalized.headers;
     *response_body = normalized.body;
@@ -6013,7 +6135,7 @@ async fn apply_buffered_grpc_plugin_reject(
 fn normalized_h3_grpc_deadline() -> crate::proxy::NormalizedRejectResponse {
     normalize_h3_grpc_reject(
         StatusCode::OK,
-        &[],
+        Bytes::new(),
         &HashMap::from([
             ("content-type".to_string(), "application/grpc".to_string()),
             (
@@ -6032,7 +6154,7 @@ fn replace_buffered_grpc_response_with_deadline(
     ctx: &mut RequestContext,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut bytes::Bytes,
     response_trailers: &mut HashMap<String, String>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) {
@@ -6823,10 +6945,10 @@ where
     })
 }
 
-fn normalize_reject_for_client(
+pub(crate) fn normalize_reject_for_client(
     ctx: &mut RequestContext,
     status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     headers: &HashMap<String, String>,
     native_grpc: bool,
 ) -> (
@@ -6834,6 +6956,9 @@ fn normalize_reject_for_client(
     Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
 ) {
     let grpc_web = crate::plugins::grpc_web::client_uses_grpc_web(ctx);
+    // Cross-protocol rejects run only after backend dispatch; `serverless_function`
+    // terminate short-circuits in `before_proxy`, so framed unary provenance
+    // never reaches this normalizer.
     let normalized =
         crate::proxy::normalize_reject_response(status, body, headers, native_grpc || grpc_web);
     if native_grpc || grpc_web {
@@ -6862,18 +6987,18 @@ fn normalize_reject_for_client(
 fn reject_committed_response_view<'a>(
     normalized: &'a crate::proxy::NormalizedRejectResponse,
     translated: Option<&'a crate::plugins::grpc_web::GrpcWebErrorResponse>,
-) -> (u16, &'a HashMap<String, String>, &'a [u8]) {
+) -> (u16, &'a HashMap<String, String>, Bytes) {
     if let Some(translated) = translated {
         (
             StatusCode::OK.as_u16(),
             &translated.headers,
-            &translated.body,
+            Bytes::from(translated.body.clone()),
         )
     } else {
         (
             normalized.http_status.as_u16(),
             &normalized.headers,
-            &normalized.body,
+            normalized.body.clone(),
         )
     }
 }
@@ -6912,7 +7037,7 @@ async fn run_cross_protocol_reject_committed_hooks(
             (*normalized, *translated) = normalize_reject_for_client(
                 ctx,
                 deadline.http_status,
-                &deadline.body,
+                deadline.body.clone(),
                 &deadline.headers,
                 native_grpc,
             );
@@ -6924,7 +7049,7 @@ async fn run_cross_protocol_reject_committed_hooks(
             plugins[index + 1..].to_vec(),
             status,
             Arc::new(headers.clone()),
-            Arc::new(body.to_vec()),
+            body,
         );
         return deadline_replaced;
     }
@@ -6950,7 +7075,7 @@ where
         stream,
         ctx,
         status,
-        body.as_bytes(),
+        Bytes::from_static(body.as_bytes()),
         &headers,
         backend_start,
         bytes_sent,
@@ -6962,7 +7087,7 @@ async fn write_plain_gateway_reject<S>(
     stream: &mut RequestStream<S, Bytes>,
     ctx: &mut RequestContext,
     status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     headers: &HashMap<String, String>,
     backend_start: Instant,
     bytes_sent: u64,
@@ -6975,7 +7100,7 @@ where
         return write_reject_with_headers(
             stream,
             StatusCode::OK,
-            &translated.body,
+            Bytes::from(translated.body),
             &translated.headers,
             backend_start,
             bytes_sent,
@@ -6985,7 +7110,7 @@ where
     write_reject_with_headers(
         stream,
         normalized.http_status,
-        &normalized.body,
+        normalized.body,
         &normalized.headers,
         backend_start,
         bytes_sent,
@@ -7000,7 +7125,7 @@ where
 async fn write_reject_with_headers<S>(
     stream: &mut RequestStream<S, Bytes>,
     status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     headers: &HashMap<String, String>,
     backend_start: Instant,
     bytes_sent: u64,
@@ -7023,7 +7148,7 @@ where
 async fn write_reject_with_headers_and_recv_halt<S>(
     stream: &mut RequestStream<S, Bytes>,
     status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     headers: &HashMap<String, String>,
     backend_start: Instant,
     bytes_sent: u64,
@@ -7056,7 +7181,7 @@ where
     stream.send_response(resp).await?;
     let len = body.len() as u64;
     if !body.is_empty() {
-        let _ = stream.send_data(Bytes::copy_from_slice(body)).await;
+        let _ = stream.send_data(body).await;
     }
     let _ = stream.finish().await;
     if halt_recv {
@@ -7171,7 +7296,7 @@ where
     let (mut normalized, mut grpc_web_reject) = normalize_reject_for_client(
         ctx,
         http_status,
-        &parts.body,
+        parts.body,
         &headers,
         matches!(flavor, HttpFlavor::Grpc),
     );
@@ -7196,7 +7321,7 @@ where
             let write = write_reject_with_headers_and_recv_halt(
                 stream,
                 StatusCode::OK,
-                &translated.body,
+                Bytes::from(translated.body),
                 &translated.headers,
                 backend_start,
                 bytes_sent,
@@ -7233,7 +7358,7 @@ where
         write_reject_with_headers(
             stream,
             StatusCode::OK,
-            &translated.body,
+            Bytes::from(translated.body),
             &translated.headers,
             backend_start,
             bytes_sent,
@@ -7277,7 +7402,7 @@ where
         let write = write_reject_with_headers_and_recv_halt(
             stream,
             normalized.http_status,
-            &normalized.body,
+            normalized.body,
             &normalized.headers,
             backend_start,
             bytes_sent,
@@ -7310,7 +7435,7 @@ where
         write_reject_with_headers(
             stream,
             normalized.http_status,
-            &normalized.body,
+            normalized.body,
             &normalized.headers,
             backend_start,
             bytes_sent,
@@ -7321,7 +7446,7 @@ where
 
 fn normalize_h3_grpc_reject(
     status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     headers: &HashMap<String, String>,
 ) -> crate::proxy::NormalizedRejectResponse {
     crate::proxy::normalize_reject_response(status, body, headers, true)
@@ -7372,32 +7497,28 @@ where
 {
     debug_assert!(
         reject.body.is_empty(),
-        "normalized gRPC rejects should be trailers-only"
+        "cross-protocol gRPC rejects must be trailers-only"
     );
     let mut headers = reject.headers.clone();
     strip_client_response_hop_by_hop_headers(&mut headers);
-    let mut resp_builder = Response::builder().status(reject.http_status);
-    for (key, value) in &headers {
-        let sanitized_grpc_message;
-        let header_value = if key.eq_ignore_ascii_case("grpc-message") {
-            sanitized_grpc_message = sanitize_h3_grpc_message_for_header(value);
-            if sanitized_grpc_message.is_empty() {
-                continue;
-            }
-            sanitized_grpc_message.as_str()
+    if let Some(key) = headers
+        .keys()
+        .find(|name| name.eq_ignore_ascii_case("grpc-message"))
+        .cloned()
+    {
+        let sanitized = sanitize_h3_grpc_message_for_header(&headers[&key]);
+        if sanitized.is_empty() {
+            headers.remove(&key);
         } else {
-            value.as_str()
-        };
-        if let (Ok(name), Ok(val)) = (
-            HeaderName::from_bytes(key.as_bytes()),
-            HeaderValue::from_str(header_value),
-        ) {
-            resp_builder = resp_builder.header(name, val);
+            headers.insert(key, sanitized);
         }
     }
-    let resp = resp_builder
-        .body(())
-        .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC reject response: {}", e))?;
+    let resp = crate::proxy::headers::apply_response_headers(
+        Response::builder().status(reject.http_status),
+        &headers,
+    )
+    .body(())
+    .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC reject response: {}", e))?;
     stream.send_response(resp).await?;
     let _ = stream.finish().await;
     Ok(CrossProtocolOutcome {
@@ -7456,7 +7577,7 @@ where
     )
     .await;
     let http_status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_REQUEST);
-    let mut normalized = normalize_h3_grpc_reject(http_status, &parts.body, &headers);
+    let mut normalized = normalize_h3_grpc_reject(http_status, parts.body, &headers);
     apply_h3_grpc_reject_metadata(ctx, &normalized);
     for (index, plugin) in plugins.iter().enumerate() {
         if !plugin.requires_response_committed_hook() {
@@ -7468,7 +7589,7 @@ where
             ctx,
             normalized.http_status.as_u16(),
             &normalized.headers,
-            &normalized.body,
+            normalized.body.clone(),
             terminal_gateway_deadline,
         )
         .await
@@ -7485,7 +7606,7 @@ where
             plugins[index + 1..].to_vec(),
             normalized.http_status.as_u16(),
             Arc::new(normalized.headers.clone()),
-            Arc::new(normalized.body.clone()),
+            normalized.body.clone(),
         );
         break;
     }
@@ -7648,7 +7769,7 @@ where
         return write_reject_with_headers_and_recv_halt(
             stream,
             StatusCode::OK,
-            &translated.body,
+            Bytes::from(translated.body),
             &translated.headers,
             backend_start,
             bytes_sent,
@@ -7889,7 +8010,7 @@ mod tests {
         let mut status = 503;
         let mut headers =
             HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-        let mut body = b"backend response".to_vec();
+        let mut body = bytes::Bytes::from_static(b"backend response");
         let mut trailers = HashMap::from([("grpc-status".to_string(), "0".to_string())]);
 
         replace_buffered_grpc_response_with_deadline(
@@ -8062,7 +8183,7 @@ mod tests {
         let mut response_status = 200;
         let mut response_headers =
             HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
-        let mut response_body = b"backend-body".to_vec();
+        let mut response_body = bytes::Bytes::from_static(b"backend-body");
         let mut response_trailers = HashMap::from([("grpc-status".to_string(), "0".to_string())]);
 
         apply_buffered_grpc_plugin_reject(
@@ -8130,7 +8251,7 @@ mod tests {
         let mut response_status = 200;
         let mut response_headers =
             HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
-        let mut response_body = b"backend-body".to_vec();
+        let mut response_body = bytes::Bytes::from_static(b"backend-body");
         let mut response_trailers = HashMap::from([("grpc-status".to_string(), "0".to_string())]);
 
         apply_buffered_grpc_plugin_reject(
@@ -8182,7 +8303,7 @@ mod tests {
         let mut response_status = 200;
         let mut response_headers =
             HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
-        let mut response_body = b"backend-body".to_vec();
+        let mut response_body = bytes::Bytes::from_static(b"backend-body");
 
         apply_buffered_plain_plugin_reject(
             &plugins,
@@ -8199,7 +8320,7 @@ mod tests {
         .await;
 
         assert_eq!(response_status, 403);
-        assert_eq!(response_body, br#"{"error":"Forbidden"}"#);
+        assert_eq!(&*response_body, br#"{"error":"Forbidden"}"#);
         assert_eq!(
             response_headers
                 .get("content-type")
@@ -8470,7 +8591,7 @@ mod tests {
     fn h3_grpc_reject_normalization_preserves_custom_headers_and_metadata() {
         let normalized = normalize_h3_grpc_reject(
             StatusCode::TOO_MANY_REQUESTS,
-            br#"{"error":"Rate limit exceeded"}"#,
+            bytes::Bytes::from_static(br#"{"error":"Rate limit exceeded"}"#),
             &HashMap::from([("x-ratelimit-limit".to_string(), "5".to_string())]),
         );
         let mut ctx = RequestContext::new(

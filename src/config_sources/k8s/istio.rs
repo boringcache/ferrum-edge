@@ -3,11 +3,12 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use crate::identity::spiffe::SpiffeId;
+use crate::modes::mesh::access_log_filter::parse_access_log_filter_expression;
 use crate::modes::mesh::config::{
-    AccessLogFilter, AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig,
-    MeshConsistentHash, MeshCorsOriginMatch, MeshCorsPolicy, MeshDestinationRule, MeshEndpoint,
-    MeshJwtRule, MeshLoadBalancer, MeshLocalityDistribute, MeshLocalityFailover,
-    MeshLocalityLbSetting, MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshProxyConfig,
+    AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig, MeshConsistentHash,
+    MeshCorsOriginMatch, MeshCorsPolicy, MeshDestinationRule, MeshEndpoint, MeshJwtRule,
+    MeshLoadBalancer, MeshLocalityDistribute, MeshLocalityFailover, MeshLocalityLbSetting,
+    MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshProxyConfig,
     MeshRequestAuthentication, MeshRule, MeshSidecar, MeshSidecarEgress, MeshSidecarIngress,
     MeshSimpleLb, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
     MeshTrafficPolicy, MeshTrafficPolicyTls, MeshVirtualServiceCorsPolicy, MetricTagOverride,
@@ -2797,12 +2798,15 @@ fn virtual_service_routes(
             }
 
             // Istio `http[].corsPolicy`: translate to a proxy-scoped `cors`
-            // plugin when the origins are representable (allowOrigins[].exact /
-            // legacy allowOrigin). prefix/regex origin matchers have no `cors`
-            // plugin equivalent, so they are left unprojected (warned + reported
-            // as a deferred field) rather than silently approximated. Like
-            // mirror this is a route-local plugin, so a route that must collapse
-            // with siblings fails closed via `route_has_uncollapsible_local_policy`.
+            // plugin when the origins are representable — `allowOrigins[]`
+            // exact/prefix/regex `StringMatch` (exact projected LITERALLY, regex
+            // compiled under explicit bounds) or the legacy `allowOrigin` list.
+            // A matcher outside those bounds is left unprojected (warned +
+            // reported as a deferred field) rather than silently approximated
+            // or widened. Like mirror this is a route-local plugin, so a route
+            // that must collapse with siblings fails closed via
+            // `route_has_uncollapsible_local_policy` — route-local CORS never
+            // leaks onto a sibling route.
             if let Some(cors_plugin) = route_cors_plugin(object, http, &proxy_id) {
                 route_plugins.push(cors_plugin);
             }
@@ -3654,40 +3658,49 @@ fn cors_unmatched_preflights(cors: &Value) -> Result<IstioUnmatchedPreflights, (
 
 /// Extract CORS allowed origins from an Istio `corsPolicy`, mapped to the
 /// `cors` plugin's `allowed_origins` form (a JSON array). Supports the full
-/// Istio `allowOrigins[]` `StringMatch` set — `exact` (emitted as a plain
-/// string, byte-identical to the prior exact-only projection), `prefix`
-/// (emitted as `{"prefix": ...}`), and `regex` (emitted as `{"regex": ...}`) —
-/// plus the legacy `allowOrigin` string list (exact strings). The extended
-/// `cors` plugin matches these the same way Ferrum matches Istio `StringMatch`
-/// elsewhere (literal prefix; RE2 full match for regex).
+/// Istio `allowOrigins[]` `StringMatch` set — `exact` (emitted as
+/// `{"exact": ...}`, the plugin's LITERAL matcher), `prefix` (emitted as
+/// `{"prefix": ...}`), and `regex` (emitted as `{"regex": ...}`) — plus the
+/// legacy `allowOrigin` string list (exact strings, projected through the same
+/// literal `{"exact": ...}` matcher). The `cors` plugin matches these the same
+/// way Ferrum matches Istio `StringMatch` elsewhere: byte-literal exact,
+/// literal prefix, RE2 full match for regex.
+///
+/// Every exact is emitted as the OBJECT matcher, never as the plugin's
+/// plain-string form (issue #3254): the plain-string form is native syntax that
+/// canonicalizes the value and reads a leading `*` as wildcard-subdomain
+/// syntax, so projecting `*.example.com` or `https://Example.com:443` through
+/// it would authorize origins the source never matched. The object matcher
+/// preserves the source string byte-for-byte, which is why those shapes are now
+/// translatable at all instead of being deferred.
 ///
 /// Returns `None` (policy left unprojected, surfaced as a `deferred_fields`
-/// entry by the status writer) when there is no origin list, when any entry is
-/// not a single-key `exact`/`prefix`/`regex` `StringMatch` (an unknown or
-/// multi-key matcher is fail-closed, not approximated), when a string is empty,
-/// or when a `regex` matcher does not compile — so a policy this returns `Some`
-/// for is ALWAYS projectable into a valid `cors` plugin config (no
+/// entry by the status writer) when there is no origin list, when the list
+/// exceeds the shared matcher-count bound, when any entry is not a single-key
+/// `exact`/`prefix`/`regex` `StringMatch` (an unknown or multi-key matcher is
+/// fail-closed, not approximated), or when any matcher fails the plugin's own
+/// bounded admission (empty/whitespace-only exact, empty prefix, over-budget
+/// value, un-compilable or over-complex regex) — so a policy this returns
+/// `Some` for is ALWAYS projectable into a valid `cors` plugin config (no
 /// translate-then-silently-drop gap). `cors_policy_translatable` and the actual
 /// projection both go through here, so the predicate and the emitted config can
 /// never disagree on which shapes are representable.
 fn cors_allowed_origins(cors: &Value) -> Option<Vec<Value>> {
     if let Some(arr) = cors.get("allowOrigins").and_then(Value::as_array) {
+        crate::plugins::cors::validate_origin_matcher_count(arr.len()).ok()?;
         let mut origins = Vec::with_capacity(arr.len());
         for entry in arr {
             origins.push(cors_origin_matcher_value(entry)?);
         }
         (!origins.is_empty()).then_some(origins)
     } else if let Some(arr) = cors.get("allowOrigin").and_then(Value::as_array) {
-        // Deprecated Istio field: a plain list of exact origin strings. The
-        // SAME exact-origin gate as the StringMatch `exact` arm applies — the
-        // two forms project into the identical plugin plain-string shape.
+        // Deprecated Istio field: a plain list of exact origin strings with the
+        // SAME literal semantics as the StringMatch `exact` arm — the two forms
+        // project into the identical `{"exact": ...}` plugin shape.
+        crate::plugins::cors::validate_origin_matcher_count(arr.len()).ok()?;
         let mut origins = Vec::with_capacity(arr.len());
         for entry in arr {
-            let s = entry.as_str()?;
-            if !plain_exact_origin_translatable(s) {
-                return None;
-            }
-            origins.push(Value::String(s.to_string()));
+            origins.push(cors_exact_origin_matcher_value(entry.as_str()?)?);
         }
         (!origins.is_empty()).then_some(origins)
     } else {
@@ -3695,54 +3708,33 @@ fn cors_allowed_origins(cors: &Value) -> Option<Vec<Value>> {
     }
 }
 
-/// Whether an Istio exact origin (`allowOrigins[].exact` or a legacy
-/// `allowOrigin` list entry) can be faithfully projected as the `cors`
-/// plugin's PLAIN-STRING `allowed_origins` form. Fails (policy stays
-/// deferred) when:
-/// - empty/whitespace-only, or wildcard-shaped after trimming other than exact
-///   `*`: Istio explicitly assigns exact `*` allow-all semantics, but values
-///   such as `*.example.com` remain literal upstream and must not be
-///   reinterpreted as the native plugin's wildcard-subdomain syntax;
-/// - whitespace-padded: the plugin's trim would match the TRIMMED origin
-///   while Istio's literal exact only matches the padded value (i.e. no real
-///   Origin header) — the same silent widening;
-/// - not an origin the plugin accepts (`scheme://host[:port]` only — no
-///   path/query/fragment/credentials, http(s) scheme; the shared
-///   `plugins::cors::canonicalize_exact_origin` admission): projecting it would
-///   fail `CorsPlugin` construction AFTER translation instead of deferring
-///   here, breaking the always-projectable contract documented on
-///   `cors_allowed_origins`;
-/// - non-canonical: Istio `StringMatch.exact` is literal, while the native
-///   plugin canonicalizes exact origins. Accepting a default port, case
-///   variant, IDNA spelling, or alternate IP spelling would therefore widen
-///   the source matcher to the browser-serialized origin.
-fn plain_exact_origin_translatable(exact: &str) -> bool {
-    let trimmed = exact.trim();
-    if trimmed.is_empty()
-        || (trimmed != "*" && trimmed.starts_with('*'))
-        || trimmed.len() != exact.len()
-    {
-        return false;
+/// Project one Istio exact origin (`allowOrigins[].exact` or a legacy
+/// `allowOrigin` list entry) onto the `cors` plugin's LITERAL `{"exact": ...}`
+/// matcher, preserving the source string byte-for-byte.
+///
+/// Exact `*` is Istio's documented allow-all value and is emitted verbatim; the
+/// plugin maps that one value to its wildcard policy. Every other value stays a
+/// literal — including one that looks like native wildcard syntax
+/// (`*.example.com`) and one that is not the canonical browser serialization
+/// (`https://Example.com:443`). Returns `None` only for values the plugin
+/// itself refuses (empty/whitespace-only, or over the shared byte bound), so
+/// the deferred verdict and the emitted config cannot diverge.
+fn cors_exact_origin_matcher_value(exact: &str) -> Option<Value> {
+    if exact != "*" {
+        crate::plugins::cors::validate_literal_exact_origin(exact).ok()?;
     }
-    if trimmed == "*" {
-        return true;
-    }
-
-    crate::plugins::cors::canonicalize_exact_origin(exact).is_ok_and(|canonical| canonical == exact)
+    Some(serde_json::json!({ "exact": exact }))
 }
 
 /// Map one Istio `allowOrigins[]` `StringMatch` entry to the `cors` plugin's
 /// `allowed_origins` entry form. Returns `None` (unrepresentable → policy stays
-/// deferred) when the entry is not an object carrying EXACTLY ONE non-empty
-/// `exact` / `prefix` / `regex` string, when a `regex` fails to compile, or
-/// when an `exact` is an unsupported wildcard shape, whitespace-padded, or not
-/// a valid canonical `scheme://host[:port]` origin (the plugin's own
-/// exact-origin admission — see
-/// `plugins::cors::canonicalize_exact_origin`). Exact `*` is the documented
-/// Istio allow-all value and projects to native wildcard.
-/// `regex` is compiled here (cold path) purely to gate translatability — the
-/// plugin re-compiles it at config time as the runtime matcher; an invalid
-/// pattern is never reflected into a header.
+/// deferred) when the entry is not an object carrying EXACTLY ONE
+/// `exact` / `prefix` / `regex` string, or when the matcher fails the plugin's
+/// own bounded admission (`plugins::cors::{validate_literal_exact_origin,
+/// validate_origin_prefix, compile_origin_regex}` — do not fork).
+/// `regex` is compiled here (cold path) purely to gate translatability under
+/// the same byte/complexity bounds — the plugin re-compiles it at config time
+/// as the runtime matcher; an invalid pattern is never reflected into a header.
 fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
     let obj = entry.as_object()?;
     // Istio `StringMatch` contract: EXACTLY ONE recognized key with a string
@@ -3761,24 +3753,17 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
     let regex = obj.get("regex").and_then(Value::as_str);
 
     match (exact, prefix, regex) {
-        (Some(exact), None, None) => {
-            // Unsupported wildcard shapes, padded values, and non-origin
-            // exacts are policy changes when projected as the plugin's plain
-            // string form. Exact `*` is intentionally accepted because Istio
-            // assigns it the same allow-all meaning.
-            plain_exact_origin_translatable(exact).then(|| Value::String(exact.to_string()))
-        }
+        (Some(exact), None, None) => cors_exact_origin_matcher_value(exact),
         (None, Some(prefix), None) => {
-            (!prefix.is_empty()).then(|| serde_json::json!({ "prefix": prefix }))
+            crate::plugins::cors::validate_origin_prefix(prefix).ok()?;
+            Some(serde_json::json!({ "prefix": prefix }))
         }
         (None, None, Some(regex)) => {
-            if regex.is_empty() {
-                return None;
-            }
-            // Only translatable if it compiles — otherwise the projected plugin
-            // config would fail validation and be silently dropped, defeating
-            // the route's CORS policy. Keep it deferred instead.
-            regex::Regex::new(&crate::config::types::anchor_regex_pattern(regex)).ok()?;
+            // Only translatable if it compiles WITHIN the plugin's explicit
+            // byte/complexity bounds — otherwise the projected plugin config
+            // would fail validation and be silently dropped, defeating the
+            // route's CORS policy. Keep it deferred instead.
+            crate::plugins::cors::compile_origin_regex(regex).ok()?;
             Some(serde_json::json!({ "regex": regex }))
         }
         _ => None,
@@ -3791,17 +3776,19 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
 /// they never disagree on whether a given policy is projected. A policy is
 /// translatable when it has at least one representable origin
 /// (`allowOrigins[]` `exact`/`prefix`/`regex` `StringMatch` — `regex` must
-/// compile — or the legacy `allowOrigin` exact list), any `maxAge` parses as a
-/// duration, and every `allowMethods`/`allowHeaders`/`exposeHeaders` entry
-/// passes the plugin's own method/header-name admission. Credentialed exact `*`
-/// is deferred because the native wildcard representation cannot emit the
-/// concrete request origin required for credentialed CORS. A malformed/unknown
-/// origin matcher, an un-compilable `regex`, or an invalid method/header token
-/// likewise makes the policy non-translatable so it is left unprojected
-/// (deferred) rather than silently approximated or failing `CorsPlugin`
-/// construction after translation. Exact origins must already equal the
-/// plugin's canonical serialization so its config-path normalization cannot
-/// widen Istio's literal matcher.
+/// compile within the shared bounds — or the legacy `allowOrigin` exact list),
+/// any `maxAge` parses as a duration, and every
+/// `allowMethods`/`allowHeaders`/`exposeHeaders` entry passes the plugin's own
+/// method/header-name admission. Credentialed exact `*` is deferred because the
+/// native wildcard representation cannot emit the concrete request origin
+/// required for credentialed CORS. A malformed/unknown origin matcher, an
+/// un-compilable or over-complex `regex`, an over-budget matcher list, or an
+/// invalid method/header token likewise makes the policy non-translatable so it
+/// is left unprojected (deferred) rather than silently approximated or failing
+/// `CorsPlugin` construction after translation. Exact origins are projected
+/// LITERALLY (issue #3254), so a wildcard-shaped or non-canonical exact is
+/// representable and no longer deferred — it simply keeps the source's literal
+/// matching.
 pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
     let allowed_origins = cors_allowed_origins(cors);
     let origins_ok = allowed_origins.is_some();
@@ -3814,18 +3801,33 @@ pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
         cors.get("allowCredentials"),
         None | Some(Value::Null) | Some(Value::Bool(_))
     );
+    // Exacts are emitted as `{"exact": ...}` matcher objects (issue #3254), so
+    // the allow-all screen must inspect that shape — a bare-string check would
+    // silently stop firing and let credentialed allow-all project, where the
+    // plugin would then drop credentials.
     let credentialed_wildcard_ok = !matches!(cors.get("allowCredentials"), Some(Value::Bool(true)))
-        || !allowed_origins.as_ref().is_some_and(|origins| {
-            origins
-                .iter()
-                .any(|origin| origin.as_str().is_some_and(|origin| origin == "*"))
-        });
+        || !allowed_origins
+            .as_ref()
+            .is_some_and(|origins| origins.iter().any(cors_origin_value_is_allow_all));
     origins_ok
         && max_age_ok
         && allow_credentials_ok
         && credentialed_wildcard_ok
         && cors_unmatched_preflights(cors).is_ok()
         && cors_string_arrays_plugin_valid(cors)
+}
+
+/// Whether one PROJECTED `allowed_origins` entry carries Istio's documented
+/// allow-all value. Covers both emitted shapes so the screen cannot go inert
+/// when the projection changes: the `{"exact": "*"}` matcher object this
+/// translator emits, and a bare `"*"` string (the plugin's native allow-all
+/// form, which the mesh carrier may still produce).
+fn cors_origin_value_is_allow_all(origin: &Value) -> bool {
+    match origin {
+        Value::String(value) => value == "*",
+        Value::Object(map) => map.get("exact").and_then(Value::as_str) == Some("*"),
+        _ => false,
+    }
 }
 
 /// Whether the projected `allowMethods`/`allowHeaders`/`exposeHeaders` lists
@@ -3981,9 +3983,13 @@ fn mesh_cors_policy_from_value(cors: &Value) -> Option<MeshCorsPolicy> {
     let mut allowed_origins = Vec::new();
     for origin in cors_allowed_origins(cors)? {
         let matcher = match &origin {
+            // Kept for the native allow-all string form; the translator itself
+            // now emits every exact as a `{"exact": ...}` matcher object.
             Value::String(exact) => MeshCorsOriginMatch::Exact(exact.clone()),
             Value::Object(map) => {
-                if let Some(prefix) = map.get("prefix").and_then(Value::as_str) {
+                if let Some(exact) = map.get("exact").and_then(Value::as_str) {
+                    MeshCorsOriginMatch::Exact(exact.to_string())
+                } else if let Some(prefix) = map.get("prefix").and_then(Value::as_str) {
                     MeshCorsOriginMatch::Prefix(prefix.to_string())
                 } else {
                     // `cors_allowed_origins` only emits the supported shapes;
@@ -4031,12 +4037,11 @@ fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option
             namespace = %object.metadata.namespace,
             name = %object.metadata.name,
             "VirtualService http[].corsPolicy is not faithfully translatable (allowOrigins[] \
-             must be exact/prefix/regex StringMatch with a compilable regex, or the legacy \
-             allowOrigin exact list, plus well-typed methods, headers, credentials, \
-             unmatched-preflight mode, and maxAge; exact origins must already use their \
-             canonical serialization, and credentialed exact '*' cannot be represented \
-             safely); leaving it unprojected. \
-             Configure the `cors` plugin directly."
+             must be exact/prefix/regex StringMatch, or the legacy allowOrigin exact list, \
+             within the bounded matcher count/size and with a compilable, bounded-complexity \
+             regex, plus well-typed methods, headers, credentials, unmatched-preflight mode, \
+             and maxAge; credentialed exact '*' cannot be represented safely); leaving it \
+             unprojected. Configure the `cors` plugin directly."
         );
         return None;
     }
@@ -4535,6 +4540,7 @@ fn telemetry(
                 disable_span_reporting: None,
                 custom_tags: HashMap::new(),
                 custom_header_tags: HashMap::new(),
+                custom_env_tags: HashMap::new(),
                 providers: Vec::new(),
             };
             let mut emits_server = false;
@@ -4553,52 +4559,66 @@ fn telemetry(
                 saw_entry = true;
                 let sampling = telemetry_sampling_percentage(object, t)?;
                 let mut custom_header_tags: HashMap<String, String> = HashMap::new();
-                let custom_tags: HashMap<String, String> = t
-                    .get("customTags")
-                    .and_then(Value::as_object)
-                    .map(|tags| {
-                        tags.iter()
-                            .filter_map(|(key, val)| {
-                                // Istio customTags: { tagName: { literal: { value: "v" } } }
-                                if let Some(header_name) = val
-                                    .get("header")
-                                    .and_then(|h| h.get("name"))
-                                    .and_then(Value::as_str)
-                                {
-                                    custom_header_tags.insert(key.clone(), header_name.to_string());
-                                    return val
-                                        .get("header")
-                                        .and_then(|header| header.get("defaultValue"))
-                                        .and_then(Value::as_str)
-                                        .map(|value| (key.clone(), value.to_string()));
-                                }
+                let mut custom_env_tags: HashMap<String, String> = HashMap::new();
+                let mut custom_tags: HashMap<String, String> = HashMap::new();
+                if let Some(tags) = t.get("customTags").and_then(Value::as_object) {
+                    for (key, val) in tags {
+                        // Istio customTags: { tagName: { literal: { value: "v" } } }
+                        // | { header: { name, defaultValue? } }
+                        // | { environment: { name, defaultValue? } }
+                        if let Some(header_name) = val
+                            .get("header")
+                            .and_then(|h| h.get("name"))
+                            .and_then(Value::as_str)
+                        {
+                            custom_header_tags.insert(key.clone(), header_name.to_string());
+                            if let Some(value) = val
+                                .get("header")
+                                .and_then(|header| header.get("defaultValue"))
+                                .and_then(Value::as_str)
+                            {
+                                custom_tags.insert(key.clone(), value.to_string());
+                            }
+                            continue;
+                        }
 
-                                let value = val
-                                    .get("literal")
-                                    .and_then(|l| l.get("value"))
-                                    .and_then(Value::as_str)
-                                    .map(str::to_string)
-                                    .or_else(|| {
-                                        let env_tag = val.get("environment")?;
-                                        let name = env_tag.get("name").and_then(Value::as_str)?;
-                                        let default_value = env_tag
-                                            .get("defaultValue")
-                                            .and_then(Value::as_str)
-                                            .map(str::to_string);
-                                        if default_value.is_none() {
-                                            tracing::debug!(
-                                                tag = %key,
-                                                env_var = %name,
-                                                "dropping telemetry custom tag environment reference without defaultValue"
-                                            );
-                                        }
-                                        default_value
-                                    });
-                                value.map(|v| (key.clone(), v))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                        if let Some(literal) = val
+                            .get("literal")
+                            .and_then(|l| l.get("value"))
+                            .and_then(Value::as_str)
+                        {
+                            custom_tags.insert(key.clone(), literal.to_string());
+                            continue;
+                        }
+
+                        if let Some(env_tag) = val.get("environment") {
+                            let Some(name) = env_tag
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|name| !name.is_empty())
+                            else {
+                                return Err(invalid_resource(
+                                    object,
+                                    format!(
+                                        "Telemetry tracing customTags.{key}.environment.name is required"
+                                    ),
+                                ));
+                            };
+                            // Carry a typed DP lookup. Never resolve the
+                            // controller-host environment here — sidecar env is
+                            // only known on the target data plane.
+                            custom_env_tags.insert(key.clone(), name.to_string());
+                            if let Some(default_value) = env_tag
+                                .get("defaultValue")
+                                .and_then(Value::as_str)
+                            {
+                                custom_tags.insert(key.clone(), default_value.to_string());
+                            }
+                            continue;
+                        }
+                    }
+                }
                 let providers = telemetry_tracing_providers(acc, object, t)?;
                 if sampling.is_some() {
                     merged.sampling_percentage = sampling;
@@ -4606,12 +4626,11 @@ fn telemetry(
                 if let Some(disabled) = t.get("disableSpanReporting").and_then(Value::as_bool) {
                     merged.disable_span_reporting = Some(disabled);
                 }
-                if !custom_tags.is_empty() {
-                    merged.custom_tags.extend(custom_tags);
-                }
-                if !custom_header_tags.is_empty() {
-                    merged.custom_header_tags.extend(custom_header_tags);
-                }
+                merged.merge_custom_tag_sources(
+                    &custom_tags,
+                    &custom_header_tags,
+                    &custom_env_tags,
+                );
                 if !providers.is_empty() {
                     extend_unique_tracing_providers(&mut merged.providers, providers);
                 }
@@ -4733,14 +4752,28 @@ fn telemetry(
         .and_then(|arr| arr.first())
         .map(|al| {
             let disabled = al.get("disabled").and_then(Value::as_bool).unwrap_or(false);
-            let filter = al
-                .get("filter")
-                .and_then(|f| f.get("expression"))
-                .and_then(Value::as_str)
-                .map(parse_access_log_filter_expression)
-                .transpose()
-                .map_err(|message| invalid_resource(object, message))?
-                .flatten();
+            let filter = match al.get("filter") {
+                None | Some(Value::Null) => None,
+                Some(Value::Object(filter)) => match filter.get("expression") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(expression)) => {
+                        parse_access_log_filter_expression(expression)
+                            .map_err(|message| invalid_resource(object, message))?
+                    }
+                    Some(_) => {
+                        return Err(invalid_resource(
+                            object,
+                            "Telemetry accessLogging.filter.expression must be a string",
+                        ));
+                    }
+                },
+                Some(_) => {
+                    return Err(invalid_resource(
+                        object,
+                        "Telemetry accessLogging.filter must be an object",
+                    ));
+                }
+            };
             Ok::<_, K8sTranslateError>(MeshAccessLoggingConfig {
                 enabled: !disabled,
                 filter,
@@ -5183,159 +5216,12 @@ fn proxy_config(
     })
 }
 
-/// Parse simple filter expressions like `response.code >= 400` into an
-/// [`AccessLogFilter`]. Returns `Ok(None)` for expressions without supported
-/// access-log predicates and `Err` for malformed supported predicates.
-fn parse_access_log_filter_expression(expr: &str) -> Result<Option<AccessLogFilter>, String> {
-    if expr.contains("||") {
-        return Err(
-            "Telemetry access log filter expressions with '||' are not supported".to_string(),
-        );
-    }
-
-    let mut filter = AccessLogFilter {
-        status_code_min: None,
-        status_code_max: None,
-        min_latency_ms: None,
-        errors_only: false,
-    };
-    let mut matched = false;
-
-    // Split on && to handle compound expressions
-    for part in expr.split("&&") {
-        let part = part.trim();
-        if part.starts_with("response.code") || part.starts_with("response.status") {
-            let Some(val) = extract_numeric_comparison(part) else {
-                return Err(
-                    "Telemetry access log response.code filter must use a numeric comparison"
-                        .to_string(),
-                );
-            };
-            apply_status_code_comparison(&mut filter, val)?;
-            matched = true;
-        } else if part.starts_with("response.duration") {
-            let Some(val) = extract_numeric_comparison(part) else {
-                return Err(
-                    "Telemetry access log response.duration filter must use a numeric comparison"
-                        .to_string(),
-                );
-            };
-            match val {
-                Comparison::Gte(n) => {
-                    merge_min_latency_ms(&mut filter.min_latency_ms, n)?;
-                }
-                Comparison::Gt(n) => {
-                    merge_min_latency_ms(&mut filter.min_latency_ms, comparison_increment(n)?)?;
-                }
-                Comparison::Lte(_) | Comparison::Lt(_) | Comparison::Eq(_) => {
-                    return Err(
-                        "Telemetry access log response.duration filters only support '>' and '>='"
-                            .to_string(),
-                    );
-                }
-            }
-            matched = true;
-        }
-    }
-
-    if matched { Ok(Some(filter)) } else { Ok(None) }
-}
-
-fn apply_status_code_comparison(
-    filter: &mut AccessLogFilter,
-    comparison: Comparison,
-) -> Result<(), String> {
-    match comparison {
-        Comparison::Gte(n) => merge_status_code_min(&mut filter.status_code_min, n)?,
-        Comparison::Gt(n) => {
-            merge_status_code_min(&mut filter.status_code_min, comparison_increment(n)?)?
-        }
-        Comparison::Lte(n) => merge_status_code_max(&mut filter.status_code_max, n)?,
-        Comparison::Lt(n) => {
-            merge_status_code_max(&mut filter.status_code_max, comparison_decrement(n)?)?
-        }
-        Comparison::Eq(n) => {
-            merge_status_code_min(&mut filter.status_code_min, n)?;
-            merge_status_code_max(&mut filter.status_code_max, n)?;
-        }
-    }
-    Ok(())
-}
-
-fn merge_status_code_min(current: &mut Option<u16>, value: i64) -> Result<(), String> {
-    let value = status_code_value(value)?;
-    *current = Some(current.map_or(value, |existing| existing.max(value)));
-    Ok(())
-}
-
-fn merge_status_code_max(current: &mut Option<u16>, value: i64) -> Result<(), String> {
-    let value = status_code_value(value)?;
-    *current = Some(current.map_or(value, |existing| existing.min(value)));
-    Ok(())
-}
-
-fn merge_min_latency_ms(current: &mut Option<u64>, value: i64) -> Result<(), String> {
-    let value = duration_value(value)?;
-    *current = Some(current.map_or(value, |existing| existing.max(value)));
-    Ok(())
-}
-
-fn status_code_value(value: i64) -> Result<u16, String> {
-    u16::try_from(value).map_err(|_| {
-        format!("Telemetry access log response code filter value {value} is outside 0..=65535")
-    })
-}
-
-fn duration_value(value: i64) -> Result<u64, String> {
-    u64::try_from(value).map_err(|_| {
-        format!("Telemetry access log duration filter value {value} must be non-negative")
-    })
-}
-
-fn comparison_increment(value: i64) -> Result<i64, String> {
-    value
-        .checked_add(1)
-        .ok_or_else(|| format!("Telemetry access log comparison value {value} overflows"))
-}
-
-fn comparison_decrement(value: i64) -> Result<i64, String> {
-    value
-        .checked_sub(1)
-        .ok_or_else(|| format!("Telemetry access log comparison value {value} underflows"))
-}
-
-enum Comparison {
-    Gte(i64),
-    Gt(i64),
-    Lte(i64),
-    Lt(i64),
-    Eq(i64),
-}
-
-fn extract_numeric_comparison(expr: &str) -> Option<Comparison> {
-    let ops = [">=", "<=", ">", "<", "=="];
-    for op in ops {
-        if let Some(idx) = expr.find(op) {
-            let val_str = expr[idx + op.len()..].trim();
-            let val: i64 = val_str.parse().ok()?;
-            return match op {
-                ">=" => Some(Comparison::Gte(val)),
-                ">" => Some(Comparison::Gt(val)),
-                "<=" => Some(Comparison::Lte(val)),
-                "<" => Some(Comparison::Lt(val)),
-                "==" => Some(Comparison::Eq(val)),
-                _ => None,
-            };
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config_sources::k8s::{K8sMetadata, K8sTranslationOptions, translate_k8s_objects};
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
+    use crate::modes::mesh::access_log_filter::AccessLogFilterExpr;
     use crate::modes::mesh::config::ParsedCidr;
     use crate::modes::mesh::policy::{
         MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
@@ -7309,7 +7195,7 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_environment_custom_tag_uses_default_value() {
+    fn telemetry_environment_custom_tag_carries_default_and_typed_lookup() {
         let result = translate_k8s_objects(
             &[object(
                 "Telemetry",
@@ -7341,18 +7227,56 @@ mod tests {
             tracing.custom_tags.get("region").map(String::as_str),
             Some("us-east-1")
         );
+        assert_eq!(
+            tracing.custom_env_tags.get("region").map(String::as_str),
+            Some("FERRUM_TEST_TELEMETRY_REGION_UNSET")
+        );
     }
 
     #[test]
-    fn telemetry_environment_custom_tag_ignores_process_environment_values() {
-        // SAFETY: this test is single-threaded — `mod tests` here doesn't
-        // touch `FERRUM_TEST_TELEMETRY_ENV_TAG` from any other thread, so
-        // the Rust 2024 unsafe contract on `set_var` is satisfied. We do not
-        // unset because the assertion is that the translation IGNORES it.
-        unsafe {
-            std::env::set_var("FERRUM_TEST_TELEMETRY_ENV_TAG", "live-env-value");
-        }
+    fn telemetry_environment_custom_tag_without_default_is_carried_not_dropped() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "customTags": {
+                            "cluster": {
+                                "environment": {
+                                    "name": "ISTIO_META_CLUSTER_ID"
+                                }
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
 
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+
+        assert!(
+            !tracing.custom_tags.contains_key("cluster"),
+            "no defaultValue means no literal fallback at translation"
+        );
+        assert_eq!(
+            tracing.custom_env_tags.get("cluster").map(String::as_str),
+            Some("ISTIO_META_CLUSTER_ID")
+        );
+    }
+
+    #[test]
+    fn telemetry_environment_custom_tag_does_not_resolve_controller_host_env() {
+        // Structural proof only: the translator carries `defaultValue` plus a
+        // typed `custom_env_tags` lookup and never reads process environment.
+        // Do not mutate the process environment — Rust 2024 forbids unsynchronized
+        // `set_var` under the parallel test harness, and host env is not the DP.
         let result = translate_k8s_objects(
             &[object(
                 "Telemetry",
@@ -7382,7 +7306,206 @@ mod tests {
 
         assert_eq!(
             tracing.custom_tags.get("env_tag").map(String::as_str),
-            Some("fallback-value")
+            Some("fallback-value"),
+            "controller must not read host env as the data plane"
+        );
+        assert_eq!(
+            tracing.custom_env_tags.get("env_tag").map(String::as_str),
+            Some("FERRUM_TEST_TELEMETRY_ENV_TAG")
+        );
+        assert!(
+            tracing
+                .custom_tags
+                .values()
+                .all(|value| value != "live-env-value"),
+            "translated literals must stay at defaultValue, never a host env read"
+        );
+    }
+
+    #[test]
+    fn telemetry_environment_custom_tag_rejects_missing_name() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "customTags": {
+                            "env_tag": {
+                                "environment": {
+                                    "defaultValue": "fallback"
+                                }
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("environment tag without name must fail closed");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("environment.name is required"),
+            "expected field-specific rejection, got {message}"
+        );
+    }
+
+    #[test]
+    fn telemetry_environment_custom_tag_rejects_empty_name() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "customTags": {
+                            "env_tag": {
+                                "environment": {
+                                    "name": "   "
+                                }
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("empty environment name must fail closed");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("environment.name is required"),
+            "expected field-specific rejection, got {message}"
+        );
+    }
+
+    #[test]
+    fn telemetry_environment_custom_tag_rejects_invalid_env_var_name() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "customTags": {
+                            "env_tag": {
+                                "environment": {
+                                    "name": "BAD-NAME"
+                                }
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid environment variable name must fail closed");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("invalid environment variable name"),
+            "expected env-var name rejection, got {message}"
+        );
+    }
+
+    #[test]
+    fn telemetry_environment_custom_tag_rejects_sensitive_env_var_name() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "customTags": {
+                            "credential": {
+                                "environment": {
+                                    "name": "FERRUM_ADMIN_JWT_SECRET"
+                                }
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("credential-bearing environment variable must fail closed");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("cannot copy a credential-bearing environment variable"),
+            "expected sensitive env-var rejection, got {message}"
+        );
+        assert!(
+            !message.contains("FERRUM_ADMIN_JWT_SECRET"),
+            "credential-bearing environment variable name must not be echoed"
+        );
+    }
+
+    #[test]
+    fn telemetry_tracing_entries_replace_custom_tag_source_exclusively() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [
+                        {
+                            "customTags": {
+                                "cluster": {
+                                    "environment": {
+                                        "name": "ISTIO_META_CLUSTER_ID",
+                                        "defaultValue": "fallback-cluster"
+                                    }
+                                },
+                                "region": {"literal": {"value": "old-region"}},
+                                "zone": {
+                                    "environment": {
+                                        "name": "ISTIO_META_ZONE",
+                                        "defaultValue": "fallback-zone"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "customTags": {
+                                "cluster": {"literal": {"value": "literal-cluster"}},
+                                "region": {
+                                    "environment": {
+                                        "name": "FERRUM_REGION"
+                                    }
+                                },
+                                "zone": {
+                                    "header": {
+                                        "name": "x-zone"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+
+        assert_eq!(
+            tracing.custom_tags.get("cluster").map(String::as_str),
+            Some("literal-cluster")
+        );
+        assert!(!tracing.custom_env_tags.contains_key("cluster"));
+        assert!(!tracing.custom_tags.contains_key("region"));
+        assert_eq!(
+            tracing.custom_env_tags.get("region").map(String::as_str),
+            Some("FERRUM_REGION")
+        );
+        assert!(!tracing.custom_tags.contains_key("zone"));
+        assert!(!tracing.custom_env_tags.contains_key("zone"));
+        assert_eq!(
+            tracing.custom_header_tags.get("zone").map(String::as_str),
+            Some("x-zone")
         );
     }
 
@@ -7489,8 +7612,104 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_access_log_filter_with_or_is_rejected() {
+    fn telemetry_access_log_filter_with_or_translates() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{
+                        "filter": {
+                            "expression": "response.code >= 500 || duration > 1s"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("OR filters should translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let access_logging = mesh.telemetry_resources[0]
+            .config
+            .access_logging
+            .as_ref()
+            .expect("access logging");
+        let filter = access_logging.filter.as_ref().expect("filter");
+        assert_eq!(
+            filter.expression,
+            Some(AccessLogFilterExpr::Or {
+                left: Box::new(AccessLogFilterExpr::StatusCodeMin { value: 500 }),
+                right: Box::new(AccessLogFilterExpr::MinLatencyMs { value: 1001 }),
+            })
+        );
+        assert_eq!(filter.status_code_min, None);
+    }
+
+    #[test]
+    fn telemetry_access_log_filter_or_errors_or_slow_example() {
+        let filter = parse_access_log_filter_expression("response.code >= 500 || duration > 1s")
+            .expect("documented errors-or-slow expression parses")
+            .expect("filter");
+        assert_eq!(
+            filter.expression,
+            Some(AccessLogFilterExpr::Or {
+                left: Box::new(AccessLogFilterExpr::StatusCodeMin { value: 500 }),
+                right: Box::new(AccessLogFilterExpr::MinLatencyMs { value: 1001 }),
+            })
+        );
+    }
+
+    #[test]
+    fn telemetry_access_log_filter_malformed_operator_is_rejected() {
         let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{
+                        "filter": {
+                            "expression": "response.code >> 500"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("malformed operator should fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("response.code filter must use a numeric comparison")
+        );
+    }
+
+    #[test]
+    fn telemetry_access_log_filter_non_string_expression_is_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{
+                        "filter": {
+                            "expression": {
+                                "response.code": {">=": 500}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("non-string expression must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("accessLogging.filter.expression must be a string")
+        );
+    }
+
+    #[test]
+    fn telemetry_access_log_filter_reload_update_delete_round_trip() {
+        let initial = translate_k8s_objects(
             &[object(
                 "Telemetry",
                 serde_json::json!({
@@ -7503,9 +7722,86 @@ mod tests {
             )],
             options(),
         )
-        .expect_err("OR filters should fail closed");
+        .expect("initial translate");
 
-        assert!(err.to_string().contains("with '||' are not supported"));
+        let updated = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{
+                        "filter": {
+                            "expression": "response.code >= 400 && response.code <= 499"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("updated translate");
+
+        let removed = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{ "disabled": false }]
+                }),
+            )],
+            options(),
+        )
+        .expect("removed translate");
+
+        let initial_filter = initial.config.mesh.as_ref().unwrap().telemetry_resources[0]
+            .config
+            .access_logging
+            .as_ref()
+            .unwrap()
+            .filter
+            .as_ref()
+            .unwrap();
+        assert!(initial_filter.expression.is_some());
+
+        let updated_filter = updated.config.mesh.as_ref().unwrap().telemetry_resources[0]
+            .config
+            .access_logging
+            .as_ref()
+            .unwrap()
+            .filter
+            .as_ref()
+            .unwrap();
+        assert!(updated_filter.expression.is_none());
+        assert_eq!(updated_filter.status_code_min, Some(400));
+        assert_eq!(updated_filter.status_code_max, Some(499));
+
+        assert!(
+            removed.config.mesh.as_ref().unwrap().telemetry_resources[0]
+                .config
+                .access_logging
+                .as_ref()
+                .unwrap()
+                .filter
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn telemetry_access_log_filter_expression_bomb_is_rejected() {
+        let mut expr = "response.code >= 500".to_string();
+        for _ in 0..=crate::modes::mesh::access_log_filter::MAX_ACCESS_LOG_FILTER_NESTING {
+            expr = format!("({expr})");
+        }
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{
+                        "filter": { "expression": expr }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("bomb input should fail closed");
+        assert!(err.to_string().contains("maximum nesting depth"));
     }
 
     #[test]
@@ -14554,6 +14850,7 @@ extensionProviders:
             enforce_sidecar_identity_narrowing: false,
             waypoint_name: None,
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
         };
         let slice = MeshSlice::from_gateway_config(&gateway_config, request);
         // Both should match — namespace-default applies to any workload, and

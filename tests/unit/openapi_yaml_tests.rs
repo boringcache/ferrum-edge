@@ -5626,6 +5626,10 @@ fn cors_schema_matches_strict_runtime_and_istio_projection_surface() {
         json!(["forward", "ignore"])
     );
 
+    let oversized_matcher = "a".repeat(513);
+    let too_many_matchers: Vec<serde_json::Value> = (0..65)
+        .map(|i| json!({"exact": format!("https://app{i}.example.com")}))
+        .collect();
     let cases = [
         (json!({"allowed_origins": ["*"]}), true),
         (json!({"allowed_origins": ["*.example.com"]}), true),
@@ -5656,10 +5660,34 @@ fn cors_schema_matches_strict_runtime_and_istio_projection_surface() {
             json!({"allowed_origins": ["https://app.example/path"]}),
             false,
         ),
+        // Issue #3254: the Istio object `exact` matcher is LITERAL, so a
+        // wildcard-shaped or noncanonical value is representable (and matches
+        // only itself) rather than rejected. The NATIVE plain-string form above
+        // keeps its own stricter origin/wildcard grammar.
         (
             json!({"allowed_origins": [{"exact": "*.example.com"}]}),
+            true,
+        ),
+        (
+            json!({"allowed_origins": [{"exact": "https://app.example.com:443"}]}),
+            true,
+        ),
+        (json!({"allowed_origins": [{"exact": "   "}]}), false),
+        // Issue #3253: explicit byte / count bounds, enforced by BOTH the
+        // schema and the runtime.
+        (
+            json!({"allowed_origins": [{"exact": &oversized_matcher}]}),
             false,
         ),
+        (
+            json!({"allowed_origins": [{"prefix": &oversized_matcher}]}),
+            false,
+        ),
+        (
+            json!({"allowed_origins": [{"regex": &oversized_matcher}]}),
+            false,
+        ),
+        (json!({"allowed_origins": too_many_matchers}), false),
         (
             json!({"allowed_origins": ["*"], "allowed_methods": []}),
             false,
@@ -5701,13 +5729,13 @@ fn workload_metrics_schema_documents_runtime_tag_limits() {
         .pointer("/components/schemas/WorkloadMetricsConfig/properties")
         .expect("WorkloadMetricsConfig properties exist");
 
-    for field in ["custom_tags", "custom_header_tags"] {
+    for field in ["custom_tags", "custom_header_tags", "custom_env_tags"] {
         assert_eq!(properties[field]["maxProperties"], json!(32));
         let description = properties[field]["description"]
             .as_str()
             .expect("custom tag description");
         assert!(
-            description.contains("32 distinct tag names combined"),
+            description.contains("32 distinct tag names"),
             "{field} must document the combined runtime cap"
         );
     }
@@ -5778,7 +5806,7 @@ fn workload_metrics_schema_documents_runtime_tag_limits() {
         .as_object_mut()
         .expect("custom_header_tags object")
         .insert("header_16".to_string(), json!("x-tag"));
-    // The per-map OpenAPI bounds cannot express a sum across two objects; the
+    // The per-map OpenAPI bounds cannot express a sum across these objects; the
     // property descriptions carry that contract and runtime rejects the union.
     assert_component_validity(&spec, "WorkloadMetricsConfig", &combined_33, true);
     assert!(WorkloadMetrics::new(&combined_33).is_err());
@@ -6074,6 +6102,10 @@ fn service_discovery_schema_matches_provider_validation_and_serialization() {
 
 #[test]
 fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
+    use ferrum_edge::modes::mesh::node_waypoint_observability::{
+        NodeWaypointAssertedIdentitySnapshot, NodeWaypointDestinationPolicySnapshot,
+        NodeWaypointHboneHandshakeSnapshot, NodeWaypointObservabilitySnapshot,
+    };
     use ferrum_edge::modes::mesh::runtime::MeshEgressScopeHealth;
     use ferrum_edge::modes::mesh::slice::{MeshEgressScopeResource, MeshEgressScopeSnapshot};
     use ferrum_edge::overload::{
@@ -6112,15 +6144,63 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
         "health": health
     });
     assert_component_validity(&spec, "MeshEgressScopeResponse", &egress_response, true);
+    // Build from the REAL snapshot type, not a hand-written literal: a serde
+    // field rename in `node_waypoint_observability` must fail this parity gate
+    // instead of silently diverging from the published OpenAPI schema.
+    let node_waypoint_observability = NodeWaypointObservabilitySnapshot {
+        enabled: true,
+        hbone_handshakes: NodeWaypointHboneHandshakeSnapshot {
+            inbound_tls_success: 1,
+            inbound_tls_failure: 2,
+            inbound_connect_success: 3,
+            inbound_connect_failure: 4,
+            outbound_dial_success: 5,
+            outbound_dial_failure: 6,
+        },
+        asserted_identity: NodeWaypointAssertedIdentitySnapshot {
+            accepted: 1,
+            rejected_untrusted_assertor: 2,
+            rejected_trust_domain_mismatch: 0,
+            rejected_unauthenticated_hbone: 0,
+            rejected_malformed: 0,
+            rejected_stale_or_unknown: 0,
+        },
+        destination_policy_rejections: NodeWaypointDestinationPolicySnapshot {
+            authz_deny: 1,
+            scope_missing: 0,
+            destination_scope_missing: 0,
+            relay_destination_denied: 0,
+        },
+        missing_destination_metadata: 1,
+        plaintext_fallback_attempts: 1,
+    };
     assert_component_validity(
         &spec,
         "HealthResponse",
         &json!({
             "status": "ok",
             "ready": true,
-            "mesh": {"egress_scope": health}
+            "mesh": {
+                "egress_scope": health,
+                "node_waypoint_observability": node_waypoint_observability
+            }
         }),
         true,
+    );
+    assert_component_validity(
+        &spec,
+        "HealthResponse",
+        &json!({
+            "status": "ok",
+            "ready": true,
+            "mesh": {
+                "egress_scope": {
+                    "sidecar_admitted_services": 1,
+                    "sidecar_denied_services": 0
+                }
+            }
+        }),
+        false,
     );
 
     let mut overload = serde_json::to_value(OverloadSnapshot {
@@ -7942,6 +8022,12 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
     );
     assert_eq!(schema["properties"]["max_scan_bytes"]["minimum"], 1);
     assert_eq!(schema["properties"]["max_completion_length"]["minimum"], 0);
+    assert_eq!(
+        schema["properties"]["grpc"]["properties"]["methods"]["propertyNames"]["pattern"],
+        json!(
+            r"^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$"
+        )
+    );
     for pointer in [
         "/properties/blocked_phrases/items/minLength",
         "/properties/required_fields/items/minLength",
@@ -7972,6 +8058,22 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
         json!({"required_fields": ["x"]}),
         json!({"custom_pii_patterns": [{"name": "x", "regex": "x"}]}),
         json!({"blocked_patterns": [{"name": "x", "regex": "x"}]}),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/etc/ferrum/d.bin",
+                "methods": {"/a.B/C": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/etc/ferrum/d.bin",
+                "max_message_bytes": 1024,
+                "max_messages": 4,
+                "methods": {"/a.B/C": {"response_type": "a.R", "text_fields": ["x.y"]}}
+            }
+        }),
     ] {
         assert_component_validity(&spec, "AiResponseGuardConfig", &valid, true);
     }
@@ -7992,6 +8094,103 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
         }),
         json!({
             "blocked_patterns": [{"name": "x", "regex": "x", "enabled": true}]
+        }),
+        // gRPC block is closed and both of its required fields are load-bearing.
+        json!({"pii_patterns": ["email"], "grpc": {}}),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {"methods": {"/a.B/C": {"response_type": "a.R"}}}
+        }),
+        json!({"pii_patterns": ["email"], "grpc": {"descriptor_path": "/d.bin"}}),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {"descriptor_path": "/d.bin", "methods": {}}
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "method": {"/a.B/C": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"/a.B/C": {"response_type": "a.R", "fields": ["x"]}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"/a.B/C": {"text_fields": ["x"]}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "max_messages": 0,
+                "methods": {"/a.B/C": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"/a..B/C": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"/1Service/Method": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"/a.B/C?x=1": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"not-a-path": {"response_type": "a.R"}}
+            }
+        }),
+        // Runtime trims these three string surfaces and rejects an empty
+        // result. The published schema must not advertise whitespace-only
+        // values as admissible.
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": " \t ",
+                "methods": {"/a.B/C": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"/a.B/C": {"response_type": "\n "}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {
+                    "/a.B/C": {
+                        "response_type": "a.R",
+                        "text_fields": [" \r\n "]
+                    }
+                }
+            }
         }),
     ] {
         assert_component_validity(&spec, "AiResponseGuardConfig", &invalid, false);

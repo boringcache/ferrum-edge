@@ -138,6 +138,35 @@ fn test_shared_validation_rejects_unknown_stdout_logging_keys() {
 }
 
 #[test]
+fn test_stdout_logging_rejects_mixed_flat_and_expression_filters() {
+    let error = StdoutLogging::new(&json!({
+        "filter": {
+            "errors_only": true,
+            "expression": {"op": "status_code_min", "value": 500}
+        }
+    }))
+    .err()
+    .expect("flat predicates must not be silently ignored");
+    assert!(error.contains("cannot be combined"), "{error}");
+}
+
+#[test]
+fn test_stdout_logging_bounds_direct_expression_trees() {
+    let mut expression = json!({"op": "errors_only"});
+    for _ in 0..32 {
+        expression = json!({
+            "op": "or",
+            "left": expression,
+            "right": {"op": "errors_only"}
+        });
+    }
+    let error = StdoutLogging::new(&json!({"filter": {"expression": expression}}))
+        .err()
+        .expect("direct expression tree must honor the parser node ceiling");
+    assert!(error.contains("maximum AST node count"), "{error}");
+}
+
+#[test]
 fn test_errors_only_uses_authoritative_terminal_failure_predicate() {
     let plugin = StdoutLogging::new(&json!({"filter": {"errors_only": true}})).unwrap();
     let mut summary = create_test_transaction_summary();

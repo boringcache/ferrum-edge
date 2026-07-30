@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use hyper::upgrade::OnUpgrade;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -432,11 +433,15 @@ pub(super) async fn handle_hbone_request(
             "mesh_authz.deny_policy".to_string(),
             "hbone_unauthenticated_peer".to_string(),
         );
+        crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+            crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
+            false,
+        );
         let reject = finalize_reject_response_with_after_proxy_hooks(
             plugins,
             ctx,
             StatusCode::FORBIDDEN,
-            br#"{"error":"HBONE tunnel requires an authenticated mesh peer"}"#,
+            Bytes::from_static(br#"{"error":"HBONE tunnel requires an authenticated mesh peer"}"#),
             HashMap::new(),
             false,
         )
@@ -474,6 +479,10 @@ pub(super) async fn handle_hbone_request(
         is_tls,
         ctx.tls_client_cert_der.is_some(),
     ) {
+        crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+            crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
+            false,
+        );
         return super::reject_mesh_inbound_peer_auth_transport_mismatch(
             state,
             plugins,
@@ -509,11 +518,18 @@ pub(super) async fn handle_hbone_request(
             "mesh_authz.deny_policy".to_string(),
             "hbone_relay_destination_denied".to_string(),
         );
+        crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+            crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
+            false,
+        );
+        crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+            crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::RelayDestinationDenied,
+        );
         let reject = finalize_reject_response_with_after_proxy_hooks(
             plugins,
             ctx,
             StatusCode::FORBIDDEN,
-            br#"{"error":"HBONE relay destination not allowed"}"#,
+            Bytes::from_static(br#"{"error":"HBONE relay destination not allowed"}"#),
             HashMap::new(),
             false,
         )
@@ -531,6 +547,13 @@ pub(super) async fn handle_hbone_request(
         return build_response_from_normalized_reject(reject);
     }
 
+    // CONNECT admission succeeded past peer-identity and open-relay guards.
+    // Circuit-breaker / upgrade failures after this are not handshake failures.
+    crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+        crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
+        true,
+    );
+
     // HBONE records the circuit-breaker outcome at header time (its `StreamingH2`
     // responses are excluded from the deferred-dispatch path, #1649), so the
     // admission open-epoch is unused here.
@@ -542,7 +565,9 @@ pub(super) async fn handle_hbone_request(
                     plugins,
                     ctx,
                     StatusCode::SERVICE_UNAVAILABLE,
-                    br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+                    Bytes::from_static(
+                        br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+                    ),
                     HashMap::new(),
                     false,
                 )
@@ -575,7 +600,7 @@ pub(super) async fn handle_hbone_request(
                         plugins,
                         ctx,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        br#"{"error":"HBONE upgrade handle missing"}"#,
+                        Bytes::from_static(br#"{"error":"HBONE upgrade handle missing"}"#),
                         HashMap::new(),
                         false,
                     )
@@ -603,7 +628,7 @@ pub(super) async fn handle_hbone_request(
                 plugins,
                 ctx,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                br#"{"error":"HBONE request buffering invariant violated"}"#,
+                Bytes::from_static(br#"{"error":"HBONE request buffering invariant violated"}"#),
                 HashMap::new(),
                 false,
             )
@@ -650,7 +675,7 @@ pub(super) async fn handle_hbone_request(
                 plugins,
                 ctx,
                 err.status,
-                err.body,
+                Bytes::from_static(err.body),
                 HashMap::new(),
                 false,
             )
@@ -895,7 +920,9 @@ pub(super) async fn handle_hbone_udp_request(
             plugins,
             ctx,
             StatusCode::FORBIDDEN,
-            br#"{"error":"HBONE UDP tunnel requires an authenticated mesh peer"}"#,
+            Bytes::from_static(
+                br#"{"error":"HBONE UDP tunnel requires an authenticated mesh peer"}"#,
+            ),
             HashMap::new(),
             false,
         )
@@ -962,7 +989,7 @@ pub(super) async fn handle_hbone_udp_request(
             plugins,
             ctx,
             StatusCode::BAD_GATEWAY,
-            br#"{"error":"HBONE UDP destination unresolved"}"#,
+            Bytes::from_static(br#"{"error":"HBONE UDP destination unresolved"}"#),
             HashMap::new(),
             false,
         )
@@ -1006,7 +1033,7 @@ pub(super) async fn handle_hbone_udp_request(
             plugins,
             ctx,
             StatusCode::FORBIDDEN,
-            br#"{"error":"HBONE UDP relay destination not allowed"}"#,
+            Bytes::from_static(br#"{"error":"HBONE UDP relay destination not allowed"}"#),
             HashMap::new(),
             false,
         )
@@ -1074,7 +1101,7 @@ pub(super) async fn handle_hbone_udp_request(
                 plugins,
                 ctx,
                 status,
-                body,
+                Bytes::from_static(body),
                 HashMap::new(),
                 false,
             )
@@ -1110,7 +1137,7 @@ pub(super) async fn handle_hbone_udp_request(
                 plugins,
                 ctx,
                 StatusCode::BAD_GATEWAY,
-                error.body,
+                Bytes::from_static(error.body),
                 HashMap::new(),
                 false,
             )
@@ -1141,7 +1168,7 @@ pub(super) async fn handle_hbone_udp_request(
                 plugins,
                 ctx,
                 StatusCode::GATEWAY_TIMEOUT,
-                error.body,
+                Bytes::from_static(error.body),
                 HashMap::new(),
                 false,
             )
@@ -1594,7 +1621,7 @@ async fn hbone_udp_internal_error(
         plugins,
         ctx,
         StatusCode::INTERNAL_SERVER_ERROR,
-        body,
+        Bytes::from_static(body),
         HashMap::new(),
         false,
     )

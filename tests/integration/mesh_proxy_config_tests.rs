@@ -196,6 +196,7 @@ fn telemetry_tracing_sampling_overrides_proxy_config_tracing_sampling() {
                     disable_span_reporting: None,
                     custom_tags: HashMap::new(),
                     custom_header_tags: HashMap::new(),
+                    custom_env_tags: HashMap::new(),
                     providers: Vec::new(),
                 }),
                 metrics: None,
@@ -264,6 +265,7 @@ fn proxy_config_tracing_sampling_survives_telemetry_without_sampling_field() {
                     disable_span_reporting: None,
                     custom_tags: HashMap::from([("region".to_string(), "us-east".to_string())]),
                     custom_header_tags: HashMap::new(),
+                    custom_env_tags: HashMap::new(),
                     providers: Vec::new(),
                 }),
                 metrics: None,
@@ -505,6 +507,7 @@ fn k8s_proxy_config_reaches_native_and_xds_equivalent_mesh_slices() {
         enforce_sidecar_identity_narrowing: false,
         waypoint_name: None,
         ambient_udp_source_scoping: false,
+        node_waypoint_capture_scoping: false,
     };
     let native = MeshSlice::from_gateway_config(&gateway_config, request);
     assert_eq!(native.proxy_configs.len(), 1);

@@ -455,6 +455,69 @@ fn plugin_cache_threads_stable_config_id_into_soap_replay_scope() {
     );
 }
 
+fn identity_soap_plugin_config(id: &str, proxy_id: &str) -> PluginConfig {
+    let mut plugin = make_plugin_config(
+        id,
+        "soap_ws_security",
+        PluginScope::Proxy,
+        Some(proxy_id),
+        true,
+    );
+    plugin.config = json!({
+        "timestamp": {"require": false},
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordText",
+            "credentials": [{"username": id, "password": "secret"}]
+        }
+    });
+    plugin
+}
+
+#[test]
+fn soap_composition_rejects_two_identity_instances_in_both_auth_modes() {
+    for auth_mode in [AuthMode::Single, AuthMode::Multi] {
+        let mut proxy = make_proxy("soap", "/soap", vec!["soap-a", "soap-b"]);
+        proxy.auth_mode = auth_mode;
+        let config = make_config(
+            vec![proxy],
+            vec![
+                identity_soap_plugin_config("soap-a", "soap"),
+                identity_soap_plugin_config("soap-b", "soap"),
+            ],
+        );
+
+        let errors = ferrum_edge::plugins::soap_ws_security::validate_composition(&config)
+            .expect_err("an auth chain must not admit two SOAP message gates");
+        let joined = errors.join("; ");
+        assert!(joined.contains("soap-a"), "{joined}");
+        assert!(joined.contains("soap-b"), "{joined}");
+        assert!(joined.contains("sole authentication mechanism"), "{joined}");
+    }
+}
+
+#[test]
+fn soap_composition_rejects_other_auth_plugins_in_both_auth_modes() {
+    for auth_mode in [AuthMode::Single, AuthMode::Multi] {
+        let mut proxy = make_proxy("soap", "/soap", vec!["key", "soap"]);
+        proxy.auth_mode = auth_mode;
+        let config = make_config(
+            vec![proxy],
+            vec![
+                make_plugin_config("key", "key_auth", PluginScope::Proxy, Some("soap"), true),
+                identity_soap_plugin_config("soap", "soap"),
+            ],
+        );
+
+        let errors = ferrum_edge::plugins::soap_ws_security::validate_composition(&config)
+            .expect_err("another auth mechanism must not bypass the SOAP message gate");
+        let joined = errors.join("; ");
+        assert!(joined.contains("soap"), "{joined}");
+        assert!(joined.contains("key"), "{joined}");
+        assert!(joined.contains("sole authentication mechanism"), "{joined}");
+    }
+}
+
 fn plugin_client_with_ca(ca_path: &str) -> PluginHttpClient {
     use ferrum_edge::config::types::DEFAULT_NAMESPACE;
     use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};
@@ -2686,6 +2749,225 @@ async fn test_request_view_precomputes_response_committed_hook_capability() {
     );
 }
 
+#[tokio::test]
+async fn test_request_view_classifies_response_trailer_policy_by_capability() {
+    // Auth/logging-only chain: nothing about it can be re-opened by a backend
+    // trailer, so it declares no names and does not fail closed (issue #2941).
+    let logging = make_plugin_config_with_json(
+        "log",
+        "stdout_logging",
+        json!({}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["log"])], vec![logging]);
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    assert!(view.response_trailer_policy_names().is_empty());
+    assert!(
+        !view
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY)
+    );
+
+    // `security_headers` enumerates the fields it sets or removes, so the
+    // trailer reconciliation is name-scoped rather than wholesale.
+    let security = make_plugin_config_with_json(
+        "sec",
+        "security_headers",
+        json!({"remove": ["X-Powered-By"], "frame_options": false,
+               "content_type_options": false, "referrer_policy": false}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["sec"])], vec![security]);
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    let names: Vec<&str> = view
+        .response_trailer_policy_names()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(names, vec!["x-powered-by"]);
+    assert!(
+        !view
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY)
+    );
+
+    // `response_transformer` also applies route overrides published at request
+    // time, so its governed field set is not enumerable and it fails closed.
+    let transformer = make_plugin_config_with_json(
+        "rt",
+        "response_transformer",
+        json!({"rules": [{
+            "target": "header",
+            "operation": "add",
+            "key": "x-gateway-note",
+            "value": "transformed",
+        }]}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["rt"])],
+        vec![transformer],
+    );
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    assert!(
+        view.capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY)
+    );
+
+    // `ai_stream_router` invalidates open-ended checksum-prefix families when
+    // normalizing Anthropic SSE. The policy models those families directly,
+    // preserving unrelated application trailers.
+    let stream_router = make_plugin_config_with_json(
+        "asr",
+        "ai_stream_router",
+        json!({
+            "providers": [{
+                "name": "test",
+                "provider_type": "openai",
+                "endpoint": "https://api.openai.com/v1/chat/completions",
+                "api_key": "sk-test",
+                "model_patterns": ["gpt-*"]
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["asr"])],
+        vec![stream_router],
+    );
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    assert!(
+        view.response_trailer_policy_names()
+            .iter()
+            .any(|name| name == "content-encoding")
+    );
+    assert!(
+        view.response_trailer_policy_names()
+            .iter()
+            .any(|name| name == "x-goog-hash")
+    );
+    assert_eq!(
+        view.response_trailer_policy_prefixes(),
+        &["x-amz-checksum-".to_string(), "x-checksum-".to_string(),]
+    );
+    assert!(
+        !view
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+        "enumerable names and prefixes must not drop unrelated trailers"
+    );
+}
+
+#[tokio::test]
+async fn test_request_view_unions_builtin_response_trailer_policy_names() {
+    // `sse` is the case the per-request mutation witness cannot see: its
+    // `strip_content_length` removal is a NO-OP on the initial header map
+    // whenever the backend sends `content-length` only as a trailer, so only
+    // this config-time declaration binds the trailer channel. The other three
+    // fields are gateway writes a trailer copy would contradict.
+    let sse = make_plugin_config_with_json(
+        "sse",
+        "sse",
+        json!({"force_sse_content_type": true}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["sse"])], vec![sse]);
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    let mut names: Vec<&str> = view
+        .response_trailer_policy_names()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec![
+            "cache-control",
+            "content-length",
+            "content-type",
+            "x-accel-buffering",
+        ],
+        "sse must declare every response field its after_proxy owns"
+    );
+    assert!(
+        !view
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+        "an enumerable declaration must not fail closed"
+    );
+
+    // Turning the owning knobs off narrows the declaration instead of widening
+    // it: a plugin that no longer writes the field governs no trailer for it.
+    let sse = make_plugin_config_with_json(
+        "sse",
+        "sse",
+        json!({"strip_content_length": false, "add_no_buffering_header": false}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["sse"])], vec![sse]);
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    let names: Vec<&str> = view
+        .response_trailer_policy_names()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(names, vec!["cache-control"]);
+}
+
+#[tokio::test]
+async fn test_request_view_unions_cors_response_trailer_prefix() {
+    // CORS sanitizes the open-ended `access-control-` family, not a finite write
+    // list: a trailer-only extension name must still be governed. The discrete
+    // `vary` merge sits outside that family and remains an exact-name entry.
+    let cors = make_plugin_config_with_json(
+        "cors",
+        "cors",
+        json!({"allowed_origins": ["https://app.example"]}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["cors"])], vec![cors]);
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    let names: Vec<&str> = view
+        .response_trailer_policy_names()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let prefixes: Vec<&str> = view
+        .response_trailer_policy_prefixes()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(names, vec!["vary"]);
+    assert_eq!(prefixes, vec!["access-control-"]);
+    assert!(
+        !view
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+        "CORS prefix ownership must not fail closed the whole trailer section"
+    );
+}
+
 #[test]
 fn test_request_view_precomputes_grpc_deadline_policy_plugins() {
     let mut deadline = make_plugin_config_with_json(
@@ -3115,6 +3397,27 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
     assert!(candidate.contains("is_security_composition_candidate_plugin("));
     assert!(candidate.contains("security_composition_capabilities("));
     assert!(candidate.contains("ServerlessSecurityCompositionPlugin"));
+    let candidate_names_start = source
+        .find("const SECURITY_COMPOSITION_PLUGIN_NAMES")
+        .expect("security-composition candidate allowlist must exist");
+    let candidate_names_end = source[candidate_names_start..]
+        .find("];")
+        .map(|offset| candidate_names_start + offset)
+        .expect("security-composition candidate allowlist must terminate");
+    let candidate_names = &source[candidate_names_start..candidate_names_end];
+    assert!(
+        candidate_names.contains("\"soap_ws_security\""),
+        "candidate construction must include SOAP so custom auth capabilities cannot bypass its sole-auth gate"
+    );
+    let effective_chain_start = source
+        .find("fn validate_plugin_security_composition(")
+        .expect("effective-chain security validator must exist");
+    let effective_chain = &source[effective_chain_start..start];
+    assert!(
+        effective_chain.contains("plugin.name() == \"soap_ws_security\"")
+            && effective_chain.contains("plugin.is_auth_plugin()"),
+        "effective-chain validation must derive authentication participation from constructed capabilities"
+    );
     assert!(candidate.contains("validate_plugin_security_composition(&merged)"));
     assert!(candidate.contains("validate_plugin_security_composition(plugins)"));
 }
@@ -7030,7 +7333,7 @@ async fn priority_overridden_correlation_retains_owned_deadline_header() {
     );
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     let transform_plugins: Vec<Arc<dyn Plugin>> =
         vec![Arc::new(StalledDeadlineResponseTransformer)];
 
@@ -7108,6 +7411,64 @@ fn test_priority_override_delegates_spec_rejection_replacement_capability() {
     assert!(plugins[0].applies_after_proxy_on_reject());
     assert!(plugins[0].may_replace_rejection_response());
     assert!(!plugins[0].warn_on_rejection_response_replacement());
+}
+
+#[test]
+fn test_priority_override_delegates_response_trailer_policy() {
+    // The priority-override wrapper hand-forwards the `Plugin` trait, so a
+    // declaration it forgets to delegate silently collapses to the
+    // `ResponseTrailerPolicy::None` default — and a trailer-forwarding HTTP/3
+    // path would stop binding the very fields the plugin owns.
+    let mut security = make_plugin_config_with_json(
+        "sec",
+        "security_headers",
+        json!({"remove": ["X-Powered-By"], "frame_options": false,
+               "content_type_options": false, "referrer_policy": false}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    security.priority_override = Some(321);
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["sec"])], vec![security]);
+    let cache = PluginCache::new(&config).unwrap();
+    assert_eq!(cache.get_plugins("ferrum", "p1")[0].priority(), 321);
+    let names: Vec<String> = cache
+        .request_view("ferrum", "p1", ProxyProtocol::Http)
+        .response_trailer_policy_names()
+        .to_vec();
+    assert_eq!(
+        names,
+        vec!["x-powered-by".to_string()],
+        "the priority-override wrapper must delegate the bounded trailer policy"
+    );
+
+    // The fail-closed arm has to survive the wrapper too, or an unbounded chain
+    // would silently start reconciling trailers field by field.
+    let mut transformer = make_plugin_config_with_json(
+        "rt",
+        "response_transformer",
+        json!({"rules": [{
+            "target": "header",
+            "operation": "add",
+            "key": "x-gateway-note",
+            "value": "transformed",
+        }]}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    transformer.priority_override = Some(322);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["rt"])],
+        vec![transformer],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    assert_eq!(cache.get_plugins("ferrum", "p1")[0].priority(), 322);
+    assert!(
+        cache
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+        "the priority-override wrapper must delegate the fail-closed unbounded arm"
+    );
 }
 
 #[test]
@@ -10199,6 +10560,318 @@ fn priority_override_preserves_dynamic_replay_provenance() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// serverless_function terminate config lifecycle (issue #3292 acceptance)
+//
+// Whether a native gRPC request gets the framed unary terminate contract is
+// decided entirely by this plugin config, so the acceptance evidence is that
+// create / read / update / reload / delete all reach the resolved gRPC request
+// view — not only first-start construction.
+// ---------------------------------------------------------------------------
+
+const SERVERLESS_GRPC_PROXY: &str = "grpc-terminate-proxy";
+
+fn serverless_terminate_plugin_config(id: &str, mode: &str) -> PluginConfig {
+    serverless_terminate_plugin_config_at(id, mode, "https://example.com/func")
+}
+
+fn serverless_terminate_plugin_config_at(id: &str, mode: &str, function_url: &str) -> PluginConfig {
+    make_plugin_config_with_json(
+        id,
+        "serverless_function",
+        json!({
+            "provider": "azure_functions",
+            "function_url": function_url,
+            "mode": mode,
+            "timeout_ms": 5000
+        }),
+        PluginScope::Proxy,
+        Some(SERVERLESS_GRPC_PROXY),
+    )
+}
+
+fn resolved_plugins(cache: &PluginCache, protocol: ProxyProtocol) -> Arc<Vec<Arc<dyn Plugin>>> {
+    plugins_for_protocol_for_test(
+        cache,
+        &ferrum_edge::config::types::default_namespace(),
+        SERVERLESS_GRPC_PROXY,
+        protocol,
+    )
+}
+
+fn resolved_plugin_names(cache: &PluginCache, protocol: ProxyProtocol) -> Vec<String> {
+    resolved_plugins(cache, protocol)
+        .iter()
+        .map(|plugin| plugin.name().to_string())
+        .collect()
+}
+
+/// The resolved `serverless_function` instance for the gRPC request view, or
+/// `None` when the config no longer publishes one.
+fn resolved_serverless_instance(cache: &PluginCache) -> Option<Arc<dyn Plugin>> {
+    resolved_plugins(cache, ProxyProtocol::Grpc)
+        .iter()
+        .find(|plugin| plugin.name() == "serverless_function")
+        .cloned()
+}
+
+#[test]
+fn test_serverless_terminate_grpc_config_lifecycle_create_update_reload_delete() {
+    let proxy = || make_proxy(SERVERLESS_GRPC_PROXY, "/rpc", vec!["sls-terminate"]);
+
+    // Create.
+    let created = make_config(
+        vec![proxy()],
+        vec![serverless_terminate_plugin_config(
+            "sls-terminate",
+            "terminate",
+        )],
+    );
+    let cache = PluginCache::new(&created).expect("terminate config builds");
+
+    // Read: resolved for native gRPC and for HTTP, matching the documented
+    // HTTP_GRPC_PROTOCOLS matrix row.
+    assert!(
+        resolved_plugin_names(&cache, ProxyProtocol::Grpc)
+            .contains(&"serverless_function".to_string()),
+        "terminate-mode serverless_function must resolve for native gRPC requests"
+    );
+    assert!(
+        resolved_plugin_names(&cache, ProxyProtocol::Http)
+            .contains(&"serverless_function".to_string())
+    );
+
+    // Read the published INSTANCE, not just the name. These are production
+    // `Plugin` predicates the runtime reads, and they are mode/config-derived —
+    // so they witness which instance the cache actually resolves without adding
+    // any introspection surface that exists only for this test.
+    let created_instance = resolved_serverless_instance(&cache).expect("terminate instance");
+    assert!(
+        created_instance.requires_prior_request_deduplication(),
+        "terminate mode must be the published behavior"
+    );
+    assert!(!created_instance.modifies_request_headers());
+    assert_eq!(
+        created_instance.warmup_hostnames(),
+        vec!["example.com".to_string()]
+    );
+    drop(created_instance);
+
+    // Update + reload: flipping the mode AND the function URL republishes in
+    // place. Asserting only that *a* plugin named `serverless_function` is still
+    // resolved would pass even if the rebuild retained the old instance, so the
+    // assertions below are on the updated behavior and config.
+    let updated = make_config(
+        vec![proxy()],
+        vec![serverless_terminate_plugin_config_at(
+            "sls-terminate",
+            "pre_proxy",
+            "https://updated.example.net/func",
+        )],
+    );
+    cache.rebuild(&updated).expect("pre_proxy config reloads");
+    let updated_instance =
+        resolved_serverless_instance(&cache).expect("updated instance stays resolved for gRPC");
+    assert!(
+        !updated_instance.requires_prior_request_deduplication(),
+        "the updated pre_proxy instance must be the one published, not the retained terminate one"
+    );
+    assert!(
+        updated_instance.modifies_request_headers(),
+        "pre_proxy mode modifies request headers; terminate mode does not"
+    );
+    assert!(updated_instance.deferred_before_proxy_may_change_routing_headers());
+    assert_eq!(
+        updated_instance.warmup_hostnames(),
+        vec!["updated.example.net".to_string()],
+        "the rebuilt instance must carry the updated function_url, not the created one"
+    );
+    drop(updated_instance);
+
+    // An invalid mode is fail-closed at reload rather than silently accepted or
+    // partially published.
+    let invalid = make_config(
+        vec![proxy()],
+        vec![serverless_terminate_plugin_config(
+            "sls-terminate",
+            "shortcircuit",
+        )],
+    );
+    let error = cache
+        .rebuild(&invalid)
+        .expect_err("an unknown serverless_function mode must reject reload");
+    assert!(error.contains("mode"), "unexpected reload error: {error}");
+    let after_failed_reload =
+        resolved_serverless_instance(&cache).expect("live instance survives a refused reload");
+    assert!(
+        !after_failed_reload.requires_prior_request_deduplication()
+            && after_failed_reload.warmup_hostnames() == vec!["updated.example.net".to_string()],
+        "a refused reload must leave the last accepted instance published, not partially apply"
+    );
+    drop(after_failed_reload);
+
+    // Delete.
+    let deleted = make_config(
+        vec![make_proxy(SERVERLESS_GRPC_PROXY, "/rpc", vec![])],
+        vec![],
+    );
+    cache
+        .rebuild(&deleted)
+        .expect("cache reloads without the plugin");
+    assert!(
+        !resolved_plugin_names(&cache, ProxyProtocol::Grpc)
+            .contains(&"serverless_function".to_string()),
+        "deleting the plugin config must remove it from the resolved gRPC view"
+    );
+}
+
+#[test]
+fn ai_response_guard_descriptor_preload_scopes_and_lifecycle() {
+    use ferrum_edge::_test_support::ai_response_guard_descriptor_preload_required_for_test;
+
+    let descriptor = format!(
+        "{}/tests/fixtures/test_validator.bin",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let guard_config = json!({
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": descriptor,
+            "methods": {
+                "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        }
+    });
+
+    let ns = ferrum_edge::config::types::default_namespace();
+    let p1 = NamespacedResourceId::new(&ns, "p1");
+    let p2 = NamespacedResourceId::new(&ns, "p2");
+
+    // Global scope: only when globals rebuild.
+    let global = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "g1",
+            "ai_response_guard",
+            guard_config.clone(),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&global).expect("global guard cache");
+    assert!(ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &global,
+        &HashSet::new(),
+        true
+    ));
+    assert!(!ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &global,
+        &HashSet::from([p1.clone()]),
+        false
+    ));
+
+    // Proxy scope: only when that proxy rebuilds and is attached.
+    let proxy_scoped = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["g1"]),
+            make_proxy("p2", "/other", vec![]),
+        ],
+        vec![make_plugin_config_with_json(
+            "g1",
+            "ai_response_guard",
+            guard_config.clone(),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&proxy_scoped).expect("proxy guard cache");
+    assert!(ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &proxy_scoped,
+        &HashSet::from([p1.clone()]),
+        false
+    ));
+    assert!(!ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &proxy_scoped,
+        &HashSet::from([p2.clone()]),
+        false
+    ));
+
+    // Proxy-group scope: active when any attached proxy in the group rebuilds.
+    let mut group_plugin = make_plugin_config_with_json(
+        "g1",
+        "ai_response_guard",
+        guard_config.clone(),
+        PluginScope::ProxyGroup,
+        None,
+    );
+    let group = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["g1"]),
+            make_proxy("p2", "/other", vec![]),
+        ],
+        vec![group_plugin.clone()],
+    );
+    let cache = PluginCache::new(&group).expect("group guard cache");
+    assert!(ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &group,
+        &HashSet::from([p1.clone()]),
+        false
+    ));
+    assert!(!ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &group,
+        &HashSet::from([p2.clone()]),
+        false
+    ));
+
+    // Disabled / inactive configs do not require preload.
+    group_plugin.enabled = false;
+    let disabled = make_config(
+        vec![make_proxy("p1", "/api", vec!["g1"])],
+        vec![group_plugin],
+    );
+    let cache = PluginCache::new(&disabled).expect("disabled guard is ignored");
+    assert!(!ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &disabled,
+        &HashSet::from([p1.clone()]),
+        true
+    ));
+
+    let no_grpc = make_config(
+        vec![make_proxy("p1", "/api", vec!["g1"])],
+        vec![make_plugin_config_with_json(
+            "g1",
+            "ai_response_guard",
+            json!({"pii_patterns": ["email"]}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&no_grpc).expect("http-only guard");
+    assert!(!ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &no_grpc,
+        &HashSet::from([p1.clone()]),
+        true
+    ));
+
+    // Deletion / empty rebuild scope: no preload.
+    let empty = make_config(vec![make_proxy("p1", "/api", vec![])], vec![]);
+    let cache = PluginCache::new(&empty).expect("empty cache");
+    assert!(!ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &empty,
+        &HashSet::from([p1]),
+        true
+    ));
+}
+
 #[test]
 fn test_transaction_debugger_body_capture_reload_flips_buffering_requirements() {
     // Issue #3316: bounded body capture is an opt-in that must take effect on
@@ -10282,4 +10955,136 @@ fn test_transaction_debugger_body_capture_reload_flips_buffering_requirements() 
         .expect("disabling bounded body capture must reload");
     assert!(!cache.requires_request_body_buffering("ferrum", "p1"));
     assert!(!cache.requires_response_body_buffering("ferrum", "p1"));
+}
+
+// ---------------------------------------------------------------------------
+// NodeWaypoint transparent-capture destination-authz readiness (issue #3287).
+//
+// The captured-connection path must never scan `config.plugin_configs` or the
+// built plugin chain to decide whether mesh-managed destination L4 authz can be
+// enforced. The plugin cache precomputes one generation-level bit at
+// construction/reload; these tests pin exactly what that bit means.
+// ---------------------------------------------------------------------------
+
+/// The reserved config id the mesh runtime injects for its managed, slice-fed
+/// authz instance. Operator-authored rows can never carry it.
+const MANAGED_MESH_AUTHZ_ID: &str = ferrum_edge::modes::mesh::MESH_AUTHZ_PLUGIN_ID;
+
+fn mesh_authz_plugin_config(id: &str, scope: PluginScope, enabled: bool) -> PluginConfig {
+    let proxy_id = if scope == PluginScope::Global {
+        None
+    } else {
+        Some("p1")
+    };
+    let mut plugin = make_plugin_config_with_json(id, "mesh_authz", json!({}), scope, proxy_id);
+    plugin.enabled = enabled;
+    plugin
+}
+
+fn node_waypoint_authz_ready(plugin_configs: Vec<PluginConfig>) -> bool {
+    let config = make_config(Vec::new(), plugin_configs);
+    let cache = PluginCache::new(&config).expect("mesh_authz plugin cache builds");
+    ferrum_edge::_test_support::node_waypoint_destination_authz_ready_for_test(&cache)
+}
+
+fn ready_from_counts(managed: bool, configured: usize, built: usize) -> bool {
+    ferrum_edge::_test_support::node_waypoint_destination_authz_ready_from_counts_for_test(
+        managed, configured, built,
+    )
+}
+
+#[test]
+fn managed_mesh_authz_plus_prebuilt_tcp_chain_is_destination_authz_ready() {
+    let plugin = mesh_authz_plugin_config(MANAGED_MESH_AUTHZ_ID, PluginScope::Global, true);
+    let config = make_config(Vec::new(), vec![plugin]);
+    let cache = PluginCache::new(&config).expect("mesh_authz plugin cache builds");
+
+    // The bit is only meaningful because the managed instance really is in the
+    // prebuilt GLOBAL TCP chain — the chain the dynamically synthesized capture
+    // relay resolves, since that proxy is never in `config.proxies`.
+    let tcp_chain = plugins_for_protocol_for_test(
+        &cache,
+        "ferrum",
+        "__mesh_inbound_tcp_relay_synthesized__",
+        ProxyProtocol::Tcp,
+    );
+    assert!(
+        tcp_chain.iter().any(|p| p.name() == "mesh_authz"),
+        "the managed mesh_authz runtime policy must be in the global TCP fallback chain"
+    );
+    assert!(
+        ferrum_edge::_test_support::node_waypoint_destination_authz_ready_for_test(&cache),
+        "an enabled managed __mesh_authz whose policy is in the global TCP chain is ready"
+    );
+}
+
+#[test]
+fn operator_only_mesh_authz_is_not_destination_authz_ready() {
+    // An operator global mesh_authz is not the mesh-managed, slice-fed capture
+    // enforcement instance, so it must never satisfy the managed requirement.
+    let operator = mesh_authz_plugin_config("operator-mesh-authz", PluginScope::Global, true);
+    assert!(!node_waypoint_authz_ready(vec![operator]));
+}
+
+#[test]
+fn disabled_managed_mesh_authz_is_not_destination_authz_ready() {
+    let disabled = mesh_authz_plugin_config(MANAGED_MESH_AUTHZ_ID, PluginScope::Global, false);
+    assert!(!node_waypoint_authz_ready(vec![disabled]));
+}
+
+#[test]
+fn proxy_scoped_managed_mesh_authz_id_is_not_destination_authz_ready() {
+    // Only a GLOBAL row lands in the global TCP fallback chain the synthesized
+    // relay resolves; a proxy-scoped row carrying the reserved id does not.
+    let scoped = mesh_authz_plugin_config(MANAGED_MESH_AUTHZ_ID, PluginScope::Proxy, true);
+    assert!(!node_waypoint_authz_ready(vec![scoped]));
+}
+
+#[test]
+fn reserved_id_on_a_different_plugin_is_not_destination_authz_ready() {
+    // The reserved id alone proves nothing: readiness requires the exact
+    // (id, plugin_name) pair the mesh runtime injects.
+    let impostor = make_plugin_config_with_json(
+        MANAGED_MESH_AUTHZ_ID,
+        "ip_restriction",
+        json!({ "allow": ["10.0.0.0/8"] }),
+        PluginScope::Global,
+        None,
+    );
+    assert!(!node_waypoint_authz_ready(vec![impostor]));
+}
+
+#[test]
+fn no_mesh_authz_at_all_is_not_destination_authz_ready() {
+    assert!(!node_waypoint_authz_ready(Vec::new()));
+}
+
+#[test]
+fn managed_and_operator_mesh_authz_together_stay_destination_authz_ready() {
+    // Both rows build and both survive the TCP protocol filter, so the managed
+    // instance is still provably present.
+    let managed = mesh_authz_plugin_config(MANAGED_MESH_AUTHZ_ID, PluginScope::Global, true);
+    let operator = mesh_authz_plugin_config("operator-mesh-authz", PluginScope::Global, true);
+    assert!(node_waypoint_authz_ready(vec![managed, operator]));
+}
+
+#[test]
+fn managed_config_without_its_runtime_policy_in_the_tcp_chain_is_not_ready() {
+    // Managed row configured, but nothing named `mesh_authz` reached the
+    // prebuilt global TCP chain: fail closed.
+    assert!(!ready_from_counts(true, 1, 0));
+    // Managed plus operator rows configured but only one instance reached the
+    // chain: which one survived is unknowable from trait objects, so this fails
+    // closed rather than assuming the managed one did.
+    assert!(!ready_from_counts(true, 2, 1));
+    // Every configured row is accounted for in the chain, so the managed
+    // instance is necessarily among them.
+    assert!(ready_from_counts(true, 1, 1));
+    assert!(ready_from_counts(true, 2, 2));
+    // An unexpected extra runtime instance also invalidates the exact
+    // config-to-chain proof and must fail closed.
+    assert!(!ready_from_counts(true, 1, 2));
+    // No managed row: an operator instance in the chain never satisfies it.
+    assert!(!ready_from_counts(false, 1, 1));
+    assert!(!ready_from_counts(true, 0, 0));
 }
