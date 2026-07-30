@@ -1581,9 +1581,10 @@ fn buffered_h3_trailers_reconcile_with_response_policy_not_chain_emptiness() {
         reconcile.contains("reconcile_backend_trailers_with_response_policy(")
             && reconcile.contains("plugin_cache_view.response_trailer_policy_names()")
             && reconcile.contains("plugin_cache_view.response_trailer_policy_prefixes()")
-            && reconcile.contains("UNBOUNDED_RESPONSE_TRAILER_POLICY"),
+            && reconcile.contains("response_trailer_governance.unbounded"),
         "buffered H3 must reconcile surviving trailers against the precomputed \
-         response-header policy names/prefixes and the fail-closed unbounded capability"
+         response-header policy names/prefixes and the same request-resolved \
+         fail-closed unbounded arm the streaming relays received"
     );
 
     // Hop-by-hop trailer names are stripped BEFORE the reconciliation, matching
@@ -1709,7 +1710,12 @@ fn streaming_h3_relays_reconcile_backend_trailers_with_response_policy() {
     }
 
     // Governance is read once from the precomputed plugin-cache view, not
-    // rebuilt per response, and keeps the fail-closed unbounded arm.
+    // rebuilt per response, and keeps the fail-closed unbounded arm. The
+    // unbounded arm is REQUEST-resolved (a `waf` instance governs only the
+    // requests its `global_exemptions` do not exempt, and a consumer exemption
+    // is known only after authentication), so it must be taken from the
+    // request-aware resolver on the finalized context and not from the
+    // config-time capability bit.
     let governance = src
         .split("let response_trailer_governance = ResponseTrailerGovernance {")
         .nth(1)
@@ -1727,8 +1733,26 @@ fn streaming_h3_relays_reconcile_backend_trailers_with_response_policy() {
         "streaming governance prefixes must come from the per-reload plugin cache view"
     );
     assert!(
-        governance.contains("UNBOUNDED_RESPONSE_TRAILER_POLICY"),
-        "streaming governance must keep the fail-closed unbounded arm"
+        governance.contains(
+            "unbounded: plugin_cache_view.unbounded_response_trailer_policy_applies(&ctx),"
+        ),
+        "streaming governance must keep the fail-closed unbounded arm and resolve it \
+         against the finalized request context"
+    );
+    // The resolution point must be after the request-side phases. Anchoring it to
+    // `should_stream_response_body` — which already evaluates the sibling
+    // per-request WAF trailer predicate — pins it to the same finalized context
+    // and fails if it drifts back to intake.
+    let stream_decision_at = src
+        .find("let should_stream_response = crate::proxy::should_stream_response_body(")
+        .expect("H3 response-body streaming decision");
+    let governance_at = src
+        .find("let response_trailer_governance = ResponseTrailerGovernance {")
+        .expect("H3 streaming trailer governance");
+    assert!(
+        stream_decision_at < governance_at,
+        "the request-resolved trailer governance must be built from the finalized \
+         request context, not before the request-side plugin phases"
     );
 
     // GHSA-r78v-rc86-6r86: native gRPC over H3 inlines its own trailer finish,

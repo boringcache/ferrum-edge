@@ -829,8 +829,9 @@ impl ResponseTrailerPolicyWitness {
     }
 }
 
-/// Config-time response-trailer governance for one request, read once from the
-/// plugin cache and threaded down the HTTP/3 relay helpers.
+/// Response-trailer governance for one request: config-time name/prefix unions
+/// read once from the plugin cache, plus the request-resolved fail-closed arm,
+/// threaded down the HTTP/3 relay helpers.
 #[derive(Clone, Copy)]
 pub(crate) struct ResponseTrailerGovernance<'a> {
     /// Union of `Plugin::response_trailer_policy()` exact names for this proxy
@@ -839,7 +840,10 @@ pub(crate) struct ResponseTrailerGovernance<'a> {
     /// Union of `Plugin::response_trailer_policy()` case-insensitive ASCII
     /// prefixes for this proxy and protocol, precomputed per reload.
     pub(crate) policy_prefixes: &'a [String],
-    /// At least one plugin declared `ResponseTrailerPolicy::Unbounded`.
+    /// At least one plugin declared `ResponseTrailerPolicy::Unbounded`, or a
+    /// plugin that declared `ResponseTrailerPolicy::RequestConditionalUnbounded`
+    /// applies it to THIS request
+    /// (`PluginCacheRequestView::unbounded_response_trailer_policy_applies`).
     pub(crate) unbounded: bool,
 }
 
