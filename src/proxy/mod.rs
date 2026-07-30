@@ -24656,8 +24656,15 @@ async fn handle_proxy_request_inner(
                 // application metadata and is governed. `content-length` is in the
                 // capture gate because the gRPC deadline strip and the gRPC-Web
                 // translation both remove it below.
+                //
+                // Resolved against the FINALIZED request context, not the
+                // capability bit alone: an instance may govern trailers only for
+                // the requests it actually inspects (`waf` skips a
+                // `global_exemptions` match entirely), and that can depend on the
+                // authenticated consumer. Every request-side phase has already
+                // run here, so this is the latest and only correct point.
                 let grpc_streaming_unbounded_trailer_policy =
-                    capabilities.has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY);
+                    plugin_cache_view.unbounded_response_trailer_policy_applies(&ctx);
                 // `content-length` is in this gate because the gRPC deadline
                 // strip and the gRPC-Web translation both remove it below.
                 let grpc_streaming_header_phases_can_mutate =
@@ -27193,7 +27200,12 @@ async fn handle_proxy_request_inner(
         } else {
             headers_mod::TrailerSectionKind::PlainResponse
         };
-        let unbounded = capabilities.has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY);
+        // Request-aware: the unconditional capability bit OR-ed with the
+        // request-conditional contributors, evaluated on the finalized context
+        // (see `unbounded_response_trailer_policy_applies`). An instance that
+        // does not govern THIS request cannot arm the fail-closed drop, and
+        // cannot disarm one another instance or plugin armed.
+        let unbounded = plugin_cache_view.unbounded_response_trailer_policy_applies(&ctx);
         // The gateway's builder-only response writes (`via`, `alt-svc`,
         // `X-Gateway-Error`, `X-Gateway-Upstream-Status`) are wire mutations
         // exactly like a plugin write, so they count as a header phase for the

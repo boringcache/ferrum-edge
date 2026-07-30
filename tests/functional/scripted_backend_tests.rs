@@ -407,8 +407,8 @@ async fn backend_close_mid_body_populates_body_error_class() {
 //
 // Configures a TLS backend with a cert that's already `notAfter` in the
 // past. The gateway, configured to *verify* the backend cert, refuses the
-// handshake and returns 502. We assert status + that the log carries a
-// TLS/cert signal rather than a body one.
+// handshake and returns 502. We assert status + the typed TLS error counter
+// rather than scraping asynchronous subprocess logs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn tls_expired_cert_produces_tls_error_not_generic_502() {
@@ -443,9 +443,13 @@ async fn tls_expired_cert_produces_tls_error_not_generic_502() {
     );
 
     let harness = GatewayHarness::builder()
+        // This test exercises backend TLS classification, not binary-process
+        // startup. Adopt pre-bound listeners so parallel shards cannot expose
+        // the bind/drop/rebind window between ephemeral-port discovery and the
+        // child process binding its proxy socket.
+        .mode_in_process()
         .file_config(yaml)
         .log_level("info")
-        .capture_output()
         .spawn()
         .await
         .expect("spawn gateway");
@@ -457,27 +461,31 @@ async fn tls_expired_cert_produces_tls_error_not_generic_502() {
         .expect("response");
     assert_eq!(resp.status, StatusCode::BAD_GATEWAY, "expected 502");
 
-    // Look for cert/TLS-specific tokens. We deliberately avoid a bare `"tls"`
-    // substring match — crate and module paths contain "tls" nearly
-    // everywhere, which would turn this assertion into a no-op.
-    let has_tls_signal = |logs: &str| {
-        logs.contains("TlsError")
-            || logs.contains("expired")
-            || logs.contains("notAfter")
-            || logs.contains("NotValidYet")
-            || logs.contains("certificate")
-            || logs.contains("CertificateError")
-            || logs.contains("InvalidCertificate")
-            || logs.contains("handshake")
+    // Runtime metrics are the production classification surface and avoid the
+    // old test's async log-flush race. Poll because `/metrics/runtime` is
+    // cached and the request can complete just before the new sample appears.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let metrics = loop {
+        let snapshot = harness
+            .get_admin_json("/metrics/runtime")
+            .await
+            .expect("runtime metrics");
+        if snapshot["errors"]["by_class"]["tls_error"]["http"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+            || Instant::now() >= deadline
+        {
+            break snapshot;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    // Poll: the TLS handshake error logs flush through the non-blocking writer
-    // after the client already sees the 502, so a single snapshot can race it.
-    let logs = harness
-        .wait_for_log_contains(&has_tls_signal, Duration::from_secs(5))
-        .await;
     assert!(
-        has_tls_signal(&logs),
-        "expected TLS/cert error signal in logs, got:\n{logs}"
+        metrics["errors"]["by_class"]["tls_error"]["http"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "expired backend certificate must be classified as tls_error: {metrics}"
     );
 }
 

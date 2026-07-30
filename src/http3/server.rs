@@ -2126,18 +2126,6 @@ async fn handle_h3_request(
     let stream_hooks_enabled = plugin_cache_view.requires_response_stream_hooks();
     let maybe_requires_response_body_buffering =
         plugin_cache_view.requires_response_body_buffering();
-    // Config-time response-trailer governance, read once and threaded into
-    // every plain native/refined H3 STREAMING relay below. Those relays send
-    // initial HEADERS before the backend's trailers exist, so the trailer frame
-    // is a second crossing of the same response-header policy boundary the
-    // buffered send path reconciles inline.
-    let response_trailer_governance = ResponseTrailerGovernance {
-        policy_names: plugin_cache_view.response_trailer_policy_names(),
-        policy_prefixes: plugin_cache_view.response_trailer_policy_prefixes(),
-        unbounded: capabilities
-            .has(crate::plugin_cache::PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
-    };
-
     let mut plugin_execution_ns: u64 = 0;
 
     // Execute on_request_received hooks
@@ -4373,6 +4361,25 @@ async fn handle_h3_request(
         &ctx,
         maybe_requires_response_body_buffering,
     );
+    // Response-trailer governance, resolved once here and threaded into every
+    // plain native/refined H3 STREAMING relay below. Those relays send initial
+    // HEADERS before the backend's trailers exist, so the trailer frame is a
+    // second crossing of the same response-header policy boundary the buffered
+    // send path reconciles inline.
+    //
+    // The name/prefix unions are config-time, but the fail-closed `unbounded`
+    // arm can be request-conditional (`waf` governs only the requests it
+    // actually inspects, and `global_exemptions` can key on the authenticated
+    // consumer). So it is resolved HERE — the same finalized-request-context
+    // point `should_stream_response_body` above uses for
+    // `requires_buffered_grpc_web_trailer_policy` — and deliberately not at
+    // intake, before authentication could populate the identity it may depend
+    // on. Every consumer of this value is below this line.
+    let response_trailer_governance = ResponseTrailerGovernance {
+        policy_names: plugin_cache_view.response_trailer_policy_names(),
+        policy_prefixes: plugin_cache_view.response_trailer_policy_prefixes(),
+        unbounded: plugin_cache_view.unbounded_response_trailer_policy_applies(&ctx),
+    };
     // A recognized gRPC-Web request can intentionally retain Plain backend
     // transport when no translator is configured. Once deadline policy has
     // installed an absolute RPC deadline, buffer that pass-through upload so
@@ -7322,8 +7329,10 @@ async fn handle_h3_request(
         // last header phase, against the precomputed per-proxy policy-name union;
         // an auth/logging-only chain contributes no names and mutates no headers,
         // so its trailers pass through untouched.
-        let unbounded_trailer_policy = capabilities
-            .has(crate::plugin_cache::PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY);
+        // Same request-aware resolution the streaming relays received, reused so
+        // buffered and streaming H3 cannot disagree about whether the
+        // fail-closed arm is armed for this request.
+        let unbounded_trailer_policy = response_trailer_governance.unbounded;
         if let Some(trailers) = response_trailers.as_mut() {
             // Strip hop-by-hop trailer names BEFORE reconciling, matching the
             // streaming helper's order (`finish_h3_response_with_backend_trailers`).

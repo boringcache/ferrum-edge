@@ -41,8 +41,8 @@ use self::stream::{
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::{
     ALL_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext,
-    StreamBytesKind, StreamConnectionContext, UdpDatagramContext, UdpDatagramDirection,
-    UdpDatagramVerdict,
+    ResponseTrailerPolicy, StreamBytesKind, StreamConnectionContext, UdpDatagramContext,
+    UdpDatagramDirection, UdpDatagramVerdict,
 };
 use crate::config::types::BackendScheme;
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -180,6 +180,19 @@ static NEXT_WAF_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 impl Waf {
     fn body_encoding_specials_active(&self) -> bool {
         self.specials.encoding.is_some() || self.specials.overlong_utf8.is_some()
+    }
+
+    fn has_enforcing_response_header_policy(&self) -> bool {
+        if self.config.mode != GlobalMode::Enforce || !self.compiled.response_header_rules_active {
+            return false;
+        }
+        if self.config.scoring.is_some() {
+            return true;
+        }
+        self.compiled.rules.iter().any(|rule| {
+            rule.action == RuleAction::Enforce
+                && matches!(&rule.target, self::rules::RuleTarget::ResponseHeaders)
+        })
     }
 
     fn has_enforcing_response_body_policy(&self) -> bool {
@@ -1199,6 +1212,37 @@ impl Plugin for Waf {
             return self.handle_unbounded_response_stream(ctx);
         }
         PluginResult::Continue
+    }
+
+    fn response_trailer_policy(&self) -> ResponseTrailerPolicy<'_> {
+        if self.active
+            && self.config.response_inspection
+            && self.has_enforcing_response_header_policy()
+        {
+            // Response-header rules can match any field name or value. Since
+            // `after_proxy` cannot inspect trailer-only fields, fail closed by
+            // preventing trailer-forwarding paths from emitting that section.
+            //
+            // REQUEST-CONDITIONAL, not `Unbounded`: `after_proxy` returns early
+            // for a `global_exemptions` match, so an exempt request never gets a
+            // response-header scan and there is nothing to fail closed about —
+            // it must keep its backend trailers exactly as it did before this
+            // governance existed, matching
+            // `requires_buffered_grpc_web_trailer_policy`. The per-request arm
+            // is `request_applies_unbounded_response_trailer_policy` below.
+            ResponseTrailerPolicy::RequestConditionalUnbounded
+        } else {
+            ResponseTrailerPolicy::None
+        }
+    }
+
+    fn request_applies_unbounded_response_trailer_policy(&self, ctx: &RequestContext) -> bool {
+        // Exactly the predicate that gates `after_proxy`'s response-header scan,
+        // so the trailer fail-closed arm is active on precisely the requests the
+        // WAF can actually enforce on. Consumer-keyed exemptions resolve only
+        // after authentication, which is why the caller defers this to the
+        // finalized request context.
+        !self.request_is_exempt(ctx)
     }
 
     fn requires_buffered_grpc_web_trailer_policy(&self, ctx: &RequestContext) -> bool {

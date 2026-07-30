@@ -1194,6 +1194,20 @@ pub enum ResponseTrailerPolicy<'a> {
     /// published at request time. Trailer-forwarding paths fail closed and drop
     /// the whole backend trailer section.
     Unbounded,
+    /// Same non-enumerable governed field set as [`Self::Unbounded`], but the
+    /// plugin only *applies* it to some requests. The plugin cache keeps these
+    /// instances in a small per-proxy list instead of folding them into the
+    /// unconditional capability bit, and trailer-forwarding paths ask
+    /// [`Plugin::request_applies_unbounded_response_trailer_policy`] once the
+    /// request context is fully populated.
+    ///
+    /// The built-in example is `waf`: an enforcing response-header
+    /// configuration governs trailers it cannot inspect, but a request matched
+    /// by `global_exemptions` never reaches a WAF response-header scan at all,
+    /// so dropping its trailers would be enforcement the operator disabled.
+    /// Whether a request is exempt can depend on the authenticated consumer, so
+    /// this arm must never be resolved before authentication.
+    RequestConditionalUnbounded,
 }
 
 /// Shared one-element declaration for the plugins whose `after_proxy` echoes
@@ -7166,9 +7180,34 @@ pub trait Plugin: Send + Sync {
     /// it (CORS `access-control-*` plus `vary`); reserve
     /// [`ResponseTrailerPolicy::Unbounded`] when the governed set cannot be
     /// listed even that way — currently request-time route overrides from
-    /// `response_transformer`.
+    /// `response_transformer`. When that non-enumerable policy is also applied to
+    /// only some requests, declare
+    /// [`ResponseTrailerPolicy::RequestConditionalUnbounded`] and implement
+    /// [`Self::request_applies_unbounded_response_trailer_policy`] instead of
+    /// dropping trailers for requests the plugin never inspects (`waf` with
+    /// `global_exemptions`).
     fn response_trailer_policy(&self) -> ResponseTrailerPolicy<'_> {
         ResponseTrailerPolicy::None
+    }
+
+    /// Whether this instance's
+    /// [`ResponseTrailerPolicy::RequestConditionalUnbounded`] declaration
+    /// applies to THIS request.
+    ///
+    /// Only consulted for instances that declared that variant; every other
+    /// declaration is resolved at config time. Returning `true` keeps the
+    /// fail-closed arm active for the request (the safe default); returning
+    /// `false` means this instance governs nothing here, so the backend trailer
+    /// section is preserved exactly as an unconfigured chain would preserve it —
+    /// subject to the other plugins' own declarations and the ordinary
+    /// gateway/hop-by-hop trailer governance.
+    ///
+    /// Called at most once per response, after the request-side phases have run,
+    /// because request-level exemptions can key on identity that only
+    /// authentication establishes. It must not suppress any OTHER plugin's
+    /// declaration: the resolver ORs contributors together.
+    fn request_applies_unbounded_response_trailer_policy(&self, _ctx: &RequestContext) -> bool {
+        true
     }
 
     /// Returns `true` when this plugin may change the response `Content-Type`
