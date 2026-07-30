@@ -2132,16 +2132,6 @@ impl McpGateway {
             .filter(|(_, stats)| stats.fully_unavailable())
             .map(|(family, _)| *family)
             .collect();
-        // Total outage with nothing to serve in any attempted family: keep the
-        // catalog stale (the next request retries) and surface the refresh
-        // error instead of publishing a misleading empty catalog. The
-        // per-request warnings above already carry the failure detail.
-        if !families.is_empty() && unavailable.len() == families.len() {
-            let attempted_lists: usize = families.values().map(|stats| stats.attempted).sum();
-            return Err(format!(
-                "all {attempted_lists} MCP upstream catalog list requests failed"
-            ));
-        }
         for (server_id, family) in &degraded {
             warn!(
                 server_id = %server_id,
