@@ -1465,6 +1465,72 @@ async fn test_post_invalidates_cached_get() {
     assert!(matches!(result, PluginResult::Continue));
 }
 
+/// A route-dispatch rewrite (`mesh_route_dispatch`, a `request_transformer`
+/// route override, `ai_stream_router`) publishes `route_override_path` during
+/// `before_proxy`; proxy core folds it into `RequestContext::path` only *after*
+/// the phase returns, and it stays there for the rest of the request.
+///
+/// The base key and the staged unsafe-method invalidation target are both the
+/// *client-facing* path observed at lookup. The storage-side invalidation index
+/// must use that same value: indexing under the then-current (rewritten) path
+/// would leave RFC 9111 §4.4 invalidation matching nothing, so a mutated
+/// resource would keep serving its stale cached representation for the rest of
+/// its TTL.
+#[tokio::test]
+async fn test_unsafe_method_invalidates_entry_stored_behind_a_route_rewrite() {
+    const CLIENT_PATH: &str = "/api/items";
+    const BACKEND_PATH: &str = "/backend/v2/items";
+
+    fn rewritten_ctx(method: &str) -> RequestContext {
+        let mut ctx = make_ctx(method, CLIENT_PATH);
+        ctx.route_override_path = Some(BACKEND_PATH.to_string());
+        ctx
+    }
+
+    // Proxy core consumes the override and rebases `ctx.path` onto the backend
+    // route only after `before_proxy` has already returned.
+    fn apply_route_rewrite(ctx: &mut RequestContext) {
+        let rewritten = ctx.route_override_path.take().expect("override staged");
+        ctx.path = rewritten;
+    }
+
+    let plugin = default_plugin();
+
+    let mut ctx = rewritten_ctx("GET");
+    let mut headers = HashMap::new();
+    let miss = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(miss, PluginResult::Continue));
+    apply_route_rewrite(&mut ctx);
+    let mut resp_headers = HashMap::new();
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &resp_headers, b"cached")
+        .await;
+
+    // Reachability first, otherwise the invalidation assertion is vacuous.
+    let mut ctx = rewritten_ctx("GET");
+    let mut headers = HashMap::new();
+    let hit = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&hit), "rewritten route must be cacheable");
+
+    // A successful POST on the same client-facing path must evict it.
+    let mut ctx = rewritten_ctx("POST");
+    let mut headers = HashMap::new();
+    let bypass = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(bypass, PluginResult::Continue));
+    apply_route_rewrite(&mut ctx);
+    let mut resp_headers = HashMap::new();
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+    let mut ctx = rewritten_ctx("GET");
+    let mut headers = HashMap::new();
+    let after = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(after, PluginResult::Continue),
+        "invalidation must reach an entry stored behind a route rewrite"
+    );
+}
+
 // === Max entry size ===
 
 #[tokio::test]

@@ -135,8 +135,8 @@ const DEFAULT_MAX_TOTAL_SIZE_BYTES: usize = 104_857_600;
 /// Request-metadata namespace prefix. Each plugin instance appends its
 /// process-unique [`ResponseCaching::instance_id`] so multiple
 /// `response_caching` configs on one proxy cannot overwrite one another's
-/// staged base key, status, predictor key, timing, header snapshot, or
-/// pending unsafe-method invalidation host partition.
+/// staged base key, status, predictor key, timing, header snapshot, lookup
+/// path, or pending unsafe-method invalidation host partition.
 const METADATA_NAMESPACE_PREFIX: &str = "response_caching.";
 const CACHE_BASE_KEY_SUFFIX: &str = "cache_base_key";
 const CACHE_STATUS_SUFFIX: &str = "cache_status";
@@ -159,6 +159,20 @@ const CACHE_PENDING_INVALIDATE_HOST_SUFFIX: &str = "cache_pending_invalidate_hos
 /// proxy may replace `RequestContext::path` with a backend route rewrite before
 /// `after_proxy`, so deferred invalidation must not read the then-current path.
 const CACHE_PENDING_INVALIDATE_PATH_SUFFIX: &str = "cache_pending_invalidate_path";
+/// Client-facing path observed at lookup, stashed for the storage side.
+///
+/// The base key binds `RequestContext::path` as it was during `before_proxy`,
+/// and [`Self::stage_pending_invalidation`] stages the same client-facing value
+/// for a later unsafe-method sweep. A route-dispatch rewrite
+/// (`route_override_path`, set by `mesh_route_dispatch` / `request_transformer`
+/// route overrides / `ai_stream_router`) is applied to `RequestContext::path`
+/// *after* `before_proxy` returns, so reading the then-current path in
+/// `on_final_response_body` would index the entry under the rewritten backend
+/// path while invalidation looks it up under the client-facing one — RFC 9111
+/// §4.4 invalidation would then silently match nothing.
+///
+/// [`Self::stage_pending_invalidation`]: ResponseCaching::stage_pending_invalidation
+const CACHE_LOOKUP_PATH_SUFFIX: &str = "cache_lookup_path";
 
 static CACHE_CLOCK_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 static NEXT_RESPONSE_CACHING_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -1152,6 +1166,8 @@ pub struct ResponseCaching {
     meta_pending_invalidate_host: String,
     /// Precomputed `response_caching.<id>.cache_pending_invalidate_path`.
     meta_pending_invalidate_path: String,
+    /// Precomputed `response_caching.<id>.cache_lookup_path`.
+    meta_lookup_path: String,
     /// Parsed configuration, including how anonymous callers are partitioned
     /// (`config.anonymous_caller_scope`, see [`AnonymousCallerScope`]). The
     /// scope is deliberately *not* mirrored onto a second field: one owner
@@ -1229,6 +1245,7 @@ impl ResponseCaching {
                 instance_id,
                 CACHE_PENDING_INVALIDATE_PATH_SUFFIX,
             ),
+            meta_lookup_path: staging_metadata_key(instance_id, CACHE_LOOKUP_PATH_SUFFIX),
             config,
             cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
             vary_index: Arc::new(DashMap::with_shard_amount(shard_amount)),
@@ -1285,6 +1302,7 @@ impl ResponseCaching {
         ctx.metadata.remove(&self.meta_predict_key);
         ctx.metadata.remove(&self.meta_request_started);
         ctx.metadata.remove(&self.meta_headers_snapshot);
+        ctx.metadata.remove(&self.meta_lookup_path);
         ctx.clear_response_cache_request_header_delta(self.instance_id);
     }
 
@@ -1692,9 +1710,13 @@ impl ResponseCaching {
 
     /// Remove every live variant of one base key.
     ///
-    /// Bounded by the variant count recorded in [`CacheMaintenance`], not by
-    /// cache size: the previous implementation scanned every entry in the map
-    /// looking for a `base_key:` string prefix.
+    /// The recorded [`BaseKeyVariants`] location narrows the search to one
+    /// `(authority scope, path)` bucket — every variant of a base key shares
+    /// both by construction — instead of the previous scan over every entry in
+    /// the map looking for a `base_key:` string prefix. The bucket can still
+    /// hold sibling base keys (other callers at the same authority and path),
+    /// so the cost is bounded by that bucket rather than by this base key's
+    /// variant count; the per-item work is one prefix comparison.
     fn invalidate_base_key_locked(&self, maintenance: &mut CacheMaintenance, base_key: &str) {
         let doomed: Vec<String> = match maintenance.variant_counts.get(base_key) {
             Some(state) => maintenance
@@ -2513,6 +2535,13 @@ impl Plugin for ResponseCaching {
         };
         ctx.metadata
             .insert(self.meta_base_key.clone(), base_key.clone());
+        // Stage the client-facing path this key was derived from. A
+        // route-dispatch rewrite is folded into `ctx.path` only after
+        // `before_proxy` returns, so the storage side must index the entry
+        // under this value rather than the then-current path — see
+        // `CACHE_LOOKUP_PATH_SUFFIX`.
+        ctx.metadata
+            .insert(self.meta_lookup_path.clone(), ctx.path.clone());
         self.stash_request_started_at(ctx, self.now_monotonic());
         // Preserve the complete backend-visible header view privately so
         // `on_final_response_body` can key arbitrary origin-supplied Vary
@@ -2913,7 +2942,18 @@ impl Plugin for ResponseCaching {
 
         let invalidation_scope =
             self.invalidation_scope(ctx, lookup_headers.headers.get("host").map(String::as_str));
-        let invalidation_path: Arc<str> = Arc::from(encode_path_for_cache_key(&ctx.path).as_ref());
+        // Index under the client-facing path staged at lookup, which is the
+        // same value the base key bound and the same value an unsafe method
+        // stages for the RFC 9111 §4.4 sweep. `ctx.path` may already carry a
+        // post-`before_proxy` route rewrite by now; indexing under that would
+        // make invalidation match nothing. Falls back to `ctx.path` only for
+        // direct hook contexts that never ran this instance's lookup.
+        let lookup_path = match ctx.metadata.get(&self.meta_lookup_path) {
+            Some(path) => path.as_str(),
+            None => ctx.path.as_str(),
+        };
+        let encoded_lookup_path = encode_path_for_cache_key(lookup_path);
+        let invalidation_path: Arc<str> = Arc::from(encoded_lookup_path.as_ref());
 
         // Copy the potentially large body before entering the publication
         // critical section. The final key and response Vary header cannot be

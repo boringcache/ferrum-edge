@@ -351,11 +351,23 @@ one fail-closed replay-partition contract
   may not be configured at all, and the value reaches the origin either way.
   Wherever that partition is used they are bound like any other backend-visible
   header, so a client that varies its trace header per request will now miss per
-  request. Deployments that want cross-trace sharing must strip or normalize
-  those headers before the cache — for example with `correlation_id` or
-  `otel_tracing` in `trace_context_trust: untrusted` mode. `response_caching` is
-  unaffected: it keys request headers through `Vary`, so a trace header is a
-  dimension there only when the origin nominates it or an operator lists it in
+  request. **Plan for this before enabling `ai_semantic_cache` alongside request
+  tracing.** `otel_tracing` injects a `traceparent` carrying a freshly generated
+  span ID into the backend-visible header map on *every* request (in both
+  `trace_context_trust` modes, whenever `generate_trace_id` is `true`), and
+  `correlation_id` injects a generated identifier whenever the client supplied
+  none. Either one makes the exact key and the semantic scope key unique per
+  request, so the cache cannot hit at all — and it still pays for an embedding
+  call and a store on every miss. `trace_context_trust: untrusted` does **not**
+  help: it generates a fresh root rather than normalizing to a shared value. To
+  keep both, either run the cached route on a proxy that does not inject a
+  per-request identifier (`otel_tracing` with `generate_trace_id: false` and no
+  trusted inbound parent, or no `correlation_id` instance), or remove the
+  identifier from the backend-visible view with a `request_transformer` header
+  rule at priority `3000` — which also removes it from what the provider
+  receives, so downstream propagation is lost. `response_caching` is unaffected:
+  it keys request headers through `Vary`, so a trace header is a dimension there
+  only when the origin nominates it or an operator lists it in
   `vary_by_headers`. Response-header replay sanitation still strips trace
   identifiers from a retained response; that contract is unchanged.
 - **`scope_by_consumer: false` and `cache_key_include_consumer` no longer
