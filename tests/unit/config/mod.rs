@@ -1,3 +1,4 @@
+mod access_log_filter_tests;
 mod admin_enhanced_tls_tests;
 mod admin_listeners_tests;
 mod admin_security_tests;
