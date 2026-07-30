@@ -1,9 +1,12 @@
 //! Tests for response_size_limiting plugin
 
+use bytes::Bytes;
+use ferrum_edge::_test_support::finalize_synthetic_response_for_test;
 use ferrum_edge::plugins::response_size_limiting::ResponseSizeLimiting;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, validate_plugin_config};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 fn make_ctx() -> RequestContext {
     make_ctx_with_method("GET")
@@ -508,12 +511,77 @@ fn enforced_response_body_limit_is_published_without_forcing_buffering() {
 
 #[test]
 fn strict_instance_publishes_the_same_ceiling_and_forces_buffering() {
-    let plugin = ResponseSizeLimiting::new(
-        &json!({"max_bytes": 1024, "require_buffered_check": true}),
-    )
-    .unwrap();
+    let plugin =
+        ResponseSizeLimiting::new(&json!({"max_bytes": 1024, "require_buffered_check": true}))
+            .unwrap();
     assert_eq!(plugin.enforced_response_body_limit(), Some(1024));
     assert!(plugin.requires_response_body_buffering());
+}
+
+// === Already-buffered synthetic response enforcement ===
+
+#[tokio::test]
+async fn synthetic_response_uses_strictest_global_and_route_ceiling() {
+    for (global_limit, route_limit, body, expected_status) in [
+        // A looser route policy cannot relax the global ceiling.
+        (4usize, Some(10u64), b"12345".as_slice(), 502u16),
+        // An unlimited global cannot disable the route ceiling.
+        (0usize, Some(4u64), b"12345".as_slice(), 502u16),
+        // The exact effective boundary is permitted.
+        (4usize, Some(10u64), b"1234".as_slice(), 200u16),
+    ] {
+        let plugin_limit = route_limit.unwrap_or(10);
+        let plugin: Arc<dyn Plugin> = Arc::new(
+            ResponseSizeLimiting::new(&json!({"max_bytes": plugin_limit})).unwrap(),
+        );
+        let plugins = vec![plugin];
+        let mut ctx = make_ctx();
+        ctx.max_response_body_size_bytes = global_limit;
+        ctx.route_response_body_limit_bytes = route_limit;
+        let mut status = 200;
+        let mut headers = HashMap::new();
+        let mut response_body = Bytes::copy_from_slice(body);
+
+        finalize_synthetic_response_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut response_body,
+        )
+        .await;
+
+        assert_eq!(
+            status, expected_status,
+            "global={global_limit}, route={route_limit:?}, body_len={}",
+            body.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn synthetic_response_without_route_plugin_still_honors_global_ceiling() {
+    let mut ctx = make_ctx();
+    ctx.max_response_body_size_bytes = 4;
+    ctx.route_response_body_limit_bytes = None;
+    let mut status = 200;
+    let mut headers = HashMap::new();
+    let mut response_body = Bytes::from_static(b"12345");
+
+    finalize_synthetic_response_for_test(
+        &[],
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut response_body,
+    )
+    .await;
+
+    assert_eq!(status, 502);
+    assert!(
+        String::from_utf8_lossy(&response_body).contains("Response body too large"),
+        "global-only rejection must replace the synthetic body"
+    );
 }
 
 // === Repeated / ambiguous response Content-Length (GHSA-xrfj-852f-645j) ===

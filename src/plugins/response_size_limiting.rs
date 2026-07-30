@@ -4,7 +4,7 @@
 //! `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`. Rejects responses that exceed the
 //! configured `max_bytes` with HTTP 502 Bad Gateway.
 //!
-//! Two enforcement paths:
+//! Enforcement paths:
 //! 1. **Content-Length fast path** (`after_proxy`): rejects immediately when the
 //!    backend response Content-Length header declares a transferable body larger
 //!    than allowed. Bodyless responses (`HEAD`, `1xx`, `204`/`205`/`304`) skip
@@ -14,6 +14,9 @@
 //!    active (either from `require_buffered_check: true` or because another plugin
 //!    requires buffering), the final client-visible byte length is verified after
 //!    any body transforms have run.
+//! 3. **Core and synthetic checks**: every response collector/streaming adapter
+//!    uses the effective route ceiling, and already-buffered gateway-generated
+//!    responses are checked independently of the body-hook scheduling gate.
 //!
 //! Set `require_buffered_check: true` to force response body buffering so that
 //! chunked/streaming responses without Content-Length are also checked. This adds

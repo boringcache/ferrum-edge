@@ -73,8 +73,14 @@ fn absent_route_limit_preserves_the_global_knob_exactly() {
 /// their own buffering cap with the route ceiling.
 #[test]
 fn stricter_optional_limit_composes_to_the_minimum() {
-    assert_eq!(stricter_optional_limit_for_test(Some(64), Some(32)), Some(32));
-    assert_eq!(stricter_optional_limit_for_test(Some(32), Some(64)), Some(32));
+    assert_eq!(
+        stricter_optional_limit_for_test(Some(64), Some(32)),
+        Some(32)
+    );
+    assert_eq!(
+        stricter_optional_limit_for_test(Some(32), Some(64)),
+        Some(32)
+    );
     assert_eq!(stricter_optional_limit_for_test(Some(32), None), Some(32));
     assert_eq!(stricter_optional_limit_for_test(None, Some(32)), Some(32));
     assert_eq!(stricter_optional_limit_for_test(None, None), None);
@@ -84,7 +90,10 @@ fn stricter_optional_limit_composes_to_the_minimum() {
 
 #[test]
 fn single_declared_length_parses_exactly() {
-    assert_eq!(parse_content_length("2048"), Some(ContentLength::Exact(2048)));
+    assert_eq!(
+        parse_content_length("2048"),
+        Some(ContentLength::Exact(2048))
+    );
     // Surrounding OWS is legal field-value whitespace.
     assert_eq!(
         parse_content_length("  2048\t"),

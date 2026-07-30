@@ -16421,7 +16421,7 @@ pub(crate) fn should_apply_synthetic_response_body_hooks(
 /// Bodyless semantics (`HEAD`, `1xx`, `204`/`205`/`304`) are skipped: their
 /// `Content-Length` describes a representation, not transferred bytes, and they
 /// carry no body to measure.
-fn enforce_synthetic_response_body_route_limit(
+fn enforce_synthetic_response_body_limit(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     status: &mut u16,
@@ -16433,12 +16433,17 @@ fn enforce_synthetic_response_body_route_limit(
     if body.is_empty() || synthetic_response_omits_body(&ctx.method, *status) {
         return;
     }
-    // Precomputed on the context at intake; `None` means no route ceiling, which
-    // leaves this path exactly as it behaved before.
-    let Some(limit) = ctx.route_response_body_limit_bytes.filter(|limit| *limit > 0) else {
+    // The context folds the process-wide ceiling with the precomputed route
+    // ceiling. This synthetic path already owns the complete body, but it must
+    // still honor the same strictest-active bound as every collector and
+    // streaming adapter. In particular, a looser route policy cannot relax the
+    // global ceiling and a synthetic response with no route plugin cannot
+    // bypass the global ceiling.
+    let limit = ctx.effective_max_response_body_size_bytes();
+    if limit == 0 {
         return;
-    };
-    if body.len() as u128 <= limit as u128 {
+    }
+    if body.len() <= limit {
         return;
     }
     // Attribute the refusal to the enforcing plugin without re-running hooks.
@@ -16447,7 +16452,7 @@ fn enforce_synthetic_response_body_route_limit(
         .find(|plugin| {
             plugin
                 .enforced_response_body_limit()
-                .is_some_and(|plugin_limit| plugin_limit == limit)
+                .is_some_and(|plugin_limit| plugin_limit == limit as u64)
         })
         .map_or("response_size_limiting", |plugin| plugin.name());
     debug!(
@@ -16857,7 +16862,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     //
     // Still inside the method-override window: bodyless semantics are decided
     // from the same effective method the hooks saw.
-    enforce_synthetic_response_body_route_limit(plugins, ctx, status, headers, body);
+    enforce_synthetic_response_body_limit(plugins, ctx, status, headers, body);
     if let Some(original_method) = original_method {
         ctx.method = original_method;
     }
@@ -20963,14 +20968,10 @@ async fn handle_proxy_request_inner(
     // knob exactly as configured.
     let route_request_body_limit = ctx.route_request_body_limit();
     let route_response_body_limit = ctx.route_response_body_limit();
-    let effective_max_grpc_recv_size_bytes = effective_request_body_limit(
-        state.max_grpc_recv_size_bytes,
-        route_request_body_limit,
-    );
-    let effective_max_request_body_size_bytes = effective_request_body_limit(
-        state.max_request_body_size_bytes,
-        route_request_body_limit,
-    );
+    let effective_max_grpc_recv_size_bytes =
+        effective_request_body_limit(state.max_grpc_recv_size_bytes, route_request_body_limit);
+    let effective_max_request_body_size_bytes =
+        effective_request_body_limit(state.max_request_body_size_bytes, route_request_body_limit);
     let effective_max_response_body_size_bytes = effective_request_body_limit(
         state.max_response_body_size_bytes,
         route_response_body_limit,
@@ -29844,10 +29845,8 @@ async fn proxy_to_backend(
     // unlimited global still cannot disable an active route limit
     // (`GHSA-xrfj-852f-645j`).
     let route_request_body_limit = request_ctx.route_request_body_limit();
-    let effective_max_request_body_size_bytes = effective_request_body_limit(
-        state.max_request_body_size_bytes,
-        route_request_body_limit,
-    );
+    let effective_max_request_body_size_bytes =
+        effective_request_body_limit(state.max_request_body_size_bytes, route_request_body_limit);
     // Same fold for the response direction. Buffered collection aborts at this
     // value, so a strict route ceiling bounds retained memory per in-flight
     // request instead of letting each one grow toward the global allowance.
@@ -31091,10 +31090,8 @@ async fn proxy_to_backend(
                 // (`GHSA-xrfj-852f-645j`). An ambiguous declaration yields `None`
                 // and falls through to the bounded collect/stream paths below,
                 // which never trust a declared length.
-                let content_length =
-                    canonical_header_content_length(response.headers()).and_then(|len| {
-                        usize::try_from(len).ok()
-                    });
+                let content_length = canonical_header_content_length(response.headers())
+                    .and_then(|len| usize::try_from(len).ok());
 
                 if let Some(len) = content_length
                     && len > effective_max_response_body_size_bytes
@@ -32537,15 +32534,15 @@ async fn proxy_to_backend_hbone(
     request_is_secure: bool,
     resolved_ip: Option<String>,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
-    /// Strictest active route-scoped request-body ceiling, or `None` when no
-    /// matched plugin enforces one. Folded with the global knob below so an
-    /// HBONE-tunneled upload is bounded by the same route policy the direct
-    /// paths enforce (`GHSA-xrfj-852f-645j`).
+    // Strictest active route-scoped request-body ceiling, or `None` when no
+    // matched plugin enforces one. Folded with the global knob below so an
+    // HBONE-tunneled upload is bounded by the same route policy the direct
+    // paths enforce (`GHSA-xrfj-852f-645j`).
     route_request_body_limit: Option<usize>,
-    /// Strictest active route-scoped response-body ceiling, or `None` when no
-    /// matched plugin enforces one. Buffered collection on this path aborts here
-    /// rather than at the generally larger global allowance
-    /// (`GHSA-xrfj-852f-645j`).
+    // Strictest active route-scoped response-body ceiling, or `None` when no
+    // matched plugin enforces one. Buffered collection on this path aborts here
+    // rather than at the generally larger global allowance
+    // (`GHSA-xrfj-852f-645j`).
     route_response_body_limit: Option<usize>,
 ) -> (
     retry::BackendResponse,
@@ -32602,10 +32599,8 @@ async fn proxy_to_backend_hbone(
     // Content-Length reject, the streaming adapter, and the buffered response
     // collector must all use the same effective ceilings
     // (`GHSA-xrfj-852f-645j`).
-    let effective_request_body_size_limit = effective_request_body_limit(
-        state.max_request_body_size_bytes,
-        route_request_body_limit,
-    );
+    let effective_request_body_size_limit =
+        effective_request_body_limit(state.max_request_body_size_bytes, route_request_body_limit);
     let effective_max_response_body_size_bytes = effective_request_body_limit(
         state.max_response_body_size_bytes,
         route_response_body_limit,
@@ -33263,14 +33258,14 @@ async fn proxy_to_backend_mesh_mtls(
     request_is_secure: bool,
     resolved_ip: Option<String>,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
-    /// Strictest active route-scoped request-body ceiling, or `None` when no
-    /// matched plugin enforces one. Narrows whichever global knob the
-    /// gRPC/HTTP selection below picks (`GHSA-xrfj-852f-645j`).
+    // Strictest active route-scoped request-body ceiling, or `None` when no
+    // matched plugin enforces one. Narrows whichever global knob the
+    // gRPC/HTTP selection below picks (`GHSA-xrfj-852f-645j`).
     route_request_body_limit: Option<usize>,
-    /// Strictest active route-scoped response-body ceiling, or `None` when no
-    /// matched plugin enforces one. Buffered collection on this path aborts here
-    /// rather than at the generally larger global allowance
-    /// (`GHSA-xrfj-852f-645j`).
+    // Strictest active route-scoped response-body ceiling, or `None` when no
+    // matched plugin enforces one. Buffered collection on this path aborts here
+    // rather than at the generally larger global allowance
+    // (`GHSA-xrfj-852f-645j`).
     route_response_body_limit: Option<usize>,
 ) -> (
     retry::BackendResponse,
@@ -34420,20 +34415,20 @@ async fn proxy_to_backend_http2(
     // this as frames are polled so summary builders observe streamed uploads
     // (not just Content-Length) once the response completes.
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
-    /// Strictest active route-scoped request-body ceiling, or `None` when no
-    /// matched plugin enforces one.
-    ///
-    /// PR #3176 closed the direct-H2/SNI *timing* window (backend response
-    /// headers are withheld until the streaming upload reaches a terminal size
-    /// outcome). This is the companion bound: the outcome is now decided against
-    /// the route ceiling as well as the global one, so the gate that already
-    /// existed fires for a route limit below the global one
-    /// (`GHSA-xrfj-852f-645j`).
+    // Strictest active route-scoped request-body ceiling, or `None` when no
+    // matched plugin enforces one.
+    //
+    // PR #3176 closed the direct-H2/SNI *timing* window (backend response
+    // headers are withheld until the streaming upload reaches a terminal size
+    // outcome). This is the companion bound: the outcome is now decided against
+    // the route ceiling as well as the global one, so the gate that already
+    // existed fires for a route limit below the global one
+    // (`GHSA-xrfj-852f-645j`).
     route_request_body_limit: Option<usize>,
-    /// Strictest active route-scoped response-body ceiling, or `None` when no
-    /// matched plugin enforces one. Buffered collection on this path aborts here
-    /// rather than at the generally larger global allowance
-    /// (`GHSA-xrfj-852f-645j`).
+    // Strictest active route-scoped response-body ceiling, or `None` when no
+    // matched plugin enforces one. Buffered collection on this path aborts here
+    // rather than at the generally larger global allowance
+    // (`GHSA-xrfj-852f-645j`).
     route_response_body_limit: Option<usize>,
 ) -> (
     retry::BackendResponse,
@@ -34465,10 +34460,8 @@ async fn proxy_to_backend_http2(
     // Build hyper request
     let (mut parts, body) = original_req.into_parts();
     let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let effective_max_request_body_size_bytes = effective_request_body_limit(
-        state.max_request_body_size_bytes,
-        route_request_body_limit,
-    );
+    let effective_max_request_body_size_bytes =
+        effective_request_body_limit(state.max_request_body_size_bytes, route_request_body_limit);
     let effective_max_response_body_size_bytes = effective_request_body_limit(
         state.max_response_body_size_bytes,
         route_response_body_limit,
@@ -35178,20 +35171,18 @@ async fn proxy_to_backend_http3(
     request_body_prepared: bool,
     stream_response: bool,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
-    /// Strictest active route-scoped request-body ceiling, or `None` when no
-    /// matched plugin enforces one. H3 request bodies buffer on the
-    /// cross-protocol bridge, so this bounds that collection as well as the
-    /// native path (`GHSA-xrfj-852f-645j`).
+    // Strictest active route-scoped request-body ceiling, or `None` when no
+    // matched plugin enforces one. H3 request bodies buffer on the
+    // cross-protocol bridge, so this bounds that collection as well as the
+    // native path (`GHSA-xrfj-852f-645j`).
     route_request_body_limit: Option<usize>,
-    /// Strictest active route-scoped response-body ceiling, or `None` when no
-    /// matched plugin enforces one.
+    // Strictest active route-scoped response-body ceiling, or `None` when no
+    // matched plugin enforces one.
     route_response_body_limit: Option<usize>,
 ) -> (retry::BackendResponse, Option<Bytes>) {
     debug!(proxy_id = %proxy.id, backend_url = %strip_query_params(backend_url), "Proxying request to HTTP/3 backend");
-    let effective_max_request_body_size_bytes = effective_request_body_limit(
-        state.max_request_body_size_bytes,
-        route_request_body_limit,
-    );
+    let effective_max_request_body_size_bytes =
+        effective_request_body_limit(state.max_request_body_size_bytes, route_request_body_limit);
     let effective_max_response_body_size_bytes = effective_request_body_limit(
         state.max_response_body_size_bytes,
         route_response_body_limit,
@@ -35967,9 +35958,9 @@ async fn drain_h3_streaming_response_to_buffered(
     method: &str,
     backend_url: &str,
     resolved_ip: Option<String>,
-    /// Already-folded effective response ceiling (global ∧ route), `0` meaning
-    /// unlimited. Passed in rather than read from `state` so a strict route
-    /// ceiling bounds this drain too (`GHSA-xrfj-852f-645j`).
+    // Already-folded effective response ceiling (global ∧ route), `0` meaning
+    // unlimited. Passed in rather than read from `state` so a strict route
+    // ceiling bounds this drain too (`GHSA-xrfj-852f-645j`).
     effective_max_response_body_size_bytes: usize,
 ) -> retry::BackendResponse {
     let status = response.status;

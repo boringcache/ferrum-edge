@@ -2962,6 +2962,17 @@ fn remove_shadowed_global_plugin(
     global_ptrs: &HashSet<usize>,
     plugin_name: &str,
 ) {
+    // Size policy is conjunctive, not replaceable configuration. Retain a
+    // global limiter beside same-name scoped instances so every hook remains
+    // active and the precomputed route ceiling can fold all configured bounds
+    // to their minimum. Letting a looser scoped instance shadow a stricter
+    // global one would silently relax a security boundary.
+    if matches!(
+        plugin_name,
+        "request_size_limiting" | "response_size_limiting"
+    ) {
+        return;
+    }
     plugins.retain(|plugin| {
         plugin.name() != plugin_name
             || !global_ptrs.contains(&(Arc::as_ptr(plugin) as *const () as usize))
@@ -3261,14 +3272,12 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         // to their minimum; a zero/disabled instance contributes nothing rather
         // than relaxing a sibling's active bound (`GHSA-xrfj-852f-645j`).
         if let Some(limit) = p.enforced_request_body_limit().filter(|limit| *limit > 0) {
-            enforced_request_body_limit = Some(
-                enforced_request_body_limit.map_or(limit, |current: u64| current.min(limit)),
-            );
+            enforced_request_body_limit =
+                Some(enforced_request_body_limit.map_or(limit, |current: u64| current.min(limit)));
         }
         if let Some(limit) = p.enforced_response_body_limit().filter(|limit| *limit > 0) {
-            enforced_response_body_limit = Some(
-                enforced_response_body_limit.map_or(limit, |current: u64| current.min(limit)),
-            );
+            enforced_response_body_limit =
+                Some(enforced_response_body_limit.map_or(limit, |current: u64| current.min(limit)));
         }
     }
     PluginPhaseData {

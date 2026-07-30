@@ -11123,6 +11123,71 @@ fn global_and_proxy_scoped_size_ceilings_are_tracked_per_direction() {
     assert_eq!(view.enforced_response_body_limit(), Some(256));
 }
 
+/// Unlike ordinary replaceable plugin configuration, same-name global and
+/// scoped size policies are conjunctive. Both instances must survive the merge
+/// and the precomputed ceiling must keep the stricter bound in each direction.
+#[test]
+fn same_name_global_and_scoped_size_limiters_compose_to_the_minimum() {
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["scoped-request", "scoped-response"],
+        )],
+        vec![
+            size_limit_plugin(
+                "global-request",
+                "request_size_limiting",
+                512,
+                PluginScope::Global,
+                None,
+            ),
+            size_limit_plugin(
+                "scoped-request",
+                "request_size_limiting",
+                8192,
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            size_limit_plugin(
+                "global-response",
+                "response_size_limiting",
+                8192,
+                PluginScope::Global,
+                None,
+            ),
+            size_limit_plugin(
+                "scoped-response",
+                "response_size_limiting",
+                512,
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("same-name mixed-scope cache");
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert_eq!(view.enforced_request_body_limit(), Some(512));
+    assert_eq!(view.enforced_response_body_limit(), Some(512));
+    assert_eq!(
+        view.plugins()
+            .iter()
+            .filter(|plugin| plugin.name() == "request_size_limiting")
+            .count(),
+        2,
+        "global and scoped request limiters must both remain active"
+    );
+    assert_eq!(
+        view.plugins()
+            .iter()
+            .filter(|plugin| plugin.name() == "response_size_limiting")
+            .count(),
+        2,
+        "global and scoped response limiters must both remain active"
+    );
+}
+
 /// Both size plugins are `HTTP_GRPC_PROTOCOLS`, so the ceiling is published to
 /// the gRPC protocol view too — that view is what the native and streaming gRPC
 /// dispatch paths bound themselves with.

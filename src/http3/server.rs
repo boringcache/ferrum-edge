@@ -8488,9 +8488,9 @@ async fn collect_h3_open_response_body(
     response_headers: HashMap<String, String>,
     mut recv_stream: crate::http3::client::H3RequestStream,
     upstream_target: Option<&UpstreamTarget>,
-    /// Already-folded effective response ceiling (global ∧ route), `0` meaning
-    /// unlimited. Passed in because this helper has no request context to derive
-    /// it from (`GHSA-xrfj-852f-645j`).
+    // Already-folded effective response ceiling (global ∧ route), `0` meaning
+    // unlimited. Passed in because this helper has no request context to derive
+    // it from (`GHSA-xrfj-852f-645j`).
     effective_max_response_body_size_bytes: usize,
 ) -> H3BufferedDispatchResult {
     // Parsed per comma-folded member so a repeated identical declaration is
@@ -11261,9 +11261,9 @@ async fn proxy_to_backend_h3(
     upstream_target: Option<&UpstreamTarget>,
     request_is_secure: bool,
     is_early_data: bool,
-    /// Already-folded effective response ceiling (global ∧ route), `0` meaning
-    /// unlimited. Passed in because this helper has no request context to derive
-    /// it from (`GHSA-xrfj-852f-645j`).
+    // Already-folded effective response ceiling (global ∧ route), `0` meaning
+    // unlimited. Passed in because this helper has no request context to derive
+    // it from (`GHSA-xrfj-852f-645j`).
     effective_max_response_body_size_bytes: usize,
 ) -> H3BufferedDispatchResult {
     let h3_headers = build_h3_backend_headers(

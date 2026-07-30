@@ -4,7 +4,7 @@
 //! `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`. Rejects requests that exceed the
 //! configured `max_bytes` with HTTP 413 Payload Too Large.
 //!
-//! Two enforcement paths:
+//! Enforcement paths:
 //! 1. **Content-Length fast path** (`on_request_received`): rejects immediately
 //!    when the header declares a body larger than allowed — zero body I/O.
 //! 2. **Buffered body check** (`before_proxy`): if another plugin caused the
@@ -14,8 +14,9 @@
 //!    body after request transforms so the backend-visible payload still
 //!    respects the configured limit.
 //!
-//! For chunked/streaming requests without Content-Length where no other plugin
-//! buffers the body, the global limit still applies at the proxy layer.
+//! The proxy core also folds this route ceiling into every request collector
+//! and streaming adapter, so chunked or unknown-length bodies are bounded even
+//! when no plugin buffers them.
 
 use async_trait::async_trait;
 use serde_json::Value;

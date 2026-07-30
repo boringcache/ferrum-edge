@@ -108,6 +108,12 @@ Each proxy's effective plugin list is built by merging global, proxy-scoped, and
 3. Multiple scoped instances of the same `plugin_name` all coexist — only the global is replaced
 4. Sort by effective priority (built-in priority or `priority_override`)
 
+**Size-limit exception:** `request_size_limiting` and
+`response_size_limiting` policies are conjunctive security boundaries. Their
+same-name global and scoped instances all remain active and compose to the
+strictest (minimum) configured limit; a looser scoped instance cannot replace
+or relax a stricter global instance.
+
 **Chargeback exception:** `api_chargeback` follows the same merge steps above, but
 admission and reload then require the resulting effective list to contain **at
 most one** instance per proxy. The in-memory `/charges` registry is a
@@ -4192,7 +4198,9 @@ limit — the route limit stays authoritative. Multiple instances on one proxy (
 a global instance composed with a proxy-scoped one) compose to their minimum; a
 looser sibling never relaxes the strictest active bound. A proxy with no
 `request_size_limiting` instance is unaffected: the global knob applies exactly as
-configured.
+configured. The effective ceiling also bounds request decompression, so a small
+compressed body cannot inflate and retain plaintext above the matched route's
+limit before the final request-body hook runs.
 
 **Repeated `Content-Length`.** RFC 9110 §8.6 permits a `Content-Length` that
 appears more than once with identical values, and plugin-facing header maps fold
@@ -4226,8 +4234,10 @@ Enforcement happens in four places:
 **Interaction with the global limit.** The effective ceiling is the strictest
 *active* (nonzero) bound of `max_bytes` and
 `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`. A global limit of `0` means "unlimited"
-and **does not** disable an active route limit. Multiple instances compose to
-their minimum. A proxy with no `response_size_limiting` instance is unaffected.
+and **does not** disable an active route limit. Multiple instances (including a
+global instance composed with a same-name proxy-scoped instance) compose to
+their minimum; a looser scoped instance cannot shadow or relax a stricter global
+one. A proxy with no `response_size_limiting` instance is unaffected.
 The effective ceiling also bounds the buffered-representation decode gate and
 compression admission, so a small compressed body cannot inflate past the route
 ceiling and be forwarded as a larger identity representation.
