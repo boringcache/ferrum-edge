@@ -1292,12 +1292,9 @@ async fn chargeback_snapshot_spool_failure_retains_generation_for_bounded_retry(
         .as_u64()
         .expect("failed pending count");
     assert_eq!(failed_pending, pending_before + 1);
-    assert!(
-        api_chargeback_sink::render_prometheus()
-            .contains(&format!(
-                "chargeback_sink_snapshot_finalizations_pending {failed_pending}"
-            ))
-    );
+    assert!(api_chargeback_sink::render_prometheus().contains(&format!(
+        "chargeback_sink_snapshot_finalizations_pending {failed_pending}"
+    )));
 
     std::fs::remove_file(&spool_dir).expect("remove blocking file");
     assert_eq!(
