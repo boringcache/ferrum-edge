@@ -1695,6 +1695,17 @@ fn contains_known_credential_compound(segment: &str) -> bool {
 /// `sessiontoken`, or `awssecretkey` without treating short credential words
 /// as arbitrary substrings (`secretion`, `authentication`, `keyboard`).
 fn segment_embeds_credential_compound(segment: &str) -> bool {
+    // Preserve the metadata redactor's fail-closed substring treatment for
+    // credential-bearing HTTP state. Environment names commonly concatenate
+    // these words (`SESSIONCOOKIE`, `AUTHORIZATIONHEADER`), so exact token
+    // matching would allow their values to escape under an innocuous tag name.
+    if ["authorization", "bearer", "cookie", "csrf"]
+        .iter()
+        .any(|stem| segment.contains(stem))
+    {
+        return true;
+    }
+
     // Exact credential compounds remain sensitive when a provider prefix or
     // qualifier is concatenated around them (`AWSACCESSKEYID`,
     // `AWSSECRETACCESSKEY`, `MYCLIENTSECRETJSON`). These compounds are specific
