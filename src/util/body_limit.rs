@@ -19,6 +19,78 @@
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use std::time::Duration;
 
+/// Outcome of parsing a `Content-Length` field value that may be a
+/// comma-folded list of repeated values.
+///
+/// Ferrum and Hyper both accept a *standards-valid* representation whose
+/// `Content-Length` appears more than once with identical values, or once as a
+/// single coalesced field line (`"2048, 2048"`) — RFC 9110 §8.6 permits the
+/// list form so long as every member agrees. The plugin-facing header views are
+/// `HashMap<String, String>`, so those repeats arrive already folded with
+/// `", "`. A bare `str::parse::<u64>()` on that folded value fails, which used
+/// to read as "no declared length" and silently skipped the size fast path
+/// (`GHSA-xrfj-852f-645j`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentLength {
+    /// Every member parsed and agreed on this single value.
+    Exact(u64),
+    /// The field is unusable as a bound: a member was empty, non-`1*DIGIT`,
+    /// above `u64`, or the members disagreed. Callers must fail closed rather
+    /// than treating it as an absent length.
+    Ambiguous,
+}
+
+/// Parse a possibly comma-folded `Content-Length` field value into a single
+/// authoritative length.
+///
+/// Returns `None` only for a genuinely absent/empty field. A present field that
+/// cannot be reduced to one agreed value is [`ContentLength::Ambiguous`], never
+/// `None`, so a fold like `"2048, 4096"` can never be mistaken for "unknown
+/// length" and bypass a size bound.
+///
+/// Digits are validated explicitly as `1*DIGIT`: `str::parse::<u64>()` accepts a
+/// leading `+`, which is not a valid `Content-Length` and must not be honored as
+/// a length.
+pub fn parse_content_length(value: &str) -> Option<ContentLength> {
+    let value = value.trim_matches(|c: char| c == ' ' || c == '\t');
+    if value.is_empty() {
+        return None;
+    }
+    let mut canonical: Option<u64> = None;
+    for token in value.split(',') {
+        let token = token.trim_matches(|c: char| c == ' ' || c == '\t');
+        // An empty member (`"2048,"`, `"2048,,2048"`) is malformed framing.
+        if token.is_empty() {
+            return Some(ContentLength::Ambiguous);
+        }
+        // `1*DIGIT` only — no sign, decimal point, hex prefix, or whitespace
+        // inside the token.
+        if !token.bytes().all(|b| b.is_ascii_digit()) {
+            return Some(ContentLength::Ambiguous);
+        }
+        let Ok(parsed) = token.parse::<u64>() else {
+            // All-digits but wider than u64.
+            return Some(ContentLength::Ambiguous);
+        };
+        match canonical {
+            None => canonical = Some(parsed),
+            Some(previous) if previous != parsed => return Some(ContentLength::Ambiguous),
+            _ => {}
+        }
+    }
+    canonical.map(ContentLength::Exact)
+}
+
+/// Canonical declared body length from a plugin-facing header map, or `None`
+/// when the field is absent.
+///
+/// The key must already be the lowercase `content-length` these maps use.
+pub fn declared_content_length(
+    headers: &std::collections::HashMap<String, String>,
+) -> Option<ContentLength> {
+    parse_content_length(headers.get("content-length")?)
+}
+
 /// Returns `true` when `error` (or any error in its source chain) is a
 /// [`LengthLimitError`] produced by [`http_body_util::Limited`].
 ///

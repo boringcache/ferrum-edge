@@ -894,7 +894,11 @@ impl CompressionPlugin {
     }
 
     fn response_body_limit_allows_compression(ctx: &RequestContext) -> bool {
-        (1..=HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE).contains(&ctx.max_response_body_size_bytes)
+        // Effective ceiling (global narrowed by any active route ceiling) so a
+        // strict route limit governs compression admission the same way a strict
+        // global limit does (`GHSA-xrfj-852f-645j`).
+        (1..=HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE)
+            .contains(&ctx.effective_max_response_body_size_bytes())
     }
 
     /// Reserve one response-buffer permit for this request when this

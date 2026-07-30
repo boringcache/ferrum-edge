@@ -11004,3 +11004,192 @@ fn managed_config_without_its_runtime_policy_in_the_tcp_chain_is_not_ready() {
     assert!(!ready_from_counts(false, 1, 1));
     assert!(!ready_from_counts(true, 0, 0));
 }
+
+// === Route body-size ceiling fold (GHSA-xrfj-852f-645j) ===
+
+fn size_limit_plugin(
+    id: &str,
+    plugin_name: &str,
+    max_bytes: u64,
+    scope: PluginScope,
+    proxy_id: Option<&str>,
+) -> PluginConfig {
+    make_plugin_config_with_json(
+        id,
+        plugin_name,
+        json!({"max_bytes": max_bytes}),
+        scope,
+        proxy_id,
+    )
+}
+
+/// The precomputed ceiling is what every streaming adapter and buffered
+/// collector reads; without it the route limit only ever reached a body hook
+/// that an unbuffered upload never executes.
+#[test]
+fn request_view_publishes_the_configured_route_request_ceiling() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["rsl"])],
+        vec![size_limit_plugin(
+            "rsl",
+            "request_size_limiting",
+            1024,
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).expect("request size cache");
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert_eq!(view.enforced_request_body_limit(), Some(1024));
+    assert_eq!(view.enforced_response_body_limit(), None);
+}
+
+#[test]
+fn request_view_publishes_the_configured_route_response_ceiling() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["resl"])],
+        vec![size_limit_plugin(
+            "resl",
+            "response_size_limiting",
+            2048,
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).expect("response size cache");
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert_eq!(view.enforced_response_body_limit(), Some(2048));
+    assert_eq!(view.enforced_request_body_limit(), None);
+}
+
+/// Multiple instances on one proxy compose to their MINIMUM. A looser sibling
+/// must never relax the strictest active bound.
+#[test]
+fn multiple_size_limiting_instances_compose_to_the_minimum() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["loose", "strict"])],
+        vec![
+            size_limit_plugin(
+                "loose",
+                "request_size_limiting",
+                8192,
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            size_limit_plugin(
+                "strict",
+                "request_size_limiting",
+                512,
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("two-instance cache");
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert_eq!(view.enforced_request_body_limit(), Some(512));
+}
+
+/// A global instance and a proxy-scoped instance of DIFFERENT size plugins both
+/// contribute; the request and response ceilings are tracked independently.
+#[test]
+fn global_and_proxy_scoped_size_ceilings_are_tracked_per_direction() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["resl"])],
+        vec![
+            size_limit_plugin(
+                "global-rsl",
+                "request_size_limiting",
+                4096,
+                PluginScope::Global,
+                None,
+            ),
+            size_limit_plugin(
+                "resl",
+                "response_size_limiting",
+                256,
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("mixed-scope cache");
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert_eq!(view.enforced_request_body_limit(), Some(4096));
+    assert_eq!(view.enforced_response_body_limit(), Some(256));
+}
+
+/// Both size plugins are `HTTP_GRPC_PROTOCOLS`, so the ceiling is published to
+/// the gRPC protocol view too — that view is what the native and streaming gRPC
+/// dispatch paths bound themselves with.
+#[test]
+fn size_ceilings_are_published_to_the_grpc_protocol_view() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["rsl", "resl"])],
+        vec![
+            size_limit_plugin(
+                "rsl",
+                "request_size_limiting",
+                1024,
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            size_limit_plugin(
+                "resl",
+                "response_size_limiting",
+                2048,
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("grpc view cache");
+
+    for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
+        let view = cache.request_view("ferrum", "p1", protocol);
+        assert_eq!(
+            view.enforced_request_body_limit(),
+            Some(1024),
+            "{protocol:?} must inherit the route request ceiling"
+        );
+        assert_eq!(
+            view.enforced_response_body_limit(),
+            Some(2048),
+            "{protocol:?} must inherit the route response ceiling"
+        );
+    }
+}
+
+/// A proxy with no size-limiting plugin publishes no ceiling, so every dispatch
+/// path keeps using the operator's global knob exactly as before the fix.
+#[test]
+fn proxy_without_size_limiting_publishes_no_ceiling() {
+    let config = make_config(vec![make_proxy("p1", "/api", vec![])], vec![]);
+    let cache = PluginCache::new(&config).expect("plain cache");
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert_eq!(view.enforced_request_body_limit(), None);
+    assert_eq!(view.enforced_response_body_limit(), None);
+}
+
+/// A disabled instance contributes nothing rather than publishing a ceiling.
+#[test]
+fn disabled_size_limiting_instance_publishes_no_ceiling() {
+    let mut plugin = size_limit_plugin(
+        "rsl",
+        "request_size_limiting",
+        1024,
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin.enabled = false;
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["rsl"])], vec![plugin]);
+    let cache = PluginCache::new(&config).expect("disabled-instance cache");
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert_eq!(view.enforced_request_body_limit(), None);
+}

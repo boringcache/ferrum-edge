@@ -1515,6 +1515,17 @@ async fn dispatch_plain<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    // Effective client-facing ceilings for this request: each global knob
+    // narrowed by any active route ceiling, `0` still meaning unlimited. The H3
+    // cross-protocol bridge buffers request bodies and coalesces responses, so
+    // both directions must be bounded by the route policy the client was
+    // admitted under (`GHSA-xrfj-852f-645j`).
+    let route_request_body_limit = ctx.route_request_body_limit();
+    let effective_max_request_body_size_bytes = crate::proxy::effective_request_body_limit(
+        state.max_request_body_size_bytes,
+        route_request_body_limit,
+    );
+    let effective_max_response_body_size_bytes = ctx.effective_max_response_body_size_bytes();
     // Honor DestinationRule per-port `connectionPool.http` effective-proxy
     // overrides for the LB-selected target, mirroring the H1/H2 plain dispatch
     // path (`proxy_to_backend` / `proxy_to_backend_retry`). The effective proxy
@@ -2027,11 +2038,14 @@ where
                 // may have reserved a HALF_OPEN probe, so neutralize it here (the
                 // reader-loop 413 below does the same) or one oversized body wedges
                 // the breaker's half-open slot.
-                if state.max_request_body_size_bytes > 0
-                    && let Some(content_length) = proxy_headers.get("content-length")
-                    && let Ok(len) = content_length.parse::<usize>()
-                    && len > state.max_request_body_size_bytes
-                {
+                // Parsed per comma-folded member so a standards-valid repeated
+                // identical declaration is compared against the ceiling instead
+                // of failing to parse and skipping this reject
+                // (`GHSA-xrfj-852f-645j`).
+                if crate::proxy::declared_request_content_length_over_limit(
+                    proxy_headers,
+                    effective_max_request_body_size_bytes,
+                ) {
                     release_cross_protocol_circuit_breaker_probe_on_admission_reject(
                         state,
                         proxy,
@@ -2188,7 +2202,7 @@ where
                     ctx.is_early_data,
                 );
 
-                let max_req_bytes = state.max_request_body_size_bytes;
+                let max_req_bytes = effective_max_request_body_size_bytes;
                 let capacity = state.env_config.http3_request_body_channel_capacity;
                 let (tx, rx) =
                     tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(capacity);
@@ -2539,13 +2553,19 @@ where
     let final_backend_resolved_ip =
         resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref()).await;
 
-    // Content-Length fast-path limit (mirrors the H3 pool path).
-    if state.max_response_body_size_bytes > 0
-        && let Some(len) = response_headers
-            .get("content-length")
-            .and_then(|v| v.parse::<usize>().ok())
-        && len > state.max_response_body_size_bytes
-    {
+    // Content-Length fast-path limit (mirrors the H3 pool path). Parsed per
+    // comma-folded member so a repeated identical declaration is honored rather
+    // than skipping this reject (`GHSA-xrfj-852f-645j`).
+    if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+        &response_headers,
+        effective_max_response_body_size_bytes,
+    ) {
+        warn!(
+            proxy_id = %proxy.id,
+            response_body_bytes = len,
+            max_response_body_size_bytes = effective_max_response_body_size_bytes,
+            "Cross-protocol backend response body exceeds configured size limit"
+        );
         record_backend_outcome(
             state,
             proxy,
@@ -2697,7 +2717,10 @@ where
         let mut response_status = status;
         let mut response_body = match crate::plugins::await_grpc_deadline(
             grpc_web_deadline_at,
-            collect_reqwest_response_body_with_limit(response, state.max_response_body_size_bytes),
+            collect_reqwest_response_body_with_limit(
+                response,
+                effective_max_response_body_size_bytes,
+            ),
         )
         .await
         {
@@ -3207,7 +3230,7 @@ where
     }
 
     let coalesce = CoalesceConfig::from_state(state);
-    let max_resp_bytes = state.max_response_body_size_bytes;
+    let max_resp_bytes = effective_max_response_body_size_bytes;
     let stream_response = async {
         if let Some(inspector) = response_inspector {
             stream_inspected_reqwest_response(stream, response, inspector, max_resp_bytes).await
@@ -3473,6 +3496,12 @@ async fn handle_h3_grpc_streaming_response<S>(
 where
     S: SendStream<Bytes>,
 {
+    // Effective client-facing ceilings for this request: each global knob
+    // narrowed by any active route ceiling, `0` still meaning unlimited. The H3
+    // cross-protocol bridge buffers request bodies and coalesces responses, so
+    // both directions must be bounded by the route policy the client was
+    // admitted under (`GHSA-xrfj-852f-645j`).
+    let effective_max_response_body_size_bytes = ctx.effective_max_response_body_size_bytes();
     let current_target_ref: Option<&UpstreamTarget> = current_target.map(|t| t.as_ref());
     // Pre-head late-overflow guard (codex P2): if the client upload already tripped
     // `max_grpc_recv_size_bytes` by the time the backend response is ready — e.g. a
@@ -3752,7 +3781,7 @@ where
         ));
     }
     let coalesce = CoalesceConfig::from_state(state);
-    let max_resp_bytes = state.max_response_body_size_bytes;
+    let max_resp_bytes = effective_max_response_body_size_bytes;
     let (
         mut bytes_streamed,
         body_completed,
@@ -4170,6 +4199,17 @@ async fn dispatch_grpc<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    // Effective client-facing ceilings for this request: each global knob
+    // narrowed by any active route ceiling, `0` still meaning unlimited. The H3
+    // cross-protocol bridge buffers request bodies and coalesces responses, so
+    // both directions must be bounded by the route policy the client was
+    // admitted under (`GHSA-xrfj-852f-645j`).
+    let route_request_body_limit = ctx.route_request_body_limit();
+    let effective_max_grpc_recv_size_bytes = crate::proxy::effective_request_body_limit(
+        state.max_grpc_recv_size_bytes,
+        route_request_body_limit,
+    );
+    let effective_max_response_body_size_bytes = ctx.effective_max_response_body_size_bytes();
     let hyper_method = match hyper::Method::from_bytes(method.as_bytes()) {
         Ok(m) => m,
         Err(_) => {
@@ -4232,7 +4272,7 @@ where
         buffered
     } else {
         match super::server::collect_h3_request_body_with_deadline(
-            drain_h3_body(stream, state.max_grpc_recv_size_bytes),
+            drain_h3_body(stream, effective_max_grpc_recv_size_bytes),
             ctx.grpc_deadline_at(),
             proxy.backend_read_timeout_ms,
         )
@@ -4471,7 +4511,7 @@ where
         &state.dns_cache,
         &trusted_assertion_headers,
         stream_grpc_response,
-        state.max_response_body_size_bytes,
+        effective_max_response_body_size_bytes,
         ctx.grpc_deadline_at(),
     )
     .await;
@@ -4663,7 +4703,7 @@ where
                 &state.dns_cache,
                 &trusted_assertion_headers,
                 stream_grpc_response,
-                state.max_response_body_size_bytes,
+                effective_max_response_body_size_bytes,
                 ctx.grpc_deadline_at(),
             )
             .await;
@@ -5656,6 +5696,17 @@ pub(crate) async fn dispatch_grpc_streaming(
     sticky_cookie_needed: bool,
     response_trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error> {
+    // Effective client-facing ceilings for this request: each global knob
+    // narrowed by any active route ceiling, `0` still meaning unlimited. The H3
+    // cross-protocol bridge buffers request bodies and coalesces responses, so
+    // both directions must be bounded by the route policy the client was
+    // admitted under (`GHSA-xrfj-852f-645j`).
+    let route_request_body_limit = ctx.route_request_body_limit();
+    let effective_max_grpc_recv_size_bytes = crate::proxy::effective_request_body_limit(
+        state.max_grpc_recv_size_bytes,
+        route_request_body_limit,
+    );
+    let effective_max_response_body_size_bytes = ctx.effective_max_response_body_size_bytes();
     let mut stream = stream;
     let current_target = upstream_target.cloned().map(Arc::new);
     let current_cb_target_key = cb_target_key.map(str::to_owned);
@@ -5854,7 +5905,7 @@ pub(crate) async fn dispatch_grpc_streaming(
         backend_url,
         &state.grpc_pool,
         &trusted_assertion_headers,
-        state.max_grpc_recv_size_bytes,
+        effective_max_grpc_recv_size_bytes,
         Arc::clone(&body_size_exceeded),
         None,
         ctx.grpc_deadline_at(),

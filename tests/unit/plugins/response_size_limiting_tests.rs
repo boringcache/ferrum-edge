@@ -487,3 +487,148 @@ fn test_size_limits_guide_matches_streaming_runtime_contract() {
         "response_size_limiting reference must mention the global streaming adapter"
     );
 }
+
+// === Route ceiling publication (GHSA-xrfj-852f-645j) ===
+
+/// Publication is deliberately independent of `require_buffered_check`. It gives
+/// the core two things the hooks cannot express: buffered collection aborts at
+/// this ceiling instead of retaining up to the larger global allowance, and an
+/// already-buffered synthetic body is governed without another plugin having to
+/// activate the response body-hook gate.
+#[test]
+fn enforced_response_body_limit_is_published_without_forcing_buffering() {
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
+    assert_eq!(plugin.enforced_response_body_limit(), Some(1024));
+    // The default instance advertises no buffering — that was exactly why the
+    // synthetic body-hook gate stayed closed before the fix.
+    assert!(!plugin.requires_response_body_buffering());
+    // It is a response-side policy only.
+    assert_eq!(plugin.enforced_request_body_limit(), None);
+}
+
+#[test]
+fn strict_instance_publishes_the_same_ceiling_and_forces_buffering() {
+    let plugin = ResponseSizeLimiting::new(
+        &json!({"max_bytes": 1024, "require_buffered_check": true}),
+    )
+    .unwrap();
+    assert_eq!(plugin.enforced_response_body_limit(), Some(1024));
+    assert!(plugin.requires_response_body_buffering());
+}
+
+// === Repeated / ambiguous response Content-Length (GHSA-xrfj-852f-645j) ===
+
+/// Hyper accepts a backend response whose `Content-Length` repeats with
+/// identical values, and the shared collector folds those repeats with `", "`.
+/// Parsing the whole folded list as one integer used to fail, so the fast path
+/// missed an oversized coalesced declaration.
+#[tokio::test]
+async fn test_repeated_identical_response_content_length_rejects_502() {
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::new();
+    headers.insert("content-length".to_string(), "2048, 2048".to_string());
+
+    match plugin.after_proxy(&mut ctx, 200, &mut headers).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 502),
+        other => panic!("Expected 502 Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_repeated_identical_response_content_length_at_boundary_passes() {
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::new();
+    headers.insert("content-length".to_string(), "1024, 1024".to_string());
+
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut headers).await,
+        PluginResult::Continue
+    ));
+}
+
+/// A response declared length that cannot be reduced to one value fails closed.
+#[tokio::test]
+async fn test_ambiguous_response_content_length_fails_closed_with_502() {
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
+    for value in ["2048, 4096", "+2048"] {
+        let mut ctx = make_ctx();
+        let mut headers = HashMap::new();
+        headers.insert("content-length".to_string(), value.to_string());
+
+        match plugin.after_proxy(&mut ctx, 200, &mut headers).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 502, "{value:?} must fail closed");
+                let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(parsed["error"], "Response Content-Length is ambiguous");
+            }
+            other => panic!("Expected 502 Reject for {value:?}, got {other:?}"),
+        }
+    }
+}
+
+/// Bodyless semantics are unaffected: their `Content-Length` describes a
+/// representation, not transferred bytes, so neither an oversized value nor an
+/// ambiguous fold is a body-size violation.
+#[tokio::test]
+async fn test_bodyless_responses_ignore_repeated_and_ambiguous_lengths() {
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 10})).unwrap();
+    for (method, status, value) in [
+        ("HEAD", 200u16, "2048, 2048"),
+        ("GET", 304, "2048, 2048"),
+        ("GET", 204, "2048, 4096"),
+        ("HEAD", 200, "2048, 4096"),
+    ] {
+        let mut ctx = make_ctx_with_method(method);
+        let mut headers = HashMap::new();
+        headers.insert("content-length".to_string(), value.to_string());
+
+        assert!(
+            matches!(
+                plugin.after_proxy(&mut ctx, status, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "bodyless {method} {status} with {value:?} must not trip a body-size limit"
+        );
+    }
+}
+
+/// A chunked / unknown-length response has no declared length: the fast path
+/// stays quiet and the bounded collector enforces the ceiling.
+#[tokio::test]
+async fn test_unknown_length_response_passes_the_header_fast_path() {
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::new();
+
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut headers).await,
+        PluginResult::Continue
+    ));
+}
+
+/// Post-transform enforcement is preserved: a body that expands past the ceiling
+/// after response transforms is still refused.
+#[tokio::test]
+async fn test_final_response_body_over_limit_still_rejects_after_transforms() {
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 8})).unwrap();
+    let mut ctx = make_ctx();
+    let headers = HashMap::new();
+
+    assert!(matches!(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, b"12345678")
+            .await,
+        PluginResult::Continue
+    ));
+    match plugin
+        .on_final_response_body(&mut ctx, 200, &headers, b"123456789")
+        .await
+    {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 502),
+        other => panic!("Expected 502 Reject, got {other:?}"),
+    }
+}
