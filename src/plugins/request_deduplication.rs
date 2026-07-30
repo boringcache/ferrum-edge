@@ -81,13 +81,11 @@
 //! `mcp_gateway` resolves public resource/tool/prompt URIs against a
 //! per-downstream-session catalog it re-lists from upstream whenever its
 //! discovery TTL expires; entries appear, disappear, get remapped, or become
-//! ambiguous with no config edit and no plugin-cache rebuild. Worse, this
-//! plugin's `before_proxy` short-circuits at priority
-//! `priorities::REQUEST_DEDUPLICATION`, ahead of `priorities::MCP_GATEWAY`, so
-//! a replay is served without MCP validating or routing the request against the
-//! current catalog at all. No digest available before the lookup can witness
-//! that state, and deriving one would mean an upstream round trip under a
-//! per-session lock on the hot path.
+//! ambiguous with no config edit and no plugin-cache rebuild. Even though MCP
+//! request validation/routing now runs before deduplication, a finalized replay
+//! deliberately skips MCP's later response-body rewrite. No construction-time
+//! digest can witness the live catalog that rewrite consumes, and deriving one
+//! would mean persisting or re-listing mutable upstream session state.
 //!
 //! Rather than replay under an unprovable policy, the composition is refused:
 //! [`validate_composition`] rejects the pair at config admission and at
@@ -134,8 +132,15 @@ const CLEANUP_INTERVAL_SECS: u64 = 30;
 /// run.
 const CLEANUP_NEVER: u64 = u64::MAX;
 
-const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v4";
-const DEDUP_FINGERPRINT_VERSION: &str = "ferrum-dedup-fingerprint-v2";
+/// Bumped to `v6` when lookup moved after routing/request-transformer shaping
+/// and the fingerprint began preferring the published outbound query. Entries
+/// keyed under an earlier lifecycle contract can never be reached again, which
+/// is the intended fail-closed outcome: no pre-contract retained result may be
+/// replayed or converted into a false conflict.
+const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v6";
+/// Bumped to `v4` when query fingerprinting moved from the raw inbound query to
+/// the request-transformer-published outbound query when present.
+const DEDUP_FINGERPRINT_VERSION: &str = "ferrum-dedup-fingerprint-v4";
 /// Version stamped into every Redis operation record. A peer running an older
 /// or newer record format is treated as a conflict rather than being parsed
 /// optimistically, so a rolling upgrade can never publish through a fence the
@@ -151,6 +156,10 @@ const REDIS_UNAVAILABLE_BODY: &str = r#"{"error":"Idempotency coordination store
 /// operations fail-closed without allocating attacker-amplified per-key state.
 const EXECUTION_BARRIER_CAPACITY_BODY: &str =
     r#"{"error":"Idempotency execution-barrier capacity is saturated"}"#;
+/// Deterministic refusal when no complete, stable replay partition can be
+/// derived for this caller and `enforce_required` demands the guarantee. Never
+/// echoes the caller context that could not be resolved.
+const UNPARTITIONABLE_CALLER_BODY: &str = r#"{"error":"Idempotency cannot be enforced: the caller context for this request cannot be partitioned"}"#;
 /// Deterministic body for a completion that must never be replayed: the
 /// protected operation already ran externally and has no safe replay value.
 const NON_REPLAYABLE_COMPLETION_BODY: &str = r#"{"error":"This idempotency key already completed an external operation and cannot be replayed safely"}"#;
@@ -186,15 +195,6 @@ const HOP_BY_HOP_FINGERPRINT_EXCLUSIONS: &[&str] = &[
     "transfer-encoding",
     "upgrade",
 ];
-const SCOPED_CREDENTIAL_FINGERPRINT_EXCLUSIONS: &[&str] = &[
-    "authorization",
-    "proxy-authorization",
-    "cookie",
-    "x-api-key",
-    "api-key",
-    "x-goog-api-key",
-    "x-forwarded-authorization",
-];
 /// Plugin-specific root config keys, excluding the shared Redis fields.
 #[allow(dead_code)] // Used by external unit tests that verify OpenAPI/allowlist parity.
 pub const REQUEST_DEDUPLICATION_POLICY_CONFIG_KEYS: &[&str] = &[
@@ -206,6 +206,7 @@ pub const REQUEST_DEDUPLICATION_POLICY_CONFIG_KEYS: &[&str] = &[
     "max_total_size_bytes",
     "applicable_methods",
     "scope_by_consumer",
+    "anonymous_caller_scope",
     "enforce_required",
     "on_redis_unavailable",
 ];
@@ -225,6 +226,7 @@ pub const REQUEST_DEDUPLICATION_CONFIG_KEYS: &[&str] = &[
     "max_total_size_bytes",
     "applicable_methods",
     "scope_by_consumer",
+    "anonymous_caller_scope",
     "enforce_required",
     "on_redis_unavailable",
     // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
@@ -289,6 +291,7 @@ fn decrement_atomic(value: &AtomicUsize) -> usize {
 use super::utils::body_transform::is_event_stream_content_type;
 use super::utils::cache_headers::{is_per_request_trace_header, sanitize_cached_headers};
 use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
+use super::utils::replay_partition::{self, AnonymousCallerScope, PartitionHasher};
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext, ResponsePolicyProvenance};
 
 /// Plugins whose response-body rewrite is derived from live runtime state that
@@ -303,14 +306,16 @@ use super::{Plugin, PluginHttpClient, PluginResult, RequestContext, ResponsePoli
 /// the list cannot drift away from the runtime behavior it stands in for.
 pub const DYNAMIC_RESPONSE_PRESENTATION_PLUGINS: &[&str] = &["mcp_gateway"];
 
-fn dynamic_response_presentation_is_active(plugin: &crate::config::types::PluginConfig) -> bool {
+/// Whether an effective instance's hooks actually apply. An instance that is
+/// merged but inert does not rewrite a response and cannot make deduplication
+/// provenance unprovable.
+fn plugin_hooks_are_active(plugin: &crate::config::types::PluginConfig) -> bool {
     if !plugin.enabled {
         return false;
     }
     match plugin.plugin_name.as_str() {
         // `mcp_gateway` retains an explicit, validated inner enable switch.
-        // When false, none of its request or response hooks apply, so there is
-        // no dynamic presentation policy to make deduplication unprovable.
+        // When false, none of its request or response hooks apply.
         "mcp_gateway" => {
             plugin
                 .config
@@ -326,13 +331,11 @@ fn dynamic_response_presentation_is_active(plugin: &crate::config::types::Plugin
 /// presentation policy cannot be proven stable for a retained representation.
 ///
 /// A dedup replay is a *finalized* representation: the synthetic replay path
-/// skips ordinary presentation transforms, and `request_deduplication`'s
-/// `before_proxy` short-circuits ahead of every plugin with a higher priority
-/// value — including `mcp_gateway`. So a hit is served without the MCP catalog
-/// ever being consulted, under a public-URI mapping that this gateway refreshes
-/// from upstream on its own schedule. There is no digest that can witness that
-/// state, so the composition is refused here rather than silently replaying
-/// bytes whose producing policy cannot be established.
+/// skips ordinary presentation transforms. MCP's public-URI rewrite is derived
+/// from a live catalog that this gateway refreshes from upstream on its own
+/// schedule. There is no static digest that can witness that state, so the
+/// composition is refused here rather than silently replaying bytes whose
+/// producing policy cannot be established.
 ///
 /// Runtime plugin-cache construction repeats this check as a fail-closed
 /// backstop, and `ResponsePresentationPolicy::Dynamic` degrades the request
@@ -399,7 +402,7 @@ pub fn validate_composition(
         };
         effective
             .into_iter()
-            .filter(|plugin| dynamic_response_presentation_is_active(plugin))
+            .filter(|plugin| plugin_hooks_are_active(plugin))
             .map(|plugin| plugin.id.clone())
             .collect()
     };
@@ -782,7 +785,14 @@ pub struct RequestDeduplication {
     /// HTTP methods to apply deduplication to.
     applicable_methods: Vec<String>,
     /// Whether to scope keys by authenticated consumer identity.
+    ///
+    /// Independent of the mandatory caller-authorization partition: the
+    /// authorization-context fingerprint from
+    /// [`crate::plugins::utils::replay_partition`] is bound unconditionally, so
+    /// disabling this can no longer let two callers share one idempotency key.
     scope_by_consumer: bool,
+    /// How anonymous callers are partitioned (see [`AnonymousCallerScope`]).
+    anonymous_caller_scope: AnonymousCallerScope,
     /// Whether to require the idempotency header (reject if missing).
     enforce_required: bool,
     /// Behavior when `sync_mode: "redis"` is configured but Redis cannot be
@@ -897,6 +907,10 @@ impl RequestDeduplication {
 
         let applicable_methods = parse_applicable_methods(config)?;
         let scope_by_consumer = optional_bool(config, "scope_by_consumer")?.unwrap_or(true);
+        let anonymous_caller_scope = match optional_string(config, "anonymous_caller_scope")? {
+            None => AnonymousCallerScope::default(),
+            Some(value) => AnonymousCallerScope::parse("request_deduplication", value)?,
+        };
         let enforce_required = optional_bool(config, "enforce_required")?.unwrap_or(false);
         let on_redis_unavailable = match optional_string(config, "on_redis_unavailable")? {
             None => RedisUnavailablePolicy::FailClosed,
@@ -941,6 +955,7 @@ impl RequestDeduplication {
             max_total_size_bytes,
             applicable_methods,
             scope_by_consumer,
+            anonymous_caller_scope,
             enforce_required,
             on_redis_unavailable,
             local_cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
@@ -1130,44 +1145,67 @@ impl RequestDeduplication {
     /// Build the logical deduplication key from unambiguous framed fields.
     ///
     /// The returned key intentionally contains only a versioned digest so
-    /// Redis keys and request metadata never expose idempotency values or
-    /// authenticated identities.
-    fn build_key(&self, ctx: &RequestContext, idempotency_value: &str) -> String {
-        let mut hasher = Sha256::new();
-        hash_framed(&mut hasher, "version", DEDUP_LOGICAL_KEY_VERSION.as_bytes());
-        hash_framed(&mut hasher, "plugin_config_id", self.config_id.as_bytes());
+    /// Redis keys and request metadata never expose idempotency values,
+    /// credentials, caller addresses, or authenticated identities.
+    ///
+    /// Every dimension the backend could use to decide what a replay means is
+    /// bound here, through the shared replay-partition contract:
+    ///
+    /// * the caller's *authorization context* (mechanism + identity + consumer
+    ///   + peer SPIFFE identity + digests of the credential headers actually
+    ///     presented), not merely a display subject, so two tokens with equal
+    ///     `sub` and different scopes cannot claim one another's operation;
+    /// * every caller's canonical peer address, which the origin observes
+    ///   through Ferrum's regenerated `X-Forwarded-For`; only an *anonymous*
+    ///   caller's binding can be relaxed by operator attestation (see
+    ///   [`AnonymousCallerScope`]);
+    /// * the effective post-routing destination, so a header-selected upstream
+    ///   cannot replay a result produced against a different backend.
+    ///
+    /// Returns `Err` when no complete stable partition can be derived; the
+    /// caller must then refuse to deduplicate rather than key incompletely. The
+    /// refusal's `reason()` is a compiled-in static string safe to emit in a
+    /// debug line.
+    ///
+    /// The built-in priority runs after route dispatch and request
+    /// header/query transformation, so both the logical key and request
+    /// fingerprint bind their effective output. Plugin-cache admission rejects
+    /// any same-protocol header/query mutator that would run at or after this
+    /// lookup, and rejects any deferred request-body transformer whose
+    /// finalized wire bytes cannot be observed during `before_proxy`.
+    fn build_key(
+        &self,
+        ctx: &RequestContext,
+        request_headers: &HashMap<String, String>,
+        idempotency_value: &str,
+    ) -> Result<String, replay_partition::PartitionRefusal> {
+        let mut hasher = PartitionHasher::new(DEDUP_LOGICAL_KEY_VERSION);
+        hasher.text("plugin_config_id", &self.config_id);
         // The Redis prefix is operator-configurable and may deliberately be
         // shared across namespaces. Namespace therefore belongs in the
         // authenticated logical identity itself, not only in the default
         // prefix, so equal resource IDs in separate namespaces cannot claim or
-        // replay one another's operation.
-        if let Some(proxy) = ctx.matched_proxy.as_ref() {
-            hash_framed(&mut hasher, "matched_proxy", b"1");
-            hash_framed(&mut hasher, "proxy_namespace", proxy.namespace.as_bytes());
-            hash_framed(&mut hasher, "proxy_id", proxy.id.as_bytes());
-        } else {
-            // Frame presence explicitly rather than reserving a sentinel that
-            // could collide with a valid namespace/resource identifier.
-            hash_framed(&mut hasher, "matched_proxy", b"0");
+        // replay one another's operation. `append_destination_partition` frames
+        // the namespace, proxy, route rewrite, and effective upstream/backend.
+        replay_partition::append_destination_partition(&mut hasher, ctx);
+        replay_partition::append_caller_partition(
+            &mut hasher,
+            ctx,
+            request_headers,
+            self.anonymous_caller_scope,
+        )?;
+        // Retained for operators who additionally want the display identity in
+        // the partition; the caller partition above already isolates callers.
+        hasher.bool_value("scope_by_consumer", self.scope_by_consumer);
+        if self.scope_by_consumer {
+            hasher.optional_text("principal", ctx.effective_identity());
         }
-        if self.scope_by_consumer
-            && let Some(identity) = ctx.effective_identity()
-        {
-            hash_framed(&mut hasher, "principal", identity.as_bytes());
-        }
-        if let Some(peer_spiffe_id) = ctx.peer_spiffe_id.as_ref() {
-            hash_framed(
-                &mut hasher,
-                "peer_spiffe_id",
-                peer_spiffe_id.as_str().as_bytes(),
-            );
-        }
-        hash_framed(&mut hasher, "idempotency_key", idempotency_value.as_bytes());
+        hasher.text("idempotency_key", idempotency_value);
 
         let mut key = String::with_capacity(67);
-        key.push_str("v4:");
-        key.push_str(&hex::encode(hasher.finalize()));
-        key
+        key.push_str("v6:");
+        key.push_str(&hasher.hex());
+        Ok(key)
     }
 
     fn replay_response(&self, ctx: &mut RequestContext, cached: &CachedResponse) -> PluginResult {
@@ -1225,36 +1263,53 @@ impl RequestDeduplication {
         ctx: &RequestContext,
         headers: &HashMap<String, String>,
     ) -> Result<String, PluginResult> {
-        let mut hasher = Sha256::new();
-        hash_framed(&mut hasher, "version", DEDUP_FINGERPRINT_VERSION.as_bytes());
-        hash_framed(
-            &mut hasher,
-            "method",
-            ctx.method.to_ascii_uppercase().as_bytes(),
-        );
-        hash_framed(
-            &mut hasher,
-            "authority",
-            canonical_authority(headers).as_bytes(),
-        );
-        hash_framed(&mut hasher, "path", ctx.path.as_bytes());
-        hash_framed(
-            &mut hasher,
+        let mut hasher = PartitionHasher::new(DEDUP_FINGERPRINT_VERSION);
+        hasher.text("method", &ctx.method.to_ascii_uppercase());
+        hasher.text("authority", &canonical_authority(headers));
+        hasher.text("path", &ctx.path);
+        // The built-in priority places deduplication after request_transformer,
+        // so bind the published outbound query when one exists. Falling back
+        // to the raw wire query preserves synthetic/direct test contexts and
+        // requests whose query was not transformed.
+        hasher.text(
             "query",
-            ctx.raw_query_string().unwrap_or("").as_bytes(),
+            ctx.outbound_query_string()
+                .or_else(|| ctx.raw_query_string())
+                .unwrap_or(""),
         );
-        let exclude_scoped_credentials =
-            self.scope_by_consumer && ctx.effective_identity().is_some();
-        for (header_name, value) in
-            request_headers_for_fingerprint(headers, &self.header_name, exclude_scoped_credentials)
-        {
-            hash_framed(&mut hasher, "header_name", header_name.as_bytes());
-            hash_framed(&mut hasher, "header_value", value.as_bytes());
+        // The fingerprint must also witness the effective destination: a
+        // header-selected route rewrite changes what the backend would do with
+        // an otherwise identical request, and a conflicting fingerprint is what
+        // stops a same-key replay from crossing that boundary.
+        replay_partition::append_destination_partition(&mut hasher, ctx);
+        // Credential headers are bound as digests rather than excluded. The
+        // previous exclusion made two credentials that resolve to one display
+        // subject — different scopes, audiences, or tenancy claims — produce an
+        // identical fingerprint and therefore an admissible replay. Digesting
+        // keeps the raw credential out of the key while making the difference
+        // observable. `request_headers_for_fingerprint` still drops hop-by-hop
+        // and per-request trace headers, which describe the transport rather
+        // than the operation.
+        let mut fields = request_headers_for_fingerprint(headers, &self.header_name);
+        hasher.count("headers", fields.len());
+        for (header_name, value) in fields.drain(..) {
+            hasher.text("header_name", &header_name);
+            if replay_partition::is_request_credential_context_header(ctx, &header_name) {
+                hasher.nested(
+                    "header_value_digest",
+                    &replay_partition::value_digest(value),
+                );
+            } else {
+                hasher.text("header_value", value);
+            }
         }
         let body_digest = request_body_digest(ctx, headers)?;
-        hash_framed(&mut hasher, "body_digest", body_digest.as_bytes());
+        hasher.text("body_digest", &body_digest);
 
-        Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
+        let mut fingerprint = String::with_capacity(71);
+        fingerprint.push_str("sha256-");
+        fingerprint.push_str(&hasher.hex());
+        Ok(fingerprint)
     }
 
     fn local_lookup_or_mark_inflight(
@@ -2694,10 +2749,26 @@ fn canonical_authority(headers: &HashMap<String, String>) -> String {
         .unwrap_or_default()
 }
 
+/// Header fields that participate in the request fingerprint, lowercased and
+/// deterministically ordered.
+///
+/// Credential-bearing names are deliberately *retained* — the caller digests
+/// their values (see [`RequestDeduplication::build_request_fingerprint`]) so a
+/// same-subject/different-scope credential cannot reuse another caller's stored
+/// result while the raw secret still never enters a key or a log line.
+///
+/// Per-request tracing/correlation identifiers are excluded here, and that is a
+/// *different* contract from the replay-partition one in
+/// `replay_partition::append_request_context_partition` (which binds them,
+/// because a retained representation may not be replayed across a
+/// backend-visible dimension). This fingerprint answers "is this the same
+/// operation?" for an idempotency key, and a client retrying a failed write
+/// emits a fresh trace ID by design. Binding it would make every retry a new
+/// operation and defeat the plugin's entire purpose — re-executing the side
+/// effect is the failure mode dedup exists to prevent.
 fn request_headers_for_fingerprint<'a>(
     headers: &'a HashMap<String, String>,
     idempotency_header: &str,
-    exclude_scoped_credentials: bool,
 ) -> Vec<(String, &'a str)> {
     let mut values = Vec::new();
     for (name, value) in headers {
@@ -2709,10 +2780,6 @@ fn request_headers_for_fingerprint<'a>(
                 .iter()
                 .any(|excluded| normalized == *excluded)
             || is_per_request_trace_header(&normalized)
-            || (exclude_scoped_credentials
-                && SCOPED_CREDENTIAL_FINGERPRINT_EXCLUSIONS
-                    .iter()
-                    .any(|excluded| normalized == *excluded))
         {
             continue;
         }
@@ -3051,7 +3118,32 @@ impl Plugin for RequestDeduplication {
                     return PluginResult::Continue;
                 }
             };
-            let key = self.build_key(ctx, idempotency_value);
+            let key = match self.build_key(ctx, headers, idempotency_value) {
+                Ok(key) => key,
+                Err(refusal) => {
+                    // Fail closed on the replay dimension: with no derivable
+                    // partition there is no key under which a retained result
+                    // can be proven to belong to this caller, so nothing is
+                    // looked up or stored. Operators who require the
+                    // idempotency guarantee itself (`enforce_required`) get an
+                    // explicit refusal instead of a silent single-execution
+                    // downgrade. Content-free: the reason is a compiled-in
+                    // static string and never carries caller or key material.
+                    debug!(
+                        reason = refusal.reason(),
+                        "request_deduplication: refusing to deduplicate without a complete \
+                         replay partition for this caller"
+                    );
+                    if self.enforce_required {
+                        return PluginResult::Reject {
+                            status_code: 503,
+                            body: UNPARTITIONABLE_CALLER_BODY.to_string(),
+                            headers: HashMap::new(),
+                        };
+                    }
+                    return PluginResult::Continue;
+                }
+            };
             let fingerprint = match self.build_request_fingerprint(ctx, headers) {
                 Ok(fingerprint) => fingerprint,
                 Err(reject) => return reject,

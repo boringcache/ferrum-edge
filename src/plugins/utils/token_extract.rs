@@ -1,4 +1,5 @@
 use crate::plugins::RequestContext;
+use sha2::{Digest, Sha256};
 
 use super::auth_attempt::AuthenticationAttempt;
 use super::auth_flow::ExtractedCredential;
@@ -22,6 +23,10 @@ pub(crate) const STRIP_QUERY_PARAM_METADATA_PREFIX: &str = "auth.strip_query_par
 pub(crate) const QUERY_CREDENTIAL_METADATA_PREFIX: &str = "auth.query_credential_param.";
 
 pub(crate) fn mark_query_credential_metadata(ctx: &mut RequestContext, name: &str) {
+    if let Some(value) = ctx.query_params.get(name) {
+        let digest: [u8; 32] = Sha256::digest(value.as_bytes()).into();
+        ctx.mark_query_credential_partition_digest(name, digest);
+    }
     let mut key = String::with_capacity(QUERY_CREDENTIAL_METADATA_PREFIX.len() + name.len());
     key.push_str(QUERY_CREDENTIAL_METADATA_PREFIX);
     key.push_str(name);

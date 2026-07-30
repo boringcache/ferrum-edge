@@ -10515,6 +10515,24 @@ struct LiveTwoClusterFixture {
 #[cfg(target_os = "linux")]
 impl LiveTwoClusterFixture {
     async fn start() -> Result<Self, String> {
+        const START_ATTEMPTS: usize = 3;
+
+        let mut failures = Vec::new();
+        for attempt in 1..=START_ATTEMPTS {
+            match Self::start_once().await {
+                Ok(fixture) => return Ok(fixture),
+                Err(error) => {
+                    failures.push(format!("attempt {attempt}: {error}"));
+                }
+            }
+        }
+        Err(format!(
+            "live two-cluster fixture exhausted {START_ATTEMPTS} fresh setup attempts:\n{}",
+            failures.join("\n")
+        ))
+    }
+
+    async fn start_once() -> Result<Self, String> {
         let source = LiveVethPod::spawn_indexed(20)?;
         let east_west = LiveVethPod::spawn_indexed(21)?;
         let destination = LiveVethPod::spawn_indexed(22)?;

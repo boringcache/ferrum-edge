@@ -21856,6 +21856,22 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
+    // A replay lookup may run before final request-body hooks, so it needs a
+    // transport-owned proof that the complete body is empty. Method/framing
+    // headers alone are insufficient for H2 GET/HEAD streams that carry DATA
+    // without Content-Length. Publish the proof only after any early body
+    // normalization has produced the representation every before_proxy hook
+    // will observe.
+    ctx.set_replay_request_body_empty_proven(
+        before_proxy_body_requirements.required
+            && match &client_request_body {
+                ClientRequestBody::Streaming(request) => {
+                    hyper::body::Body::is_end_stream(request.body())
+                }
+                ClientRequestBody::Buffered(buffered) => buffered.body.is_empty(),
+            },
+    );
+
     // before_proxy hooks — only clone headers if at least one plugin modifies them.
     // When no plugin modifies headers, pass &mut ctx.headers directly to avoid
     // an expensive per-request HashMap clone on the hot path.
@@ -22495,6 +22511,12 @@ async fn handle_proxy_request_inner(
                     ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
                     ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
                     ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
+                    // `ai_semantic_cache` stages its semantic miss (scope key +
+                    // embedding) from the final-request-body hook, and its store hook
+                    // runs later against the real context. Without carrying these two
+                    // maps back, every semantic miss would silently store as exact-only.
+                    ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
+                    ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
                 }
                 match final_body_result {
                     PluginResult::Continue => {
@@ -22806,6 +22828,12 @@ async fn handle_proxy_request_inner(
                     ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
                     ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
                     ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
+                    // `ai_semantic_cache` stages its semantic miss (scope key +
+                    // embedding) from the final-request-body hook, and its store hook
+                    // runs later against the real context. Without carrying these two
+                    // maps back, every semantic miss would silently store as exact-only.
+                    ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
+                    ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
                 }
                 match final_body_result {
                     PluginResult::Continue => {
@@ -23455,6 +23483,12 @@ async fn handle_proxy_request_inner(
                 ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
                 ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
                 ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
+                // `ai_semantic_cache` stages its semantic miss (scope key +
+                // embedding) from the final-request-body hook, and its store hook
+                // runs later against the real context. Without carrying these two
+                // maps back, every semantic miss would silently store as exact-only.
+                ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
+                ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
             }
             match final_body_result {
                 PluginResult::Continue => {}
@@ -26294,6 +26328,12 @@ async fn handle_proxy_request_inner(
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
             ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
             ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
+            // `ai_semantic_cache` stages its semantic miss (scope key +
+            // embedding) from the final-request-body hook, and its store hook
+            // runs later against the real context. Without carrying these two
+            // maps back, every semantic miss would silently store as exact-only.
+            ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
+            ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
         }
         let (mut result, retained_body) = match initial_dispatch {
             BackendDispatchResult::Response {
@@ -26714,6 +26754,12 @@ async fn handle_proxy_request_inner(
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
             ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
             ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
+            // `ai_semantic_cache` stages its semantic miss (scope key +
+            // embedding) from the final-request-body hook, and its store hook
+            // runs later against the real context. Without carrying these two
+            // maps back, every semantic miss would silently store as exact-only.
+            ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
+            ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
         }
         let resp = match dispatch {
             BackendDispatchResult::Response {
@@ -39070,13 +39116,20 @@ mod tests {
             "model": "gpt-test",
             "messages": [{"role": "user", "content": "hello"}]
         });
-
-        let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
-        let mut request_headers =
+        let request_body_bytes = serde_json::to_vec(&request_body).unwrap();
+        let request_headers =
             HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+        // Lookup lives in on_final_request_body (priority 4057), after final
+        // request transforms and before provider I/O — not in before_proxy.
+        let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
         assert!(matches!(
             cache
-                .before_proxy(&mut miss_ctx, &mut request_headers)
+                .on_final_request_body_with_context(
+                    &mut miss_ctx,
+                    &request_headers,
+                    &request_body_bytes
+                )
                 .await,
             PluginResult::Continue
         ));
@@ -39092,9 +39145,9 @@ mod tests {
             .await;
 
         let mut hit_ctx = request_ctx_with_ai_body(request_body);
-        let mut hit_headers =
-            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-        let synthetic = cache.before_proxy(&mut hit_ctx, &mut hit_headers).await;
+        let synthetic = cache
+            .on_final_request_body_with_context(&mut hit_ctx, &request_headers, &request_body_bytes)
+            .await;
         assert!(matches!(synthetic, PluginResult::RejectBinary { .. }));
 
         let response = normalize_synthetic_reject_for_test(&plugins, &mut hit_ctx, synthetic).await;
@@ -39116,13 +39169,20 @@ mod tests {
             "model": "gpt-test",
             "messages": [{"role": "user", "content": "hello"}]
         });
-
-        let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
-        let mut request_headers =
+        let request_body_bytes = serde_json::to_vec(&request_body).unwrap();
+        let request_headers =
             HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+        // Lookup lives in on_final_request_body (priority 4057), after final
+        // request transforms and before provider I/O — not in before_proxy.
+        let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
         assert!(matches!(
             cache
-                .before_proxy(&mut miss_ctx, &mut request_headers)
+                .on_final_request_body_with_context(
+                    &mut miss_ctx,
+                    &request_headers,
+                    &request_body_bytes
+                )
                 .await,
             PluginResult::Continue
         ));
@@ -39138,9 +39198,9 @@ mod tests {
             .await;
 
         let mut hit_ctx = request_ctx_with_ai_body(request_body);
-        let mut hit_headers =
-            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-        let synthetic = cache.before_proxy(&mut hit_ctx, &mut hit_headers).await;
+        let synthetic = cache
+            .on_final_request_body_with_context(&mut hit_ctx, &request_headers, &request_body_bytes)
+            .await;
         assert!(matches!(synthetic, PluginResult::RejectBinary { .. }));
 
         let response = normalize_synthetic_reject_for_test(&plugins, &mut hit_ctx, synthetic).await;

@@ -36,6 +36,7 @@ fn decode_claims_only(token: &str) -> Option<serde_json::Value> {
 
 pub struct JwtAuth {
     token_lookup: TokenLookup,
+    request_headers_to_redact: Vec<String>,
     consumer_claim_field: String,
     validation: Validation,
     require_nbf: bool,
@@ -107,8 +108,14 @@ impl JwtAuth {
         }
         validation.required_spec_claims = required;
 
+        let request_headers_to_redact = match &token_lookup {
+            TokenLookup::Header { lower_name, .. } => vec![lower_name.clone()],
+            TokenLookup::Query(_) => Vec::new(),
+        };
+
         Ok(Self {
             token_lookup,
+            request_headers_to_redact,
             consumer_claim_field,
             validation,
             require_nbf,
@@ -265,6 +272,10 @@ auth_flow::impl_auth_plugin!(
         {
             crate::plugins::utils::token_extract::mark_query_credential_metadata(ctx, name);
         }
+    }
+
+    fn request_headers_to_redact(&self) -> &[String] {
+        &self.request_headers_to_redact
     }
 );
 
