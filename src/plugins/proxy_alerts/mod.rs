@@ -650,28 +650,29 @@ impl ProxyAlerts {
         }
     }
 
-    /// Snapshot delivery metrics for external tests (process-wide registry).
-    #[doc(hidden)]
-    pub fn delivery_metrics_snapshot_for_test(
-        &self,
-    ) -> crate::notifications::DeliveryMetricsSnapshot {
-        self.dispatch_generation.metrics().snapshot()
-    }
-
     /// Cancel admission for this instance's dispatch generation (test hook).
     #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
     pub fn cancel_dispatch_generation_for_test(&self) {
         self.dispatch_generation.cancel();
     }
 
     /// In-flight dispatch count for this instance generation.
     #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
     pub fn dispatch_in_flight_for_test(&self) -> usize {
         self.dispatch_generation.in_flight()
     }
 
     /// Current recovery state for deterministic external delivery tests.
     #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
     pub fn recovery_state_for_test(
         &self,
         rule_id: u32,
@@ -684,6 +685,9 @@ impl ProxyAlerts {
 
     /// Try to reserve one cooldown seat for deterministic external tests.
     #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub fn try_acquire_cooldown_for_test(
         &self,
