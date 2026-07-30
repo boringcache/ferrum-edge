@@ -2628,6 +2628,13 @@ pub struct RequestContext {
     /// default inbound routes (which authorize on the container/backend port,
     /// matching Istio inbound authz) and for all non-ingress traffic.
     pub mesh_inbound_listener_authz_port: Option<u16>,
+    /// Set exactly once by `run_finalized_request_egress_hooks` when the
+    /// finalized-request-egress phase has run for this request. The phase is
+    /// reachable from several dispatch ladders (H1/H2 terminal preparation,
+    /// H1/H2 ordinary preparation, the native-gRPC branch, and the H3 terminal
+    /// preparation); this flag keeps an irreversible external side effect
+    /// exactly-once across all of them.
+    pub finalized_request_egress_dispatched: bool,
 }
 
 /// Return an identity only when it contains a meaningful non-whitespace value.
@@ -2786,6 +2793,7 @@ impl RequestContext {
             orig_dst: None,
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
+            finalized_request_egress_dispatched: false,
         }
     }
 
@@ -3640,6 +3648,13 @@ impl RequestContext {
             orig_dst: self.orig_dst,
             mesh_outbound_destination_authz_port: self.mesh_outbound_destination_authz_port,
             mesh_inbound_listener_authz_port: self.mesh_inbound_listener_authz_port,
+            // The finalized-request-egress phase always runs against the REAL
+            // request context (mirror admission leases, mirror result
+            // receivers, and serverless terminate provenance all live there and
+            // are deliberately not copied back from this compatibility clone).
+            // Carrying the flag keeps a hook that reads it on this clone
+            // consistent with the live request.
+            finalized_request_egress_dispatched: self.finalized_request_egress_dispatched,
         }
     }
 
@@ -6669,8 +6684,75 @@ pub trait Plugin: Send + Sync {
     /// and final-body policy hooks run. Cache validation rejects a same-protocol
     /// transformer in that chain so policy cannot govern different bytes than
     /// the backend receives.
+    ///
+    /// Built-in egress plugins no longer do this: they declare
+    /// [`dispatches_finalized_request_egress`] instead and run in the
+    /// finalized-request-egress phase. The capability is retained because a
+    /// registered custom plugin may still egress from `before_proxy`, and
+    /// composition admission must keep failing that chain closed.
     fn egresses_request_body_before_finalization(&self) -> bool {
         false
+    }
+
+    /// Returns `true` when this plugin's enforcement decision is taken in the
+    /// final request-body phase (`on_final_request_body*`) over the exact
+    /// backend-visible representation: WAF body rules, OpenAPI request-schema
+    /// validation, request-body validation, and the post-transform request-size
+    /// ceiling.
+    ///
+    /// Composition admission uses this to refuse a chain in which a plugin
+    /// egresses BEFORE finalization (`egresses_request_body_before_finalization`)
+    /// alongside a validator that only decides afterwards — the operator would
+    /// otherwise be promised a fail-closed body policy that a mirror, function,
+    /// or provider had already bypassed.
+    fn enforces_finalized_request_policy(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin performs irreversible outbound request
+    /// egress — or any other external side effect that cannot be retracted —
+    /// and must therefore observe the exact backend-visible request
+    /// representation (GHSA-4vr5-4wm3-x5xv).
+    ///
+    /// The gateway calls [`dispatch_finalized_request_egress`] for these
+    /// plugins, in configured priority order, only after request-body
+    /// collection, canonical `transform_request_body` rewrites, and every
+    /// `on_final_request_body` policy hook have accepted that representation.
+    /// A plugin declaring this must not perform any part of that egress from
+    /// `before_proxy`: the built-in egress plugins have no `before_proxy` hook
+    /// at all, precisely so the earlier phase cannot be reintroduced by
+    /// accident.
+    fn dispatches_finalized_request_egress(&self) -> bool {
+        false
+    }
+
+    /// Irreversible outbound request egress over the finalized representation.
+    ///
+    /// `headers` and `body` are an immutable snapshot of exactly what the
+    /// backend would receive: request-body transforms have run, and every
+    /// applicable final request-policy hook (WAF body rules, OpenAPI request
+    /// schema, body validation, the post-transform request-size ceiling) has
+    /// already accepted these bytes. Consuming anything else — the pre-transform
+    /// `ctx.metadata["request_body"]`, for example — reintroduces the advisory.
+    ///
+    /// A plugin that must add request headers for the primary backend (the
+    /// `serverless_function` `pre_proxy` contract) writes them into
+    /// `backend_header_overlay` rather than mutating the snapshot. The proxy
+    /// merges that overlay into the outbound header map after the phase and
+    /// re-applies gateway-owned assertion and egress-baggage policy, so an
+    /// externally supplied header can never impersonate a gateway assertion or
+    /// re-add a stripped baggage key.
+    ///
+    /// Returning a rejection terminates the request with that representation;
+    /// this is how `serverless_function` `terminate` mode answers the client.
+    async fn dispatch_finalized_request_egress(
+        &self,
+        _ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
+        _backend_header_overlay: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Continue
     }
 
     /// Returns `true` when this plugin can execute an external side effect and

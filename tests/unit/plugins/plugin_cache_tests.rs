@@ -28,6 +28,37 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Test shim for the finalized-request-egress phase (GHSA-4vr5-4wm3-x5xv).
+///
+/// `request_mirror` and `serverless_function` no longer have a `before_proxy`
+/// hook. They dispatch over an immutable backend-visible snapshot, so this
+/// derives the finalized body from the representation the test staged on the
+/// context and folds the backend header overlay back into the mutable map.
+async fn finalized_egress(
+    plugin: &dyn Plugin,
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) -> PluginResult {
+    let body: Vec<u8> = ctx
+        .request_body_bytes
+        .as_ref()
+        .map(|body| body.to_vec())
+        .or_else(|| {
+            ctx.metadata
+                .get("request_body")
+                .map(|body| body.as_bytes().to_vec())
+        })
+        .unwrap_or_default();
+    let mut overlay = HashMap::new();
+    let snapshot = headers.clone();
+    let result = plugin
+        .dispatch_finalized_request_egress(ctx, &snapshot, &body, &mut overlay)
+        .await;
+    headers.extend(overlay);
+    result
+}
+
+
 struct LegacyAuthorizePlugin;
 
 #[async_trait::async_trait]
@@ -3232,7 +3263,7 @@ async fn request_mirror_cache_construction_preserves_plugin_config_id() {
     let mut headers = HashMap::new();
 
     assert!(matches!(
-        mirror.before_proxy(&mut ctx, &mut headers).await,
+        finalized_egress(mirror.as_ref(), &mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
     let result = tokio::time::timeout(

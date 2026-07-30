@@ -64,8 +64,18 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
 2. `authenticate`: mTLS, JWKS, JWT, keyauth, LDAP, basicauth, HMAC
 3. `authorize`: ACL, mesh_authz, rate limiting
 4. `normalize_buffered_request_body_before_before_proxy`: configured request decompression (and any future early body normalizers) after the pre-`before_proxy` buffer is stored
-5. `before_proxy`: SOAP, AI plugins, workload metrics, transformers, serverless, mock, gRPC deadline, mirror, load, cache, compression
-6. `on_final_request_body`: body validator and gRPC-Web validation
+5. `before_proxy`: SOAP, AI plugins, workload metrics, transformers, mock, gRPC deadline, load, cache, compression
+6. `on_final_request_body`: body validator, gRPC-Web validation, WAF body rules, OpenAPI request schema, post-transform request-size ceiling, `ai_federation`
+6b. `dispatch_finalized_request_egress`: irreversible outbound request egress
+    (`request_mirror`, `serverless_function`) over the immutable backend-visible
+    header/body snapshot, after every hook in step 6 accepted it
+    (GHSA-4vr5-4wm3-x5xv). A local rejection therefore implies no mirror,
+    function, or provider was contacted. Runs at most once per request
+    (`RequestContext.finalized_request_egress_dispatched`), so retries never
+    re-fire it. `pre_proxy` header injection goes through the backend header
+    overlay, which the proxy merges only after re-stripping reserved gateway
+    assertions and re-applying the egress baggage policy. Neither plugin has a
+    `before_proxy` hook — do not add one back.
 7. `after_proxy`: response-side counterpart to before_proxy
    - Successful H1/H2/H3 WebSocket handshakes bypass general `after_proxy` and
      instead run the synchronous, non-rejecting
@@ -142,6 +152,17 @@ on a native-gRPC request.
 - `PUT /consumers/:id/credentials/:type` replaces the array, `POST` appends one entry, and `DELETE .../:index` removes one entry.
 - Indexable credentials insert all entries into `ConsumerIndex`; secret-based credentials iterate over the array.
 - Body buffering is two-tier: `PluginCache.requires_request/response_body_buffering()` for the upper bound, then per-request `should_buffer_*_body(&RequestContext)`.
+- A configured finalized-egress plugin forces buffered request-body
+  finalization to complete BEFORE backend dispatch (the `has_finalized_request_egress`
+  term in `final_request_body_requirements`), because the ordinary ladder
+  otherwise finalizes inside `proxy_to_backend`. On H1/H2 that term is gated to
+  non-gRPC; native gRPC reaches the egress boundary from its own branch after
+  its own transform/final-hook pass.
+- Composition admission fails closed for anything that still egresses earlier:
+  `egresses_request_body_before_finalization()` may not coexist with a
+  request-body transformer, with `enforces_finalized_request_policy()` (waf,
+  body_validator, openapi_validator, request_size_limiting), or with
+  `dispatches_finalized_request_egress()` on the same plugin.
 - gRPC uses `GrpcBody::Streaming(Incoming)` when there are no body plugins and no retries; otherwise `Buffered(Full<Bytes>)`.
 - In `before_proxy(ctx, headers)`, read headers from the `headers` parameter, never `ctx.headers`. The handler may have moved headers out of `ctx.headers` when no plugin modifies request headers.
 - `ctx.authenticated_identity` is first-class for rate-limit/cache keys, log summaries, and backend identity header injection.

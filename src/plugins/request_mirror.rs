@@ -9,11 +9,15 @@
 //!
 //! ## How it works
 //!
-//! During the `before_proxy` phase (after all request transforms), the plugin
+//! During the finalized-request-egress phase — after request-body transforms and
+//! after every `on_final_request_body` policy hook has accepted the
+//! backend-visible representation (advisory `GHSA-4vr5-4wm3-x5xv`) — the plugin
 //! captures the request method, path, query string, headers, and optionally the
 //! body, then spawns an async task to replay the request against the configured
 //! mirror destination. The main request proceeds immediately — mirror latency
-//! has zero impact on client response time.
+//! has zero impact on client response time. A request Ferrum goes on to reject
+//! locally is therefore never mirrored, and the shadow destination never sees a
+//! field an operator configured `request_transformer` to remove or redact.
 //!
 //! Multiple independent `request_mirror` instances on one proxy each dispatch
 //! and each push their own result receiver onto a per-request collection. A
@@ -1791,6 +1795,11 @@ impl Plugin for RequestMirror {
         super::HTTP_GRPC_PROTOCOLS
     }
 
+    /// Keeps the admitted body collected on the early pre-`before_proxy` buffer
+    /// (the `GHSA-jv66-mq44-m9v3` admission design depends on that timing). The
+    /// mirror does not read it there: the bytes it replays come from the
+    /// finalized-request-egress phase parameter, after transforms and final
+    /// request policy.
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.body_admission_enabled()
     }
@@ -1807,8 +1816,12 @@ impl Plugin for RequestMirror {
         self.body_admission_enabled() && ctx.request_mirror_body_admitted(self.instance_id)
     }
 
+    /// The mirror reads the finalized body from the finalized-request-egress
+    /// phase parameter, never from `ctx.request_body_bytes` (which holds the
+    /// PRE-transform client body). Declining the context copy avoids a full-body
+    /// `Bytes::copy_from_slice` per request that nothing would read.
     fn needs_request_body_bytes(&self) -> bool {
-        self.body_admission_enabled()
+        false
     }
 
     /// The mirror replays raw bytes only. Declining the UTF-8 copy avoids
@@ -1891,14 +1904,27 @@ impl Plugin for RequestMirror {
         self.mirror_hostname.iter().cloned().collect()
     }
 
-    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+    /// The mirror is dispatched in the finalized-request-egress phase, after
+    /// request-body transforms and every final request-policy hook have
+    /// accepted the backend-visible representation. A shadow destination
+    /// therefore never receives a field `request_transformer` was configured to
+    /// remove, and never receives a request that WAF, OpenAPI-schema, or
+    /// request-size policy goes on to reject (GHSA-4vr5-4wm3-x5xv).
+    fn dispatches_finalized_request_egress(&self) -> bool {
         true
     }
 
-    async fn before_proxy(
+    /// Dispatch the shadow request over the finalized representation.
+    ///
+    /// `headers` and `body` are immutable and byte-identical to what the
+    /// primary backend receives. The mirror never mutates the outbound request,
+    /// so it publishes nothing into `backend_header_overlay`.
+    async fn dispatch_finalized_request_egress(
         &self,
         ctx: &mut RequestContext,
-        headers: &mut HashMap<String, String>,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        _backend_header_overlay: &mut HashMap<String, String>,
     ) -> PluginResult {
         // Take this instance's pre-buffer admission (staged by `authorize`)
         // exactly once. Dropping it here releases the permit and the retained
@@ -2055,14 +2081,13 @@ impl Plugin for RequestMirror {
             },
         };
 
-        // Share immutable body bytes with the primary buffer: one `Bytes`
-        // handle, no second `Vec`/`String` copy for the detached task.
+        // The finalized backend-visible body, not `ctx.request_body_bytes` /
+        // `ctx.metadata["request_body"]` — those hold the PRE-transform client
+        // body, and replaying them is exactly the disclosure this advisory
+        // describes. One `Bytes` allocation for the detached task; the primary
+        // buffer is untouched.
         let body_bytes: Option<Bytes> = if self.mirror_request_body {
-            ctx.request_body_bytes.clone().or_else(|| {
-                ctx.metadata
-                    .get("request_body")
-                    .map(|body| Bytes::copy_from_slice(body.as_bytes()))
-            })
+            Some(Bytes::copy_from_slice(body))
         } else {
             None
         };

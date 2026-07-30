@@ -91,6 +91,12 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
+│ 5d. finalized egress    │  Irreversible outbound request egress, after body
+│                         │  transforms and every final request-policy hook
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
 │ 5d. final request body  │  Terminal body dispatch after selected-path policy
 └────────────┬────────────┘
              │
@@ -197,26 +203,31 @@ WebSocket retry loops.
 When backend-path policy is active, `before_proxy` hooks that can dispatch
 external work or synthesize a terminal response opt into the deferred phases.
 Ferrum runs them in their normal relative priority order only after path policy.
-`fault_injection`, `request_mirror`, pre-proxy `serverless_function`,
-`response_mock`, `grpc_deadline`, and `load_testing` use this boundary, so a
-backend-effective gRPC deny cannot be delayed, faulted, mirrored, invoked,
+`fault_injection`, `response_mock`, `grpc_deadline`, and `load_testing` use
+this boundary, so a backend-effective gRPC deny cannot be delayed, faulted,
 mocked, deadline-rejected, or load-fanned-out before it is enforced. Proxies
 without a backend-path policy retain the ordinary single `before_proxy` pass.
 Deferred hooks generally observe the original client path, preserving their
 normal request semantics even when mesh routing rewrote the backend path.
-`request_mirror` is the route-parity exception: an unset `mirror_path` reads
-the finalized mesh `route_override_path` without taking it from primary
+
+`request_mirror` and `serverless_function` are no longer deferred
+`before_proxy` hooks — they have no `before_proxy` hook at all. Both moved to
+the finalized-request-egress phase (5d), which is strictly later than the
+backend-path gate, so the same enforcement ordering holds by construction
+rather than by opt-in. That phase also runs with the original client path
+installed on the context, matching the deferred-hook request view.
+`request_mirror` remains the route-parity exception: an unset `mirror_path`
+reads the finalized mesh `route_override_path` without taking it from primary
 dispatch, then falls back to the backend-effective authorized path and finally
 the original client path.
-Within that deferred transform band, `load_testing` (3070) runs before
-`request_mirror` (3075) so the reserved `X-Loadtesting-Key` is stripped on both
-matching and non-matching paths before mirror can copy it. As defense in depth,
+Within the transform band, `load_testing` (3070) runs before `request_mirror`
+(3075) so the reserved `X-Loadtesting-Key` is stripped on both matching and
+non-matching paths before mirror can copy it. As defense in depth,
 `request_mirror` also excludes both load-testing control headers if priority
-overrides reverse the order. Both plugins still require backend-path resolution
-and pre-`before_proxy` body availability when they opt in. `request_mirror` is
-also the security-sensitive path exception: when backend-path policy is active
-and `mirror_path` is unset, it mirrors the exact effective path that passed
-final authorization. An explicit operator-configured `mirror_path` still wins.
+overrides reverse the order. `request_mirror` is also the security-sensitive
+path exception: when backend-path policy is active and `mirror_path` is unset,
+it mirrors the exact effective path that passed final authorization. An
+explicit operator-configured `mirror_path` still wins.
 Each configured mirror instance appends its own bounded result receiver; result
 logging is detached per instance, so later instances and mixed completion order
 cannot overwrite an earlier destination's outcome.
@@ -239,8 +250,9 @@ phase before collecting the body; that rejection drops the staged permit and
 reservation without reading the upload, though it may consume a sampling slot.
 Instances with `mirror_request_body: false` or a zero-quantized `percentage`
 declare no body capability at all and stay out of the authorize list. The staged
-decision is left behind as a consumed marker after `before_proxy` takes the
-lease, so the buffering predicate answers consistently for the whole request.
+decision is left behind as a consumed marker after the finalized-egress phase
+takes the lease, so the buffering predicate answers consistently for the whole
+request.
 
 A deferred hook that can inject routing headers runs after the selected
 target's single state-consuming enforcement, and that target is pinned across
@@ -257,6 +269,58 @@ backend-only admission, circuit breaking, pool, TLS, or transport work. This
 keeps final transformed-body provider dispatch outside placeholder-backend
 health accounting without allowing it to bypass backend-effective gRPC method
 policy.
+
+## Finalized Request Egress
+
+Irreversible outbound request egress is its own phase (advisory
+`GHSA-4vr5-4wm3-x5xv`). A plugin declaring
+`dispatches_finalized_request_egress()` is called through
+`dispatch_finalized_request_egress()` — in configured priority order — only
+after **all** of the following have happened for the same request:
+
+1. the request body has been collected (when any plugin requires buffering),
+2. every `transform_request_body` rewrite has produced the canonical
+   backend-visible bytes, and
+3. every `on_final_request_body` policy hook has returned `Continue` for those
+   exact bytes — WAF body rules, OpenAPI request-schema validation,
+   `body_validator`, and the post-transform `request_size_limiting` ceiling.
+
+The phase therefore satisfies a simple contract: **a local rejection implies no
+mirror, function, or provider was contacted.** Built-in participants are
+`serverless_function` (3025) and `request_mirror` (3075); `ai_federation`
+(4060) reaches the same guarantee through the final request-body phase it
+already used.
+
+Plugins receive an *immutable* header and body snapshot. A `pre_proxy`
+`serverless_function` that injects backend request headers publishes them into a
+separate backend header overlay; the proxy merges that overlay into the outbound
+map afterwards and then re-strips reserved gateway assertions
+(`x-consumer-username`, `x-consumer-custom-id`, `x-geo-country`) and re-applies
+the configured egress baggage filter, exactly as it does after a deferred
+`before_proxy` pass. An egress plugin cannot therefore alter the representation
+that policy accepted and the backend receives.
+
+The phase runs at most once per request (`finalized_request_egress_dispatched`),
+so retries — which replay the already-finalized body — never re-fire a mirror
+or re-invoke a function. It is reached from the H1/H2 terminal and ordinary
+request-body finalization sites, the H1/H2 native-gRPC branch, the H1/H2
+no-buffering boundary (which covers WebSocket handshakes and streamed requests
+with no body policy), and the HTTP/3 boundary that follows terminal
+finalization (which likewise precedes the H3 WebSocket branch). HBONE `CONNECT`
+tunnels short-circuit the dispatch ladder before the boundary and do not run
+egress plugins.
+
+Because a configured egress plugin forces request-body finalization to complete
+*before* backend dispatch, a buffered request on such a proxy reads its upload
+before the backend circuit-breaker gate rather than inside backend dispatch.
+
+Plugin-cache construction still fails closed for a plugin that egresses
+*earlier* (file mode startup-fatal, DB/CP admin warn, DP rejects the update and
+keeps the live generation): a registered custom plugin declaring
+`egresses_request_body_before_finalization()` may not share a protocol chain
+with a request-body transformer, nor with a plugin whose enforcement decision is
+taken in the final request-body phase (`enforces_finalized_request_policy()`),
+and it may not also declare `dispatches_finalized_request_egress()`.
 
 When a plugin returns a replacement body from `transform_response_body`, the core first removes representation metadata that can no longer describe the client-visible bytes: range fields, ETag/Last-Modified validators, content digests/checksums, and content-bound signatures. It then calls that plugin's `on_response_body_transformed` callback before the next transform, allowing the plugin to attach metadata it recomputed for the replacement representation. Neither step runs when the transform returns `None`, so unmodified responses retain their original semantics — with one exception: a body the representation gate **decoded** has already had its client-visible bytes changed (encoded in, identity out), so that same metadata invalidation is applied at the decode itself, whether or not a later rule matches. Otherwise a decoded body no rule happened to change would be served as identity bytes carrying the origin's validator for the encoded ones. `206 Partial Content` and `226 IM Used` responses that no configured body policy claims skip provider normalization and presentation transforms entirely: the buffered bytes are only a selected range or delta, so Ferrum cannot rewrite them into a truthful full representation merely by changing headers or status. When a configured body policy *does* claim such a response, skipping the transform would silently forward protected bytes, so the representation gate described below rejects it instead — see [Buffered response representation gate](#buffered-response-representation-gate). Transform-dependent header hooks also decline these statuses: compression does not attach `Content-Encoding`, gRPC-Web does not relabel native gRPC bytes or expose transformed trailers, and SSE does not force a non-SSE representation into event-stream headers when wrapping cannot run. Inspection hooks still run. If an enforcing policy detects content whose safe disposition requires redaction, it rejects the response instead of forwarding the original bytes with false redaction telemetry. This lifecycle rule is shared by buffered H1, H2, H3, gRPC, and synthetic/rejection response paths rather than delegated to individual transformer implementations.
 
@@ -619,7 +683,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 
 `soap_ws_security` keeps AuthN-band priority 1500 for ordering, but validates SOAP bodies in `before_proxy` after request-body buffering is available.
 
-`serverless_function` also runs in `before_proxy`. With `forward_body: true` it receives the exact lossless client representation before any request-body transform. Candidate admission and cache construction therefore reject a same-protocol chain that also contains a body transformer (including request decompression); the same capability-based validation covers registered custom body-egress plugins. Candidate admission derives the built-in serverless protocol, effective priority, `mode`, and `forward_body` capabilities without constructing its environment-bound HTTP/AWS client, so a CP can validate composition without requiring credentials that intentionally exist only on DPs. Runtime cache construction still resolves and validates those node-local values as a fail-closed backstop. Ferrum does not allow an external decision to govern bytes different from those ultimately dispatched. Non-identity encoded bodies fail closed before function egress. When a terminate-mode instance shares a protocol chain with `request_deduplication`, every deduplication instance must have a strictly lower effective priority so retry ownership exists before the function can execute; candidate admission and cache construction reject equal or reversed ordering.
+`serverless_function` runs in the finalized-request-egress phase, not `before_proxy` (advisory `GHSA-4vr5-4wm3-x5xv`). With `forward_body: true` it receives the exact lossless **backend-visible** representation: request-body transforms have run and every final request-policy hook has accepted those bytes. It may therefore share a protocol chain with a body transformer, which the previous `before_proxy` ordering had to refuse outright; the capability-based refusal is retained, and widened to cover final request-body policy plugins, for registered custom plugins that still declare `egresses_request_body_before_finalization()`. Candidate admission derives the built-in serverless protocol, effective priority, `mode`, and `forward_body` capabilities without constructing its environment-bound HTTP/AWS client, so a CP can validate composition without requiring credentials that intentionally exist only on DPs. Runtime cache construction still resolves and validates those node-local values as a fail-closed backstop. Ferrum does not allow an external decision to govern bytes different from those ultimately dispatched. Non-identity encoded bodies fail closed before function egress. When a terminate-mode instance shares a protocol chain with `request_deduplication`, every deduplication instance must have a strictly lower effective priority so retry ownership exists before the function can execute; candidate admission and cache construction reject equal or reversed ordering.
 
 `mcp_gateway` sits at priority 2992: generic admission/auth/body validation runs first, then MCP JSON-RPC metadata is extracted and aggregate-router calls can set `RequestContext.route_override_*` before final route-dispatch plugins and request transformers. It is HTTP-only and does not implement generic auth, rate limiting, retry, timeout, tracing, WAF, DLP, or semantic safety behavior; those remain separate Ferrum plugins that can consume emitted `mcp.*` metadata.
 
@@ -695,11 +759,11 @@ Given all built-in plugins enabled, the execution order is:
 | 48 | `mesh_route_dispatch` | 2995 | before_proxy |
 | 49 | `ai_semantic_cache` | 2996 | before_proxy, after_proxy, on_final_response_body |
 | 50 | `request_transformer` | 3000 | before_proxy, transform_request_body |
-| 51 | `serverless_function` | 3025 | before_proxy |
+| 51 | `serverless_function` | 3025 | finalized request egress |
 | 52 | `response_mock` | 3030 | before_proxy |
 | 53 | `grpc_deadline` | 3050 | receipt-time deadline preflight, before_proxy |
 | 54 | `load_testing` | 3070 | before_proxy |
-| 55 | `request_mirror` | 3075 | authorize (pre-buffer mirror admission; never rejects), before_proxy |
+| 55 | `request_mirror` | 3075 | authorize (pre-buffer mirror admission; never rejects), finalized request egress |
 | 56 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
 | 57 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
 | 58 | `response_transformer` | 4000 | after_proxy, transform_response_body |

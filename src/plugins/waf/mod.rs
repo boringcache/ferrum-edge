@@ -832,6 +832,14 @@ impl Plugin for Waf {
         super::priority::WAF
     }
 
+    /// WAF body rules decide in the final request-body phase, over the exact
+    /// backend-visible representation. Composition admission refuses to pair
+    /// this with a plugin that egresses the request before finalization
+    /// (GHSA-4vr5-4wm3-x5xv).
+    fn enforces_finalized_request_policy(&self) -> bool {
+        true
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         self.supported_protocols
     }

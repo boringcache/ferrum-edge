@@ -19827,7 +19827,11 @@ components:
       description: |
         Plugin: request_mirror — Duplicates live proxy traffic to a secondary
         destination for shadow testing, validation, or migration checks
-        without affecting client responses. Only the properties below are
+        without affecting client responses. The shadow request is dispatched in
+        the finalized-request-egress phase, after request-body transforms and
+        after every final request-policy hook has accepted the backend-visible
+        representation, so the mirror receives byte-identical headers and body
+        to the primary backend and a request Ferrum rejects is never mirrored. Only the properties below are
         admitted; unknown top-level keys are rejected so misspelled sampling,
         body, protocol, or endpoint controls cannot silently fall back to
         security-sensitive defaults (cleartext http, 100% mirroring, body
@@ -20025,7 +20029,12 @@ components:
       additionalProperties: false
       description: |
         Plugin: serverless_function — Invokes AWS Lambda, Azure Functions, or
-        Google Cloud Functions as middleware in the proxy pipeline. In
+        Google Cloud Functions as middleware in the proxy pipeline. The function
+        is invoked in the finalized-request-egress phase, after request-body
+        transforms and after every final request-policy hook (WAF body rules,
+        OpenAPI request schema, body validation, the post-transform request-size
+        ceiling) has accepted the exact backend-visible representation, so a
+        request Ferrum ultimately rejects never reaches the function. In
         `pre_proxy` mode the function response can inject request headers and
         metadata before the backend call. In `terminate` mode the function
         response is returned directly to the client. Native gRPC terminate
@@ -20205,7 +20214,7 @@ components:
           type: array
           items:
             type: string
-          description: "Header names to forward into the function payload (lowercased at config load). Values come from the effective before_proxy header view, so a header an earlier plugin removed - authorization under strip_authorization_on_success, or a gateway-owned claim_headers destination with no verified claim - is omitted rather than re-read from the client's original request."
+          description: "Header names to forward into the function payload (lowercased at config load). Values come from the finalized backend-visible header view (the function is invoked in the finalized-request-egress phase, after request-body transforms and every final request-policy hook), so a header an earlier plugin removed - authorization under strip_authorization_on_success, or a gateway-owned claim_headers destination with no verified claim - is omitted rather than re-read from the client's original request."
         forward_query_params:
           type: boolean
           default: false
