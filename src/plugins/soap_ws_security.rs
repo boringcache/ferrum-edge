@@ -4720,13 +4720,26 @@ impl SoapWsSecurity {
         // Record the exact representation that was authenticated so a later
         // request-body transform cannot silently substitute a different message
         // for the one this policy accepted.
-        let authenticated_digest = ctx
-            .request_body_bytes
-            .as_ref()
-            .map(|bytes| sha256_hex_lower(bytes));
-        if let Some(digest) = authenticated_digest {
-            ctx.metadata
-                .insert(AUTHENTICATED_BODY_DIGEST_KEY.to_string(), digest);
+        //
+        // Only the identity-establishing form records it, matching
+        // `requires_final_request_body_before_backend_dispatch`. A timestamp-only
+        // policy authenticates nobody and claims no integrity over the Body: it
+        // proves the message was fresh when it arrived, and it runs in
+        // `before_proxy` rather than ahead of the shared body-normalization
+        // phase, so there is no ordering hazard to close. Binding its
+        // representation anyway would protect nothing while turning an ordinary
+        // composition with a request-body transformer — whose rewrite lands
+        // immediately before the final-body hooks — into an unconditional `500`
+        // for every governed SOAP request.
+        if self.establishes_identity() {
+            let authenticated_digest = ctx
+                .request_body_bytes
+                .as_ref()
+                .map(|bytes| sha256_hex_lower(bytes));
+            if let Some(digest) = authenticated_digest {
+                ctx.metadata
+                    .insert(AUTHENTICATED_BODY_DIGEST_KEY.to_string(), digest);
+            }
         }
 
         if let Some(username) = principal.username.clone() {
@@ -5056,8 +5069,13 @@ impl Plugin for SoapWsSecurity {
         self.establishes_identity()
     }
 
+    /// Only the identity-establishing form records an authenticated-representation
+    /// digest, so only it needs the request context in the final-body hook. A
+    /// timestamp-only policy's hook can answer nothing but `Continue`, and
+    /// returning `true` for it would make the proxy clone a request context on
+    /// every governed request for no decision.
     fn needs_final_request_body_context(&self) -> bool {
-        true
+        self.establishes_identity()
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -5104,6 +5122,11 @@ impl Plugin for SoapWsSecurity {
     /// refuses the one composition that would do this systematically (see
     /// [`validate_composition`]); this is the runtime backstop for every other
     /// transform, including custom plugins.
+    ///
+    /// Only the identity-establishing form records the digest this compares
+    /// against, so a timestamp-only policy — which authenticates nobody and
+    /// makes no integrity claim — stays composable with request-body
+    /// transformers instead of failing every governed request closed.
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,

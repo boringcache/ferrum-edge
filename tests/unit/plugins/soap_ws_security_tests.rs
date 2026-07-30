@@ -7329,6 +7329,35 @@ mod advisory_regressions {
             other => panic!("a mutated authenticated body must not dispatch, got {other:?}"),
         }
     }
+
+    /// The representation binding belongs to the identity-establishing form
+    /// only. A timestamp-only policy authenticates nobody and claims no
+    /// integrity over the Body, so it must not bind the representation: a
+    /// request-body transformer's rewrite lands immediately before the
+    /// final-body hooks, and binding here would fail every governed SOAP
+    /// request on such a proxy closed with `500` while protecting nothing.
+    #[tokio::test]
+    async fn a_timestamp_only_policy_does_not_bind_the_representation() {
+        let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+        assert!(!plugin.requires_final_request_body_before_backend_dispatch());
+        assert!(!plugin.needs_final_request_body_context());
+
+        let body = wrap_soap(&fresh_timestamp());
+        let mut ctx = ctx_with(&body, Some("text/xml"));
+        let mut headers = soap_headers();
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+
+        let transformed = body.replace("Widget", "Mainframe");
+        assert!(matches!(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+                .await,
+            PluginResult::Continue
+        ));
+    }
 }
 
 // ── Strict MTOM/XOP MIME framing (GHSA-435h-f785-wmm4 residual) ─────────────

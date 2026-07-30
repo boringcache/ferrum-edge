@@ -78,8 +78,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message is validated twice. **Breaking:** an identity-establishing instance
   must be the proxy's sole authentication mechanism in either auth mode, and
   composing one with `compression`'s `decompress_request` is rejected at config
-  admission; an `on_final_request_body` guard additionally refuses to dispatch a
-  message whose bytes changed after validation.
+  admission; for that identity-establishing form an `on_final_request_body`
+  guard additionally refuses to dispatch a message whose bytes changed after
+  validation. A timestamp-only instance authenticates nobody and claims no
+  integrity over the Body, so it does not bind the representation and stays
+  composable with request-body transformers. Also **breaking:** because an
+  identity-establishing instance is the proxy's sole authentication mechanism,
+  a request the SOAP policy passes through — a non-SOAP media type under
+  `content_type.mode: mixed_route`, or a governed envelope with no
+  `wsse:Security` header under `reject_missing_security_header: false` —
+  reaches the authentication chain with no identity and is answered `401`
+  rather than forwarded anonymously; pair those options with a timestamp-only
+  instance, or separate anonymous and SOAP-authenticated traffic onto different
+  proxies.
 - `soap_ws_security` X.509 signatures must now protect the backend-visible SOAP
   Body (GHSA-3mwq-c8j6-9xhp). `Envelope`/`Header`/`Body`/`Security` selection is
   namespace-qualified and positional rather than by local name, duplicate
