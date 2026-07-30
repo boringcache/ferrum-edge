@@ -971,8 +971,7 @@ async fn vs_query_params_exact_match() {
         category = CATEGORY,
         feature = "queryParams.X.exact",
         status = Status::Supported,
-        notes =
-            "mesh_route_dispatch matches the canonical forwarded query and materializes ctx.query_params for sibling plugins.",
+        notes = "mesh_route_dispatch matches the canonical forwarded query and materializes ctx.query_params for sibling plugins.",
     );
     let plugin_config = dispatch_plugin_for_host_only(&[virtual_service(json!({
         "hosts": ["api.example.com"],
