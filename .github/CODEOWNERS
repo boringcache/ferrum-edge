@@ -11,9 +11,12 @@
 # Dependency gate + vendored-patch governance docs and scripts.
 /deny.toml                                  @jeremyjpj0916
 /docs/dependency-policy.md                  @jeremyjpj0916
+/docs/vendored-patch-lifecycle.json         @jeremyjpj0916
 /docs/upstream-h3-patches/                  @jeremyjpj0916
 /docs/upstream-reqwest-patches/             @jeremyjpj0916
 /docs/upstream-tungstenite-patches/         @jeremyjpj0916
+/docs/upstream-dimpl-patches/               @jeremyjpj0916
+/scripts/check_vendored_patch_lifecycle.py  @jeremyjpj0916
 /scripts/check_vendored_patch_status.sh     @jeremyjpj0916
 /scripts/update_vendor_integrity.sh         @jeremyjpj0916
 /.claude/rules/dependencies.md              @jeremyjpj0916

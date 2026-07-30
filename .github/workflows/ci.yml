@@ -868,6 +868,12 @@ jobs:
         # exception is rejected at PR time, not only by the weekly workflow.
         run: bash scripts/check_advisory_expiry.sh
 
+      - name: Vendored-patch lifecycle parity
+        # Fails when docs/vendored-patch-lifecycle.json drifts from Cargo.toml,
+        # vendor/, dependency-policy.md, or per-patch READMEs. The checker runs
+        # synthetic self-tests before repository parity.
+        run: python3 scripts/check_vendored_patch_lifecycle.py
+
   test-vendor-patches:
     name: Vendored Patch Regressions
     needs: build-test-artifacts
