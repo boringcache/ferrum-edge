@@ -38661,9 +38661,15 @@ mod tests {
         let request_body_bytes = serde_json::to_vec(&request_body).unwrap();
         let mut ctx = request_ctx_with_ai_body(request_body);
         let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-        let synthetic = plugins[0]
-            .on_final_request_body_with_context(&mut ctx, &headers, &request_body_bytes)
-            .await;
+        let synthetic = run_finalized_request_egress_hooks(
+            &plugins,
+            &mut ctx,
+            "/v1/chat/completions",
+            &headers,
+            &request_body_bytes,
+        )
+        .await
+        .result;
 
         let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
 
