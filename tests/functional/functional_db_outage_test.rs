@@ -127,7 +127,29 @@ impl DbOutageTestHarness {
             let _ = std::fs::copy(&wal_backup, self.db_path.with_extension("db-wal"));
         }
         if shm_backup.exists() {
-            let _ = std::fs::copy(&shm_backup, self.db_path.with_extension("db-shm"));
+            // The SHM file remains memory-mapped by the gateway process.
+            // `std::fs::copy` opens the destination with truncation, briefly
+            // shrinking the live mapping to zero and making a concurrent
+            // SQLite access vulnerable to SIGBUS. Restore only when the
+            // original extent is still intact, and write the backup bytes in
+            // place without truncating or resizing the mapped file.
+            let shm_path = self.db_path.with_extension("db-shm");
+            let backup = std::fs::read(&shm_backup).expect("Failed to read SHM backup");
+            let live_len = std::fs::metadata(&shm_path)
+                .expect("Failed to stat live SHM file")
+                .len();
+            assert_eq!(
+                live_len,
+                backup.len() as u64,
+                "Refusing to resize the live SQLite SHM mapping during restore"
+            );
+            let mut shm = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&shm_path)
+                .expect("Failed to open live SHM file for in-place restore");
+            shm.write_all(&backup)
+                .expect("Failed to restore SHM bytes in place");
+            shm.sync_all().expect("Failed to sync restored SHM bytes");
         }
         println!("  DB file restored from backup");
     }

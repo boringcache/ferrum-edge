@@ -485,6 +485,84 @@ async fn reserve_mesh_ports() -> MeshPorts {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn ephemeral_port_range_in_netns(pid: u32) -> Result<(u16, u16), String> {
+    run_in_live_netns(pid, || {
+        let raw = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+            .map_err(|error| format!("read netns ephemeral port range: {error}"))?;
+        let mut fields = raw.split_whitespace();
+        let first = fields
+            .next()
+            .ok_or_else(|| "netns ephemeral port range is empty".to_string())?
+            .parse::<u16>()
+            .map_err(|error| format!("parse netns ephemeral port range start: {error}"))?;
+        let last = fields
+            .next()
+            .ok_or_else(|| "netns ephemeral port range has no end".to_string())?
+            .parse::<u16>()
+            .map_err(|error| format!("parse netns ephemeral port range end: {error}"))?;
+        if fields.next().is_some() || first > last {
+            return Err(format!("invalid netns ephemeral port range: {raw:?}"));
+        }
+        Ok((first, last))
+    })
+}
+
+/// Select a listener port in the gateway's actual network namespace and
+/// outside that namespace's ephemeral range.
+///
+/// A host-namespace `127.0.0.1:0` reservation does not protect the same port
+/// number in a pod namespace. Worse, selecting an ephemeral number lets an
+/// already-running gateway claim it as a source port after the reservation is
+/// dropped but before the next gateway binds. The live two-cluster fixture
+/// starts several gateways in one source namespace, so that race can make a
+/// later listener fail with `EADDRINUSE`. Binding each candidate in the target
+/// namespace proves it is currently free; keeping it outside the kernel's
+/// ephemeral allocation range prevents an outbound connection from stealing it
+/// during the handoff.
+#[cfg(target_os = "linux")]
+fn reserve_unique_mesh_port_in_netns(pid: u32) -> Result<u16, String> {
+    let (ephemeral_first, ephemeral_last) = ephemeral_port_range_in_netns(pid)?;
+    for port in 10_240..=u16::MAX {
+        if (ephemeral_first..=ephemeral_last).contains(&port) || mesh_port_is_reserved(port) {
+            continue;
+        }
+        let listener = run_in_live_netns(pid, move || {
+            match std::net::TcpListener::bind(("0.0.0.0", port)) {
+                Ok(listener) => Ok(Some(listener)),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => Ok(None),
+                Err(error) => Err(format!("probe netns mesh port {port}: {error}")),
+            }
+        })?;
+        let Some(listener) = listener else {
+            continue;
+        };
+        let inserted = used_mesh_ports()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(port);
+        if inserted {
+            drop(listener);
+            return Ok(port);
+        }
+    }
+    Err(format!(
+        "no free non-ephemeral mesh port in netns {pid} outside \
+         {ephemeral_first}-{ephemeral_last}"
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn reserve_mesh_ports_in_netns(pid: u32) -> Result<MeshPorts, String> {
+    Ok(MeshPorts {
+        inbound: reserve_unique_mesh_port_in_netns(pid)?,
+        outbound: reserve_unique_mesh_port_in_netns(pid)?,
+        hbone: reserve_unique_mesh_port_in_netns(pid)?,
+        egress: reserve_unique_mesh_port_in_netns(pid)?,
+        east_west: reserve_unique_mesh_port_in_netns(pid)?,
+    })
+}
+
 struct MeshGatewaySpawnOptions<'a> {
     cp_addr: SocketAddr,
     ports: MeshPorts,
@@ -10437,6 +10515,24 @@ struct LiveTwoClusterFixture {
 #[cfg(target_os = "linux")]
 impl LiveTwoClusterFixture {
     async fn start() -> Result<Self, String> {
+        const START_ATTEMPTS: usize = 3;
+
+        let mut failures = Vec::new();
+        for attempt in 1..=START_ATTEMPTS {
+            match Self::start_once().await {
+                Ok(fixture) => return Ok(fixture),
+                Err(error) => {
+                    failures.push(format!("attempt {attempt}: {error}"));
+                }
+            }
+        }
+        Err(format!(
+            "live two-cluster fixture exhausted {START_ATTEMPTS} fresh setup attempts:\n{}",
+            failures.join("\n")
+        ))
+    }
+
+    async fn start_once() -> Result<Self, String> {
         let source = LiveVethPod::spawn_indexed(20)?;
         let east_west = LiveVethPod::spawn_indexed(21)?;
         let destination = LiveVethPod::spawn_indexed(22)?;
@@ -10465,11 +10561,11 @@ impl LiveTwoClusterFixture {
         let temp_ambient_destination =
             TempDir::new().map_err(|e| format!("ambient dest tempdir: {e}"))?;
 
-        let ports_sidecar_destination = reserve_mesh_ports().await;
+        let ports_sidecar_destination = reserve_mesh_ports_in_netns(destination.pod.pid())?;
         let sidecar_destination_inbound = ports_sidecar_destination.inbound;
-        let ports_ambient_destination = reserve_mesh_ports().await;
+        let ports_ambient_destination = reserve_mesh_ports_in_netns(destination.pod.pid())?;
         let ambient_destination_hbone = ports_ambient_destination.hbone;
-        let ports_east_west = reserve_mesh_ports().await;
+        let ports_east_west = reserve_mesh_ports_in_netns(east_west.pod.pid())?;
         let east_west_port = ports_east_west.east_west;
 
         let cp_sidecar_destination = start_static_mesh_cp_on(
@@ -10635,7 +10731,7 @@ impl LiveTwoClusterFixture {
         )
         .await;
 
-        let ports_sidecar_source = reserve_mesh_ports().await;
+        let ports_sidecar_source = reserve_mesh_ports_in_netns(source.pod.pid())?;
         let sidecar_inbound = ports_sidecar_source.inbound;
         let sidecar_outbound = ports_sidecar_source.outbound;
         let mut sidecar_env =
@@ -10689,7 +10785,7 @@ impl LiveTwoClusterFixture {
             },
         );
 
-        let ports_unfederated = reserve_mesh_ports().await;
+        let ports_unfederated = reserve_mesh_ports_in_netns(source.pod.pid())?;
         let unfederated_outbound = ports_unfederated.outbound;
         let unfederated_source = live_xc_spawn_gateway(
             &temp_unfederated_source,
@@ -10708,7 +10804,7 @@ impl LiveTwoClusterFixture {
             },
         );
 
-        let ports_wrong_td = reserve_mesh_ports().await;
+        let ports_wrong_td = reserve_mesh_ports_in_netns(source.pod.pid())?;
         let wrong_td_outbound = ports_wrong_td.outbound;
         let wrong_td_source = live_xc_spawn_gateway(
             &temp_wrong_td_source,
@@ -10723,7 +10819,7 @@ impl LiveTwoClusterFixture {
             },
         );
 
-        let ports_missing_sni = reserve_mesh_ports().await;
+        let ports_missing_sni = reserve_mesh_ports_in_netns(source.pod.pid())?;
         let missing_sni_outbound = ports_missing_sni.outbound;
         let missing_sni_source = live_xc_spawn_gateway(
             &temp_missing_sni_source,

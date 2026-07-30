@@ -40,6 +40,12 @@ fn token_for_issuer(issuer: &str, subject: &str) -> String {
     )
 }
 
+#[test]
+fn custom_header_locations_are_registered_as_credentials() {
+    let plugin = plugin_with_custom_locations();
+    assert_eq!(plugin.request_headers_to_redact(), &["x-token"]);
+}
+
 #[tokio::test]
 async fn custom_header_empty_prefix_accepts_raw_header_value() {
     let jwks = build_rsa_jwks_from_pem(include_bytes!(

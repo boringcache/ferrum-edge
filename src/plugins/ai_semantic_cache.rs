@@ -34,6 +34,20 @@
 //! params, tools, response format, stream flag, system prompt, and
 //! system/developer message instructions).
 //!
+//! # Lifecycle
+//!
+//! Lookup runs at priority **4057**, in `on_final_request_body_with_context` —
+//! not in `before_proxy`. That is the first point at which the request the
+//! provider would actually receive exists: `request_transformer` (3000) has
+//! rewritten headers and the query, every `transform_request_body` hook has run
+//! (`compression` request decode at 4050, `ai_prompt_compressor` at 4055), and
+//! `ai_prompt_compressor`'s staged marker-sanitization rejection has already
+//! been enforced by its own final hook at 4055. Lookup still precedes
+//! `ai_federation` (4060), which performs provider I/O from the same stage, and
+//! every `before_proxy` admission guardrail (rate limiting, WAF, prompt shield,
+//! body/OpenAPI validation, semantic firewall, request guard, tool governor)
+//! still runs ahead of any hit. Store remains in `on_final_response_body`.
+//!
 //! # Storage
 //!
 //! - **local** (default): In-memory `DashMap` with TTL-based eviction
@@ -69,6 +83,7 @@ use super::utils::cache_headers::sanitize_cached_headers;
 use super::utils::redis_rate_limiter::{
     BoundedRedisValue, REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient,
 };
+use super::utils::replay_partition::{self, AnonymousCallerScope, PartitionHasher};
 use super::utils::response_body::read_response_body_bounded;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -104,6 +119,25 @@ fn staging_metadata_key(instance_id: u64, suffix: &str) -> String {
     key
 }
 
+/// Domain-separation tags for the canonical, length-framed cache-key digests.
+///
+/// Distinct tags keep the exact key, the semantic scope key, and the caller
+/// partition in disjoint digest spaces, so no preimage of one can ever be a
+/// preimage of another. The `v2` suffixes mark the move from raw `:`/`|`/`\n`
+/// delimiter concatenation to canonical length framing: keys minted under the
+/// old encoding are unreachable, which is the intended fail-closed outcome.
+const AI_SEMANTIC_CACHE_EXACT_KEY_DOMAIN: &str = "ferrum-ai-semantic-cache-exact-v2";
+const AI_SEMANTIC_CACHE_SCOPE_KEY_DOMAIN: &str = "ferrum-ai-semantic-cache-scope-v2";
+const AI_SEMANTIC_CACHE_CALLER_DOMAIN: &str = "ferrum-ai-semantic-cache-caller-v1";
+/// Effective destination under the shared canonical contract
+/// (`replay_partition::append_destination_partition`), which binds the proxy
+/// *namespace* the plugin's former hand-rolled encoding omitted.
+const AI_SEMANTIC_CACHE_DESTINATION_DOMAIN: &str = "ferrum-ai-semantic-cache-destination-v1";
+/// Backend-visible request context: original authority, method, path, the
+/// effective outbound query, and the finalized non-credential header view
+/// (credential values digested).
+const AI_SEMANTIC_CACHE_REQUEST_DOMAIN: &str = "ferrum-ai-semantic-cache-request-v1";
+
 /// Fixed-shape retention, isolation, size, and keying fields at the plugin root.
 pub const AI_SEMANTIC_CACHE_ROOT_POLICY_KEYS: &[&str] = &[
     "ttl_seconds",
@@ -113,6 +147,7 @@ pub const AI_SEMANTIC_CACHE_ROOT_POLICY_KEYS: &[&str] = &[
     "include_model_in_key",
     "include_params_in_key",
     "scope_by_consumer",
+    "anonymous_caller_scope",
     "cache_multimodal",
 ];
 
@@ -151,6 +186,7 @@ pub const AI_SEMANTIC_CACHE_CONFIG_KEYS: &[&str] = &[
     "include_model_in_key",
     "include_params_in_key",
     "scope_by_consumer",
+    "anonymous_caller_scope",
     "cache_multimodal",
     // Semantic policy
     "semantic_similarity_enabled",
@@ -940,8 +976,16 @@ pub struct AiSemanticCache {
     include_model_in_key: bool,
     /// Whether to include sampling parameters (temperature, top_p) in the cache key.
     include_params_in_key: bool,
-    /// Whether to scope cache entries by authenticated consumer.
+    /// Whether to additionally scope cache entries by the authenticated
+    /// consumer's display identity.
+    ///
+    /// Independent of the mandatory caller-authorization partition, which is
+    /// bound unconditionally in [`append_identity_key_parts`], so disabling
+    /// this can no longer let two distinct callers share one retained
+    /// completion.
     scope_by_consumer: bool,
+    /// How anonymous callers are partitioned (see [`AnonymousCallerScope`]).
+    anonymous_caller_scope: AnonymousCallerScope,
     /// Multimodal cache behavior for requests with non-text content parts.
     cache_multimodal: MultimodalCacheMode,
     /// Optional semantic-similarity configuration.
@@ -1118,6 +1162,10 @@ impl AiSemanticCache {
         // shared cache (e.g., a public LLM proxy with no per-tenant data)
         // must set this to `false`.
         let scope_by_consumer = optional_bool(config, "scope_by_consumer")?.unwrap_or(true);
+        let anonymous_caller_scope = match optional_string(config, "anonymous_caller_scope")? {
+            None => AnonymousCallerScope::default(),
+            Some(value) => AnonymousCallerScope::parse("ai_semantic_cache", &value)?,
+        };
         let cache_multimodal = parse_multimodal_cache_mode(config)?;
         let semantic = parse_semantic_config(config, http_client.backend_allow_ips())?;
 
@@ -1175,6 +1223,7 @@ impl AiSemanticCache {
             include_params_in_key,
             scope_by_consumer,
             cache_multimodal = cache_multimodal.as_str(),
+            anonymous_caller_scope = anonymous_caller_scope.as_str(),
             semantic_similarity_enabled,
             sync_mode,
             "ai_semantic_cache: admitted with effective retention and storage posture"
@@ -1198,6 +1247,7 @@ impl AiSemanticCache {
             include_model_in_key,
             include_params_in_key,
             scope_by_consumer,
+            anonymous_caller_scope,
             cache_multimodal,
             semantic,
             embedding_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EMBEDDINGS)),
@@ -1301,55 +1351,71 @@ impl AiSemanticCache {
     fn build_cache_key(
         &self,
         ctx: &RequestContext,
+        request_headers: &HashMap<String, String>,
         body: &Value,
         multimodal_fingerprint: Option<&str>,
     ) -> Option<String> {
         let family = classify_cache_request_family(body)?;
         let mut key_input = String::with_capacity(512);
-        let mut has_part = false;
+        let mut has_part = KeyParts::new();
 
-        append_identity_key_parts(self, ctx, body, family, &mut key_input, &mut has_part);
+        append_identity_key_parts(
+            self,
+            ctx,
+            request_headers,
+            body,
+            family,
+            &mut key_input,
+            &mut has_part,
+        )?;
         append_family_prompt_exact_key(family, body, &mut key_input, &mut has_part)?;
         append_family_conversation_state(family, body, &mut key_input, &mut has_part)?;
         append_family_instruction_exact_key(family, body, &mut key_input, &mut has_part);
 
         if let Some(fingerprint) = multimodal_fingerprint {
-            start_key_part(&mut key_input, &mut has_part);
+            start_key_part(&key_input, &mut has_part);
             key_input.push_str("mm:");
             key_input.push_str(fingerprint);
         }
 
         append_family_shape_fields(family, body, &mut key_input, &mut has_part);
 
-        let hash = Sha256::digest(key_input.as_bytes());
-        Some(hex::encode(hash))
+        Some(has_part.finish(AI_SEMANTIC_CACHE_EXACT_KEY_DOMAIN, &key_input))
     }
 
     fn build_semantic_scope_key(
         &self,
         ctx: &RequestContext,
+        request_headers: &HashMap<String, String>,
         body: &Value,
         multimodal_fingerprint: Option<&str>,
     ) -> Option<String> {
         let family = classify_cache_request_family(body)?;
         let mut key_input = String::with_capacity(512);
-        let mut has_part = false;
+        let mut has_part = KeyParts::new();
 
-        append_identity_key_parts(self, ctx, body, family, &mut key_input, &mut has_part);
+        append_identity_key_parts(
+            self,
+            ctx,
+            request_headers,
+            body,
+            family,
+            &mut key_input,
+            &mut has_part,
+        )?;
         append_family_semantic_role_scope(family, body, &mut key_input, &mut has_part)?;
         append_family_conversation_state(family, body, &mut key_input, &mut has_part)?;
         append_family_instruction_scope(family, body, &mut key_input, &mut has_part);
 
         if let Some(fingerprint) = multimodal_fingerprint {
-            start_key_part(&mut key_input, &mut has_part);
+            start_key_part(&key_input, &mut has_part);
             key_input.push_str("mm:");
             key_input.push_str(fingerprint);
         }
 
         append_family_shape_fields(family, body, &mut key_input, &mut has_part);
 
-        let hash = Sha256::digest(key_input.as_bytes());
-        Some(hex::encode(hash))
+        Some(has_part.finish(AI_SEMANTIC_CACHE_SCOPE_KEY_DOMAIN, &key_input))
     }
 
     /// Build the embedding input from family-correct user/prompt text only.
@@ -1587,7 +1653,7 @@ impl AiSemanticCache {
         &self,
         scope_key: &str,
         embedding: &EmbeddingPoint,
-    ) -> Option<(CachedResponse, f32, String)> {
+    ) -> Option<(CachedResponse, f32)> {
         let semantic = self.semantic.as_ref()?;
         let snapshot = self.vector_index.load_full()?;
         let mut search = HnswSearch::default();
@@ -1618,7 +1684,6 @@ impl AiSemanticCache {
                     body: entry.body.clone(),
                 },
                 similarity,
-                item.value.cache_key.clone(),
             ));
         }
 
@@ -2365,7 +2430,7 @@ impl AiSemanticCache {
     }
 
     /// Hot-path suppressor probe that increments the suppression counter when
-    /// active (mirrors production `before_proxy` behavior).
+    /// active (mirrors production lookup behavior).
     #[allow(dead_code)]
     pub(crate) fn redis_quarantine_is_suppressed_for_tests(&self, cache_key: &str) -> bool {
         self.redis_quarantine
@@ -2437,12 +2502,59 @@ impl Drop for CleanupRunningGuard {
     }
 }
 
-fn start_key_part(buffer: &mut String, has_part: &mut bool) {
-    if *has_part {
-        buffer.push('\n');
-    } else {
-        *has_part = true;
+/// Part boundaries recorded while a cache-key preimage is assembled.
+///
+/// Key material is attacker-controlled (prompt text, model names, tool
+/// arguments, role labels), so no byte can serve as a structural separator: a
+/// literal `\n`, `:`, or `|` inside one field can otherwise reproduce the exact
+/// preimage of a differently-shaped request. Instead of separating parts with a
+/// byte, this records where each part starts and the digest is taken over a
+/// canonical, length-framed encoding of the part sequence
+/// ([`KeyParts::finish`]). Two different structures can then never share a
+/// preimage without breaking SHA-256.
+#[derive(Debug, Default)]
+struct KeyParts {
+    offsets: Vec<usize>,
+}
+
+impl KeyParts {
+    fn new() -> Self {
+        Self {
+            offsets: Vec::with_capacity(8),
+        }
     }
+
+    fn is_empty(&self) -> bool {
+        self.offsets.is_empty()
+    }
+
+    /// Digest the assembled buffer as a canonical, length-framed part sequence
+    /// under an explicit domain-separation tag.
+    fn finish(&self, domain: &str, buffer: &str) -> String {
+        let bytes = buffer.as_bytes();
+        let mut hasher = PartitionHasher::new(domain);
+        // Any bytes written before the first `start_key_part` belong to no
+        // part; frame them explicitly rather than dropping or merging them.
+        let prefix_end = self.offsets.first().copied().unwrap_or(bytes.len());
+        hasher.field("prefix", &bytes[..prefix_end]);
+        hasher.count("parts", self.offsets.len());
+        for (index, start) in self.offsets.iter().enumerate() {
+            let end = self
+                .offsets
+                .get(index + 1)
+                .copied()
+                .unwrap_or(bytes.len())
+                .max(*start);
+            hasher.field("part", &bytes[*start..end]);
+        }
+        hasher.hex()
+    }
+}
+
+/// Open a new key part. Boundaries are recorded as offsets, never written into
+/// the buffer, so no attacker-controlled byte can forge one.
+fn start_key_part(buffer: &str, has_part: &mut KeyParts) {
+    has_part.offsets.push(buffer.len());
 }
 
 /// Classify a request body into exactly one supported cache family.
@@ -2516,53 +2628,72 @@ fn classify_cache_request_family(body: &Value) -> Option<CacheRequestFamily> {
 fn append_identity_key_parts(
     plugin: &AiSemanticCache,
     ctx: &RequestContext,
+    request_headers: &HashMap<String, String>,
     body: &Value,
     family: CacheRequestFamily,
     key_input: &mut String,
-    has_part: &mut bool,
-) {
+    has_part: &mut KeyParts,
+) -> Option<()> {
     start_key_part(key_input, has_part);
     key_input.push_str("fam:");
     key_input.push_str(family.as_str());
 
-    if let Some(ref proxy) = ctx.matched_proxy {
-        start_key_part(key_input, has_part);
-        key_input.push_str("proxy:");
-        append_len_prefixed(key_input, &proxy.id);
+    // Mandatory caller-authorization partition. A retained AI completion is
+    // returned before the provider ever sees the request, so it may only be
+    // reused by a caller whose *authorization context* matches — the mechanism
+    // that authenticated it, the resolved identity/consumer, the peer SPIFFE
+    // identity, and a digest of every credential header actually presented.
+    // Two tokens sharing a `sub` but carrying different scopes, audiences, or
+    // tenancy claims therefore land in different partitions even though
+    // `effective_identity()` renders them identically. Credential digests cover
+    // both the pristine inbound wire view and the live backend-visible one, so
+    // the `ai_stream_router` rewrite that runs before this plugin cannot erase
+    // the original caller distinction. Every caller also binds its canonical
+    // peer address; only an anonymous caller's binding is relaxable by operator
+    // attestation. The partition is an opaque digest; no credential, claim, or
+    // address byte reaches the key.
+    let mut caller = PartitionHasher::new(AI_SEMANTIC_CACHE_CALLER_DOMAIN);
+    replay_partition::append_caller_partition(
+        &mut caller,
+        ctx,
+        request_headers,
+        plugin.anonymous_caller_scope,
+    )
+    .ok()?;
+    start_key_part(key_input, has_part);
+    key_input.push_str("caller:");
+    key_input.push_str(&caller.hex());
 
-        // Canonical route/operation identity within the same proxy. This plugin
-        // runs after route-dispatch plugins (`ai_stream_router`, `mcp_gateway`,
-        // `a2a_gateway`, `mesh_route_dispatch`) so `route_override_*` already
-        // reflects the effective destination that will serve a miss. Exact and
-        // semantic scope keys share these dimensions:
-        // - `listen_path` (route template / matched proxy route identity; binds
-        //   dynamic path segments to the configured route rather than only the
-        //   raw request path)
-        // - request path (distinguishes sibling operations under one template
-        //   and rewritten public paths)
-        // - post-routing rewrite path when present
-        // - effective destination/provider (upstream id, or direct host/port/
-        //   scheme override, else the proxy's configured backend identity)
-        start_key_part(key_input, has_part);
-        key_input.push_str("route:");
-        if let Some(listen_path) = proxy.listen_path.as_deref() {
-            key_input.push_str("lp:");
-            append_len_prefixed(key_input, listen_path);
-            key_input.push('|');
-        }
-        key_input.push_str("path:");
-        append_len_prefixed(key_input, &ctx.path);
-        if let Some(rewrite) = ctx.route_override_path.as_deref() {
-            key_input.push_str("|rw:");
-            append_len_prefixed(key_input, rewrite);
-            if ctx.route_override_path_is_absolute {
-                key_input.push_str("|rwa:1");
-            }
-        }
-        start_key_part(key_input, has_part);
-        key_input.push_str("dst:");
-        append_effective_destination_identity(ctx, proxy.as_ref(), key_input);
-    }
+    // Effective destination under the *shared* canonical contract rather than a
+    // plugin-local encoding. This plugin runs after the route-dispatch plugins
+    // (`ai_stream_router`, `mcp_gateway`, `a2a_gateway`, `mesh_route_dispatch`),
+    // so `route_override_*` already reflects the destination that will serve a
+    // miss. The shared contract binds the proxy *namespace*, listen path,
+    // upstream/host/port/scheme, rewritten path, and authority, and frames the
+    // unmatched-proxy case explicitly — the previous hand-rolled encoding
+    // omitted the namespace entirely, so one proxy ID in two namespaces shared a
+    // partition.
+    let mut destination = PartitionHasher::new(AI_SEMANTIC_CACHE_DESTINATION_DOMAIN);
+    replay_partition::append_destination_partition(&mut destination, ctx);
+    start_key_part(key_input, has_part);
+    key_input.push_str("dst:");
+    key_input.push_str(&destination.hex());
+
+    // Backend-visible request context. The rest of this key is derived from the
+    // request *body*, so without this the origin's other inputs — the original
+    // client authority, the effective outbound query, and every non-credential
+    // request header — are unbound and two tenants separated only by a header or
+    // a query parameter share one retained completion. Because lookup runs in
+    // the final-request-body hook, `request_headers` is the post-transform
+    // outbound map and the query is `request_transformer`'s published outbound
+    // query, so this is genuinely what the provider will see rather than the
+    // pre-transform request. Credential values are digested inside the
+    // partition; no secret enters the assembled `String`.
+    let mut request = PartitionHasher::new(AI_SEMANTIC_CACHE_REQUEST_DOMAIN);
+    replay_partition::append_request_context_partition(&mut request, ctx, request_headers);
+    start_key_part(key_input, has_part);
+    key_input.push_str("req:");
+    key_input.push_str(&request.hex());
 
     if plugin.scope_by_consumer
         && let Some(identity) = ctx.effective_identity()
@@ -2583,9 +2714,10 @@ fn append_identity_key_parts(
     if plugin.include_params_in_key {
         append_family_generation_controls(family, body, key_input, has_part);
     }
+    Some(())
 }
 
-fn append_json_field(body: &Value, field: &str, key_input: &mut String, has_part: &mut bool) {
+fn append_json_field(body: &Value, field: &str, key_input: &mut String, has_part: &mut KeyParts) {
     if let Some(value) = body.get(field) {
         start_key_part(key_input, has_part);
         key_input.push_str(field);
@@ -2598,7 +2730,7 @@ fn append_family_generation_controls(
     family: CacheRequestFamily,
     body: &Value,
     key_input: &mut String,
-    has_part: &mut bool,
+    has_part: &mut KeyParts,
 ) {
     match family {
         CacheRequestFamily::Messages
@@ -2667,7 +2799,7 @@ fn append_family_shape_fields(
     family: CacheRequestFamily,
     body: &Value,
     key_input: &mut String,
-    has_part: &mut bool,
+    has_part: &mut KeyParts,
 ) {
     match family {
         CacheRequestFamily::Messages
@@ -2710,7 +2842,7 @@ fn append_family_conversation_state(
     family: CacheRequestFamily,
     body: &Value,
     key_input: &mut String,
-    has_part: &mut bool,
+    has_part: &mut KeyParts,
 ) -> Option<()> {
     start_key_part(key_input, has_part);
     key_input.push_str("state:");
@@ -2914,7 +3046,7 @@ fn append_family_prompt_exact_key(
     family: CacheRequestFamily,
     body: &Value,
     key_input: &mut String,
-    has_part: &mut bool,
+    has_part: &mut KeyParts,
 ) -> Option<()> {
     match family {
         CacheRequestFamily::Messages => {
@@ -3021,7 +3153,7 @@ fn append_family_instruction_exact_key(
     family: CacheRequestFamily,
     body: &Value,
     key_input: &mut String,
-    has_part: &mut bool,
+    has_part: &mut KeyParts,
 ) {
     match family {
         CacheRequestFamily::Messages => {
@@ -3076,7 +3208,7 @@ fn append_family_semantic_role_scope(
     family: CacheRequestFamily,
     body: &Value,
     key_input: &mut String,
-    has_part: &mut bool,
+    has_part: &mut KeyParts,
 ) -> Option<()> {
     match family {
         CacheRequestFamily::Messages => {
@@ -3163,7 +3295,7 @@ fn append_family_instruction_scope(
     family: CacheRequestFamily,
     body: &Value,
     key_input: &mut String,
-    has_part: &mut bool,
+    has_part: &mut KeyParts,
 ) {
     match family {
         CacheRequestFamily::Messages => {
@@ -3644,7 +3776,7 @@ fn responses_item_has_multimodal_parts(item: &Value) -> bool {
 
 fn build_multimodal_fingerprint(body: &Value) -> Option<String> {
     let mut descriptor = String::new();
-    let mut has_part = false;
+    let mut has_part = KeyParts::new();
 
     match classify_cache_request_family(body) {
         Some(CacheRequestFamily::Messages) => {
@@ -3740,17 +3872,16 @@ fn build_multimodal_fingerprint(body: &Value) -> Option<String> {
         | None => {}
     }
 
-    if has_part {
-        let hash = Sha256::digest(descriptor.as_bytes());
-        Some(hex::encode(hash))
-    } else {
+    if has_part.is_empty() {
         None
+    } else {
+        Some(has_part.finish("ferrum-ai-semantic-cache-multimodal-v2", &descriptor))
     }
 }
 
 fn append_responses_multimodal_fingerprint(
     buffer: &mut String,
-    has_part: &mut bool,
+    has_part: &mut KeyParts,
     input: &Value,
 ) {
     match input {
@@ -3768,7 +3899,7 @@ fn append_responses_multimodal_fingerprint(
 
 fn append_responses_item_multimodal_fingerprint(
     buffer: &mut String,
-    has_part: &mut bool,
+    has_part: &mut KeyParts,
     index: Option<usize>,
     item: &Value,
 ) {
@@ -3802,7 +3933,7 @@ fn append_responses_item_multimodal_fingerprint(
 
 fn append_multimodal_content_fingerprint(
     buffer: &mut String,
-    has_part: &mut bool,
+    has_part: &mut KeyParts,
     owner: &str,
     owner_index: Option<usize>,
     role: Option<&str>,
@@ -3846,7 +3977,7 @@ fn append_multimodal_content_fingerprint(
 
 fn append_multimodal_part_descriptor(
     buffer: &mut String,
-    has_part: &mut bool,
+    has_part: &mut KeyParts,
     owner: &str,
     owner_index: Option<usize>,
     role: Option<&str>,
@@ -4473,7 +4604,23 @@ impl Plugin for AiSemanticCache {
         self.rebuild_signal.notify_waiters();
     }
 
-    fn requires_request_body_before_before_proxy(&self) -> bool {
+    /// The request body must be buffered, but this plugin no longer needs it
+    /// *before* `before_proxy`: lookup runs in the final-request-body hook over
+    /// the fully transformed backend-visible bytes.
+    fn requires_request_body_buffering(&self) -> bool {
+        true
+    }
+
+    fn needs_final_request_body_context(&self) -> bool {
+        true
+    }
+
+    /// Lookup is a terminal request-phase boundary: a hit returns the retained
+    /// provider response instead of dispatching. Declaring it here keeps it
+    /// ahead of backend-only circuit-breaker / pool / TLS preflight, in the same
+    /// stage as `ai_federation` (4060) — and, because this plugin's priority is
+    /// 4057, ordered before it.
+    fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
         true
     }
 
@@ -4504,10 +4651,40 @@ impl Plugin for AiSemanticCache {
             && !content_type.is_some_and(is_event_stream_content_type)
     }
 
-    async fn before_proxy(
+    /// Exact + semantic cache lookup over the **finalized backend-visible
+    /// request**.
+    ///
+    /// This deliberately runs in `on_final_request_body_with_context` rather
+    /// than `before_proxy`. A retained completion may only be replayed to a
+    /// request that provably shares every dimension the provider could decide
+    /// on, and in `before_proxy` none of those dimensions are final yet:
+    ///
+    /// * `request_transformer` (3000) has not rewritten headers or the query,
+    ///   so a "backend-visible" header/query partition taken there describes a
+    ///   request that will never be sent;
+    /// * no `transform_request_body` hook has run, so the prompt bytes keyed
+    ///   there are not the prompt bytes the provider would receive
+    ///   (`compression` request decode at 4050, `ai_prompt_compressor` at
+    ///   4055, `mcp_gateway`/`ai_stream_router` body rewrites);
+    /// * fail-closed final-request-body validators have not run, so a hit could
+    ///   answer a request the gateway had already decided to refuse — in
+    ///   particular `ai_prompt_compressor` stages a marker-sanitization
+    ///   rejection in its transform and enforces it in its final hook at 4055.
+    ///
+    /// Running here — after every request-body transform, after 4055, and
+    /// before `ai_federation`'s provider I/O at 4060 — makes the partition
+    /// describe the request that would actually be dispatched. Every admission
+    /// guardrail that must precede a hit (rate limiting, WAF, prompt shield,
+    /// body/OpenAPI validation, semantic firewall, request guard, tool
+    /// governor) still runs earlier, in `before_proxy`.
+    ///
+    /// Only `ctx.metadata` and the semantic staging maps survive this hook on
+    /// H1/H2, which is all this plugin writes.
+    async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
-        headers: &mut HashMap<String, String>,
+        headers: &HashMap<String, String>,
+        body: &[u8],
     ) -> PluginResult {
         // Only cache POST requests with JSON body
         if ctx.method != "POST" {
@@ -4522,13 +4699,11 @@ impl Plugin for AiSemanticCache {
             return PluginResult::Continue;
         }
 
-        // Get request body
-        let body_str = match ctx.metadata.get("request_body") {
-            Some(b) if !b.is_empty() => b.as_str(),
-            _ => return PluginResult::Continue,
-        };
+        if body.is_empty() {
+            return PluginResult::Continue;
+        }
 
-        let json: Value = match serde_json::from_str(body_str) {
+        let json: Value = match serde_json::from_slice(body) {
             Ok(v) => v,
             Err(_) => return PluginResult::Continue,
         };
@@ -4567,14 +4742,15 @@ impl Plugin for AiSemanticCache {
         let multimodal_fingerprint = build_multimodal_fingerprint(&json);
 
         // Build cache key
-        let cache_key = match self.build_cache_key(ctx, &json, multimodal_fingerprint.as_deref()) {
-            Some(k) => k,
-            None => {
-                self.clear_instance_staging(ctx);
-                self.set_cache_status(ctx, "BYPASS");
-                return PluginResult::Continue;
-            }
-        };
+        let cache_key =
+            match self.build_cache_key(ctx, headers, &json, multimodal_fingerprint.as_deref()) {
+                Some(k) => k,
+                None => {
+                    self.clear_instance_staging(ctx);
+                    self.set_cache_status(ctx, "BYPASS");
+                    return PluginResult::Continue;
+                }
+            };
 
         // Periodic cleanup — scheduled off the request hot path so no single
         // request pays the full-map scan / oldest-entry eviction.
@@ -4614,7 +4790,6 @@ impl Plugin for AiSemanticCache {
                         {
                             Some(cached) => {
                                 debug!(
-                                    cache_key = %cache_key,
                                     "ai_semantic_cache: Redis cache HIT, returning cached response"
                                 );
                                 self.redis_quarantine.clear(&cache_key);
@@ -4641,7 +4816,6 @@ impl Plugin for AiSemanticCache {
                                     self.redis_quarantine.note_suppression();
                                 } else {
                                     debug!(
-                                        cache_key = %cache_key,
                                         "ai_semantic_cache: quarantining Redis entry that failed hit-side admission"
                                     );
                                     self.quarantine_invalid_redis_entry(
@@ -4665,7 +4839,6 @@ impl Plugin for AiSemanticCache {
                             self.redis_quarantine.note_suppression();
                         } else {
                             debug!(
-                                cache_key = %cache_key,
                                 length,
                                 cap = self.redis_value_byte_cap(),
                                 "ai_semantic_cache: quarantining oversized Redis entry"
@@ -4688,10 +4861,7 @@ impl Plugin for AiSemanticCache {
                         ) {
                             self.redis_quarantine.note_suppression();
                         } else {
-                            debug!(
-                                cache_key = %cache_key,
-                                "ai_semantic_cache: quarantining empty Redis entry"
-                            );
+                            debug!("ai_semantic_cache: quarantining empty Redis entry");
                             self.quarantine_invalid_redis_entry(
                                 redis,
                                 &redis_key,
@@ -4714,10 +4884,7 @@ impl Plugin for AiSemanticCache {
         // Check local cache
         if let Some(entry) = self.cache.get(&cache_key) {
             if Instant::now().duration_since(entry.inserted_at) < self.ttl {
-                debug!(
-                    cache_key = %cache_key,
-                    "ai_semantic_cache: cache HIT, returning cached response"
-                );
+                debug!("ai_semantic_cache: cache HIT, returning cached response");
                 let mut response_headers = entry.headers.clone();
                 response_headers.insert("x-ai-cache-status".to_string(), "HIT".to_string());
                 self.clear_instance_staging(ctx);
@@ -4747,17 +4914,20 @@ impl Plugin for AiSemanticCache {
         if self.semantic.is_some()
             && semantic_allowed
             && let (Some(scope_key), Some(input)) = (
-                self.build_semantic_scope_key(ctx, &json, multimodal_fingerprint.as_deref()),
+                self.build_semantic_scope_key(
+                    ctx,
+                    headers,
+                    &json,
+                    multimodal_fingerprint.as_deref(),
+                ),
                 self.build_semantic_input(&json),
             )
         {
             match self.compute_embedding(&input).await {
                 Ok(embedding) => {
-                    if let Some((entry, similarity, matched_key)) =
-                        self.lookup_semantic(&scope_key, &embedding)
+                    if let Some((entry, similarity)) = self.lookup_semantic(&scope_key, &embedding)
                     {
                         debug!(
-                            cache_key = %matched_key,
                             similarity = similarity,
                             "ai_semantic_cache: semantic cache HIT, returning cached response"
                         );
@@ -4790,10 +4960,7 @@ impl Plugin for AiSemanticCache {
         }
 
         // Cache miss — store the key for on_final_response_body
-        debug!(
-            cache_key = %cache_key,
-            "ai_semantic_cache: cache MISS"
-        );
+        debug!("ai_semantic_cache: cache MISS");
         ctx.metadata.insert(self.meta_cache_key.clone(), cache_key);
         self.set_cache_status(ctx, "MISS");
 
@@ -4844,11 +5011,11 @@ impl Plugin for AiSemanticCache {
         }
 
         // Synthetic short-circuit guard. On a semantic-cache MISS this plugin's
-        // `before_proxy` sets `meta_cache_key` so this hook stores the
-        // (real) backend response. But this plugin (priority 2996) runs before
-        // later synthetic-2xx producers such as `serverless_function` (3025),
-        // `response_mock` (3030), and `ai_federation` (4060), so when one of
-        // those short-circuits
+        // final-request-body hook sets `meta_cache_key` so this hook stores the
+        // (real) backend response. But this plugin (priority 4057) runs before
+        // later synthetic-2xx producers — most directly `ai_federation` (4060),
+        // whose provider dispatch answers from the same final-body stage — so
+        // when one of those short-circuits
         // with a 2xx body, the generic synthetic body-hook path
         // (`apply_synthetic_response_body_hooks`) re-runs this
         // `on_final_response_body` with `meta_cache_key` still set from
@@ -4901,7 +5068,6 @@ impl Plugin for AiSemanticCache {
         // Size checks
         if body.len() > self.max_entry_size_bytes {
             debug!(
-                cache_key = %cache_key,
                 body_size = body.len(),
                 max_size = self.max_entry_size_bytes,
                 "ai_semantic_cache: response exceeds max_entry_size_bytes, skipping"
@@ -4937,7 +5103,6 @@ impl Plugin for AiSemanticCache {
         // cannot permanently exceed `max_total_size_bytes`.
         let Some(budget_lease) = self.cache_budget.try_acquire(approx_size) else {
             debug!(
-                cache_key = %cache_key,
                 entry_size = approx_size,
                 max_total = self.max_total_size_bytes,
                 "ai_semantic_cache: total cache size would exceed limit, skipping"
@@ -5020,33 +5185,6 @@ impl Plugin for AiSemanticCache {
 
     fn tracked_keys_count(&self) -> Option<usize> {
         Some(self.cache.len())
-    }
-}
-
-fn append_effective_destination_identity(
-    ctx: &RequestContext,
-    proxy: &crate::config::types::Proxy,
-    key_input: &mut String,
-) {
-    if let Some(upstream) = ctx.effective_upstream_id(proxy) {
-        key_input.push_str("up:");
-        append_len_prefixed(key_input, upstream);
-    } else {
-        // Direct-backend override or the proxy's configured backend. Always bind
-        // host/port so a route rewrite to a different provider cannot share a
-        // cache entry with the proxy default destination.
-        key_input.push_str("host:");
-        append_len_prefixed(key_input, ctx.effective_backend_host(proxy));
-        let _ = write!(key_input, "|port:{}", ctx.effective_backend_port(proxy));
-        if let Some(scheme) = ctx.route_override_backend_scheme {
-            let _ = write!(key_input, "|scheme:{scheme}");
-        } else if let Some(scheme) = proxy.backend_scheme {
-            let _ = write!(key_input, "|pscheme:{scheme}");
-        }
-    }
-    if let Some(authority) = ctx.route_override_authority.as_deref() {
-        key_input.push_str("|auth:");
-        append_len_prefixed(key_input, authority);
     }
 }
 
@@ -5573,7 +5711,7 @@ mod tests {
 
     #[tokio::test]
     async fn reject_mode_bypass_clears_only_this_instance_staging() {
-        // A prior `ai_semantic_cache` instance in the same `before_proxy` chain
+        // A prior `ai_semantic_cache` instance in the same final-request-body chain
         // may have staged a cache key/embedding/scope under its own instance id.
         // When a later reject-mode instance bypasses a multimodal request, it
         // must clear only its own staging so its `on_final_response_body` does
@@ -5599,8 +5737,7 @@ mod tests {
                 ]
             }]
         });
-        ctx.metadata
-            .insert("request_body".to_string(), body.to_string());
+        let wire_body = body.to_string();
         // Simulate staging owned by a sibling instance (different id).
         let sibling_id = plugin.instance_id.wrapping_add(1);
         ctx.metadata.insert(
@@ -5622,7 +5759,9 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
 
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, wire_body.as_bytes())
+            .await;
         assert!(matches!(result, PluginResult::Continue));
 
         assert!(

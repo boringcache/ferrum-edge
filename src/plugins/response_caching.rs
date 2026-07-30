@@ -13,19 +13,38 @@
 //! `response_transformer` header/body `add` sequences cannot run a second time
 //! over an already-transformed entry.
 //!
-//! Static rules cannot change under a live instance — a config reload builds a
-//! new plugin instance with a new, empty cache — but RTDS runtime-overlay gates
-//! (`runtime_overlay_scope`) can flip at any moment without one. Without
-//! provenance, an entry stored while a redaction rule was disabled would keep
-//! being replayed unredacted after an operator enabled it.
+//! A `response_caching` instance can outlive the presentation policy that
+//! produced its entries. Its own config is untouched by a
+//! `response_transformer` edit, and a *global* instance is not even rebuilt when
+//! the proxy carrying that transformer is (`rebuild_globals` is only set by a
+//! global plugin change), so the same cache keeps serving across the change.
+//! Without provenance, an entry stored while a redaction rule was disabled would
+//! keep being replayed unredacted after an operator enabled it.
 //!
-//! Every entry therefore carries an opaque publication identity, pinned from
-//! the same atomically published state as the response-side gate map by
-//! `RequestContext::pin_response_policy_stamp`. Two rules keep it honest:
+//! Every entry therefore carries two independent provenance halves, and a
+//! difference in **either** retires it:
 //!
-//! - **Lookup**: an entry whose identity differs from the current request's
-//!   pinned identity is invalidated and refetched — checked before freshness,
-//!   for both HIT and REVALIDATED, so neither can serve a superseded policy.
+//! - The **published gate identity**, pinned by
+//!   `RequestContext::pin_response_policy_stamp` from the same atomically
+//!   published state as the response-side gate map.
+//! - The **generation's effective presentation policy digest**
+//!   (`RequestContext::response_presentation_policy_digest`), copied from this
+//!   request's own plugin-cache view before any plugin ran.
+//!
+//! Both are needed. The gate map is published *after*
+//! `ProxyState::update_config`, so the two are read from different generations
+//! whenever a mesh apply lands between a request pinning its plugin cache and
+//! that request reaching `before_proxy` (its authenticate/authorize phase can
+//! span a whole apply). Since GHSA-83rc-23c9-3g9x a transformer's effective gate
+//! is materialized into its configuration, so the digest — which covers the gate
+//! *and* the static rules, per instance — is the exact witness of the policy
+//! that shaped the stored bytes, while the gate identity remains the witness of
+//! what the rest of the process currently publishes. Two rules keep them honest:
+//!
+//! - **Lookup**: an entry whose gate identity or generation digest differs from
+//!   the current request's is invalidated and refetched — checked before
+//!   freshness, for both HIT and REVALIDATED, so neither can serve a superseded
+//!   policy.
 //! - **Store**: a response whose request straddled a gate publication is not
 //!   stored at all; its bytes belong to neither policy.
 //!
@@ -34,7 +53,10 @@
 //! product of the live policy, so transforms are neither skipped when policy
 //! tightened nor stacked when it did not change. Reapplying the identical live
 //! map is a no-op; every real policy transition receives a fresh, collision-free
-//! identity and retires entries from the preceding publication.
+//! identity and retires entries from the preceding publication. A proxy whose
+//! effective presentation policy is *unprovable* (an enrolled plugin rewrites
+//! from live runtime state) never stores or replays an entry. Unknown policy is
+//! not evidence that two requests shared one.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -45,7 +67,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -53,8 +75,40 @@ use tracing::debug;
 
 use crate::util::unknown_keys::reject_unknown_keys;
 
+use super::utils::replay_partition::{self, AnonymousCallerScope, PartitionHasher};
 use super::utils::runtime_bool_gate::GatePolicyStamp;
 use super::{Plugin, PluginResult, RequestContext};
+
+/// Domain-separation tags for the canonical, length-framed cache-key digests.
+///
+/// Cache keys used to be raw `proxy:host:method:path:query:consumer` strings
+/// with `name=value|name=value` Vary suffixes. Every one of those delimiters can
+/// appear inside an attacker-supplied Vary value, so two structurally different
+/// requests could serialize to one preimage (GHSA-v4g3-2r4f-f6pc). Keys are now
+/// digests over typed, length-framed fields under these tags; the `v1` suffixes
+/// make every pre-contract key unreachable, which is the intended fail-closed
+/// outcome for entries stored under a partition that omitted caller
+/// authorization, canonical caller context, or the effective destination
+/// (GHSA-w27g-65rf-h7xm).
+const RESPONSE_CACHING_BASE_KEY_DOMAIN: &str = "ferrum-response-caching-base-v1";
+const RESPONSE_CACHING_VARY_DOMAIN: &str = "ferrum-response-caching-vary-v1";
+const RESPONSE_CACHING_SCOPE_DOMAIN: &str = "ferrum-response-caching-scope-v1";
+
+/// Separator between the base-key digest and the Vary digest inside a full
+/// cache key. Both sides are fixed-length lowercase hex, so this byte can never
+/// occur inside either component and the split is unambiguous by construction.
+const CACHE_KEY_VARY_SEPARATOR: char = '.';
+
+/// Bodyless retrieval methods a shared cache can key completely.
+///
+/// A cached representation is selected by method + target + Vary. For a
+/// body-bearing method the *body* is part of what the origin answered, and this
+/// plugin performs its lookup in `before_proxy` — before
+/// `on_final_request_body`, and therefore before the exact backend-visible body
+/// exists. Rather than key a pre-transform body that is not the one sent
+/// upstream, body-bearing methods are refused outright at config admission and
+/// again at runtime (GHSA-w27g-65rf-h7xm).
+const BODYLESS_CACHEABLE_METHODS: [&str; 2] = ["GET", "HEAD"];
 
 /// Authoritative closed set of top-level `response_caching` configuration keys.
 ///
@@ -65,6 +119,7 @@ use super::{Plugin, PluginResult, RequestContext};
 /// or retention policy.
 pub const RESPONSE_CACHING_CONFIG_KEYS: &[&str] = &[
     "add_cache_status_header",
+    "anonymous_caller_scope",
     "cache_key_include_consumer",
     "cache_key_include_query",
     "cacheable_methods",
@@ -102,8 +157,8 @@ const DEFAULT_MAX_TOTAL_SIZE_BYTES: usize = 104_857_600;
 /// Request-metadata namespace prefix. Each plugin instance appends its
 /// process-unique [`ResponseCaching::instance_id`] so multiple
 /// `response_caching` configs on one proxy cannot overwrite one another's
-/// staged base key, status, predictor key, timing, header snapshot, or
-/// pending unsafe-method invalidation host partition.
+/// staged base key, status, predictor key, timing, header snapshot, lookup
+/// path, or pending unsafe-method invalidation host partition.
 const METADATA_NAMESPACE_PREFIX: &str = "response_caching.";
 const CACHE_BASE_KEY_SUFFIX: &str = "cache_base_key";
 const CACHE_STATUS_SUFFIX: &str = "cache_status";
@@ -119,12 +174,27 @@ const CACHE_REQUEST_STARTED_MONOTONIC_NANOS_SUFFIX: &str = "cache_request_starte
 const CACHE_REQUEST_HEADERS_SNAPSHOT_SUFFIX: &str = "cache_request_headers_snapshot";
 /// Normalized Host/authority partition (`h-<sha256>` or empty) stashed when an
 /// unsafe method may require RFC 9111 §4.4 invalidation after a non-error
-/// response. Must match [`cache_key_host_part`] used by lookup/storage.
+/// response. Must match [`ResponseCaching::invalidation_scope`] used by
+/// lookup/storage.
 const CACHE_PENDING_INVALIDATE_HOST_SUFFIX: &str = "cache_pending_invalidate_host";
 /// Client-facing path stashed alongside the authority partition above. The
 /// proxy may replace `RequestContext::path` with a backend route rewrite before
 /// `after_proxy`, so deferred invalidation must not read the then-current path.
 const CACHE_PENDING_INVALIDATE_PATH_SUFFIX: &str = "cache_pending_invalidate_path";
+/// Client-facing path observed at lookup, stashed for the storage side.
+///
+/// The base key binds `RequestContext::path` as it was during `before_proxy`,
+/// and [`Self::stage_pending_invalidation`] stages the same client-facing value
+/// for a later unsafe-method sweep. A route-dispatch rewrite
+/// (`route_override_path`, set by `mesh_route_dispatch` / `request_transformer`
+/// route overrides / `ai_stream_router`) is applied to `RequestContext::path`
+/// *after* `before_proxy` returns, so reading the then-current path in
+/// `on_final_response_body` would index the entry under the rewritten backend
+/// path while invalidation looks it up under the client-facing one — RFC 9111
+/// §4.4 invalidation would then silently match nothing.
+///
+/// [`Self::stage_pending_invalidation`]: ResponseCaching::stage_pending_invalidation
+const CACHE_LOOKUP_PATH_SUFFIX: &str = "cache_lookup_path";
 
 static CACHE_CLOCK_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 static NEXT_RESPONSE_CACHING_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -145,52 +215,12 @@ fn sha256_hex(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
 
-fn cache_key_host_part(host: &str) -> String {
-    let host = host.to_ascii_lowercase();
-    if host.is_empty() {
-        String::new()
-    } else {
-        let digest = sha256_hex(&host);
-        let mut part = String::with_capacity(2 + digest.len());
-        part.push_str("h-");
-        part.push_str(&digest);
-        part
-    }
-}
-
-/// Render an authenticated principal as the `sha256-<hex>` `consumer_part` of
-/// a cache key. SHA-256-hashing keeps a username or SPIFFE ID (which may carry
-/// the `:` / `|` key delimiters and can surface in debug logs) out of the key
-/// verbatim. Built with `String::with_capacity` + `push_str` rather than
-/// `format!` because `build_base_cache_key` runs on the `before_proxy` hot path
-/// for every authenticated request (mirrors [`cache_key_host_part`]).
-fn cache_key_identity_part(identity: &str) -> String {
-    let digest = sha256_hex(identity);
-    let mut part = String::with_capacity(7 + digest.len());
-    part.push_str("sha256-");
-    part.push_str(&digest);
-    part
-}
-
-/// Render the exact raw query string as a bounded cache-key part.
+/// Credential/session headers that every cacheable response varies by.
 ///
-/// The raw query is hashed as received, without parsing, sorting,
-/// percent-decoding, or normalizing, so duplicate keys, pair order,
-/// percent-encoding, and bare/empty values remain distinct.
-fn cache_key_query_part(raw_query: &str) -> String {
-    let digest = sha256_hex(raw_query);
-    let mut part = String::with_capacity(2 + digest.len());
-    part.push_str("q-");
-    part.push_str(&digest);
-    part
-}
-
-/// Request headers whose presence makes a cacheable response automatically vary
-/// by that header.
-///
-/// These are credentials or session identifiers, so they are auto-added to the
-/// keyed `Vary` set at storage time (see `on_final_response_body`) and
-/// SHA-256-hashed by [`cache_key_vary_value`] when they appear in a cache key.
+/// The name and presence bit are always keyed; present values are SHA-256-hashed
+/// by [`cache_key_vary_value`]. Keeping the names on anonymous retained
+/// responses also prevents a cache HIT from presenting an unvaried anonymous
+/// representation to a downstream shared cache.
 /// Additional operator-configured or backend-supplied Vary headers are also
 /// hashed when their header name matches the centralized log-redaction
 /// sensitivity rules.
@@ -275,6 +305,29 @@ fn sanitize_cached_response_headers(
     });
 }
 
+/// Whether the request declares a body on the wire.
+///
+/// A shared cache selects a stored representation by method + target + Vary;
+/// nothing in that selection witnesses a request body. This plugin looks up in
+/// `before_proxy`, before `on_final_request_body`, so the exact backend-visible
+/// bytes do not exist yet and a pre-transform digest would not describe what is
+/// actually sent. Any declared body therefore bypasses lookup and storage
+/// entirely (GHSA-w27g-65rf-h7xm).
+fn request_declares_body(headers: &HashMap<String, String>) -> bool {
+    if header_value(headers, "transfer-encoding").is_some() {
+        return true;
+    }
+    let Some(content_length) = header_value(headers, "content-length") else {
+        return false;
+    };
+    let trimmed = content_length.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // An unparsable Content-Length is not proof of an empty body.
+    trimmed.parse::<u64>().map_or(true, |length| length > 0)
+}
+
 fn is_auto_sensitive_vary_header(header: &str) -> bool {
     SENSITIVE_VARY_HEADERS
         .iter()
@@ -331,10 +384,6 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
     })
 }
 
-fn vary_index_prune_slack(cache_len: usize) -> usize {
-    if cache_len == 0 { 0 } else { cache_len / 4 + 1 }
-}
-
 /// Cache keys use `:` as a structural delimiter, but URL paths legitimately
 /// contain `:` (e.g. `/users:1/details`, matrix params, FHIR `$everything`).
 /// Encode path bytes into a cache-key-safe representation before joining so
@@ -380,6 +429,17 @@ struct CacheEntry {
     ///
     /// [`prune_vary_index_locked`]: ResponseCaching::prune_vary_index_locked
     base_key_len: usize,
+    /// Monotonic insertion sequence, paired with this entry's key in the FIFO
+    /// eviction queue. A queued `(key, seq)` pair only evicts the entry that is
+    /// still live under that exact sequence, so a replacement store can never
+    /// be evicted by its predecessor's stale queue slot.
+    insert_seq: u64,
+    /// Authority partition (`proxy_id` + normalized Host) this entry is indexed
+    /// under for RFC 9111 §4.4 invalidation.
+    invalidation_scope: Arc<str>,
+    /// Encoded client-facing path this entry is indexed under. Held so removal
+    /// is an O(log n) index operation instead of a full-cache scan.
+    invalidation_path: Arc<str>,
     /// Response-side runtime-overlay gate map this representation was produced
     /// under (`RequestContext::pin_response_policy_stamp`).
     ///
@@ -394,6 +454,21 @@ struct CacheEntry {
     /// instead of replaying a representation from a superseded policy. It is
     /// opaque and carries no rule, header, or body content.
     response_policy_stamp: GatePolicyStamp,
+    /// Effective static response-presentation policy digest of the plugin-cache
+    /// generation that shaped this representation
+    /// (`RequestContext::response_presentation_policy_digest`).
+    ///
+    /// The stamp above is published *after* `ProxyState::update_config`, so a
+    /// request that pinned the previous plugin generation can still pin the new
+    /// publication identity — its authenticate/authorize phase can span an
+    /// entire mesh apply — and would otherwise store bytes shaped by the old
+    /// policy under the new identity. Since GHSA-83rc-23c9-3g9x a transformer's
+    /// effective RTDS gate is materialized into its configuration, so this
+    /// generation-local digest covers the gate as well as the static rules and
+    /// is the exact witness of what produced these bytes. `None` means this
+    /// Unknown policy is never stored: every replay consumer must fail closed
+    /// when the effective presentation policy cannot be established.
+    response_presentation_digest: [u8; 32],
 }
 
 impl CacheEntry {
@@ -408,6 +483,14 @@ impl CacheEntry {
         self.current_age(now) < self.freshness_lifetime
     }
 
+    fn expires_at(&self) -> Duration {
+        duration_saturating_add(
+            self.stored_at,
+            self.freshness_lifetime
+                .saturating_sub(self.corrected_initial_age),
+        )
+    }
+
     /// Approximate memory footprint of this entry (for total size tracking).
     fn approx_size(&self) -> usize {
         self.body.len()
@@ -416,7 +499,9 @@ impl CacheEntry {
                 .iter()
                 .map(|(k, v)| k.len() + v.len())
                 .sum::<usize>()
-            + 64 // struct overhead estimate
+            + self.invalidation_scope.len()
+            + self.invalidation_path.len()
+            + 96 // struct overhead estimate, including the policy digest
     }
 }
 
@@ -765,6 +850,7 @@ struct ResponseCachingConfig {
     cache_key_include_consumer: bool,
     add_cache_status_header: bool,
     invalidate_on_unsafe_methods: bool,
+    anonymous_caller_scope: AnonymousCallerScope,
 }
 
 impl ResponseCachingConfig {
@@ -806,6 +892,10 @@ impl ResponseCachingConfig {
                 .unwrap_or(true),
             invalidate_on_unsafe_methods: optional_bool(config, "invalidate_on_unsafe_methods")?
                 .unwrap_or(true),
+            anonymous_caller_scope: match optional_string(config, "anonymous_caller_scope")? {
+                None => AnonymousCallerScope::default(),
+                Some(value) => AnonymousCallerScope::parse("response_caching", value)?,
+            },
         })
     }
 }
@@ -815,6 +905,14 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
         Some(Value::Bool(value)) => Ok(Some(*value)),
         Some(Value::Null) | None => Ok(None),
         Some(_) => Err(format!("response_caching: '{field}' must be a boolean")),
+    }
+}
+
+fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
+    match config.get(field) {
+        Some(Value::String(value)) => Ok(Some(value.as_str())),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!("response_caching: '{field}' must be a string")),
     }
 }
 
@@ -871,7 +969,23 @@ fn parse_method_list(config: &Value, field: &'static str) -> Result<Option<Vec<S
         Method::from_bytes(method.as_bytes()).map_err(|_| {
             format!("response_caching: '{field}[{index}]' is not a valid HTTP method")
         })?;
-        methods.push(method.to_ascii_uppercase());
+        let method = method.to_ascii_uppercase();
+        // A shared cache selects a stored representation by method + target +
+        // Vary. For a body-bearing method the request body is part of what the
+        // origin answered, and this plugin looks up in `before_proxy` — before
+        // the final backend-visible body exists. Keying a pre-transform body
+        // (or no body at all) would let two POSTs with the same target and
+        // different payloads share one entry, so body-bearing methods are
+        // refused here and again at runtime.
+        if !BODYLESS_CACHEABLE_METHODS.contains(&method.as_str()) {
+            return Err(format!(
+                "response_caching: '{field}[{index}]' ({method}) is not a bodyless retrieval \
+                 method — a shared cache cannot key the exact backend-visible request body at \
+                 lookup time, so only {} may be cached",
+                BODYLESS_CACHEABLE_METHODS.join(" / ")
+            ));
+        }
+        methods.push(method);
     }
     Ok(Some(methods))
 }
@@ -941,12 +1055,25 @@ fn parse_header_list(config: &Value, field: &'static str) -> Result<Option<Vec<S
     Ok(Some(headers))
 }
 
-/// Bounded LRU tracker of keys known to be uncacheable.
-/// Prevents wasted cache lock acquisition for assets that were historically uncacheable.
+/// Bounded FIFO tracker of keys known to be uncacheable.
+///
+/// Prevents wasted cache lock acquisition for assets that were historically
+/// uncacheable. Capacity is enforced with an insertion-ordered queue rather
+/// than by cloning and sorting the whole map at capacity: request targets and
+/// response eligibility are remotely influenced, so a caller able to mint
+/// high-cardinality uncacheable keys could otherwise force a full clone + sort
+/// on every admission (GHSA-37gg-v9m4-8445). Every operation here is O(1)
+/// amortized.
 struct UncacheablePredictor {
-    /// Keys known to be uncacheable, mapped to the epoch second when recorded.
+    /// Keys known to be uncacheable, mapped to the insertion sequence that owns
+    /// the matching queue slot.
     keys: DashMap<String, u64>,
-    /// Maximum entries before oldest are evicted.
+    /// Insertion order. A slot is authoritative only while its sequence still
+    /// matches the live map entry, so re-marking a key simply supersedes its
+    /// older slot instead of requiring a queue search.
+    order: Mutex<VecDeque<(String, u64)>>,
+    next_seq: AtomicU64,
+    /// Maximum live entries before the oldest are evicted.
     max_entries: usize,
 }
 
@@ -954,8 +1081,16 @@ impl UncacheablePredictor {
     fn new(max_entries: usize, shard_amount: usize) -> Self {
         Self {
             keys: DashMap::with_capacity_and_shard_amount(max_entries / 4, shard_amount),
+            order: Mutex::new(VecDeque::with_capacity(max_entries.min(1024))),
+            next_seq: AtomicU64::new(1),
             max_entries,
         }
+    }
+
+    fn order_guard(&self) -> MutexGuard<'_, VecDeque<(String, u64)>> {
+        self.order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Returns true if this key is predicted to be cacheable (not in the uncacheable set).
@@ -963,31 +1098,89 @@ impl UncacheablePredictor {
         !self.keys.contains_key(key)
     }
 
-    /// Mark a key as uncacheable. If the map is full, remove ~25% of entries by oldest timestamp.
+    /// Mark a key as uncacheable, evicting the oldest live entries when the
+    /// bound is exceeded. Amortized O(1): at most one queue slot is appended
+    /// per call, and each appended slot is popped at most once.
     fn mark_uncacheable(&self, key: &str) {
-        if self.keys.len() >= self.max_entries {
-            // Evict oldest 25%
-            let target = self.max_entries / 4;
-            let mut entries: Vec<(String, u64)> = self
-                .keys
-                .iter()
-                .map(|e| (e.key().clone(), *e.value()))
-                .collect();
-            entries.sort_by_key(|(_, ts)| *ts);
-            for (k, _) in entries.into_iter().take(target) {
-                self.keys.remove(&k);
-            }
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        self.keys.insert(key.to_string(), seq);
+
+        let mut order = self.order_guard();
+        order.push_back((key.to_string(), seq));
+        while self.keys.len() > self.max_entries {
+            let Some((oldest_key, oldest_seq)) = order.pop_front() else {
+                break;
+            };
+            self.keys
+                .remove_if(&oldest_key, |_, live_seq| *live_seq == oldest_seq);
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        self.keys.insert(key.to_string(), now);
+        // Superseded slots accumulate only when the same key is re-marked.
+        // Compact them in one amortized pass rather than searching on insert.
+        if order.len() > self.max_entries.saturating_mul(4) {
+            order.retain(|(queued_key, queued_seq)| {
+                self.keys
+                    .get(queued_key)
+                    .is_some_and(|live_seq| *live_seq == *queued_seq)
+            });
+        }
     }
 
-    /// Remove a key from the uncacheable set (it became cacheable).
+    /// Remove a key from the uncacheable set (it became cacheable). The stale
+    /// queue slot is reclaimed by the next capacity pop or compaction.
     fn mark_cacheable(&self, key: &str) {
         self.keys.remove(key);
+    }
+}
+
+/// Cache maintenance metadata protected by the single accounting mutex.
+///
+/// Everything here exists to keep admission, eviction, and invalidation bounded
+/// while the mutex is held. The previous implementation cloned and sorted the
+/// entire cache on every overflow and scanned the entire cache on every
+/// qualifying unsafe-method request, so low-byte request churn could serialize
+/// all concurrent writers behind superlinear maintenance
+/// (GHSA-37gg-v9m4-8445).
+#[derive(Default)]
+struct CacheMaintenance {
+    /// Insertion-ordered eviction queue. `stored_at` ordering and insertion
+    /// ordering coincide, so FIFO reproduces the previous oldest-first policy
+    /// without materializing or sorting the key set.
+    eviction_queue: VecDeque<(String, u64)>,
+    /// Expiration-ordered live-entry index. Freshness lifetime can vary per
+    /// response, so insertion order cannot identify every expired entry: a
+    /// short-lived response may expire behind an older long-lived one. Exact
+    /// tuples are removed on replacement and eviction, keeping reclamation
+    /// bounded to expired entries with O(log n) maintenance and no full-cache
+    /// scan under the publication mutex.
+    expiry_index: BTreeSet<(Duration, u64, String)>,
+    /// `authority scope -> encoded path -> cache keys`. RFC 9111 §4.4
+    /// invalidation is an exact `BTreeMap` lookup plus one ordered range over
+    /// the `path/` descendants, so its cost is bounded by the number of entries
+    /// it actually removes rather than by cache size.
+    path_index: HashMap<Arc<str>, BTreeMap<Arc<str>, HashSet<String>>>,
+    /// Live variant state per base key. `vary_index` mappings are reclaimed
+    /// exactly when their last variant leaves, replacing the previous
+    /// heuristic full-cache prune sweep, and the recorded index location makes
+    /// base-key invalidation a direct bucket lookup instead of a scan.
+    variant_counts: HashMap<String, BaseKeyVariants>,
+    next_insert_seq: u64,
+}
+
+/// Live-variant bookkeeping for one base key.
+///
+/// Every variant of a base key shares its authority scope and path by
+/// construction — both are inputs to the base key itself — so one recorded
+/// location locates all of them.
+struct BaseKeyVariants {
+    count: usize,
+    scope: Arc<str>,
+    path: Arc<str>,
+}
+
+impl CacheMaintenance {
+    fn next_seq(&mut self) -> u64 {
+        self.next_insert_seq = self.next_insert_seq.wrapping_add(1);
+        self.next_insert_seq
     }
 }
 
@@ -1010,11 +1203,21 @@ pub struct ResponseCaching {
     meta_pending_invalidate_host: String,
     /// Precomputed `response_caching.<id>.cache_pending_invalidate_path`.
     meta_pending_invalidate_path: String,
+    /// Precomputed `response_caching.<id>.cache_lookup_path`.
+    meta_lookup_path: String,
+    /// Parsed configuration, including how anonymous callers are partitioned
+    /// (`config.anonymous_caller_scope`, see [`AnonymousCallerScope`]). The
+    /// scope is deliberately *not* mirrored onto a second field: one owner
+    /// means a later edit cannot leave the two copies disagreeing about the
+    /// partition contract.
     config: ResponseCachingConfig,
     cache: Arc<DashMap<String, CacheEntry>>,
     vary_index: Arc<DashMap<String, Vec<String>>>,
     total_size: Arc<AtomicUsize>,
-    accounting_lock: Arc<Mutex<()>>,
+    /// Single publication mutex. Holds the bounded maintenance metadata so
+    /// admission, eviction, and invalidation never take a second lock and never
+    /// perform an unbounded pass while it is held.
+    accounting_lock: Arc<Mutex<CacheMaintenance>>,
     clock_offset_nanos: Arc<AtomicU64>,
     uncacheable_predictor: UncacheablePredictor,
     /// Effective shard count used for `cache`, `vary_index`, and the
@@ -1079,11 +1282,12 @@ impl ResponseCaching {
                 instance_id,
                 CACHE_PENDING_INVALIDATE_PATH_SUFFIX,
             ),
+            meta_lookup_path: staging_metadata_key(instance_id, CACHE_LOOKUP_PATH_SUFFIX),
             config,
             cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
             vary_index: Arc::new(DashMap::with_shard_amount(shard_amount)),
             total_size: Arc::new(AtomicUsize::new(0)),
-            accounting_lock: Arc::new(Mutex::new(())),
+            accounting_lock: Arc::new(Mutex::new(CacheMaintenance::default())),
             clock_offset_nanos: Arc::new(AtomicU64::new(0)),
             uncacheable_predictor: UncacheablePredictor::new(predictor_size.max(100), shard_amount),
             shard_amount,
@@ -1135,6 +1339,8 @@ impl ResponseCaching {
         ctx.metadata.remove(&self.meta_predict_key);
         ctx.metadata.remove(&self.meta_request_started);
         ctx.metadata.remove(&self.meta_headers_snapshot);
+        ctx.metadata.remove(&self.meta_lookup_path);
+        ctx.clear_response_cache_request_header_delta(self.instance_id);
     }
 
     /// Drop a staged unsafe-method invalidation without applying it.
@@ -1146,7 +1352,7 @@ impl ResponseCaching {
         ctx.metadata.remove(&self.meta_pending_invalidate_path);
     }
 
-    fn accounting_guard(&self) -> MutexGuard<'_, ()> {
+    fn accounting_guard(&self) -> MutexGuard<'_, CacheMaintenance> {
         self.accounting_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1192,6 +1398,15 @@ impl ResponseCaching {
             .sum()
     }
 
+    fn add_total_size_locked(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let current = self.total_size.load(Ordering::Relaxed);
+        self.total_size
+            .store(current.saturating_add(n), Ordering::Relaxed);
+    }
+
     fn sub_total_size_locked(&self, n: usize) {
         if n == 0 {
             return;
@@ -1230,130 +1445,160 @@ impl ResponseCaching {
         }
     }
 
-    /// Build the base cache key (proxy_id + Host + method + path + query + consumer).
+    /// Build the base cache key: a canonical, length-framed digest over every
+    /// stable backend-visible dimension of this request.
+    ///
+    /// The partition is:
+    ///
+    /// * **effective destination** — proxy id/namespace, listen path, and the
+    ///   post-routing upstream (or direct host/port/scheme) plus authority and
+    ///   rewritten path. `response_caching` runs at
+    ///   [`super::priority::RESPONSE_CACHING`], after every route-dispatch
+    ///   plugin, so this is the destination that will actually serve a miss;
+    /// * **request target** — original authority, `Host`, method, path, and the
+    ///   *effective outbound* query, so a `request_transformer` query rewrite
+    ///   that ran before this plugin is part of the partition. The request
+    ///   header dimension is deliberately **not** the raw header view: it is the
+    ///   complete `Vary` tuple appended by [`Self::extend_base_key_with_vary`]
+    ///   (backend-nominated dimensions, `vary_by_headers`, and the mandatory
+    ///   credential/session auto-Vary), plus the caller partition below.
+    ///
+    ///   Binding the whole live header map here instead would be
+    ///   self-defeating rather than stricter. A shared cache selects a stored
+    ///   representation by target + `Vary` (RFC 9111 §4.1), and three of this
+    ///   plugin's own contracts are addressed *to the entry* rather than
+    ///   selecting it: an `If-None-Match` / `If-Modified-Since` revalidation
+    ///   (RFC 9110 §13), a client `Cache-Control: no-cache` refresh whose
+    ///   zero-freshness response must invalidate the entry (RFC 9111 §5.2),
+    ///   and `Content-Length: 0` framing. Each of those requests carries a
+    ///   header the stored request did not, so a raw-header partition would put
+    ///   it in a different partition from the entry it names — and the `Vary`
+    ///   index, variant union, and predictor would become unreachable because
+    ///   no two requests could ever share a base key. Origin-visible headers
+    ///   the backend does not nominate are covered by `vary_by_headers`, and
+    ///   cross-caller isolation by the mandatory caller partition;
+    /// * **complete `Vary` tuple** — appended to this base key by
+    ///   [`Self::extend_base_key_with_vary`];
+    /// * **caller authorization context** — see
+    ///   [`replay_partition::append_caller_partition`]. Authenticated callers
+    ///   bind a fingerprint of the credential material and mechanism, not a
+    ///   display subject, so two tokens resolving to one `sub` with different
+    ///   scopes cannot share an entry. Both the pristine inbound wire
+    ///   credentials and the live backend-visible ones are bound under separate
+    ///   provenance labels, so an earlier `ai_stream_router` credential rewrite
+    ///   cannot erase the original caller distinction. Every caller also binds
+    ///   its canonical peer address, which the origin observes through Ferrum's
+    ///   regenerated `X-Forwarded-For`; only an *anonymous* caller's address
+    ///   binding can be relaxed by operator attestation.
+    ///
+    /// Returns `Err` when no complete stable partition can be derived, in
+    /// which case the caller must neither look up nor store. The refusal's
+    /// `reason()` is a compiled-in static string safe to emit in a debug line.
     ///
     /// `request_headers` is supplied separately because in `before_proxy` the
     /// gateway may have temporarily moved `ctx.headers` out of the context to
     /// satisfy the borrow checker (zero-allocation hot path when no plugin
     /// modifies headers). Always pass the same `headers` map you got from the
-    /// `before_proxy(ctx, headers)` parameter, or `&ctx.headers` from
-    /// post-proxy phases where the headers have been restored.
+    /// `before_proxy(ctx, headers)` parameter, or the restored view from
+    /// post-proxy phases.
+    ///
+    /// The key is an opaque digest and carries no host, path, query, credential,
+    /// identity, or address bytes.
     fn build_base_cache_key(
         &self,
         ctx: &RequestContext,
         request_headers: &HashMap<String, String>,
-    ) -> String {
-        let proxy_id = ctx
-            .matched_proxy
-            .as_ref()
-            .map(|p| p.id.as_str())
-            .unwrap_or("_");
+    ) -> Result<String, replay_partition::PartitionRefusal> {
+        let mut hasher = PartitionHasher::new(RESPONSE_CACHING_BASE_KEY_DOMAIN);
+        replay_partition::append_destination_partition(&mut hasher, ctx);
 
-        // Include the request `Host` header in the base key so multi-host
-        // proxies (e.g. `hosts: ["a.example.com", "b.example.com"]`) don't
-        // collide. Hash the ASCII-lowercased host before putting it into the
-        // colon-delimited key so host:port and bracketed IPv6 literals cannot
-        // be mistaken for structural delimiters during invalidation.
-        let host_part: String = request_headers
-            .get("host")
-            .map(|h| cache_key_host_part(h))
-            .unwrap_or_default();
+        // This legacy option no longer permits an origin-visible query to be
+        // omitted from a replay key. Keep the setting in the digest so changing
+        // it still rotates the keyspace, then bind the effective request target
+        // unconditionally below.
+        hasher.bool_value("include_query", self.config.cache_key_include_query);
+        // `cache_key_include_consumer` no longer decides whether callers are
+        // isolated — the caller partition below is unconditional. It is kept in
+        // the digest so flipping it still produces a disjoint keyspace rather
+        // than silently reusing entries minted under the other setting.
+        hasher.bool_value("include_consumer", self.config.cache_key_include_consumer);
+        replay_partition::append_request_target_partition(&mut hasher, ctx, request_headers);
+        replay_partition::append_caller_partition(
+            &mut hasher,
+            ctx,
+            request_headers,
+            self.config.anonymous_caller_scope,
+        )?;
 
-        let query_part = if self.config.cache_key_include_query {
-            ctx.raw_query_string()
-                .map(cache_key_query_part)
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        // Bind the cache entry to the authenticated principal whenever the
-        // request is authenticated by ANY mechanism — a gateway Consumer
-        // (key_auth / mtls_auth / basic_auth / hmac_auth) or an external
-        // `authenticated_identity` emitted by jwks_auth / oidc. Without this,
-        // two principals authenticated by a non-`Authorization` scheme (API
-        // key, mTLS, JWT carried in a custom header) share one cache entry
-        // whenever the backend marks the response `public` / `s-maxage`,
-        // serving one principal's private response to another. The identity
-        // is SHA-256-hashed so a username or SPIFFE ID (which may contain the
-        // `:` / `|` key delimiters and can surface in debug logs) never lands
-        // in the key verbatim. `cache_key_include_consumer` remains an
-        // explicit opt-in that additionally keys *anonymous* requests as
-        // `_anon`.
-        let consumer_part: Cow<'_, str> = match ctx.effective_identity() {
-            Some(identity) => Cow::Owned(cache_key_identity_part(identity)),
-            None if self.config.cache_key_include_consumer => Cow::Borrowed("_anon"),
-            None => Cow::Borrowed(""),
-        };
-
-        let encoded_path = encode_path_for_cache_key(&ctx.path);
-        let mut key = String::with_capacity(
-            proxy_id.len()
-                + host_part.len()
-                + ctx.method.len()
-                + encoded_path.len()
-                + query_part.len()
-                + consumer_part.len()
-                + 5,
-        );
-        key.push_str(proxy_id);
-        key.push(':');
-        key.push_str(&host_part);
-        key.push(':');
-        key.push_str(&ctx.method);
-        key.push(':');
-        key.push_str(&encoded_path);
-        key.push(':');
-        key.push_str(&query_part);
-        key.push(':');
-        key.push_str(&consumer_part);
-        key
+        Ok(hasher.hex())
     }
 
-    fn build_cache_key(
+    /// Append the Vary component to an already-derived base key.
+    ///
+    /// The complete Vary tuple is digested — every configured, auto-merged, and
+    /// origin-nominated dimension, with its name, a framed presence flag, and
+    /// its value — rather than only the subset classified as sensitive. The old
+    /// `name=value|name=value` concatenation let a legal value containing `|`
+    /// or `=` reproduce a different tuple's preimage
+    /// (GHSA-v4g3-2r4f-f6pc); length framing makes that impossible.
+    ///
+    /// Values already reduced to their cache-key form by the request-header
+    /// snapshot are framed verbatim so lookup and storage agree; every other
+    /// value goes through [`cache_key_vary_value`] first, which keeps
+    /// credentials and operator-redacted values out of memory in their raw form
+    /// even before the outer digest.
+    fn extend_base_key_with_vary(
         &self,
-        ctx: &RequestContext,
-        vary_headers: &[String],
-        request_headers: &HashMap<String, String>,
-    ) -> String {
-        self.build_cache_key_with_ready_values(ctx, vary_headers, request_headers, None)
-    }
-
-    fn build_cache_key_with_ready_values(
-        &self,
-        ctx: &RequestContext,
+        base_key: String,
         vary_headers: &[String],
         request_headers: &HashMap<String, String>,
         cache_key_ready_headers: Option<&HashSet<String>>,
     ) -> String {
-        let base_key = self.build_base_cache_key(ctx, request_headers);
         if vary_headers.is_empty() {
             return base_key;
         }
 
-        let mut cache_key = base_key;
-        cache_key.push(':');
-        for (index, header) in vary_headers.iter().enumerate() {
-            if index > 0 {
-                cache_key.push('|');
-            }
-            let value = request_headers
-                .get(header.as_str())
-                .map(String::as_str)
-                .unwrap_or("");
-            cache_key.push_str(header);
-            cache_key.push('=');
-            if let Some(ready_headers) = cache_key_ready_headers
-                && ready_headers.contains(header)
-            {
-                cache_key.push_str(value);
-            } else {
-                let value = cache_key_vary_value(header, value);
-                cache_key.push_str(&value);
+        let mut hasher = PartitionHasher::new(RESPONSE_CACHING_VARY_DOMAIN);
+        hasher.count("vary", vary_headers.len());
+        for header in vary_headers {
+            hasher.text("vary_name", header);
+            match request_headers.get(header.as_str()) {
+                None => hasher.bool_value("vary_present", false),
+                Some(value) => {
+                    hasher.bool_value("vary_present", true);
+                    let ready = cache_key_ready_headers
+                        .is_some_and(|ready_headers| ready_headers.contains(header));
+                    if ready {
+                        hasher.text("vary_value", value);
+                    } else {
+                        hasher.text("vary_value", &cache_key_vary_value(header, value));
+                    }
+                }
             }
         }
 
+        let vary_digest = hasher.hex();
+        let mut cache_key = base_key;
+        cache_key.reserve(1 + vary_digest.len());
+        cache_key.push(CACHE_KEY_VARY_SEPARATOR);
+        cache_key.push_str(&vary_digest);
         cache_key
+    }
+
+    /// Authority partition an entry is indexed under for RFC 9111 §4.4
+    /// invalidation: the same `(proxy id, normalized Host)` pair the base key
+    /// binds, reduced to an opaque digest so no host bytes are retained.
+    fn invalidation_scope(&self, ctx: &RequestContext, host: Option<&str>) -> Arc<str> {
+        let mut hasher = PartitionHasher::new(RESPONSE_CACHING_SCOPE_DOMAIN);
+        hasher.optional_text(
+            "proxy_id",
+            ctx.matched_proxy.as_ref().map(|proxy| proxy.id.as_str()),
+        );
+        hasher.optional_text(
+            "host",
+            host.map(|host| host.to_ascii_lowercase()).as_deref(),
+        );
+        Arc::from(hasher.hex().as_str())
     }
 
     /// Check if the request method is cacheable.
@@ -1389,16 +1634,10 @@ impl ResponseCaching {
             .unwrap_or_else(|| self.config.vary_by_headers.clone())
     }
 
-    fn merge_present_sensitive_vary_headers(
-        &self,
-        vary_headers: &mut Vec<String>,
-        request_headers: &HashMap<String, String>,
-    ) -> bool {
+    fn merge_mandatory_sensitive_vary_headers(&self, vary_headers: &mut Vec<String>) -> bool {
         let mut added = false;
         for sensitive in SENSITIVE_VARY_HEADERS {
-            if request_headers.contains_key(sensitive) {
-                added |= merge_vary_header(vary_headers, sensitive);
-            }
+            added |= merge_vary_header(vary_headers, sensitive);
         }
         if added {
             vary_headers.sort();
@@ -1502,51 +1741,179 @@ impl ResponseCaching {
     }
 
     fn invalidate_base_key(&self, base_key: &str) {
-        let _guard = self.accounting_guard();
-        self.invalidate_base_key_locked(base_key);
+        let mut guard = self.accounting_guard();
+        self.invalidate_base_key_locked(&mut guard, base_key);
     }
 
-    fn invalidate_base_key_locked(&self, base_key: &str) {
-        let mut variant_prefix = String::with_capacity(base_key.len() + 1);
-        variant_prefix.push_str(base_key);
-        variant_prefix.push(':');
-        let mut removed_size = 0usize;
-        self.cache.retain(|key, entry| {
-            if key == base_key || key.starts_with(&variant_prefix) {
-                removed_size += entry.approx_size();
-                false
-            } else {
-                true
-            }
-        });
-
-        if removed_size > 0 {
-            self.sub_total_size_locked(removed_size);
+    /// Remove every live variant of one base key.
+    ///
+    /// The recorded [`BaseKeyVariants`] location narrows the search to one
+    /// `(authority scope, path)` bucket — every variant of a base key shares
+    /// both by construction — instead of the previous scan over every entry in
+    /// the map looking for a `base_key:` string prefix. The bucket can still
+    /// hold sibling base keys (other callers at the same authority and path),
+    /// so the cost is bounded by that bucket rather than by this base key's
+    /// variant count; the per-item work is one prefix comparison.
+    fn invalidate_base_key_locked(&self, maintenance: &mut CacheMaintenance, base_key: &str) {
+        let doomed: Vec<String> = match maintenance.variant_counts.get(base_key) {
+            Some(state) => maintenance
+                .path_index
+                .get(&state.scope)
+                .and_then(|paths| paths.get(&state.path))
+                .map(|keys| {
+                    keys.iter()
+                        .filter(|key| Self::cache_key_belongs_to_base(key.as_str(), base_key))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        for cache_key in doomed {
+            self.remove_entry_locked(maintenance, &cache_key);
         }
+        // Reclaim the dimension mapping even when no variant survived.
+        maintenance.variant_counts.remove(base_key);
         self.vary_index.remove(base_key);
     }
 
-    fn invalidate_cache_key(&self, base_key: &str, cache_key: &str) {
-        let _guard = self.accounting_guard();
-        self.invalidate_cache_key_locked(base_key, cache_key);
+    /// A full cache key is its base key, optionally followed by the fixed
+    /// separator and a Vary digest. Both components are lowercase hex, so this
+    /// test cannot be spoofed by key content.
+    fn cache_key_belongs_to_base(cache_key: &str, base_key: &str) -> bool {
+        cache_key == base_key
+            || (cache_key.len() > base_key.len()
+                && cache_key.starts_with(base_key)
+                && cache_key.as_bytes().get(base_key.len())
+                    == Some(&(CACHE_KEY_VARY_SEPARATOR as u8)))
     }
 
-    fn invalidate_cache_key_locked(&self, base_key: &str, cache_key: &str) {
-        let Some((_, entry)) = self.cache.remove(cache_key) else {
-            return;
-        };
+    fn invalidate_cache_key(&self, base_key: &str, cache_key: &str) {
+        let mut guard = self.accounting_guard();
+        self.invalidate_cache_key_locked(&mut guard, base_key, cache_key);
+    }
 
-        self.sub_total_size_locked(entry.approx_size());
-        if cache_key == base_key {
+    fn invalidate_cache_key_locked(
+        &self,
+        maintenance: &mut CacheMaintenance,
+        base_key: &str,
+        cache_key: &str,
+    ) {
+        if !self.remove_entry_locked(maintenance, cache_key) {
+            return;
+        }
+        if cache_key == base_key && !maintenance.variant_counts.contains_key(base_key) {
             self.vary_index.remove(base_key);
         }
+    }
+
+    /// Admit one entry, keeping byte accounting, the eviction queue, the path
+    /// index, and the per-base-key variant state exactly in step.
+    ///
+    /// Replacement of an existing key is not a new variant: the index and the
+    /// variant state already describe it, and only the byte delta and a fresh
+    /// eviction slot change. All work is O(1) plus one `BTreeMap` insert and
+    /// one expiration-index `BTreeSet` update.
+    fn insert_entry_locked(
+        &self,
+        maintenance: &mut CacheMaintenance,
+        base_key: &str,
+        cache_key: String,
+        entry: CacheEntry,
+    ) {
+        let scope = Arc::clone(&entry.invalidation_scope);
+        let path = Arc::clone(&entry.invalidation_path);
+        let insert_seq = entry.insert_seq;
+        let expires_at = entry.expires_at();
+        let entry_size = entry.approx_size();
+
+        match self.cache.insert(cache_key.clone(), entry) {
+            Some(old) => {
+                self.sub_total_size_locked(old.approx_size());
+                maintenance.expiry_index.remove(&(
+                    old.expires_at(),
+                    old.insert_seq,
+                    cache_key.clone(),
+                ));
+            }
+            None => {
+                maintenance
+                    .variant_counts
+                    .entry(base_key.to_string())
+                    .and_modify(|state| state.count = state.count.saturating_add(1))
+                    .or_insert_with(|| BaseKeyVariants {
+                        count: 1,
+                        scope: Arc::clone(&scope),
+                        path: Arc::clone(&path),
+                    });
+                maintenance
+                    .path_index
+                    .entry(scope)
+                    .or_default()
+                    .entry(path)
+                    .or_default()
+                    .insert(cache_key.clone());
+            }
+        }
+        self.add_total_size_locked(entry_size);
+        maintenance
+            .expiry_index
+            .insert((expires_at, insert_seq, cache_key.clone()));
+        maintenance
+            .eviction_queue
+            .push_back((cache_key, insert_seq));
+    }
+
+    /// Remove one entry and every piece of metadata that described it.
+    /// Returns whether an entry was actually removed. O(1) plus ordered path-
+    /// and expiration-index removals.
+    fn remove_entry_locked(&self, maintenance: &mut CacheMaintenance, cache_key: &str) -> bool {
+        let Some((_, entry)) = self.cache.remove(cache_key) else {
+            return false;
+        };
+        self.sub_total_size_locked(entry.approx_size());
+        maintenance.expiry_index.remove(&(
+            entry.expires_at(),
+            entry.insert_seq,
+            cache_key.to_string(),
+        ));
+
+        // `base_key_len` is always a byte boundary of this key: the key is the
+        // base-key hex, optionally followed by an ASCII separator and more hex.
+        let base_key = cache_key
+            .get(..entry.base_key_len)
+            .unwrap_or(cache_key)
+            .to_string();
+        if let Some(state) = maintenance.variant_counts.get_mut(&base_key) {
+            state.count = state.count.saturating_sub(1);
+            if state.count == 0 {
+                maintenance.variant_counts.remove(&base_key);
+                // Exact reclamation: the dimension mapping outlives its last
+                // variant by exactly zero requests, so a high-cardinality
+                // principal stream cannot grow `vary_index` unboundedly and no
+                // heuristic full-cache sweep is required.
+                self.vary_index.remove(&base_key);
+            }
+        }
+
+        if let Some(paths) = maintenance.path_index.get_mut(&entry.invalidation_scope) {
+            if let Some(keys) = paths.get_mut(&entry.invalidation_path) {
+                keys.remove(cache_key);
+                if keys.is_empty() {
+                    paths.remove(&entry.invalidation_path);
+                }
+            }
+            if paths.is_empty() {
+                maintenance.path_index.remove(&entry.invalidation_scope);
+            }
+        }
+        true
     }
 
     fn invalidate_zero_freshness_response(
         &self,
         base_key: &str,
         predict_key: Option<&str>,
-        ctx: &RequestContext,
         response_headers: &HashMap<String, String>,
         lookup_headers: &RestoredRequestHeadersView,
     ) {
@@ -1557,12 +1924,9 @@ impl ResponseCaching {
         match self.merged_vary_headers(response_headers) {
             Some(mut vary_headers) => {
                 self.merge_existing_vary_headers(base_key, &mut vary_headers);
-                self.merge_present_sensitive_vary_headers(
-                    &mut vary_headers,
-                    &lookup_headers.headers,
-                );
-                let response_key = self.build_cache_key_with_ready_values(
-                    ctx,
+                self.merge_mandatory_sensitive_vary_headers(&mut vary_headers);
+                let response_key = self.extend_base_key_with_vary(
+                    base_key.to_string(),
                     &vary_headers,
                     &lookup_headers.headers,
                     Some(&lookup_headers.cache_key_ready_headers),
@@ -1584,155 +1948,135 @@ impl ResponseCaching {
         }
     }
 
-    /// Remove every expired entry, refund its tracked bytes, and reclaim any
-    /// `vary_index` mappings left without a surviving variant. Caller must
-    /// hold `accounting_lock`. Returns the number of entries removed.
-    fn reclaim_expired_locked(&self) -> usize {
-        let now = self.now_monotonic();
-        let mut removed_size = 0usize;
-        let mut removed_count = 0usize;
-        self.cache.retain(|_, entry| {
-            if !entry.is_fresh_at(now) {
-                removed_size += entry.approx_size();
-                removed_count += 1;
-                false
-            } else {
-                true
-            }
-        });
-        self.sub_total_size_locked(removed_size);
-        if removed_count > 0 {
-            // Expired variants may have been the last live entry for their
-            // base key; reclaim the stranded `vary_index` mappings now rather
-            // than waiting for the next store-side prune.
-            self.prune_vary_index_locked();
-        }
-        removed_count
-    }
-
-    /// Evict expired entries when cache exceeds max_entries.
-    fn evict_if_needed_locked(&self) {
-        if self.cache.len() <= self.config.max_entries {
-            return;
-        }
-
-        self.reclaim_expired_locked();
-
-        if self.cache.len() > self.config.max_entries {
-            let mut entries: Vec<(String, Duration)> = self
+    /// Enforce the entry-count cap with amortized O(1) work per admitted entry.
+    ///
+    /// The previous implementation cloned every key + timestamp, sorted the
+    /// whole vector, and removed only the single-entry overflow — a full sort
+    /// per insertion at a saturated default 10,000-entry cache, performed while
+    /// holding the publication mutex, which any caller able to mint unique
+    /// cacheable targets could drive continuously (GHSA-37gg-v9m4-8445).
+    /// Insertion order and `stored_at` order coincide, so popping the FIFO
+    /// reproduces the same oldest-first policy without materializing the key
+    /// set.
+    fn evict_if_needed_locked(&self, maintenance: &mut CacheMaintenance) {
+        while self.cache.len() > self.config.max_entries {
+            let Some((oldest_key, oldest_seq)) = maintenance.eviction_queue.pop_front() else {
+                break;
+            };
+            // A slot is authoritative only while it still names the live entry;
+            // a replaced entry's older slot is dropped here for free.
+            let is_current = self
                 .cache
-                .iter()
-                .map(|entry| (entry.key().clone(), entry.value().stored_at))
-                .collect();
-            entries.sort_by_key(|(_, stored_at)| *stored_at);
-
-            let to_remove = self.cache.len() - self.config.max_entries;
-            for (key, _) in entries.into_iter().take(to_remove) {
-                if let Some((_, removed)) = self.cache.remove(&key) {
-                    self.sub_total_size_locked(removed.approx_size());
-                }
+                .get(&oldest_key)
+                .is_some_and(|entry| entry.insert_seq == oldest_seq);
+            if is_current {
+                self.remove_entry_locked(maintenance, &oldest_key);
             }
         }
+        self.compact_eviction_queue_locked(maintenance);
     }
 
-    /// Reclaim `vary_index` mappings whose base key has no surviving cache
-    /// variant.
+    /// Reclaim *expired* retained bytes in expiration order so a stale working set
+    /// cannot trap the byte budget (#2400).
     ///
-    /// `vary_index` is keyed by base key and otherwise pruned only in
-    /// [`Self::invalidate_base_key`]; eviction, expiry, and path invalidation
-    /// drop entries from `self.cache` but leave their `vary_index` mapping
-    /// behind. Because the base key now embeds the per-principal `consumer_part`
-    /// (see [`Self::build_base_cache_key`]), a workload with high principal
-    /// cardinality (JWT `sub`s, ephemeral SPIFFE IDs) would otherwise grow
-    /// `vary_index` without bound even though `self.cache` stays capped at
-    /// `max_entries`. A stale mapping is only ever fail-safe — it over-specifies
-    /// the vary list for a base key with no live entry, so the next lookup
-    /// simply MISSes and re-stores — making this a pure memory reclaim, not a
-    /// correctness fix.
-    ///
-    /// The number of distinct live base keys can never exceed
-    /// `self.cache.len()`, so `vary_index.len() > self.cache.len()` is a
-    /// necessary precondition for any stale mapping to exist. The sweep is
-    /// deliberately batched with slack so a saturated, high-cardinality cache
-    /// reclaims stale mappings in groups instead of cloning every live base key
-    /// on every store.
-    fn prune_vary_index_locked(&self) {
-        let cache_len = self.cache.len();
-        if self.vary_index.len() <= cache_len.saturating_add(vary_index_prune_slack(cache_len)) {
+    /// `max_total_size_bytes` is a hard cap on retained bytes, not an LRU
+    /// trigger: a store that still does not fit once every reclaimable expired
+    /// entry is gone is refused, and a *fresh* representation is never dropped
+    /// to make room for a new one. Freshness lifetimes differ per response, so
+    /// the expiry index—not insertion FIFO—selects candidates. The walk stops
+    /// at the earliest live future expiry and is bounded by expired entries it
+    /// actually retires rather than by cache size.
+    fn reclaim_expired_for_byte_budget_locked(
+        &self,
+        maintenance: &mut CacheMaintenance,
+        now: Duration,
+    ) {
+        while let Some((expires_at, insert_seq, cache_key)) =
+            maintenance.expiry_index.iter().next().cloned()
+        {
+            if expires_at > now {
+                break;
+            }
+            let is_current = self
+                .cache
+                .get(&cache_key)
+                .is_some_and(|entry| entry.insert_seq == insert_seq);
+            if is_current {
+                self.remove_entry_locked(maintenance, &cache_key);
+            } else {
+                // Defensive stale-index retirement: normal replacement and
+                // removal paths delete the exact tuple, but never let an
+                // inconsistent tuple spin this bounded reclaim loop.
+                maintenance
+                    .expiry_index
+                    .remove(&(expires_at, insert_seq, cache_key));
+            }
+        }
+        self.compact_eviction_queue_locked(maintenance);
+    }
+
+    /// Drop superseded queue slots in one amortized pass. Slots accumulate only
+    /// when a key is re-stored, so this runs rarely and is bounded by the queue
+    /// length it is about to shrink.
+    fn compact_eviction_queue_locked(&self, maintenance: &mut CacheMaintenance) {
+        let bound = self.config.max_entries.saturating_mul(4).max(1024);
+        if maintenance.eviction_queue.len() <= bound {
             return;
         }
-
-        // Materialize the live base keys (owned) before touching `vary_index`
-        // so no `self.cache` read guards are held across the `retain` below.
-        let live_base_keys: HashSet<String> = self
-            .cache
-            .iter()
-            .filter_map(|entry| {
-                entry
-                    .key()
-                    .get(..entry.value().base_key_len)
-                    .map(str::to_string)
-            })
-            .collect();
-
-        let before = self.vary_index.len();
-        self.vary_index
-            .retain(|base_key, _| live_base_keys.contains(base_key));
-
-        let removed = before.saturating_sub(self.vary_index.len());
-        if removed > 0 {
-            debug!(
-                removed = removed,
-                vary_index_len = self.vary_index.len(),
-                "response_caching: pruned stale vary_index entries"
-            );
-        }
+        let cache = Arc::clone(&self.cache);
+        maintenance
+            .eviction_queue
+            .retain(|(key, seq)| cache.get(key).is_some_and(|entry| entry.insert_seq == *seq));
     }
 
     /// Invalidate cache entries matching a path under one authority partition.
     ///
     /// Called only after a non-error response to an unsafe method (see
-    /// [`Self::is_unsafe_method`] and RFC 9111 §4.4). `host_part` must be the
-    /// same normalized Host partition that [`Self::build_base_cache_key`]
-    /// embeds (including the empty partition when Host is absent), so a
-    /// mutation on authority A cannot evict authority B on a shared proxy.
-    fn invalidate_path(&self, ctx: &RequestContext, host_part: &str, path: &str) {
-        let _guard = self.accounting_guard();
-        let proxy_id = ctx
-            .matched_proxy
-            .as_ref()
-            .map(|p| p.id.as_str())
-            .unwrap_or("_");
-        // Prefix is `proxy_id:host_part:` — identical authority isolation to
-        // lookup/storage. Avoids scanning other Host partitions on the proxy.
-        let mut prefix = String::with_capacity(proxy_id.len() + 1 + host_part.len() + 1);
-        prefix.push_str(proxy_id);
-        prefix.push(':');
-        prefix.push_str(host_part);
-        prefix.push(':');
-        let mut removed_size = 0usize;
+    /// [`Self::is_unsafe_method`] and RFC 9111 §4.4). `scope` must be the same
+    /// authority partition [`Self::invalidation_scope`] produced at lookup, so
+    /// a mutation on authority A cannot evict authority B on a shared proxy.
+    ///
+    /// Cost is one hash lookup, one `BTreeMap` point lookup, and one ordered
+    /// range over the mutated path's descendants — bounded by the entries
+    /// actually removed, not by cache size. The previous implementation scanned
+    /// and re-parsed every cache key under the publication mutex for every
+    /// qualifying unsafe-method request (GHSA-37gg-v9m4-8445).
+    fn invalidate_path(&self, scope: &str, path: &str) {
+        let encoded = encode_path_for_cache_key(path);
+        let mut guard = self.accounting_guard();
+        let maintenance = &mut *guard;
 
-        self.cache.retain(|key, entry| {
-            if key.starts_with(&prefix) && cache_key_path_matches(key, path) {
-                removed_size += entry.approx_size();
-                debug!(
-                    cache_key = %key,
-                    method = %ctx.method,
-                    "response_caching: invalidated cache entry due to unsafe method"
-                );
-                false
-            } else {
-                true
+        let descendant_prefix: Arc<str> = {
+            let mut prefix = String::with_capacity(encoded.len() + 1);
+            prefix.push_str(encoded.as_ref());
+            prefix.push('/');
+            prefix.into()
+        };
+
+        let mut doomed: Vec<String> = Vec::new();
+        if let Some(paths) = maintenance.path_index.get(scope) {
+            if let Some(keys) = paths.get(encoded.as_ref()) {
+                doomed.extend(keys.iter().cloned());
             }
-        });
-
-        if removed_size > 0 {
-            self.sub_total_size_locked(removed_size);
+            for (indexed_path, keys) in paths.range(Arc::clone(&descendant_prefix)..) {
+                if !indexed_path.starts_with(descendant_prefix.as_ref()) {
+                    break;
+                }
+                doomed.extend(keys.iter().cloned());
+            }
         }
-        // A path sweep can strand many base keys' `vary_index` mappings at once
-        // (every principal/variant of the invalidated path); reclaim them now
-        // rather than waiting for the next store.
-        self.prune_vary_index_locked();
+
+        let removed = doomed.len();
+        for cache_key in doomed {
+            self.remove_entry_locked(maintenance, &cache_key);
+        }
+        if removed > 0 {
+            // Content-free: never emits the cache key, path, or authority.
+            debug!(
+                removed = removed,
+                "response_caching: invalidated cache entries after an unsafe method"
+            );
+        }
     }
 
     /// Stage RFC 9111 §4.4 invalidation for an unsafe method using the same
@@ -1743,12 +2087,9 @@ impl ResponseCaching {
         ctx: &mut RequestContext,
         request_headers: &HashMap<String, String>,
     ) {
-        let host_part = request_headers
-            .get("host")
-            .map(|h| cache_key_host_part(h))
-            .unwrap_or_default();
+        let scope = self.invalidation_scope(ctx, request_headers.get("host").map(String::as_str));
         ctx.metadata
-            .insert(self.meta_pending_invalidate_host.clone(), host_part);
+            .insert(self.meta_pending_invalidate_host.clone(), scope.to_string());
         ctx.metadata
             .insert(self.meta_pending_invalidate_path.clone(), ctx.path.clone());
     }
@@ -1761,10 +2102,10 @@ impl ResponseCaching {
     /// earlier `after_proxy` rejection that replaces the client-visible status
     /// cannot suppress eviction after a successful mutation. Falls back to
     /// `response_status` for direct `after_proxy` calls (unit tests) that never
-    /// went through `run_after_proxy_hooks`. Consumes the staged host exactly
+    /// went through `run_after_proxy_hooks`. Consumes the staged scope exactly
     /// once so observe + after_proxy cannot double-invalidate.
     fn maybe_apply_pending_invalidation(&self, ctx: &mut RequestContext, response_status: u16) {
-        let Some(host_part) = ctx.metadata.remove(&self.meta_pending_invalidate_host) else {
+        let Some(scope) = ctx.metadata.remove(&self.meta_pending_invalidate_host) else {
             return;
         };
         let Some(path) = ctx.metadata.remove(&self.meta_pending_invalidate_path) else {
@@ -1772,7 +2113,7 @@ impl ResponseCaching {
         };
         let status = ctx.origin_http_response_status().unwrap_or(response_status);
         if Self::is_non_error_status(status) {
-            self.invalidate_path(ctx, &host_part, &path);
+            self.invalidate_path(&scope, &path);
         }
     }
 
@@ -1845,12 +2186,12 @@ impl ResponseCaching {
     /// the protected representation for the rest of its TTL even after the
     /// backend would revoke, expire, or narrow that token.
     ///
-    /// `request_headers` must be the same live/restored view the cache key was
-    /// derived from (`before_proxy`'s `headers` parameter as replayed by
-    /// [`Self::restore_request_headers_view`]), never the untransformed
-    /// `ctx.headers` alone — a request-side transformer can add or remove the
-    /// credential. The restored view is the union of both, so a credential
-    /// visible in either direction still refuses.
+    /// `request_headers` is the live/restored backend-visible view the cache key
+    /// was derived from (`before_proxy`'s `headers` parameter as replayed by
+    /// [`Self::restore_request_headers_view`]). Admission deliberately checks
+    /// both that view and the pristine inbound `ctx.headers`: a request-side
+    /// transformer may add or remove the credential, but visibility in either
+    /// provenance is sufficient to refuse storage without origin opt-in.
     ///
     /// `Proxy-Authorization` is deliberately not part of this predicate: it is
     /// an intermediary credential consumed at this hop and says nothing about
@@ -1863,8 +2204,9 @@ impl ResponseCaching {
         request_headers: &HashMap<String, String>,
         directives: &CacheControlDirectives,
     ) -> bool {
-        let authorized_request =
-            ctx.effective_identity().is_some() || request_headers.contains_key("authorization");
+        let authorized_request = ctx.effective_identity().is_some()
+            || header_value(&ctx.headers, "authorization").is_some()
+            || header_value(request_headers, "authorization").is_some();
         if !authorized_request {
             return true;
         }
@@ -1898,17 +2240,20 @@ impl ResponseCaching {
     /// load-bearing cache-key dimensions even when the operator never lists them
     /// in `vary_by_headers`.
     ///
-    /// Snapshot is intentionally narrow: only headers we know we will
-    /// consume go into it. Headers that show up later via the response
-    /// `Vary` directive — which can be any header at all — fall through
-    /// to `ctx.headers` at storage time. That's the same value we'd have
-    /// had to read at lookup time anyway, so the lookup/storage symmetry
-    /// is still preserved for them.
+    /// The complete live view is represented separately by a delta from
+    /// `ctx.headers` in RequestContext's private response-cache provenance map.
+    /// That private delta covers arbitrary origin-supplied `Vary` fields without
+    /// duplicating an unchanged header map or exposing raw values to transaction
+    /// metadata. This serialized snapshot remains intentionally narrow and
+    /// reduced so direct compatibility contexts that do not carry private
+    /// staging can still rebuild configured and auto-sensitive dimensions
+    /// without logging secrets.
     fn stash_request_headers_snapshot(
         &self,
         ctx: &mut RequestContext,
         headers: &HashMap<String, String>,
     ) {
+        ctx.stage_response_cache_request_header_delta(self.instance_id, headers);
         let mut snapshot: Vec<RequestHeaderSnapshotEntry> = Vec::with_capacity(
             self.config.vary_by_headers.len() + 1 + SENSITIVE_VARY_HEADERS.len(),
         );
@@ -1949,12 +2294,29 @@ impl ResponseCaching {
         }
     }
 
-    /// Rebuild the request-headers view used to derive the storage cache
-    /// key. Layers `before_proxy`'s snapshot on top of `ctx.headers` so
-    /// snapshotted keys reflect the transformed values seen at lookup
-    /// time while any other key (typically a header added by the
-    /// response's own `Vary` directive) falls back to the original.
+    /// Rebuild the request-headers view used to derive the storage cache key.
+    /// Prefer the private backend-visible delta so an arbitrary origin-supplied
+    /// `Vary` field reflects the value that actually reached the backend. The
+    /// reduced public-metadata snapshot remains a fail-closed compatibility
+    /// fallback for direct hook contexts that do not carry private staging.
     fn restore_request_headers_view(&self, ctx: &RequestContext) -> RestoredRequestHeadersView {
+        if let Some(delta) = ctx.response_cache_request_header_delta(self.instance_id) {
+            let mut headers = ctx.headers.clone();
+            for (name, value) in delta {
+                match value {
+                    Some(value) => {
+                        headers.insert(name.clone(), value.clone());
+                    }
+                    None => {
+                        headers.remove(name);
+                    }
+                }
+            }
+            return RestoredRequestHeadersView {
+                headers,
+                cache_key_ready_headers: HashSet::new(),
+            };
+        }
         let mut headers = ctx.headers.clone();
         let mut cache_key_ready_headers = HashSet::new();
         if let Some(serialized) = ctx.metadata.get(&self.meta_headers_snapshot)
@@ -1975,38 +2337,6 @@ impl ResponseCaching {
             cache_key_ready_headers,
         }
     }
-}
-
-/// Check if a cache key's path segment matches the invalidation path.
-///
-/// Cache key format: `proxy_id:host_hash:method:path:query_hash:consumer[:vary...]`.
-/// The `path` segment has any `:` percent-encoded (see
-/// [`encode_path_for_cache_key`]) so it cannot be confused with a structural
-/// delimiter. Returns true if the cached path equals the encoded `target_path`
-/// or starts with it as a proper path prefix (followed by `/`).
-fn cache_key_path_matches(cache_key: &str, target_path: &str) -> bool {
-    let after_proxy_id = match cache_key.find(':') {
-        Some(i) => &cache_key[i + 1..],
-        None => return false,
-    };
-    let after_host = match after_proxy_id.find(':') {
-        Some(i) => &after_proxy_id[i + 1..],
-        None => return false,
-    };
-    let after_method = match after_host.find(':') {
-        Some(i) => &after_host[i + 1..],
-        None => return false,
-    };
-    let cached_path = match after_method.find(':') {
-        Some(i) => &after_method[..i],
-        None => after_method,
-    };
-
-    let encoded_target = encode_path_for_cache_key(target_path);
-    let encoded_target = encoded_target.as_ref();
-    cached_path == encoded_target
-        || (cached_path.starts_with(encoded_target)
-            && cached_path.as_bytes().get(encoded_target.len()) == Some(&b'/'))
 }
 
 fn skip_etag_ows(bytes: &[u8], position: &mut usize) {
@@ -2139,6 +2469,18 @@ impl Plugin for ResponseCaching {
         true
     }
 
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        true
+    }
+
+    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        self.is_cacheable_method(&ctx.method)
+    }
+
+    fn needs_request_body_text(&self) -> bool {
+        false
+    }
+
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         // Skip body buffering for SSE requests (`Accept: text/event-stream`).
         // Buffering an unbounded event stream would collect frames until the
@@ -2163,6 +2505,11 @@ impl Plugin for ResponseCaching {
         // refuses to store a representation produced across a publication.
         // One ArcSwap load, memoized on the context for sibling instances.
         let policy_stamp = ctx.pin_response_policy_stamp().clone();
+        // The other provenance half, and the only one that is generation-local:
+        // it was copied from this request's own plugin-cache view before any
+        // plugin ran, so unlike the stamp above it cannot describe a generation
+        // other than the one whose transformer instances shape this response.
+        let presentation_digest = ctx.response_presentation_policy_digest;
 
         // Method safety is independent of storage eligibility (RFC 9111 §4.4 /
         // RFC 9110 §9.2.1). An unsafe method listed in `cacheable_methods`
@@ -2198,28 +2545,63 @@ impl Plugin for ResponseCaching {
         // before invoking `before_proxy` (zero-alloc when no plugin modifies
         // headers). The `headers` parameter is the single source of truth
         // during this phase.
-        let base_key = self.build_base_cache_key(ctx, headers);
+        // A request that carries a body has no complete partition here. The
+        // proxy must first observe the entire H1/H2/H3 upload and publish a
+        // private empty-body proof; method and framing headers alone cannot
+        // establish emptiness because H2/H3 GET/HEAD streams may carry DATA
+        // without Content-Length. The header check remains defense in depth
+        // for inconsistent or malformed framing views.
+        if !ctx.replay_request_body_empty_proven() || request_declares_body(headers) {
+            self.clear_lookup_staging(ctx);
+            self.set_cache_status(ctx, "BYPASS");
+            return PluginResult::Continue;
+        }
+
+        let base_key = match self.build_base_cache_key(ctx, headers) {
+            Ok(base_key) => base_key,
+            Err(refusal) => {
+                // Fail closed: without a complete, stable partition there is no
+                // key under which a retained representation can be proven to
+                // belong to this caller, so nothing is looked up and nothing is
+                // stored. The refusal's reason is a compiled-in static string
+                // and carries no caller, credential, or key material.
+                debug!(
+                    reason = refusal.reason(),
+                    "response_caching: bypassing without a complete replay partition for this \
+                     caller"
+                );
+                self.clear_lookup_staging(ctx);
+                self.set_cache_status(ctx, "BYPASS");
+                return PluginResult::Continue;
+            }
+        };
         ctx.metadata
             .insert(self.meta_base_key.clone(), base_key.clone());
+        // Stage the client-facing path this key was derived from. A
+        // route-dispatch rewrite is folded into `ctx.path` only after
+        // `before_proxy` returns, so the storage side must index the entry
+        // under this value rather than the then-current path — see
+        // `CACHE_LOOKUP_PATH_SUFFIX`.
+        ctx.metadata
+            .insert(self.meta_lookup_path.clone(), ctx.path.clone());
         self.stash_request_started_at(ctx, self.now_monotonic());
-        // Snapshot every header value that could end up in the cache key
-        // so `on_final_response_body` can rebuild the same key from
-        // metadata. The transformed `headers` view is only available
-        // during `before_proxy`; by storage time `on_final_response_body`
-        // has only `ctx.headers` (the original, untransformed map). Without
-        // this snapshot a request-side transformer that touches a
-        // configured `vary_by_headers` value, or rewrites `Host`, would
-        // make the lookup and storage keys disagree and cache every hit
-        // would miss.
+        // Preserve the complete backend-visible header view privately so
+        // `on_final_response_body` can key arbitrary origin-supplied Vary
+        // fields from the same values that reached the backend. A reduced,
+        // redaction-safe metadata snapshot also supports direct compatibility
+        // hook contexts. By storage time `ctx.headers` alone is the original,
+        // untransformed map.
         self.stash_request_headers_snapshot(ctx, headers);
 
         let mut vary_headers = self.cache_lookup_vary_headers(&base_key);
-        // A request that carries credentials/session headers must never probe
-        // the unvaried base key, even if this base key has only seen anonymous
-        // responses so far. Storage also merges these dimensions so the
-        // `vary_index` stays widened for future anonymous lookups.
-        self.merge_present_sensitive_vary_headers(&mut vary_headers, headers);
-        let cache_key = self.build_cache_key(ctx, &vary_headers, headers);
+        // Every internal key and every retained response uses the same fixed
+        // credential/session presence tuple. Ferrum's caller partition is not
+        // visible to downstream shared caches, so only adding a Vary name when
+        // the current request carries it would let an anonymous response omit
+        // `Vary` and be replayed downstream to a credentialed request.
+        self.merge_mandatory_sensitive_vary_headers(&mut vary_headers);
+        let cache_key =
+            self.extend_base_key_with_vary(base_key.clone(), &vary_headers, headers, None);
         // Store the full cache key (with Vary dimensions) so on_final_response_body
         // can mark the correct variant-specific key in the uncacheable predictor.
         ctx.metadata
@@ -2262,7 +2644,14 @@ impl Plugin for ResponseCaching {
             // identity. Pointer identity cannot collide or wrap, so a
             // representation is either provably current or refetched, never
             // stacked with a second pass of non-idempotent rules.
-            let stale_policy = entry.response_policy_stamp != policy_stamp;
+            //
+            // The generation digest is checked alongside it because the two are
+            // published at different points: an entry can carry the current
+            // publication identity yet have been shaped by an older plugin
+            // generation's rules/gate (GHSA-83rc-23c9-3g9x). Either half
+            // differing retires the entry.
+            let stale_policy = entry.response_policy_stamp != policy_stamp
+                || presentation_digest != Some(entry.response_presentation_digest);
             // Belt-and-braces companion to the store-side refusal: an entry
             // whose status has semantics this plugin does not implement is
             // never replayed, whatever produced it.
@@ -2279,7 +2668,8 @@ impl Plugin for ResponseCaching {
                     );
                 }
             } else {
-                debug!(cache_key = %cache_key, "response_caching: cache HIT");
+                // Never log the cache key: it is the replay partition itself.
+                debug!("response_caching: cache HIT");
 
                 if self.is_fresh_conditional_hit(headers, &entry) {
                     self.set_cache_status(ctx, "REVALIDATED");
@@ -2433,6 +2823,17 @@ impl Plugin for ResponseCaching {
             );
             return PluginResult::Continue;
         }
+        // Record the generation that actually shaped these bytes alongside the
+        // publication identity — the request kept its pinned plugin cache for
+        // its whole lifetime, so this digest is exact even when the stamp above
+        // belongs to a newer publication (GHSA-83rc-23c9-3g9x).
+        let Some(presentation_digest) = ctx.response_presentation_policy_digest else {
+            debug!(
+                "response_caching: presentation policy is unprovable, \
+                 skipping store of an unattributable representation"
+            );
+            return PluginResult::Continue;
+        };
         // Use the variant-specific predict key (set during before_proxy) for
         // predictor marking so that uncacheability of one Vary variant does not
         // suppress cache lookups for other variants of the same route.
@@ -2494,7 +2895,6 @@ impl Plugin for ResponseCaching {
             self.invalidate_zero_freshness_response(
                 &base_key,
                 predict_key.as_deref(),
-                ctx,
                 response_headers,
                 &lookup_headers,
             );
@@ -2553,14 +2953,18 @@ impl Plugin for ResponseCaching {
         // entry by the credential so two clients presenting different
         // credentials land on different cache entries.
         //
-        // Auto-merge every credential/session header the request carried
+        // Unconditionally merge every credential/session header name
         // (`authorization`, `proxy-authorization`, `cookie`) into the keyed
-        // Vary list. Operators don't need to remember to set
+        // Vary list. Presence remains a keyed bit, and present values remain
+        // hashed. Operators don't need to remember to set
         // `cache_key_include_consumer: true` or list these in
         // `vary_by_headers` — the safe default is to never share a cached
-        // response across distinct credentials or sessions. The merged list is
-        // sorted and re-stored in `vary_index` so the same dimension applies to
-        // every subsequent lookup at this base key.
+        // response across distinct credentials or sessions. Keeping the names
+        // on anonymous responses is also load-bearing: downstream shared caches
+        // cannot observe Ferrum's private caller partition and must receive the
+        // same `Vary` contract. The merged list is sorted and re-stored in
+        // `vary_index` so the same dimension applies to every subsequent lookup
+        // at this base key.
         //
         // This is complementary to the per-principal `consumer_part` in
         // `build_base_cache_key`: that isolates *authenticated* principals
@@ -2572,26 +2976,44 @@ impl Plugin for ResponseCaching {
         // `lookup_headers` was built above from
         // `restore_request_headers_view`: it layers `before_proxy`'s header
         // snapshot on top of `ctx.headers`, so configured `vary_by_headers`
-        // / `host` / the sensitive headers reflect the transformed values that
-        // were live during lookup. Response-added Vary headers fall back to
-        // `ctx.headers`, the same source any future lookup would use for them,
-        // so the lookup/storage symmetry holds for those too.
-        self.merge_present_sensitive_vary_headers(&mut vary_headers, &lookup_headers.headers);
-        debug_assert_eq!(
-            base_key,
-            self.build_base_cache_key(ctx, &lookup_headers.headers),
-            "response_caching base-key inputs must be reproduced by the request-header snapshot"
-        );
+        // / `host` / the sensitive headers and arbitrary response-added Vary
+        // fields all reflect the complete backend-visible view staged during
+        // lookup.
+        self.merge_mandatory_sensitive_vary_headers(&mut vary_headers);
+        // The base key is *read back* from this instance's staging, never
+        // recomputed here. `stash_request_headers_snapshot` deliberately stores
+        // credential/session values in their reduced `sha256-…` cache-key form
+        // so raw secrets never reach `ctx.metadata` (which is copied into
+        // transaction-log metadata), and the caller-authorization partition is
+        // derived from the *raw* credential material. Recomputing the base key
+        // from the restored view would therefore digest the reduced form and
+        // silently store under a key no lookup can ever produce. Staging the key
+        // at lookup time is what keeps the two provably identical.
 
         if body.len() > self.config.max_entry_size_bytes {
+            // Never emits the key: it is the replay partition itself.
             debug!(
-                base_key = %base_key,
                 body_size = body.len(),
                 max_size = self.config.max_entry_size_bytes,
                 "response_caching: response body exceeds max_entry_size_bytes, skipping cache"
             );
             return PluginResult::Continue;
         }
+
+        let invalidation_scope =
+            self.invalidation_scope(ctx, lookup_headers.headers.get("host").map(String::as_str));
+        // Index under the client-facing path staged at lookup, which is the
+        // same value the base key bound and the same value an unsafe method
+        // stages for the RFC 9111 §4.4 sweep. `ctx.path` may already carry a
+        // post-`before_proxy` route rewrite by now; indexing under that would
+        // make invalidation match nothing. Falls back to `ctx.path` only for
+        // direct hook contexts that never ran this instance's lookup.
+        let lookup_path = match ctx.metadata.get(&self.meta_lookup_path) {
+            Some(path) => path.as_str(),
+            None => ctx.path.as_str(),
+        };
+        let encoded_lookup_path = encode_path_for_cache_key(lookup_path);
+        let invalidation_path: Arc<str> = Arc::from(encoded_lookup_path.as_ref());
 
         // Copy the potentially large body before entering the publication
         // critical section. The final key and response Vary header cannot be
@@ -2608,10 +3030,12 @@ impl Plugin for ResponseCaching {
 
         let (cache_key, entry_size) = {
             // Lock ordering: acquire `accounting_lock` before mutating
-            // `cache`, `vary_index`, or `total_size`, and never acquire it
-            // while holding a DashMap entry guard. Cache-hit reads do not take
-            // this lock.
-            let _guard = self.accounting_guard();
+            // `cache`, `vary_index`, `total_size`, or any maintenance
+            // structure, and never acquire it while holding a DashMap entry
+            // guard. Cache-hit reads do not take this lock. Every operation
+            // performed under it is bounded: no full-map clone, sort, or scan.
+            let mut guard = self.accounting_guard();
+            let maintenance = &mut *guard;
 
             // Merge against the latest published dimensions while holding the
             // same lock that protects cache-key publication. A pre-lock
@@ -2640,11 +3064,11 @@ impl Plugin for ResponseCaching {
                 .as_ref()
                 .is_some_and(|previous| previous != &vary_headers)
             {
-                self.invalidate_base_key_locked(&base_key);
+                self.invalidate_base_key_locked(maintenance, &base_key);
             }
 
-            let cache_key = self.build_cache_key_with_ready_values(
-                ctx,
+            let cache_key = self.extend_base_key_with_vary(
+                base_key.clone(),
                 &vary_headers,
                 &lookup_headers.headers,
                 Some(&lookup_headers.cache_key_ready_headers),
@@ -2663,10 +3087,14 @@ impl Plugin for ResponseCaching {
                 stored_at: response_time_monotonic,
                 freshness_lifetime,
                 corrected_initial_age,
-                // `cache_key` is `base_key` plus an optional `:<vary>` suffix,
-                // so `base_key.len()` recovers this entry's base key.
+                // `cache_key` is `base_key` plus an optional separator + Vary
+                // digest, so `base_key.len()` recovers this entry's base key.
                 base_key_len: base_key.len(),
+                insert_seq: maintenance.next_seq(),
+                invalidation_scope,
+                invalidation_path,
                 response_policy_stamp: policy_stamp,
+                response_presentation_digest: presentation_digest,
             };
             let entry_size = entry.approx_size();
             let mut old_size = self
@@ -2682,14 +3110,14 @@ impl Plugin for ResponseCaching {
             if next_total > self.config.max_total_size_bytes
                 && entry_size <= self.config.max_total_size_bytes
             {
-                // The byte cap is the limiting dimension: reclaim expired
-                // entries before rejecting an otherwise eligible store.
-                // Stale entries must not trap the byte budget when the entry
-                // count never exceeded `max_entries` — the count-gated sweep
-                // in `evict_if_needed_locked` never runs for them. The reclaim
-                // may also collect the entry being replaced, so recompute both
+                // The byte cap is the limiting dimension: reclaim *expired*
+                // entries before refusing an otherwise eligible store. Stale
+                // entries must not trap the byte budget when the entry count
+                // never exceeded `max_entries` — the count-gated sweep in
+                // `evict_if_needed_locked` never runs for them. The reclaim may
+                // also collect the entry being replaced, so recompute both
                 // accounting inputs under the same lock.
-                self.reclaim_expired_locked();
+                self.reclaim_expired_for_byte_budget_locked(maintenance, response_time_monotonic);
                 old_size = self
                     .cache
                     .get(&cache_key)
@@ -2705,7 +3133,6 @@ impl Plugin for ResponseCaching {
                 || next_total > self.config.max_total_size_bytes
             {
                 debug!(
-                    cache_key = %cache_key,
                     current_total = current_total,
                     old_size = old_size,
                     entry_size = entry_size,
@@ -2716,20 +3143,9 @@ impl Plugin for ResponseCaching {
                 return PluginResult::Continue;
             }
 
-            if let Some(old) = self.cache.insert(cache_key.clone(), entry) {
-                debug_assert_eq!(
-                    old.approx_size(),
-                    old_size,
-                    "response_caching replacement size must match admitted old entry"
-                );
-            }
-            self.total_size.store(next_total, Ordering::Relaxed);
+            self.insert_entry_locked(maintenance, &base_key, cache_key.clone(), entry);
             self.vary_index.insert(base_key, vary_headers);
-            self.evict_if_needed_locked();
-            // The store above is the only path that grows `vary_index`; prune
-            // here so a high-cardinality principal stream can't leak it
-            // unboundedly.
-            self.prune_vary_index_locked();
+            self.evict_if_needed_locked(maintenance);
             (cache_key, entry_size)
         };
         // Response was cacheable; remove the exact cache key from the predictor
@@ -2737,8 +3153,9 @@ impl Plugin for ResponseCaching {
         // this instance's predict-key metadata is available.
         self.uncacheable_predictor.mark_cacheable(&cache_key);
 
+        // Never emits the cache key: it is the replay partition itself and
+        // encodes caller authorization and canonical caller context.
         debug!(
-            cache_key = %cache_key,
             entry_size = entry_size,
             freshness_lifetime_secs = freshness_lifetime.as_secs(),
             corrected_initial_age_secs = corrected_initial_age.as_secs(),
@@ -2762,11 +3179,19 @@ mod tests {
     }
 
     fn make_ctx(method: &str, path: &str) -> RequestContext {
-        RequestContext::new(
+        let mut ctx = RequestContext::new(
             "127.0.0.1".to_string(),
             method.to_string(),
             path.to_string(),
-        )
+        );
+        ctx.set_replay_request_body_empty_proven(true);
+        // Protocol entry paths copy the selected plugin-cache generation's
+        // presentation digest before any plugin runs. These inline cache tests
+        // exercise ordinary provable generations, so give every shared fixture
+        // the same deterministic witness instead of accidentally testing the
+        // fail-closed `None` path.
+        ctx.set_response_presentation_policy_digest(Some([0x51; 32]));
+        ctx
     }
 
     #[tokio::test]
@@ -2876,7 +3301,15 @@ mod tests {
         };
         assert!(!predict_key.contains(bearer));
         assert!(!predict_key.contains("reviewer-secret-token"));
-        assert!(predict_key.contains("authorization=sha256-"));
+        // Keys are opaque, fixed-length hex digests: a base-key digest, and for
+        // a varied variant a separator plus a Vary-tuple digest.
+        assert!(
+            predict_key
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == CACHE_KEY_VARY_SEPARATOR),
+            "cache key must be opaque hex"
+        );
+        let credential_free_predict_key = predict_key.clone();
 
         let mut response_headers = HashMap::new();
         response_headers.insert(
@@ -2896,7 +3329,23 @@ mod tests {
         let stored_key = &cache_keys[0];
         assert!(!stored_key.contains(bearer));
         assert!(!stored_key.contains("reviewer-secret-token"));
-        assert!(stored_key.contains("authorization=sha256-"));
+        assert_eq!(
+            stored_key, &credential_free_predict_key,
+            "lookup and storage must derive the same Vary-framed key"
+        );
+
+        // A different credential for the same target must not reach that entry.
+        let mut other = make_ctx("GET", "/api/public-auth");
+        other.headers.insert(
+            "authorization".to_string(),
+            "Bearer a-different-token".to_string(),
+        );
+        let mut other_headers = other.headers.clone();
+        let other_result = plugin.before_proxy(&mut other, &mut other_headers).await;
+        assert!(
+            matches!(other_result, PluginResult::Continue),
+            "a different credential must MISS, not replay"
+        );
     }
 
     #[tokio::test]
@@ -2935,8 +3384,22 @@ mod tests {
             "raw cookie leaked into cache key: {stored_key}"
         );
         assert!(
-            stored_key.contains("cookie=sha256-"),
-            "cookie was not auto-varied into the cache key: {stored_key}"
+            stored_key.contains(CACHE_KEY_VARY_SEPARATOR),
+            "cookie was not auto-varied into the cache key"
+        );
+
+        // A different session must not reach the stored entry.
+        let mut other = make_ctx("GET", "/dashboard");
+        other
+            .headers
+            .insert("cookie".to_string(), "session=other-secret".to_string());
+        let mut other_headers = other.headers.clone();
+        assert!(
+            matches!(
+                plugin.before_proxy(&mut other, &mut other_headers).await,
+                PluginResult::Continue
+            ),
+            "a different session cookie must MISS, not replay"
         );
     }
 
@@ -2971,23 +3434,30 @@ mod tests {
         let stored_key = &cache_keys[0];
         assert!(
             !stored_key.contains("alice@example.com"),
-            "raw identity leaked into cache key: {stored_key}"
+            "raw identity leaked into cache key"
         );
+
+        // A different principal on the same target must MISS: the caller
+        // partition is bound unconditionally, without `cache_key_include_consumer`.
+        let mut bob = make_ctx("GET", "/api/profile");
+        bob.authenticated_identity = Some("bob@example.com".to_string());
+        let mut bob_headers = bob.headers.clone();
         assert!(
-            stored_key.contains(&format!("sha256-{}", sha256_hex("alice@example.com"))),
-            "authenticated principal was not bound into the base key: {stored_key}"
+            matches!(
+                plugin.before_proxy(&mut bob, &mut bob_headers).await,
+                PluginResult::Continue
+            ),
+            "a different principal must MISS, not replay"
         );
     }
 
     #[tokio::test]
-    async fn vary_index_stays_bounded_under_high_principal_cardinality() {
-        // Binding the principal into the base key (the fix above) means each
-        // distinct identity gets its own base key — and `vary_index` is keyed
-        // by base key. `vary_index` was only ever pruned in
-        // `invalidate_base_key`, so a stream of distinct principals (JWT `sub`s,
-        // ephemeral SPIFFE IDs) would leak it without bound even though
-        // `self.cache` stays capped at `max_entries`. `prune_vary_index_locked`
-        // must reclaim mappings whose base key has no surviving cache variant.
+    async fn vary_index_is_reclaimed_exactly_under_high_principal_cardinality() {
+        // The caller partition gives each distinct identity its own base key,
+        // and `vary_index` is keyed by base key. Reclamation is now exact:
+        // a mapping is dropped the moment its last live variant is removed, so
+        // `vary_index.len()` can never exceed the number of live base keys —
+        // no heuristic slack, no full-cache prune sweep.
         let max_entries = 4;
         let plugin = plugin_with_config(json!({
             "ttl_seconds": 60,
@@ -2998,9 +3468,6 @@ mod tests {
         for i in 0..principals {
             let mut ctx = make_ctx("GET", "/api/profile");
             ctx.authenticated_identity = Some(format!("user-{i}"));
-            // A `cookie` makes the full key `base(principal):cookie=sha256-…`,
-            // so the base key is a strict prefix of the full key — this also
-            // exercises `base_key_len` slicing on a vary-suffixed key.
             ctx.headers
                 .insert("cookie".to_string(), "session=shared".to_string());
             let mut request_headers = ctx.headers.clone();
@@ -3016,33 +3483,17 @@ mod tests {
                 .await;
         }
 
-        // Cache is capped by eviction, and `vary_index` is reclaimed alongside
-        // it — not left at `principals` (40) entries as it would be without the
-        // prune. Distinct live base keys can never exceed the live cache.
-        //
-        // `== max_entries` (not `<=`): 40 distinct non-expiring entries must
-        // pin the cache exactly at its cap, which also proves the responses
-        // were actually stored — otherwise the `vary_index` bounds below would
-        // pass vacuously.
         assert_eq!(
             plugin.cache.len(),
             max_entries,
             "expected the cache pinned at max_entries; got {}",
             plugin.cache.len()
         );
-        let max_vary_index_entries =
-            plugin.cache.len() + vary_index_prune_slack(plugin.cache.len());
         assert!(
-            plugin.vary_index.len() <= max_vary_index_entries,
-            "vary_index leaked past cache+slack bound ({}): {} entries — prune_vary_index_locked did not reclaim stale base keys",
-            max_vary_index_entries,
-            plugin.vary_index.len()
-        );
-        assert!(
-            plugin.vary_index.len() <= max_entries + vary_index_prune_slack(max_entries),
-            "vary_index ({}) outgrew max_entries plus prune slack ({})",
+            plugin.vary_index.len() <= plugin.cache.len(),
+            "vary_index ({}) must never exceed the live base-key count ({})",
             plugin.vary_index.len(),
-            max_entries + vary_index_prune_slack(max_entries)
+            plugin.cache.len()
         );
     }
 
@@ -3078,45 +3529,6 @@ mod tests {
         let colon = encode_path_for_cache_key("/users:1/details");
         let pct = encode_path_for_cache_key("/users%3A1/details");
         assert_ne!(colon.as_ref(), pct.as_ref());
-    }
-
-    #[test]
-    fn cache_key_path_matches_handles_paths_containing_colons() {
-        // Build cache_key the same way build_base_cache_key does, with the
-        // path segment percent-encoded. The matcher must accept the same
-        // unencoded path as the invalidation target.
-        let cache_key = format!(
-            "proxy:host:GET:{}:q=1:_anon",
-            encode_path_for_cache_key("/users:1/details")
-        );
-        assert!(cache_key_path_matches(&cache_key, "/users:1/details"));
-    }
-
-    #[test]
-    fn cache_key_path_matches_unrelated_short_path_does_not_match_longer_colon_path() {
-        // `/users` must NOT match a cached entry for `/users:1/details` —
-        // the old colon-truncating matcher returned `/users` as the cached
-        // path and wrongly matched on equality.
-        let cache_key = format!(
-            "proxy:host:GET:{}:q=1:_anon",
-            encode_path_for_cache_key("/users:1/details")
-        );
-        assert!(!cache_key_path_matches(&cache_key, "/users"));
-    }
-
-    #[test]
-    fn cache_key_path_matches_targeted_colon_path_does_not_match_unrelated_short_cache() {
-        // Conversely, `/users:1/details` must NOT invalidate a cached
-        // entry for `/users` (no false-positive prefix expansion through
-        // the colon).
-        let cache_key = "proxy:host:GET:/users:q=1:_anon".to_string();
-        assert!(!cache_key_path_matches(&cache_key, "/users:1/details"));
-    }
-
-    #[test]
-    fn cache_key_path_matches_proper_path_prefix_with_trailing_slash_still_works() {
-        let cache_key = "proxy:host:GET:/api/items/42:q=1:_anon".to_string();
-        assert!(cache_key_path_matches(&cache_key, "/api/items"));
     }
 
     #[tokio::test]
@@ -3223,9 +3635,24 @@ mod tests {
             .get(&plugin.meta_predict_key)
             .expect("predict_key stored")
             .clone();
-        assert!(
-            predict_key.contains("x-tenant=acme"),
-            "lookup key must carry the transformer-injected tenant: {predict_key}"
+        // The key is an opaque digest, so the binding is proven by behavior:
+        // the same request without the injected tenant must derive a different
+        // key (asserted below against the stored key).
+        let baseline = {
+            let mut plain_ctx = make_ctx("GET", "/api/items");
+            let mut plain_headers = plain_ctx.headers.clone();
+            plugin
+                .before_proxy(&mut plain_ctx, &mut plain_headers)
+                .await;
+            plain_ctx
+                .metadata
+                .get(&plugin.meta_predict_key)
+                .expect("predict_key stored")
+                .clone()
+        };
+        assert_ne!(
+            predict_key, baseline,
+            "lookup key must carry the transformer-injected tenant"
         );
 
         let mut response_headers = HashMap::new();
@@ -3239,16 +3666,80 @@ mod tests {
 
         let cache_keys: Vec<String> = plugin.cache.iter().map(|e| e.key().clone()).collect();
         assert_eq!(cache_keys.len(), 1);
-        assert!(
-            cache_keys[0].contains("x-tenant=acme"),
-            "storage key must carry the transformer-injected tenant — \
-             otherwise the next identical request will miss: {}",
-            cache_keys[0]
-        );
         assert_eq!(
             predict_key, cache_keys[0],
             "lookup and storage keys must be identical when no Vary \
              header is added by the response"
+        );
+    }
+
+    #[tokio::test]
+    async fn origin_vary_uses_complete_backend_visible_header_view() {
+        // The origin can name a header the operator did not preconfigure in
+        // `vary_by_headers`. Storage must still use the transformed value sent
+        // upstream, never the original client value retained in `ctx.headers`.
+        let plugin = plugin_with_config(json!({"ttl_seconds": 60}));
+
+        let mut store_ctx = make_ctx("GET", "/api/origin-vary");
+        store_ctx
+            .headers
+            .insert("x-origin-vary".to_string(), "client-a".to_string());
+        let mut store_headers = store_ctx.headers.clone();
+        store_headers.insert("x-origin-vary".to_string(), "backend-tenant-a".to_string());
+        assert!(matches!(
+            plugin
+                .before_proxy(&mut store_ctx, &mut store_headers)
+                .await,
+            PluginResult::Continue
+        ));
+
+        let response_headers = HashMap::from([
+            (
+                "cache-control".to_string(),
+                "public, max-age=60".to_string(),
+            ),
+            ("vary".to_string(), "X-Origin-Vary".to_string()),
+        ]);
+        plugin
+            .on_final_response_body(&mut store_ctx, 200, &response_headers, b"tenant-a-response")
+            .await;
+
+        // If storage incorrectly used the original `client-a` value, this
+        // request would replay tenant A even though its backend-visible value
+        // belongs to a different partition.
+        let mut cross_ctx = make_ctx("GET", "/api/origin-vary");
+        cross_ctx
+            .headers
+            .insert("x-origin-vary".to_string(), "different-client".to_string());
+        let mut cross_headers = cross_ctx.headers.clone();
+        cross_headers.insert("x-origin-vary".to_string(), "client-a".to_string());
+        assert!(
+            matches!(
+                plugin
+                    .before_proxy(&mut cross_ctx, &mut cross_headers)
+                    .await,
+                PluginResult::Continue
+            ),
+            "a transformed value matching another request's original value must not cross-hit"
+        );
+
+        let mut hit_ctx = make_ctx("GET", "/api/origin-vary");
+        hit_ctx
+            .headers
+            .insert("x-origin-vary".to_string(), "third-client".to_string());
+        let mut hit_headers = hit_ctx.headers.clone();
+        hit_headers.insert("x-origin-vary".to_string(), "backend-tenant-a".to_string());
+        let hit = plugin.before_proxy(&mut hit_ctx, &mut hit_headers).await;
+        assert!(
+            matches!(
+                hit,
+                PluginResult::RejectBinary {
+                    status_code: 200,
+                    ref body,
+                    ..
+                } if body.as_ref() == b"tenant-a-response"
+            ),
+            "the same backend-visible value must select the stored representation"
         );
     }
 
