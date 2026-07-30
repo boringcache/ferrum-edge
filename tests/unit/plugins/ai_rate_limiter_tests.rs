@@ -2653,9 +2653,8 @@ async fn total_count_mode_sums_prompt_and_completion() {
 
 #[tokio::test]
 async fn prompt_estimate_covers_system_prompt_input_and_tools_fields() {
-    // `prompt_character_count` accumulates across the shared billed field set.
-    // Use prompt_tokens mode and a body that exercises system/prompt/input/
-    // contents/tools together so their character counts sum into the reservation.
+    // Whole-body prompt walk accumulates string values under system/prompt/input/
+    // contents/tools together into the reservation.
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 100_000,
@@ -2696,12 +2695,10 @@ async fn prompt_estimate_covers_system_prompt_input_and_tools_fields() {
 }
 
 #[tokio::test]
-async fn prompt_estimate_falls_back_to_whole_body_when_no_billed_fields() {
-    // When an LLM-shaped body uses none of the enumerated billed prompt fields,
-    // the estimate falls back to counting the whole JSON body's string values
-    // (minus the max_* keys). A Responses continuation (`previous_response_id` —
-    // a strong AI-request marker, but not a billed prompt field) exercises that
-    // fallback branch while still passing the LLM-shape gate.
+async fn prompt_estimate_counts_ai_marker_outside_common_prompt_containers() {
+    // An LLM-shaped body whose only string text sits under an AI marker that is
+    // not a common prompt container (Responses continuation `previous_response_id`)
+    // must still reserve via the whole-body string walk.
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 100_000,
@@ -2718,9 +2715,7 @@ async fn prompt_estimate_falls_back_to_whole_body_when_no_billed_fields() {
     ctx.method = "POST".to_string();
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
-    // `previous_response_id` is a strong AI-request marker but is NOT among the
-    // billed prompt fields, so the estimate falls back to counting the whole
-    // body's string values (minus the max_* keys): 7 chars -> ceil(7/4) = 2.
+    // 7 chars -> ceil(7/4) = 2.
     ctx.metadata.insert(
         "request_body".to_string(),
         serde_json::to_string(&json!({"previous_response_id": "yyyyyyy"})).unwrap(),
@@ -2731,7 +2726,7 @@ async fn prompt_estimate_falls_back_to_whole_body_when_no_billed_fields() {
     assert_eq!(
         reserved_tokens(&ctx),
         2,
-        "estimate falls back to counting the whole body's string values"
+        "estimate must count string values under AI markers via the whole-body walk"
     );
 }
 
@@ -2938,11 +2933,11 @@ async fn prose_starting_with_data_prefix_is_counted_not_treated_as_data_url() {
     );
 }
 
-// ─── Sibling-exhaustive prompt reservation (GHSA-2r5g-438w-85hr) ─────────────
+// ─── Fail-closed whole-body prompt reservation (GHSA-2r5g-438w-85hr) ──────────
 //
-// Pre-dispatch estimation must sum every applicable billed sibling even when
-// another recognized field already contributed text. These tests drive the
-// public `before_proxy` surface in `prompt_tokens` mode.
+// Pre-dispatch estimation walks every string value in the request JSON once so
+// a present recognized field cannot suppress unknown (or known) billed siblings.
+// These tests drive the public `before_proxy` surface in `prompt_tokens` mode.
 
 /// Reserved prompt-token estimate for `body` under an isolated
 /// `prompt_tokens`-mode limiter with a budget far above any test request.
@@ -3061,7 +3056,7 @@ async fn prompt_estimate_sums_cohere_preamble_and_documents_with_message() {
 
 #[tokio::test]
 async fn prompt_estimate_counts_titan_input_text_and_bedrock_system() {
-    // Titan `inputText` is a billed field in its own right (not whole-body-only).
+    // Titan `inputText` is counted by the whole-body walk.
     assert_eq!(
         prompt_tokens_reserved(json!({
             "inputText": "0123456789abcdef0123456789abcdef" // 32 chars
@@ -3070,9 +3065,8 @@ async fn prompt_estimate_counts_titan_input_text_and_bedrock_system() {
         8
     );
 
-    // TGI `inputs` likewise reserves from the enumerated set even when another
-    // billed sibling (`tools`) is present — it must not depend on the zero-sum
-    // whole-body fallback.
+    // TGI `inputs` likewise reserves alongside another textual sibling (`tools`)
+    // — the recognized tools field must not hide the inputs prompt.
     let tools_only = prompt_tokens_reserved(json!({
         "tools": [{"name": "abcd"}]
     }))
@@ -3227,9 +3221,39 @@ async fn concurrent_sibling_heavy_requests_cannot_oversubscribe_on_omitted_instr
         + u8::from(matches!(&result_b, PluginResult::Reject { .. }));
 
     // If instructions were omitted, each request would reserve ~1 token and both
-    // would fit. Exhaustive sibling counting makes only one fit.
+    // would fit. Fail-closed whole-body counting makes only one fit.
     assert_eq!(allowed, 1, "only one sibling-heavy reservation should fit");
     assert_eq!(rejected, 1, "the second sibling-heavy request must be rejected");
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_unknown_textual_sibling_alongside_recognized_field() {
+    // GHSA-2r5g-438w-85hr root finding: a non-empty recognized prompt field must
+    // not hide provider-native billed text under an unknown top-level sibling.
+    // The whole-body walk must increase the reservation by the unknown text.
+    let recognized_only = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}]
+    }))
+    .await;
+    let unknown_sibling = "0123456789abcdef0123456789abcdef"; // 32 chars
+    let with_unknown = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "provider_native_prompt_extension": unknown_sibling
+    }))
+    .await;
+
+    assert!(
+        with_unknown > recognized_only,
+        "unknown textual sibling must increase the reservation when a recognized \
+         field is already non-empty (got {with_unknown}, recognized-only {recognized_only})"
+    );
+    assert_eq!(
+        with_unknown - recognized_only,
+        8,
+        "unknown sibling delta must be exactly ceil(32/4)=8 tokens"
+    );
 }
 
 #[tokio::test]
@@ -4249,10 +4273,11 @@ async fn federation_usageless_response_kept_when_guard_rejects() {
 // Azure's "On Your Data" / extensions API attaches a per-data-source system
 // instruction (`data_sources[].parameters.role_information`, or the legacy
 // camelCase `dataSources[].parameters.roleInformation`). That text is sent to the
-// model and billed as input but is not part of `messages`/`system`/etc., so the
-// pre-reservation prompt estimate must add it. These tests drive the public
-// `before_proxy` surface in `prompt_tokens` mode and read the reserved estimate,
-// asserting the delta equals exactly the instruction text (and nothing else).
+// model and billed as input. The whole-body walk counts it once alongside
+// `messages` (no separate add path — that would double-count). These tests drive
+// the public `before_proxy` surface in `prompt_tokens` mode and compare a
+// connection-fields-only data-source baseline against the same shape with
+// `role_information` so the reserved delta equals the instruction text.
 
 /// A minimal Azure chat-completions request. The `messages` content is `"abcd"`
 /// (4 chars); together with the `"user"` role value the recognized prompt fields
@@ -4300,22 +4325,23 @@ async fn azure_reserved(body: serde_json::Value) -> u64 {
 #[tokio::test]
 async fn prompt_estimate_counts_azure_on_your_data_role_information() {
     // Current chat-completions data plane: snake_case `data_sources` /
-    // `role_information`. The instruction must be counted, while the surrounding
-    // endpoint / index / key fields (which are NOT prompt input) must not be — the
-    // delta equals exactly the instruction text.
+    // `role_information`. Compare against the same connection-field shape so the
+    // delta isolates the instruction (endpoint/index/key strings are already in
+    // the baseline and therefore cancel out of the delta).
     let instruction = "You are a helpful assistant answering only from the indexed docs.";
-    let reserved_base = azure_reserved(azure_base_messages()).await;
-
-    let mut with = azure_base_messages();
-    with["data_sources"] = json!([{
+    let mut baseline = azure_base_messages();
+    baseline["data_sources"] = json!([{
         "type": "azure_search",
         "parameters": {
             "endpoint": "https://example.search.windows.net",
             "index_name": "contoso-products-index-name-not-prompt-input",
-            "authentication": {"type": "api_key", "key": "super-secret-key-not-prompt-input"},
-            "role_information": instruction
+            "authentication": {"type": "api_key", "key": "super-secret-key-not-prompt-input"}
         }
     }]);
+    let reserved_base = azure_reserved(baseline.clone()).await;
+
+    let mut with = baseline;
+    with["data_sources"][0]["parameters"]["role_information"] = json!(instruction);
     let reserved_with = azure_reserved(with).await;
 
     let instruction_tokens = (instruction.chars().count() as u64).div_ceil(4);
@@ -4326,8 +4352,7 @@ async fn prompt_estimate_counts_azure_on_your_data_role_information() {
     assert_eq!(
         reserved_with - reserved_base,
         instruction_tokens,
-        "only the role_information text should be added; endpoint/index/key fields \
-         are not prompt input and must be excluded"
+        "role_information must be counted once; delta isolates the instruction text"
     );
 }
 
@@ -4335,19 +4360,20 @@ async fn prompt_estimate_counts_azure_on_your_data_role_information() {
 async fn prompt_estimate_counts_azure_extensions_api_role_information_camelcase() {
     // The original extensions API used camelCase for BOTH the outer array
     // (`dataSources`) and the inner field (`roleInformation`); both casings must be
-    // recognized.
+    // recognized by the whole-body walk.
     let instruction = "Answer in formal English and cite the source document id.";
-    let reserved_base = azure_reserved(azure_base_messages()).await;
-
-    let mut with = azure_base_messages();
-    with["dataSources"] = json!([{
+    let mut baseline = azure_base_messages();
+    baseline["dataSources"] = json!([{
         "type": "AzureCognitiveSearch",
         "parameters": {
             "endpoint": "https://example.search.windows.net",
-            "indexName": "contoso-index",
-            "roleInformation": instruction
+            "indexName": "contoso-index"
         }
     }]);
+    let reserved_base = azure_reserved(baseline.clone()).await;
+
+    let mut with = baseline;
+    with["dataSources"][0]["parameters"]["roleInformation"] = json!(instruction);
     let reserved_with = azure_reserved(with).await;
 
     let instruction_tokens = (instruction.chars().count() as u64).div_ceil(4);
@@ -4357,22 +4383,21 @@ async fn prompt_estimate_counts_azure_extensions_api_role_information_camelcase(
 
 #[tokio::test]
 async fn prompt_estimate_does_not_short_circuit_on_empty_role_information() {
-    // `Value::as_str("")` is `Some("")` (not `None`), so an `or_else`-style lookup
-    // that stops at the first present key would be fooled by an empty
-    // `role_information` decoy and never count a real `roleInformation` sibling.
-    // Both inner casings must be summed independently. (Both keys on one source is
-    // a synthetic, defensive shape — real requests carry one casing.)
+    // Distinct Azure role-information casings are distinct JSON keys, so an empty
+    // `role_information` decoy cannot hide a real `roleInformation` sibling under
+    // the whole-body walk (each string value is visited independently).
     let instruction = "Stay strictly within the retrieved enterprise knowledge base.";
-    let reserved_base = azure_reserved(azure_base_messages()).await;
-
-    let mut with = azure_base_messages();
-    with["data_sources"] = json!([{
+    let mut baseline = azure_base_messages();
+    baseline["data_sources"] = json!([{
         "type": "azure_search",
         "parameters": {
-            "role_information": "",
-            "roleInformation": instruction
+            "role_information": ""
         }
     }]);
+    let reserved_base = azure_reserved(baseline.clone()).await;
+
+    let mut with = baseline;
+    with["data_sources"][0]["parameters"]["roleInformation"] = json!(instruction);
     let reserved_with = azure_reserved(with).await;
 
     let instruction_tokens = (instruction.chars().count() as u64).div_ceil(4);
@@ -4388,23 +4413,23 @@ async fn prompt_estimate_does_not_short_circuit_on_empty_role_information() {
 async fn prompt_estimate_counts_whitespace_role_information_without_hiding_sibling() {
     // Whitespace is literal prompt input (sent and billed), so a whitespace-only
     // value is counted as its characters rather than trimmed away — and, like the
-    // empty-string case, it must not short-circuit a real sibling in the other
-    // casing.
+    // empty-string case, it must not hide a real sibling in the other casing.
     let whitespace = "   "; // 3 chars: neither None nor empty.
     let instruction = "Respond concisely.";
-    let reserved_base = azure_reserved(azure_base_messages()).await;
-
-    let mut with = azure_base_messages();
-    with["data_sources"] = json!([{
+    let mut baseline = azure_base_messages();
+    baseline["data_sources"] = json!([{
         "type": "azure_search",
         "parameters": {
-            "role_information": whitespace,
-            "roleInformation": instruction
+            "role_information": whitespace
         }
     }]);
+    let reserved_base = azure_reserved(baseline.clone()).await;
+
+    let mut with = baseline;
+    with["data_sources"][0]["parameters"]["roleInformation"] = json!(instruction);
     let reserved_with = azure_reserved(with).await;
 
-    let added_chars = (whitespace.chars().count() + instruction.chars().count()) as u64;
+    let added_chars = instruction.chars().count() as u64;
     assert!(
         reserved_with > reserved_base,
         "the real instruction must be counted alongside a whitespace decoy"
@@ -4414,28 +4439,27 @@ async fn prompt_estimate_counts_whitespace_role_information_without_hiding_sibli
 
 #[tokio::test]
 async fn prompt_estimate_counts_role_information_on_non_first_data_source() {
-    // The instruction can live on any data source, not just the first; the estimate
-    // must enumerate every entry in the array.
+    // The instruction can live on any data source, not just the first; the
+    // whole-body walk enumerates every entry in the array.
     let instruction = "Prefer the most recently updated document when sources conflict.";
-    let reserved_base = azure_reserved(azure_base_messages()).await;
-
-    let mut with = azure_base_messages();
-    with["data_sources"] = json!([
-        // First source carries no role_information (only connection fields).
+    let mut baseline = azure_base_messages();
+    baseline["data_sources"] = json!([
         {
             "type": "azure_search",
             "parameters": {"endpoint": "https://a.search.windows.net", "index_name": "first"}
         },
-        // The instruction is on the SECOND source.
         {
             "type": "azure_search",
             "parameters": {
                 "endpoint": "https://b.search.windows.net",
-                "index_name": "second",
-                "role_information": instruction
+                "index_name": "second"
             }
         }
     ]);
+    let reserved_base = azure_reserved(baseline.clone()).await;
+
+    let mut with = baseline;
+    with["data_sources"][1]["parameters"]["role_information"] = json!(instruction);
     let reserved_with = azure_reserved(with).await;
 
     let instruction_tokens = (instruction.chars().count() as u64).div_ceil(4);
@@ -4447,21 +4471,18 @@ async fn prompt_estimate_counts_role_information_on_non_first_data_source() {
 }
 
 #[tokio::test]
-async fn prompt_estimate_preserves_whole_body_fallback_prompt_with_role_information() {
-    // Regression guard (Codex P2 on #1942): fields like TGI/HuggingFace `inputs`
-    // are AI markers but are NOT summed by the recognized-field pass, so their
-    // prompt text is captured only by the zero-char whole-body fallback. Counting
-    // `role_information` must NOT make the recognized-field total nonzero and
-    // short-circuit that fallback — doing so would drop the real `inputs` prompt
-    // and reserve only the short instruction.
-    let inputs = "a".repeat(400); // real prompt text, counted only via the fallback
+async fn prompt_estimate_counts_inputs_prompt_with_role_information() {
+    // TGI/HuggingFace `inputs` and Azure `role_information` are both string values
+    // under the whole-body walk. Adding role_information must not drop or replace
+    // the `inputs` prompt — both contribute, and neither is double-counted.
+    let inputs = "a".repeat(400);
     let instruction = "Be terse.";
 
     let mut body = json!({ "inputs": inputs });
     let reserved_inputs_only = azure_reserved(body.clone()).await;
     assert!(
         reserved_inputs_only > 0,
-        "the `inputs` prompt must be counted via the whole-body fallback"
+        "the `inputs` prompt must be counted by the whole-body walk"
     );
 
     body["data_sources"] = json!([{
@@ -4470,12 +4491,9 @@ async fn prompt_estimate_preserves_whole_body_fallback_prompt_with_role_informat
     }]);
     let reserved_with_role = azure_reserved(body).await;
 
-    // The fallback still walks the whole body, so the full `inputs` prompt remains
-    // counted (now alongside the instruction) — the estimate must not collapse to
-    // just the instruction.
     assert!(
         reserved_with_role >= reserved_inputs_only,
-        "role_information must not drop the fallback-counted `inputs` prompt \
+        "role_information must not drop the `inputs` prompt \
          (got {reserved_with_role}, inputs-only was {reserved_inputs_only})"
     );
 }

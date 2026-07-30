@@ -39,8 +39,7 @@ use std::time::Instant;
 use tracing::{debug, warn};
 
 use super::utils::ai_providers::{
-    AiProvider, AiTokenUsage, BILLED_PROMPT_TEXT_FIELDS, detect_response_provider,
-    extract_response_usage, parse_ai_provider,
+    AiProvider, AiTokenUsage, detect_response_provider, extract_response_usage, parse_ai_provider,
 };
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::rate_limit::{
@@ -1272,106 +1271,18 @@ fn estimate_prompt_tokens(json: &Value) -> u64 {
 ///
 /// # Estimator contract
 ///
-/// Sums string text under every applicable billed sibling in
-/// [`BILLED_PROMPT_TEXT_FIELDS`] (OpenAI Chat/`messages`, Responses
-/// `input`+`instructions`, Gemini `contents`+`systemInstruction`, Cohere
-/// `message`/`chat_history`/`preamble`/`documents`, TGI `inputs`, Titan
-/// `inputText`, Anthropic/Bedrock `system`, tool schemas, RAG fields, …)
-/// without short-circuiting once one recognized field contributes. A present
-/// `input` therefore still reserves `instructions`; a present `contents`
-/// still reserves `systemInstruction`. Alias pairs are counted independently
-/// when both appear (conservative over-reservation; never silent omission).
+/// Walks every string value in the already-parsed request JSON once via
+/// [`string_value_character_count`]. That single pass covers known billed
+/// fields and unknown provider-native textual siblings alike — a present
+/// recognized field never suppresses an unknown sibling, and each JSON string
+/// value is counted at most once (distinct alias keys over-reserve rather than
+/// omit). Token-cap fields, multimodal binary/base64 subtrees, binary Anthropic
+/// `source` blocks, and well-formed `data:` URLs remain excluded by the walker.
 ///
-/// Azure "On Your Data" `role_information` is added on top when any billed
-/// field contributed text. When the enumerated subtotal is zero, the whole
-/// JSON body is walked once as a fail-closed fallback for unexpected
-/// provider-native shapes (or AI markers whose only text lives outside the
-/// list); that walk already includes Azure role text, so the targeted add is
-/// skipped to avoid double-counting.
-///
-/// Multimodal binary/base64 payloads under known keys and well-formed `data:`
-/// URLs remain excluded by [`string_value_character_count`]. Unknown top-level
-/// keys that coexist with a non-zero enumerated subtotal are not scanned —
-/// operators who need fail-closed rejection of unknown request shapes should
-/// use `ai_request_guard` `strict_schema`. The hot path is a bounded top-level
-/// field walk (no unbounded recursion beyond the request JSON the caller
-/// already parsed, no cloning, no locks).
+/// The hot path is allocation-light: no cloning, locks, or per-request key sets;
+/// recursion is bounded by the request JSON the caller already parsed.
 fn prompt_character_count(json: &Value) -> u64 {
-    let mut chars = 0_u64;
-
-    for field in BILLED_PROMPT_TEXT_FIELDS {
-        if let Some(value) = json.get(*field) {
-            chars = chars.saturating_add(string_value_character_count(value));
-        }
-    }
-
-    if chars == 0 {
-        // No enumerated billed field carried text. Fall back to counting the
-        // whole body so unexpected provider-native shapes (or AI markers whose
-        // only text sits outside the list) still reserve. That walk already
-        // includes any `data_sources` / `dataSources` role_information, so the
-        // targeted add below is gated behind this early return: counting it
-        // again would double it, and making `chars` nonzero here would skip the
-        // fallback and drop the real prompt.
-        return string_value_character_count(json);
-    }
-
-    // Azure OpenAI "On Your Data" carries a per-data-source system instruction in
-    // `data_sources[].parameters.role_information` (current chat-completions data
-    // plane) / `dataSources[].parameters.roleInformation` (the original
-    // extensions-API camelCase). That text is sent to the model and billed as
-    // input, but it is not part of any enumerated field above. A billed field
-    // DID contribute (we are past the zero-char fallback), so add the instruction
-    // text explicitly — otherwise an On Your Data request (which always carries
-    // `messages`) would never count it and the reservation would under-estimate
-    // the prompt the backend bills.
-    chars.saturating_add(count_data_source_role_information(json))
-}
-
-/// The data-source entries of an Azure OpenAI "On Your Data" request, across both
-/// the current chat-completions casing (`data_sources`) and the original
-/// extensions-API camelCase (`dataSources`). Both keys are scanned and their
-/// arrays concatenated rather than `or_else`-chained, so a body carrying one
-/// casing — or, defensively, both — is fully enumerated. Non-array values (and
-/// absent keys) yield nothing.
-fn azure_data_source_items(json: &Value) -> impl Iterator<Item = &Value> {
-    ["data_sources", "dataSources"]
-        .into_iter()
-        .filter_map(move |key| json.get(key))
-        .filter_map(Value::as_array)
-        .flatten()
-}
-
-/// The `role_information` instruction string(s) for one data-source entry, across
-/// both the current `role_information` and the legacy `roleInformation` field
-/// casings. Every present key is yielded independently — we deliberately do NOT
-/// fold to the first present key with `or_else`, because `Value::as_str` on an
-/// empty string returns `Some("")` (not `None`), so an `or_else` chain would stop
-/// at a decoy `role_information: ""` and never see a real `roleInformation`
-/// sibling. Non-string values are skipped.
-fn azure_role_information_values(item: &Value) -> impl Iterator<Item = &str> {
-    item.get("parameters").into_iter().flat_map(|parameters| {
-        ["role_information", "roleInformation"]
-            .into_iter()
-            .filter_map(move |key| parameters.get(key))
-            .filter_map(Value::as_str)
-    })
-}
-
-/// Total characters of every Azure "On Your Data" `role_information` instruction
-/// in the request. This text is sent to the model and billed as input but is not
-/// part of any field in [`BILLED_PROMPT_TEXT_FIELDS`], so it is counted
-/// here. Only the instruction text is summed — the surrounding `endpoint`,
-/// `index_name`, and key/secret fields under `parameters` are intentionally left
-/// out (they are not prompt input, and counting them would inflate the estimate).
-fn count_data_source_role_information(json: &Value) -> u64 {
-    let mut chars = 0_u64;
-    for item in azure_data_source_items(json) {
-        for text in azure_role_information_values(item) {
-            chars = chars.saturating_add(text.chars().count() as u64);
-        }
-    }
-    chars
+    string_value_character_count(json)
 }
 
 /// Object keys whose values carry binary/non-text payloads (base64 image,

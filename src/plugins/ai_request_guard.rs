@@ -227,10 +227,6 @@ const TOP_LEVEL_PROMPT_FIELDS: &[&str] = &[
     "preamble",
     "context",
 ];
-// Keep this list aligned with `crate::plugins::utils::ai_providers::BILLED_PROMPT_TEXT_FIELDS`
-// (plus the container / RAG / tools walks in `count_prompt_characters`). The rate
-// limiter reserves from that shared field set; drifting here re-opens sibling
-// under-count gaps between guard caps and pre-dispatch estimates.
 
 /// Action to take when max_tokens exceeds the limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
