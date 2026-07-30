@@ -849,7 +849,7 @@ fn test_terminate_mode() {
 }
 
 #[test]
-fn test_pre_proxy_mode_modifies_headers() {
+fn test_pre_proxy_mode_uses_finalized_header_overlay() {
     let plugin = ServerlessFunction::new(
         &json!({
             "provider": "azure_functions",
@@ -860,7 +860,8 @@ fn test_pre_proxy_mode_modifies_headers() {
     )
     .unwrap();
 
-    assert!(plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_headers());
+    assert!(plugin.dispatches_finalized_request_egress());
 }
 
 // ---------------------------------------------------------------------------
@@ -932,8 +933,9 @@ fn test_default_mode_is_pre_proxy() {
     )
     .unwrap();
 
-    // Default mode is pre_proxy which modifies request headers
-    assert!(plugin.modifies_request_headers());
+    // Default mode is pre_proxy, dispatched through finalized request egress.
+    assert!(!plugin.modifies_request_headers());
+    assert!(plugin.dispatches_finalized_request_egress());
 }
 
 #[test]

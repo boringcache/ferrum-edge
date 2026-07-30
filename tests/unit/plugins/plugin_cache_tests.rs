@@ -58,6 +58,39 @@ async fn finalized_egress(
     result
 }
 
+async fn run_finalized_egress_chain(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) -> PluginResult {
+    let body: Vec<u8> = ctx
+        .request_body_bytes
+        .as_ref()
+        .map(|body| body.to_vec())
+        .or_else(|| {
+            ctx.metadata
+                .get("request_body")
+                .map(|body| body.as_bytes().to_vec())
+        })
+        .unwrap_or_default();
+    let snapshot = headers.clone();
+    let mut overlay = HashMap::new();
+    for plugin in plugins {
+        if !plugin.dispatches_finalized_request_egress() {
+            continue;
+        }
+        let result = plugin
+            .dispatch_finalized_request_egress(ctx, &snapshot, &body, &mut overlay)
+            .await;
+        if !matches!(result, PluginResult::Continue) {
+            headers.extend(overlay);
+            return result;
+        }
+    }
+    headers.extend(overlay);
+    PluginResult::Continue
+}
+
 struct LegacyAuthorizePlugin;
 
 #[async_trait::async_trait]
@@ -3162,9 +3195,10 @@ async fn serverless_instances_keep_independent_transaction_metadata() {
         "GET".to_string(),
         "/api".to_string(),
     );
+    let mut headers = HashMap::new();
 
     assert!(matches!(
-        run_before_proxy_chain(&plugins, &mut ctx).await,
+        run_finalized_egress_chain(&plugins, &mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
     assert_eq!(
@@ -3469,7 +3503,7 @@ fn candidate_serverless_composition_uses_pure_capabilities_not_runtime_credentia
 }
 
 #[test]
-fn candidate_serverless_pure_capabilities_still_reject_unsafe_order_and_body_egress() {
+fn candidate_serverless_pure_capabilities_reject_unsafe_order_and_allow_finalized_body_egress() {
     let mut terminal = make_plugin_config_with_json(
         "function",
         "serverless_function",
@@ -3503,7 +3537,7 @@ fn candidate_serverless_pure_capabilities_still_reject_unsafe_order_and_body_egr
         "{order_error}"
     );
 
-    let unsafe_body = make_config(
+    let transformed_body = make_config(
         vec![make_proxy("p1", "/api", vec!["function", "transform"])],
         vec![
             make_plugin_config_with_json(
@@ -3533,10 +3567,8 @@ fn candidate_serverless_pure_capabilities_still_reject_unsafe_order_and_body_egr
             ),
         ],
     );
-    let body_error =
-        validate_plugin_composition_candidate_with_real_ip_header_for_test(&unsafe_body, None)
-            .expect_err("pure forward_body capability must retain body-view enforcement");
-    assert!(body_error.contains("request-body"), "{body_error}");
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&transformed_body, None)
+        .expect("finalized forward_body egress must compose with request-body transforms");
 }
 
 #[test]
@@ -10618,6 +10650,7 @@ fn test_serverless_terminate_grpc_config_lifecycle_create_update_reload_delete()
         "terminate mode must be the published behavior"
     );
     assert!(!created_instance.modifies_request_headers());
+    assert!(created_instance.dispatches_finalized_request_egress());
     assert_eq!(
         created_instance.warmup_hostnames(),
         vec!["example.com".to_string()]
@@ -10644,10 +10677,11 @@ fn test_serverless_terminate_grpc_config_lifecycle_create_update_reload_delete()
         "the updated pre_proxy instance must be the one published, not the retained terminate one"
     );
     assert!(
-        updated_instance.modifies_request_headers(),
-        "pre_proxy mode modifies request headers; terminate mode does not"
+        !updated_instance.modifies_request_headers(),
+        "pre_proxy mode publishes a finalized backend overlay instead of mutating before_proxy headers"
     );
-    assert!(updated_instance.deferred_before_proxy_may_change_routing_headers());
+    assert!(!updated_instance.deferred_before_proxy_may_change_routing_headers());
+    assert!(updated_instance.dispatches_finalized_request_egress());
     assert_eq!(
         updated_instance.warmup_hostnames(),
         vec!["updated.example.net".to_string()],

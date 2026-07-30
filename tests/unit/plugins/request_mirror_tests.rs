@@ -1766,7 +1766,7 @@ async fn mesh_shadow_uses_rewritten_authority_and_explicit_mirror_path_wins() {
         ("content-type".to_string(), "application/json".to_string()),
     ]);
 
-    plugin_utils::assert_continue(route.finalized_egress(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(route.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(
         ctx.route_override_path.as_deref(),
         Some("/mesh-rewritten/users")
@@ -1788,7 +1788,7 @@ async fn mesh_shadow_uses_rewritten_authority_and_explicit_mirror_path_wins() {
     let mut exact_headers = HashMap::from([("host".to_string(), "public.example.com".to_string())]);
     plugin_utils::assert_continue(
         route
-            .finalized_egress(&mut exact_ctx, &mut exact_headers)
+            .before_proxy(&mut exact_ctx, &mut exact_headers)
             .await,
     );
     assert_eq!(
@@ -3411,7 +3411,7 @@ async fn mesh_shadow_ipv6_authority_stays_valid_on_outbound_host() {
     let mut ctx = make_ctx_with_proxy();
     let mut headers = HashMap::new();
     headers.insert("host".to_string(), "client.example".to_string());
-    plugin_utils::assert_continue(route.finalized_egress(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(route.before_proxy(&mut ctx, &mut headers).await);
     plugin_utils::assert_continue(mirror.finalized_egress(&mut ctx, &mut headers).await);
     let _ = ctx.collect_mirror_result().await;
 
