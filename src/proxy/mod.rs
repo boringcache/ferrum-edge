@@ -28846,10 +28846,10 @@ pub(crate) async fn proxy_to_backend_retry(
         request_ctx.route_response_body_limit(),
     );
 
-    // All reqwest clients use our DnsCacheResolver, so DNS resolution is
-    // always served from the warmed cache — never hitting DNS on the hot path.
-    // For both single-backend and load-balanced proxies, the client transparently
-    // resolves hostnames through the DNS cache.
+    // All reqwest hostname resolution uses our DnsCacheResolver, so it is
+    // served from the warmed cache — never hitting DNS on the hot path.
+    // URL-literal hosts bypass reqwest's resolver and are screened below before
+    // this retry-only reqwest path can dial them.
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
@@ -28859,8 +28859,23 @@ pub(crate) async fn proxy_to_backend_retry(
     // rotation must be rejected here too, mirroring the first-attempt screen in
     // proxy_to_backend. (Hostname targets are screened by the resolver at
     // dispatch and classified via classify_reqwest_error.)
-    if denied_literal_backend_ip(effective_host, &state.env_config.backend_allow_ips).is_some() {
+    if let Some(reason) = denied_literal_backend_or_dns_override(
+        effective_host,
+        proxy,
+        &state.env_config.backend_allow_ips,
+    ) {
+        warn!(
+            proxy_id = %proxy.id,
+            backend = %effective_host,
+            reason,
+            "Backend egress policy denied literal-IP retry target; not dialing"
+        );
         return backend_egress_denied_response(effective_host);
+    }
+
+    if let Some(conflict) = reqwest_dns_override_literal_conflict(effective_host, proxy) {
+        warn_reqwest_dns_override_literal_conflict(proxy, effective_host, conflict);
+        return backend_dns_override_literal_conflict_response(conflict);
     }
 
     if proxy.resolved_tls.sni.is_some() {
@@ -29588,6 +29603,66 @@ pub(crate) fn denied_literal_backend_or_dns_override(
     })
 }
 
+/// A reqwest dispatch cannot apply a custom DNS resolver to a URL host that
+/// parses as an IP literal: hyper-util skips resolution and dials the literal
+/// directly. Keep that dependency behavior from silently defeating a proxy's
+/// `dns_override`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReqwestDnsOverrideLiteralConflict {
+    InvalidOverride {
+        target_ip: std::net::IpAddr,
+    },
+    Mismatch {
+        target_ip: std::net::IpAddr,
+        override_ip: std::net::IpAddr,
+    },
+}
+
+fn reqwest_dns_override_literal_conflict(
+    host: &str,
+    proxy: &Proxy,
+) -> Option<ReqwestDnsOverrideLiteralConflict> {
+    let dns_override = proxy.dns_override.as_deref()?;
+    let target_ip = crate::config::types::egress_literal_ip(host)?;
+    match dns_override.parse::<std::net::IpAddr>() {
+        Ok(override_ip) if override_ip == target_ip => None,
+        Ok(override_ip) => Some(ReqwestDnsOverrideLiteralConflict::Mismatch {
+            target_ip,
+            override_ip,
+        }),
+        Err(_) => Some(ReqwestDnsOverrideLiteralConflict::InvalidOverride { target_ip }),
+    }
+}
+
+fn warn_reqwest_dns_override_literal_conflict(
+    proxy: &Proxy,
+    host: &str,
+    conflict: ReqwestDnsOverrideLiteralConflict,
+) {
+    match conflict {
+        ReqwestDnsOverrideLiteralConflict::InvalidOverride { target_ip } => {
+            warn!(
+                proxy_id = %proxy.id,
+                backend = %host,
+                target_ip = %target_ip,
+                "Invalid dns_override cannot be applied to literal reqwest target; not dialing"
+            );
+        }
+        ReqwestDnsOverrideLiteralConflict::Mismatch {
+            target_ip,
+            override_ip,
+        } => {
+            warn!(
+                proxy_id = %proxy.id,
+                backend = %host,
+                target_ip = %target_ip,
+                dns_override_ip = %override_ip,
+                "dns_override differs from literal reqwest target; not dialing"
+            );
+        }
+    }
+}
+
 /// Canonical-literal-only counterpart of [`denied_literal_backend_ip`] for the
 /// **self-resolving** dispatch pools — gRPC (`GrpcConnectionPool`) and native H3
 /// (`Http3ConnectionPool`). Those pools do NOT hand the host to reqwest's URL
@@ -29640,6 +29715,30 @@ fn backend_egress_denied_response(host: &str) -> retry::BackendResponse {
         headers: HashMap::new(),
         connection_error: false,
         backend_resolved_ip: Some(host.to_string()),
+        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+    }
+}
+
+/// Fail closed when reqwest would bypass a configured DNS override for a
+/// literal URL target. No dial occurred, so this is neutral to retries,
+/// passive health, and circuit-breaker accounting.
+fn backend_dns_override_literal_conflict_response(
+    conflict: ReqwestDnsOverrideLiteralConflict,
+) -> retry::BackendResponse {
+    let resolved_ip = match conflict {
+        ReqwestDnsOverrideLiteralConflict::InvalidOverride { .. } => None,
+        ReqwestDnsOverrideLiteralConflict::Mismatch { override_ip, .. } => {
+            Some(override_ip.to_string())
+        }
+    };
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::buffered(
+            br#"{"error":"backend DNS override cannot be applied to literal target"}"#.to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
     }
 }
@@ -29856,10 +29955,10 @@ async fn proxy_to_backend(
         route_response_body_limit,
     );
 
-    // All reqwest clients use our DnsCacheResolver, so DNS resolution is
-    // always served from the warmed cache — never hitting DNS on the hot path.
-    // For both single-backend and load-balanced proxies, the client transparently
-    // resolves hostnames through the DNS cache.
+    // All reqwest hostname resolution uses our DnsCacheResolver, so it is
+    // served from the warmed cache — never hitting DNS on the hot path.
+    // URL-literal hosts bypass reqwest's resolver; direct connectors can still
+    // honor their override, while the reqwest fallback is screened below.
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
@@ -29881,8 +29980,11 @@ async fn proxy_to_backend(
     }
 
     // Resolve backend IP from DNS cache (O(1) cached lookup, <1μs).
-    // This is the same cache reqwest will use internally via DnsCacheResolver,
-    // so the IP will match the actual connection target.
+    // When `dns_override` is set, this returns the override IP for the
+    // selected host — the same address the pooled reqwest client's
+    // `DnsCacheResolver::with_dns_override` will dial for that hostname
+    // (including load-balanced targets that differ from `backend_host`).
+    // Without an override, both paths consult the shared cache.
     let resolve_backend_ip = state.dns_cache.resolve(
         effective_host,
         proxy.dns_override.as_deref(),
@@ -30425,6 +30527,20 @@ async fn proxy_to_backend(
                 "H2 pool bypassed for request buffering support — using reqwest (ALPN HTTP/2)"
             );
         }
+    }
+
+    // hyper-util bypasses reqwest's custom resolver for URL-literal hosts. A
+    // differing (or invalid) dns_override would therefore be reported in
+    // telemetry but not used for the socket dial. Direct H2/H3/HBONE branches
+    // above resolve independently and may honor that combination; reject only
+    // now that dispatch has fallen through to reqwest.
+    if let Some(conflict) = reqwest_dns_override_literal_conflict(effective_host, proxy) {
+        warn_reqwest_dns_override_literal_conflict(proxy, effective_host, conflict);
+        return backend_dispatch_response(
+            backend_dns_override_literal_conflict_response(conflict),
+            None,
+            None,
+        );
     }
 
     // Get client from connection pool for HTTP/1.1 and HTTP/2.
@@ -36820,6 +36936,39 @@ mod tests {
         .expect("valid proxy")
     }
 
+    #[test]
+    fn reqwest_dns_override_literal_conflict_matches_url_host_semantics() {
+        let mut proxy = streaming_dispatch_test_proxy();
+        proxy.dns_override = Some("127.0.0.2".to_string());
+
+        assert_eq!(
+            reqwest_dns_override_literal_conflict("2130706433", &proxy),
+            Some(ReqwestDnsOverrideLiteralConflict::Mismatch {
+                target_ip: "127.0.0.1".parse().unwrap(),
+                override_ip: "127.0.0.2".parse().unwrap(),
+            }),
+            "non-canonical URL literals must be screened exactly as reqwest parses them"
+        );
+        assert_eq!(
+            reqwest_dns_override_literal_conflict("127.0.0.2", &proxy),
+            None,
+            "a literal already equal to the override is safe when reqwest bypasses DNS"
+        );
+        assert_eq!(
+            reqwest_dns_override_literal_conflict("backend.example.com", &proxy),
+            None,
+            "hostname targets still pass through the custom resolver"
+        );
+
+        proxy.dns_override = Some("not-an-ip".to_string());
+        assert_eq!(
+            reqwest_dns_override_literal_conflict("127.0.0.1", &proxy),
+            Some(ReqwestDnsOverrideLiteralConflict::InvalidOverride {
+                target_ip: "127.0.0.1".parse().unwrap(),
+            })
+        );
+    }
+
     /// The cross-cluster HBONE backend-URL authority rewrite swaps the
     /// (non-parseable) scoped synthetic host for the real pod addr in the
     /// AUTHORITY position only, leaving the path/query (and any host-like
@@ -39878,6 +40027,101 @@ mod tests {
             resp.headers.get("gateway-error-reason").map(String::as_str),
             Some(BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON)
         );
+    }
+
+    #[tokio::test]
+    async fn reqwest_retry_fails_closed_when_literal_target_differs_from_dns_override() {
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.backend_host = "127.0.0.1".to_string();
+        proxy.backend_port = 1;
+        proxy.dns_override = Some("127.0.0.2".to_string());
+        let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+
+        let resp = proxy_to_backend_retry(
+            &state,
+            &proxy,
+            "http://127.0.0.1:1/",
+            "GET",
+            &HashMap::new(),
+            None,
+            None,
+            true,
+            &[],
+            &ctx,
+            "127.0.0.1",
+            "127.0.0.1",
+            false,
+            hyper::Version::HTTP_11,
+        )
+        .await;
+
+        assert_eq!(resp.status_code, 502);
+        assert!(!resp.connection_error);
+        assert_eq!(
+            resp.error_class,
+            Some(retry::ErrorClass::DispatchPolicyRejected)
+        );
+        assert_eq!(resp.backend_resolved_ip.as_deref(), Some("127.0.0.2"));
+    }
+
+    #[tokio::test]
+    async fn reqwest_initial_dispatch_fails_closed_on_literal_dns_override_conflict() {
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.backend_host = "127.0.0.1".to_string();
+        proxy.backend_port = 1;
+        proxy.dns_override = Some("127.0.0.2".to_string());
+        let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+        let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut backend_start = std::time::Instant::now();
+
+        let dispatch = proxy_to_backend(
+            &state,
+            &proxy,
+            "http://127.0.0.1:1/",
+            "GET",
+            &HashMap::new(),
+            ClientRequestBody::Buffered(BufferedClientRequestBody {
+                method: hyper::Method::GET,
+                headers: hyper::HeaderMap::new(),
+                body: Vec::new(),
+            }),
+            None,
+            &[],
+            &[],
+            PreacquiredBackendAdmission::default(),
+            None,
+            &ctx,
+            true,
+            false,
+            true,
+            false,
+            false,
+            "127.0.0.1",
+            "127.0.0.1",
+            false,
+            false,
+            false,
+            false,
+            &bytes_sent,
+            hyper::Version::HTTP_11,
+            &mut backend_start,
+        )
+        .await;
+
+        let BackendDispatchResult::Response { response, .. } = dispatch else {
+            panic!("dns_override policy rejection must be a backend response");
+        };
+        assert_eq!(response.status_code, 502);
+        assert!(!response.connection_error);
+        assert_eq!(
+            response.error_class,
+            Some(retry::ErrorClass::DispatchPolicyRejected)
+        );
+        assert_eq!(response.backend_resolved_ip.as_deref(), Some("127.0.0.2"));
     }
 
     /// End-to-end wiring guard for the content-type-aware buffer->stream

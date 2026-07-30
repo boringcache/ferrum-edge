@@ -1493,3 +1493,152 @@ async fn test_per_proxy_vs_global_ttl_precedence_on_shared_hostname() {
         "per-proxy 1s policy must re-resolve after expiry"
     );
 }
+
+// ============================================================================
+// Reqwest DnsCacheResolver + per-proxy dns_override (issue #2414)
+// ============================================================================
+
+#[tokio::test]
+async fn reqwest_resolver_dns_override_pins_load_balanced_target_hostnames() {
+    use ferrum_edge::dns::DnsCacheResolver;
+    use reqwest::dns::Resolve;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    // Failure scenario from #2414: backend_host is a route template, selected
+    // targets differ, and dns_override must still determine the dial IP for
+    // every initial / retry hostname — not only the template host.
+    let cache = DnsCache::new(default_dns_config(HashMap::new()));
+    let override_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+    let resolver = DnsCacheResolver::with_dns_override(cache, Some(override_ip.to_string()));
+
+    let base_host = "route-template.internal";
+    let initial_target = "target-a.internal";
+    let retry_target = "target-b.internal";
+    assert_ne!(base_host, initial_target);
+    assert_ne!(initial_target, retry_target);
+
+    for host in [base_host, initial_target, retry_target] {
+        let addrs: Vec<_> = resolver
+            .resolve(host.parse().expect("valid dns name"))
+            .await
+            .expect("override resolve")
+            .collect();
+        assert_eq!(
+            addrs,
+            vec![SocketAddr::new(override_ip, 0)],
+            "reqwest resolver must dial override for selected host {host}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reqwest_resolver_dns_override_matches_direct_connector_resolve() {
+    use ferrum_edge::dns::DnsCacheResolver;
+    use reqwest::dns::Resolve;
+    use std::net::SocketAddr;
+
+    // Parity: direct connectors call DnsCache::resolve_candidates(host, Some(ovr), …);
+    // the reqwest pool installs the same override on DnsCacheResolver.
+    let cache = DnsCache::new(default_dns_config(HashMap::new()));
+    let override_ip = "192.0.2.55";
+    let host = "lb-target.internal";
+
+    let direct = cache
+        .resolve_candidates(host, Some(override_ip), None)
+        .await
+        .expect("direct resolve_candidates");
+    let resolver =
+        DnsCacheResolver::with_dns_override(cache.clone(), Some(override_ip.to_string()));
+    let reqwest_addrs: Vec<_> = resolver
+        .resolve(host.parse().expect("valid dns name"))
+        .await
+        .expect("reqwest resolver")
+        .collect();
+
+    assert_eq!(direct.len(), 1);
+    let direct_ip = direct.first().expect("override answer");
+    assert_eq!(
+        reqwest_addrs,
+        vec![SocketAddr::new(direct_ip, 0)],
+        "reqwest dial destination must match direct-connector override resolution"
+    );
+    // Telemetry / backend_resolved_ip also uses DnsCache::resolve with the
+    // override; that first address must agree with the dial set.
+    let telemetry = cache
+        .resolve(host, Some(override_ip), None)
+        .await
+        .expect("telemetry resolve");
+    assert_eq!(telemetry, direct_ip);
+}
+
+#[tokio::test]
+async fn reqwest_dns_override_dials_override_and_preserves_selected_host() {
+    use ferrum_edge::dns::DnsCacheResolver;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind override listener");
+    let port = listener.local_addr().expect("listener address").port();
+    let accepted =
+        tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("reqwest dial timeout")
+                .expect("accept reqwest dial");
+            let mut request = vec![0u8; 4096];
+            let read = stream.read(&mut request).await.expect("read request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(
+                request.lines().any(|line| line
+                    .eq_ignore_ascii_case(&format!("host: selected-target.invalid:{port}"))),
+                "the HTTP Host identity must remain the selected target: {request}"
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("write response");
+        });
+
+    let cache = DnsCache::new(default_dns_config(HashMap::new()));
+    let resolver = DnsCacheResolver::with_dns_override(cache, Some("127.0.0.1".to_string()));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .dns_resolver(Arc::new(resolver))
+        .build()
+        .expect("build reqwest client");
+    let response = client
+        .get(format!("http://selected-target.invalid:{port}/"))
+        .send()
+        .await
+        .expect("dial through dns_override");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.expect("response body"), "ok");
+    accepted.await.expect("override listener task");
+}
+
+#[tokio::test]
+async fn reqwest_resolver_without_override_uses_cached_answers() {
+    use ferrum_edge::dns::DnsCacheResolver;
+    use reqwest::dns::Resolve;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let cache = DnsCache::new(default_dns_config(HashMap::new()));
+    // Warm via a successful override resolve that does NOT populate the cache,
+    // then resolve localhost without override to prove the no-override path
+    // still hits the shared cache / system resolver.
+    let resolver = DnsCacheResolver::new(cache);
+    let addrs: Vec<_> = resolver
+        .resolve("127.0.0.1".parse().expect("literal name"))
+        .await
+        .expect("literal resolve")
+        .collect();
+    assert_eq!(
+        addrs,
+        vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0)]
+    );
+}
