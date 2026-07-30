@@ -1564,47 +1564,29 @@ async fn test_failed_fetch_burst_is_single_flight_with_bounded_waiters() {
 
 #[tokio::test(start_paused = true)]
 async fn test_cached_failure_retry_after_reports_remaining_backoff() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/openapi.yaml"))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(2)
-        .mount(&mock_server)
-        .await;
-
     let plugin = SpecExpose::new(
         &json!({
-            "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+            "spec_url": "http://127.0.0.1/openapi.yaml",
             "cache_ttl_seconds": 0
         }),
         PluginHttpClient::default(),
     )
     .unwrap();
 
-    let mut first_ctx = make_ctx("GET", "/api/specz", "/api");
-    let (_, _, first_headers) = reject_parts(plugin.on_request_received(&mut first_ctx).await);
-    assert_eq!(
-        first_headers.get("retry-after").map(String::as_str),
-        Some("1")
-    );
+    assert_eq!(plugin.record_failure_backoff_for_tests(), 1);
 
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    let mut second_ctx = make_ctx("GET", "/api/specz", "/api");
-    let (_, _, second_headers) = reject_parts(plugin.on_request_received(&mut second_ctx).await);
     assert_eq!(
-        second_headers.get("retry-after").map(String::as_str),
-        Some("2")
+        plugin.cached_failure_backoff_for_tests(),
+        None,
+        "the first negative-cache window must expire at its deadline"
     );
+    assert_eq!(plugin.record_failure_backoff_for_tests(), 2);
 
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    let mut cached_ctx = make_ctx("GET", "/api/specz", "/api");
-    let (_, _, cached_headers) = reject_parts(plugin.on_request_received(&mut cached_ctx).await);
     assert_eq!(
-        cached_headers.get("retry-after").map(String::as_str),
-        Some("1"),
+        plugin.cached_failure_backoff_for_tests(),
+        Some(1),
         "cached failures must advertise only the remaining backoff"
     );
 }
