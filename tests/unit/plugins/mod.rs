@@ -77,6 +77,7 @@ mod plugin_doc_parity_tests;
 mod plugin_http_client_tests;
 mod plugin_integration_tests;
 mod plugin_utils_core_tests;
+mod prometheus_metric_contract_tests;
 mod prometheus_metrics_tests;
 mod proxy_alerts_tests;
 mod rate_limit_capacity_tests;

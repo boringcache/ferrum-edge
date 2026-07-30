@@ -1840,6 +1840,11 @@ jobs:
       - name: Install Kubernetes tools
         uses: ./.github/actions/setup-kubernetes-tools
 
+      - name: Install Prometheus rule validator
+        run: |
+          sudo apt-get update
+          sudo apt-get install --assume-yes --no-install-recommends prometheus
+
       - name: Helm static validation
         run: |
           set -euo pipefail
@@ -1852,7 +1857,18 @@ jobs:
           python3 -m pip install --require-hashes \
             -r ./scripts/check_helm_values_schema_parity.requirements.txt
           python3 ./scripts/check_helm_values_schema_parity.py
+          # DOC-10: executable Prometheus metric contract (inventory ↔ docs ↔ charts).
+          python3 -I .github/scripts/validate_prometheus_metric_contract.py
           helm lint ./charts/ferrum-mesh
+          helm template ferrum ./charts/ferrum-mesh \
+            --namespace ferrum \
+            --set observability.enabled=true \
+            --set observability.alerts.enabled=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/prometheus-rule-rendered.yaml"
+          python3 -I .github/scripts/extract_rendered_prometheus_rules.py \
+            "$RUNNER_TEMP/ferrum-helm-results/prometheus-rule-rendered.yaml" \
+            "$RUNNER_TEMP/ferrum-helm-results/prometheus-rules.yaml"
+          promtool check rules "$RUNNER_TEMP/ferrum-helm-results/prometheus-rules.yaml"
           # Unknown / misspelled keys must fail schema validation (additionalProperties: false).
           if helm lint ./charts/ferrum-mesh --set ambient.enabld=true \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-misspelled-root.out" \
