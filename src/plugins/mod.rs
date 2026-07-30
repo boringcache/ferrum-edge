@@ -6728,12 +6728,15 @@ pub trait Plugin: Send + Sync {
 
     /// Irreversible outbound request egress over the finalized representation.
     ///
-    /// `headers` and `body` are an immutable snapshot of exactly what the
-    /// backend would receive: request-body transforms have run, and every
-    /// applicable final request-policy hook (WAF body rules, OpenAPI request
-    /// schema, body validation, the post-transform request-size ceiling) has
-    /// already accepted these bytes. Consuming anything else — the pre-transform
-    /// `ctx.metadata["request_body"]`, for example — reintroduces the advisory.
+    /// `headers` and `body` are an immutable snapshot of the finalized request:
+    /// request-body transforms have run, and every applicable final
+    /// request-policy hook (WAF body rules, OpenAPI request schema, body
+    /// validation, the post-transform request-size ceiling) has already accepted
+    /// these bytes. The body is exactly what the backend would receive. The
+    /// header map is the finalized pre-egress baseline; a `pre_proxy` function
+    /// may subsequently add the explicitly supported backend header overlay
+    /// described below. Consuming any pre-transform body source such as
+    /// `ctx.metadata["request_body"]` reintroduces the advisory.
     ///
     /// A plugin that must add request headers for the primary backend (the
     /// `serverless_function` `pre_proxy` contract) writes them into

@@ -15,9 +15,11 @@
 //! captures the request method, path, query string, headers, and optionally the
 //! body, then spawns an async task to replay the request against the configured
 //! mirror destination. The main request proceeds immediately — mirror latency
-//! has zero impact on client response time. A request Ferrum goes on to reject
-//! locally is therefore never mirrored, and the shadow destination never sees a
-//! field an operator configured `request_transformer` to remove or redact.
+//! has zero impact on client response time. A request rejected by final
+//! request-body policy is therefore never mirrored, and the shadow destination
+//! never sees a field an operator configured `request_transformer` to remove or
+//! redact. Later backend-admission or transport failures can still occur after
+//! mirror dispatch.
 //!
 //! Multiple independent `request_mirror` instances on one proxy each dispatch
 //! and each push their own result receiver onto a per-request collection. A
@@ -1916,9 +1918,12 @@ impl Plugin for RequestMirror {
 
     /// Dispatch the shadow request over the finalized representation.
     ///
-    /// `headers` and `body` are immutable and byte-identical to what the
-    /// primary backend receives. The mirror never mutates the outbound request,
-    /// so it publishes nothing into `backend_header_overlay`.
+    /// `headers` is the finalized pre-egress baseline and `body` is the exact
+    /// finalized body the primary backend receives. A preceding
+    /// `serverless_function` may publish a later backend-only header overlay, so
+    /// mirror headers deliberately need not include those injected fields. The
+    /// mirror never mutates the outbound request and publishes nothing into
+    /// `backend_header_overlay`.
     async fn dispatch_finalized_request_egress(
         &self,
         ctx: &mut RequestContext,

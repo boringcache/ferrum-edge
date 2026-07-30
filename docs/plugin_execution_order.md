@@ -91,13 +91,12 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 5d. finalized egress    │  Irreversible outbound request egress, after body
-│                         │  transforms and every final request-policy hook
+│ 5d. final request body  │  Transforms, policy hooks, and terminal body dispatch
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 5d. final request body  │  Terminal body dispatch after selected-path policy
+│ 5e. finalized egress    │  Irreversible outbound request egress after 5d accepts
 └────────────┬────────────┘
              │
              ▼
@@ -212,7 +211,7 @@ normal request semantics even when mesh routing rewrote the backend path.
 
 `request_mirror` and `serverless_function` are no longer deferred
 `before_proxy` hooks — they have no `before_proxy` hook at all. Both moved to
-the finalized-request-egress phase (5d), which is strictly later than the
+the finalized-request-egress phase (5e), which is strictly later than the
 backend-path gate, so the same enforcement ordering holds by construction
 rather than by opt-in. That phase also runs with the original client path
 installed on the context, matching the deferred-hook request view.
@@ -285,20 +284,22 @@ after **all** of the following have happened for the same request:
    exact bytes — WAF body rules, OpenAPI request-schema validation,
    `body_validator`, and the post-transform `request_size_limiting` ceiling.
 
-The phase therefore satisfies a simple contract: **a local rejection implies no
-mirror, function, or provider was contacted.** Built-in participants are
-`serverless_function` (3025) and `request_mirror` (3075); `ai_federation`
-(4060) reaches the same guarantee through the final request-body phase it
-already used.
+The phase therefore satisfies a focused contract: **a rejection from final
+request-body policy implies no mirror, function, or provider was contacted.**
+Backend admission, circuit-breaker, and transport checks still occur later and
+can fail after egress. Built-in participants are `serverless_function` (3025),
+`request_mirror` (3075), and `ai_federation` (4060). Federation dispatch lives
+at this later boundary rather than inside the ordered final-body hook pass, so
+an operator `priority_override` cannot move provider I/O ahead of final policy.
 
-Plugins receive an *immutable* header and body snapshot. A `pre_proxy`
-`serverless_function` that injects backend request headers publishes them into a
-separate backend header overlay; the proxy merges that overlay into the outbound
-map afterwards and then re-strips reserved gateway assertions
+Plugins receive an immutable finalized body and pre-egress header snapshot. A
+`pre_proxy` `serverless_function` that injects backend request headers publishes
+them into a separate backend header overlay; the proxy merges that overlay into
+the outbound map afterwards and then re-strips reserved gateway assertions
 (`x-consumer-username`, `x-consumer-custom-id`, `x-geo-country`) and re-applies
 the configured egress baggage filter, exactly as it does after a deferred
-`before_proxy` pass. An egress plugin cannot therefore alter the representation
-that policy accepted and the backend receives.
+`before_proxy` pass. The finalized body cannot change after policy acceptance;
+the overlay is the explicit, bounded exception for backend request headers.
 
 The phase runs at most once per request (`finalized_request_egress_dispatched`),
 so retries — which replay the already-finalized body — never re-fire a mirror
@@ -912,7 +913,7 @@ guardrails on the same client-visible representation across H1/H2 and every
 buffered H3 path without changing `ai_stream_router`'s request-side priority
 (which must remain after `ai_semantic_cache`).
 
-Because `ai_stream_router` runs first, when it claims a request it sets `ctx.metadata["ai_stream_router_claimed"] = "true"`; `ai_federation` checks this at the top of its final request-body hook and immediately continues, so the two plugins compose cleanly on the same proxy. `ai_stream_router` does not implement provider fallback in any form, and a `fallback` config block is rejected at admission rather than stored inert (issue #3328): the plugin commits one provider route, credential set, backend TLS resolution, and translated request body in `before_proxy`, and the dispatch retry loop replays exactly those prepared bytes and headers against the same effective proxy. No `ai_stream_router.fallback_attempts` metadata is emitted.
+Because `ai_stream_router` runs first, when it claims a request it sets `ctx.metadata["ai_stream_router_claimed"] = "true"`; `ai_federation` checks this at the top of its finalized-request-egress hook and immediately continues, so the two plugins compose cleanly on the same proxy. `ai_stream_router` does not implement provider fallback in any form, and a `fallback` config block is rejected at admission rather than stored inert (issue #3328): the plugin commits one provider route, credential set, backend TLS resolution, and translated request body in `before_proxy`, and the dispatch retry loop replays exactly those prepared bytes and headers against the same effective proxy. No `ai_stream_router.fallback_attempts` metadata is emitted.
 
 ### Transforms after auth (3000+)
 

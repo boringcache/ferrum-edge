@@ -65,17 +65,19 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
 3. `authorize`: ACL, mesh_authz, rate limiting
 4. `normalize_buffered_request_body_before_before_proxy`: configured request decompression (and any future early body normalizers) after the pre-`before_proxy` buffer is stored
 5. `before_proxy`: SOAP, AI plugins, workload metrics, transformers, mock, gRPC deadline, load, cache, compression
-6. `on_final_request_body`: body validator, gRPC-Web validation, WAF body rules, OpenAPI request schema, post-transform request-size ceiling, `ai_federation`
+6. `on_final_request_body`: body validator, gRPC-Web validation, WAF body rules, OpenAPI request schema, post-transform request-size ceiling
 6b. `dispatch_finalized_request_egress`: irreversible outbound request egress
-    (`request_mirror`, `serverless_function`) over the immutable backend-visible
-    header/body snapshot, after every hook in step 6 accepted it
-    (GHSA-4vr5-4wm3-x5xv). A local rejection therefore implies no mirror,
-    function, or provider was contacted. Runs at most once per request
+    (`request_mirror`, `serverless_function`, `ai_federation`) over the immutable
+    backend-visible body and finalized pre-egress header snapshot, after every
+    hook in step 6 accepted it
+    (GHSA-4vr5-4wm3-x5xv). A rejection from final request-body policy therefore
+    implies no mirror, function, or provider was contacted; backend admission
+    and transport checks still occur later. Runs at most once per request
     (`RequestContext.finalized_request_egress_dispatched`), so retries never
     re-fire it. `pre_proxy` header injection goes through the backend header
     overlay, which the proxy merges only after re-stripping reserved gateway
-    assertions and re-applying the egress baggage policy. Neither plugin has a
-    `before_proxy` hook — do not add one back.
+    assertions and re-applying the egress baggage policy. None of these plugins
+    has a `before_proxy` egress hook — do not add one back.
 7. `after_proxy`: response-side counterpart to before_proxy
    - Successful H1/H2/H3 WebSocket handshakes bypass general `after_proxy` and
      instead run the synchronous, non-rejecting

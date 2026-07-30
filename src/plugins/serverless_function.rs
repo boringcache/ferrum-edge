@@ -2784,13 +2784,14 @@ impl Plugin for ServerlessFunction {
 
     /// Invoke the function over the finalized, backend-visible request.
     ///
-    /// `headers` and `body` are immutable: they are exactly what the primary
-    /// backend would receive, and every final request-policy hook (WAF body
-    /// rules, OpenAPI request schema, body validation, the post-transform
-    /// request-size ceiling) has already accepted them. A `pre_proxy` function
-    /// publishes its header injections through `backend_header_overlay`, which
-    /// the proxy merges into the outbound map after re-establishing
-    /// gateway-owned assertions and the egress baggage policy.
+    /// `headers` is the immutable finalized pre-egress baseline and `body` is
+    /// exactly what the primary backend would receive; every final
+    /// request-policy hook (WAF body rules, OpenAPI request schema, body
+    /// validation, the post-transform request-size ceiling) has already accepted
+    /// that representation. A `pre_proxy` function publishes its supported
+    /// post-policy header injections through `backend_header_overlay`, which the
+    /// proxy merges into the outbound map after re-establishing gateway-owned
+    /// assertions and the egress baggage policy.
     async fn dispatch_finalized_request_egress(
         &self,
         ctx: &mut RequestContext,

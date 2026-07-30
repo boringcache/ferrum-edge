@@ -40,11 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plugins an immutable header/body snapshot; a `pre_proxy` `serverless_function`
   publishes its header injections through a backend header overlay that the
   proxy merges only after re-establishing gateway-owned assertions and the
-  egress baggage policy. `ai_federation` already dispatched from the final
-  request-body phase and is unchanged. The phase is wired on H1/H2 (HTTP,
-  WebSocket handshakes, and native gRPC) and HTTP/3, runs at most once per
-  request, and is therefore not repeated by retries, which replay the
-  already-finalized body.
+  egress baggage policy. `ai_federation` also dispatches from this boundary
+  rather than from inside the ordered final-body hook pass, so
+  `priority_override` cannot move provider I/O ahead of a final request policy.
+  The phase is wired on H1/H2 (HTTP, WebSocket handshakes, and native gRPC) and
+  HTTP/3, runs at most once per request, and is therefore not repeated by
+  retries, which replay the already-finalized body.
 
   Consequences worth reading before upgrading:
   - A body-forwarding `serverless_function` may now share a proxy with

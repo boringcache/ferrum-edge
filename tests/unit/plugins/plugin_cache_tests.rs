@@ -9399,7 +9399,7 @@ fn test_waf_sets_needs_final_request_body_context_capability() {
 }
 
 #[test]
-fn test_ai_federation_sets_terminal_final_body_dispatch_capability() {
+fn test_ai_federation_sets_terminal_final_body_and_finalized_egress_capabilities() {
     let mut plugin_config = make_plugin_config_with_json(
         "ps1",
         "ai_federation",
@@ -9427,6 +9427,10 @@ fn test_ai_federation_sets_terminal_final_body_dispatch_capability() {
     assert!(
         caps.has(PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH),
         "AI federation must finalize and dispatch before backend-only preflights and accounting"
+    );
+    assert!(
+        caps.has(PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS),
+        "AI federation provider I/O must run after the complete final request-policy hook pass"
     );
 }
 

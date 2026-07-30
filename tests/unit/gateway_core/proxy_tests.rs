@@ -546,13 +546,14 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
         );
     }
 
-    // `request_mirror` and `serverless_function` no longer defer a
-    // `before_proxy` hook: they have no `before_proxy` hook at all and dispatch
-    // in the finalized-request-egress phase, which is strictly later than the
-    // backend-path policy gate (GHSA-4vr5-4wm3-x5xv).
+    // Irreversible built-in egress has no `before_proxy` hook and dispatches in
+    // the finalized-request-egress phase, which is strictly later than the
+    // backend-path policy gate and the complete final-body policy pass
+    // (GHSA-4vr5-4wm3-x5xv).
     for plugin_source in [
         include_str!("../../../src/plugins/request_mirror.rs"),
         include_str!("../../../src/plugins/serverless_function.rs"),
+        include_str!("../../../src/plugins/ai_federation.rs"),
     ] {
         assert!(plugin_source.contains("fn dispatches_finalized_request_egress(&self) -> bool"));
         assert!(plugin_source.contains("async fn dispatch_finalized_request_egress("));

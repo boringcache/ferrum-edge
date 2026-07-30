@@ -22522,11 +22522,12 @@ async fn handle_proxy_request_inner(
                 }
                 // Irreversible outbound egress runs here and nowhere earlier:
                 // `transformed` is the backend-visible body and every final
-                // request-policy hook has just accepted it, so a later local
-                // rejection can no longer imply that a mirror, function, or
-                // provider was already contacted (GHSA-4vr5-4wm3-x5xv). The
-                // hook context has already been written back, so the phase
-                // observes the live request context.
+                // request-policy hook has just accepted it, so no final-body
+                // policy can reject only after a mirror, function, or provider
+                // was contacted (GHSA-4vr5-4wm3-x5xv). Backend admission and
+                // transport checks still occur later. The hook context has
+                // already been written back, so the phase observes the live
+                // request context.
                 let mut rejected_by_egress = false;
                 if matches!(final_body_result, PluginResult::Continue)
                     && capabilities.has(PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS)
