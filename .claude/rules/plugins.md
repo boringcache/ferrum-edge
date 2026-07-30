@@ -64,6 +64,7 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
 2. `authenticate`: mTLS, JWKS, JWT, keyauth, LDAP, basicauth, HMAC
 3. `authorize`: ACL, mesh_authz, rate limiting
 4. `normalize_buffered_request_body_before_before_proxy`: configured request decompression (and any future early body normalizers) after the pre-`before_proxy` buffer is stored
+4b. `validate_client_request_body_contract`: CLIENT-contract admission over the ORIGINAL client representation, after normalization and before any `before_proxy`/`transform_request_body` hook can reshape it. Read-only (admit or reject, never rewrite). `openapi_validator` owns this phase; its `on_final_request_body` is the BACKEND-contract fallback and is skipped per instance once the client phase decided, so one request is never charged twice (`GHSA-896v-jx23-9g6p`). A plugin here must select buffering from the matched route/operation, never from an attacker-omittable `Content-Type` (`GHSA-6p78-6x8c-9g9x`).
 5. `before_proxy`: SOAP, AI plugins, workload metrics, transformers, serverless, mock, gRPC deadline, mirror, load, cache, compression
 6. `on_final_request_body`: body validator and gRPC-Web validation
 7. `after_proxy`: response-side counterpart to before_proxy

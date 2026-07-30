@@ -525,6 +525,19 @@ impl Plugin for PriorityOverridePlugin {
             .normalize_buffered_request_body_before_before_proxy(ctx, headers, body)
             .await
     }
+    fn validates_client_request_body_contract(&self) -> bool {
+        self.inner.validates_client_request_body_contract()
+    }
+    async fn validate_client_request_body_contract(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &std::collections::HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        self.inner
+            .validate_client_request_body_contract(ctx, headers, body)
+            .await
+    }
     fn requires_request_body_before_authenticate(&self) -> bool {
         self.inner.requires_request_body_before_authenticate()
     }

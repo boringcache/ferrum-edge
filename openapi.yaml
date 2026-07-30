@@ -19352,6 +19352,15 @@ components:
         operator/schema-controlled schema location; backend instance values and
         JSON property names never appear in client problem bodies or
         `openapi_validator.response_error` metadata.
+        The REQUEST contract is decided in the dedicated
+        `validate_client_request_body_contract` lifecycle phase over the original
+        client representation, before any `before_proxy` hook or request-body
+        transformer can add, remove, rename, coerce, or replace fields
+        (`GHSA-896v-jx23-9g6p`). Buffering for that phase is selected from the
+        matched operation alone, never from a `Content-Type` a client can omit
+        or mismatch; in `block` mode a missing required body and a nonempty body
+        with no applicable declared media type both fail closed
+        (`GHSA-6p78-6x8c-9g9x`).
       properties:
         enforcement_mode:
           type: string
@@ -19483,6 +19492,18 @@ components:
               minimum: 400
               maximum: 599
               default: 502
+            unsupported_media_type_status_code:
+              type: integer
+              format: uint16
+              minimum: 400
+              maximum: 599
+              default: 415
+              description: >-
+                Status for a nonempty request body that no media entry declared
+                for the matched operation covers (including a body sent with no
+                `Content-Type` at all). Kept distinct from `request_status_code`
+                so remapping schema failures does not also remap media-type
+                refusals. `log_only` records the same decision and continues.
             content_type:
               type: string
               pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+/[!#$%&'*+.^_`|~0-9A-Za-z-]+(?:;.*)?$"

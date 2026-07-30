@@ -2851,119 +2851,148 @@ async fn handle_h3_request(
         );
     }
 
-    // Opt-in buffered-body normalization (configured request decompression)
-    // before any `before_proxy` hook — same contract as the shared H1/H2 path.
-    if capabilities
+    // Pre-`before_proxy` buffered-body phases — same fixed order and same
+    // contract as the shared H1/H2 path: opt-in gateway-owned normalization
+    // (configured request decompression), then the distinct client-request-
+    // contract decision over the ORIGINAL client representation before any
+    // `before_proxy` / `transform_request_body` hook can reshape it
+    // (`GHSA-896v-jx23-9g6p`).
+    let runs_pre_before_proxy_body_phase = capabilities
         .has(crate::plugin_cache::PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY)
+        || before_proxy_body_requirements.validates_client_contract;
+    if runs_pre_before_proxy_body_phase
         && let Some(body_data) = prebuffered_body_data.as_mut()
     {
         let phase_start = std::time::Instant::now();
-        let mut tmp_headers = std::mem::take(&mut ctx.headers);
-        let normalize_result =
-            crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
-                &plugins,
-                &mut ctx,
-                &mut tmp_headers,
-                body_data,
-                before_proxy_body_requirements.needs_text,
-                before_proxy_body_requirements.needs_bytes,
-            )
-            .await;
-        ctx.headers = tmp_headers;
-        match normalize_result {
-            PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-                let Some(reject) = plugin_result_into_reject_parts(reject) else {
-                    tracing::error!(
-                        "request-body normalization rejection could not be normalized"
-                    );
-                    run_h3_reject_response_committed_hooks(
-                        &plugins,
-                        &mut ctx,
-                        http_flavor,
-                        grpc_web_response_content_type,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Bytes::from_static(b"Internal Server Error"),
-                        &HashMap::new(),
-                    )
-                    .await;
-                    let log_status_code = h3_reject_log_status_and_metadata(
-                        &mut ctx,
-                        http_flavor,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        b"Internal Server Error",
-                        &HashMap::new(),
-                    );
-                    record_request(&state, log_status_code);
-                    send_h3_plugin_reject_flavor_aware(
-                        &mut stream,
-                        &plugins,
-                        &mut ctx,
-                        http_flavor,
-                        grpc_web_response_content_type,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Bytes::from_static(b"Internal Server Error"),
-                        &HashMap::new(),
-                    )
-                    .await?;
-                    return Ok(());
-                };
-                let mut headers = reject.headers;
-                let mut reject_status = reject.status_code;
-                let mut reject_body = reject.body;
-                apply_reject_after_proxy_and_synthetic_body_hooks(
+        let mut rejected: Option<(PluginResult, &'static str)> = None;
+        if capabilities
+            .has(crate::plugin_cache::PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY)
+        {
+            let mut tmp_headers = std::mem::take(&mut ctx.headers);
+            let normalize_result =
+                crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
                     &plugins,
                     &mut ctx,
-                    &mut reject_status,
-                    &mut headers,
-                    &mut reject_body,
-                    matches!(http_flavor, HttpFlavor::Grpc),
-                    false,
+                    &mut tmp_headers,
+                    body_data,
+                    before_proxy_body_requirements.needs_text,
+                    before_proxy_body_requirements.needs_bytes,
                 )
                 .await;
-                plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                let http_status = StatusCode::from_u16(reject_status)
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            ctx.headers = tmp_headers;
+            if !matches!(normalize_result, PluginResult::Continue) {
+                rejected = Some((normalize_result, "normalize_buffered_request_body"));
+            }
+        }
+        if rejected.is_none() && before_proxy_body_requirements.validates_client_contract {
+            let client_headers = std::mem::take(&mut ctx.headers);
+            let contract_result = crate::proxy::apply_client_request_contract_validation(
+                &plugins,
+                &mut ctx,
+                &client_headers,
+                body_data,
+            )
+            .await;
+            ctx.headers = client_headers;
+            if !matches!(contract_result, PluginResult::Continue) {
+                rejected = Some((
+                    contract_result,
+                    crate::proxy::CLIENT_REQUEST_CONTRACT_PHASE,
+                ));
+            }
+        }
+        if let Some((rejection, reject_phase)) = rejected {
+            let Some(reject) = plugin_result_into_reject_parts(rejection) else {
+                tracing::error!(
+                    phase = reject_phase,
+                    "pre-before_proxy body-phase rejection could not be normalized"
+                );
                 run_h3_reject_response_committed_hooks(
                     &plugins,
                     &mut ctx,
                     http_flavor,
                     grpc_web_response_content_type,
-                    http_status,
-                    reject_body.clone(),
-                    &headers,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Bytes::from_static(b"Internal Server Error"),
+                    &HashMap::new(),
                 )
                 .await;
                 let log_status_code = h3_reject_log_status_and_metadata(
                     &mut ctx,
                     http_flavor,
-                    http_status,
-                    &reject_body,
-                    &headers,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    b"Internal Server Error",
+                    &HashMap::new(),
                 );
                 record_request(&state, log_status_code);
-                log_rejected_request(
-                    &plugins,
-                    &ctx,
-                    log_status_code,
-                    start_time,
-                    "normalize_buffered_request_body",
-                    plugin_execution_ns,
-                )
-                .await;
                 send_h3_plugin_reject_flavor_aware(
                     &mut stream,
                     &plugins,
                     &mut ctx,
                     http_flavor,
                     grpc_web_response_content_type,
-                    http_status,
-                    reject_body.clone(),
-                    &headers,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Bytes::from_static(b"Internal Server Error"),
+                    &HashMap::new(),
                 )
                 .await?;
                 return Ok(());
-            }
+            };
+            let mut headers = reject.headers;
+            let mut reject_status = reject.status_code;
+            let mut reject_body = reject.body;
+            apply_reject_after_proxy_and_synthetic_body_hooks(
+                &plugins,
+                &mut ctx,
+                &mut reject_status,
+                &mut headers,
+                &mut reject_body,
+                matches!(http_flavor, HttpFlavor::Grpc),
+                false,
+            )
+            .await;
+            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+            let http_status =
+                StatusCode::from_u16(reject_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            run_h3_reject_response_committed_hooks(
+                &plugins,
+                &mut ctx,
+                http_flavor,
+                grpc_web_response_content_type,
+                http_status,
+                reject_body.clone(),
+                &headers,
+            )
+            .await;
+            let log_status_code = h3_reject_log_status_and_metadata(
+                &mut ctx,
+                http_flavor,
+                http_status,
+                &reject_body,
+                &headers,
+            );
+            record_request(&state, log_status_code);
+            log_rejected_request(
+                &plugins,
+                &ctx,
+                log_status_code,
+                start_time,
+                reject_phase,
+                plugin_execution_ns,
+            )
+            .await;
+            send_h3_plugin_reject_flavor_aware(
+                &mut stream,
+                &plugins,
+                &mut ctx,
+                http_flavor,
+                grpc_web_response_content_type,
+                http_status,
+                reject_body.clone(),
+                &headers,
+            )
+            .await?;
+            return Ok(());
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }

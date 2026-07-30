@@ -71,6 +71,11 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
+│ 3c. client contract     │  Client-facing request contract over the ORIGINAL body, pre-transform
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
 │ 4. before_proxy         │  Route/header preparation before backend-path policy
 └────────────┬────────────┘
              │
@@ -685,7 +690,7 @@ Given all built-in plugins enabled, the execution order is:
 | 38 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body, on_stream_connect, on_udp_datagram |
 | 39 | `fault_injection` | 2940 | before_proxy, on_stream_connect, on_udp_datagram |
 | 40 | `body_validator` | 2950 | before_proxy, on_final_request_body, after_proxy, on_final_response_body |
-| 41 | `openapi_validator` | 2960 | before_proxy, on_final_request_body, after_proxy, on_final_response_body |
+| 41 | `openapi_validator` | 2960 | validate_client_request_body_contract, before_proxy, on_final_request_body, after_proxy, on_final_response_body |
 | 42 | `ai_semantic_firewall` | 2968 | before_proxy, on_final_request_body, on_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
 | 43 | `ai_request_guard` | 2975 | before_proxy, transform_request_body, on_final_request_body |
 | 44 | `ai_tool_governor` | 2978 | before_proxy, on_final_request_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
@@ -814,6 +819,12 @@ Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforc
 ### OpenAPI validation runs after body validation (priority 2960)
 
 `openapi_validator` runs after the generic `body_validator` so explicit per-proxy body checks can fail first, then the generated OpenAPI contract can enforce operation-specific schemas. It runs before AI request policy and request transformation, which means contract mismatches are caught before the request body is reshaped or sent to an upstream.
+
+That ordering is enforced by a dedicated lifecycle phase, not by priority alone. The imported OpenAPI **request** contract is decided in `validate_client_request_body_contract`, which the proxy runs on the prebuffered original client body after gateway-owned normalization (bounded `Content-Encoding` decoding) and **before any `before_proxy` hook or `transform_request_body` transformer**. A configured transform can therefore no longer add a schema-required property, coerce an invalid type, rename a field, or delete an `additionalProperties: false` violation and have the result accepted as if the client had sent it (`GHSA-896v-jx23-9g6p`). The phase is read-only: it admits or rejects, it never rewrites the body or headers.
+
+`on_final_request_body` remains the **backend** contract phase and is retained only as a fallback for request paths that never prebuffer (an HBONE CONNECT tunnel, or a proxy where request-body buffering is disallowed), so the two phases can never both charge the same request. Which representation a decision was taken over is published as `openapi_validator.request_contract_phase` (`client` or `backend_final`). Multiple `openapi_validator` instances on one proxy each stage their own decision under a process-unique instance ID and never consume each other's.
+
+Buffering for that phase is selected from the matched operation alone — not from the received `Content-Type` and not from a method allowlist — so omitting or mismatching a representation hint cannot vote the validator out of the request (`GHSA-6p78-6x8c-9g9x`). Retained bytes stay bounded by the global and route request-body ceilings. In `block` mode a missing/empty body for a `request_required` operation fails closed with the configured request status (400 by default), and a nonempty body that no declared media entry of the operation covers fails closed with `error_response.unsupported_media_type_status_code` (415 by default) instead of continuing unvalidated — including when the body was buffered because a *different* plugin voted for it. `log_only` records the same decisions in metadata and continues; `disabled` does nothing.
 
 ### AI Plugins: audit → PII shield → semantic firewall → guard → tool governor → routing → metrics → rate limiter (2740–4200)
 

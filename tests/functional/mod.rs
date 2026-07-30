@@ -68,6 +68,7 @@ mod functional_mtls_test;
 mod functional_namespace_test;
 mod functional_node_agent_test;
 mod functional_opa_key_auth_redaction_test;
+mod functional_openapi_client_contract_test;
 mod functional_otel_ldap_test;
 mod functional_overload_test;
 mod functional_passthrough_test;
