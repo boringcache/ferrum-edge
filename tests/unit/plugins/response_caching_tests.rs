@@ -15,6 +15,7 @@ use ferrum_edge::_test_support::{
     response_caching_staging_metadata_key_for_test, response_caching_vary_index_snapshot_for_test,
     run_after_proxy_hooks_for_test, run_after_proxy_hooks_reject_for_test,
     set_replay_credential_headers_for_test, set_replay_request_body_empty_proven_for_test,
+    set_response_presentation_policy_digest_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::response_caching::{RESPONSE_CACHING_CONFIG_KEYS, ResponseCaching};
@@ -48,6 +49,7 @@ fn make_ctx(method: &str, path: &str) -> RequestContext {
     );
     ctx.matched_proxy = Some(std::sync::Arc::new(create_test_proxy()));
     set_replay_request_body_empty_proven_for_test(&mut ctx, true);
+    set_response_presentation_policy_digest_for_test(&mut ctx, Some([0x51; 32]));
     ctx
 }
 
@@ -2795,13 +2797,16 @@ async fn test_invalidation_disabled() {
 
 #[tokio::test]
 async fn test_max_total_size_exceeded() {
+    let _policy_guard = response_cache_replay_policy_guard();
     let plugin = plugin_with_config(json!({
         "max_total_size_bytes": 500,
-        "max_entry_size_bytes": 1048576
+        "max_entry_size_bytes": 1048576,
+        // Keep generated telemetry out of this accounting fixture.
+        "add_cache_status_header": false
     }));
 
     // Cache a response that takes up most of the total size. Each entry is
-    // ~200 bytes body + ~64 bytes struct overhead + the retained
+    // ~200 bytes body + ~96 bytes struct overhead + the retained
     // invalidation-index scope digest and path, so one fits inside 500 bytes
     // and two do not.
     cache_response(&plugin, "GET", "/api/a", 200, &HashMap::new(), &[b'x'; 200]).await;

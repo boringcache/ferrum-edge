@@ -457,6 +457,44 @@ fn streaming_dispatch_acquires_sender_before_wrapping_frontend_upload() {
 }
 
 #[test]
+fn h2c_settings_observer_preserves_vectored_writes() {
+    let source = include_str!("../../../src/proxy/grpc_proxy.rs");
+    let start = source
+        .find("impl AsyncWrite for H2cSettingsIo")
+        .expect("H2cSettingsIo AsyncWrite implementation not found");
+    let implementation = &source[start..];
+    let end = implementation
+        .find("\n}\n\n/// Canonical terminal message")
+        .expect("H2cSettingsIo AsyncWrite implementation end not found");
+    let implementation = &implementation[..end];
+
+    assert!(
+        implementation.contains("fn poll_write_vectored(")
+            && implementation.contains(".poll_write_vectored(cx, bufs)"),
+        "the lifetime h2c wrapper must forward TcpStream scatter/gather writes"
+    );
+    assert!(
+        implementation.contains("fn is_write_vectored(&self)")
+            && implementation.contains("self.inner.is_write_vectored()"),
+        "the h2c wrapper must advertise the inner transport capability"
+    );
+
+    assert!(
+        source.contains("fn initial_settings_header_is_well_formed(&self)")
+            && source.contains("self.first_frame_header[4] & 0x1 == 0")
+            && source.contains("stream_id == 0")
+            && source.contains("payload_len <= DEFAULT_MAX_FRAME_SIZE")
+            && source.contains("payload_len % 6 == 0"),
+        "raw readiness must reject an ACK, nonzero stream, oversized frame, or malformed SETTINGS payload"
+    );
+    assert!(
+        source.contains("let post_observation = std::future::poll_fn(|cx|")
+            && source.contains("Pin::new(&mut *conn).poll(cx)"),
+        "Hyper must receive one post-observation poll so a protocol error wins the readiness race"
+    );
+}
+
+#[test]
 fn test_grpc_error_response_deadline_exceeded() {
     let resp = grpc_proxy::build_grpc_error_response(
         grpc_proxy::grpc_status::DEADLINE_EXCEEDED,

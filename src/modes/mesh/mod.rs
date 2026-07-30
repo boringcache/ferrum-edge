@@ -1281,6 +1281,7 @@ fn prepare_normalized_gateway_config_for_mesh(
         mesh.declared_ingress_http_ports = mesh_slice.declared_ingress_http_ports;
     }
     materialize_fault_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
+    materialize_transformer_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
     config.normalize_fields();
     config.resolve_upstream_tls();
 
@@ -1731,7 +1732,62 @@ fn materialize_fault_runtime_overlay(
     }
 }
 
-/// Advance fault-plugin generations whose reconciled non-persistence content changed.
+/// Bind transformer RTDS gates into candidate configs on the cold path.
+///
+/// The counterpart to [`materialize_fault_runtime_overlay`] for
+/// `request_transformer` / `response_transformer` (GHSA-83rc-23c9-3g9x). Before
+/// this, the two gates lived in process-global stores that
+/// `record_applied_slice` swapped AFTER `ProxyState::update_config` had already
+/// published the new `RequestEpoch`. That made gate and rules two separately
+/// published values with two distinct straddle windows: a plugin built from the
+/// new slice read the OLD gate for the length of the publication gap, and an
+/// in-flight plugin from the old slice read the NEW gate for as long as its
+/// request lived — unbounded for a slow upload or a slow backend. Folding the
+/// gate into the instance's own config here makes it part of the candidate that
+/// is validated, built into the plugin cache, and published atomically with the
+/// rules it gates, so neither window exists.
+///
+/// Unlike the fault materializer this does NOT skip disabled instances: the
+/// reserved key is rewritten authoritatively for every transformer config so a
+/// value cannot survive from an earlier generation onto an instance that is
+/// later re-enabled.
+///
+/// Cold path. Two gate maps are built once per apply and shared across every
+/// instance; the request path performs no overlay work at all.
+pub(crate) fn materialize_transformer_runtime_overlay(
+    config: &mut GatewayConfig,
+    overlay: &crate::modes::mesh::config::MeshRuntimeOverlay,
+) {
+    use crate::plugins::request_transformer::runtime_overlay as request_gate;
+    use crate::plugins::response_transformer::runtime_overlay as response_gate;
+    use crate::plugins::utils::transformer_gate::materialize_resolved_gate;
+
+    let request_gates = request_gate::scope_gates(overlay);
+    let response_gates = response_gate::scope_gates(overlay);
+
+    for plugin in config.plugin_configs.iter_mut() {
+        let gates = match plugin.plugin_name.as_str() {
+            "request_transformer" => &request_gates,
+            "response_transformer" => &response_gates,
+            _ => continue,
+        };
+        materialize_resolved_gate(&mut plugin.config, gates);
+    }
+}
+
+/// Plugin types whose effective config is materialized from the RTDS overlay.
+///
+/// Each of these binds an overlay-derived value into its own configuration on
+/// the cold path, so an overlay-only change must be able to rebuild exactly
+/// these instances — see [`reconcile_runtime_overlay_plugin_generations`].
+const RUNTIME_OVERLAY_MATERIALIZED_PLUGINS: &[&str] = &[
+    "fault_injection",
+    "request_transformer",
+    "response_transformer",
+];
+
+/// Advance overlay-materialized plugin generations whose reconciled
+/// non-persistence content changed.
 ///
 /// RTDS is not one of the mesh slice's version-coherence resource types, so an
 /// RTDS-only response can legitimately keep `GatewayConfig.loaded_at` stable.
@@ -1739,24 +1795,51 @@ fn materialize_fault_runtime_overlay(
 /// cold-path stamp makes the affected instances rebuild from their materialized
 /// effective config before `RequestEpoch` publishes the candidate. Unchanged
 /// and unrelated scopes retain their stateful plugin instances.
-pub(crate) fn reconcile_fault_plugin_generations(
+///
+/// This covers every plugin in [`RUNTIME_OVERLAY_MATERIALIZED_PLUGINS`], not
+/// just `fault_injection`: a transformer gate flip is exactly an RTDS-only
+/// change, so without the stamp `ConfigDelta` would see no plugin difference,
+/// retain the old instance, and leave the old gate live while the new slice was
+/// nominally accepted (GHSA-83rc-23c9-3g9x). Because the comparison is a whole
+/// serialized-config equality, the materialized `runtime_overlay_resolved_enabled`
+/// participates automatically.
+pub(crate) fn reconcile_runtime_overlay_plugin_generations(
     candidate: &mut GatewayConfig,
     previous: &GatewayConfig,
 ) {
+    let is_materialized = |plugin: &PluginConfig| {
+        RUNTIME_OVERLAY_MATERIALIZED_PLUGINS.contains(&plugin.plugin_name.as_str())
+    };
+
+    // Keyed by plugin NAME as well as identity: the key space now spans three
+    // plugin types, and pairing a candidate against a previous config of a
+    // different type would compare unrelated schemas.
     let previous_plugins = previous
         .plugin_configs
         .iter()
-        .filter(|plugin| plugin.plugin_name == "fault_injection")
-        .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
+        .filter(|plugin| is_materialized(plugin))
+        .map(|plugin| {
+            (
+                (
+                    plugin.plugin_name.as_str(),
+                    plugin.namespace.as_str(),
+                    plugin.id.as_str(),
+                ),
+                plugin,
+            )
+        })
         .collect::<HashMap<_, _>>();
 
     for plugin in candidate
         .plugin_configs
         .iter_mut()
-        .filter(|plugin| plugin.plugin_name == "fault_injection")
+        .filter(|plugin| is_materialized(plugin))
     {
-        let Some(previous) = previous_plugins.get(&(plugin.namespace.as_str(), plugin.id.as_str()))
-        else {
+        let Some(previous) = previous_plugins.get(&(
+            plugin.plugin_name.as_str(),
+            plugin.namespace.as_str(),
+            plugin.id.as_str(),
+        )) else {
             continue;
         };
         if plugin_config_content_eq_ignoring_persistence(plugin, previous) {
@@ -13779,7 +13862,7 @@ async fn apply_mesh_slice_generation(
             // upstream keeps its fresh timestamp and still rebuilds exactly that
             // one LB. Must run BEFORE `update_config` computes the delta.
             reconcile_mesh_upstream_timestamps(&mut config, &previous_config);
-            reconcile_fault_plugin_generations(&mut config, &previous_config);
+            reconcile_runtime_overlay_plugin_generations(&mut config, &previous_config);
             // GAP-2M.4: build node-waypoint per-pod policy scopes before
             // config apply, but publish them only after update_config accepts
             // the candidate. Pre-swapping scopes can pair old policies with a
@@ -24323,7 +24406,7 @@ mod tests {
                 )]),
             },
         );
-        reconcile_fault_plugin_generations(&mut candidate, &accepted);
+        reconcile_runtime_overlay_plugin_generations(&mut candidate, &accepted);
 
         assert_ne!(candidate.plugin_configs[0].updated_at, generation);
         let delta = crate::config_delta::ConfigDelta::compute(&accepted, &candidate);
@@ -24340,7 +24423,7 @@ mod tests {
                 )]),
             },
         );
-        reconcile_fault_plugin_generations(&mut repeated, &candidate);
+        reconcile_runtime_overlay_plugin_generations(&mut repeated, &candidate);
         assert_eq!(
             repeated.plugin_configs[0].updated_at, candidate.plugin_configs[0].updated_at,
             "an unchanged effective RTDS generation must retain the accepted stamp"
@@ -24359,13 +24442,13 @@ mod tests {
                 )]),
             },
         );
-        reconcile_fault_plugin_generations(&mut unrelated_only, &accepted);
+        reconcile_runtime_overlay_plugin_generations(&mut unrelated_only, &accepted);
         assert_eq!(unrelated_only.plugin_configs[0].updated_at, generation);
 
         let mut moved_to_proxy = accepted.clone();
         moved_to_proxy.plugin_configs[0].scope = PluginScope::Proxy;
         moved_to_proxy.plugin_configs[0].proxy_id = Some("checkout".to_string());
-        reconcile_fault_plugin_generations(&mut moved_to_proxy, &accepted);
+        reconcile_runtime_overlay_plugin_generations(&mut moved_to_proxy, &accepted);
         assert_ne!(moved_to_proxy.plugin_configs[0].updated_at, generation);
         let moved_delta = crate::config_delta::ConfigDelta::compute(&accepted, &moved_to_proxy);
         assert_eq!(moved_delta.modified_plugin_configs.len(), 1);
@@ -24373,7 +24456,7 @@ mod tests {
 
         let mut reprioritized = accepted.clone();
         reprioritized.plugin_configs[0].priority_override = Some(42);
-        reconcile_fault_plugin_generations(&mut reprioritized, &accepted);
+        reconcile_runtime_overlay_plugin_generations(&mut reprioritized, &accepted);
         assert_ne!(reprioritized.plugin_configs[0].updated_at, generation);
         let priority_delta = crate::config_delta::ConfigDelta::compute(&accepted, &reprioritized);
         assert_eq!(priority_delta.modified_plugin_configs.len(), 1);
@@ -24389,7 +24472,7 @@ mod tests {
                 )]),
             },
         );
-        reconcile_fault_plugin_generations(&mut disabled, &accepted);
+        reconcile_runtime_overlay_plugin_generations(&mut disabled, &accepted);
         assert!(!disabled.plugin_configs[0].enabled);
         assert_ne!(disabled.plugin_configs[0].updated_at, generation);
     }
@@ -24429,7 +24512,7 @@ mod tests {
                 )]),
             },
         );
-        reconcile_fault_plugin_generations(&mut candidate, &accepted);
+        reconcile_runtime_overlay_plugin_generations(&mut candidate, &accepted);
 
         assert_eq!(candidate.plugin_configs[0].updated_at, generation);
         assert_eq!(

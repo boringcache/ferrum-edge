@@ -186,6 +186,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `response_mock`) now wins, and a priority override placing the cache at or
     before a co-located `ai_prompt_compressor` re-opens the bypass this change
     closes.
+- Transformer RTDS gates are now bound to the mesh generation that supplied
+  their rules (GHSA-83rc-23c9-3g9x). `request_transformer` and
+  `response_transformer` read `ferrum.{request,response}_transformer.<scope>.enabled`
+  from process-global stores that mesh swapped *after* `ProxyState::update_config`
+  had already published the new `RequestEpoch`, and they re-read those stores at
+  every request phase. That opened two windows: a plugin built from the new slice
+  could read the previous gate during the publication gap, and an already-admitted
+  request could read a newly published gate for its whole lifetime — unbounded for
+  a slow upload or a slow backend. Scope, rules, defaults, and gate could combine
+  into states that existed in neither accepted slice, and one request could
+  observe different values at different phases: a request-side marker header
+  could be added while its paired body removal was skipped, and a response whose
+  buffering preflight answered `false` (selecting streaming) could then have
+  header rules applied by a `true` header phase, shipping a response marked as
+  sanitized whose body rules never ran.
+
+  The accepted overlay's gate is now materialized into each candidate instance's
+  own effective config on the mesh cold path — the same model `fault_injection`
+  already used for RTDS fault percentages — as the reserved
+  `runtime_overlay_resolved_enabled`. Gate and rules are therefore validated,
+  built, and published as one indivisible generation, and each instance resolves
+  one immutable decision at construction that every phase reads: buffering
+  preflight, request headers/query/body, response streaming/buffering selection,
+  response headers/body, retries, and synthetic responses, identically on
+  H1/H2/H3. An in-flight request stays wholly on the generation it pinned; a
+  rejected slice leaves the previous gate serving in full. Overlay-only changes
+  publish as coherent new generations because the affected instances are
+  re-stamped for rebuild. The request path no longer performs any overlay lookup,
+  removing a per-request `ArcSwap` load. The gate stores are still published
+  after acceptance as the provenance surface `response_caching` and
+  `request_deduplication` bind retained representations to, and
+  `GET /mesh/runtime-overlay` is unchanged. Because that publication lands
+  *after* the request epoch, a request whose authenticate/authorize phase spans
+  a slice apply keeps the plugin generation it pinned while pinning the newly
+  published identity; `response_caching` therefore also binds each stored entry
+  to its own generation's effective presentation-policy digest — which now
+  covers the materialized gate — so an entry shaped by a superseded generation
+  is refetched instead of replayed. An unprovable digest retains nothing.
+  `request_deduplication` already bound both halves.
 - Route-scoped request/response body ceilings are now enforced by the proxy core
   on every path, not just in body hooks (GHSA-xrfj-852f-645j). The `max_bytes` of
   `request_size_limiting` / `response_size_limiting` is published to the core

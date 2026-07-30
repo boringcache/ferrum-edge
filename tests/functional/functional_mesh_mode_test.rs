@@ -485,47 +485,81 @@ async fn reserve_mesh_ports() -> MeshPorts {
     }
 }
 
-/// Reserve gateway ports in the namespace where the subprocess will bind them.
+#[cfg(target_os = "linux")]
+fn ephemeral_port_range_in_netns(pid: u32) -> Result<(u16, u16), String> {
+    run_in_live_netns(pid, || {
+        let raw = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+            .map_err(|error| format!("read netns ephemeral port range: {error}"))?;
+        let mut fields = raw.split_whitespace();
+        let first = fields
+            .next()
+            .ok_or_else(|| "netns ephemeral port range is empty".to_string())?
+            .parse::<u16>()
+            .map_err(|error| format!("parse netns ephemeral port range start: {error}"))?;
+        let last = fields
+            .next()
+            .ok_or_else(|| "netns ephemeral port range has no end".to_string())?
+            .parse::<u16>()
+            .map_err(|error| format!("parse netns ephemeral port range end: {error}"))?;
+        if fields.next().is_some() || first > last {
+            return Err(format!("invalid netns ephemeral port range: {raw:?}"));
+        }
+        Ok((first, last))
+    })
+}
+
+/// Select a listener port in the gateway's actual network namespace and
+/// outside that namespace's ephemeral range.
 ///
-/// A host-namespace `:0` reservation cannot see an established/TIME_WAIT socket
-/// in an isolated pod namespace. The live two-cluster fixture probes from its
-/// source namespace before starting every source gateway, so the kernel could
-/// already have assigned that probe the same numeric ephemeral port selected
-/// later in the host namespace. Binding `0.0.0.0:port` in the target namespace
-/// detects that collision before the gateway is spawned.
+/// A host-namespace `127.0.0.1:0` reservation does not protect the same port
+/// number in a pod namespace. Worse, selecting an ephemeral number lets an
+/// already-running gateway claim it as a source port after the reservation is
+/// dropped but before the next gateway binds. The live two-cluster fixture
+/// starts several gateways in one source namespace, so that race can make a
+/// later listener fail with `EADDRINUSE`. Binding each candidate in the target
+/// namespace proves it is currently free; keeping it outside the kernel's
+/// ephemeral allocation range prevents an outbound connection from stealing it
+/// during the handoff.
+#[cfg(target_os = "linux")]
+fn reserve_unique_mesh_port_in_netns(pid: u32) -> Result<u16, String> {
+    let (ephemeral_first, ephemeral_last) = ephemeral_port_range_in_netns(pid)?;
+    for port in 10_240..=u16::MAX {
+        if (ephemeral_first..=ephemeral_last).contains(&port) || mesh_port_is_reserved(port) {
+            continue;
+        }
+        let listener = run_in_live_netns(pid, move || {
+            match std::net::TcpListener::bind(("0.0.0.0", port)) {
+                Ok(listener) => Ok(Some(listener)),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => Ok(None),
+                Err(error) => Err(format!("probe netns mesh port {port}: {error}")),
+            }
+        })?;
+        let Some(listener) = listener else {
+            continue;
+        };
+        let inserted = used_mesh_ports()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(port);
+        if inserted {
+            drop(listener);
+            return Ok(port);
+        }
+    }
+    Err(format!(
+        "no free non-ephemeral mesh port in netns {pid} outside \
+         {ephemeral_first}-{ephemeral_last}"
+    ))
+}
+
 #[cfg(target_os = "linux")]
 fn reserve_mesh_ports_in_netns(pid: u32) -> Result<MeshPorts, String> {
-    run_in_live_netns(pid, || {
-        let mut held = Vec::new();
-        let mut reserve = || -> Result<u16, String> {
-            for _ in 0..FIXTURE_BIND_ATTEMPTS {
-                let listener = std::net::TcpListener::bind(("0.0.0.0", 0))
-                    .map_err(|error| format!("reserve mesh port in pod netns: {error}"))?;
-                let port = listener
-                    .local_addr()
-                    .map_err(|error| format!("read pod-netns mesh port: {error}"))?
-                    .port();
-                let inserted = used_mesh_ports()
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(port);
-                held.push(listener);
-                if inserted {
-                    return Ok(port);
-                }
-            }
-            Err(format!(
-                "no unique pod-netns mesh port after {FIXTURE_BIND_ATTEMPTS} attempts"
-            ))
-        };
-
-        Ok(MeshPorts {
-            inbound: reserve()?,
-            outbound: reserve()?,
-            hbone: reserve()?,
-            egress: reserve()?,
-            east_west: reserve()?,
-        })
+    Ok(MeshPorts {
+        inbound: reserve_unique_mesh_port_in_netns(pid)?,
+        outbound: reserve_unique_mesh_port_in_netns(pid)?,
+        hbone: reserve_unique_mesh_port_in_netns(pid)?,
+        egress: reserve_unique_mesh_port_in_netns(pid)?,
+        east_west: reserve_unique_mesh_port_in_netns(pid)?,
     })
 }
 

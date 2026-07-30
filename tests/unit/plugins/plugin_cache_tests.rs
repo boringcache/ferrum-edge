@@ -6,7 +6,7 @@ use ferrum_edge::_test_support::{
     initial_response_header_policy_plugins_by_bare_proxy_id_for_test,
     initial_response_header_policy_plugins_for_test, plugin_cache_with_real_ip_header_for_test,
     plugins_for_protocol_by_bare_proxy_id_for_test, plugins_for_protocol_for_test,
-    reconcile_fault_plugin_generations_for_test,
+    reconcile_runtime_overlay_plugin_generations_for_test,
     request_deduplication_logical_keys_from_context_for_test, run_after_proxy_hooks_for_test,
     set_grpc_deadline_budget_for_test, transform_buffered_response_body_with_deadline_for_test,
     validate_correlation_id_composition_with_real_ip_header_for_test,
@@ -6204,7 +6204,7 @@ fn fault_reconciliation_scope_move_advances_the_actual_generation() {
     let mut candidate = accepted.clone();
     candidate.plugin_configs[0].scope = PluginScope::Proxy;
     candidate.plugin_configs[0].proxy_id = Some("p1".to_string());
-    reconcile_fault_plugin_generations_for_test(&mut candidate, &accepted);
+    reconcile_runtime_overlay_plugin_generations_for_test(&mut candidate, &accepted);
 
     assert!(candidate.plugin_configs[0].updated_at > generation);
     let delta = ConfigDelta::compute(&accepted, &candidate);
@@ -6228,7 +6228,7 @@ fn fault_reconciliation_priority_change_advances_the_actual_generation() {
 
     let mut candidate = accepted.clone();
     candidate.plugin_configs[0].priority_override = Some(42);
-    reconcile_fault_plugin_generations_for_test(&mut candidate, &accepted);
+    reconcile_runtime_overlay_plugin_generations_for_test(&mut candidate, &accepted);
 
     assert!(candidate.plugin_configs[0].updated_at > generation);
     let delta = ConfigDelta::compute(&accepted, &candidate);
@@ -6250,12 +6250,12 @@ fn fault_reconciliation_comparison_is_schema_complete_and_normalizes_only_timest
 
     let mut persistence_only = accepted.clone();
     persistence_only.plugin_configs[0].created_at += chrono::Duration::seconds(1);
-    reconcile_fault_plugin_generations_for_test(&mut persistence_only, &accepted);
+    reconcile_runtime_overlay_plugin_generations_for_test(&mut persistence_only, &accepted);
     assert_eq!(persistence_only.plugin_configs[0].updated_at, generation);
 
     let mut metadata_changed = accepted.clone();
     metadata_changed.plugin_configs[0].api_spec_id = Some("spec-owner".to_string());
-    reconcile_fault_plugin_generations_for_test(&mut metadata_changed, &accepted);
+    reconcile_runtime_overlay_plugin_generations_for_test(&mut metadata_changed, &accepted);
     assert!(metadata_changed.plugin_configs[0].updated_at > generation);
     assert_eq!(
         ConfigDelta::compute(&accepted, &metadata_changed)

@@ -67,12 +67,24 @@
 //!
 //! ## RTDS overlay
 //!
-//! When `runtime_overlay_scope: "<scope>"` is set, the plugin reads
-//! `ferrum.request_transformer.<scope>.enabled` from the mesh runtime
-//! overlay at request time. A `false` value short-circuits the plugin
-//! (static rules AND route-overlay overrides become no-ops). A missing
-//! entry falls back to `default_enabled` (defaults to `true` so the gate
-//! is fail-open).
+//! When `runtime_overlay_scope: "<scope>"` is set, the effective value of
+//! `ferrum.request_transformer.<scope>.enabled` is bound into this instance's
+//! configuration by mesh preparation and resolved ONCE, immutably, at
+//! construction. A `false` value short-circuits the plugin (static rules AND
+//! route-overlay overrides become no-ops). A scope the accepted overlay does
+//! not name falls back to `default_enabled` (defaults to `true` so the gate is
+//! fail-open).
+//!
+//! The gate is deliberately NOT read at request time (GHSA-83rc-23c9-3g9x).
+//! Because it is resolved from configuration, the gate and the rules it gates
+//! are one indivisible generation: they are validated together, built into one
+//! plugin cache, and published in one `RequestEpoch`. A request that pinned an
+//! epoch therefore observes a single complete accepted generation for its whole
+//! lifetime — it is wholly enabled or wholly disabled across `before_proxy`,
+//! query rules, and body transformation, no matter how long it is in flight or
+//! how many overlay updates land meanwhile. That holds identically on H1, H2,
+//! and H3, across retries and synthetic responses, and for every instance in a
+//! multi-instance chain.
 
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
@@ -86,6 +98,7 @@ use super::utils::query::OrderedQuery;
 use super::utils::route_header_transform::{
     RouteHeaderTransformRule, apply_route_header_transforms,
 };
+use super::utils::transformer_gate;
 use super::{Plugin, PluginResult, RequestContext};
 
 pub mod runtime_overlay;
@@ -96,6 +109,10 @@ const CONFIG_KEYS: &[&str] = &[
     "apply_route_overrides",
     "runtime_overlay_scope",
     "default_enabled",
+    // Reserved: written by mesh preparation from the accepted RTDS overlay so
+    // the gate rides the same generation as the rules. See
+    // `crate::plugins::utils::transformer_gate::RESOLVED_ENABLED_KEY`.
+    transformer_gate::RESOLVED_ENABLED_KEY,
 ];
 
 /// Per-rule keys accepted for header, query, and body rules.
@@ -149,24 +166,17 @@ pub struct RequestTransformer {
     /// when auto-emitting a `request_transformer` whose sole purpose is to
     /// apply per-rule `mesh_route_dispatch` route-level transforms.
     apply_route_overrides: bool,
-    /// When `Some`, the plugin reads
-    /// `ferrum.request_transformer.<scope>.enabled` from the mesh runtime
-    /// overlay on every request before applying rules.
-    runtime_overlay_scope: Option<String>,
-    /// Fallback when [`runtime_overlay_scope`] is set but the overlay does
-    /// not carry the matching key. Defaults to `true` (fail-open).
-    default_enabled: bool,
-}
-
-impl RequestTransformer {
-    fn rules_enabled(&self) -> bool {
-        let Some(scope) = self.runtime_overlay_scope.as_deref() else {
-            return true;
-        };
-        runtime_overlay::current_gates()
-            .gate(scope)
-            .unwrap_or(self.default_enabled)
-    }
+    /// The one immutable effective gate decision for this instance, resolved at
+    /// construction from `runtime_overlay_scope`, the mesh-materialized
+    /// `runtime_overlay_resolved_enabled`, and `default_enabled`.
+    ///
+    /// `true` for every instance that did not opt into an RTDS scope. Every
+    /// request phase reads this field, so a request can never see the gate
+    /// change underneath it and paired header/query/body rules can never be
+    /// applied under different gate states (GHSA-83rc-23c9-3g9x). A gate change
+    /// arrives as a new plugin instance in a new `RequestEpoch`; in-flight
+    /// requests keep the generation they pinned.
+    rules_enabled: bool,
 }
 
 fn parse_op(op: &str) -> Option<(HeaderOp, QueryOp)> {
@@ -479,13 +489,33 @@ impl RequestTransformer {
             }
         };
 
+        let resolved_enabled = match config.get(transformer_gate::RESOLVED_ENABLED_KEY) {
+            Some(Value::Bool(b)) => Some(*b),
+            Some(Value::Null) | None => None,
+            Some(_) => {
+                return Err(format!(
+                    "request_transformer: {} must be a boolean",
+                    transformer_gate::RESOLVED_ENABLED_KEY
+                ));
+            }
+        };
+
+        // Resolve the gate exactly once, here. An instance without a scope is
+        // unconditionally enabled; otherwise the accepted overlay's value for
+        // this generation wins, falling back to the operator's `default_enabled`
+        // when the overlay named no gate for the scope.
+        let rules_enabled = if runtime_overlay_scope.is_some() {
+            resolved_enabled.unwrap_or(default_enabled)
+        } else {
+            true
+        };
+
         Ok(Self {
             header_rules,
             query_rules,
             body_rules,
             apply_route_overrides,
-            runtime_overlay_scope,
-            default_enabled,
+            rules_enabled,
         })
     }
 }
@@ -512,7 +542,7 @@ impl Plugin for RequestTransformer {
         // to plugins via `mem::take`, which both breaks the gateway-wide
         // "ctx.headers is the original inbound headers" invariant and (on
         // some paths) silently drops route-level header writes.
-        !self.header_rules.is_empty() || self.apply_route_overrides
+        self.rules_enabled && (!self.header_rules.is_empty() || self.apply_route_overrides)
     }
 
     fn modifies_request_query(&self) -> bool {
@@ -520,7 +550,11 @@ impl Plugin for RequestTransformer {
     }
 
     fn modifies_request_body(&self) -> bool {
-        !self.body_rules.is_empty()
+        // The gate is immutable for this plugin generation, so a disabled
+        // instance can safely drop the config-time buffering capability too.
+        // Otherwise the kill-switch would still retain every request body even
+        // though no phase can consume or transform it.
+        self.rules_enabled && !self.body_rules.is_empty()
     }
 
     async fn before_proxy(
@@ -528,7 +562,7 @@ impl Plugin for RequestTransformer {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.rules_enabled() {
+        if !self.rules_enabled {
             return PluginResult::Continue;
         }
         for rule in &self.header_rules {
@@ -586,7 +620,9 @@ impl Plugin for RequestTransformer {
         content_type: Option<&str>,
         _request_headers: &std::collections::HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        if !self.rules_enabled() {
+        // The same immutable decision `before_proxy` used. A marker header and
+        // its paired body removal therefore cannot straddle a gate flip.
+        if !self.rules_enabled {
             return None;
         }
         // Only transform JSON bodies. When Content-Type is absent, attempt

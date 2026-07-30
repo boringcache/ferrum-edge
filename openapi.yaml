@@ -17936,8 +17936,20 @@ components:
           type: boolean
           default: true
           description: >-
-            Fallback when `runtime_overlay_scope` is configured but the RTDS
-            overlay has no boolean value for that key.
+            Fallback when `runtime_overlay_scope` is configured but the accepted
+            RTDS overlay has no boolean value for that key.
+        runtime_overlay_resolved_enabled:
+          type: boolean
+          description: >-
+            Reserved, mesh-managed. Mesh slice preparation writes the accepted
+            RTDS overlay's value for `runtime_overlay_scope` here, so the gate is
+            validated, built, and published in the same request generation as the
+            rules it gates (GHSA-83rc-23c9-3g9x). The plugin resolves one
+            immutable decision at construction and every request phase reads it,
+            so the gate is never re-evaluated mid-request. Ignored without
+            `runtime_overlay_scope`, and rewritten authoritatively on every mesh
+            apply — operators should not set it by hand; an explicitly authored
+            value simply acts as a static pin outside mesh mode.
 
     RequestTransformerHeaderRule:
       type: object
@@ -18110,8 +18122,18 @@ components:
           type: boolean
           default: true
           description: >-
-            Fallback when `runtime_overlay_scope` is configured but the RTDS
-            overlay has no boolean value for that key.
+            Fallback when `runtime_overlay_scope` is configured but the accepted
+            RTDS overlay has no boolean value for that key.
+        runtime_overlay_resolved_enabled:
+          type: boolean
+          description: >-
+            Reserved, mesh-managed. Counterpart to
+            `RequestTransformerConfig.runtime_overlay_resolved_enabled`. Binding
+            the gate to the generation is what keeps this plugin's buffering
+            preflight and its later header/body hooks in agreement: a gate that
+            moved between those phases could otherwise stream a response that had
+            already been header-marked as transformed
+            (GHSA-83rc-23c9-3g9x).
 
     ResponseTransformerHeaderRule:
       type: object

@@ -10,7 +10,7 @@ use ferrum_edge::_test_support::{
     apply_synthetic_response_body_hooks_for_test,
     discard_grpc_application_trailers_after_body_rewrite_for_test,
     finalize_plugin_rejection_parts_for_test, run_after_proxy_hooks_reject_for_test,
-    stamp_original_response_metadata_for_test,
+    set_response_presentation_policy_digest_for_test, stamp_original_response_metadata_for_test,
     transform_buffered_response_body_with_deadline_full_for_test,
 };
 use ferrum_edge::plugins::compression::{COMPRESSION_CONFIG_KEYS, CompressionPlugin};
@@ -119,6 +119,10 @@ async fn plan_response_algorithm(
 /// is the same lock every overlay publisher holds.
 fn response_cache_replay_policy_guard() -> std::sync::MutexGuard<'static, ()> {
     ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock()
+}
+
+fn seed_response_cache_presentation_policy(ctx: &mut RequestContext) {
+    set_response_presentation_policy_digest_for_test(ctx, Some([0x51; 32]));
 }
 
 #[test]
@@ -1028,6 +1032,7 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
     );
     store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     prove_empty_request_body(&mut store_ctx);
+    seed_response_cache_presentation_policy(&mut store_ctx);
     let mut store_req = HashMap::new();
     assert!(matches!(
         cache.before_proxy(&mut store_ctx, &mut store_req).await,
@@ -1074,6 +1079,7 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
     );
     hit_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     prove_empty_request_body(&mut hit_ctx);
+    seed_response_cache_presentation_policy(&mut hit_ctx);
     let mut hit_headers = HashMap::new();
     let (status, body, headers) = match cache.before_proxy(&mut hit_ctx, &mut hit_headers).await {
         PluginResult::Reject {
@@ -1110,7 +1116,8 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
             "/cache-vary-order".to_string(),
         );
         miss_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
-        prove_empty_request_body(&mut miss_ctx);
+    prove_empty_request_body(&mut miss_ctx);
+    seed_response_cache_presentation_policy(&mut miss_ctx);
         miss_ctx
             .headers
             .insert("accept-encoding".to_string(), accept_encoding.to_string());
@@ -1132,6 +1139,7 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
     gzip_store_ctx.max_response_body_size_bytes = 10 * 1024 * 1024;
     gzip_store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     prove_empty_request_body(&mut gzip_store_ctx);
+    seed_response_cache_presentation_policy(&mut gzip_store_ctx);
     gzip_store_ctx
         .headers
         .insert("accept-encoding".to_string(), "gzip".to_string());
@@ -1184,6 +1192,7 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
     );
     gzip_hit_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     prove_empty_request_body(&mut gzip_hit_ctx);
+    seed_response_cache_presentation_policy(&mut gzip_hit_ctx);
     gzip_hit_ctx
         .headers
         .insert("accept-encoding".to_string(), "gzip".to_string());
@@ -1222,7 +1231,8 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
             "/cache-vary-order".to_string(),
         );
         miss_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
-        prove_empty_request_body(&mut miss_ctx);
+    prove_empty_request_body(&mut miss_ctx);
+    seed_response_cache_presentation_policy(&mut miss_ctx);
         if let Some(ae) = accept_encoding {
             miss_ctx
                 .headers
@@ -1252,6 +1262,7 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
 
 #[tokio::test]
 async fn test_response_cache_hit_cannot_bypass_required_406() {
+    let _policy_guard = response_cache_replay_policy_guard();
     // Compose response_caching + compression. An identity variant cached
     // without Vary: Accept-Encoding (#2355) must still be replaced by 406 when
     // a later request refuses identity — the shared reject-path after_proxy
@@ -1269,6 +1280,7 @@ async fn test_response_cache_hit_cannot_bypass_required_406() {
     );
     store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     prove_empty_request_body(&mut store_ctx);
+    seed_response_cache_presentation_policy(&mut store_ctx);
     let mut store_headers = HashMap::new();
     assert!(matches!(
         plugins[0]
@@ -1303,6 +1315,7 @@ async fn test_response_cache_hit_cannot_bypass_required_406() {
     );
     hit_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     prove_empty_request_body(&mut hit_ctx);
+    seed_response_cache_presentation_policy(&mut hit_ctx);
     hit_ctx
         .headers
         .insert("accept-encoding".to_string(), "*;q=0".to_string());
@@ -1353,6 +1366,7 @@ async fn test_response_cache_hit_cannot_bypass_required_406() {
 
 #[tokio::test]
 async fn test_response_cache_hit_preserves_identity_when_acceptable() {
+    let _policy_guard = response_cache_replay_policy_guard();
     // Cache HIT + absent / identity-acceptable Accept-Encoding must keep the
     // cached identity representation — replacement is only when identity is
     // explicitly unacceptable.
@@ -1368,6 +1382,7 @@ async fn test_response_cache_hit_preserves_identity_when_acceptable() {
     );
     store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     prove_empty_request_body(&mut store_ctx);
+    seed_response_cache_presentation_policy(&mut store_ctx);
     let mut store_headers = HashMap::new();
     assert!(matches!(
         plugins[0]
@@ -1397,7 +1412,8 @@ async fn test_response_cache_hit_preserves_identity_when_acceptable() {
             "/cache-identity-ok".to_string(),
         );
         hit_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
-        prove_empty_request_body(&mut hit_ctx);
+    prove_empty_request_body(&mut hit_ctx);
+    seed_response_cache_presentation_policy(&mut hit_ctx);
         if let Some(ae) = accept_encoding {
             hit_ctx
                 .headers
