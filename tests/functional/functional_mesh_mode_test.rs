@@ -10543,11 +10543,9 @@ impl LiveTwoClusterFixture {
         let temp_ambient_destination =
             TempDir::new().map_err(|e| format!("ambient dest tempdir: {e}"))?;
 
-        let ports_sidecar_destination =
-            reserve_mesh_ports_in_netns(destination.pod.pid())?;
+        let ports_sidecar_destination = reserve_mesh_ports_in_netns(destination.pod.pid())?;
         let sidecar_destination_inbound = ports_sidecar_destination.inbound;
-        let ports_ambient_destination =
-            reserve_mesh_ports_in_netns(destination.pod.pid())?;
+        let ports_ambient_destination = reserve_mesh_ports_in_netns(destination.pod.pid())?;
         let ambient_destination_hbone = ports_ambient_destination.hbone;
         let ports_east_west = reserve_mesh_ports_in_netns(east_west.pod.pid())?;
         let east_west_port = ports_east_west.east_west;
