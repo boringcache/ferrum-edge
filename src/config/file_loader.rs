@@ -748,6 +748,27 @@ pub fn decode_and_validate_config_document(
         ))
         .run()?;
 
+    let plaintext_basic_auth_consumers: Vec<&str> = config
+        .consumers
+        .iter()
+        .filter(|consumer| {
+            consumer
+                .credentials
+                .get("basicauth")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|entries| entries.iter().any(|entry| entry.get("password").is_some()))
+        })
+        .map(|consumer| consumer.id.as_str())
+        .collect();
+    if !plaintext_basic_auth_consumers.is_empty() {
+        anyhow::bail!(
+            "Configuration validation failed: file-mode Basic-auth credentials must use \
+             'password_hash'; plaintext 'password' is accepted only by Admin API writes \
+             (consumer IDs: {})",
+            plaintext_basic_auth_consumers.join(", ")
+        );
+    }
+
     if let Err(errors) = config.validate_operator_provided_fields() {
         anyhow::bail!(
             "Configuration validation failed: {} mesh-projected upstream field(s) \

@@ -13,7 +13,7 @@ only under `fuzz/` — the production `ferrum-edge` binary does not depend on th
 | `proxy_protocol` | PROXY v1/v2 header parse | 528-byte header cap | Fail closed; bounded address block |
 | `mesh_udp_frame` | HBONE datagram framing | 64 KiB input, 256 frames/invocation | Length prefix bounded; encode/decode round-trip |
 | `k8s_crd` | Istio/Gateway API JSON → translation | 32 objects, depth 64 | Fail-closed translation errors |
-| `plugin_config` | Representative plugin JSON validation | depth 64 | `validate_plugin_config` never panics |
+| `plugin_config` | Representative plugin JSON validation (one selector byte followed by JSON) | depth 64 | `validate_plugin_config` never panics |
 
 Shared budgets and helpers live in `src/fuzz_support.rs`.
 

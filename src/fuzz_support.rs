@@ -131,14 +131,17 @@ pub fn mesh_udp_frame_round_trip(payload: &[u8]) -> Result<(), String> {
 pub fn fuzz_translate_k8s_json(data: &[u8]) -> Result<(), String> {
     let value: Value = serde_json::from_slice(data).map_err(|error| error.to_string())?;
     reject_excessive_json_depth(&value).map_err(|()| "json depth budget exceeded".to_string())?;
+    if value
+        .as_array()
+        .is_some_and(|objects| objects.len() > MAX_K8S_OBJECTS)
+    {
+        return Err("k8s object count budget exceeded".to_string());
+    }
     let objects: Vec<K8sObject> = if value.is_array() {
         serde_json::from_value(value).map_err(|error| error.to_string())?
     } else {
         vec![serde_json::from_value(value).map_err(|error| error.to_string())?]
     };
-    if objects.len() > MAX_K8S_OBJECTS {
-        return Err("k8s object count budget exceeded".to_string());
-    }
     let options = K8sTranslationOptions::new(
         "default".to_string(),
         TrustDomain::new("cluster.local").map_err(|error| error.to_string())?,
@@ -150,12 +153,15 @@ pub fn fuzz_translate_k8s_json(data: &[u8]) -> Result<(), String> {
 
 /// Validate a plugin configuration JSON blob against a representative plugin set.
 pub fn fuzz_validate_plugin_config(data: &[u8]) -> Result<(), String> {
-    if data.is_empty() {
+    let Some((&selector, payload)) = data.split_first() else {
+        return Ok(());
+    };
+    if payload.is_empty() {
         return Ok(());
     }
-    let value: Value = serde_json::from_slice(data).map_err(|error| error.to_string())?;
+    let value: Value = serde_json::from_slice(payload).map_err(|error| error.to_string())?;
     reject_excessive_json_depth(&value).map_err(|()| "json depth budget exceeded".to_string())?;
-    let plugin_idx = data[0] as usize % FUZZ_PLUGIN_NAMES.len();
+    let plugin_idx = selector as usize % FUZZ_PLUGIN_NAMES.len();
     let plugin_name = FUZZ_PLUGIN_NAMES[plugin_idx];
     validate_plugin_config(plugin_name, &value).map_err(|error| error)
 }
@@ -175,7 +181,6 @@ pub fn smoke_invariants() -> Result<(), String> {
     let config =
         r#"{"version":"1","proxies":[],"consumers":[],"plugin_configs":[],"upstreams":[]}"#;
     fuzz_decode_config_document(config)?;
-    let plugin = serde_json::json!({"origins": ["*"]});
-    validate_plugin_config("cors", &plugin).map_err(|error| error)?;
+    fuzz_validate_plugin_config(b"0{\"origins\":[\"*\"]}")?;
     Ok(())
 }
