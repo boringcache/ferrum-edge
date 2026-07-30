@@ -22397,6 +22397,32 @@ async fn handle_proxy_request_inner(
         .await);
     }
 
+    // Most protocol-classified gRPC requests finalize inside the native gRPC
+    // branch below. Pass-through gRPC-Web on a mesh transport instead rides the
+    // generic HTTP-family path, so classify it before terminal preparation:
+    // when one of its plugins requires the request body, that generic path must
+    // still run transforms, final policy, and finalized-request egress in that
+    // order before any mirror/function/provider can be contacted.
+    let grpc_request_is_web_translated =
+        crate::plugins::grpc_web::request_is_grpc_web_translated(&ctx);
+    let grpc_mesh_fall_through = is_grpc_request
+        && proxy.dispatch_kind.is_http_family()
+        && upstream_target.as_deref().is_some_and(|target| {
+            grpc_proxy::grpc_mesh_dispatch_falls_through(
+                grpc_proxy::classify_grpc_mesh_dispatch(target),
+                request_uses_grpc_content_type,
+                grpc_request_is_web_translated,
+                !requires_request_body_buffering,
+            )
+        });
+    let grpc_uses_native_dispatch =
+        is_grpc_request && proxy.dispatch_kind.is_http_family() && !grpc_mesh_fall_through;
+    let grpc_uses_generic_dispatch = is_grpc_request && !grpc_uses_native_dispatch;
+    let final_body_before_backend_dispatch = final_body_before_backend_dispatch
+        || (grpc_uses_generic_dispatch
+            && requires_request_body_buffering
+            && capabilities.has(PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS));
+
     // A terminal final-body plugin (currently `ai_federation`) owns its own
     // external dispatch and returns the complete response. Finalize and invoke
     // it after inbound transport policy, but before the placeholder route's
@@ -22631,11 +22657,15 @@ async fn handle_proxy_request_inner(
     //
     // A request that did finalize has already dispatched and is excluded by
     // `finalized_request_egress_dispatched` before the header snapshot is
-    // cloned. Only a buffering native-gRPC chain is left out: its branch
+    // cloned. A buffering gRPC request that uses generic dispatch (mesh
+    // fall-through or a non-HTTP-family dispatch kind) was pulled through
+    // terminal preparation above; if it carried no body, it deliberately
+    // remained streaming and reaches this empty-body boundary. Only a buffering
+    // request that will enter the native-gRPC branch is left out: that branch
     // collects the message and reaches the boundary with those exact bytes.
     if capabilities.has(PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS)
         && !ctx.finalized_request_egress_dispatched
-        && !(is_grpc_request && requires_request_body_buffering)
+        && !(grpc_uses_native_dispatch && requires_request_body_buffering)
     {
         let phase_start = Instant::now();
         let egress_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
@@ -23187,19 +23217,7 @@ async fn handle_proxy_request_inner(
     //     gRPC-Web, but text-mode translated gRPC-Web remains fail-closed here
     //     because it requires request-body buffering and the generic mesh-mTLS
     //     path does not accept pre-buffered request bodies.
-    let grpc_request_is_web_translated =
-        crate::plugins::grpc_web::request_is_grpc_web_translated(&ctx);
-    let grpc_mesh_fall_through = is_grpc_request
-        && proxy.dispatch_kind.is_http_family()
-        && upstream_target.as_deref().is_some_and(|target| {
-            grpc_proxy::grpc_mesh_dispatch_falls_through(
-                grpc_proxy::classify_grpc_mesh_dispatch(target),
-                request_uses_grpc_content_type,
-                grpc_request_is_web_translated,
-                !requires_request_body_buffering,
-            )
-        });
-    if is_grpc_request && proxy.dispatch_kind.is_http_family() && !grpc_mesh_fall_through {
+    if grpc_uses_native_dispatch {
         {
             let grpc_proxy_headers = owned_proxy_headers.as_mut().unwrap_or(&mut ctx.headers);
             apply_effective_backend_scheme_headers(

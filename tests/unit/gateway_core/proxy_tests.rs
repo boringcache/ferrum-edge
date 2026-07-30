@@ -3521,11 +3521,27 @@ fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch
     );
     assert!(
         handler[fallback..]
-            .find("!(is_grpc_request && requires_request_body_buffering)")
-            .is_some_and(|offset| offset < 200),
-        "only a buffering native-gRPC chain may defer to the gRPC branch's own egress \
-         boundary; every other request that reaches no finalization site must still be \
-         dispatched here (GHSA-4vr5-4wm3-x5xv)"
+            .find("!(grpc_uses_native_dispatch && requires_request_body_buffering)")
+            .is_some_and(|offset| offset < 300),
+        "only a buffering request that will enter the native-gRPC branch may defer to \
+         that branch's own egress boundary; mesh fall-through requests must still be \
+         dispatched here when they carry no body (GHSA-4vr5-4wm3-x5xv)"
+    );
+
+    let mesh_fall_through = handler
+        .find("let grpc_mesh_fall_through")
+        .expect("mesh gRPC fall-through must be classified before terminal preparation");
+    let terminal = handler
+        .find("if final_body_before_backend_dispatch")
+        .expect("terminal body preparation must remain present");
+    assert!(
+        mesh_fall_through < terminal
+            && handler[mesh_fall_through..terminal]
+                .contains(
+                    "grpc_uses_generic_dispatch\n            && requires_request_body_buffering",
+                ),
+        "every buffering gRPC request that will use generic dispatch must be pulled through \
+         transforms, final policy, and finalized-request egress before dispatch"
     );
 
     // A buffered request on an egress chain finalizes before backend dispatch

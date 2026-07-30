@@ -310,8 +310,12 @@ handshakes, streamed requests with no body policy, and — even on a proxy that
 *does* require buffering — a request carrying no body at all, which the gateway
 deliberately leaves streaming and never runs transforms or final-body hooks
 for), and the HTTP/3 boundary that follows terminal finalization (which likewise
-precedes the H3 WebSocket branch). HBONE `CONNECT` tunnels short-circuit the
-dispatch ladder before the boundary and do not run egress plugins.
+precedes the H3 WebSocket branch). Buffering protocol-classified gRPC requests
+that use generic dispatch — including pass-through gRPC-Web falling through to
+a mesh HTTP transport — are pulled through terminal finalization before that
+boundary; native gRPC keeps its transport-local boundary. HBONE `CONNECT`
+tunnels short-circuit the dispatch ladder before the boundary and do not run
+egress plugins.
 
 Because a configured egress plugin forces request-body finalization to complete
 *before* backend dispatch, a buffered request on such a proxy reads its upload
