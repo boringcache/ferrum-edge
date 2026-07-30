@@ -23162,8 +23162,21 @@ components:
             validate_tool_results:
               type: boolean
               default: false
-              enum: [false]
-              description: Reserved; tool result validation is not implemented yet, so true is rejected at config validation.
+              description: >
+                Aggregate-router only. When true, compile each discovered tool
+                outputSchema at catalog construction, pin the exact validator
+                selected for each dispatched call, and validate bounded tools/call
+                results against it before releasing the caller-visible response
+                or publishing audit metadata.
+                structuredContent is preferred; a single JSON text
+                content block is accepted when structuredContent is absent; mixed
+                disagreeing variants and exact response bytes with duplicate
+                object members fail closed. Well-formed tool execution errors
+                (result.isError true with array content) and upstream JSON-RPC
+                errors are preserved; non-boolean or bare isError values,
+                event-stream, and non-JSON tool results fail closed. Invalid or unrepresentable
+                outputSchema values are refused at catalog admission with
+                field-specific diagnostics. Default false.
             max_upstream_response_bytes:
               type: integer
               format: int64
