@@ -15872,16 +15872,17 @@ components:
                       type: string
                     description: >-
                       Query parameter equality matches (all-of), compared after
-                      percent-decoding the effective backend-visible query — the
-                      same bytes the proxy forwards, including any
-                      request_transformer query mutation and
-                      authentication-owned credential strips — so a rule can
-                      never select a backend under a value the application does
-                      not execute. A request whose query cannot be decoded to
-                      one such value is rejected with 400 before any rule is
-                      evaluated: a repeated or percent-encoded duplicate name, a
-                      literal '+' (RFC 3986 plus vs form-urlencoded space),
-                      malformed percent-encoding, or a non-UTF-8 decoding.
+                      percent-decoding the backend-bound query representation
+                      available at the dispatch hook, including
+                      authentication-owned credential strips and any
+                      priority-overridden request_transformer that already ran.
+                      A deliberately later route/request transform remains a
+                      separate ordered operation. A request whose query cannot
+                      be decoded to one value is rejected with 400 before any
+                      rule is evaluated: a repeated or percent-encoded duplicate
+                      name, a literal '+' (RFC 3986 plus vs form-urlencoded
+                      space), malformed percent-encoding, or a non-UTF-8
+                      decoding.
                   uri:
                     description: |
                       Optional URI predicate (Istio `StringMatch` shape).

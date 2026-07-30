@@ -39,6 +39,36 @@ const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'|')
     .add(b'}');
 
+/// Whether one decoded query name appears with conflicting decoded values.
+///
+/// The WAF parameter-pollution rule deliberately keeps this narrower
+/// predicate: it reports the concrete first/last-value differential, while an
+/// identical repeated value does not trigger that rule. Security-sensitive
+/// routing and delegated policy must use [`CanonicalQuery`] instead, because
+/// they also fail closed on identical duplicates, encoded aliases, literal
+/// plus, and invalid encodings.
+pub fn has_conflicting_duplicate_query_key(raw_query: &str) -> bool {
+    let mut seen: HashMap<String, String> = HashMap::new();
+    for pair in raw_query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode_str(raw_key).decode_utf8_lossy().into_owned();
+        let value = percent_decode_str(raw_value)
+            .decode_utf8_lossy()
+            .into_owned();
+        match seen.get(&key) {
+            Some(previous) if previous != &value => return true,
+            Some(_) => {}
+            None => {
+                seen.insert(key, value);
+            }
+        }
+    }
+    false
+}
+
 /// A reason the client's query cannot be reduced to one unambiguous decoded
 /// name→value view that Ferrum policy and the backend are guaranteed to read
 /// identically.
@@ -103,11 +133,12 @@ pub struct CanonicalQueryParam {
 /// # The forwarding-parity contract
 ///
 /// [`canonical_query_for_policy`] builds this from
-/// [`crate::proxy::effective_backend_query_string`] — the *same* string the
-/// proxy composes into the backend request line. The canonical view is
-/// therefore a decoding of the exact bytes Ferrum forwards, not of a separate
-/// parse of the raw wire query. Any security decision made on this view is
-/// made on the bytes the backend receives.
+/// [`crate::proxy::effective_backend_query_string`] — the backend-bound query
+/// representation in the request context at the consumer's hook. That includes
+/// authentication-owned strips and any query transform that has already run,
+/// rather than a separate parse of the lossy shared map. A deliberately later
+/// transformer may still replace the query in its own ordered phase; consumers
+/// that run after it observe the replacement.
 ///
 /// # Ambiguity is recorded, never silently resolved
 ///
@@ -251,8 +282,8 @@ impl CanonicalQuery {
     }
 }
 
-/// Build the canonical policy view of this request's query from the exact
-/// bytes Ferrum forwards to the backend.
+/// Build the canonical policy view from the request's current backend-bound
+/// query representation.
 ///
 /// This is the single entry point every security-sensitive query consumer must
 /// use — OPA authorization input, `mesh_route_dispatch` predicates, and

@@ -506,9 +506,11 @@ impl Plugin for Opa {
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
-        // Decode the exact bytes Ferrum will forward to the backend, so the
-        // value OPA authorizes and the value the application executes are the
-        // same value (advisories GHSA-j2j6-f9c7-hh85, GHSA-gr4p-3qw3-87r5).
+        // Decode the backend-bound query representation at the OPA hook,
+        // including authentication-owned strips, instead of the lossy shared
+        // map. A deliberately later request_transformer remains a separate
+        // ordered operation (advisories GHSA-j2j6-f9c7-hh85,
+        // GHSA-gr4p-3qw3-87r5).
         let query = self.include_query.then(|| canonical_query_for_policy(ctx));
 
         if let Some(query) = query.as_ref()

@@ -816,11 +816,11 @@ pub struct MatchCriteria {
     #[serde(default)]
     pub headers: HashMap<String, HeaderMatchOp>,
     /// Query parameter equality matches (all-of). Names and values match
-    /// exactly after percent-decoding the **effective backend-visible query** —
-    /// the same bytes the proxy forwards, including any `request_transformer`
-    /// query mutation and authentication-owned credential strips — so a rule
-    /// can never select a backend under a value the application does not
-    /// execute.
+    /// exactly after percent-decoding the backend-bound query representation
+    /// available at this dispatch hook, including authentication-owned
+    /// credential strips and any priority-overridden query transformer that
+    /// already ran. A later route/request transform remains an intentional,
+    /// separately ordered operation.
     ///
     /// A request whose query cannot be decoded to one such value is rejected
     /// with 400 before any rule is evaluated: a repeated or percent-encoded
