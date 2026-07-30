@@ -304,7 +304,9 @@ fn confirmation_matches_serde_json_value_acceptance() {
     assert!(serde_json::from_str::<serde_json::Value>(trailing).is_err());
     assert!(str_ambiguity(trailing).is_none());
 
-    // Lone / mispaired surrogates: `Value` rejects; must not be ambiguity.
+    // Lone / mispaired surrogates: `Value` rejects, but JavaScript and other
+    // downstream parsers can accept them. They must fail closed so governed
+    // content cannot bypass inspection through the parser differential.
     for body in [
         format!("{{\"{backslash}ud83d\":1}}"),
         format!("{{\"{backslash}ude00\":1}}"),
@@ -314,11 +316,20 @@ fn confirmation_matches_serde_json_value_acceptance() {
             serde_json::from_str::<serde_json::Value>(&body).is_err(),
             "serde Value unexpectedly accepted {body:?}"
         );
-        assert!(
-            slice_ambiguity(body.as_bytes()).is_none(),
-            "{body:?} was reported as ambiguity rather than malformed"
+        assert_eq!(
+            slice_ambiguity(body.as_bytes()),
+            Some(JsonScanReject::InvalidSurrogate.reason()),
+            "{body:?} did not fail closed"
         );
     }
+
+    let governed = format!(
+        "{{\"tool_calls\":[{{\"function\":{{\"name\":\"danger\"}}}}],\"pad\":\"{backslash}ud83d\"}}"
+    );
+    assert_eq!(
+        slice_ambiguity(governed.as_bytes()),
+        Some(JsonScanReject::InvalidSurrogate.reason())
+    );
 
     // Malformed UTF-8 in a member name.
     let non_utf8 = b"{\"\xff\xfe\":1}";
@@ -589,6 +600,7 @@ fn reasons_are_fixed_cardinality_and_echo_no_input() {
         JsonScanReject::KeyTooLong,
         JsonScanReject::TooLarge,
         JsonScanReject::Malformed,
+        JsonScanReject::InvalidSurrogate,
     ] {
         assert!(!reject.reason().is_empty());
     }
