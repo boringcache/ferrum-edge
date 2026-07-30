@@ -5704,13 +5704,7 @@ fn audit_output_schema_node(
                 ));
             }
             if let Some(target) = local_output_schema_pointer_target(document, reference, key)? {
-                audit_output_schema_node(
-                    target,
-                    document,
-                    depth + 1,
-                    max_depth_seen,
-                    active,
-                )?;
+                audit_output_schema_node(target, document, depth + 1, max_depth_seen, active)?;
             }
         }
     }
@@ -5756,13 +5750,9 @@ fn audit_output_schema_node(
                         )?;
                     }
                 }
-                other => audit_output_schema_node(
-                    other,
-                    document,
-                    depth + 1,
-                    max_depth_seen,
-                    active,
-                )?,
+                other => {
+                    audit_output_schema_node(other, document, depth + 1, max_depth_seen, active)?
+                }
             },
             "additionalProperties"
             | "unevaluatedProperties"
@@ -5774,13 +5764,7 @@ fn audit_output_schema_node(
             | "then"
             | "else"
             | "contentSchema" => {
-                audit_output_schema_node(
-                    value,
-                    document,
-                    depth + 1,
-                    max_depth_seen,
-                    active,
-                )?;
+                audit_output_schema_node(value, document, depth + 1, max_depth_seen, active)?;
             }
             "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
                 if let Some(items) = value.as_array() {
