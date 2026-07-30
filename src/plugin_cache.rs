@@ -3504,14 +3504,25 @@ fn start_background_tasks(
 /// generation has been installed. Must stay infallible and idempotent.
 fn commit_background_tasks(proxy_map: &ProxyPluginMap, globals: &[Arc<dyn Plugin>]) {
     let mut committed = HashSet::new();
+    let mut saw_api_chargeback = false;
     for plugin in globals
         .iter()
         .chain(proxy_map.values().flat_map(|plugins| plugins.iter()))
     {
         let pointer = Arc::as_ptr(plugin) as *const () as usize;
         if committed.insert(pointer) {
+            if plugin.name() == "api_chargeback" {
+                saw_api_chargeback = true;
+            }
             plugin.commit_background_tasks();
         }
+    }
+    // Instance commit publishes the `/charges` projection while at least one
+    // enabled api_chargeback exists. A generation with zero instances has no
+    // plugin callback, so publish absence explicitly after atomic installation
+    // (never during candidate construction/validation).
+    if !saw_api_chargeback {
+        crate::plugins::api_chargeback::publish_render_schema_absence();
     }
 }
 
