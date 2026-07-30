@@ -5,9 +5,9 @@ Criterion fixture contract (see tests/performance/mesh/benches/rr_selection.rs):
   - Each measured custom iteration runs ITERATIONS_PER_THREAD selections per
     worker thread (currently 50_000).
   - The gated comparison uses PARALLEL_THREADS workers for both:
-      * `sharded`: production LoadBalancer::select RoundRobin
-      * `shared`: deliberately contended bare AtomicU64 + the same 2-target
-        Arc clone traffic
+      * `sharded`: exact RoundRobin selection seam with one explicit
+        CachePadded shard per worker
+      * `shared`: the same seam with every worker pinned to shard zero
   - Multi-thread samples reuse a long-lived barrier-synchronized worker pool;
     Criterion's mean is the wall time from barrier release until every worker
     completes the selection loop, not thread spawn/join overhead.
@@ -15,13 +15,14 @@ Criterion fixture contract (see tests/performance/mesh/benches/rr_selection.rs):
     whole custom iteration (not ns/selection).
   - A diagnostic 1-thread sharded sample is recorded for logs only.
 
-Contended advantage (same-run, equal element counts):
+Contended advantage (same Criterion invocation, equal element counts):
 
   advantage = shared_wall_ns / sharded_wall_ns
 
-A production path that has regressed to one shared `AtomicU64` collapses this
+A production path that has regressed to one shared counter line collapses this
 toward 1.0x (sharded ≈ shared). Healthy CachePadded sharding keeps the shared
-control slower under the same Arc/scheduler load, clearing the hosted floor.
+control slower while both sides perform the same ticket, modulo, target lookup,
+and Arc clone work, clearing the hosted floor.
 Absolute 1-thread vs N-thread speedup is intentionally not gated: hosted
 runners and 2-target Arc refcount concentration made that ratio swing from
 ~1.50x to 0.44x without an RR code change.
@@ -46,8 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Verify hosted RoundRobin selection Criterion results. "
-            "Gates same-run shared-AtomicU64 control wall time over production "
-            "sharded RoundRobin wall time under identical worker counts."
+            "Gates same-shard RoundRobin wall time over distinct-shard "
+            "RoundRobin wall time under identical worker counts and work."
         )
     )
     parser.add_argument("--criterion-root", type=Path, required=False)
@@ -61,13 +62,6 @@ def parse_args() -> argparse.Namespace:
             f"{PARALLEL_THREADS} * {ITERATIONS_PER_THREAD} selections."
         ),
     )
-    # Back-compat alias used by older workflow snippets.
-    parser.add_argument(
-        "--min-parallel-speedup",
-        type=float,
-        required=False,
-        help=argparse.SUPPRESS,
-    )
     parser.add_argument(
         "--self-test",
         action="store_true",
@@ -77,7 +71,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def contended_advantage(sharded_ns: float, shared_ns: float) -> float:
-    """Return shared/sharded wall ratio for equal-work same-run samples."""
+    """Return shared/sharded wall ratio for equal-work samples."""
     if sharded_ns <= 0 or shared_ns <= 0:
         raise ValueError(
             f"invalid timing inputs sharded_ns={sharded_ns} shared_ns={shared_ns}"
@@ -130,13 +124,13 @@ def self_test() -> int:
         )
 
     # Absolute 1-vs-N collapse must not be sufficient to fail by itself once
-    # the same-run control still shows sharding wins.
+    # the equal-work control still shows sharding wins.
     absolute_collapse = (PARALLEL_THREADS * 100.0) / 900.0  # ~0.44x style
     if absolute_collapse >= HOSTED_CONTENTION_FLOOR:
         failures.append("synthetic absolute collapse fixture must stay below 1.10")
     if contended_advantage(100.0, 150.0) < HOSTED_CONTENTION_FLOOR:
         failures.append(
-            "same-run 1.50x shared/sharded advantage must still clear the floor "
+            "equal-work 1.50x shared/sharded advantage must still clear the floor "
             "even when absolute 1-vs-N speedup would look collapsed"
         )
 
@@ -148,7 +142,7 @@ def self_test() -> int:
     print(
         "RR verifier self-test passed "
         f"(contended advantage = shared_wall_ns / sharded_wall_ns; "
-        f"{PARALLEL_THREADS}-thread same-run control)."
+        f"{PARALLEL_THREADS}-thread equal-work control)."
     )
     return 0
 
@@ -158,10 +152,7 @@ def main() -> int:
     if args.self_test:
         return self_test()
 
-    min_advantage = args.min_contended_advantage
-    if min_advantage is None:
-        min_advantage = args.min_parallel_speedup
-    if args.criterion_root is None or min_advantage is None:
+    if args.criterion_root is None or args.min_contended_advantage is None:
         print(
             "::error::--criterion-root and --min-contended-advantage "
             "are required unless --self-test"
@@ -170,7 +161,7 @@ def main() -> int:
 
     failures: list[str] = []
 
-    if min_advantage <= 1:
+    if args.min_contended_advantage <= 1:
         failures.append("--min-contended-advantage must be greater than 1")
 
     sharded_label = f"{TARGET_COUNT}_targets_sharded_{PARALLEL_THREADS}_threads"
@@ -195,13 +186,13 @@ def main() -> int:
             f"contended_advantage={advantage:.2f}x (= shared_wall / sharded_wall), "
             f"gate=required"
         )
-        if advantage < min_advantage:
+        if advantage < args.min_contended_advantage:
             failures.append(
                 f"{TARGET_COUNT}_targets contended advantage {advantage:.2f}x "
-                f"below floor {min_advantage:.2f}x "
-                "(shared AtomicU64 control should remain slower than sharded RR "
-                "under the same Arc/scheduler load; collapse near 1.0x means the "
-                "production path is again bouncing one counter line)"
+                f"below floor {args.min_contended_advantage:.2f}x "
+                "(same-shard RR should remain slower than distinct-shard RR "
+                "under identical selection work; collapse near 1.0x means the "
+                "production counter design no longer provides shard isolation)"
             )
 
         # Diagnostic absolute speedup for log continuity; never gated.
@@ -225,7 +216,7 @@ def main() -> int:
 
     print(
         "RR selection benchmark is within hosted contention guardrails "
-        f"(same-run shared AtomicU64 control vs sharded RR at {PARALLEL_THREADS} "
+        f"(same-shard vs distinct-shard RR at {PARALLEL_THREADS} "
         "threads; absolute 1-thread/N-thread speedup is diagnostic-only)."
     )
     return 0

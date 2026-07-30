@@ -4197,7 +4197,7 @@ jobs:
           fi
           if [ "${RUN_RR}" = "true" ]; then
             {
-              echo "RoundRobin selection contention guard executed: same-run shared AtomicU64 control vs sharded RR at 4 threads (shared_wall/sharded_wall >= 1.10x) for the 2-target fixture; absolute 1-thread/N-thread speedup is diagnostic-only."
+              echo "RoundRobin selection contention guard executed: equal-work same-shard vs distinct-shard RR at 4 threads (shared_wall/sharded_wall >= 1.10x) for the 2-target fixture; both sides use the exact selection seam and absolute 1-thread/N-thread speedup is diagnostic-only."
               echo ""
             } >> "${GITHUB_STEP_SUMMARY}"
           fi

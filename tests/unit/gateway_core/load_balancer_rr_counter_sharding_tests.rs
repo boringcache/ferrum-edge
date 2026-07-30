@@ -3,9 +3,10 @@
 //! and cache-line padded (reusing the WRR shard mechanism).
 //!
 //! Hosted CI runs `tests/performance/mesh/benches/rr_selection.rs` with
-//! `.github/scripts/verify_rr_selection_benchmark.py`: a same-run 4-thread
-//! shared-`AtomicU64` control versus production sharded RoundRobin on the
-//! 2-target fixture (absolute 1-thread/N-thread speedup is diagnostic-only).
+//! `.github/scripts/verify_rr_selection_benchmark.py`: an equal-work 4-thread
+//! same-shard control versus distinct-shard RoundRobin on the 2-target fixture,
+//! using the exact same selection seam on both sides (absolute
+//! 1-thread/N-thread speedup is diagnostic-only).
 //! These unit tests guard layout, selection parity, and the hosted gate's
 //! measurement contract.
 
@@ -89,10 +90,11 @@ fn upstream_with_locality_lb(
 }
 
 #[test]
-fn rr_contention_bench_uses_same_run_shared_atomic_control() {
-    // The hosted gate must compare production sharded RR against a deliberately
-    // contended bare AtomicU64 under the same worker pool — not absolute
-    // 1-thread vs N-thread speedup on a variable runner (observed 1.50x→0.44x).
+fn rr_contention_bench_uses_exact_same_shard_control() {
+    // The hosted gate must compare distinct-shard RR against deliberately
+    // contended same-shard RR through the exact same selection seam — not
+    // absolute 1-thread vs N-thread speedup on a variable runner (observed
+    // 1.50x→0.44x).
     let bench = std::fs::read_to_string("tests/performance/mesh/benches/rr_selection.rs")
         .expect("rr_selection bench must be readable from crate root");
     let verifier =
@@ -100,11 +102,11 @@ fn rr_contention_bench_uses_same_run_shared_atomic_control() {
             .expect("RR verifier must be readable from crate root");
 
     assert!(
-        bench.contains("run_shared_selections")
-            && bench.contains("AtomicU64")
-            && bench.contains("sharded")
-            && bench.contains("shared"),
-        "RR bench must measure a same-run shared AtomicU64 control beside sharded select"
+        bench.contains("select_round_robin_from_shard_for_test")
+            && bench.contains("run_rr_selections")
+            && bench.contains("move |worker|")
+            && bench.contains("run_rr_selections(&lb, 0"),
+        "RR bench must compare distinct and shared shards through one exact selection seam"
     );
     assert!(
         bench.contains("PARALLEL_THREADS: usize = 4")
