@@ -1005,7 +1005,8 @@ pub(crate) struct StreamingResponseTrailerGovernor {
     /// reserved status fields survive governance. Fixed at construction from the
     /// dispatch the handler already chose — never from a trailer name.
     section: TrailerSectionKind,
-    /// At least one plugin declared `ResponseTrailerPolicy::Unbounded`.
+    /// Request-resolved unbounded arm: an unconditional declaration or at
+    /// least one request-conditional contributor that applies to this response.
     unbounded: bool,
 }
 

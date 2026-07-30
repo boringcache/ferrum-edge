@@ -4011,11 +4011,12 @@ by `global_exemptions` (path, method, IP, or consumer) never reaches a WAF
 response-header scan, so it keeps its backend trailers exactly as it would with
 no WAF configured — the same request-level contract that governs body buffering
 and the buffered gRPC-Web trailer policy. Because a consumer exemption is only
-known after authentication, the decision is made on the finalized request
-context, just before backend dispatch. Exemption is per instance and never
-subtractive: with several WAF instances, or alongside another plugin whose own
-response policy is non-enumerable (`response_transformer`), the trailer section
-is still dropped whenever any one of them governs that request.
+known after authentication, every trailer-forwarding response boundary resolves
+the decision from the finalized request context after the request-side phases.
+Exemption is per instance and never subtractive: with several WAF instances, or
+alongside another plugin whose own response policy is non-enumerable
+(`response_transformer`), the trailer section is still dropped whenever any one
+of them governs that request.
 
 WAF scans raw query pairs even after the proxy has materialized the parsed
 query map, so duplicate keys remain visible before the parsed `HashMap` can
