@@ -1542,7 +1542,10 @@ async fn test_request_transformer_rejects_non_boolean_resolved_gate() {
     }))
     .err()
     .expect("a non-boolean resolved gate must be rejected");
-    assert!(err.contains("runtime_overlay_resolved_enabled"), "got: {err}");
+    assert!(
+        err.contains("runtime_overlay_resolved_enabled"),
+        "got: {err}"
+    );
 }
 
 // ── Issue #2374: unknown keys, operation-exact fields, HeaderValue admission ──

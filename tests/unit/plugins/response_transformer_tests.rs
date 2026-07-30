@@ -1506,7 +1506,9 @@ async fn test_response_transformer_ignores_live_process_global_gate_mutations() 
         )]),
     });
     let mut headers: HashMap<String, String> = HashMap::new();
-    enabled.after_proxy(&mut make_ctx(), 200, &mut headers).await;
+    enabled
+        .after_proxy(&mut make_ctx(), 200, &mut headers)
+        .await;
     assert_eq!(
         headers.get("x-gated").map(String::as_str),
         Some("yes"),
@@ -1546,7 +1548,10 @@ async fn test_response_transformer_rejects_non_boolean_resolved_gate() {
     }))
     .err()
     .expect("a non-boolean resolved gate must be rejected");
-    assert!(err.contains("runtime_overlay_resolved_enabled"), "got: {err}");
+    assert!(
+        err.contains("runtime_overlay_resolved_enabled"),
+        "got: {err}"
+    );
 }
 
 /// The two namespaces stay independent: a `request_transformer` gate key must
@@ -1588,10 +1593,10 @@ async fn test_response_transformer_disabled_overlay_skips_response_buffering() {
             "default_enabled": true
         });
         if let Some(resolved) = resolved {
-            config
-                .as_object_mut()
-                .expect("object")
-                .insert("runtime_overlay_resolved_enabled".to_string(), json!(resolved));
+            config.as_object_mut().expect("object").insert(
+                "runtime_overlay_resolved_enabled".to_string(),
+                json!(resolved),
+            );
         }
         ResponseTransformer::new(&config).unwrap()
     };
@@ -1620,11 +1625,7 @@ async fn test_response_transformer_disabled_overlay_skips_response_buffering() {
     );
     assert!(
         disabled
-            .transform_response_body(
-                br#"{"old":"v"}"#,
-                Some("application/json"),
-                &HashMap::new()
-            )
+            .transform_response_body(br#"{"old":"v"}"#, Some("application/json"), &HashMap::new())
             .await
             .is_none(),
         "the phase that would have consumed the buffer must agree it is disabled"

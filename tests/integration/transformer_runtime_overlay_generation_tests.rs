@@ -287,7 +287,9 @@ async fn observe_response(plugin: &std::sync::Arc<dyn Plugin>) -> (bool, bool, b
     let mut headers: HashMap<String, String> =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     assert!(matches!(
-        plugin.after_proxy(&mut response_ctx, 200, &mut headers).await,
+        plugin
+            .after_proxy(&mut response_ctx, 200, &mut headers)
+            .await,
         PluginResult::Continue
     ));
     let header_applied = headers.contains_key("x-redacted");
