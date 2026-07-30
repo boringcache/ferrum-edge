@@ -3434,6 +3434,10 @@ fn streaming_grpc_web_adapters_honor_preserved_response_statuses() {
 #[test]
 fn reqwest_dispatch_fails_closed_when_proxy_ttl_dns_preflight_fails() {
     let source = include_str!("../../../src/proxy/mod.rs");
+    assert!(
+        source.contains("let policy_rejected = crate::dns::is_egress_policy_denial(error);"),
+        "DNS preflight failures must use the canonical egress-policy classifier"
+    );
     for (label, start_marker, end_marker, rejection) in [
         (
             "retry",

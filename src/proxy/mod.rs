@@ -29519,7 +29519,7 @@ fn backend_dns_resolution_failed_response(
     host: &str,
     error: &anyhow::Error,
 ) -> retry::BackendResponse {
-    let policy_rejected = error.to_string().contains("backend egress policy");
+    let policy_rejected = crate::dns::is_egress_policy_denial(error);
     warn!(
         backend = %host,
         error = %error,
