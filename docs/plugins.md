@@ -3644,7 +3644,7 @@ Configuration must be a top-level object. Unknown top-level and per-rule keys ar
 |---|---|---|
 | `HEAD` with a body-capable status (not 204/205/304) | Omitted (no DATA / no payload) | Representation length (same as the GET body would have been) |
 | `204` / `205` / `304` (any method) | Omitted | Stripped, even when `body` is configured non-empty |
-| Other final statuses on GET/POST/… | Configured `body` | Unchanged unless a later hook sets it |
+| Other final statuses on GET/POST/… | Final body after response-body hooks | Exact final wire-body byte length, derived by the gateway |
 
 **Native gRPC exclusion:** `response_mock` is not selected for native gRPC (`application/grpc`) requests on H2 or H3. Gateway reject normalization turns `PluginResult::Reject` into trailers-only gRPC errors and discards the configured body, so advertising gRPC would turn a default `status_code: 200` mock into `grpc-status: 13` (`INTERNAL`) without a payload. A matching rule still short-circuits only the HTTP WebSocket handshake; it does not mock upgraded frame streams. Use dedicated gRPC plugins (or a real backend) for native gRPC contract testing.
 
