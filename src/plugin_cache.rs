@@ -554,6 +554,12 @@ impl Plugin for PriorityOverridePlugin {
     fn request_body_buffer_limit(&self) -> Option<usize> {
         self.inner.request_body_buffer_limit()
     }
+    fn enforced_request_body_limit(&self) -> Option<u64> {
+        self.inner.enforced_request_body_limit()
+    }
+    fn enforced_response_body_limit(&self) -> Option<u64> {
+        self.inner.enforced_response_body_limit()
+    }
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -2987,6 +2993,17 @@ fn remove_shadowed_global_plugin(
     global_ptrs: &HashSet<usize>,
     plugin_name: &str,
 ) {
+    // Size policy is conjunctive, not replaceable configuration. Retain a
+    // global limiter beside same-name scoped instances so every hook remains
+    // active and the precomputed route ceiling can fold all configured bounds
+    // to their minimum. Letting a looser scoped instance shadow a stricter
+    // global one would silently relax a security boundary.
+    if matches!(
+        plugin_name,
+        "request_size_limiting" | "response_size_limiting"
+    ) {
+        return;
+    }
     plugins.retain(|plugin| {
         plugin.name() != plugin_name
             || !global_ptrs.contains(&(Arc::as_ptr(plugin) as *const () as usize))
@@ -3070,6 +3087,22 @@ impl PluginCapabilities {
 /// Built at config reload time so the hot path does zero filtering or allocation.
 #[derive(Clone)]
 pub struct PluginPhaseData {
+    /// Strictest active client-facing request-body ceiling declared by this
+    /// proxy/protocol plugin set via `Plugin::enforced_request_body_limit`, or
+    /// `None` when no matched plugin enforces one.
+    ///
+    /// Precomputed per cache generation so the request path never scans the
+    /// plugin list to learn its own upload bound. Request paths fold this with
+    /// the global limit through `crate::proxy::effective_request_body_limit`,
+    /// which keeps an active route ceiling authoritative even when the global
+    /// limit is the unlimited `0` (`GHSA-xrfj-852f-645j`).
+    pub enforced_request_body_limit: Option<u64>,
+    /// Strictest active client-facing response-body ceiling declared by this
+    /// proxy/protocol plugin set via `Plugin::enforced_response_body_limit`, or
+    /// `None` when no matched plugin enforces one. Folded exactly like
+    /// `enforced_request_body_limit`; buffered collection aborts here instead of
+    /// at the generally larger global allowance.
+    pub enforced_response_body_limit: Option<u64>,
     /// gRPC deadline-policy plugins only, in configured priority order.
     pub grpc_deadline_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Auth plugins only (pre-filtered from the protocol plugin list).
@@ -3171,6 +3204,8 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     // omitted an undescribable member would keep matching while that member's
     // behavior changed underneath every retained representation.
     let mut presentation_policy_unprovable = false;
+    let mut enforced_request_body_limit: Option<u64> = None;
+    let mut enforced_response_body_limit: Option<u64> = None;
     for p in plugins {
         match p.response_presentation_policy() {
             Some(ResponsePresentationPolicy::Static(digest)) => {
@@ -3294,8 +3329,22 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         if p.requires_response_stream_hooks() {
             caps |= PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS;
         }
+        // Strictest active client-facing body ceiling across the matched set.
+        // Multiple instances (and a global plus a proxy-scoped instance) compose
+        // to their minimum; a zero/disabled instance contributes nothing rather
+        // than relaxing a sibling's active bound (`GHSA-xrfj-852f-645j`).
+        if let Some(limit) = p.enforced_request_body_limit().filter(|limit| *limit > 0) {
+            enforced_request_body_limit =
+                Some(enforced_request_body_limit.map_or(limit, |current: u64| current.min(limit)));
+        }
+        if let Some(limit) = p.enforced_response_body_limit().filter(|limit| *limit > 0) {
+            enforced_response_body_limit =
+                Some(enforced_response_body_limit.map_or(limit, |current: u64| current.min(limit)));
+        }
     }
     PluginPhaseData {
+        enforced_request_body_limit,
+        enforced_response_body_limit,
         grpc_deadline_plugins: Arc::new(grpc_deadline),
         auth_plugins: Arc::new(auth),
         authorize_plugins: Arc::new(authorize),
@@ -4154,6 +4203,32 @@ impl PluginCacheInner {
             .and_then(|entry| entry.phase.response_presentation_policy_digest)
     }
 
+    /// Strictest active client-facing request-body ceiling for a composed
+    /// `proxy_key` and protocol, or `None` when no matched plugin enforces one.
+    ///
+    /// A missing entry falls back to the global chain's value exactly like
+    /// [`Self::get_capabilities`], so a proxy served by global-only plugins still
+    /// inherits a global size-limiting instance's ceiling.
+    pub(crate) fn get_enforced_request_body_limit(
+        &self,
+        proxy_key: &str,
+        protocol: ProxyProtocol,
+    ) -> Option<u64> {
+        self.protocol_entry(proxy_key, protocol)
+            .and_then(|entry| entry.phase.enforced_request_body_limit)
+    }
+
+    /// Strictest active client-facing response-body ceiling for a composed
+    /// `proxy_key` and protocol, or `None` when no matched plugin enforces one.
+    pub(crate) fn get_enforced_response_body_limit(
+        &self,
+        proxy_key: &str,
+        protocol: ProxyProtocol,
+    ) -> Option<u64> {
+        self.protocol_entry(proxy_key, protocol)
+            .and_then(|entry| entry.phase.enforced_response_body_limit)
+    }
+
     /// Response-body buffering upper bound for a composed `proxy_key`.
     ///
     /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
@@ -4250,6 +4325,10 @@ impl PluginCacheInner {
                 requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
                 requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
                 requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
+                enforced_request_body_limit: self
+                    .get_enforced_request_body_limit(proxy_key, protocol),
+                enforced_response_body_limit: self
+                    .get_enforced_response_body_limit(proxy_key, protocol),
             }
         })
     }
@@ -4303,6 +4382,8 @@ impl PluginCacheInner {
                 requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
                 requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
                 requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
+                enforced_request_body_limit: entry.phase.enforced_request_body_limit,
+                enforced_response_body_limit: entry.phase.enforced_response_body_limit,
             }
         })
     }
@@ -4333,9 +4414,27 @@ pub struct PluginCacheRequestView {
     requires_response_body_buffering: bool,
     requires_request_body_buffering: bool,
     requires_ws_frame_hooks: bool,
+    enforced_request_body_limit: Option<u64>,
+    enforced_response_body_limit: Option<u64>,
 }
 
 impl PluginCacheRequestView {
+    /// Strictest active client-facing request-body ceiling for this
+    /// proxy/protocol pair, or `None` when no matched plugin enforces one.
+    ///
+    /// Request paths fold this with the global ceiling via
+    /// `crate::proxy::effective_request_body_limit` before forwarding or
+    /// retaining any bytes (`GHSA-xrfj-852f-645j`).
+    pub fn enforced_request_body_limit(&self) -> Option<u64> {
+        self.enforced_request_body_limit
+    }
+
+    /// Strictest active client-facing response-body ceiling for this
+    /// proxy/protocol pair, or `None` when no matched plugin enforces one.
+    pub fn enforced_response_body_limit(&self) -> Option<u64> {
+        self.enforced_response_body_limit
+    }
+
     /// Get pre-resolved protocol-filtered plugins from this request view.
     pub fn plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
         Arc::clone(&self.plugins)

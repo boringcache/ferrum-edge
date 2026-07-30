@@ -1991,6 +1991,29 @@ async fn handle_h3_request(
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
     let plugins = plugin_cache_view.plugins();
+    // Publish this route's client-facing body ceilings before any request DATA
+    // frame is read or any response byte is retained, so native H3 and the H3
+    // cross-protocol bridge bound themselves at the route limit rather than only
+    // at the global one (`GHSA-xrfj-852f-645j`).
+    ctx.route_request_body_limit_bytes = plugin_cache_view.enforced_request_body_limit();
+    ctx.route_response_body_limit_bytes = plugin_cache_view.enforced_response_body_limit();
+    // Folded once for this request. `0` still means unlimited, and an absent
+    // route ceiling leaves each global knob exactly as configured, so a proxy
+    // without a size-limiting plugin is byte-for-byte unchanged.
+    let route_request_body_limit = ctx.route_request_body_limit();
+    let route_response_body_limit = ctx.route_response_body_limit();
+    let effective_max_request_body_size_bytes = crate::proxy::effective_request_body_limit(
+        state.max_request_body_size_bytes,
+        route_request_body_limit,
+    );
+    let effective_max_grpc_recv_size_bytes = crate::proxy::effective_request_body_limit(
+        state.max_grpc_recv_size_bytes,
+        route_request_body_limit,
+    );
+    let effective_max_response_body_size_bytes = crate::proxy::effective_request_body_limit(
+        state.max_response_body_size_bytes,
+        route_response_body_limit,
+    );
     ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
     // Same cache generation as `plugins` above: replay provenance must describe
     // exactly the response-side rules this request will run.
@@ -2286,9 +2309,9 @@ async fn handle_h3_request(
 
     let mut prebuffered_body_data: Option<Vec<u8>> = if authenticate_body_requirements.required {
         let protocol_max_body = if matches!(http_flavor, HttpFlavor::Grpc) {
-            state.max_grpc_recv_size_bytes
+            effective_max_grpc_recv_size_bytes
         } else {
-            state.max_request_body_size_bytes
+            effective_max_request_body_size_bytes
         };
         let max_body = crate::proxy::effective_request_body_limit(
             protocol_max_body,
@@ -2468,9 +2491,9 @@ async fn handle_h3_request(
         };
     if authorize_body_requirements.required && allows_request_body_buffering {
         let global_body_limit = if matches!(http_flavor, HttpFlavor::Grpc) {
-            state.max_grpc_recv_size_bytes
+            effective_max_grpc_recv_size_bytes
         } else {
-            state.max_request_body_size_bytes
+            effective_max_request_body_size_bytes
         };
         let body_limit = crate::proxy::effective_request_body_limit(
             global_body_limit,
@@ -2718,9 +2741,9 @@ async fn handle_h3_request(
         crate::proxy::RequestBodyPhaseRequirements::default()
     };
     let protocol_body_limit = if matches!(http_flavor, HttpFlavor::Grpc) {
-        state.max_grpc_recv_size_bytes
+        effective_max_grpc_recv_size_bytes
     } else {
-        state.max_request_body_size_bytes
+        effective_max_request_body_size_bytes
     };
     let before_proxy_body_limit = crate::proxy::effective_request_body_limit(
         protocol_body_limit,
@@ -3314,14 +3337,20 @@ async fn handle_h3_request(
     // Enforce request body size limit via Content-Length fast path. Apply
     // the gRPC-specific ceiling to gRPC requests so H3 matches H1/H2.
     let content_length_limit = if matches!(http_flavor, HttpFlavor::Grpc) {
-        state.max_grpc_recv_size_bytes
+        effective_max_grpc_recv_size_bytes
     } else {
-        state.max_request_body_size_bytes
+        effective_max_request_body_size_bytes
     };
+    // Parsed per comma-folded member so a standards-valid repeated identical
+    // declaration is compared against the ceiling instead of failing to parse
+    // and skipping this fast path (`GHSA-xrfj-852f-645j`). An unusable
+    // declaration falls through to the bounded stream/collect paths, which never
+    // trust a declared length.
     if content_length_limit > 0
-        && let Some(content_length) = proxy_headers.get("content-length")
-        && let Ok(len) = content_length.parse::<usize>()
-        && len > content_length_limit
+        && crate::proxy::declared_request_content_length_over_limit(
+            &proxy_headers,
+            content_length_limit,
+        )
     {
         if final_body_before_backend_dispatch {
             let rejection = finalize_h3_terminal_body_read_rejection(
@@ -5007,7 +5036,7 @@ async fn handle_h3_request(
                     &backend_url,
                     &h3_headers,
                     &mut stream,
-                    state.max_request_body_size_bytes,
+                    effective_max_request_body_size_bytes,
                     Arc::clone(&request_body_bytes_seen),
                     proxy.backend_read_timeout_ms,
                     Arc::clone(&request_stream_opened),
@@ -5024,7 +5053,7 @@ async fn handle_h3_request(
                     &backend_url,
                     &h3_headers,
                     &mut stream,
-                    state.max_request_body_size_bytes,
+                    effective_max_request_body_size_bytes,
                     Arc::clone(&request_body_bytes_seen),
                     proxy.backend_read_timeout_ms,
                     Arc::clone(&request_stream_opened),
@@ -5241,12 +5270,16 @@ async fn handle_h3_request(
         stamp_h3_original_response_metadata(&mut ctx, response_status, &response_headers);
 
         // Enforce response body size limit via Content-Length fast path
-        if state.max_response_body_size_bytes > 0
-            && let Some(len) = response_headers
-                .get("content-length")
-                .and_then(|v| v.parse::<usize>().ok())
-            && len > state.max_response_body_size_bytes
-        {
+        if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+            &response_headers,
+            effective_max_response_body_size_bytes,
+        ) {
+            warn!(
+                proxy_id = %proxy.id,
+                response_body_bytes = len,
+                max_response_body_size_bytes = effective_max_response_body_size_bytes,
+                "HTTP/3 backend response body exceeds configured size limit"
+            );
             // Do NOT propagate a send error: record_backend_outcome below
             // releases the LB active-connection count, so a `?` here would skip
             // it and leak the count when the client disconnects during the
@@ -5568,12 +5601,12 @@ async fn handle_h3_request(
                             // semantically complete, even when the body-size
                             // limit is disabled (FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0).
                             total_streamed += chunk_len;
-                            if state.max_response_body_size_bytes > 0
-                                && total_streamed > state.max_response_body_size_bytes
+                            if effective_max_response_body_size_bytes > 0
+                                && total_streamed > effective_max_response_body_size_bytes
                             {
                                 warn!(
                                     "Backend response exceeded {} byte limit during streaming",
-                                    state.max_response_body_size_bytes
+                                    effective_max_response_body_size_bytes
                                 );
                                 crate::http3::stream_util::abort_response_stream(&mut stream);
                                 body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
@@ -5957,7 +5990,7 @@ async fn handle_h3_request(
     let mut body_data = prebuffered_body_data.take().unwrap_or_default();
     if !body_was_prebuffered {
         body_data = match collect_h3_request_body_with_deadline(
-            drain_h3_request_body(&mut stream, state.max_request_body_size_bytes),
+            drain_h3_request_body(&mut stream, effective_max_request_body_size_bytes),
             ctx.grpc_deadline_at(),
             proxy.backend_read_timeout_ms,
         )
@@ -6608,6 +6641,7 @@ async fn handle_h3_request(
                         current_target.as_deref(),
                         ctx.request_is_secure,
                         ctx.is_early_data,
+                        effective_max_response_body_size_bytes,
                     )
                     .await
                 }
@@ -6816,6 +6850,7 @@ async fn handle_h3_request(
                         current_target.as_deref(),
                         ctx.request_is_secure,
                         ctx.is_early_data,
+                        effective_max_response_body_size_bytes,
                     )
                     .await
                 } else {
@@ -6880,6 +6915,7 @@ async fn handle_h3_request(
                 upstream_target.as_deref(),
                 ctx.request_is_secure,
                 ctx.is_early_data,
+                effective_max_response_body_size_bytes,
             )
             .await;
             (
@@ -8291,6 +8327,9 @@ async fn proxy_to_backend_h3_refined_response(
     retry_config: Option<&crate::config::types::RetryConfig>,
     trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<H3RefinedResponse, anyhow::Error> {
+    // Effective response ceiling for this request: the global knob narrowed by
+    // any active route ceiling (`GHSA-xrfj-852f-645j`).
+    let effective_max_response_body_size_bytes = ctx.effective_max_response_body_size_bytes();
     let h3_headers = build_h3_backend_headers(
         proxy,
         upstream_target,
@@ -8444,11 +8483,13 @@ async fn proxy_to_backend_h3_refined_response(
             response_headers,
             h3_resp.recv_stream,
             upstream_target,
+            effective_max_response_body_size_bytes,
         )
         .await,
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn collect_h3_open_response_body(
     state: &ProxyState,
     proxy: &Proxy,
@@ -8457,12 +8498,17 @@ async fn collect_h3_open_response_body(
     response_headers: HashMap<String, String>,
     mut recv_stream: crate::http3::client::H3RequestStream,
     upstream_target: Option<&UpstreamTarget>,
+    // Already-folded effective response ceiling (global ∧ route), `0` meaning
+    // unlimited. Passed in because this helper has no request context to derive
+    // it from (`GHSA-xrfj-852f-645j`).
+    effective_max_response_body_size_bytes: usize,
 ) -> H3BufferedDispatchResult {
-    let content_length = response_headers
-        .get("content-length")
-        .and_then(|value| value.parse::<u64>().ok());
-    if state.max_response_body_size_bytes > 0
-        && content_length.is_some_and(|len| len > state.max_response_body_size_bytes as u64)
+    // Parsed per comma-folded member so a repeated identical declaration is
+    // honored by both the ceiling check and the preallocation hint below
+    // (`GHSA-xrfj-852f-645j`).
+    let content_length = crate::proxy::canonical_header_content_length_from_map(&response_headers);
+    if effective_max_response_body_size_bytes > 0
+        && content_length.is_some_and(|len| len > effective_max_response_body_size_bytes as u64)
     {
         return H3BufferedDispatchResult {
             status: 502,
@@ -8515,8 +8561,9 @@ async fn collect_h3_open_response_body(
         match recv_result {
             Ok(Some(mut chunk)) => {
                 let chunk_bytes = crate::http3::config::copy_remaining_response_chunk(&mut chunk);
-                if state.max_response_body_size_bytes > 0
-                    && response_body.len() + chunk_bytes.len() > state.max_response_body_size_bytes
+                if effective_max_response_body_size_bytes > 0
+                    && response_body.len() + chunk_bytes.len()
+                        > effective_max_response_body_size_bytes
                 {
                     return H3BufferedDispatchResult {
                         status: 502,
@@ -8710,12 +8757,22 @@ async fn stream_h3_open_response_to_client(
     backend_admission_elapsed: std::time::Duration,
     trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<H3StreamResult, anyhow::Error> {
-    if state.max_response_body_size_bytes > 0
-        && let Some(len) = response_headers
-            .get("content-length")
-            .and_then(|v| v.parse::<usize>().ok())
-        && len > state.max_response_body_size_bytes
-    {
+    // Effective response ceiling for this request: the global knob narrowed by
+    // any active route ceiling (`GHSA-xrfj-852f-645j`). Hoisted so the streaming
+    // chunk loop below compares against a plain local.
+    let effective_max_response_body_size_bytes = ctx.effective_max_response_body_size_bytes();
+    // Parsed per comma-folded member so a repeated identical declaration is
+    // honored instead of skipping this reject (`GHSA-xrfj-852f-645j`).
+    if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+        &response_headers,
+        effective_max_response_body_size_bytes,
+    ) {
+        warn!(
+            proxy_id = %proxy.id,
+            response_body_bytes = len,
+            max_response_body_size_bytes = effective_max_response_body_size_bytes,
+            "HTTP/3 backend response body exceeds configured size limit"
+        );
         let size_reject_sent = send_h3_response(
             h3_stream,
             StatusCode::BAD_GATEWAY,
@@ -8870,8 +8927,8 @@ async fn stream_h3_open_response_to_client(
                         just_received_backend_frame = true;
                         let chunk_len = chunk.remaining();
                         total_streamed += chunk_len;
-                        if state.max_response_body_size_bytes > 0
-                            && total_streamed > state.max_response_body_size_bytes
+                        if effective_max_response_body_size_bytes > 0
+                            && total_streamed > effective_max_response_body_size_bytes
                         {
                             crate::http3::stream_util::abort_response_stream(h3_stream);
                             terminal_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
@@ -9107,6 +9164,17 @@ async fn dispatch_grpc_native_h3(
     // RESERVED terminal fields are exempt — see `TrailerSectionKind`.
     response_trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<(), anyhow::Error> {
+    // Effective response ceiling for this request: the global knob narrowed by
+    // any active route ceiling (`GHSA-xrfj-852f-645j`). Hoisted so the streaming
+    // chunk loop below compares against a plain local.
+    let effective_max_response_body_size_bytes = ctx.effective_max_response_body_size_bytes();
+    // Same fold for the native-gRPC receive ceiling, applied to the streaming
+    // upload below so an unbuffered H3 gRPC request is bounded at the route
+    // limit rather than only at `FERRUM_MAX_GRPC_RECV_SIZE_BYTES`.
+    let effective_max_grpc_recv_size_bytes = crate::proxy::effective_request_body_limit(
+        state.max_grpc_recv_size_bytes,
+        ctx.route_request_body_limit(),
+    );
     // Backend admission (gRPC rejects are emitted as trailers-only errors).
     let mut backend_admission_permits = match run_h3_backend_admission_or_send_reject(
         backend_admission_plugins,
@@ -9230,7 +9298,7 @@ async fn dispatch_grpc_native_h3(
                     backend_url,
                     &h3_headers,
                     stream,
-                    state.max_grpc_recv_size_bytes,
+                    effective_max_grpc_recv_size_bytes,
                     Arc::clone(&request_body_bytes_seen),
                     grpc_header_read_timeout_ms,
                     Arc::clone(&request_stream_opened),
@@ -9247,7 +9315,7 @@ async fn dispatch_grpc_native_h3(
                     backend_url,
                     &h3_headers,
                     stream,
-                    state.max_grpc_recv_size_bytes,
+                    effective_max_grpc_recv_size_bytes,
                     Arc::clone(&request_body_bytes_seen),
                     grpc_header_read_timeout_ms,
                     Arc::clone(&request_stream_opened),
@@ -9547,12 +9615,16 @@ async fn dispatch_grpc_native_h3(
     // plain native-H3 streaming path and the cross-protocol streaming gRPC bridge
     // apply — NOT the request-side gRPC receive cap, so a large-but-valid gRPC
     // response is not spuriously rejected.
-    if state.max_response_body_size_bytes > 0
-        && let Some(len) = response_headers
-            .get("content-length")
-            .and_then(|v| v.parse::<usize>().ok())
-        && len > state.max_response_body_size_bytes
-    {
+    if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+        &response_headers,
+        effective_max_response_body_size_bytes,
+    ) {
+        warn!(
+            proxy_id = %proxy.id,
+            response_body_bytes = len,
+            max_response_body_size_bytes = effective_max_response_body_size_bytes,
+            "HTTP/3 gRPC backend response body exceeds configured size limit"
+        );
         let error_sent = send_h3_grpc_error(
             stream,
             crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -10049,8 +10121,8 @@ async fn dispatch_grpc_native_h3(
                         // Backend RESPONSE bytes are bounded by the response-body
                         // limit (matching the plain native-H3 streaming path), not
                         // the request-side gRPC receive cap.
-                        if state.max_response_body_size_bytes > 0
-                            && total_streamed > state.max_response_body_size_bytes
+                        if effective_max_response_body_size_bytes > 0
+                            && total_streamed > effective_max_response_body_size_bytes
                         {
                             crate::http3::stream_util::abort_response_stream(stream);
                             body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
@@ -10615,6 +10687,10 @@ async fn proxy_to_backend_h3_streaming(
     backend_admission_start: std::time::Instant,
     trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<H3StreamResult, anyhow::Error> {
+    // Effective response ceiling for this request: the global knob narrowed by
+    // any active route ceiling (`GHSA-xrfj-852f-645j`). Hoisted so the streaming
+    // chunk loop below compares against a plain local.
+    let effective_max_response_body_size_bytes = ctx.effective_max_response_body_size_bytes();
     let h3_headers = build_h3_backend_headers(
         proxy,
         upstream_target,
@@ -10712,15 +10788,13 @@ async fn proxy_to_backend_h3_streaming(
     stamp_h3_original_response_metadata(ctx, response_status, &response_headers);
 
     // Enforce response body size limit via Content-Length fast path
-    if state.max_response_body_size_bytes > 0
-        && let Some(len) = response_headers
-            .get("content-length")
-            .and_then(|v| v.parse::<usize>().ok())
-        && len > state.max_response_body_size_bytes
-    {
+    if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+        &response_headers,
+        effective_max_response_body_size_bytes,
+    ) {
         warn!(
             "Backend response body ({} bytes) exceeds limit ({} bytes)",
-            len, state.max_response_body_size_bytes
+            len, effective_max_response_body_size_bytes
         );
         // Same connection-accounting contract as the after_proxy reject below:
         // never propagate a send error, or the caller's `record_backend_outcome`
@@ -10912,12 +10986,12 @@ async fn proxy_to_backend_h3_streaming(
                         // semantically complete, even when the body-size
                         // limit is disabled (FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0).
                         total_streamed += chunk_len;
-                        if state.max_response_body_size_bytes > 0
-                            && total_streamed > state.max_response_body_size_bytes
+                        if effective_max_response_body_size_bytes > 0
+                            && total_streamed > effective_max_response_body_size_bytes
                         {
                             warn!(
                                 "Backend response exceeded {} byte limit during streaming",
-                                state.max_response_body_size_bytes
+                                effective_max_response_body_size_bytes
                             );
                             crate::http3::stream_util::abort_response_stream(h3_stream);
                             terminal_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
@@ -11199,6 +11273,10 @@ async fn proxy_to_backend_h3(
     upstream_target: Option<&UpstreamTarget>,
     request_is_secure: bool,
     is_early_data: bool,
+    // Already-folded effective response ceiling (global ∧ route), `0` meaning
+    // unlimited. Passed in because this helper has no request context to derive
+    // it from (`GHSA-xrfj-852f-645j`).
+    effective_max_response_body_size_bytes: usize,
 ) -> H3BufferedDispatchResult {
     let h3_headers = build_h3_backend_headers(
         proxy,
@@ -11245,13 +11323,13 @@ async fn proxy_to_backend_h3(
             } = response;
 
             // Enforce response body size limit
-            if state.max_response_body_size_bytes > 0
-                && resp_body.len() > state.max_response_body_size_bytes
+            if effective_max_response_body_size_bytes > 0
+                && resp_body.len() > effective_max_response_body_size_bytes
             {
                 warn!(
                     "Backend response body ({} bytes) exceeds limit ({} bytes)",
                     resp_body.len(),
-                    state.max_response_body_size_bytes
+                    effective_max_response_body_size_bytes
                 );
                 return H3BufferedDispatchResult {
                     status: 502,

@@ -18536,6 +18536,18 @@ components:
         check when another plugin already loaded the body (`before_proxy`),
         and a final post-transform check before forwarding to the backend
         (`on_final_request_body`).
+        `max_bytes` is additionally published to the proxy core as the effective
+        streaming/buffering ceiling, so unbuffered H1/H2, H3, and streaming-gRPC
+        uploads (chunked or unknown-length) are bounded at this route limit
+        before any byte is forwarded or retained. The effective bound is the
+        strictest active (nonzero) value of this limit and
+        FERRUM_MAX_REQUEST_BODY_SIZE_BYTES; a global limit of 0 means unlimited
+        and does not disable an active route limit, and multiple instances
+        compose to their minimum.
+        Repeated identical Content-Length values (RFC 9110 §8.6, which arrive
+        comma-folded in plugin-facing header maps) are parsed per member and
+        compared against the limit. A declared length that cannot be reduced to
+        one agreed value fails closed with HTTP 400.
       required:
         - max_bytes
       properties:
@@ -19016,10 +19028,25 @@ components:
         Rejects oversized responses with HTTP 502 either via Content-Length
         fast path (`after_proxy`) or after final buffering when
         `require_buffered_check: true` is set (`on_final_response_body`).
-        Without `require_buffered_check`, chunked/streaming responses
-        without Content-Length cannot be enforced by this plugin — the
-        global `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` limit applies in that
-        case via the gateway's `SizeLimitedStreamingResponse` adapter.
+        `max_bytes` is additionally published to the proxy core as the effective
+        collection/streaming ceiling across H1/H2, H3, gRPC, retries,
+        coalescing, mesh mTLS, and HBONE: buffered collection aborts at this
+        route ceiling rather than retaining up to the larger global allowance,
+        and unknown-length streaming paths engage the frame-by-frame
+        `SizeLimitedStreamingResponse` adapter at this ceiling (known-length
+        paths reject an over-limit declaration before forwarding). Already-buffered
+        synthetic responses (mock, serverless, cache, federation, dedup replay)
+        are checked against the ceiling even when no plugin activated the
+        response body-hook gate, after any body transform. The effective bound
+        is the strictest active (nonzero) value of this limit and
+        FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES; a global limit of 0 means unlimited
+        and does not disable an active route limit, and multiple instances
+        compose to their minimum. It also bounds the buffered-representation
+        decode gate and compression admission.
+        Repeated identical Content-Length values are parsed per comma-folded
+        member and compared against the limit; a declared length that cannot be
+        reduced to one agreed value fails closed with HTTP 502. Bodyless
+        semantics (HEAD, 1xx, 204/205/304) are exempt from both checks.
         Unknown keys and non-object configs are rejected. Explicit null
         members are rejected; omitted keys keep defaults.
       required:
@@ -19036,7 +19063,12 @@ components:
         require_buffered_check:
           type: boolean
           default: false
-          description: Force response body buffering so this plugin can enforce the size limit on chunked/streaming responses without Content-Length.
+          description: >-
+            Force route-bounded whole-body buffering so the complete final
+            post-transform size is proven before response headers are committed.
+            Unknown-length streams are already bounded frame by frame when this
+            is false. Enabling it adds memory overhead and rejects indefinite
+            SSE streams whose complete size cannot be proven.
 
     FaultInjectionConfig:
       type: object
