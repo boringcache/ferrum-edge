@@ -3438,35 +3438,39 @@ fn reqwest_dispatch_fails_closed_when_proxy_ttl_dns_preflight_fails() {
         source.contains("let policy_rejected = crate::dns::is_egress_policy_denial(error);"),
         "DNS preflight failures must use the canonical egress-policy classifier"
     );
-    for (label, start_marker, end_marker, rejection) in [
+    for (label, start_marker, resume_marker, rejection) in [
         (
             "retry",
             "pub(crate) async fn proxy_to_backend_retry(",
-            "pub(crate) async fn proxy_to_backend_with_body(",
+            "let client_result = crate::plugins::await_grpc_deadline(",
             "return backend_dns_resolution_failed_response(effective_host, &error);",
         ),
         (
             "initial dispatch",
             "async fn proxy_to_backend(",
-            "async fn proxy_to_backend_hbone(",
+            "if dispatch_hbone {",
             "return backend_dns_resolution_failed_dispatch_result(effective_host, &error);",
         ),
     ] {
-        let start = source
+        let function_start = source
             .find(start_marker)
             .unwrap_or_else(|| panic!("{label}: missing start marker"));
-        let end = source[start..]
-            .find(end_marker)
-            .map(|offset| start + offset)
-            .unwrap_or_else(|| panic!("{label}: missing end marker"));
-        let dispatch = &source[start..end];
+        let preflight_start = source[function_start..]
+            .find("let resolved_ip = match resolved_ip_result {")
+            .map(|offset| function_start + offset)
+            .unwrap_or_else(|| panic!("{label}: missing DNS preflight result handling"));
+        let resume = source[preflight_start..]
+            .find(resume_marker)
+            .map(|offset| preflight_start + offset)
+            .unwrap_or_else(|| panic!("{label}: missing post-preflight dispatch marker"));
+        let preflight = &source[preflight_start..resume];
 
         assert!(
-            dispatch.contains(rejection),
+            preflight.contains(rejection),
             "{label} must not continue to reqwest after the proxy-specific DNS lookup fails"
         );
         assert!(
-            !dispatch.contains("resolved_ip_result.ok()"),
+            !preflight.contains("resolved_ip_result.ok()"),
             "{label} must not discard the proxy-specific DNS error"
         );
     }
