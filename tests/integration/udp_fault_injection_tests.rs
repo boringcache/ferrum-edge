@@ -32,6 +32,7 @@ use crate::scaffolding::ports::reserve_udp_port;
 
 const PROXY_ID: &str = "udp-fault-injection";
 const PLUGIN_CONFIG_ID: &str = "udp-fault-plugin";
+const ACCESS_CONTROL_CONFIG_ID: &str = "udp-access-control";
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const PER_ATTEMPT_STARTED_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_GATEWAY_ATTEMPTS: u32 = 3;
@@ -142,14 +143,37 @@ async fn try_spawn_udp_gateway(
     backend_port: u16,
     listen_port: u16,
     fault_config: serde_json::Value,
+    reject_unauthenticated: bool,
 ) -> Option<SpawnedUdpGateway> {
-    let proxy = udp_proxy(listen_port, backend_port);
+    let mut proxy = udp_proxy(listen_port, backend_port);
+    let mut plugin_configs = vec![fault_plugin_config(fault_config)];
+    if reject_unauthenticated {
+        proxy.plugins.insert(
+            0,
+            PluginAssociation {
+                plugin_config_id: ACCESS_CONTROL_CONFIG_ID.to_string(),
+            },
+        );
+        plugin_configs.push(PluginConfig {
+            id: ACCESS_CONTROL_CONFIG_ID.to_string(),
+            plugin_name: "access_control".to_string(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            config: json!({ "allowed_consumers": ["authorized"] }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some(PROXY_ID.to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+    }
     let proxy_namespace = proxy.namespace.clone();
     let gateway_config = GatewayConfig {
         version: "1".to_string(),
         proxies: vec![proxy],
         consumers: vec![],
-        plugin_configs: vec![fault_plugin_config(fault_config)],
+        plugin_configs,
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
@@ -257,11 +281,24 @@ async fn spawn_udp_gateway_with_retry(
     backend_port: u16,
     fault_config: serde_json::Value,
 ) -> SpawnedUdpGateway {
+    spawn_udp_gateway_with_policy(backend_port, fault_config, false).await
+}
+
+async fn spawn_udp_gateway_with_policy(
+    backend_port: u16,
+    fault_config: serde_json::Value,
+    reject_unauthenticated: bool,
+) -> SpawnedUdpGateway {
     for attempt in 1..=MAX_GATEWAY_ATTEMPTS {
         let frontend = reserve_udp_port().await.expect("reserve frontend UDP port");
         let listen_port = frontend.drop_and_take_port();
-        if let Some(gateway) =
-            try_spawn_udp_gateway(backend_port, listen_port, fault_config.clone()).await
+        if let Some(gateway) = try_spawn_udp_gateway(
+            backend_port,
+            listen_port,
+            fault_config.clone(),
+            reject_unauthenticated,
+        )
+        .await
         {
             return gateway;
         }
@@ -274,6 +311,34 @@ async fn spawn_udp_gateway_with_retry(
         }
     }
     panic!("udp listener never reported started=true after {MAX_GATEWAY_ATTEMPTS} attempts");
+}
+
+#[tokio::test]
+async fn udp_stream_rejection_precedes_first_datagram_fault_delay() {
+    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend_port = backend.local_addr().expect("backend addr").port();
+    let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
+
+    let gateway = spawn_udp_gateway_with_policy(
+        backend_port,
+        json!({ "delay": { "duration_ms": 2_000, "percentage": 100.0 } }),
+        true,
+    )
+    .await;
+    let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway.listen_port);
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+
+    client
+        .send_to(b"unauthorized", gateway_addr)
+        .await
+        .expect("send unauthorized datagram");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let _ = gateway.shutdown_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(1), gateway.join)
+        .await
+        .expect("rejected setup must not retain a fault-delay worker")
+        .expect("UDP listener task must shut down cleanly");
 }
 
 async fn echo_round_trip(
