@@ -37,8 +37,9 @@ nevertheless includes `curl/curl.h` because one preprocessor guard tests whether
 the disabled macro is defined instead of whether it is enabled. The isolated
 fuzz dependency graph therefore activates `rdkafka`'s `curl-static` feature and
 uses its real vendored curl headers. Production builds retain their existing
-feature set, while the byte-frozen hosted workflows stay hermetic without
-installing runner packages or trusting a nested Cargo configuration.
+feature set, while the byte-frozen hosted workflows avoid relying on ambient
+curl development headers or a nested Cargo configuration. They still install
+the pinned workflow's required `protobuf-compiler` build dependency.
 
 ## Local workflow (optional)
 
