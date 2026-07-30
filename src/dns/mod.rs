@@ -2564,8 +2564,9 @@ pub struct DnsCacheResolver {
     /// Per-proxy static IP override. `None` for shared plugin/health clients
     /// and proxies without `dns_override`. When `Some`, every hostname this
     /// resolver answers returns that address (policy-screened), independent of
-    /// the requested name.
-    dns_override: Option<String>,
+    /// the requested name. The immutable snapshot is reference-counted so a
+    /// resolver call does not allocate a fresh override string.
+    dns_override: Option<Arc<str>>,
 }
 
 impl DnsCacheResolver {
@@ -2585,7 +2586,7 @@ impl DnsCacheResolver {
     pub fn with_dns_override(cache: DnsCache, dns_override: Option<String>) -> Self {
         Self {
             cache,
-            dns_override,
+            dns_override: dns_override.map(Arc::from),
         }
     }
 }
