@@ -128,7 +128,13 @@ pub struct CanonicalQueryParam {
     pub bare: bool,
 }
 
-/// Lossless, ordered, explicitly-ambiguity-classified view of a request query.
+/// Ordered, occurrence-complete, explicitly ambiguity-classified view of a
+/// request query.
+///
+/// Valid UTF-8 components are decoded exactly once. A component that decodes to
+/// non-UTF-8 is represented with replacement characters and explicitly marked
+/// `non_utf8_name` / `non_utf8_value`; consumers must not mistake that decoded
+/// value for an exact byte representation.
 ///
 /// # The forwarding-parity contract
 ///

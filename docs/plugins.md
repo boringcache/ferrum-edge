@@ -2819,7 +2819,7 @@ Delegates HTTP request authorization to [Open Policy Agent](https://www.openpoli
 | `decision_pointer` | String[] | `["result"]` | Path inside the OPA JSON response to evaluate. Use `["result","allow"]` for `{ "result": { "allow": true } }`. |
 | `include_method` | Boolean | `true` | Include `input.method`. |
 | `include_path` | Boolean | `true` | Include `input.path`. |
-| `include_query` | Boolean | `true` | Include the request query as `input.query` (flat decoded map), `input.query_pairs` (ordered lossless pairs), and `input.query_ambiguity`. All three are decoded from the exact backend-visible query bytes. Query credentials are omitted by default. |
+| `include_query` | Boolean | `true` | Include the request query as `input.query` (flat decoded map), `input.query_pairs` (ordered occurrence-complete pairs), and `input.query_ambiguity`. All three are decoded from the exact backend-visible query bytes. Query credentials are omitted by default. |
 | `include_query_credentials` | Boolean | `false` | Unsafe opt-in to send built-in and authentication-plugin-marked query credentials to OPA. Explicit `redact_query_keys` remain omitted. |
 | `include_headers` | Boolean | `true` | Include request headers as `input.headers` after redaction. |
 | `include_body` | Boolean | `false` | After authentication succeeds, buffer and forward the request body. UTF-8 bodies use `input.body`; non-UTF-8 raw bytes use `input.body_base64`. |
@@ -2848,7 +2848,7 @@ A query is *ambiguous* when Ferrum cannot prove the backend will read it the sam
 
 Under the default `query_ambiguity_policy: reject`, such a request is denied before OPA is called. Under `delegate`, OPA receives:
 
-- `input.query_pairs` — every occurrence in wire order as `{"name": …, "value": …, "bare": …}`. `bare` distinguishes `?flag` from `?flag=`; both decode to an empty `value`.
+- `input.query_pairs` — every occurrence in wire order as `{"name": …, "value": …, "bare": …}`. `bare` distinguishes `?flag` from `?flag=`; both decode to an empty `value`. A non-UTF-8 component is replacement-decoded and classified in `input.query_ambiguity`; a policy that needs exact bytes must reject that class.
 - `input.query_ambiguity` — the classification tokens above, in the order encountered. Empty for an unambiguous query.
 - `input.query` — **omitted** when `input.query_ambiguity` is non-empty, so a rule written against the flat map cannot authorize a value the backend does not execute.
 

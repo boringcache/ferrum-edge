@@ -138,8 +138,8 @@ enum QueryAmbiguityPolicy {
     /// Deny the request before calling OPA. Default: a policy decision must
     /// never be made on a value different from the one the backend executes.
     Reject,
-    /// Call OPA anyway and let Rego decide, using the lossless
-    /// `input.query_pairs` plus the `input.query_ambiguity` classifications.
+    /// Call OPA anyway and let Rego decide, using the ordered occurrence list
+    /// in `input.query_pairs` plus the `input.query_ambiguity` classifications.
     /// `input.query` is omitted for an ambiguous query so a rule written
     /// against the flat map cannot silently authorize the wrong value.
     Delegate,
@@ -254,7 +254,7 @@ impl Opa {
             if query.is_unambiguous() {
                 input.insert("query".to_string(), self.query_map_input(ctx, query));
             }
-            // The lossless ordered representation and the ambiguity
+            // The ordered occurrence-complete representation and the ambiguity
             // classifications are always present, so a policy that opts into
             // `query_ambiguity_policy: delegate` can validate the query
             // against its own backend's duplicate/plus contract.
@@ -305,10 +305,12 @@ impl Opa {
         Value::Object(map)
     }
 
-    /// Ordered, lossless view: every occurrence in wire order, with the
+    /// Ordered occurrence view: every pair in wire order, with the
     /// bare-parameter bit that distinguishes `?flag` from `?flag=`. Credential
     /// redaction applies here exactly as it does to the flat map, so opting
-    /// into `delegate` never widens what OPA is told.
+    /// into `delegate` never widens what OPA is told. Non-UTF-8 components are
+    /// lossy-decoded and carry an explicit ambiguity classification; Rego must
+    /// reject that class when it needs exact bytes.
     fn query_pairs_input(&self, ctx: &RequestContext, query: &CanonicalQuery) -> Value {
         let mut pairs = Vec::with_capacity(query.len());
         for param in query.params() {

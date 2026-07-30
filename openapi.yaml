@@ -17469,10 +17469,12 @@ components:
             form-urlencoded space), malformed percent-encoding, or a non-UTF-8
             decoding. 'reject' denies the request with the configured deny_status
             and deny_body before calling OPA. 'delegate' calls OPA anyway and
-            lets the policy decide from the lossless input.query_pairs array and
-            the input.query_ambiguity classifications; input.query is omitted in
-            that case so a rule written against the flat map cannot authorize a
-            value the backend does not execute.
+            lets the policy decide from the ordered, occurrence-complete
+            input.query_pairs array and the input.query_ambiguity
+            classifications; non-UTF-8 components are replacement-decoded and
+            explicitly classified. input.query is omitted in that case so a
+            rule written against the flat map cannot authorize a value the
+            backend does not execute.
         redact_headers:
           type: array
           items:
