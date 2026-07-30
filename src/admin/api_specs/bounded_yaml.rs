@@ -730,6 +730,13 @@ fn untagged_plain_scalar(value: &str) -> Result<Value, BoundedYamlError> {
     {
         return number_from_f64(n);
     }
+    // Rust's finite f64 parser returns infinity for a syntactically numeric
+    // exponent outside its range (for example `1e400`). That is still a YAML
+    // number, not a string. Reject it exactly like `.inf` rather than silently
+    // changing the operator's scalar type at the JSON boundary.
+    if yaml_float_overflows_finite_range(value) {
+        return Err(BoundedYamlError::NonFiniteNumber);
+    }
     Ok(Value::String(value.to_owned()))
 }
 
@@ -854,6 +861,24 @@ fn parse_f64(scalar: &str) -> Option<f64> {
         return Some(float);
     }
     None
+}
+
+fn yaml_float_overflows_finite_range(scalar: &str) -> bool {
+    let unpositive = if let Some(unpositive) = scalar.strip_prefix('+') {
+        if unpositive.starts_with(['+', '-']) {
+            return false;
+        }
+        unpositive
+    } else {
+        scalar
+    };
+    // Keep legacy word-like spellings (`NaN`, `inf`) as strings unless they
+    // use the YAML core forms handled by `parse_f64`. An overflowing numeric
+    // spelling necessarily contains a digit.
+    unpositive.bytes().any(|byte| byte.is_ascii_digit())
+        && unpositive
+            .parse::<f64>()
+            .is_ok_and(|float| !float.is_finite())
 }
 
 fn digits_but_not_number(scalar: &str) -> bool {

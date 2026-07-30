@@ -312,6 +312,28 @@ fn integer_outside_exact_json_range_fails_closed() {
 }
 
 #[test]
+fn float_outside_finite_json_range_fails_closed() {
+    let yaml = concat!(
+        "openapi: '3.1.0'\n",
+        "info:\n",
+        "  title: Overflow\n",
+        "  version: '1.0'\n",
+        "x-overflow: 1e400\n",
+        "x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}\n",
+    );
+    let err = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "default")
+        .expect_err("an overflowing YAML float must not become a JSON string");
+    assert!(
+        matches!(
+            &err,
+            ExtractError::InvalidYaml(message)
+                if message.contains("non-finite numbers are not representable")
+        ),
+        "an overflowing YAML float must fail closed, got {err:?}"
+    );
+}
+
+#[test]
 fn alias_bomb_fails_closed_under_budgets() {
     let yaml = format!(
         concat!(
