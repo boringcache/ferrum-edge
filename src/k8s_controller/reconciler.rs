@@ -861,11 +861,7 @@ async fn patch_gateway_api_statuses(
         updates.truncate(GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP);
     }
     let updates_len = updates.len();
-    match await_status_patch_batch(
-        writer.patch_updates(updates),
-        STATUS_PATCH_BATCH_TIMEOUT,
-    )
-    .await
+    match await_status_patch_batch(writer.patch_updates(updates), STATUS_PATCH_BATCH_TIMEOUT).await
     {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
@@ -920,11 +916,7 @@ async fn patch_istio_statuses(
         return;
     }
     let updates_len = updates.len();
-    match await_status_patch_batch(
-        writer.patch_updates(updates),
-        STATUS_PATCH_BATCH_TIMEOUT,
-    )
-    .await
+    match await_status_patch_batch(writer.patch_updates(updates), STATUS_PATCH_BATCH_TIMEOUT).await
     {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
