@@ -3431,3 +3431,105 @@ fn streaming_grpc_web_adapters_honor_preserved_response_statuses() {
         "generic preserved statuses must retain native headers and body framing"
     );
 }
+#[test]
+fn reqwest_dispatch_fails_closed_when_proxy_ttl_dns_preflight_fails() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    assert!(
+        source.contains("let policy_rejected = crate::dns::is_egress_policy_denial(error);"),
+        "DNS preflight failures must use the canonical egress-policy classifier"
+    );
+    for (label, start_marker, resume_marker, rejection) in [
+        (
+            "retry",
+            "pub(crate) async fn proxy_to_backend_retry(",
+            "let client_result = crate::plugins::await_grpc_deadline(",
+            "return backend_dns_resolution_failed_response(effective_host, &error);",
+        ),
+        (
+            "initial dispatch",
+            "async fn proxy_to_backend(",
+            "if dispatch_hbone {",
+            "return backend_dns_resolution_failed_dispatch_result(effective_host, &error);",
+        ),
+    ] {
+        let function_start = source
+            .find(start_marker)
+            .unwrap_or_else(|| panic!("{label}: missing start marker"));
+        let preflight_start = source[function_start..]
+            .find(if label == "retry" {
+                "let resolved_ip = match resolved_ip_result {"
+            } else {
+                "let resolved_ip = if dispatch_hbone"
+            })
+            .map(|offset| function_start + offset)
+            .unwrap_or_else(|| panic!("{label}: missing DNS preflight result handling"));
+        let resume = source[preflight_start..]
+            .find(resume_marker)
+            .map(|offset| preflight_start + offset)
+            .unwrap_or_else(|| panic!("{label}: missing post-preflight dispatch marker"));
+        let preflight = &source[preflight_start..resume];
+
+        assert!(
+            preflight.contains(rejection),
+            "{label} must not continue to reqwest after the proxy-specific DNS lookup fails"
+        );
+        assert!(
+            !preflight.contains("resolved_ip_result.ok()"),
+            "{label} must not discard the proxy-specific DNS error"
+        );
+    }
+}
+
+#[test]
+fn cross_cluster_hbone_identity_bypasses_only_the_reqwest_dns_preflight() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let helper = source
+        .split("fn is_synthetic_cross_cluster_hbone_dispatch_target(")
+        .nth(1)
+        .expect("synthetic cross-cluster HBONE shape helper")
+        .split("/// Whether a target dispatches over the Sidecar")
+        .next()
+        .expect("bounded synthetic cross-cluster HBONE shape helper");
+    for required in [
+        "HBONE_CROSS_CLUSTER_SYNTHETIC_HOST_PREFIX",
+        "target_hbone_enabled(target)",
+        "target_hbone_cross_cluster(target)",
+        "HBONE_DIAL_HOST_TAG",
+        "HBONE_AUTHORITY_HOST_TAG",
+        "MESH_EASTWEST_SNI_TAG",
+        "MESH_TRUST_DOMAIN_TAG",
+    ] {
+        assert!(
+            helper.contains(required),
+            "synthetic-host exemption must require {required}"
+        );
+    }
+
+    let initial = source
+        .split("async fn proxy_to_backend(")
+        .nth(1)
+        .expect("initial backend dispatch")
+        .split("if dispatch_hbone {")
+        .next()
+        .expect("bounded pre-HBONE dispatch section");
+    let synthetic_gate = initial
+        .find("is_synthetic_cross_cluster_hbone_dispatch_target")
+        .expect("cross-cluster HBONE synthetic-host gate");
+    let dns_preflight = initial[synthetic_gate..]
+        .find("state.dns_cache.resolve(")
+        .map(|offset| synthetic_gate + offset)
+        .expect("ordinary-host DNS preflight");
+    let hard_failure = initial[dns_preflight..]
+        .find("return backend_dns_resolution_failed_dispatch_result(effective_host, &error);")
+        .map(|offset| dns_preflight + offset)
+        .expect("ordinary-host fail-closed result");
+
+    assert!(
+        synthetic_gate < dns_preflight && dns_preflight < hard_failure,
+        "only the scoped HBONE identity may skip the reqwest-oriented DNS preflight"
+    );
+    assert!(
+        initial[synthetic_gate..dns_preflight].contains("None"),
+        "the synthetic identity must carry no fabricated resolved IP into HBONE dispatch"
+    );
+}
