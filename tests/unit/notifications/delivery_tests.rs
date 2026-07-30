@@ -351,7 +351,7 @@ async fn proxy_alerts_failed_trigger_releases_cooldown_and_pending_state() {
         plugin.try_acquire_cooldown_for_test(0, "ferrum|p1", 0, 60_000, monotonic_now_ms(), 0,),
         "failed trigger must release cooldown"
     );
-    let _ = server;
+    drop(server);
 }
 
 #[tokio::test]
