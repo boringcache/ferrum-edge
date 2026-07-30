@@ -454,6 +454,11 @@ pub(crate) struct K8sAccumulator {
     explicit_workload_services: HashSet<K8sServiceKey>,
     explicit_service_entries: HashSet<K8sServiceKey>,
     pub(crate) gateway_api_conflict_losers: HashMap<K8sResourceKey, Vec<GatewayApiRouteConflict>>,
+    /// Source route kind for every materialized Gateway API HTTP-family proxy.
+    /// The route table is port-agnostic, so cross-kind proxies must not collapse:
+    /// doing so would expose each route through listeners that admitted only the
+    /// other kind.
+    pub(crate) gateway_api_route_proxy_kinds: HashMap<NamespacedResourceId, String>,
     pub(crate) gateway_api_listener_policies:
         HashMap<GatewayApiListenerKey, GatewayApiListenerPolicy>,
     gateway_api_gateway_classes: HashMap<String, bool>,
@@ -487,6 +492,7 @@ impl K8sAccumulator {
             explicit_workload_services: HashSet::new(),
             explicit_service_entries: HashSet::new(),
             gateway_api_conflict_losers: HashMap::new(),
+            gateway_api_route_proxy_kinds: HashMap::new(),
             gateway_api_listener_policies: HashMap::new(),
             gateway_api_gateway_classes: HashMap::new(),
             namespace_labels: HashMap::new(),

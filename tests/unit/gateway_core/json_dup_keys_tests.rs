@@ -238,8 +238,9 @@ fn malformed_documents_are_not_reported_as_ambiguous() {
     }
 }
 
-/// Control characters and bad escapes inside strings are rejected the same way
-/// `serde_json` rejects them.
+/// Control characters and bad escapes inside strings are rejected without
+/// panicking. Ordinary malformed escapes retain the existing malformed-body
+/// handling, while surrogate parser differentials fail closed.
 #[test]
 fn rejects_invalid_string_content_without_panicking() {
     let backslash = '\\';
@@ -248,6 +249,19 @@ fn rejects_invalid_string_content_without_panicking() {
         format!("{{\"{backslash}q\":1}}"),
         format!("{{\"{backslash}u00\":1}}"),
         format!("{{\"{backslash}uZZZZ\":1}}"),
+    ] {
+        assert_eq!(
+            scan(body.as_bytes(), &GOVERNED_JSON_LIMITS),
+            Err(JsonScanReject::Malformed),
+            "scanner returned the wrong rejection for {body:?}"
+        );
+        assert!(
+            slice_ambiguity(body.as_bytes()).is_none(),
+            "{body:?} was reported as ambiguity rather than malformed"
+        );
+    }
+
+    for body in [
         // Lone high surrogate.
         format!("{{\"{backslash}ud83d\":1}}"),
         // Lone low surrogate.
@@ -255,13 +269,15 @@ fn rejects_invalid_string_content_without_panicking() {
         // High surrogate not followed by a low one.
         format!("{{\"{backslash}ud83d{backslash}u0061\":1}}"),
     ] {
-        assert!(
-            scan(body.as_bytes(), &GOVERNED_JSON_LIMITS).is_err(),
-            "scanner accepted {body:?}"
+        assert_eq!(
+            scan(body.as_bytes(), &GOVERNED_JSON_LIMITS),
+            Err(JsonScanReject::InvalidSurrogate),
+            "scanner returned the wrong rejection for {body:?}"
         );
-        assert!(
-            slice_ambiguity(body.as_bytes()).is_none(),
-            "{body:?} was reported as ambiguity rather than malformed"
+        assert_eq!(
+            slice_ambiguity(body.as_bytes()),
+            Some(JsonScanReject::InvalidSurrogate.reason()),
+            "{body:?} did not fail closed"
         );
     }
 }
@@ -304,7 +320,9 @@ fn confirmation_matches_serde_json_value_acceptance() {
     assert!(serde_json::from_str::<serde_json::Value>(trailing).is_err());
     assert!(str_ambiguity(trailing).is_none());
 
-    // Lone / mispaired surrogates: `Value` rejects; must not be ambiguity.
+    // Lone / mispaired surrogates: `Value` rejects, but JavaScript and other
+    // downstream parsers can accept them. They must fail closed so governed
+    // content cannot bypass inspection through the parser differential.
     for body in [
         format!("{{\"{backslash}ud83d\":1}}"),
         format!("{{\"{backslash}ude00\":1}}"),
@@ -314,11 +332,20 @@ fn confirmation_matches_serde_json_value_acceptance() {
             serde_json::from_str::<serde_json::Value>(&body).is_err(),
             "serde Value unexpectedly accepted {body:?}"
         );
-        assert!(
-            slice_ambiguity(body.as_bytes()).is_none(),
-            "{body:?} was reported as ambiguity rather than malformed"
+        assert_eq!(
+            slice_ambiguity(body.as_bytes()),
+            Some(JsonScanReject::InvalidSurrogate.reason()),
+            "{body:?} did not fail closed"
         );
     }
+
+    let governed = format!(
+        "{{\"tool_calls\":[{{\"function\":{{\"name\":\"danger\"}}}}],\"pad\":\"{backslash}ud83d\"}}"
+    );
+    assert_eq!(
+        slice_ambiguity(governed.as_bytes()),
+        Some(JsonScanReject::InvalidSurrogate.reason())
+    );
 
     // Malformed UTF-8 in a member name.
     let non_utf8 = b"{\"\xff\xfe\":1}";
@@ -589,6 +616,7 @@ fn reasons_are_fixed_cardinality_and_echo_no_input() {
         JsonScanReject::KeyTooLong,
         JsonScanReject::TooLarge,
         JsonScanReject::Malformed,
+        JsonScanReject::InvalidSurrogate,
     ] {
         assert!(!reject.reason().is_empty());
     }

@@ -371,8 +371,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend dispatch. A route-authored `content-type` match still replaces the
   gate, but it is validated against the same native contract first, so an
   operator header can only narrow the protocol boundary. GRPCRoutes share
-  HTTPRoute's same-`(hostname, listen path)` collapse, so rule/match ordering
-  and fall-through are preserved. Gateway API v1.5.1
+  HTTPRoute's same-`(hostname, listen path)` collapse **within their own kind**,
+  so rule/match ordering and fall-through are preserved. Gateway API v1.5.1
   forbids merging rules between GRPCRoutes and HTTPRoutes: an HTTPRoute and a
   GRPCRoute attached to the same resolved listener with any intersecting
   hostname now resolve to exactly one accepted Route on that listener and
@@ -385,22 +385,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not the literal `parentRefs[]` selector: a wildcard reference and a reference
   pinning that listener by `sectionName` or `port` contend with each other,
   while two wildcard references that `allowedRoutes.kinds` sends to different
-  listeners do not. A wildcard reference spanning several listeners emits one
-  shared conflict claim, and Ferrum's HTTP-family route representation is
-  port-agnostic, so a claim kept for the listener it won would still route on
-  the listener it lost: such a claim is conservatively withdrawn whole as soon
-  as it loses on **any** listener it reaches. Route status always echoes the
-  parentRef the operator wrote. Two Routes of different kinds that Gateway API
-  requires be accepted *together* — because `allowedRoutes.kinds`, a
-  `sectionName`/`port` pin, or separate Gateways send them to different
-  listeners — still share Ferrum's single port-agnostic `(hosts, listen path)`
-  slot and collapse into one ordered dispatch-rule list. Their predicates stay
-  intact and disjoint there (the gRPC rules are content-type gated), and the
-  alternative would emit two proxies with an identical `(hosts, listen path)`,
-  which `validate_unique_listen_paths` rejects — aborting the entire config
-  reload for the common "HTTP listener plus gRPC listener on one Gateway"
-  topology, where a pathless GRPCRoute and an HTTPRoute `PathPrefix: /` rule
-  both land on `/`. gRPC shapes Ferrum cannot represent exactly
+  listeners do not. Ferrum's HTTP-family route representation is
+  port-agnostic, so retaining any second parentRef or hostname claim after one
+  loss would also retain the Route's proxy on the listener where it lost: the
+  entire Route is conservatively withdrawn across every claim as soon as it
+  loses on **any** listener. Whole-Route arbitration runs in the same total
+  Gateway API order, so a withdrawn Route cannot displace a later valid Route
+  elsewhere. Route status always echoes each parentRef the operator wrote.
+  Cross-kind routes never collapse, including when separate listeners admit
+  them: because the route table is port-agnostic, merging would make each
+  backend reachable through the other kind's listener. An identical
+  `(hosts, listen path)` therefore fails config validation closed.
+  gRPC shapes Ferrum cannot represent exactly
   — `method.type: RegularExpression` (Ferrum cannot constrain a regex operand
   to a single gRPC path segment, so the predicate is refused rather than
   compiled into a matcher that could widen across service/method boundaries)

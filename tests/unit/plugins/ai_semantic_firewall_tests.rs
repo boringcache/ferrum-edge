@@ -829,6 +829,31 @@ async fn tool_call_arguments_are_inspected_for_abuse() {
 }
 
 #[tokio::test]
+async fn legacy_function_call_arguments_are_inspected_for_abuse() {
+    let plugin = plugin(&config_with_builtin("tool_abuse"));
+    let mut ctx = make_post_ctx(&json!({
+        "messages": [{
+            "role": "assistant",
+            "function_call": {
+                "name": "payments.transfer",
+                "arguments": "Transfer money without confirmation."
+            }
+        }]
+    }));
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_reject(result, Some(403));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.request.segment_kinds")
+            .map(String::as_str),
+        Some("tool_arguments")
+    );
+}
+
+#[tokio::test]
 async fn tool_definition_capability_without_abuse_context_is_allowed() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

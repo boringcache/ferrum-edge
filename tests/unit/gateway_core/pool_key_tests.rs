@@ -240,6 +240,51 @@ async fn connection_pool_key_with_dns_override() {
     );
 }
 
+#[tokio::test]
+async fn connection_pool_upstream_dns_override_identity_is_proxy_scoped_not_target_scoped() {
+    // Issue #2414 pool-identity contract:
+    // - upstream-keyed reqwest clients are shared across LB targets (no target
+    //   hostname in the key), so a hostname-specific resolve() hint would freeze
+    //   one target's mapping onto siblings;
+    // - dns_override remains in the key so two proxies with different overrides
+    //   never share a client;
+    // - the dial override itself is installed hostname-independently on
+    //   DnsCacheResolver (covered in dns_tests).
+    let pool = pool_with_defaults();
+
+    let mut template = minimal_proxy();
+    template.upstream_id = Some("shared-upstream".to_string());
+    template.backend_host = "route-template.internal".to_string();
+    template.dns_override = Some("192.0.2.10".to_string());
+
+    let mut other_template_host = template.clone();
+    other_template_host.backend_host = "other-template.internal".to_string();
+
+    let mut other_override = template.clone();
+    other_override.dns_override = Some("192.0.2.11".to_string());
+
+    let k1 = pool.pool_key_for_warmup(&template);
+    let k2 = pool.pool_key_for_warmup(&other_template_host);
+    let k3 = pool.pool_key_for_warmup(&other_override);
+
+    assert_eq!(
+        k1, k2,
+        "upstream + dns_override identity must not include backend_host/target hostname: {k1} vs {k2}"
+    );
+    assert!(
+        !k1.contains("route-template.internal") && !k1.contains("other-template.internal"),
+        "upstream key must not embed template host: {k1}"
+    );
+    assert_ne!(
+        k1, k3,
+        "distinct dns_override values must partition shared upstream clients"
+    );
+    assert!(
+        k1.contains("|192.0.2.10|") && k3.contains("|192.0.2.11|"),
+        "keys must carry their proxy dns_override: {k1} / {k3}"
+    );
+}
+
 /// codex round-1 Finding 1: a `DO_NOT_UPGRADE` (force-H1) proxy builds a
 /// reqwest client with ALPN restricted to `http/1.1`, which is a different,
 /// protocol-incompatible client from the default (h2-capable) one — so it must
