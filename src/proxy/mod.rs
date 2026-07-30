@@ -3071,11 +3071,11 @@ async fn buffer_request_body_for_before_proxy(
         return Ok(ClientRequestBody::Streaming(Box::new(request)));
     }
 
-    if max_request_body_size_bytes > 0
-        && let Some(content_length) = headers.get("content-length")
-        && let Ok(len) = content_length.parse::<usize>()
-        && len > max_request_body_size_bytes
-    {
+    // Parsed per comma-folded member so a repeated identical declaration is
+    // compared against the ceiling rather than skipping this guard
+    // (`GHSA-xrfj-852f-645j`). An unusable declaration falls through to the
+    // bounded collect below, which never trusts a declared length.
+    if declared_request_content_length_over_limit(headers, max_request_body_size_bytes) {
         return Err(RequestBodyBufferError::TooLarge);
     }
 
@@ -3379,6 +3379,14 @@ pub(crate) fn request_body_requirements_before_authenticate(
     requirements
 }
 
+/// Fold a global body ceiling with an applicable plugin/route ceiling into the
+/// single effective bound, where `0` means unlimited.
+///
+/// The shared rule for both directions and every protocol path: take the
+/// strictest *active* (nonzero) bound, and never let an unlimited global (`0`)
+/// disable an active route bound. An absent plugin ceiling leaves the global
+/// exactly as configured, so a proxy with no size-limiting plugin behaves
+/// identically to the pre-`GHSA-xrfj-852f-645j` path.
 pub(crate) fn effective_request_body_limit(
     global_limit: usize,
     plugin_limit: Option<usize>,
@@ -3387,6 +3395,19 @@ pub(crate) fn effective_request_body_limit(
         (0, Some(plugin_limit)) => plugin_limit,
         (global_limit, Some(plugin_limit)) => global_limit.min(plugin_limit),
         (global_limit, None) => global_limit,
+    }
+}
+
+/// Strictest of two optional ceilings; `None` only when both are absent.
+///
+/// Used to compose a phase's plugin-local buffering cap with this route's
+/// enforced client-facing ceiling, so an early prebuffer never retains more than
+/// the route policy allows (`GHSA-xrfj-852f-645j`).
+pub(crate) fn stricter_optional_limit(a: Option<usize>, b: Option<usize>) -> Option<usize> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(limit), None) | (None, Some(limit)) => Some(limit),
+        (None, None) => None,
     }
 }
 
@@ -16591,6 +16612,76 @@ pub(crate) fn should_apply_synthetic_response_body_hooks(
     response_body_plugins_process_body(plugins, ctx)
 }
 
+/// Enforce the effective route response-body ceiling over an already-buffered
+/// synthetic/short-circuit body, independently of the response body-hook gate.
+///
+/// Replaces `status`/`headers`/`body` in place with a 502 when the body exceeds
+/// the ceiling.
+///
+/// Why this is not simply folded into
+/// [`should_apply_synthetic_response_body_hooks`]: opening that gate would
+/// activate the *entire* synthetic body pipeline (`on_response_body`,
+/// `transform_response_body_with_context`, `on_final_response_body`) for every
+/// plugin in the chain merely because a size ceiling exists, changing behavior
+/// well beyond size policy. This applies exactly the size decision.
+///
+/// Bodyless semantics (`HEAD`, `1xx`, `204`/`205`/`304`) are skipped: their
+/// `Content-Length` describes a representation, not transferred bytes, and they
+/// carry no body to measure.
+fn enforce_synthetic_response_body_limit(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status: &mut u16,
+    headers: &mut HashMap<String, String>,
+    body: &mut Bytes,
+) {
+    use crate::plugins::utils::synthetic_response::synthetic_response_omits_body;
+
+    if body.is_empty() || synthetic_response_omits_body(&ctx.method, *status) {
+        return;
+    }
+    // The context folds the process-wide ceiling with the precomputed route
+    // ceiling. This synthetic path already owns the complete body, but it must
+    // still honor the same strictest-active bound as every collector and
+    // streaming adapter. In particular, a looser route policy cannot relax the
+    // global ceiling and a synthetic response with no route plugin cannot
+    // bypass the global ceiling.
+    let limit = ctx.effective_max_response_body_size_bytes();
+    if limit == 0 {
+        return;
+    }
+    if body.len() <= limit {
+        return;
+    }
+    // Attribute the refusal to the enforcing plugin without re-running hooks.
+    let plugin_name = plugins
+        .iter()
+        .find(|plugin| {
+            plugin
+                .enforced_response_body_limit()
+                .is_some_and(|plugin_limit| plugin_limit == limit as u64)
+        })
+        .map_or("response_size_limiting", |plugin| plugin.name());
+    debug!(
+        plugin = plugin_name,
+        body_len = body.len(),
+        max_bytes = limit,
+        "Synthetic response rejected: buffered body exceeds route limit"
+    );
+    *body = rebuild_plugin_rejection_response_headers(
+        status,
+        headers,
+        RejectedResponseParts {
+            status_code: 502,
+            body: Bytes::from(crate::plugins::utils::size_limit::rejection_body(
+                "Response body too large",
+                limit as u128,
+            )),
+            headers: HashMap::new(),
+        },
+    );
+}
+
 /// Whether this synthetic response IS the validated `serverless_function`
 /// native-gRPC terminate representation for this request.
 ///
@@ -16964,6 +17055,21 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         // and accept the minor body-transform divergence on the synthetic path.
         apply_synthetic_response_body_hooks(plugins, ctx, status, headers, body).await;
     }
+    // Route response-size policy over an ALREADY-BUFFERED synthetic body, run
+    // independently of the body-hook gate above (`GHSA-xrfj-852f-645j`).
+    //
+    // A default `response_size_limiting` instance advertises no response
+    // buffering and does not opt into reject-path `after_proxy`, so the gate is
+    // false unless some *other* plugin independently elects response buffering.
+    // An oversized body already produced by a mock, serverless, cache, or
+    // federation short-circuit then reached the client over the configured
+    // ceiling. These bytes are in memory either way, so enforcing here costs no
+    // additional retention. It runs AFTER the hooks so a body-transform
+    // expansion cannot escape the ceiling either.
+    //
+    // Still inside the method-override window: bodyless semantics are decided
+    // from the same effective method the hooks saw.
+    enforce_synthetic_response_body_limit(plugins, ctx, status, headers, body);
     if let Some(original_method) = original_method {
         ctx.method = original_method;
     }
@@ -21055,6 +21161,28 @@ async fn handle_proxy_request_inner(
             .plugin_cache
             .request_view(&proxy.namespace, &proxy.id, request_protocol)
     };
+    // Publish this route's effective client-facing body ceilings on the context
+    // before any body is forwarded, retained, or collected. Every streaming
+    // adapter, buffered collector, retry replay, and coalescer folds these with
+    // the applicable global knob at its point of use, so a route limit lower
+    // than the global one bounds unbuffered uploads and buffered responses
+    // instead of only being checked in a body hook that a streaming request
+    // never reaches (`GHSA-xrfj-852f-645j`).
+    ctx.route_request_body_limit_bytes = plugin_cache_view.enforced_request_body_limit();
+    ctx.route_response_body_limit_bytes = plugin_cache_view.enforced_response_body_limit();
+    // Folded once per request for this handler's own dispatch/collection sites.
+    // `0` still means unlimited, and an absent route ceiling leaves each global
+    // knob exactly as configured.
+    let route_request_body_limit = ctx.route_request_body_limit();
+    let route_response_body_limit = ctx.route_response_body_limit();
+    let effective_max_grpc_recv_size_bytes =
+        effective_request_body_limit(state.max_grpc_recv_size_bytes, route_request_body_limit);
+    let effective_max_request_body_size_bytes =
+        effective_request_body_limit(state.max_request_body_size_bytes, route_request_body_limit);
+    let effective_max_response_body_size_bytes = effective_request_body_limit(
+        state.max_response_body_size_bytes,
+        route_response_body_limit,
+    );
     let initial_response_header_policy_plugins =
         plugin_cache_view.initial_response_header_policy_plugins();
     let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
@@ -21346,7 +21474,10 @@ async fn handle_proxy_request_inner(
                         is_grpc_request,
                         state.max_request_body_size_bytes,
                         state.max_grpc_recv_size_bytes,
-                        authenticate_body_requirements.plugin_limit,
+                        stricter_optional_limit(
+                            authenticate_body_requirements.plugin_limit,
+                            route_request_body_limit,
+                        ),
                     ),
                     proxy.backend_read_timeout_ms,
                     ctx.grpc_deadline_at(),
@@ -21393,7 +21524,10 @@ async fn handle_proxy_request_inner(
                                 is_grpc_request,
                                 state.max_request_body_size_bytes,
                                 state.max_grpc_recv_size_bytes,
-                                authenticate_body_requirements.plugin_limit,
+                                stricter_optional_limit(
+                                    authenticate_body_requirements.plugin_limit,
+                                    route_request_body_limit,
+                                ),
                             ),
                             plugin_cache_view
                                 .initial_response_header_policy_plugins()
@@ -21515,7 +21649,10 @@ async fn handle_proxy_request_inner(
             is_grpc_request,
             state.max_request_body_size_bytes,
             state.max_grpc_recv_size_bytes,
-            authorize_body_requirements.plugin_limit,
+            stricter_optional_limit(
+                authorize_body_requirements.plugin_limit,
+                route_request_body_limit,
+            ),
         );
         client_request_body = match client_request_body {
             ClientRequestBody::Streaming(request) => {
@@ -21724,7 +21861,10 @@ async fn handle_proxy_request_inner(
             is_grpc_request,
             state.max_request_body_size_bytes,
             state.max_grpc_recv_size_bytes,
-            before_proxy_body_requirements.plugin_limit,
+            stricter_optional_limit(
+                before_proxy_body_requirements.plugin_limit,
+                route_request_body_limit,
+            ),
         );
         client_request_body = match client_request_body {
             ClientRequestBody::Streaming(request) => {
@@ -22454,7 +22594,7 @@ async fn handle_proxy_request_inner(
                     *request,
                     &method,
                     &hook_headers,
-                    state.max_request_body_size_bytes,
+                    effective_max_request_body_size_bytes,
                     proxy.backend_read_timeout_ms,
                     ctx.grpc_deadline_at(),
                 )
@@ -22879,7 +23019,7 @@ async fn handle_proxy_request_inner(
                     *request,
                     &method,
                     &hook_headers,
-                    state.max_request_body_size_bytes,
+                    effective_max_request_body_size_bytes,
                     proxy.backend_read_timeout_ms,
                     ctx.grpc_deadline_at(),
                 )
@@ -23514,7 +23654,7 @@ async fn handle_proxy_request_inner(
                 ClientRequestBody::Streaming(request) => {
                     match grpc_proxy::collect_grpc_request_body(
                         *request,
-                        state.max_grpc_recv_size_bytes,
+                        effective_max_grpc_recv_size_bytes,
                         proxy.backend_read_timeout_ms,
                         ctx.grpc_deadline_at(),
                     )
@@ -23578,15 +23718,15 @@ async fn handle_proxy_request_inner(
                     }
                 }
                 ClientRequestBody::Buffered(buffered) => {
-                    if state.max_grpc_recv_size_bytes > 0
-                        && buffered.body.len() > state.max_grpc_recv_size_bytes
+                    if effective_max_grpc_recv_size_bytes > 0
+                        && buffered.body.len() > effective_max_grpc_recv_size_bytes
                     {
                         record_request(&state, StatusCode::OK.as_u16());
                         return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                             grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                             &format!(
                                 "gRPC request payload size exceeds maximum of {} bytes",
-                                state.max_grpc_recv_size_bytes
+                                effective_max_grpc_recv_size_bytes
                             ),
                             initial_response_header_policy_plugins.as_ref(),
                         ));
@@ -23816,7 +23956,7 @@ async fn handle_proxy_request_inner(
                 &state.dns_cache,
                 owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                 grpc_should_stream,
-                state.max_response_body_size_bytes,
+                effective_max_response_body_size_bytes,
                 ctx.grpc_deadline_at(),
             )
             .await;
@@ -23845,20 +23985,16 @@ async fn handle_proxy_request_inner(
                 // fully-streaming path never collects, so the check is hoisted here
                 // (mirrors the reqwest/direct-H2/H3/HBONE ordering). gRPC errors ride
                 // on HTTP 200, matching the streaming overflow's logged status.
-                if state.max_grpc_recv_size_bytes > 0
-                    && let Some(content_length) = request.headers().get("content-length")
-                    && let Some(len) = content_length
-                        .to_str()
-                        .ok()
-                        .and_then(|s| s.parse::<usize>().ok())
-                    && len > state.max_grpc_recv_size_bytes
+                if effective_max_grpc_recv_size_bytes > 0
+                    && let Some(declared) = canonical_header_content_length(request.headers())
+                    && declared > effective_max_grpc_recv_size_bytes as u64
                 {
                     record_request(&state, 200);
                     return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                         &format!(
                             "gRPC request payload size exceeds maximum of {} bytes",
-                            state.max_grpc_recv_size_bytes
+                            effective_max_grpc_recv_size_bytes
                         ),
                         initial_response_header_policy_plugins.as_ref(),
                     ));
@@ -23971,7 +24107,7 @@ async fn handle_proxy_request_inner(
                     &state.grpc_pool,
                     &state.dns_cache,
                     owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
-                    state.max_grpc_recv_size_bytes,
+                    effective_max_grpc_recv_size_bytes,
                     body_size_exceeded,
                     upload_observer,
                     ctx.grpc_deadline_at(),
@@ -23988,20 +24124,20 @@ async fn handle_proxy_request_inner(
                     ClientRequestBody::Streaming(request) => {
                         grpc_proxy::collect_grpc_request_body(
                             *request,
-                            state.max_grpc_recv_size_bytes,
+                            effective_max_grpc_recv_size_bytes,
                             proxy.backend_read_timeout_ms,
                             ctx.grpc_deadline_at(),
                         )
                         .await
                     }
                     ClientRequestBody::Buffered(buffered) => {
-                        if state.max_grpc_recv_size_bytes > 0
-                            && buffered.body.len() > state.max_grpc_recv_size_bytes
+                        if effective_max_grpc_recv_size_bytes > 0
+                            && buffered.body.len() > effective_max_grpc_recv_size_bytes
                         {
                             Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(
                                 GrpcProxyError::ResourceExhausted(format!(
                                     "gRPC request payload size exceeds maximum of {} bytes",
-                                    state.max_grpc_recv_size_bytes
+                                    effective_max_grpc_recv_size_bytes
                                 )),
                             ))
                         } else {
@@ -24075,7 +24211,7 @@ async fn handle_proxy_request_inner(
                             &state.dns_cache,
                             owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                             grpc_should_stream,
-                            state.max_response_body_size_bytes,
+                            effective_max_response_body_size_bytes,
                             ctx.grpc_deadline_at(),
                         )
                         .await;
@@ -24531,7 +24667,7 @@ async fn handle_proxy_request_inner(
                     &state.dns_cache,
                     owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                     grpc_should_stream,
-                    state.max_response_body_size_bytes,
+                    effective_max_response_body_size_bytes,
                     ctx.grpc_deadline_at(),
                 )
                 .await;
@@ -25143,7 +25279,7 @@ async fn handle_proxy_request_inner(
                         ));
                 }
                 let body = if state.response_buffer_cutoff_bytes == 0
-                    && state.max_response_body_size_bytes == 0
+                    && effective_max_response_body_size_bytes == 0
                 {
                     crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
@@ -25152,10 +25288,10 @@ async fn handle_proxy_request_inner(
                         grpc_total_deadline,
                         grpc_streaming_trailer_governor.take(),
                     )
-                } else if state.max_response_body_size_bytes > 0 {
+                } else if effective_max_response_body_size_bytes > 0 {
                     crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
-                        state.max_response_body_size_bytes,
+                        effective_max_response_body_size_bytes,
                         cl,
                         state.h2_coalesce_target_bytes,
                         grpc_read_timeout_ms,
@@ -28105,7 +28241,7 @@ async fn handle_proxy_request_inner(
                     response,
                     inspector,
                     tx,
-                    state.max_response_body_size_bytes,
+                    effective_max_response_body_size_bytes,
                     reqwest_backend_guard,
                     lb_connection_guard,
                 ));
@@ -28143,15 +28279,15 @@ async fn handle_proxy_request_inner(
                 // no size limits apply, and response buffer cutoff is disabled.
                 // This eliminates per-frame BytesMut buffering and branch overhead.
                 let base = if state.response_buffer_cutoff_bytes == 0
-                    && state.max_response_body_size_bytes == 0
+                    && effective_max_response_body_size_bytes == 0
                 {
                     crate::proxy::body::direct_streaming_body(response, cl)
-                } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
+                } else if effective_max_response_body_size_bytes > 0 && cl.is_none() {
                     // No Content-Length — enforce size limit while streaming instead
                     // of buffering the entire body into memory.
                     crate::proxy::body::size_limited_streaming_body(
                         response,
-                        state.max_response_body_size_bytes,
+                        effective_max_response_body_size_bytes,
                         cl,
                     )
                 } else {
@@ -28249,7 +28385,7 @@ async fn handle_proxy_request_inner(
             // win is documented in CLAUDE.md and depends on coalescing.
             let use_passthrough = should_bypass_h2_coalesce_for_large_response(
                 cl,
-                state.max_response_body_size_bytes,
+                effective_max_response_body_size_bytes,
             );
 
             // Timeout regime for this streaming H2 body (codex r2-2 finding
@@ -28275,7 +28411,7 @@ async fn handle_proxy_request_inner(
             // size-limited / coalescing variant of this arm enforces the same
             // response-trailer policy boundary.
             let body = if state.response_buffer_cutoff_bytes == 0
-                && state.max_response_body_size_bytes == 0
+                && effective_max_response_body_size_bytes == 0
             {
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
@@ -28284,13 +28420,13 @@ async fn handle_proxy_request_inner(
                     None,
                     streaming_trailer_governor.take(),
                 )
-            } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
+            } else if effective_max_response_body_size_bytes > 0 && cl.is_none() {
                 // No Content-Length — enforce response-size limits while
                 // streaming H2 bodies, including HBONE tunnel responses,
                 // without buffering the whole backend response into memory.
                 crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
-                    state.max_response_body_size_bytes,
+                    effective_max_response_body_size_bytes,
                     cl,
                     state.h2_coalesce_target_bytes,
                     h2_read_timeout_ms,
@@ -28326,7 +28462,7 @@ async fn handle_proxy_request_inner(
                     body,
                     inspector,
                     tx,
-                    state.max_response_body_size_bytes,
+                    effective_max_response_body_size_bytes,
                     lb_connection_guard,
                 ));
                 crate::proxy::body::inspected_streaming_body(rx)
@@ -28439,7 +28575,7 @@ async fn handle_proxy_request_inner(
             // relay does. `H3FrameSource` applies it on the single TRAILERS
             // frame, immediately after the hop-by-hop trailer strip.
             let body = if state.response_buffer_cutoff_bytes == 0
-                && state.max_response_body_size_bytes == 0
+                && effective_max_response_body_size_bytes == 0
             {
                 crate::proxy::body::direct_streaming_h3_body(
                     h3_resp.recv_stream,
@@ -28449,10 +28585,10 @@ async fn handle_proxy_request_inner(
                     h3_read_timeout_ms,
                     streaming_trailer_governor.take(),
                 )
-            } else if state.max_response_body_size_bytes > 0 {
+            } else if effective_max_response_body_size_bytes > 0 {
                 crate::proxy::body::size_limited_streaming_h3_body(
                     h3_resp.recv_stream,
-                    state.max_response_body_size_bytes,
+                    effective_max_response_body_size_bytes,
                     h3_method,
                     response_status,
                     backend_content_length,
@@ -28481,7 +28617,7 @@ async fn handle_proxy_request_inner(
                     body,
                     inspector,
                     tx,
-                    state.max_response_body_size_bytes,
+                    effective_max_response_body_size_bytes,
                     lb_connection_guard,
                 ));
                 crate::proxy::body::inspected_streaming_body(rx)
@@ -29127,6 +29263,14 @@ pub(crate) async fn proxy_to_backend_retry(
     let effective_proxy = resolve_effective_proxy_for_target(proxy, upstream_target);
     let proxy: &Proxy = effective_proxy.as_ref();
 
+    // A retry attempt must be admitted under the same effective ceiling as the
+    // first attempt: the route policy is request-scoped, so a replay cannot
+    // widen back to the global allowance (`GHSA-xrfj-852f-645j`).
+    let effective_max_response_body_size_bytes = effective_request_body_limit(
+        state.max_response_body_size_bytes,
+        request_ctx.route_response_body_limit(),
+    );
+
     // All reqwest hostname resolution uses our DnsCacheResolver, so it is
     // served from the warmed cache — never hitting DNS on the hot path.
     // URL-literal hosts bypass reqwest's resolver and are screened below before
@@ -29457,20 +29601,20 @@ pub(crate) async fn proxy_to_backend_retry(
             // `proxy_to_backend`. Without this the retry path would accept
             // arbitrarily large response bodies, bypassing the operator-
             // configured `max_response_body_size_bytes`.
-            let content_length = response
-                .headers()
-                .get("content-length")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<usize>().ok());
+            // Parsed per comma-folded member so a repeated identical declaration
+            // is honored here instead of failing to parse and skipping this
+            // reject (`GHSA-xrfj-852f-645j`).
+            let content_length = canonical_header_content_length(response.headers())
+                .and_then(|len| usize::try_from(len).ok());
 
             // Fast path: reject immediately when Content-Length exceeds limit.
-            if state.max_response_body_size_bytes > 0
+            if effective_max_response_body_size_bytes > 0
                 && let Some(len) = content_length
-                && len > state.max_response_body_size_bytes
+                && len > effective_max_response_body_size_bytes
             {
                 warn!(
                     "Backend response body ({} bytes) exceeds limit ({} bytes)",
-                    len, state.max_response_body_size_bytes
+                    len, effective_max_response_body_size_bytes
                 );
                 return retry::BackendResponse {
                     status_code: 502,
@@ -29540,8 +29684,8 @@ pub(crate) async fn proxy_to_backend_retry(
                 // Buffered mode: use size-limited collection when a limit is
                 // configured so an oversized chunked response cannot exhaust
                 // memory.
-                if state.max_response_body_size_bytes > 0 {
-                    let max_size = state.max_response_body_size_bytes;
+                if effective_max_response_body_size_bytes > 0 {
+                    let max_size = effective_max_response_body_size_bytes;
                     let collected = match crate::plugins::await_grpc_deadline(
                         request_ctx.grpc_deadline_at(),
                         collect_response_with_limit(response, max_size),
@@ -30030,21 +30174,93 @@ fn backend_egress_denied_dispatch_result(host: &str) -> BackendDispatchResult {
     backend_dispatch_response(backend_egress_denied_response(host), None, None)
 }
 
+/// Single authoritative `Content-Length` from a raw header map, or `None` when
+/// absent or unusable.
+///
+/// Handles both shapes the wire allows for a standards-valid repeated
+/// declaration: several `content-length` entries, and one entry holding a
+/// comma-folded list. Every member must parse as `1*DIGIT` and agree; anything
+/// else is unusable and returns `None` so the caller falls back to a bound that
+/// does not trust a declared length, never to "no length at all"
+/// (`GHSA-xrfj-852f-645j`).
+pub(crate) fn canonical_header_content_length(headers: &http::HeaderMap) -> Option<u64> {
+    use crate::util::body_limit::{ContentLength, parse_content_length};
+
+    // Starts `None` and is only ever set from a successfully parsed member, so a
+    // header map with no `content-length` entry falls out of the loop as `None`
+    // ("absent") without a separate presence flag.
+    let mut canonical: Option<u64> = None;
+    for value in headers.get_all("content-length") {
+        // A non-UTF-8 field value is unusable, not absent-with-a-length: return
+        // `None` so the caller falls back to a bound that does not trust it.
+        let text = value.to_str().ok()?;
+        let len = match parse_content_length(text) {
+            ContentLength::Exact(len) => len,
+            ContentLength::Ambiguous => return None,
+        };
+        match canonical {
+            None => canonical = Some(len),
+            Some(previous) if previous != len => return None,
+            Some(_) => {}
+        }
+    }
+    canonical
+}
+
+/// Single authoritative `Content-Length` from a collected header map, or `None`
+/// when absent or unusable.
+///
+/// Map counterpart of [`canonical_header_content_length`] for the paths that
+/// have already folded headers into a `HashMap`. Used both as a size bound and
+/// as a body-preallocation hint, so an unusable declaration must read as "no
+/// length" rather than as a wrong length (`GHSA-xrfj-852f-645j`).
+pub(crate) fn canonical_header_content_length_from_map(
+    headers: &HashMap<String, String>,
+) -> Option<u64> {
+    match crate::util::body_limit::declared_content_length(headers)? {
+        crate::util::body_limit::ContentLength::Exact(len) => Some(len),
+        crate::util::body_limit::ContentLength::Ambiguous => None,
+    }
+}
+
+/// Whether a request's declared `Content-Length` provably exceeds `max_bytes`
+/// (`0` meaning unlimited).
+///
+/// Parses comma-folded repeated values. `check_protocol_headers` already refuses
+/// *conflicting* repeats at the inbound boundary, so a fold reaching here is
+/// either a set of identical values (which must be compared against the bound —
+/// previously a whole-list `parse()` failed and the bound was skipped) or a
+/// malformed field. A malformed/unusable field returns `false` here and is
+/// bounded by the streaming/collect ceiling instead of being guessed at, so this
+/// helper never turns an unparsable header into a wrong length
+/// (`GHSA-xrfj-852f-645j`).
+pub(crate) fn declared_request_content_length_over_limit(
+    headers: &HashMap<String, String>,
+    max_bytes: usize,
+) -> bool {
+    if max_bytes == 0 {
+        return false;
+    }
+    match canonical_header_content_length_from_map(headers) {
+        Some(len) => len > max_bytes as u64,
+        None => false,
+    }
+}
+
 /// deterministic gateway 413, masking a client/gateway policy violation as
 /// upstream pressure. The reqwest/direct-H2 paths already run their size checks
 /// before admitting; this restores the same ordering. Returns the 413 dispatch
 /// result when the declared Content-Length exceeds the limit, else `None`.
+/// `max_bytes` is the already-folded effective ceiling (global ∧ route), not the
+/// raw global knob, so an active route limit rejects here too.
 fn oversized_request_body_dispatch_reject(
-    state: &ProxyState,
+    max_bytes: usize,
     method: &str,
     headers: &HashMap<String, String>,
     resolved_ip: Option<String>,
 ) -> Option<BackendDispatchResult> {
-    if state.max_request_body_size_bytes > 0
-        && request_may_have_body(method, headers)
-        && let Some(content_length) = headers.get("content-length")
-        && let Ok(len) = content_length.parse::<usize>()
-        && len > state.max_request_body_size_bytes
+    if request_may_have_body(method, headers)
+        && declared_request_content_length_over_limit(headers, max_bytes)
     {
         return Some(backend_dispatch_response(
             retry::BackendResponse {
@@ -30143,6 +30359,27 @@ async fn proxy_to_backend(
     // call sites in `proxy_to_backend_inner` are unchanged.
     let mut retained_body: Option<Bytes> = None;
 
+    // Effective client-facing request-body ceiling for this dispatch: the
+    // strictest of the operator's global knob and any active route ceiling, `0`
+    // meaning unlimited. Computed once here (the route value is precomputed on
+    // the context at intake, so this is a scalar fold, not a plugin scan) and
+    // used by every body arm below — Content-Length fast path, streaming
+    // adapter, and buffered collect — so an unbuffered upload is bounded at the
+    // route limit rather than only at the generally larger global one, and an
+    // unlimited global still cannot disable an active route limit
+    // (`GHSA-xrfj-852f-645j`).
+    let route_request_body_limit = request_ctx.route_request_body_limit();
+    let effective_max_request_body_size_bytes =
+        effective_request_body_limit(state.max_request_body_size_bytes, route_request_body_limit);
+    // Same fold for the response direction. Buffered collection aborts at this
+    // value, so a strict route ceiling bounds retained memory per in-flight
+    // request instead of letting each one grow toward the global allowance.
+    let route_response_body_limit = request_ctx.route_response_body_limit();
+    let effective_max_response_body_size_bytes = effective_request_body_limit(
+        state.max_response_body_size_bytes,
+        route_response_body_limit,
+    );
+
     // All reqwest hostname resolution uses our DnsCacheResolver, so it is
     // served from the warmed cache — never hitting DNS on the hot path.
     // URL-literal hosts bypass reqwest's resolver; direct connectors can still
@@ -30197,9 +30434,12 @@ async fn proxy_to_backend(
     if dispatch_hbone {
         // 413 on an oversized declared Content-Length BEFORE admission, so a
         // capacity rejection cannot mask the size violation as a 503.
-        if let Some(reject) =
-            oversized_request_body_dispatch_reject(state, method, headers, resolved_ip.clone())
-        {
+        if let Some(reject) = oversized_request_body_dispatch_reject(
+            effective_max_request_body_size_bytes,
+            method,
+            headers,
+            resolved_ip.clone(),
+        ) {
             return reject;
         }
         backend_admission_permits = match preacquired_backend_admission.take_or_run(
@@ -30230,6 +30470,8 @@ async fn proxy_to_backend(
             request_is_secure,
             resolved_ip.clone(),
             ctx_bytes_sent_observed,
+            route_request_body_limit,
+            route_response_body_limit,
         )
         .await;
         return BackendDispatchResult::Response {
@@ -30261,31 +30503,40 @@ async fn proxy_to_backend(
             .get("content-type")
             .is_some_and(|ct| backend_dispatch::is_native_grpc_content_type(ct.as_bytes()));
         if mesh_grpc_flavored {
-            let grpc_limit = grpc_proxy::mesh_request_body_limit(
-                true,
-                state.max_request_body_size_bytes,
-                state.max_grpc_recv_size_bytes,
+            // Route ceilings are protocol-agnostic client policy, so an active
+            // one narrows the selected gRPC receive limit here too
+            // (`GHSA-xrfj-852f-645j`).
+            let grpc_limit = effective_request_body_limit(
+                grpc_proxy::mesh_request_body_limit(
+                    true,
+                    state.max_request_body_size_bytes,
+                    state.max_grpc_recv_size_bytes,
+                ),
+                route_request_body_limit,
             );
             if grpc_limit > 0
                 && request_may_have_body(method, headers)
-                && let Some(content_length) = headers.get("content-length")
-                && let Ok(len) = content_length.parse::<usize>()
-                && len > grpc_limit
+                && let Some(crate::util::body_limit::ContentLength::Exact(len)) =
+                    crate::util::body_limit::declared_content_length(headers)
+                && len > grpc_limit as u64
             {
                 return backend_dispatch_response(
                     grpc_proxy::grpc_request_body_too_large_backend_response(
                         &proxy.id,
                         resolved_ip.clone(),
-                        Some(len),
+                        usize::try_from(len).ok(),
                         grpc_limit,
                     ),
                     None,
                     None,
                 );
             }
-        } else if let Some(reject) =
-            oversized_request_body_dispatch_reject(state, method, headers, resolved_ip.clone())
-        {
+        } else if let Some(reject) = oversized_request_body_dispatch_reject(
+            effective_max_request_body_size_bytes,
+            method,
+            headers,
+            resolved_ip.clone(),
+        ) {
             return reject;
         }
         backend_admission_permits = match preacquired_backend_admission.take_or_run(
@@ -30316,6 +30567,8 @@ async fn proxy_to_backend(
             request_is_secure,
             resolved_ip.clone(),
             ctx_bytes_sent_observed,
+            route_request_body_limit,
+            route_response_body_limit,
         )
         .await;
         return BackendDispatchResult::Response {
@@ -30353,9 +30606,12 @@ async fn proxy_to_backend(
         // 413 on an oversized declared Content-Length BEFORE admission (same
         // ordering as the reqwest/direct-H2 paths), so a capacity rejection
         // cannot mask the size violation as a 503.
-        if let Some(reject) =
-            oversized_request_body_dispatch_reject(state, method, headers, resolved_ip.clone())
-        {
+        if let Some(reject) = oversized_request_body_dispatch_reject(
+            effective_max_request_body_size_bytes,
+            method,
+            headers,
+            resolved_ip.clone(),
+        ) {
             return reject;
         }
         backend_admission_permits = match preacquired_backend_admission.take_or_run(
@@ -30390,6 +30646,8 @@ async fn proxy_to_backend(
             request_body_prepared,
             stream_response,
             ctx_bytes_sent_observed,
+            route_request_body_limit,
+            route_response_body_limit,
         )
         .await;
         // For streaming H3 responses, move headers from the H3StreamingResponse
@@ -30457,8 +30715,8 @@ async fn proxy_to_backend(
                 pool_config.enable_http2,
                 retain_request_body,
                 requires_request_body_buffering,
-                state.max_request_body_size_bytes,
-                state.max_response_body_size_bytes,
+                effective_max_request_body_size_bytes,
+                effective_max_response_body_size_bytes,
             )
         };
         // Fold the DestinationRule `connectionPool.http.h2UpgradePolicy` override
@@ -30490,9 +30748,12 @@ async fn proxy_to_backend(
             // matching HBONE/mesh-mTLS ordering so a capacity 503 cannot mask a
             // size violation — especially important for SNI routes that must
             // stay on direct-H2 under nonzero body limits.
-            if let Some(reject) =
-                oversized_request_body_dispatch_reject(state, method, headers, resolved_ip.clone())
-            {
+            if let Some(reject) = oversized_request_body_dispatch_reject(
+                effective_max_request_body_size_bytes,
+                method,
+                headers,
+                resolved_ip.clone(),
+            ) {
                 return reject;
             }
             // Gate adaptive-concurrency admission BEFORE opening the H2 sender.
@@ -30642,6 +30903,8 @@ async fn proxy_to_backend(
                     request_is_secure,
                     resolved_ip,
                     ctx_bytes_sent_observed,
+                    route_request_body_limit,
+                    route_response_body_limit,
                 )
                 .await;
                 return BackendDispatchResult::Response {
@@ -30661,8 +30924,8 @@ async fn proxy_to_backend(
         {
             debug!(
                 proxy_id = %proxy.id,
-                max_request_body_size_bytes = state.max_request_body_size_bytes,
-                max_response_body_size_bytes = state.max_response_body_size_bytes,
+                max_request_body_size_bytes = effective_max_request_body_size_bytes,
+                max_response_body_size_bytes = effective_max_response_body_size_bytes,
                 "H2 pool bypassed because body-size limits are enabled"
             );
         }
@@ -30895,12 +31158,14 @@ async fn proxy_to_backend(
     let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     if has_body {
-        // Enforce request body size limit via Content-Length fast path
-        if state.max_request_body_size_bytes > 0
-            && let Some(content_length) = headers.get("content-length")
-            && let Ok(len) = content_length.parse::<usize>()
-            && len > state.max_request_body_size_bytes
-        {
+        // Enforce request body size limit via Content-Length fast path.
+        // `declared_request_content_length_over_limit` parses comma-folded
+        // repeated identical values instead of failing to parse the whole list
+        // and skipping the bound.
+        if declared_request_content_length_over_limit(
+            headers,
+            effective_max_request_body_size_bytes,
+        ) {
             return backend_dispatch_response(
                 retry::BackendResponse {
                     status_code: 413,
@@ -30991,10 +31256,10 @@ async fn proxy_to_backend(
                 // body adapter writes byte counts directly into the context that
                 // summary builders read — no separate handle-capture needed.
                 let incoming = (*original_req).into_body();
-                if state.max_request_body_size_bytes > 0 {
+                if effective_max_request_body_size_bytes > 0 {
                     let limited = body::SizeLimitedIncoming::new_with_counter(
                         incoming,
-                        state.max_request_body_size_bytes,
+                        effective_max_request_body_size_bytes,
                         Arc::clone(&body_size_exceeded),
                         Arc::clone(ctx_bytes_sent_observed),
                     );
@@ -31015,10 +31280,10 @@ async fn proxy_to_backend(
             ClientRequestBody::Streaming(original_req) => {
                 // Buffered path: collect body into memory for plugin transformation.
                 // Pre-transform length is recorded below after collect completes.
-                let body_bytes = if state.max_request_body_size_bytes > 0 {
+                let body_bytes = if effective_max_request_body_size_bytes > 0 {
                     let limited = http_body_util::Limited::new(
                         (*original_req).into_body(),
-                        state.max_request_body_size_bytes,
+                        effective_max_request_body_size_bytes,
                     );
                     match collect_request_body_with_deadline(
                         limited.collect(),
@@ -31319,7 +31584,7 @@ async fn proxy_to_backend(
                 warn!(
                     proxy_id = %proxy.id,
                     backend_url = %strip_query_params(backend_url),
-                    max_body_size = state.max_request_body_size_bytes,
+                    max_body_size = effective_max_request_body_size_bytes,
                     backend_status = response.status().as_u16(),
                     "Streaming request body exceeded maximum size (backend responded before body error surfaced)"
                 );
@@ -31358,20 +31623,23 @@ async fn proxy_to_backend(
             );
 
             // Enforce response body size limit
-            if state.max_response_body_size_bytes > 0 {
-                // Fast path: check Content-Length header from backend
-                let content_length = response
-                    .headers()
-                    .get("content-length")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<usize>().ok());
+            if effective_max_response_body_size_bytes > 0 {
+                // Fast path: check Content-Length header from backend.
+                // Parsed per comma-folded member so a standards-valid repeated
+                // identical declaration is compared against the limit instead of
+                // failing to parse and skipping this reject
+                // (`GHSA-xrfj-852f-645j`). An ambiguous declaration yields `None`
+                // and falls through to the bounded collect/stream paths below,
+                // which never trust a declared length.
+                let content_length = canonical_header_content_length(response.headers())
+                    .and_then(|len| usize::try_from(len).ok());
 
                 if let Some(len) = content_length
-                    && len > state.max_response_body_size_bytes
+                    && len > effective_max_response_body_size_bytes
                 {
                     warn!(
                         "Backend response body ({} bytes) exceeds limit ({} bytes)",
-                        len, state.max_response_body_size_bytes
+                        len, effective_max_response_body_size_bytes
                     );
                     return backend_dispatch_response(
                         retry::BackendResponse {
@@ -31469,7 +31737,7 @@ async fn proxy_to_backend(
                 }
 
                 // Buffered mode: stream-collect with size limit
-                let max_size = state.max_response_body_size_bytes;
+                let max_size = effective_max_response_body_size_bytes;
                 let collected = match crate::plugins::await_grpc_deadline(
                     request_ctx.grpc_deadline_at(),
                     collect_response_with_limit(response, max_size),
@@ -31594,7 +31862,7 @@ async fn proxy_to_backend(
                 warn!(
                     proxy_id = %proxy.id,
                     backend_url = %strip_query_params(backend_url),
-                    max_body_size = state.max_request_body_size_bytes,
+                    max_body_size = effective_max_request_body_size_bytes,
                     "Streaming request body exceeded maximum size"
                 );
                 return backend_dispatch_response(
@@ -32807,6 +33075,16 @@ async fn proxy_to_backend_hbone(
     request_is_secure: bool,
     resolved_ip: Option<String>,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+    // Strictest active route-scoped request-body ceiling, or `None` when no
+    // matched plugin enforces one. Folded with the global knob below so an
+    // HBONE-tunneled upload is bounded by the same route policy the direct
+    // paths enforce (`GHSA-xrfj-852f-645j`).
+    route_request_body_limit: Option<usize>,
+    // Strictest active route-scoped response-body ceiling, or `None` when no
+    // matched plugin enforces one. Buffered collection on this path aborts here
+    // rather than at the generally larger global allowance
+    // (`GHSA-xrfj-852f-645j`).
+    route_response_body_limit: Option<usize>,
 ) -> (
     retry::BackendResponse,
     Option<Bytes>,
@@ -32858,18 +33136,30 @@ async fn proxy_to_backend_hbone(
         }
     };
 
+    // Folded once for this dispatch, above the first size decision: the declared
+    // Content-Length reject, the streaming adapter, and the buffered response
+    // collector must all use the same effective ceilings
+    // (`GHSA-xrfj-852f-645j`).
+    let effective_request_body_size_limit =
+        effective_request_body_limit(state.max_request_body_size_bytes, route_request_body_limit);
+    let effective_max_response_body_size_bytes = effective_request_body_limit(
+        state.max_response_body_size_bytes,
+        route_response_body_limit,
+    );
+
     if request_may_have_body(method, headers)
-        && state.max_request_body_size_bytes > 0
-        && let Some(content_length) = headers.get("content-length")
-        && let Ok(len) = content_length.parse::<usize>()
-        && len > state.max_request_body_size_bytes
+        && let Some(crate::util::body_limit::ContentLength::Exact(declared)) =
+            crate::util::body_limit::declared_content_length(headers)
+        && effective_request_body_size_limit > 0
+        && declared > effective_request_body_size_limit as u64
     {
+        let len = usize::try_from(declared).unwrap_or(usize::MAX);
         return (
             hbone_request_body_too_large_response(
                 proxy,
                 resolved_ip,
                 Some(len),
-                state.max_request_body_size_bytes,
+                effective_request_body_size_limit,
             ),
             None,
             None,
@@ -33139,8 +33429,8 @@ async fn proxy_to_backend_hbone(
 
     let (mut parts, body) = original_req.into_parts();
     let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let max_request_body_size = if state.max_request_body_size_bytes > 0 {
-        state.max_request_body_size_bytes
+    let max_request_body_size = if effective_request_body_size_limit > 0 {
+        effective_request_body_size_limit
     } else {
         usize::MAX
     };
@@ -33292,7 +33582,7 @@ async fn proxy_to_backend_hbone(
                             proxy,
                             resolved_ip,
                             None,
-                            state.max_request_body_size_bytes,
+                            effective_request_body_size_limit,
                         ),
                         None,
                         None,
@@ -33311,7 +33601,7 @@ async fn proxy_to_backend_hbone(
                             proxy,
                             resolved_ip,
                             None,
-                            state.max_request_body_size_bytes,
+                            effective_request_body_size_limit,
                         ),
                         None,
                         None,
@@ -33348,7 +33638,7 @@ async fn proxy_to_backend_hbone(
                             proxy,
                             resolved_ip,
                             None,
-                            state.max_request_body_size_bytes,
+                            effective_request_body_size_limit,
                         ),
                         None,
                         None,
@@ -33364,21 +33654,18 @@ async fn proxy_to_backend_hbone(
     };
 
     let status = response.status().as_u16();
-    let content_length = response
-        .headers()
-        .get("content-length")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok());
-    if state.max_response_body_size_bytes > 0
+    let content_length = canonical_header_content_length(response.headers())
+        .and_then(|len| usize::try_from(len).ok());
+    if effective_max_response_body_size_bytes > 0
         && let Some(len) = content_length
-        && len > state.max_response_body_size_bytes
+        && len > effective_max_response_body_size_bytes
     {
         return (
             hbone_response_body_too_large_response(
                 proxy,
                 resolved_ip,
                 Some(len),
-                state.max_response_body_size_bytes,
+                effective_max_response_body_size_bytes,
             ),
             None,
             None,
@@ -33413,7 +33700,7 @@ async fn proxy_to_backend_hbone(
     } else {
         let body_bytes = match collect_hyper_body_with_limit(
             response.into_body(),
-            state.max_response_body_size_bytes,
+            effective_max_response_body_size_bytes,
             proxy.backend_read_timeout_ms,
         )
         .await
@@ -33425,7 +33712,7 @@ async fn proxy_to_backend_hbone(
                         proxy,
                         resolved_ip,
                         None,
-                        state.max_response_body_size_bytes,
+                        effective_max_response_body_size_bytes,
                     ),
                     None,
                     None,
@@ -33509,6 +33796,15 @@ async fn proxy_to_backend_mesh_mtls(
     request_is_secure: bool,
     resolved_ip: Option<String>,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+    // Strictest active route-scoped request-body ceiling, or `None` when no
+    // matched plugin enforces one. Narrows whichever global knob the
+    // gRPC/HTTP selection below picks (`GHSA-xrfj-852f-645j`).
+    route_request_body_limit: Option<usize>,
+    // Strictest active route-scoped response-body ceiling, or `None` when no
+    // matched plugin enforces one. Buffered collection on this path aborts here
+    // rather than at the generally larger global allowance
+    // (`GHSA-xrfj-852f-645j`).
+    route_response_body_limit: Option<usize>,
 ) -> (
     retry::BackendResponse,
     Option<Bytes>,
@@ -33725,17 +34021,30 @@ async fn proxy_to_backend_mesh_mtls(
     } else {
         None
     };
-    let request_body_limit = grpc_proxy::mesh_request_body_limit(
-        is_grpc_flavored,
-        state.max_request_body_size_bytes,
-        state.max_grpc_recv_size_bytes,
+    // Narrow the selected protocol ceiling by any active route ceiling, and keep
+    // the route ceiling authoritative when the selected global knob is the
+    // unlimited `0` (`GHSA-xrfj-852f-645j`).
+    let request_body_limit = effective_request_body_limit(
+        grpc_proxy::mesh_request_body_limit(
+            is_grpc_flavored,
+            state.max_request_body_size_bytes,
+            state.max_grpc_recv_size_bytes,
+        ),
+        route_request_body_limit,
+    );
+    let effective_max_response_body_size_bytes = effective_request_body_limit(
+        state.max_response_body_size_bytes,
+        route_response_body_limit,
     );
     if request_may_have_body(method, headers)
         && request_body_limit > 0
-        && let Some(content_length) = headers.get("content-length")
-        && let Ok(len) = content_length.parse::<usize>()
-        && len > request_body_limit
+        && let Some(crate::util::body_limit::ContentLength::Exact(declared)) =
+            crate::util::body_limit::declared_content_length(headers)
+        && declared > request_body_limit as u64
     {
+        // Reported size only; saturating rather than dropping the rejection,
+        // because a declared length wider than `usize` is still over the limit.
+        let len = usize::try_from(declared).unwrap_or(usize::MAX);
         // Mirror the direct gRPC path's oversize rejection shape (Trailers-Only
         // RESOURCE_EXHAUSTED) for gRPC-flavored requests; plain HTTP keeps the
         // 413. Both carry `ErrorClass::RequestBodyTooLarge` so backend-health
@@ -34318,14 +34627,11 @@ async fn proxy_to_backend_mesh_mtls(
     };
 
     let status = response.status().as_u16();
-    let content_length = response
-        .headers()
-        .get("content-length")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok());
-    if state.max_response_body_size_bytes > 0
+    let content_length = canonical_header_content_length(response.headers())
+        .and_then(|len| usize::try_from(len).ok());
+    if effective_max_response_body_size_bytes > 0
         && let Some(len) = content_length
-        && len > state.max_response_body_size_bytes
+        && len > effective_max_response_body_size_bytes
     {
         return (
             if is_grpc_flavored {
@@ -34333,14 +34639,14 @@ async fn proxy_to_backend_mesh_mtls(
                     proxy,
                     resolved_ip,
                     Some(len),
-                    state.max_response_body_size_bytes,
+                    effective_max_response_body_size_bytes,
                 )
             } else {
                 hbone_response_body_too_large_response(
                     proxy,
                     resolved_ip,
                     Some(len),
-                    state.max_response_body_size_bytes,
+                    effective_max_response_body_size_bytes,
                 )
             },
             None,
@@ -34423,7 +34729,7 @@ async fn proxy_to_backend_mesh_mtls(
         // applies as before.
         let collect_fut = collect_hyper_body_and_trailers_with_limit(
             response.into_body(),
-            state.max_response_body_size_bytes,
+            effective_max_response_body_size_bytes,
             if buffered_grpc_shared_deadline.is_some() {
                 0
             } else {
@@ -34470,14 +34776,14 @@ async fn proxy_to_backend_mesh_mtls(
                             proxy,
                             resolved_ip,
                             None,
-                            state.max_response_body_size_bytes,
+                            effective_max_response_body_size_bytes,
                         )
                     } else {
                         hbone_response_body_too_large_response(
                             proxy,
                             resolved_ip,
                             None,
-                            state.max_response_body_size_bytes,
+                            effective_max_response_body_size_bytes,
                         )
                     },
                     None,
@@ -34644,6 +34950,21 @@ async fn proxy_to_backend_http2(
     // this as frames are polled so summary builders observe streamed uploads
     // (not just Content-Length) once the response completes.
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+    // Strictest active route-scoped request-body ceiling, or `None` when no
+    // matched plugin enforces one.
+    //
+    // PR #3176 closed the direct-H2/SNI *timing* window (backend response
+    // headers are withheld until the streaming upload reaches a terminal size
+    // outcome). This is the companion bound: the outcome is now decided against
+    // the route ceiling as well as the global one, so the gate that already
+    // existed fires for a route limit below the global one
+    // (`GHSA-xrfj-852f-645j`).
+    route_request_body_limit: Option<usize>,
+    // Strictest active route-scoped response-body ceiling, or `None` when no
+    // matched plugin enforces one. Buffered collection on this path aborts here
+    // rather than at the generally larger global allowance
+    // (`GHSA-xrfj-852f-645j`).
+    route_response_body_limit: Option<usize>,
 ) -> (
     retry::BackendResponse,
     Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -34674,8 +34995,14 @@ async fn proxy_to_backend_http2(
     // Build hyper request
     let (mut parts, body) = original_req.into_parts();
     let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let max_request_body_size = if state.max_request_body_size_bytes > 0 {
-        state.max_request_body_size_bytes
+    let effective_max_request_body_size_bytes =
+        effective_request_body_limit(state.max_request_body_size_bytes, route_request_body_limit);
+    let effective_max_response_body_size_bytes = effective_request_body_limit(
+        state.max_response_body_size_bytes,
+        route_response_body_limit,
+    );
+    let max_request_body_size = if effective_max_request_body_size_bytes > 0 {
+        effective_max_request_body_size_bytes
     } else {
         usize::MAX
     };
@@ -34686,7 +35013,7 @@ async fn proxy_to_backend_http2(
     // completion channel (and therefore the response gate) is limit-gated.
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     let mut body_cancel_tx = Some(cancel_tx);
-    let (body, body_completion_rx) = if state.max_request_body_size_bytes > 0 {
+    let (body, body_completion_rx) = if effective_max_request_body_size_bytes > 0 {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         (
             body::SizeLimitedIncoming::new_with_counter_and_completion(
@@ -35088,13 +35415,14 @@ async fn proxy_to_backend_http2(
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
     collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
-    if let Some(len) =
-        declared_response_length_exceeds_limit(&resp_headers, state.max_response_body_size_bytes)
-    {
+    if let Some(len) = declared_response_length_exceeds_limit(
+        &resp_headers,
+        effective_max_response_body_size_bytes,
+    ) {
         warn!(
             proxy_id = %proxy.id,
             response_body_bytes = len,
-            max_response_body_size_bytes = state.max_response_body_size_bytes,
+            max_response_body_size_bytes = effective_max_response_body_size_bytes,
             "HTTP/2 backend response body exceeds configured size limit"
         );
         return (
@@ -35140,7 +35468,7 @@ async fn proxy_to_backend_http2(
         // Buffer the full response body, enforcing the operator size cap.
         let collect = collect_hyper_body_with_limit(
             response.into_body(),
-            state.max_response_body_size_bytes,
+            effective_max_response_body_size_bytes,
             proxy.backend_read_timeout_ms,
         );
         let collect_result =
@@ -35162,7 +35490,7 @@ async fn proxy_to_backend_http2(
             Err(HyperBodyCollectError::TooLarge) => {
                 warn!(
                     proxy_id = %proxy.id,
-                    max_response_body_size_bytes = state.max_response_body_size_bytes,
+                    max_response_body_size_bytes = effective_max_response_body_size_bytes,
                     "HTTP/2 buffered body collection exceeded configured size limit"
                 );
                 return (
@@ -35378,8 +35706,22 @@ async fn proxy_to_backend_http3(
     request_body_prepared: bool,
     stream_response: bool,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+    // Strictest active route-scoped request-body ceiling, or `None` when no
+    // matched plugin enforces one. H3 request bodies buffer on the
+    // cross-protocol bridge, so this bounds that collection as well as the
+    // native path (`GHSA-xrfj-852f-645j`).
+    route_request_body_limit: Option<usize>,
+    // Strictest active route-scoped response-body ceiling, or `None` when no
+    // matched plugin enforces one.
+    route_response_body_limit: Option<usize>,
 ) -> (retry::BackendResponse, Option<Bytes>) {
     debug!(proxy_id = %proxy.id, backend_url = %strip_query_params(backend_url), "Proxying request to HTTP/3 backend");
+    let effective_max_request_body_size_bytes =
+        effective_request_body_limit(state.max_request_body_size_bytes, route_request_body_limit);
+    let effective_max_response_body_size_bytes = effective_request_body_limit(
+        state.max_response_body_size_bytes,
+        route_response_body_limit,
+    );
 
     // Resolve backend IP from DNS cache for the effective host
     let effective_host = upstream_target
@@ -35437,11 +35779,10 @@ async fn proxy_to_backend_http3(
                     "streaming HTTP/3 request body should not retain bytes for retries"
                 );
 
-                if state.max_request_body_size_bytes > 0
-                    && let Some(content_length) = headers.get("content-length")
-                    && let Ok(len) = content_length.parse::<usize>()
-                    && len > state.max_request_body_size_bytes
-                {
+                if declared_request_content_length_over_limit(
+                    headers,
+                    effective_max_request_body_size_bytes,
+                ) {
                     return (
                         retry::BackendResponse {
                             status_code: 413,
@@ -35489,7 +35830,7 @@ async fn proxy_to_backend_http3(
                             backend_url,
                             &http3_headers,
                             body,
-                            state.max_request_body_size_bytes,
+                            effective_max_request_body_size_bytes,
                             Arc::clone(ctx_bytes_sent_observed),
                             move || connection_pool.get_tls_config_for_backend(&proxy_clone),
                         )
@@ -35505,7 +35846,7 @@ async fn proxy_to_backend_http3(
                             backend_url,
                             &http3_headers,
                             body,
-                            state.max_request_body_size_bytes,
+                            effective_max_request_body_size_bytes,
                             Arc::clone(ctx_bytes_sent_observed),
                             move || connection_pool.get_tls_config_for_backend(&proxy_clone),
                         )
@@ -35537,7 +35878,7 @@ async fn proxy_to_backend_http3(
                                     response,
                                     proxy,
                                     resolved_ip,
-                                    state.max_response_body_size_bytes,
+                                    effective_max_response_body_size_bytes,
                                 ),
                                 None,
                             )
@@ -35550,6 +35891,7 @@ async fn proxy_to_backend_http3(
                                     method,
                                     backend_url,
                                     resolved_ip,
+                                    effective_max_response_body_size_bytes,
                                 )
                                 .await,
                                 None,
@@ -35672,11 +36014,11 @@ async fn proxy_to_backend_http3(
         ClientRequestBody::Buffered(buffered) => buffered.body,
         ClientRequestBody::Streaming(original_req) => {
             let (_parts, body) = (*original_req).into_parts();
-            if state.max_request_body_size_bytes > 0 {
-                if let Some(content_length) = headers.get("content-length")
-                    && let Ok(len) = content_length.parse::<usize>()
-                    && len > state.max_request_body_size_bytes
-                {
+            if effective_max_request_body_size_bytes > 0 {
+                if declared_request_content_length_over_limit(
+                    headers,
+                    effective_max_request_body_size_bytes,
+                ) {
                     return (
                         retry::BackendResponse {
                             status_code: 413,
@@ -35693,7 +36035,8 @@ async fn proxy_to_backend_http3(
                         None,
                     );
                 }
-                let limited = http_body_util::Limited::new(body, state.max_request_body_size_bytes);
+                let limited =
+                    http_body_util::Limited::new(body, effective_max_request_body_size_bytes);
                 match collect_request_body_with_deadline(
                     limited.collect(),
                     grpc_deadline_at,
@@ -35885,7 +36228,7 @@ async fn proxy_to_backend_http3(
                     response,
                     proxy,
                     resolved_ip,
-                    state.max_response_body_size_bytes,
+                    effective_max_response_body_size_bytes,
                 ),
                 retained_body,
             ),
@@ -35999,7 +36342,7 @@ async fn proxy_to_backend_http3(
                             response,
                             proxy,
                             resolved_ip,
-                            state.max_response_body_size_bytes,
+                            effective_max_response_body_size_bytes,
                         ),
                         retained_body,
                     )
@@ -36012,6 +36355,7 @@ async fn proxy_to_backend_http3(
                             method,
                             backend_url,
                             resolved_ip,
+                            effective_max_response_body_size_bytes,
                         )
                         .await,
                         retained_body,
@@ -36148,20 +36492,22 @@ async fn drain_h3_streaming_response_to_buffered(
     method: &str,
     backend_url: &str,
     resolved_ip: Option<String>,
+    // Already-folded effective response ceiling (global ∧ route), `0` meaning
+    // unlimited. Passed in rather than read from `state` so a strict route
+    // ceiling bounds this drain too (`GHSA-xrfj-852f-645j`).
+    effective_max_response_body_size_bytes: usize,
 ) -> retry::BackendResponse {
     let status = response.status;
     let response_headers = response.headers;
     let mut recv_stream = response.recv_stream;
-    let content_length: Option<u64> = response_headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok());
+    let content_length = canonical_header_content_length_from_map(&response_headers);
 
     match crate::http3::client::drain_h3_response_body(
         &mut recv_stream,
         method,
         status,
         content_length,
-        state.max_response_body_size_bytes,
+        effective_max_response_body_size_bytes,
         proxy.backend_read_timeout_ms,
     )
     .await
@@ -36178,7 +36524,7 @@ async fn drain_h3_streaming_response_to_buffered(
             error!(
                 proxy_id = %proxy.id,
                 backend_url = %strip_query_params(backend_url),
-                max_response_body_size_bytes = state.max_response_body_size_bytes,
+                max_response_body_size_bytes = effective_max_response_body_size_bytes,
                 "HTTP/3 backend response body exceeded configured maximum"
             );
             retry::BackendResponse {
@@ -36398,17 +36744,28 @@ fn h3_response_body_too_large_response(
 /// Fast-path size check on the declared `Content-Length` of a backend
 /// response, mirroring the reqwest retry path's pre-stream reject. Returns
 /// the declared length when it exceeds a nonzero limit.
-fn declared_response_length_exceeds_limit(
+///
+/// `headers` is the shared collected map, which folds repeated non-`Set-Cookie`
+/// fields with `", "`. Hyper accepts a backend response whose `Content-Length`
+/// repeats with identical values, so the declared length is parsed per member
+/// rather than by parsing the whole folded list as one integer — the latter
+/// failed and skipped this fast path (`GHSA-xrfj-852f-645j`). An ambiguous fold
+/// yields `None` here and is bounded by the collection/streaming ceiling
+/// instead, which never trusts a declared length.
+pub(crate) fn declared_response_length_exceeds_limit(
     headers: &HashMap<String, String>,
     max_response_body_size_bytes: usize,
 ) -> Option<usize> {
     if max_response_body_size_bytes == 0 {
         return None;
     }
-    let len = headers
-        .get("content-length")
-        .and_then(|value| value.parse::<usize>().ok())?;
-    (len > max_response_body_size_bytes).then_some(len)
+    let len = canonical_header_content_length_from_map(headers)?;
+    if len <= max_response_body_size_bytes as u64 {
+        return None;
+    }
+    // Reported size only; saturating keeps the reject rather than dropping it on
+    // a 32-bit target where the declared length exceeds `usize`.
+    Some(usize::try_from(len).unwrap_or(usize::MAX))
 }
 
 /// Build the 504 `BackendResponse` for an H3 backend read timeout
@@ -36455,6 +36812,12 @@ async fn proxy_to_backend_http3_retry(
     request_is_secure: bool,
     inbound_version: hyper::Version,
 ) -> retry::BackendResponse {
+    // A replay stays bound by the same request-scoped route ceiling as the
+    // first attempt (`GHSA-xrfj-852f-645j`).
+    let effective_max_response_body_size_bytes = effective_request_body_limit(
+        state.max_response_body_size_bytes,
+        request_ctx.route_response_body_limit(),
+    );
     // reqwest dispatch receives `upstream_target` separately, so it only
     // needs per-port timeout rebasing. gRPC/direct-H2 pool paths use
     // `resolve_backend_connection_proxy_for_target` because their pool key and
@@ -36554,13 +36917,13 @@ async fn proxy_to_backend_http3_retry(
                 // builder only size-limits when Content-Length is absent).
                 if let Some(len) = declared_response_length_exceeds_limit(
                     &response.headers,
-                    state.max_response_body_size_bytes,
+                    effective_max_response_body_size_bytes,
                 ) {
                     return h3_response_body_too_large_response(
                         proxy,
                         resolved_ip,
                         Some(len),
-                        state.max_response_body_size_bytes,
+                        effective_max_response_body_size_bytes,
                     );
                 }
                 let should_stream = if stream_response {
@@ -36598,6 +36961,7 @@ async fn proxy_to_backend_http3_retry(
                         method,
                         backend_url,
                         resolved_ip,
+                        effective_max_response_body_size_bytes,
                     )
                     .await
                 }
@@ -36690,13 +37054,13 @@ async fn proxy_to_backend_http3_retry(
             // draining the response body so oversized responses stop before
             // full buffering; keep this post-return check to protect future
             // alternate H3 collection paths.
-            if state.max_response_body_size_bytes > 0
-                && response.body.len() > state.max_response_body_size_bytes
+            if effective_max_response_body_size_bytes > 0
+                && response.body.len() > effective_max_response_body_size_bytes
             {
                 warn!(
                     "Backend response body ({} bytes) exceeds limit ({} bytes)",
                     response.body.len(),
-                    state.max_response_body_size_bytes
+                    effective_max_response_body_size_bytes
                 );
                 return retry::BackendResponse {
                     status_code: 502,

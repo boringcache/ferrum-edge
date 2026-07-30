@@ -567,10 +567,20 @@ impl CompressionPlugin {
         !self.config.algorithms.is_empty()
     }
 
-    fn request_decode_limits(&self) -> DecodeLimits {
+    fn request_decode_limits(&self, route_limit: Option<usize>) -> DecodeLimits {
+        // The construction-time ceiling is already folded with the active
+        // process-wide request-body limit. Narrow it once more for the matched
+        // route so compressed bytes cannot inflate and retain plaintext above
+        // a stricter request_size_limiting policy before the final body hook
+        // gets a chance to reject it.
+        let max_decoded_bytes = route_limit
+            .filter(|limit| *limit > 0)
+            .map_or(self.config.max_decompressed_request_size, |limit| {
+                self.config.max_decompressed_request_size.min(limit)
+            });
         DecodeLimits {
-            max_decoded_bytes: self.config.max_decompressed_request_size,
-            max_cumulative_bytes: self.config.max_decompressed_request_size,
+            max_decoded_bytes,
+            max_cumulative_bytes: max_decoded_bytes,
             max_codings: REQUEST_DECODE_MAX_CODINGS,
             max_amplification_ratio: MAX_RAW_TO_DECODED_AMPLIFICATION_RATIO,
         }
@@ -706,7 +716,7 @@ impl CompressionPlugin {
                     };
                 };
 
-                let limits = self.request_decode_limits();
+                let limits = self.request_decode_limits(ctx.route_request_body_limit());
                 let header_for_decode = ce.clone();
                 let decode_result = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
@@ -894,7 +904,11 @@ impl CompressionPlugin {
     }
 
     fn response_body_limit_allows_compression(ctx: &RequestContext) -> bool {
-        (1..=HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE).contains(&ctx.max_response_body_size_bytes)
+        // Effective ceiling (global narrowed by any active route ceiling) so a
+        // strict route limit governs compression admission the same way a strict
+        // global limit does (`GHSA-xrfj-852f-645j`).
+        (1..=HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE)
+            .contains(&ctx.effective_max_response_body_size_bytes())
     }
 
     /// Reserve one response-buffer permit for this request when this
@@ -1158,12 +1172,13 @@ impl CompressionPlugin {
         &self,
         body: &[u8],
         encoding_header: &str,
+        route_limit: Option<usize>,
     ) -> Option<Vec<u8>> {
         let Ok(permit) = try_acquire_codec_permit() else {
             warn!("compression: codec admission saturated in request body transform");
             return None;
         };
-        let limits = self.request_decode_limits();
+        let limits = self.request_decode_limits(route_limit);
         let header = encoding_header.to_string();
         let data = body.to_vec();
         match tokio::task::spawn_blocking(move || {
@@ -1980,7 +1995,7 @@ impl Plugin for CompressionPlugin {
             .or_else(|| request_headers.get("content-encoding"))?;
         match self.classify_request_content_encoding(encoding_header) {
             Ok(RequestCodingPlan::Decode(_)) => {
-                self.decompress_request_body_transform(body, encoding_header)
+                self.decompress_request_body_transform(body, encoding_header, None)
                     .await
             }
             Ok(RequestCodingPlan::IdentityOnly) | Err(_) => None,
@@ -1991,7 +2006,7 @@ impl Plugin for CompressionPlugin {
         &self,
         ctx: &mut RequestContext,
         body: &[u8],
-        content_type: Option<&str>,
+        _content_type: Option<&str>,
         request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         // Production H1/H2/H3 loops call this context-aware path. Only the
@@ -2010,8 +2025,20 @@ impl Plugin for CompressionPlugin {
         if ctx.metadata.contains_key(REQUEST_DECODED_METADATA_KEY) {
             return None;
         }
-        self.transform_request_body(body, content_type, request_headers)
-            .await
+        let encoding_header = request_headers
+            .get("x-ferrum-original-content-encoding")
+            .or_else(|| request_headers.get("content-encoding"))?;
+        match self.classify_request_content_encoding(encoding_header) {
+            Ok(RequestCodingPlan::Decode(_)) => {
+                self.decompress_request_body_transform(
+                    body,
+                    encoding_header,
+                    ctx.route_request_body_limit(),
+                )
+                .await
+            }
+            Ok(RequestCodingPlan::IdentityOnly) | Err(_) => None,
+        }
     }
 
     async fn transform_response_body(

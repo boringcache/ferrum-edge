@@ -191,8 +191,13 @@ pub(crate) const MAX_STACKED_RESPONSE_CODINGS: usize = 4;
 ///
 /// `0` is the project-wide "unlimited" spelling for the configured limit, and
 /// the hard ceiling still applies to it; otherwise the smaller of the two wins.
+///
+/// The configured value is the *effective* ceiling — the global limit narrowed
+/// by any active route response ceiling — so a decode cannot inflate past the
+/// bound a route-scoped `response_size_limiting` instance enforces, including
+/// when the global limit is the unlimited `0` (`GHSA-xrfj-852f-645j`).
 fn decoded_inspection_limit(ctx: &RequestContext) -> usize {
-    match ctx.max_response_body_size_bytes {
+    match ctx.effective_max_response_body_size_bytes() {
         0 => MAX_DECODED_RESPONSE_INSPECTION_BYTES,
         configured => configured.min(MAX_DECODED_RESPONSE_INSPECTION_BYTES),
     }

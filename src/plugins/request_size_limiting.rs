@@ -4,7 +4,7 @@
 //! `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`. Rejects requests that exceed the
 //! configured `max_bytes` with HTTP 413 Payload Too Large.
 //!
-//! Two enforcement paths:
+//! Enforcement paths:
 //! 1. **Content-Length fast path** (`on_request_received`): rejects immediately
 //!    when the header declares a body larger than allowed — zero body I/O.
 //! 2. **Buffered body check** (`before_proxy`): if another plugin caused the
@@ -14,8 +14,9 @@
 //!    body after request transforms so the backend-visible payload still
 //!    respects the configured limit.
 //!
-//! For chunked/streaming requests without Content-Length where no other plugin
-//! buffers the body, the global limit still applies at the proxy layer.
+//! The proxy core also folds this route ceiling into every request collector
+//! and streaming adapter, so chunked or unknown-length bodies are bounded even
+//! when no plugin buffers them.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -23,7 +24,8 @@ use std::collections::HashMap;
 use tracing::debug;
 
 use super::utils::size_limit::{
-    SizeLimiter, content_length_over_limit, reject_with_limit, required_positive_u64,
+    ContentLengthRefusal, SizeLimiter, content_length_refusal, reject_with_limit,
+    required_positive_u64,
 };
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -86,20 +88,50 @@ impl Plugin for RequestSizeLimiting {
         super::HTTP_GRPC_PROTOCOLS
     }
 
+    /// Publish the configured ceiling to the proxy core so unbuffered H1/H2,
+    /// H3, and streaming-gRPC uploads are bounded at this route's limit instead
+    /// of only at the generally larger global one (`GHSA-xrfj-852f-645j`).
+    ///
+    /// Without this the hooks below can only decide on a declared
+    /// `Content-Length` or on a body some *other* plugin happened to buffer, so
+    /// a chunked or unknown-length upload was forwarded up to the global ceiling
+    /// — and to no bound at all when the global was disabled.
+    fn enforced_request_body_limit(&self) -> Option<u64> {
+        self.is_enabled().then_some(self.max_bytes)
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         if !self.is_enabled() {
             return PluginResult::Continue;
         }
 
-        // Fast path: check Content-Length header without reading the body
-        if let Some(len) = content_length_over_limit(&ctx.headers, self.max_size_bytes()) {
-            debug!(
-                plugin = self.plugin_name(),
-                content_length = len,
-                max_bytes = self.max_size_bytes(),
-                "Request rejected: Content-Length exceeds limit"
-            );
-            return reject_with_limit(413, "Request body too large", self.max_size_bytes());
+        // Fast path: check Content-Length header without reading the body.
+        // Repeated identical values arrive comma-folded in this map, so parse
+        // every member; a fold that cannot be reduced to one agreed value is
+        // refused rather than treated as an absent length.
+        match content_length_refusal(&ctx.headers, self.max_size_bytes()) {
+            Some(ContentLengthRefusal::OverLimit(len)) => {
+                debug!(
+                    plugin = self.plugin_name(),
+                    content_length = len,
+                    max_bytes = self.max_size_bytes(),
+                    "Request rejected: Content-Length exceeds limit"
+                );
+                return reject_with_limit(413, "Request body too large", self.max_size_bytes());
+            }
+            Some(ContentLengthRefusal::Ambiguous) => {
+                debug!(
+                    plugin = self.plugin_name(),
+                    max_bytes = self.max_size_bytes(),
+                    "Request rejected: Content-Length is ambiguous"
+                );
+                return reject_with_limit(
+                    400,
+                    "Request Content-Length is ambiguous",
+                    self.max_size_bytes(),
+                );
+            }
+            None => {}
         }
 
         PluginResult::Continue
