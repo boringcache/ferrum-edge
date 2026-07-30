@@ -4065,7 +4065,10 @@ fn websocket_transport_boundary_strips_connection_nominated_extensions() {
             "Upgrade, X-Handshake-Hop".to_string(),
         ),
         ("X-Handshake-Hop".to_string(), "must-not-leak".to_string()),
-        ("Sec-WebSocket-Protocol".to_string(), "fabricated".to_string()),
+        (
+            "Sec-WebSocket-Protocol".to_string(),
+            "fabricated".to_string(),
+        ),
         ("Content-Length".to_string(), "999".to_string()),
         ("x-end-to-end".to_string(), "preserved".to_string()),
     ]);
