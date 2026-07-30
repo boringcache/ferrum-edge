@@ -17415,16 +17415,19 @@ components:
           type: boolean
           default: true
           description: >-
-            Include decoded, non-redacted query parameters as input.query.
-            Present query parameters configured as authentication credential
-            locations are omitted by default.
+            Include the backend-bound request query as input.query (a flat
+            decoded map, emitted only when unambiguous), input.query_pairs (an
+            ordered, occurrence-complete pair list), and
+            input.query_ambiguity (fixed-cardinality ambiguity
+            classifications). Present query parameters configured as
+            authentication credential locations are omitted by default.
         include_query_credentials:
           type: boolean
           default: false
           description: >-
             Unsafe opt-in to include built-in and authentication-plugin-marked
-            query credentials in input.query. Keys listed in redact_query_keys
-            remain redacted.
+            query credentials in input.query and input.query_pairs. Keys
+            listed in redact_query_keys remain redacted from both views.
         include_headers:
           type: boolean
           default: true
@@ -17503,10 +17506,11 @@ components:
             minLength: 1
           default: []
           description: >-
-            Additional query parameter names to omit from input.query,
-            matched case-insensitively. Built-in credential names and query
-            locations marked by authentication plugins are already omitted
-            unless include_query_credentials is explicitly enabled.
+            Additional query parameter names to omit from input.query and
+            input.query_pairs, matched case-insensitively. Built-in credential
+            names and query locations marked by authentication plugins are
+            already omitted unless include_query_credentials is explicitly
+            enabled.
 
     AccessControlConfig:
       type: object
@@ -20558,7 +20562,7 @@ components:
         forward_query_params:
           type: boolean
           default: false
-          description: "Include decoded query parameters in the function payload after omitting credentials that an earlier auth plugin marked for backend stripping. Duplicate decoded names, invalid percent-encoded UTF-8, raw '+' ambiguity, and parameters lacking their original encoded representation are rejected before invocation even when on_error=continue."
+          description: "Include decoded query parameters from the shared canonical backend-bound query view in the function payload, after omitting credentials that an earlier auth plugin marked for backend stripping. Behavior is identical on HTTP/1.1, HTTP/2, and HTTP/3 and includes any earlier ordered query transform. Duplicate decoded names (including percent-encoded aliases and bare/valued pairs), literal '+', malformed percent-encoding, non-UTF-8 decodings, and parameters lacking their original encoded representation are rejected before invocation even when on_error=continue."
         timeout_ms:
           type: integer
           format: uint64
