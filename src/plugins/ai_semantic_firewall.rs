@@ -29,6 +29,8 @@ use super::{
 
 const DEFAULT_REQUEST_JSON_PATHS: &[&str] = &[
     "$.messages[*].content",
+    "$.messages[*].function_call.name",
+    "$.messages[*].function_call.arguments",
     "$.messages[*].tool_calls[*].function.name",
     "$.messages[*].tool_calls[*].function.arguments",
     "$.prompt",
@@ -4836,6 +4838,22 @@ fn extract_known_path(
             prefix,
             segments,
         ),
+        "$.messages[*].function_call.name" => extract_message_function_calls(
+            json,
+            direction,
+            "name",
+            SegmentKind::ToolCall,
+            prefix,
+            segments,
+        ),
+        "$.messages[*].function_call.arguments" => extract_message_function_calls(
+            json,
+            direction,
+            "arguments",
+            SegmentKind::ToolArguments,
+            prefix,
+            segments,
+        ),
         "$.prompt" => extract_text_value(
             json.get("prompt"),
             direction,
@@ -5090,6 +5108,34 @@ fn extract_message_tool_calls(
                         segments,
                     );
                 }
+            }
+        }
+    }
+}
+
+fn extract_message_function_calls(
+    json: &Value,
+    direction: Direction,
+    field: &str,
+    kind: SegmentKind,
+    prefix: Option<&str>,
+    segments: &mut Vec<TextSegment>,
+) {
+    if let Some(messages) = json.get("messages").and_then(Value::as_array) {
+        for (message_index, message) in messages.iter().enumerate() {
+            let role = message.get("role").and_then(Value::as_str);
+            if let Some(function_call) = message.get("function_call") {
+                extract_text_value(
+                    function_call.get(field),
+                    direction,
+                    kind,
+                    role.map(str::to_string),
+                    Some(prefixed_json_path(
+                        prefix,
+                        format!("$.messages[{message_index}].function_call.{field}"),
+                    )),
+                    segments,
+                );
             }
         }
     }
