@@ -2406,6 +2406,45 @@ fn test_proxy_udp_amplification_factor_negative_rejected() {
     );
 }
 
+#[test]
+fn test_proxy_dns_override_requires_ip_address() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.dns_override = Some("override.internal".to_string());
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("dns_override must be a valid IPv4 or IPv6 address")),
+        "unexpected validation errors: {errs:?}"
+    );
+}
+
+#[test]
+fn test_proxy_dns_override_rejects_different_direct_literal_target() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.dns_override = Some("127.0.0.2".to_string());
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter().any(|e| {
+            e.contains("dns_override IP 127.0.0.2")
+                && e.contains("literal backend_host IP 127.0.0.1")
+        }),
+        "unexpected validation errors: {errs:?}"
+    );
+}
+
+#[test]
+fn test_proxy_dns_override_allows_hostname_or_matching_literal_target() {
+    let mut hostname_proxy = make_proxy("hostname", "/hostname");
+    hostname_proxy.dns_override = Some("127.0.0.2".to_string());
+    assert!(hostname_proxy.validate_fields().is_ok());
+
+    let mut literal_proxy = make_proxy("literal", "/literal");
+    literal_proxy.backend_host = "127.0.0.2".to_string();
+    literal_proxy.dns_override = Some("127.0.0.2".to_string());
+    assert!(literal_proxy.validate_fields().is_ok());
+}
+
 // ---- SSRF: Backend IP policy validation tests ----
 
 use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};

@@ -7080,7 +7080,12 @@ components:
         dns_override:
           type: [string, "null"]
 
-          description: Override DNS resolution with a specific IP address
+          description: |
+            Override backend DNS resolution with a valid IPv4 or IPv6 address.
+            Applies to every hostname selected for the proxy, including
+            load-balanced targets. A reqwest target that is itself an IP literal
+            must equal the override; conflicting direct targets are rejected at
+            admission and runtime-selected conflicts fail closed with 502.
         dns_cache_ttl_seconds:
           type: [integer, "null"]
           format: uint64
@@ -21503,6 +21508,8 @@ components:
                 type: string
                 enum:
                   - "$.messages[*].content"
+                  - "$.messages[*].function_call.name"
+                  - "$.messages[*].function_call.arguments"
                   - "$.messages[*].tool_calls[*].function.name"
                   - "$.messages[*].tool_calls[*].function.arguments"
                   - "$.prompt"
@@ -21517,6 +21524,8 @@ components:
                   - "$.tool_results[*].content"
               default:
                 - "$.messages[*].content"
+                - "$.messages[*].function_call.name"
+                - "$.messages[*].function_call.arguments"
                 - "$.messages[*].tool_calls[*].function.name"
                 - "$.messages[*].tool_calls[*].function.arguments"
                 - "$.prompt"

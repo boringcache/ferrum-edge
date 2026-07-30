@@ -260,14 +260,15 @@ impl GrpcJwtSecret {
         audience: Option<&str>,
     ) -> Result<String, anyhow::Error> {
         if let Some(path) = self.token_file.as_deref() {
-            let token = std::fs::read_to_string(path).map_err(|e| {
-                anyhow::anyhow!("failed to read FERRUM_DP_CP_GRPC_TOKEN_FILE '{path}': {e}")
+            let token = std::fs::read_to_string(path).map_err(|error| {
+                anyhow::anyhow!("failed to read FERRUM_DP_CP_GRPC_TOKEN_FILE: {error}")
             })?;
             let token = token.trim();
             if token.is_empty() {
-                anyhow::bail!("FERRUM_DP_CP_GRPC_TOKEN_FILE '{path}' is empty");
+                anyhow::bail!("FERRUM_DP_CP_GRPC_TOKEN_FILE is empty");
             }
-            // The token itself is never logged or echoed into an error.
+            // Neither the token nor its source path is logged or echoed into
+            // an error.
             return Ok(token.to_string());
         }
         generate_dp_jwt_full_with_key_id(

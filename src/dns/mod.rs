@@ -2551,13 +2551,43 @@ fn parse_dns_order(order_str: Option<&str>) -> Vec<DnsRecordOrder> {
 /// By setting this as the `dns_resolver` on every `reqwest::Client`, DNS
 /// resolution is kept completely off the hot request path: the cache is
 /// pre-warmed at startup and continuously refreshed in the background.
+///
+/// When a proxy carries a static [`dns_override`](crate::config::types::Proxy::dns_override),
+/// the connection pool installs that override on this resolver (not via
+/// reqwest's hostname-specific `ClientBuilder::resolve()` map). The override
+/// therefore applies to **every** hostname the shared client dials — including
+/// load-balanced upstream targets whose host differs from `proxy.backend_host`
+/// — matching direct connectors that call
+/// [`DnsCache::resolve_candidates`] with the same per-proxy override.
 pub struct DnsCacheResolver {
     cache: DnsCache,
+    /// Per-proxy static IP override. `None` for shared plugin/health clients
+    /// and proxies without `dns_override`. When `Some`, every hostname this
+    /// resolver answers returns that address (policy-screened), independent of
+    /// the requested name. The immutable snapshot is reference-counted so a
+    /// resolver call does not allocate a fresh override string.
+    dns_override: Option<Arc<str>>,
 }
 
 impl DnsCacheResolver {
     pub fn new(cache: DnsCache) -> Self {
-        Self { cache }
+        Self {
+            cache,
+            dns_override: None,
+        }
+    }
+
+    /// Build a resolver that pins every dial to a per-proxy `dns_override`.
+    ///
+    /// Used by the reqwest connection pool so load-balanced target hostnames
+    /// that differ from the route template's `backend_host` still dial the
+    /// override IP. Pool keys already partition by `dns_override`, so a shared
+    /// upstream-keyed client cannot freeze one proxy's override onto another.
+    pub fn with_dns_override(cache: DnsCache, dns_override: Option<String>) -> Self {
+        Self {
+            cache,
+            dns_override: dns_override.map(Arc::from),
+        }
     }
 }
 
@@ -2565,10 +2595,11 @@ impl reqwest::dns::Resolve for DnsCacheResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let cache = self.cache.clone();
         let hostname = name.as_str().to_string();
+        let dns_override = self.dns_override.clone();
 
         Box::pin(async move {
             let addresses = cache
-                .resolve_candidates(&hostname, None, None)
+                .resolve_candidates(&hostname, dns_override.as_deref(), None)
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                     Box::new(std::io::Error::other(e.to_string()))

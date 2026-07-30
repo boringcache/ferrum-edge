@@ -1263,6 +1263,15 @@ async fn chargeback_snapshot_spool_failure_retains_generation_for_bounded_retry(
     plugin.commit_background_tasks();
     plugin.log(&create_test_transaction_summary()).await;
 
+    // Other serialized recovery tests intentionally leave process-global
+    // generations pending when their spool remains unwritable. Measure this
+    // test's contribution instead of assuming it runs before those cases.
+    let baseline_status: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("baseline status");
+    let pending_before = baseline_status["snapshot_finalizations_pending"]
+        .as_u64()
+        .expect("pending count");
+
     assert_eq!(
         api_chargeback_sink_finalize_snapshot_for_test(&plugin).await,
         Some(false),
@@ -1279,11 +1288,13 @@ async fn chargeback_snapshot_spool_failure_retains_generation_for_bounded_retry(
     );
     let failed_status: Value =
         serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("failed status");
-    assert_eq!(failed_status["snapshot_finalizations_pending"], 1);
-    assert!(
-        api_chargeback_sink::render_prometheus()
-            .contains("chargeback_sink_snapshot_finalizations_pending 1")
-    );
+    let failed_pending = failed_status["snapshot_finalizations_pending"]
+        .as_u64()
+        .expect("failed pending count");
+    assert_eq!(failed_pending, pending_before + 1);
+    assert!(api_chargeback_sink::render_prometheus().contains(&format!(
+        "chargeback_sink_snapshot_finalizations_pending {failed_pending}"
+    )));
 
     std::fs::remove_file(&spool_dir).expect("remove blocking file");
     assert_eq!(
@@ -1297,7 +1308,10 @@ async fn chargeback_snapshot_spool_failure_retains_generation_for_bounded_retry(
     );
     let recovered_status: Value =
         serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("recovered status");
-    assert_eq!(recovered_status["snapshot_finalizations_pending"], 0);
+    assert_eq!(
+        recovered_status["snapshot_finalizations_pending"].as_u64(),
+        Some(pending_before)
+    );
     let rows = chargeback_spool_rows(&spool_dir);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["call_count"], 1);
