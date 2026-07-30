@@ -1988,6 +1988,13 @@ pub struct RequestContext {
     /// `&'static str` because every `AuthMechanism::mechanism_name()` returns a
     /// compiled-in literal — zero allocation on the hot path.
     pub auth_method: Option<&'static str>,
+    /// SHA-256 of the exact SOAP representation accepted by an
+    /// identity-establishing `soap_ws_security` policy. The final request-body
+    /// hook compares this private proof with the bytes dispatched to the
+    /// backend, so a later/custom plugin cannot forge it through public
+    /// metadata. Keeping a credential/body-derived digest here also prevents
+    /// transaction-log serialization.
+    soap_ws_security_authenticated_body_digest: Option<[u8; 32]>,
     pub timestamp_received: DateTime<Utc>,
     /// Whether the request's gRPC deadline state has been initialized from the
     /// inbound `grpc-timeout` value. Initialization happens once, immediately
@@ -2725,6 +2732,7 @@ impl RequestContext {
             authenticated_identity_header: None,
             backend_geo_country: None,
             auth_method: None,
+            soap_ws_security_authenticated_body_digest: None,
             timestamp_received: Utc::now(),
             grpc_deadline_initialized: false,
             grpc_deadline_had_valid_client_timeout: false,
@@ -3586,6 +3594,8 @@ impl RequestContext {
             authenticated_identity_header: self.authenticated_identity_header.clone(),
             backend_geo_country: self.backend_geo_country,
             auth_method: self.auth_method,
+            soap_ws_security_authenticated_body_digest: self
+                .soap_ws_security_authenticated_body_digest,
             timestamp_received: self.timestamp_received,
             grpc_deadline_initialized: self.grpc_deadline_initialized,
             grpc_deadline_had_valid_client_timeout: self.grpc_deadline_had_valid_client_timeout,

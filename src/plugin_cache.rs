@@ -273,6 +273,31 @@ fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), Stri
 /// cannot preserve the configured enforcement contract.
 fn validate_plugin_security_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
     for protocol in ALL_PROXY_PROTOCOLS {
+        let identity_soap_count = plugins
+            .iter()
+            .filter(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && plugin.name() == "soap_ws_security"
+                    && plugin.is_auth_plugin()
+            })
+            .count();
+        if identity_soap_count > 0 {
+            let auth_plugins: Vec<&str> = plugins
+                .iter()
+                .filter(|plugin| {
+                    plugin.supported_protocols().contains(&protocol) && plugin.is_auth_plugin()
+                })
+                .map(|plugin| plugin.name())
+                .collect();
+            if auth_plugins.len() != 1 {
+                return Err(format!(
+                    "identity-establishing soap_ws_security must be the sole authentication \
+                     mechanism for protocol {protocol:?} on its effective plugin chain; found: {}",
+                    auth_plugins.join(", ")
+                ));
+            }
+        }
+
         let has_hmac = plugins
             .iter()
             .filter(|plugin| plugin.supported_protocols().contains(&protocol))
@@ -2903,7 +2928,10 @@ struct ProxyGroupPluginInstance {
 /// rather than a core allowlist.
 const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "a2a_gateway",
+    "ai_prompt_compressor",
+    "ai_prompt_shield",
     "ai_rate_limiter",
+    "ai_request_guard",
     "ai_stream_router",
     "ai_transcript_audit",
     "compression",
@@ -2924,10 +2952,8 @@ const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "response_caching",
     "request_transformer",
     "serverless_function",
+    "soap_ws_security",
     "sse",
-    "ai_prompt_shield",
-    "ai_prompt_compressor",
-    "ai_request_guard",
 ];
 
 fn is_security_composition_candidate_plugin(
@@ -2947,6 +2973,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
 ) -> Result<(), String> {
     validate_api_chargeback_ownership(config)?;
     validate_replay_provenance_composition(config)?;
+    validate_soap_ws_security_composition(config)?;
     let mut errors = Vec::new();
     let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
     let mut scoped_plugins: SecurityCompositionPluginMap<'_> = HashMap::new();
@@ -3617,14 +3644,25 @@ fn start_background_tasks(
 /// generation has been installed. Must stay infallible and idempotent.
 fn commit_background_tasks(proxy_map: &ProxyPluginMap, globals: &[Arc<dyn Plugin>]) {
     let mut committed = HashSet::new();
+    let mut saw_api_chargeback = false;
     for plugin in globals
         .iter()
         .chain(proxy_map.values().flat_map(|plugins| plugins.iter()))
     {
         let pointer = Arc::as_ptr(plugin) as *const () as usize;
         if committed.insert(pointer) {
+            if plugin.name() == "api_chargeback" {
+                saw_api_chargeback = true;
+            }
             plugin.commit_background_tasks();
         }
+    }
+    // Instance commit publishes the `/charges` projection while at least one
+    // enabled api_chargeback exists. A generation with zero instances has no
+    // plugin callback, so publish absence explicitly after atomic installation
+    // (never during candidate construction/validation).
+    if !saw_api_chargeback {
+        crate::plugins::api_chargeback::publish_render_schema_absence();
     }
 }
 
@@ -4533,6 +4571,15 @@ fn validate_replay_provenance_composition(config: &GatewayConfig) -> Result<(), 
         .map_err(|errors| errors.join("; "))
 }
 
+/// `soap_ws_security` establishes SOAP identity in the `authenticate` phase, so
+/// multi-auth composition would skip or override it and request decompression
+/// would run after the message was already validated. Reject both before
+/// constructing a generation whose ordering guarantees cannot hold.
+fn validate_soap_ws_security_composition(config: &GatewayConfig) -> Result<(), String> {
+    crate::plugins::soap_ws_security::validate_composition(config)
+        .map_err(|errors| errors.join("; "))
+}
+
 /// `__mesh_bpf_metrics` is a single scrape exporter per process. Require at
 /// most one enabled global instance so reload never registers duplicate
 /// collectors / double-emits series on authenticated `/metrics`.
@@ -4624,6 +4671,7 @@ impl PluginCache {
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
         validate_replay_provenance_composition(config)?;
+        validate_soap_ws_security_composition(config)?;
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let (
             proxy_map,
@@ -5030,6 +5078,7 @@ impl PluginCache {
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
         validate_replay_provenance_composition(config)?;
+        validate_soap_ws_security_composition(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         let restrict_country_mmdb_refresh_to_rebuild_scope =
             matches!(country_mmdb_load_mode, CountryMmdbLoadMode::PreloadedOnly);
@@ -5072,6 +5121,7 @@ impl PluginCache {
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
         validate_replay_provenance_composition(config)?;
+        validate_soap_ws_security_composition(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         if paths.is_empty() {
             return Ok(None);
