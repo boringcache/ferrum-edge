@@ -895,13 +895,6 @@ fn invalid_config_shapes_are_rejected() {
             "sessions": { "downstream_session_header": "bad header" },
             "servers": { "github": { "upstream_url": "http://x/mcp", "namespace": "github" } }
         }),
-        // validate_tool_results is not implemented; setting true must be rejected.
-        json!({
-            "mode": "transparent_proxy",
-            "endpoint": { "path": "/mcp" },
-            "validation": { "validate_tool_results": true },
-            "servers": { "github": { "upstream_url": "http://x/mcp", "namespace": "github" } }
-        }),
         // mode is required (no silent default).
         json!({
             "endpoint": { "path": "/mcp" },
@@ -926,6 +919,29 @@ fn invalid_config_shapes_are_rejected() {
             "config should be rejected: {config:?}"
         );
     }
+}
+
+#[test]
+fn validate_tool_results_config_is_accepted() {
+    let mut config = aggregate_config("http://127.0.0.1:9/mcp");
+    config["validation"] = json!({ "validate_tool_results": true });
+    assert!(
+        create_plugin("mcp_gateway", &config).is_ok(),
+        "validation.validate_tool_results=true must be constructible in aggregate_router mode"
+    );
+}
+
+#[test]
+fn validate_tool_results_rejects_transparent_mode() {
+    let mut config = transparent_config("http://127.0.0.1:9/mcp");
+    config["validation"] = json!({ "validate_tool_results": true });
+    let error = create_plugin("mcp_gateway", &config)
+        .err()
+        .expect("transparent mode must reject inert tool-result validation");
+    assert!(
+        error.contains("validate_tool_results") && error.contains("aggregate_router"),
+        "error must identify the field and required mode: {error}"
+    );
 }
 
 #[test]
@@ -7632,4 +7648,1736 @@ fn downstream_session_header_refuses_protocol_managed_destinations() {
             "sessions.downstream_session_header = {spelling:?} must stay allowed"
         );
     }
+}
+
+async fn start_mcp_output_schema_tool_server(output_schema: Value) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "initialize"})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", "upstream-session")
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "github", "version": "1.0.0" }
+                    }
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "notifications/initialized"}),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "tools",
+            "result": {
+                "tools": [{
+                    "name": "create_pr",
+                    "description": "Create a pull request",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["repo"],
+                        "properties": { "repo": { "type": "string" } }
+                    },
+                    "outputSchema": output_schema
+                }]
+            }
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+fn aggregate_output_validation_config(upstream_url: &str) -> Value {
+    let mut config = aggregate_config(upstream_url);
+    config["validation"] = json!({
+        "validate_tool_arguments": true,
+        "validate_tool_results": true
+    });
+    config["discovery"]["aggregate_resources"] = json!(false);
+    config["discovery"]["aggregate_prompts"] = json!(false);
+    config["servers"]["github"]["expose_resources"] = json!(false);
+    config["servers"]["github"]["expose_prompts"] = json!(false);
+    config
+}
+
+fn weather_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["temperature", "conditions"],
+        "properties": {
+            "temperature": { "type": "number" },
+            "conditions": { "type": "string" }
+        }
+    })
+}
+
+async fn route_validated_tool_call(
+    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
+    session_id: &str,
+    id: i64,
+) -> ferrum_edge::plugins::RequestContext {
+    let _ = aggregate_tool_names(plugin, session_id, id).await;
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "id": id + 1,
+        "method": "tools/call",
+        "params": {
+            "name": "github.create_pr",
+            "arguments": { "repo": "payments-api" }
+        }
+    });
+    let (mut ctx, mut headers) = mcp_ctx(request_body.clone());
+    headers.insert("mcp-session-id".to_string(), session_id.to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        ctx.metadata
+            .get("mcp.needs_response_rewrite")
+            .is_some_and(|value| value == "true"),
+        "validate_tool_results must stage response buffering for tools/call"
+    );
+    let _ = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            serde_json::to_vec(&request_body).unwrap().as_slice(),
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("tool call request should be rewritten");
+    ctx
+}
+
+#[tokio::test]
+async fn validate_tool_results_accepts_valid_structured_content() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let mut ctx = route_validated_tool_call(&plugin, &session_id, 100).await;
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 101,
+        "result": {
+            "content": [{
+                "type": "text",
+                "text": "{\"temperature\":22.5,\"conditions\":\"Partly cloudy\"}"
+            }],
+            "structuredContent": {
+                "temperature": 22.5,
+                "conditions": "Partly cloudy"
+            }
+        }
+    }))
+    .unwrap();
+    let headers = known_json_response_headers(&upstream_response);
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.result_schema_validation")
+            .map(String::as_str),
+        Some("pass")
+    );
+}
+
+#[tokio::test]
+async fn validate_tool_results_rejects_invalid_structured_content() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let mut ctx = route_validated_tool_call(&plugin, &session_id, 110).await;
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 111,
+        "result": {
+            "structuredContent": {
+                "temperature": "hot",
+                "conditions": "sunny"
+            }
+        }
+    }))
+    .unwrap();
+    let headers = known_json_response_headers(&upstream_response);
+    let (status, body, _) = reject_json(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+            .await,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body["error"]["code"], -32012);
+    assert_eq!(body["error"]["message"], "Invalid MCP tool result");
+    assert_eq!(body["id"], 111);
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.result_schema_validation")
+            .map(String::as_str),
+        Some("fail")
+    );
+    // Audit metadata must never carry the result body.
+    assert!(!ctx.metadata.keys().any(|key| key.contains("result_body")));
+    assert!(!ctx.metadata.contains_key("mcp.results"));
+}
+
+#[tokio::test]
+async fn validate_tool_results_accepts_content_only_json_text() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let mut ctx = route_validated_tool_call(&plugin, &session_id, 120).await;
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 121,
+        "result": {
+            "content": [{
+                "type": "text",
+                "text": "{\"temperature\":18.0,\"conditions\":\"Clear\"}"
+            }]
+        }
+    }))
+    .unwrap();
+    let headers = known_json_response_headers(&upstream_response);
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn validate_tool_results_rejects_mixed_structured_and_content_disagreement() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let mut ctx = route_validated_tool_call(&plugin, &session_id, 130).await;
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 131,
+        "result": {
+            "content": [{
+                "type": "text",
+                "text": "{\"temperature\":1.0,\"conditions\":\"A\"}"
+            }],
+            "structuredContent": {
+                "temperature": 2.0,
+                "conditions": "B"
+            }
+        }
+    }))
+    .unwrap();
+    let headers = known_json_response_headers(&upstream_response);
+    let (status, body, _) = reject_json(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+            .await,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body["error"]["code"], -32012);
+}
+
+#[tokio::test]
+async fn validate_tool_results_preserves_tool_execution_errors() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let mut ctx = route_validated_tool_call(&plugin, &session_id, 140).await;
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 141,
+        "result": {
+            "content": [{ "type": "text", "text": "API rate limit exceeded" }],
+            "isError": true
+        }
+    }))
+    .unwrap();
+    let headers = known_json_response_headers(&upstream_response);
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn validate_tool_results_preserves_json_rpc_protocol_errors() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+
+    for (offset, response_id) in [Value::Null, json!("upstream"), json!(151)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut ctx =
+            route_validated_tool_call(&plugin, &session_id, 150 + offset as i64 * 2).await;
+        let upstream_response = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": response_id,
+            "error": {
+                "code": -32603,
+                "message": "Internal error",
+                "data": {"retryable": false}
+            }
+        }))
+        .unwrap();
+        let headers = known_json_response_headers(&upstream_response);
+        let result = plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+            .await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "null, string, and numeric JSON-RPC ids must be preserved"
+        );
+    }
+}
+
+#[tokio::test]
+async fn validate_tool_results_rejects_malformed_json_rpc_protocol_errors() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let malformed = [
+        (
+            "non-object envelope",
+            json!(["not", "a", "response"]),
+            Value::Null,
+        ),
+        (
+            "missing jsonrpc",
+            json!({"id": 1, "error": {"code": -32603, "message": "bad"}}),
+            json!(1),
+        ),
+        (
+            "wrong jsonrpc",
+            json!({"jsonrpc": "1.0", "id": 2, "error": {"code": -32603, "message": "bad"}}),
+            json!(2),
+        ),
+        (
+            "missing id",
+            json!({"jsonrpc": "2.0", "error": {"code": -32603, "message": "bad"}}),
+            Value::Null,
+        ),
+        (
+            "object id",
+            json!({"jsonrpc": "2.0", "id": {}, "error": {"code": -32603, "message": "bad"}}),
+            Value::Null,
+        ),
+        (
+            "array id",
+            json!({"jsonrpc": "2.0", "id": [], "error": {"code": -32603, "message": "bad"}}),
+            Value::Null,
+        ),
+        (
+            "boolean id",
+            json!({"jsonrpc": "2.0", "id": true, "error": {"code": -32603, "message": "bad"}}),
+            Value::Null,
+        ),
+        (
+            "non-integer error code",
+            json!({"jsonrpc": "2.0", "id": 3, "error": {"code": 1.5, "message": "bad"}}),
+            json!(3),
+        ),
+        (
+            "non-string error message",
+            json!({"jsonrpc": "2.0", "id": 4, "error": {"code": -32603, "message": 4}}),
+            json!(4),
+        ),
+    ];
+
+    for (offset, (case, upstream_value, expected_id)) in malformed.into_iter().enumerate() {
+        let mut ctx =
+            route_validated_tool_call(&plugin, &session_id, 160 + offset as i64 * 2).await;
+        let upstream_response = serde_json::to_vec(&upstream_value).unwrap();
+        let headers = known_json_response_headers(&upstream_response);
+        let (status, body, _) = reject_json(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+                .await,
+        );
+        assert_eq!(status, 200, "{case}");
+        assert_eq!(body["error"]["code"], -32012, "{case}");
+        assert_eq!(body["id"], expected_id, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn validate_tool_results_rejects_result_and_error_bypass() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let mut ctx = route_validated_tool_call(&plugin, &session_id, 155).await;
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 156,
+        "result": {
+            "structuredContent": {
+                "temperature": "not-a-number",
+                "conditions": "sunny"
+            }
+        },
+        "error": { "code": -32603, "message": "mask the invalid result" }
+    }))
+    .unwrap();
+    let headers = known_json_response_headers(&upstream_response);
+    let (status, body, _) = reject_json(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+            .await,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body["error"]["code"], -32012);
+    assert_eq!(body["id"], 156);
+}
+
+#[tokio::test]
+async fn validate_tool_results_rejects_malformed_json_rpc_result_envelopes() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let valid_result = json!({
+        "structuredContent": {
+            "temperature": 22.5,
+            "conditions": "Clear"
+        }
+    });
+    let malformed = [
+        (
+            "missing jsonrpc",
+            json!({"id": 157, "result": valid_result}),
+            json!(157),
+        ),
+        (
+            "wrong jsonrpc",
+            json!({"jsonrpc": "1.0", "id": 158, "result": valid_result}),
+            json!(158),
+        ),
+        (
+            "missing id",
+            json!({"jsonrpc": "2.0", "result": valid_result}),
+            Value::Null,
+        ),
+        (
+            "object id",
+            json!({"jsonrpc": "2.0", "id": {}, "result": valid_result}),
+            Value::Null,
+        ),
+        (
+            "array id",
+            json!({"jsonrpc": "2.0", "id": [], "result": valid_result}),
+            Value::Null,
+        ),
+        (
+            "boolean id",
+            json!({"jsonrpc": "2.0", "id": false, "result": valid_result}),
+            Value::Null,
+        ),
+    ];
+
+    for (offset, (case, upstream_value, expected_id)) in malformed.into_iter().enumerate() {
+        let mut ctx =
+            route_validated_tool_call(&plugin, &session_id, 220 + offset as i64 * 2).await;
+        let upstream_response = serde_json::to_vec(&upstream_value).unwrap();
+        let headers = known_json_response_headers(&upstream_response);
+        let (status, body, _) = reject_json(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+                .await,
+        );
+        assert_eq!(status, 200, "{case}");
+        assert_eq!(body["error"]["code"], -32012, "{case}");
+        assert_eq!(body["id"], expected_id, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn validate_tool_results_rejects_malformed_and_oversized_results() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
+    config["validation"]["max_upstream_response_bytes"] = json!(4 * 1024);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let mut ctx = route_validated_tool_call(&plugin, &session_id, 160).await;
+
+    let malformed = br#"{"jsonrpc":"2.0","id":161,"result":"#;
+    let headers = known_json_response_headers(malformed);
+    let (status, body, _) = reject_json(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, malformed)
+            .await,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body["error"]["code"], -32012);
+
+    let oversized = vec![b'x'; 8 * 1024];
+    let oversized_headers = known_json_response_headers(&oversized);
+    let (status, body, _) = reject_json(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &oversized_headers, &oversized)
+            .await,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body["error"]["code"], -32012);
+}
+
+#[tokio::test]
+async fn validate_tool_results_rejects_uninspectable_response_headers() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let valid_body = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 171,
+        "result": {
+            "structuredContent": {
+                "temperature": 22.5,
+                "conditions": "Clear"
+            }
+        }
+    }))
+    .unwrap();
+    let mut valid_ctx = route_validated_tool_call(&plugin, &session_id, 170).await;
+    let mut valid_headers = known_json_response_headers(&valid_body);
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut valid_ctx, 200, &mut valid_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let cases = [
+        (
+            "event stream",
+            HashMap::from([
+                ("content-type".to_string(), "text/event-stream".to_string()),
+                ("content-length".to_string(), "128".to_string()),
+            ]),
+        ),
+        (
+            "non-JSON",
+            HashMap::from([
+                ("content-type".to_string(), "text/plain".to_string()),
+                ("content-length".to_string(), "128".to_string()),
+            ]),
+        ),
+        (
+            "encoded",
+            HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("content-length".to_string(), "128".to_string()),
+                ("content-encoding".to_string(), "gzip".to_string()),
+            ]),
+        ),
+        (
+            "missing content-length",
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        ),
+        (
+            "malformed content-length",
+            HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("content-length".to_string(), "not-a-size".to_string()),
+            ]),
+        ),
+        (
+            "oversized content-length",
+            HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                (
+                    "content-length".to_string(),
+                    (4 * 1024 * 1024 + 1).to_string(),
+                ),
+            ]),
+        ),
+    ];
+    for (offset, (case, mut headers)) in cases.into_iter().enumerate() {
+        let mut ctx =
+            route_validated_tool_call(&plugin, &session_id, 172 + offset as i64 * 2).await;
+        let (status, body, _) = reject_json(plugin.after_proxy(&mut ctx, 200, &mut headers).await);
+        assert_eq!(status, 200, "{case}");
+        assert_eq!(body["error"]["code"], -32012, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn validate_tool_results_skips_tools_with_invalid_output_schema() {
+    let server = start_mcp_output_schema_tool_server(json!({
+        "$ref": "https://example.invalid/schemas/weather.json"
+    }))
+    .await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let tools = aggregate_tool_names(&plugin, &session_id, 180).await;
+    assert!(
+        tools.is_empty(),
+        "tools with non-local outputSchema $ref must be refused at catalog admission: {tools:?}"
+    );
+}
+
+#[tokio::test]
+async fn disabled_tool_result_validation_keeps_tools_with_unusable_output_schema() {
+    let server = start_mcp_output_schema_tool_server(json!({
+        "$ref": "https://example.invalid/schemas/weather.json"
+    }))
+    .await;
+    let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
+    config["validation"]["validate_tool_results"] = json!(false);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let tools = aggregate_tool_names(&plugin, &session_id, 185).await;
+    assert_eq!(
+        tools,
+        vec!["github.create_pr"],
+        "default-off result validation must preserve the legacy catalog even when an upstream advertises an unusable outputSchema"
+    );
+}
+
+#[tokio::test]
+async fn validate_tool_results_reload_update_and_delete_change_enforcement() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let upstream = format!("{}/mcp", server.uri());
+
+    let enabled = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&upstream),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&enabled).await;
+    let mut ctx = route_validated_tool_call(&enabled, &session_id, 190).await;
+    let invalid = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 191,
+        "result": { "structuredContent": { "temperature": "nope" } }
+    }))
+    .unwrap();
+    let headers = known_json_response_headers(&invalid);
+    assert!(matches!(
+        enabled
+            .on_final_response_body(&mut ctx, 200, &headers, &invalid)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
+    // Reload/update: reconstruct without validation — same invalid body passes.
+    let mut disabled_config = aggregate_output_validation_config(&upstream);
+    disabled_config["validation"]["validate_tool_results"] = json!(false);
+    let disabled = create_plugin("mcp_gateway", &disabled_config)
+        .unwrap()
+        .unwrap();
+    let session_id = initialize(&disabled).await;
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "id": 192,
+        "method": "tools/call",
+        "params": {
+            "name": "github.create_pr",
+            "arguments": { "repo": "payments-api" }
+        }
+    });
+    let _ = aggregate_tool_names(&disabled, &session_id, 193).await;
+    let (mut ctx, mut headers_map) = mcp_ctx(request_body.clone());
+    headers_map.insert("mcp-session-id".to_string(), session_id);
+    assert!(matches!(
+        disabled.before_proxy(&mut ctx, &mut headers_map).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        !disabled.may_enforce_response_body_policy(&ctx),
+        "disabled validation must not claim tool-result enforcement"
+    );
+    let result = disabled
+        .on_final_response_body(&mut ctx, 200, &headers, &invalid)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    // Delete: dropping the plugin removes enforcement entirely.
+    drop(enabled);
+    drop(disabled);
+}
+
+#[tokio::test]
+async fn validate_tool_results_output_schema_change_hides_until_configured() {
+    let list_hits = Arc::new(AtomicUsize::new(0));
+    let hits = Arc::clone(&list_hits);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "initialize"})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", "upstream-session")
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "github", "version": "1.0.0" }
+                    }
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "notifications/initialized"}),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = hits.fetch_add(1, Ordering::SeqCst);
+            let output_schema = if n == 0 {
+                weather_output_schema()
+            } else {
+                json!({
+                    "type": "object",
+                    "required": ["temperature", "conditions", "humidity"],
+                    "properties": {
+                        "temperature": { "type": "number" },
+                        "conditions": { "type": "string" },
+                        "humidity": { "type": "number" }
+                    }
+                })
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": "tools",
+                "result": {
+                    "tools": [{
+                        "name": "create_pr",
+                        "inputSchema": {
+                            "type": "object",
+                            "required": ["repo"],
+                            "properties": { "repo": { "type": "string" } }
+                        },
+                        "outputSchema": output_schema
+                    }]
+                }
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
+    config["discovery"]["cache_ttl_seconds"] = json!(1);
+    config["discovery"]["on_schema_change"] = json!("hide_until_configured");
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    assert_eq!(
+        aggregate_tool_names(&plugin, &session_id, 200).await,
+        vec!["github.create_pr"]
+    );
+    // Force refresh so the changed outputSchema is observed.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert!(
+        aggregate_tool_names(&plugin, &session_id, 201)
+            .await
+            .is_empty(),
+        "outputSchema drift under hide_until_configured must hide the tool"
+    );
+}
+
+#[tokio::test]
+async fn validate_tool_results_batch_tools_call_still_singleton_only() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let batch = json!([
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "github.create_pr",
+                "arguments": { "repo": "payments-api" }
+            }
+        }
+    ]);
+    let (mut ctx, mut headers) = mcp_ctx(batch);
+    headers.insert("mcp-session-id".to_string(), session_id);
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert!(body.is_array());
+    assert_eq!(body[0]["error"]["code"], -32009);
+}
+
+async fn start_mcp_tool_server_without_output_schema() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "initialize"})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", "upstream-session")
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "github", "version": "1.0.0" }
+                    }
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "notifications/initialized"}),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "tools",
+            "result": {
+                "tools": [{
+                    "name": "create_pr",
+                    "description": "Create a pull request",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["repo"],
+                        "properties": { "repo": { "type": "string" } }
+                    }
+                }]
+            }
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+fn deeply_nested_output_schema(depth: usize) -> Value {
+    let mut node = json!({"type": "string"});
+    for _ in 0..depth {
+        node = json!({ "properties": { "n": node } });
+    }
+    node
+}
+
+fn node_budget_output_schema(property_count: usize) -> Value {
+    let mut properties = serde_json::Map::new();
+    for index in 0..property_count {
+        properties.insert(format!("f{index}"), json!({ "type": "string" }));
+    }
+    json!({
+        "type": "object",
+        "properties": Value::Object(properties)
+    })
+}
+
+/// A schema whose `$defs` form a chain of local `$ref`s, each pointing at the
+/// next. The document stays flat — three levels and two nodes per link — so it
+/// sits far inside the nesting and node budgets, and only the schema-walk depth
+/// budget can refuse it. Without that budget the audit recurses one stack frame
+/// per link while building the catalog on the request path.
+fn ref_chain_output_schema(links: usize) -> Value {
+    let mut defs = serde_json::Map::new();
+    for index in 0..links {
+        defs.insert(
+            format!("d{index}"),
+            json!({ "$ref": format!("#/$defs/d{}", index + 1) }),
+        );
+    }
+    defs.insert(format!("d{links}"), json!({ "type": "object" }));
+    json!({
+        "$ref": "#/$defs/d0",
+        "$defs": Value::Object(defs)
+    })
+}
+
+/// A flat local-reference chain whose definitions are traversed from the leaf
+/// toward the root before the longest path is reached. A single global
+/// `visited` set would incorrectly skip each already-seen target and admit the
+/// long path; depth-aware memoization must audit it again at the deeper depth.
+fn previsited_ref_chain_output_schema(links: usize) -> Value {
+    let mut defs = serde_json::Map::new();
+    defs.insert("d0000".to_string(), json!({ "type": "object" }));
+    for index in 1..=links {
+        defs.insert(
+            format!("d{index:04}"),
+            json!({ "$ref": format!("#/$defs/d{:04}", index - 1) }),
+        );
+    }
+    json!({
+        "$defs": Value::Object(defs),
+        "allOf": [{ "$ref": format!("#/$defs/d{links:04}") }]
+    })
+}
+
+fn recursive_local_ref_output_schema() -> Value {
+    json!({
+        "$defs": {
+            "node": {
+                "type": "object",
+                "properties": {
+                    "child": { "$ref": "#/$defs/node" }
+                }
+            },
+            "encoded target": {
+                "type": "string",
+                "const": "decoded"
+            }
+        },
+        "type": "object",
+        "required": ["temperature", "conditions", "encoded"],
+        "properties": {
+            "temperature": { "type": "number" },
+            "conditions": { "type": "string" },
+            "tree": { "$ref": "#/$defs/node" },
+            "echo": { "$ref": "#" },
+            "encoded": { "$ref": "#/$defs/encoded%20target" },
+            "tags": {
+                "type": "array",
+                "items": { "type": "string" },
+                "prefixItems": [{ "type": "string" }],
+                "contains": { "type": "string" }
+            },
+            "meta": {
+                "type": "object",
+                "additionalProperties": { "type": "string" },
+                "propertyNames": { "type": "string" },
+                "unevaluatedProperties": false
+            }
+        },
+        "allOf": [{ "type": "object" }],
+        "anyOf": [{ "type": "object" }],
+        "oneOf": [{ "type": "object" }],
+        "not": { "type": "array" }
+    })
+}
+
+#[tokio::test]
+async fn validate_tool_results_skips_tools_for_output_schema_security_boundaries() {
+    let cases = [
+        ("non-object schema", json!("not-a-schema")),
+        ("null schema", Value::Null),
+        ("array schema", json!([])),
+        ("non-string $ref", json!({ "$ref": ["#/$defs/x"] })),
+        ("non-string $dynamicRef", json!({ "$dynamicRef": 12 })),
+        (
+            "non-local $id",
+            json!({
+                "type": "object",
+                "$id": "https://example.invalid/schemas/weather.json"
+            }),
+        ),
+        ("non-string $id", json!({ "type": "object", "$id": 7 })),
+        (
+            "non-local id",
+            json!({
+                "type": "object",
+                "id": "https://example.invalid/legacy-id"
+            }),
+        ),
+        ("non-string id", json!({ "type": "object", "id": false })),
+        (
+            "$vocabulary refused",
+            json!({
+                "type": "object",
+                "$vocabulary": { "https://json-schema.org/draft/2020-12/vocab/core": true }
+            }),
+        ),
+        ("non-pointer local $ref", json!({ "$ref": "#foo" })),
+        (
+            "non-UTF-8 local $ref fragment",
+            json!({ "$ref": "#/$defs/%FF" }),
+        ),
+        (
+            "missing local $ref target",
+            json!({ "$ref": "#/$defs/missing" }),
+        ),
+        (
+            "properties keyword not an object",
+            json!({ "type": "object", "properties": true }),
+        ),
+        (
+            "allOf keyword not an array",
+            json!({ "type": "object", "allOf": true }),
+        ),
+        (
+            "tuple-form items keyword",
+            json!({
+                "type": "array",
+                "items": [{ "type": "string" }, { "type": "number" }]
+            }),
+        ),
+        ("schema deeper than budget", deeply_nested_output_schema(40)),
+        (
+            "schema wider than node budget",
+            node_budget_output_schema(10_100),
+        ),
+        (
+            "local $ref chain longer than the schema-walk budget",
+            ref_chain_output_schema(512),
+        ),
+        (
+            "previsited local $ref chain longer than the schema-walk budget",
+            previsited_ref_chain_output_schema(512),
+        ),
+    ];
+
+    for (offset, (case, schema)) in cases.into_iter().enumerate() {
+        let server = start_mcp_output_schema_tool_server(schema).await;
+        let plugin = create_plugin(
+            "mcp_gateway",
+            &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+        )
+        .unwrap()
+        .unwrap();
+        let session_id = initialize(&plugin).await;
+        let tools = aggregate_tool_names(&plugin, &session_id, 900 + offset as i64).await;
+        assert!(
+            tools.is_empty(),
+            "{case}: hostile or unusable outputSchema must be refused at catalog admission, got {tools:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn validate_tool_results_accepts_local_ref_and_combinator_output_schema() {
+    let server = start_mcp_output_schema_tool_server(recursive_local_ref_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    assert_eq!(
+        aggregate_tool_names(&plugin, &session_id, 930).await,
+        vec!["github.create_pr"],
+        "local $ref / combinator outputSchema must compile at catalog admission"
+    );
+
+    let mut ctx = route_validated_tool_call(&plugin, &session_id, 931).await;
+    assert!(
+        plugin.may_replace_rejection_response(),
+        "SSE/uninspectable tool-result rejects must be replaceable under enforcement"
+    );
+    assert!(
+        plugin.may_enforce_response_body_policy(&ctx),
+        "routed tools/call with a compiled outputSchema must stage private enforcement"
+    );
+    assert!(
+        plugin.enforces_response_body_policy(&ctx, Some("application/json"), &[]),
+        "enforces_response_body_policy must mirror may_enforce once private state is set"
+    );
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 932,
+        "result": {
+            "structuredContent": {
+                "temperature": 19.5,
+                "conditions": "Overcast",
+                "encoded": "decoded",
+                "tree": { "child": { "child": {} } },
+                "tags": ["a"],
+                "meta": { "source": "unit" }
+            }
+        }
+    }))
+    .unwrap();
+    let headers = known_json_response_headers(&upstream_response);
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.result_schema_validation")
+            .map(String::as_str),
+        Some("pass")
+    );
+}
+
+#[tokio::test]
+async fn validate_tool_results_without_output_schema_does_not_stage_enforcement() {
+    let server = start_mcp_tool_server_without_output_schema().await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    assert_eq!(
+        aggregate_tool_names(&plugin, &session_id, 940).await,
+        vec!["github.create_pr"],
+        "tools that omit outputSchema must remain in the catalog when validation is enabled"
+    );
+
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "id": 941,
+        "method": "tools/call",
+        "params": {
+            "name": "github.create_pr",
+            "arguments": { "repo": "payments-api" }
+        }
+    });
+    let (mut ctx, mut headers) = mcp_ctx(request_body.clone());
+    headers.insert("mcp-session-id".to_string(), session_id);
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        !plugin.may_enforce_response_body_policy(&ctx),
+        "omitted outputSchema must not set private mcp_validate_tool_result enforcement"
+    );
+    assert!(!plugin.enforces_response_body_policy(&ctx, None, &[]));
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 941,
+        "result": {
+            "content": [{ "type": "text", "text": "created" }]
+        }
+    }))
+    .unwrap();
+    let response_headers = known_json_response_headers(&upstream_response);
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, &upstream_response)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn validate_tool_results_rejects_unusable_caller_visible_representations() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let cases = [
+        (
+            "missing structuredContent and JSON text",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "content": [{ "type": "text", "text": "plain prose only" }]
+                }
+            }),
+        ),
+        (
+            "content is not an array",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "content": { "type": "text", "text": "{\"temperature\":1,\"conditions\":\"x\"}" }
+                }
+            }),
+        ),
+        (
+            "text content missing text field",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "content": [{ "type": "text" }]
+                }
+            }),
+        ),
+        (
+            "multiple JSON text content blocks",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": {
+                    "content": [
+                        { "type": "text", "text": "{\"temperature\":1,\"conditions\":\"a\"}" },
+                        { "type": "image", "data": "ignored" },
+                        { "text": "no-type-ignored" },
+                        { "type": "text", "text": "{\"temperature\":2,\"conditions\":\"b\"}" }
+                    ]
+                }
+            }),
+        ),
+        (
+            "empty result object",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "result": {}
+            }),
+        ),
+    ];
+
+    for (offset, (case, upstream_value)) in cases.into_iter().enumerate() {
+        let mut ctx =
+            route_validated_tool_call(&plugin, &session_id, 950 + offset as i64 * 2).await;
+        let upstream_response = serde_json::to_vec(&upstream_value).unwrap();
+        let headers = known_json_response_headers(&upstream_response);
+        let (status, body, _) = reject_json(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+                .await,
+        );
+        assert_eq!(status, 200, "{case}");
+        assert_eq!(body["error"]["code"], -32012, "{case}");
+        assert_eq!(
+            ctx.metadata
+                .get("mcp.result_schema_validation")
+                .map(String::as_str),
+            Some("fail"),
+            "{case}"
+        );
+        assert!(
+            !ctx.metadata.keys().any(|key| key.contains("result_body")),
+            "{case}: rejection metadata must never carry result bodies"
+        );
+    }
+}
+
+#[tokio::test]
+async fn validate_tool_results_accepts_structured_with_non_json_companion_text() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let mut ctx = route_validated_tool_call(&plugin, &session_id, 970).await;
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 971,
+        "result": {
+            "content": [
+                { "type": "text", "text": "human summary, not JSON" },
+                {
+                    "type": "text",
+                    "text": "{\"temperature\":11.0,\"conditions\":\"Fog\"}"
+                }
+            ],
+            "structuredContent": {
+                "temperature": 11.0,
+                "conditions": "Fog"
+            }
+        }
+    }))
+    .unwrap();
+    let headers = known_json_response_headers(&upstream_response);
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.result_schema_validation")
+            .map(String::as_str),
+        Some("pass")
+    );
+}
+
+#[tokio::test]
+async fn validate_tool_results_rejects_duplicate_json_keys() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+
+    // Raw bytes: serde_json keeps last-wins while other MCP clients may keep
+    // first-wins. Ambiguous documents must fail closed before materialization.
+    let cases: &[(&str, &[u8])] = &[
+        (
+            "top-level duplicate result",
+            br#"{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"temperature":22.5,"conditions":"ok"}},"result":{"isError":true,"content":[{"type":"text","text":"bypass"}]}}"#,
+        ),
+        (
+            "nested duplicate structuredContent member",
+            br#"{"jsonrpc":"2.0","id":2,"result":{"structuredContent":{"temperature":22.5,"conditions":"ok","nested":{"a":1,"a":2}}}}"#,
+        ),
+        (
+            "escaped-equivalent structuredContent key",
+            br#"{"jsonrpc":"2.0","id":3,"result":{"structuredContent":{"temperature":22.5,"conditions":"ok"},"\u0073tructuredContent":{"temperature":"bad","conditions":"x"}}}"#,
+        ),
+        (
+            "duplicate member inside JSON text content",
+            br#"{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"{\"temperature\":\"bad\",\"temperature\":22.5,\"conditions\":\"ok\"}"},{"type":"text","text":"human summary"}]}}"#,
+        ),
+    ];
+
+    for (offset, (case, body)) in cases.iter().enumerate() {
+        let mut ctx =
+            route_validated_tool_call(&plugin, &session_id, 980 + offset as i64 * 2).await;
+        let headers = known_json_response_headers(body);
+        assert!(
+            plugin
+                .transform_response_body_with_context(
+                    &mut ctx,
+                    body,
+                    Some("application/json"),
+                    &headers,
+                )
+                .await
+                .is_none(),
+            "{case}: response rewrite must not materialize ambiguous raw JSON"
+        );
+        let (status, response, _) = reject_json(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &headers, body)
+                .await,
+        );
+        assert_eq!(status, 200, "{case}");
+        assert_eq!(response["error"]["code"], -32012, "{case}");
+        assert_eq!(
+            response["error"]["message"], "Invalid MCP tool result",
+            "{case}"
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("mcp.result_schema_validation")
+                .map(String::as_str),
+            Some("fail"),
+            "{case}"
+        );
+        assert!(
+            !ctx.metadata.keys().any(|key| key.contains("result_body")),
+            "{case}: rejection metadata must never carry result bodies"
+        );
+        assert!(
+            !format!("{response:?}").contains("bypass")
+                && !format!("{response:?}").contains("temperature"),
+            "{case}: client error must never echo ambiguous body content"
+        );
+    }
+}
+
+#[tokio::test]
+async fn validate_tool_results_rejects_malformed_is_error_escape() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let rejected = [
+        (
+            "non-boolean string isError",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "isError": "true",
+                    "structuredContent": {
+                        "temperature": "hot",
+                        "conditions": "sunny"
+                    }
+                }
+            }),
+        ),
+        (
+            "non-boolean numeric isError",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "isError": 1,
+                    "structuredContent": {
+                        "temperature": "hot",
+                        "conditions": "sunny"
+                    }
+                }
+            }),
+        ),
+        (
+            "isError true without content",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "isError": true,
+                    "structuredContent": {
+                        "temperature": "hot",
+                        "conditions": "sunny"
+                    }
+                }
+            }),
+        ),
+        (
+            "isError true with non-array content",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": {
+                    "isError": true,
+                    "content": { "type": "text", "text": "not an array" }
+                }
+            }),
+        ),
+    ];
+
+    for (offset, (case, upstream_value)) in rejected.into_iter().enumerate() {
+        let mut ctx =
+            route_validated_tool_call(&plugin, &session_id, 1000 + offset as i64 * 2).await;
+        let upstream_response = serde_json::to_vec(&upstream_value).unwrap();
+        let headers = known_json_response_headers(&upstream_response);
+        let (status, body, _) = reject_json(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+                .await,
+        );
+        assert_eq!(status, 200, "{case}");
+        assert_eq!(body["error"]["code"], -32012, "{case}");
+        assert_eq!(
+            ctx.metadata
+                .get("mcp.result_schema_validation")
+                .map(String::as_str),
+            Some("fail"),
+            "{case}"
+        );
+    }
+
+    // isError:false still runs ordinary outputSchema validation.
+    let mut ctx = route_validated_tool_call(&plugin, &session_id, 1020).await;
+    let invalid_with_false = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 1021,
+        "result": {
+            "isError": false,
+            "structuredContent": {
+                "temperature": "hot",
+                "conditions": "sunny"
+            }
+        }
+    }))
+    .unwrap();
+    let headers = known_json_response_headers(&invalid_with_false);
+    let (status, body, _) = reject_json(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &invalid_with_false)
+            .await,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body["error"]["code"], -32012);
+}
+
+#[tokio::test]
+async fn validate_tool_results_pinned_validator_ignores_public_rewrite_metadata() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let mut ctx = route_validated_tool_call(&plugin, &session_id, 1030).await;
+    assert!(
+        ferrum_edge::_test_support::mcp_validate_tool_result_is_some_for_test(&ctx),
+        "dispatch must pin a private outputSchema validator"
+    );
+
+    // Sibling-writable public rewrite metadata must not disable or rebind
+    // the pinned validator. Old code re-resolved through these keys.
+    ctx.metadata.remove("mcp.needs_response_rewrite");
+    ctx.metadata.remove("mcp.response_rewrite.method");
+    ctx.metadata.remove("mcp.response_rewrite.server_id");
+    ctx.metadata.remove("mcp.response_rewrite.session");
+    ctx.metadata.insert(
+        "mcp.response_rewrite.catalog_version".to_string(),
+        "999999".to_string(),
+    );
+    ctx.metadata.insert(
+        "mcp.response_rewrite.session".to_string(),
+        "forged-session".to_string(),
+    );
+    assert!(
+        plugin.should_buffer_response_body(&ctx),
+        "clearing public rewrite metadata must not release a privately governed tool result"
+    );
+
+    let valid = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 1031,
+        "result": {
+            "structuredContent": {
+                "temperature": 21.0,
+                "conditions": "Clear"
+            }
+        }
+    }))
+    .unwrap();
+    let headers = known_json_response_headers(&valid);
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, &valid)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "pinned validator must still accept a valid payload after public rewrite metadata is forged"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.result_schema_validation")
+            .map(String::as_str),
+        Some("pass")
+    );
+
+    let mut ctx = route_validated_tool_call(&plugin, &session_id, 1032).await;
+    ctx.metadata.remove("mcp.response_rewrite.session");
+    ctx.metadata.remove("mcp.response_rewrite.catalog_version");
+    let invalid = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 1033,
+        "result": {
+            "structuredContent": {
+                "temperature": "hot",
+                "conditions": "sunny"
+            }
+        }
+    }))
+    .unwrap();
+    let headers = known_json_response_headers(&invalid);
+    let (status, body, _) = reject_json(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &invalid)
+            .await,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body["error"]["code"], -32012);
+    assert!(
+        plugin.may_enforce_response_body_policy(&ctx),
+        "clearing public rewrite metadata must not disable private enforcement"
+    );
+}
+
+#[tokio::test]
+async fn validate_tool_results_pinned_validator_survives_catalog_refresh_and_clone() {
+    let list_hits = Arc::new(AtomicUsize::new(0));
+    let hits = Arc::clone(&list_hits);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "initialize"})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", "upstream-session")
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "github", "version": "1.0.0" }
+                    }
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "notifications/initialized"}),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = hits.fetch_add(1, Ordering::SeqCst);
+            // First catalog: weather schema (temperature + conditions).
+            // Later catalogs: stricter schema that also requires humidity.
+            let output_schema = if n == 0 {
+                weather_output_schema()
+            } else {
+                json!({
+                    "type": "object",
+                    "required": ["temperature", "conditions", "humidity"],
+                    "properties": {
+                        "temperature": { "type": "number" },
+                        "conditions": { "type": "string" },
+                        "humidity": { "type": "number" }
+                    }
+                })
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": "tools",
+                "result": {
+                    "tools": [{
+                        "name": "create_pr",
+                        "inputSchema": {
+                            "type": "object",
+                            "required": ["repo"],
+                            "properties": { "repo": { "type": "string" } }
+                        },
+                        "outputSchema": output_schema
+                    }]
+                }
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
+    config["discovery"]["cache_ttl_seconds"] = json!(1);
+    // Keep the tool published under the refreshed (stricter) schema so this
+    // proves the in-flight pin is not replaced by a catalog re-lookup.
+    config["discovery"]["on_schema_change"] = json!("allow");
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    assert_eq!(
+        aggregate_tool_names(&plugin, &session_id, 1040).await,
+        vec!["github.create_pr"]
+    );
+
+    let mut ctx = route_validated_tool_call(&plugin, &session_id, 1041).await;
+    assert!(ferrum_edge::_test_support::mcp_validate_tool_result_is_some_for_test(&ctx));
+
+    let clone = ferrum_edge::_test_support::clone_for_final_request_body_hooks_for_test(&mut ctx);
+    assert!(
+        ferrum_edge::_test_support::mcp_validate_tool_result_ptr_eq_for_test(&ctx, &clone),
+        "compatibility clone must carry the same pinned validator Arc"
+    );
+    assert!(plugin.may_enforce_response_body_policy(&clone));
+
+    // Expire the catalog and refresh so a new schema is published while this
+    // request is still in flight with its dispatch-time pin.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 1043).await;
+    assert!(
+        list_hits.load(Ordering::SeqCst) >= 2,
+        "catalog refresh must observe the stricter schema"
+    );
+
+    // Payload valid under the pinned weather schema but missing humidity
+    // required by the refreshed catalog. In-flight pin must still accept it.
+    let weather_only = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 1042,
+        "result": {
+            "structuredContent": {
+                "temperature": 16.0,
+                "conditions": "Windy"
+            }
+        }
+    }))
+    .unwrap();
+    let headers = known_json_response_headers(&weather_only);
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, &weather_only)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "catalog refresh must not replace an in-flight request's pinned validator"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.result_schema_validation")
+            .map(String::as_str),
+        Some("pass")
+    );
 }
