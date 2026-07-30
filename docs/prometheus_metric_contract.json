@@ -1229,7 +1229,7 @@
   {
     "name": "ferrum_mesh_bpf_ringbuf_overruns_total",
     "type": "counter",
-    "help": "Ringbuf overrun episodes.",
+    "help": "Ringbuf overrun episodes. Incremented when the kernel dropped-events counter advances between polls, and once when attaching (or re-attaching after pin rotation) to a map generation that already reports a nonzero dropped total. Non-zero = userspace fell behind and the kernel dropped events. Set FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES higher.",
     "labels": [],
     "subsystem": "mesh_bpf",
     "export_surface": "/metrics",
