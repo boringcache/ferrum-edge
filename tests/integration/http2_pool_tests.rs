@@ -805,7 +805,11 @@ async fn test_grpc_h2c_accepts_settings_with_zero_concurrent_streams() {
             .write_all(&[0, 0, 6, 4, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0])
             .await
             .expect("write SETTINGS_MAX_CONCURRENT_STREAMS=0");
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Keep the valid zero-capacity connection open well beyond both the
+        // pool's 500 ms connect bound and the test's outer hang guard. The old
+        // sentinel path therefore returns an error at the pool deadline rather
+        // than succeeding because the scripted peer happened to close.
+        tokio::time::sleep(Duration::from_secs(10)).await;
     });
 
     let pool = GrpcConnectionPool::new(
@@ -822,9 +826,9 @@ async fn test_grpc_h2c_accepts_settings_with_zero_concurrent_streams() {
     proxy.backend_port = port;
     proxy.backend_connect_timeout_ms = 500;
 
-    let sender = tokio::time::timeout(Duration::from_millis(250), pool.get_sender(&proxy))
+    let sender = tokio::time::timeout(Duration::from_secs(5), pool.get_sender(&proxy))
         .await
-        .expect("valid peer SETTINGS should establish h2c without waiting for capacity");
+        .expect("valid peer SETTINGS should not hang h2c establishment");
     assert!(
         sender.is_ok(),
         "zero-capacity SETTINGS is valid: {sender:?}"
