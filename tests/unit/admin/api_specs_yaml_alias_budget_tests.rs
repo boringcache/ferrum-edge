@@ -432,8 +432,7 @@ fn yaml_scalar_resolution_preserves_serde_yaml_compatibility() {
         "  backend_port: 0o673\n",
         "x-ferrum-validate: false\n",
     );
-    let (bundle, metadata) =
-        extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap();
+    let (bundle, metadata) = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap();
     assert_eq!(bundle.proxy.id, "on");
     assert_eq!(bundle.proxy.backend_port, 443);
     assert_eq!(metadata.title.as_deref(), Some("yes"));
