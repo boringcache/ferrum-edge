@@ -8456,7 +8456,9 @@ async fn transform_injected_field_cannot_satisfy_the_client_contract() {
             .await;
     let transformed: Value = serde_json::from_slice(&transformed).expect("transformed json");
     assert_eq!(
-        transformed.get("client_attestation").and_then(Value::as_str),
+        transformed
+            .get("client_attestation")
+            .and_then(Value::as_str),
         Some("gateway-synthesized")
     );
 }
@@ -8478,11 +8480,7 @@ async fn client_decision_is_not_re_taken_over_transformed_bytes() {
     // against the backend representation.
     assert_continue(
         plugin
-            .on_final_request_body_with_context(
-                &mut ctx,
-                &json_headers(),
-                br#"{"forbidden":true}"#,
-            )
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), br#"{"forbidden":true}"#)
             .await,
     );
     assert_eq!(

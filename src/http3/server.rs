@@ -2860,9 +2860,7 @@ async fn handle_h3_request(
     let runs_pre_before_proxy_body_phase = capabilities
         .has(crate::plugin_cache::PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY)
         || before_proxy_body_requirements.validates_client_contract;
-    if runs_pre_before_proxy_body_phase
-        && let Some(body_data) = prebuffered_body_data.as_mut()
-    {
+    if runs_pre_before_proxy_body_phase && let Some(body_data) = prebuffered_body_data.as_mut() {
         let phase_start = std::time::Instant::now();
         let mut rejected: Option<(PluginResult, &'static str)> = None;
         if capabilities
@@ -2895,10 +2893,7 @@ async fn handle_h3_request(
             .await;
             ctx.headers = client_headers;
             if !matches!(contract_result, PluginResult::Continue) {
-                rejected = Some((
-                    contract_result,
-                    crate::proxy::CLIENT_REQUEST_CONTRACT_PHASE,
-                ));
+                rejected = Some((contract_result, crate::proxy::CLIENT_REQUEST_CONTRACT_PHASE));
             }
         }
         if let Some((rejection, reject_phase)) = rejected {
