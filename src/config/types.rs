@@ -7284,9 +7284,7 @@ impl Proxy {
                     }
                 }
                 Err(_) => {
-                    errors.push(
-                        "dns_override must be a valid IPv4 or IPv6 address".to_string(),
-                    );
+                    errors.push("dns_override must be a valid IPv4 or IPv6 address".to_string());
                 }
             }
         }

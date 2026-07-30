@@ -39757,10 +39757,7 @@ mod tests {
             response.error_class,
             Some(retry::ErrorClass::DispatchPolicyRejected)
         );
-        assert_eq!(
-            response.backend_resolved_ip.as_deref(),
-            Some("127.0.0.2")
-        );
+        assert_eq!(response.backend_resolved_ip.as_deref(), Some("127.0.0.2"));
     }
 
     /// End-to-end wiring guard for the content-type-aware buffer->stream

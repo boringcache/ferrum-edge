@@ -1582,31 +1582,28 @@ async fn reqwest_dns_override_dials_override_and_preserves_selected_host() {
         .await
         .expect("bind override listener");
     let port = listener.local_addr().expect("listener address").port();
-    let accepted = tokio::spawn(async move {
-        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-            .await
-            .expect("reqwest dial timeout")
-            .expect("accept reqwest dial");
-        let mut request = vec![0u8; 4096];
-        let read = stream.read(&mut request).await.expect("read request");
-        let request = String::from_utf8_lossy(&request[..read]);
-        assert!(
-            request
-                .lines()
-                .any(|line| line.eq_ignore_ascii_case(&format!(
-                    "host: selected-target.invalid:{port}"
-                ))),
-            "the HTTP Host identity must remain the selected target: {request}"
-        );
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
-            .await
-            .expect("write response");
-    });
+    let accepted =
+        tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("reqwest dial timeout")
+                .expect("accept reqwest dial");
+            let mut request = vec![0u8; 4096];
+            let read = stream.read(&mut request).await.expect("read request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(
+                request.lines().any(|line| line
+                    .eq_ignore_ascii_case(&format!("host: selected-target.invalid:{port}"))),
+                "the HTTP Host identity must remain the selected target: {request}"
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("write response");
+        });
 
     let cache = DnsCache::new(default_dns_config(HashMap::new()));
-    let resolver =
-        DnsCacheResolver::with_dns_override(cache, Some("127.0.0.1".to_string()));
+    let resolver = DnsCacheResolver::with_dns_override(cache, Some("127.0.0.1".to_string()));
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))
