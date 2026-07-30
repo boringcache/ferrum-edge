@@ -108,7 +108,7 @@ pub fn dispatch(
     for channel in targets {
         let _ = dispatch_one(
             Arc::clone(&notification),
-            Arc::clone(extras),
+            Arc::clone(&extras),
             Arc::clone(channel),
             Arc::clone(sem),
             http.clone(),
