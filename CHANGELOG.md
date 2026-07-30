@@ -61,11 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of running before it exists. A timestamp-only policy establishes no
   principal, stays out of the authentication chain, and keeps validating in
   `before_proxy`; the two phases are mutually exclusive by configuration, so no
-  message is validated twice. **Breaking:** composing an identity-establishing
-  instance with another authentication plugin under `auth_mode: multi`, or with
-  `compression`'s `decompress_request`, is now rejected at config admission; an
-  `on_final_request_body` guard additionally refuses to dispatch a message whose
-  bytes changed after validation.
+  message is validated twice. **Breaking:** an identity-establishing instance
+  must be the proxy's sole authentication mechanism in either auth mode, and
+  composing one with `compression`'s `decompress_request` is rejected at config
+  admission; an `on_final_request_body` guard additionally refuses to dispatch a
+  message whose bytes changed after validation.
 - `soap_ws_security` X.509 signatures must now protect the backend-visible SOAP
   Body (GHSA-3mwq-c8j6-9xhp). `Envelope`/`Header`/`Body`/`Security` selection is
   namespace-qualified and positional rather than by local name, duplicate

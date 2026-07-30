@@ -4826,15 +4826,16 @@ fn compression_config_decompresses_request(plugin: &crate::config::types::Plugin
 ///
 /// Two of them:
 ///
-/// 1. **`auth_mode: multi` with another auth plugin.** Multi-auth stops at the
-///    first mechanism that establishes an identity and treats a rejection as
-///    one candidate among several. WS-Security is a message *gate*, not one of
-///    several interchangeable credentials: under multi-auth an earlier
-///    mechanism's success would skip SOAP validation entirely, and a SOAP
-///    rejection would be overridden by a later mechanism's success. Since
-///    `soap_ws_security` is the highest-numbered priority in the AuthN band it
-///    also runs last, so the skip is the common case rather than the corner
-///    case. The composition is refused rather than silently reordered.
+/// 1. **Another authentication plugin in either auth mode.** Both modes stop
+///    after the first mechanism establishes an identity, and single-auth also
+///    makes the first rejection terminal. WS-Security is a message *gate*, not
+///    one of several interchangeable credentials: since `soap_ws_security` is
+///    the highest-numbered priority in the AuthN band, an earlier mechanism's
+///    success would normally skip SOAP validation entirely. Multi-auth can also
+///    let a later success override an earlier SOAP rejection when priorities
+///    are overridden. A second identity-establishing SOAP instance is another
+///    message gate with the same problem. The composition is refused rather
+///    than silently reordered.
 /// 2. **Request decompression on the same proxy.** SOAP authentication now runs
 ///    in the `authenticate` phase, which precedes the shared buffered-body
 ///    normalization phase where `compression`'s `decompress_request` decodes
@@ -4898,12 +4899,11 @@ pub fn validate_composition(
             .filter(|plugin| soap_config_establishes_identity(plugin))
             .collect();
 
-        if !identity_soap.is_empty() && proxy.auth_mode == AuthMode::Multi {
+        if !identity_soap.is_empty() {
             // A second identity-establishing SOAP instance is another
-            // authentication plugin too. Multi-auth may stop after the first
-            // one succeeds or let the second one's success override the first
-            // one's rejection, so it carries the same message-gate bypass as a
-            // differently named mechanism.
+            // authentication plugin too. Every authentication mode may stop
+            // after the first success, so every SOAP message gate must be the
+            // sole identity mechanism on its effective proxy chain.
             let mut others: Vec<String> = identity_soap
                 .iter()
                 .skip(1)
@@ -4916,9 +4916,14 @@ pub fn validate_composition(
                     .map(|plugin| plugin.id.clone()),
             );
             if !others.is_empty() {
+                let auth_mode = match &proxy.auth_mode {
+                    AuthMode::Single => "single",
+                    AuthMode::Multi => "multi",
+                };
                 errors.push(format!(
-                    "soap_ws_security cannot be composed with another authentication plugin on                      proxy '{}' while auth_mode is 'multi': multi-auth stops at the first                      mechanism that establishes an identity and overrides a rejection with a                      later success, so WS-Security message validation would be skipped or                      ignored. soap_ws_security: {}; other auth plugins: {}. Use auth_mode                      'single', or disable the other mechanisms on this proxy",
+                    "soap_ws_security must be the sole authentication mechanism on proxy '{}'                      while auth_mode is '{}': both authentication modes stop after the first                      mechanism establishes an identity, single-auth also makes the first rejection                      terminal, and multi-auth can let a later success override an earlier rejection,                      so one or more WS-Security message gates would be skipped or ignored.                      soap_ws_security: {}; other auth plugins: {}. Disable the other mechanisms                      on this proxy",
                     proxy.id,
+                    auth_mode,
                     identity_soap
                         .iter()
                         .map(|plugin| plugin.id.clone())

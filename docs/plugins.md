@@ -2354,7 +2354,7 @@ A **timestamp-only** configuration proves freshness and nothing about the caller
 
 Because authentication now precedes the shared buffered-body normalization phase, two compositions are rejected at config admission (file-mode startup fails, Admin validation returns `400`, a DP/reload keeps the last known good generation):
 
-- An identity-establishing instance on a proxy whose `auth_mode` is `multi` alongside another authentication plugin. Multi-auth stops at the first mechanism that establishes an identity and lets a later success override an earlier rejection, so WS-Security message validation would be skipped or ignored. Use `auth_mode: single`, or disable the other mechanisms on that proxy.
+- An identity-establishing instance alongside any other authentication plugin (including a second identity-establishing `soap_ws_security` instance), in either auth mode. Both modes stop after the first mechanism establishes an identity; single-auth also makes the first rejection terminal, while multi-auth can let a later success override an earlier rejection. Any of those outcomes can skip or ignore a mandatory WS-Security message gate. Disable the other authentication mechanisms on that proxy.
 - An identity-establishing instance alongside `compression` with `decompress_request: true`. The gateway would validate the encoded bytes rather than the plaintext the backend parses. Decompress upstream, or disable `decompress_request` on that proxy.
 
 As a runtime backstop for every other transform (including custom plugins), the SHA-256 of the exact validated representation is recorded and re-checked in `on_final_request_body` before backend dispatch; a message whose bytes changed after validation is refused with `500` rather than forwarded.

@@ -475,23 +475,59 @@ fn identity_soap_plugin_config(id: &str, proxy_id: &str) -> PluginConfig {
 }
 
 #[test]
-fn soap_composition_rejects_two_identity_instances_under_multi_auth() {
-    let mut proxy = make_proxy("soap", "/soap", vec!["soap-a", "soap-b"]);
-    proxy.auth_mode = AuthMode::Multi;
-    let config = make_config(
-        vec![proxy],
-        vec![
-            identity_soap_plugin_config("soap-a", "soap"),
-            identity_soap_plugin_config("soap-b", "soap"),
-        ],
-    );
+fn soap_composition_rejects_two_identity_instances_in_both_auth_modes() {
+    for auth_mode in [AuthMode::Single, AuthMode::Multi] {
+        let mut proxy = make_proxy("soap", "/soap", vec!["soap-a", "soap-b"]);
+        proxy.auth_mode = auth_mode;
+        let config = make_config(
+            vec![proxy],
+            vec![
+                identity_soap_plugin_config("soap-a", "soap"),
+                identity_soap_plugin_config("soap-b", "soap"),
+            ],
+        );
 
-    let errors = ferrum_edge::plugins::soap_ws_security::validate_composition(&config)
-        .expect_err("multi-auth must not admit two SOAP message gates");
-    let joined = errors.join("; ");
-    assert!(joined.contains("soap-a"), "{joined}");
-    assert!(joined.contains("soap-b"), "{joined}");
-    assert!(joined.contains("auth_mode is 'multi'"), "{joined}");
+        let errors = ferrum_edge::plugins::soap_ws_security::validate_composition(&config)
+            .expect_err("an auth chain must not admit two SOAP message gates");
+        let joined = errors.join("; ");
+        assert!(joined.contains("soap-a"), "{joined}");
+        assert!(joined.contains("soap-b"), "{joined}");
+        assert!(
+            joined.contains("sole authentication mechanism"),
+            "{joined}"
+        );
+    }
+}
+
+#[test]
+fn soap_composition_rejects_other_auth_plugins_in_both_auth_modes() {
+    for auth_mode in [AuthMode::Single, AuthMode::Multi] {
+        let mut proxy = make_proxy("soap", "/soap", vec!["key", "soap"]);
+        proxy.auth_mode = auth_mode;
+        let config = make_config(
+            vec![proxy],
+            vec![
+                make_plugin_config(
+                    "key",
+                    "key_auth",
+                    PluginScope::Proxy,
+                    Some("soap"),
+                    true,
+                ),
+                identity_soap_plugin_config("soap", "soap"),
+            ],
+        );
+
+        let errors = ferrum_edge::plugins::soap_ws_security::validate_composition(&config)
+            .expect_err("another auth mechanism must not bypass the SOAP message gate");
+        let joined = errors.join("; ");
+        assert!(joined.contains("soap"), "{joined}");
+        assert!(joined.contains("key"), "{joined}");
+        assert!(
+            joined.contains("sole authentication mechanism"),
+            "{joined}"
+        );
+    }
 }
 
 fn plugin_client_with_ca(ca_path: &str) -> PluginHttpClient {
