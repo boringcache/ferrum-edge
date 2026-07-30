@@ -2752,10 +2752,7 @@ fn decode_rejects_duplicate_charset_parameters() {
 #[test]
 fn decode_rejects_unbalanced_charset_quotes() {
     let xml = wrap_soap(&fresh_timestamp());
-    for content_type in [
-        "text/xml; charset=\"utf-8",
-        "text/xml; charset=utf-8\"",
-    ] {
+    for content_type in ["text/xml; charset=\"utf-8", "text/xml; charset=utf-8\""] {
         let err = soap_decode_xml_body_for_test(xml.as_bytes(), content_type)
             .expect_err("unbalanced charset quotes must fail closed");
         assert!(err.contains("conflicting or ambiguous"), "got: {err}");
@@ -2765,10 +2762,7 @@ fn decode_rejects_unbalanced_charset_quotes() {
 #[test]
 fn decode_does_not_treat_single_quotes_as_parameter_delimiters() {
     let xml = wrap_soap(&fresh_timestamp());
-    for content_type in [
-        "text/xml; charset='utf-8'",
-        "text/xml; charset='utf-8",
-    ] {
+    for content_type in ["text/xml; charset='utf-8'", "text/xml; charset='utf-8"] {
         let err = soap_decode_xml_body_for_test(xml.as_bytes(), content_type)
             .expect_err("a single quote is part of a token, not MIME quoted-string syntax");
         assert!(err.contains("unsupported character encoding"), "got: {err}");
@@ -7021,9 +7015,7 @@ mod advisory_regressions {
         assert_eq!(
             classify(
                 &config,
-                Some(
-                    "multipart/related; type='application/xop+xml'; boundary=MIME_boundary"
-                )
+                Some("multipart/related; type='application/xop+xml'; boundary=MIME_boundary")
             ),
             Ok("reject:415:unsupported_media_type".to_string()),
             "single quotes are token bytes and must not turn a non-matching type into XOP"
@@ -7031,9 +7023,7 @@ mod advisory_regressions {
         assert_eq!(
             classify(
                 &config,
-                Some(
-                    "multipart/related; type=\"application/xop+xml\"; boundary=MIME boundary"
-                )
+                Some("multipart/related; type=\"application/xop+xml\"; boundary=MIME boundary")
             ),
             Ok("reject:400:malformed_media_type".to_string()),
             "a boundary containing spaces must use a double-quoted parameter"

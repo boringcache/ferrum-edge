@@ -492,10 +492,7 @@ fn soap_composition_rejects_two_identity_instances_in_both_auth_modes() {
         let joined = errors.join("; ");
         assert!(joined.contains("soap-a"), "{joined}");
         assert!(joined.contains("soap-b"), "{joined}");
-        assert!(
-            joined.contains("sole authentication mechanism"),
-            "{joined}"
-        );
+        assert!(joined.contains("sole authentication mechanism"), "{joined}");
     }
 }
 
@@ -507,13 +504,7 @@ fn soap_composition_rejects_other_auth_plugins_in_both_auth_modes() {
         let config = make_config(
             vec![proxy],
             vec![
-                make_plugin_config(
-                    "key",
-                    "key_auth",
-                    PluginScope::Proxy,
-                    Some("soap"),
-                    true,
-                ),
+                make_plugin_config("key", "key_auth", PluginScope::Proxy, Some("soap"), true),
                 identity_soap_plugin_config("soap", "soap"),
             ],
         );
@@ -523,10 +514,7 @@ fn soap_composition_rejects_other_auth_plugins_in_both_auth_modes() {
         let joined = errors.join("; ");
         assert!(joined.contains("soap"), "{joined}");
         assert!(joined.contains("key"), "{joined}");
-        assert!(
-            joined.contains("sole authentication mechanism"),
-            "{joined}"
-        );
+        assert!(joined.contains("sole authentication mechanism"), "{joined}");
     }
 }
 

@@ -2160,8 +2160,7 @@ impl SoapWsSecurity {
                 // private empty state so their operator-controlled config ids
                 // cannot consume the bounded registry reserved for live
                 // replay scopes.
-                let scope_key = if replay_active
-                    && replay_scope == Some(NonceReplayScope::Process)
+                let scope_key = if replay_active && replay_scope == Some(NonceReplayScope::Process)
                 {
                     plugin_config_id.map(|config_id| nonce_replay_scope_key(namespace, config_id))
                 } else {
