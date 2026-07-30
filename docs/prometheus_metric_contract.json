@@ -1241,7 +1241,7 @@
   {
     "name": "ferrum_mesh_bpf_srtt_microseconds",
     "type": "histogram",
-    "help": "TCP smoothed RTT samples in microseconds. Fixed le buckets plus sum/count.",
+    "help": "TCP smoothed RTT samples in microseconds. Fixed le buckets plus sum/count; zero samples are ignored and sum overflow drops the sample.",
     "labels": [
       "le"
     ],
@@ -1255,7 +1255,7 @@
   {
     "name": "ferrum_mesh_bpf_syn_to_ack_microseconds",
     "type": "histogram",
-    "help": "Time between SYN send and ACK observation in microseconds. Fixed le buckets plus sum/count.",
+    "help": "Time between SYN send and ACK observation in microseconds. Fixed le buckets plus sum/count; zero samples are ignored and sum overflow drops the sample.",
     "labels": [
       "le"
     ],
