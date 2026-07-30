@@ -1465,7 +1465,7 @@ async fn test_file_mode_rejects_non_object_correlation_id_config() {
     write_invalid_correlation_id_file_config(&config_path, free_port().await);
     build_gateway().expect("build gateway");
 
-    let (mut gateway, _admin_port) = start_gateway_with_extra_env(
+    let (mut gateway, _admin_port, _stderr_path) = start_gateway_with_extra_env(
         config_path.to_str().unwrap(),
         free_port().await,
         None,
@@ -2183,7 +2183,7 @@ async fn test_foreign_listener_on_proxy_port_is_not_gateway_readiness() {
     let contested_port = squatter.local_addr().unwrap().port();
 
     let observability_token = mint_observability_token();
-    let (mut child, admin_port) = start_gateway_with_extra_env(
+    let (mut child, admin_port, _stderr_path) = start_gateway_with_extra_env(
         config_path.to_str().unwrap(),
         contested_port,
         None,
