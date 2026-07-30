@@ -434,7 +434,10 @@ fn opa_rejects_unknown_query_ambiguity_policy() {
         .expect("base config is an object")
         .insert("query_ambiguity_policy".to_string(), json!("allow"));
 
-    let error = Opa::new(&config, default_client()).expect_err("unknown policy must be rejected");
+    let error = match Opa::new(&config, default_client()) {
+        Ok(_) => panic!("unknown policy must be rejected"),
+        Err(error) => error,
+    };
     assert!(error.contains("query_ambiguity_policy"), "got: {error}");
     assert!(validate_plugin_config("opa", &config).is_err());
 }
