@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- API-spec YAML ingestion now expands anchors and aliases through a bounded
+  libyaml event graph (node, depth, alias-reference, expanded-byte, and work
+  budgets) with cycle / undefined-alias / duplicate-anchor /
+  duplicate-mapping-key detection before JSON conversion (#3307). The expanded
+  byte budget is a fail-closed upper bound on the compact JSON representation,
+  including string/key escaping. Merge keys are applied when present. JSON and
+  YAML share the same expanded-node admission cap so autodetection cannot
+  weaken checks. Expansion also fails closed on non-core/local YAML tags,
+  non-finite numbers, and integers outside the exact JSON `i64`/`u64` range.
+  Scalar number and boolean mapping keys keep the stringified spelling the
+  previous `serde_json::to_value` conversion produced (`200:` → `"200"`), so
+  YAML that leaves status codes unquoted still ingests and already-stored specs
+  still restore.
 - Istio Telemetry `accessLogging.filter.expression` now supports bounded boolean
   expressions with `||`, `&&`, parentheses, and the existing `response.code`,
   `response.status`, and `response.duration` comparison atoms. `duration` is
