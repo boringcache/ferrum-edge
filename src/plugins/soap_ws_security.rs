@@ -6372,9 +6372,7 @@ fn extract_pem_der(pem: &str) -> Option<Vec<u8>> {
 /// the generic path fallback would make the filesystem error echo the entire
 /// configured value before the redacted PEM parser can reject it.
 fn parse_trusted_certificate_source(raw: &str) -> CertSource {
-    if raw.contains("-----BEGIN CERTIFICATE-----")
-        || raw.contains("-----END CERTIFICATE-----")
-    {
+    if raw.contains("-----BEGIN CERTIFICATE-----") || raw.contains("-----END CERTIFICATE-----") {
         CertSource::InlinePem(SecretString::new(raw.to_string()))
     } else {
         CertSource::parse(raw, MaterialKind::Cert)
