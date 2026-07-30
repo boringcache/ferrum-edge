@@ -66,6 +66,28 @@ gateway SVID, `MultiClusterConfig.remote_clusters[]` entry for the peer, peer
 | Gateway restart | Gateway restarts with no partial trust state; it bootstraps according to fail-open/fail-closed policy and then converges from CP/poller data. |
 | Asymmetric trust | `GET /mesh/remote-clusters` distinguishes outbound and inbound trust, so missing inbound SPIFFE verifier material is visible as `outbound_trust_active=true`, `inbound_trust_active=false`. |
 
+## Remote discovery metrics and alerts
+
+Cross-cluster endpoint discovery exports four Prometheus families (see
+[prometheus_metrics.md](prometheus_metrics.md#mesh-remote-cluster-endpoint-discovery)):
+
+| Family | Use |
+|---|---|
+| `ferrum_mesh_remote_discovery_poll_failures_total{cluster,trust_domain,control_plane,gateway_namespace}` | Rising failures: check peer CP reachability, JWT/audience, and TLS trust. The `control_plane` label is a redacted token, never a raw URL. |
+| `ferrum_mesh_remote_discovery_poll_successes_total{cluster,trust_domain,gateway_namespace}` | Successful polls; should advance while the peer remains configured. |
+| `ferrum_mesh_remote_discovery_last_success_timestamp_seconds{cluster,trust_domain,gateway_namespace}` | Last successful poll time. |
+| `ferrum_mesh_remote_discovery_endpoint_age_seconds{cluster,trust_domain,gateway_namespace}` | Age of cached remote endpoints. Alert when age exceeds your freshness window while the cluster is still configured; last-good endpoints are preserved on transient poll failure. |
+
+**Poll-failure response:** confirm `GET /mesh/remote-clusters` for the peer, verify
+control-plane URL/JWT, and restore connectivity. Do not wipe last-good endpoints
+solely because failures increment — wait for a successful poll or an explicit
+cluster withdrawal.
+
+**Endpoint-age response:** if age climbs with flat successes, the poller is
+stalled or failing; if age climbs after intentional cluster removal, wait for
+metric withdrawal. Fail closed on stale endpoints only when policy requires
+fresh discovery data.
+
 ## Operator Checks
 
 For each cluster:

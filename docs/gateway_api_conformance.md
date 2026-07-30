@@ -166,18 +166,19 @@ materializes anything:
   and a GRPCRoute method predicate on the same host are a conflict even though
   their predicates are disjoint.
 - The losing Route produces no proxy, no upstream, no plugin, and no
-  materialized-parent record for the rejected `(parentRef, hostname)` claim, so
-  it cannot route traffic. It is reported `Accepted=False` with
-  `reason: Conflicted` and a message naming the winner, and the translator emits
-  a matching warning.
-- Resolution is per listener and per hostname intersection. The same GRPCRoute
-  can still win on a hostname the HTTPRoute does not claim, or on a *separate*
-  parentRef claim (for example a second `sectionName`-pinned reference) that
-  reaches only a listener it wins. What it cannot do is keep one shared claim on
-  a subset of the listeners that claim reaches — see the wildcard rule below.
-- Rejection does not cascade: a route is only rejected when it overlaps an
-  **accepted** route of the other kind, so a second HTTPRoute is unaffected by a
-  GRPCRoute that already lost.
+  materialized-parent record for **any** of its `(parentRef, hostname)` claims,
+  so it cannot route traffic through a different parent after losing elsewhere.
+  It is reported `Accepted=False` with `reason: Conflicted` and a message naming
+  the winner, and the translator emits a matching warning.
+- Overlap is detected per listener and per hostname intersection, but the
+  resulting acceptance decision is whole-Route: a loss on any listener
+  withdraws every parentRef and hostname claim authored by that Route. Splitting
+  independently admissible claims into separate Route objects is the only way
+  to retain one after another loses.
+- Rejection does not cascade: Routes are considered once in the total Gateway
+  API order, and a Route withdrawn after a loss is never admitted as a winner
+  on another listener. A later Route is therefore unaffected when it overlaps
+  only that already-rejected Route.
 
 "The same listener" means the **resolved** listener, not the literal
 `parentRefs[]` entry. A parentRef is a selector, so the two are not
@@ -188,16 +189,13 @@ interchangeable:
   contend, even though their selector shapes differ.
 - Two wildcard references on one Gateway that `allowedRoutes.kinds` sends to
   *different* listeners never share one, so neither is rejected.
-- A wildcard reference that reaches several listeners is arbitrated on each of
-  them independently, but it emits one shared conflict claim, which cannot
-  express a partial withdrawal — and Ferrum's route representation is
-  port-agnostic (see the known limitation below), so a claim kept for the
-  listener it won would still route on the listener it lost. Such a claim is
-  therefore **conservatively withdrawn whole on a loss on any listener it
-  reaches**, and the reported winner is the accepted opposite-kind Route on the
-  lowest-ordered listener it lost on. Availability on the non-conflicting
-  listener does not take priority over not serving cross-kind traffic on the
-  conflicting one.
+- ParentRefs are not independent acceptance compartments inside one Route.
+  Ferrum's route representation is port-agnostic (see the known limitation
+  below), so retaining a second parentRef after a loss would retain that Route's
+  proxy on the listener where it lost. The Route is therefore
+  **conservatively withdrawn across every parentRef and hostname after a loss
+  on any listener**. Availability on a non-conflicting listener does not take
+  priority over not serving cross-kind traffic on the conflicting one.
 
 Route status is still reported against the parentRef the operator wrote —
 listener resolution is an internal arbitration detail and never rewrites the
@@ -207,38 +205,21 @@ Same-kind behavior is unchanged: two HTTPRoutes (or two GRPCRoutes) sharing a
 `(hostname, listen path)` still collapse into one ordered dispatch-rule list,
 and only claim-for-claim collisions are resolved as conflicts.
 
-The prohibition is enforced where it applies — coexistence on one resolved
-listener — and not as a blanket ban on the route-proxy collapse. Two Routes that
-Gateway API requires be accepted *together* because they resolve to different
-listeners share Ferrum's single port-agnostic `(hosts, listen path)` slot, so
-they collapse into one ordered dispatch-rule list even across kinds. That is a
-representation detail, not spec-forbidden rule merging: the two kinds'
-predicates stay intact and disjoint inside that list, because every emitted
-GRPCRoute rule carries the native-gRPC `content-type` gate and can therefore
-only select gRPC calls, while everything else falls through to the HTTPRoute's
-own rules and default backend. The alternative — one proxy each — is not a
-choice the route table can express; it fails
-`validate_unique_listen_paths` and aborts the whole config reload. This matters
-in the ordinary "HTTP listener plus gRPC listener on one Gateway" topology,
-where a pathless GRPCRoute predicate always lands on `/` and so does an
-HTTPRoute `PathPrefix: /` rule.
-
 **Known limitation.** Ferrum materializes Gateway API HTTP-family routes as
 port-agnostic `(hosts, listen path)` proxies, so listeners of one Gateway are
 not distinguishable in the route table. Two consequences follow:
 
 - Two routes that legitimately survive on different listeners but claim the same
-  `(hostname, listen path)` share one route-table slot rather than being served
-  per listener port: their rules collapse into one ordered dispatch list, and a
-  request that matches the other listener's route is answered on both listener
-  ports. Give such routes distinct listen paths, distinct hostnames, or distinct
-  Gateways when per-listener isolation is required.
-- A single `(parentRef, hostname)` claim spanning several listeners cannot be
-  restricted to the listeners it won, so a cross-kind loss on any one of them
-  withdraws the claim from all of them (above). A GRPCRoute that must keep
-  serving a listener an HTTPRoute also claims elsewhere needs a parentRef that
-  reaches only that listener (`sectionName` or `port`), a non-intersecting
-  hostname, or a separate Gateway.
+  `(hostname, listen path)` collide at config validation
+  (`Overlapping host+listen_path`) rather than being served per listener port.
+  This fail-closed behavior prevents either route from becoming reachable on a
+  listener that admitted only the other kind. Give such routes distinct listen
+  paths, distinct hostnames, or distinct Gateways.
+- One Route cannot retain a second `(parentRef, hostname)` claim after a
+  cross-kind loss elsewhere; the entire Route is withdrawn (above). Claims that
+  need independent acceptance must be expressed as separate Route objects,
+  each scoped to its own listener (`sectionName` or `port`) and non-intersecting
+  hostname as appropriate.
 
 ### Fail-closed match shapes
 

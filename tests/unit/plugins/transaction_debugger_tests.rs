@@ -10,7 +10,8 @@ use ferrum_edge::plugins::transaction_debugger::{
 };
 use ferrum_edge::plugins::{
     Direction, DisconnectCause, Plugin, ProxyProtocol, RequestContext, StreamTransactionSummary,
-    WsDisconnectContext, transaction_debugger::TransactionDebugger, validate_plugin_config,
+    TransactionSummary, WsDisconnectContext, transaction_debugger::TransactionDebugger,
+    validate_plugin_config,
 };
 use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::ErrorClass;
@@ -544,11 +545,21 @@ fn test_transaction_debugger_rejects_unknown_keys_deterministically() {
 }
 
 #[test]
-fn test_transaction_debugger_preserves_specialized_schema_rejection() {
-    for config in [json!({"schema": {}}), json!({"schema_ref": "debug"})] {
-        let err = TransactionDebugger::new(&config).err().unwrap();
-        assert!(err.contains("'schema' / 'schema_ref' is not supported"));
-    }
+fn test_transaction_debugger_accepts_inline_schema_and_rejects_dangling_ref() {
+    // Inline schemas compile at construction against the diagnostic field
+    // inventory; a `schema_ref` with no registered definition fails closed.
+    TransactionDebugger::new(&json!({"schema": {}})).expect("empty inline schema compiles");
+    let err = TransactionDebugger::new(&json!({"schema_ref": "definitely-not-defined"}))
+        .err()
+        .unwrap();
+    assert!(
+        err.contains("references unknown schema 'definitely-not-defined'"),
+        "got: {err}"
+    );
+    let err = TransactionDebugger::new(&json!({"schema": {}, "schema_ref": "x"}))
+        .err()
+        .unwrap();
+    assert!(err.contains("mutually exclusive"), "got: {err}");
 }
 
 #[test]
@@ -1035,15 +1046,28 @@ async fn test_json_response_body_capture_covers_error_responses() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_credential_shaped_values_are_redacted_regardless_of_field_name() {
     let plugin = capture_plugin();
-    let headers = body_headers("application/json", 128);
-    let body = br#"{"note":"Bearer sk-live-abcdefghijklmnop","jot":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig"}"#;
+    let body = br#"{"note":"upstream said Authorization: Bearer sk-live-abcdefghijklmnop","basic":"prefix Basic dXNlcjpwYXNz","jot":"embedded eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig"}"#;
+    let headers = body_headers("application/json", body.len());
 
     let logs = capture_debug_logs(|| async {
         let _ = plugin.on_final_request_body(&headers, body).await;
     })
     .await;
     assert!(!logs.contains("sk-live-abcdefghijklmnop"), "got: {logs}");
+    assert!(!logs.contains("dXNlcjpwYXNz"), "got: {logs}");
     assert!(!logs.contains("eyJhbGciOiJIUzI1NiJ9"), "got: {logs}");
+}
+
+#[test]
+fn test_many_jwt_prefixes_without_compact_serialization_remain_visible() {
+    let plugin = capture_plugin();
+    let benign = format!("{}tail", "eyJ".repeat(1_000));
+    let body = serde_json::to_vec(&json!({"note": benign})).unwrap();
+    let rendered = plugin.render_captured_body(&body, BodyKind::Json, 8_192);
+
+    assert_eq!(rendered.state, "captured");
+    assert!(!rendered.rendered.contains("***REDACTED***"));
+    assert!(rendered.rendered.contains(&"eyJ".repeat(16)));
 }
 
 #[test]
@@ -1056,6 +1080,11 @@ fn test_form_and_text_body_redaction() {
     assert!(form.rendered.contains("user=alice"), "{}", form.rendered);
     assert!(!form.rendered.contains("shhh"), "{}", form.rendered);
     assert!(form.rendered.contains("note=fine"), "{}", form.rendered);
+
+    let embedded_credential = b"note=prefix+Bearer+secret-token&message=keep";
+    let form = plugin.render_captured_body(embedded_credential, BodyKind::Form, 512);
+    assert!(!form.rendered.contains("secret-token"), "{}", form.rendered);
+    assert!(form.rendered.contains("message=keep"), "{}", form.rendered);
 
     let text_body = b"line one is fine\nauthorization: Bearer abc\nline three is fine";
     let text = plugin.render_captured_body(text_body, BodyKind::Text, 512);
@@ -1741,4 +1770,353 @@ async fn test_request_capture_record_carries_method_and_path_from_context() {
     .await;
     assert!(logs.contains("capture=captured"), "got: {logs}");
     assert!(logs.contains("alice"), "got: {logs}");
+}
+
+// ---------------------------------------------------------------------------
+// Terminal-diagnostic schema projection (issue #3314)
+// ---------------------------------------------------------------------------
+
+fn projected_http(config: serde_json::Value, summary: &TransactionSummary) -> serde_json::Value {
+    let plugin = TransactionDebugger::new(&config).expect("schema compiles");
+    let rendered = plugin
+        .project_http_for_tests(summary)
+        .expect("schema applies to HTTP diagnostics");
+    serde_json::from_str(&rendered).expect("projection is valid JSON")
+}
+
+#[test]
+fn test_debugger_default_diagnostic_field_inventory_is_projected_verbatim() {
+    let mut summary = create_test_transaction_summary();
+    summary.proxy_id = None;
+    let value = projected_http(json!({ "schema": { "summary_type": "http" } }), &summary);
+    let object = value.as_object().expect("object");
+
+    // Exactly the diagnostic inventory — the debugger's own names, not the
+    // transaction-summary names.
+    for key in [
+        "outcome",
+        "namespace",
+        "timestamp_received",
+        "client_ip",
+        "method",
+        "path",
+        "status",
+        "proxy_id",
+        "proxy_name",
+        "backend_target",
+        "backend_resolved_ip",
+        "consumer_username",
+        "auth_method",
+        "error_class",
+        "body_error_class",
+        "response_streamed",
+        "body_completed",
+        "client_disconnected",
+        "bytes_sent",
+        "bytes_received",
+        "rejection_phase",
+        "grpc_status",
+        "request_id",
+        "trace_id",
+        "latency_total_ms",
+        "latency_backend_ttfb_ms",
+        "latency_backend_total_ms",
+        "latency_plugin_ms",
+        "latency_gw_overhead_ms",
+        "metadata",
+    ] {
+        assert!(object.contains_key(key), "missing diagnostic field `{key}`");
+    }
+    assert_eq!(object.len(), 30, "unexpected diagnostic field: {object:?}");
+    // Absent optionals keep the default record's `-` placeholder rather than
+    // vanishing, so `order` completeness stays meaningful.
+    assert_eq!(object["proxy_id"], json!("-"));
+    // Summary-only names are NOT part of this family.
+    assert!(!object.contains_key("request_user_agent"));
+    assert!(!object.contains_key("mirror"));
+}
+
+#[test]
+fn test_debugger_projection_renames_omits_and_adds_fields() {
+    let summary = create_test_transaction_summary();
+    let value = projected_http(
+        json!({
+            "schema": {
+                "summary_type": "http",
+                "rename": { "path": "http.url", "status": "http.status_code" },
+                "omit": ["latency_gw_overhead_ms", "latency_plugin_ms"],
+                "static_fields": { "service": "ferrum-edge" },
+                "derived_fields": [
+                    { "name": "status_group", "kind": "status_class" },
+                    { "name": "record_kind", "kind": "summary_kind" }
+                ]
+            }
+        }),
+        &summary,
+    );
+    assert_eq!(value["http.url"], json!(summary.request_path));
+    assert!(value.get("path").is_none());
+    assert_eq!(
+        value["http.status_code"],
+        json!(summary.response_status_code)
+    );
+    assert!(value.get("latency_gw_overhead_ms").is_none());
+    assert!(value.get("latency_plugin_ms").is_none());
+    assert_eq!(value["service"], json!("ferrum-edge"));
+    assert_eq!(value["status_group"], json!("2xx"));
+    assert_eq!(value["record_kind"], json!("http"));
+}
+
+#[test]
+fn test_debugger_projection_orders_output_keys() {
+    let summary = create_test_transaction_summary();
+    let plugin = TransactionDebugger::new(&json!({
+        "schema": {
+            "summary_type": "http",
+            "order": ["status", "method", "*"]
+        }
+    }))
+    .expect("schema compiles");
+    let rendered = plugin
+        .project_http_for_tests(&summary)
+        .expect("schema applies");
+    let status_at = rendered.find("\"status\"").expect("status present");
+    let method_at = rendered.find("\"method\"").expect("method present");
+    let namespace_at = rendered.find("\"namespace\"").expect("namespace present");
+    assert!(
+        status_at < method_at && method_at < namespace_at,
+        "{rendered}"
+    );
+}
+
+#[test]
+fn test_debugger_projection_redacts_metadata_through_rename_and_flatten() {
+    let mut summary = create_test_transaction_summary();
+    summary
+        .metadata
+        .insert("authorization".to_string(), "Bearer abc".to_string());
+    summary
+        .metadata
+        .insert("trace_id".to_string(), "t-1".to_string());
+    summary
+        .metadata
+        .insert("_dedup_key".to_string(), "internal".to_string());
+
+    // Renamed outer metadata field: redaction still applies.
+    let renamed = projected_http(
+        json!({
+            "schema": { "summary_type": "http", "rename": { "metadata": "attrs" } }
+        }),
+        &summary,
+    );
+    assert_eq!(renamed["attrs"]["authorization"], json!("[REDACTED]"));
+    assert_eq!(renamed["attrs"]["trace_id"], json!("t-1"));
+    assert!(renamed["attrs"].get("_dedup_key").is_none());
+
+    // Flattened metadata: redaction and internal-only stripping survive.
+    let flattened = projected_http(
+        json!({
+            "schema": {
+                "summary_type": "http",
+                "metadata": { "mode": "flatten", "prefix": "meta_" }
+            }
+        }),
+        &summary,
+    );
+    assert_eq!(flattened["meta_authorization"], json!("[REDACTED]"));
+    assert_eq!(flattened["meta_trace_id"], json!("t-1"));
+    assert!(flattened.get("meta__dedup_key").is_none());
+    assert!(flattened.get("metadata").is_none());
+
+    // Omitted metadata drops the map entirely.
+    let omitted = projected_http(
+        json!({
+            "schema": { "summary_type": "http", "metadata": { "mode": "omit" } }
+        }),
+        &summary,
+    );
+    assert!(omitted.get("metadata").is_none());
+    assert!(omitted.get("authorization").is_none());
+}
+
+#[test]
+fn test_debugger_projection_converts_timestamps() {
+    let mut summary = create_test_transaction_summary();
+    summary.timestamp_received = "2026-05-11T12:00:00Z".to_string();
+    let value = projected_http(
+        json!({
+            "schema": { "summary_type": "http", "timestamp_format": "epoch_ms" }
+        }),
+        &summary,
+    );
+    assert_eq!(value["timestamp_received"], json!(1778500800000_i64));
+}
+
+#[test]
+fn test_debugger_projection_covers_stream_and_websocket_entry_kinds() {
+    let plugin = TransactionDebugger::new(&json!({
+        "schema": { "rename": { "outcome": "terminal_state" } }
+    }))
+    .expect("schema compiles");
+
+    let rendered = plugin
+        .project_stream_for_tests(&stream_summary())
+        .expect("stream projected");
+    let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(value["terminal_state"], json!("graceful_shutdown"));
+    assert_eq!(value["protocol"], json!("tcp"));
+    assert_eq!(value["disconnect_cause"], json!("graceful_shutdown"));
+    assert!(value.get("outcome").is_none());
+    // The hand-picked correlation field keeps its existing redaction, and the
+    // full metadata map is redacted by the shared serializer.
+    assert_eq!(value["request_id"], json!("req-stream"));
+    assert_eq!(value["metadata"]["authorization"], json!("[REDACTED]"));
+
+    let rendered = plugin
+        .project_ws_for_tests(&websocket_summary())
+        .expect("ws projected");
+    let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(value["terminal_state"], json!("completed"));
+    assert_eq!(value["frames_client_to_backend"], json!(3));
+    assert_eq!(value["io_side"], json!("-"));
+    assert_eq!(value["metadata"]["cookie"], json!("[REDACTED]"));
+    // WebSocket-only names never leak into the stream diagnostic and vice
+    // versa: each entry kind serializes only what it owns.
+    assert!(value.get("disconnect_cause").is_none());
+}
+
+/// The stream record carries the same silent-drop risk that
+/// `test_debugger_default_diagnostic_field_inventory_is_projected_verbatim`
+/// closes for the HTTP record: a name added to a family inventory without a
+/// matching `serialize_native` arm falls into the catch-all `_ => Ok(())` and
+/// vanishes from the projected record while the default `tracing` diagnostic
+/// still carries it. The registry drift guard in
+/// `tests/integration/log_schema_registry_tests.rs` cannot see that — these
+/// families have no serde struct to compare against.
+///
+/// The default (`both`) schema is used deliberately: its compiled spec list is
+/// the union of all three families, so an exact key count also proves that
+/// names owned by another entry kind never leak into this record.
+#[test]
+fn test_debugger_projected_stream_record_emits_its_whole_inventory() {
+    let config = json!({ "schema": {} });
+    let plugin = TransactionDebugger::new(&config).expect("schema compiles");
+    let rendered = plugin
+        .project_stream_for_tests(&stream_summary())
+        .expect("stream projected");
+    let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let object = value.as_object().expect("object");
+
+    for key in [
+        "outcome",
+        "namespace",
+        "protocol",
+        "proxy_id",
+        "proxy_name",
+        "client_ip",
+        "listen_port",
+        "backend_target",
+        "backend_resolved_ip",
+        "consumer_username",
+        "auth_method",
+        "connection_error",
+        "error_class",
+        "disconnect_direction",
+        "disconnect_cause",
+        "duration_ms",
+        "bytes_sent",
+        "bytes_received",
+        "timestamp_connected",
+        "timestamp_disconnected",
+        "sni_hostname",
+        "request_id",
+        "trace_id",
+        "metadata",
+    ] {
+        assert!(object.contains_key(key), "missing diagnostic field `{key}`");
+    }
+    assert_eq!(object.len(), 24, "unexpected diagnostic field: {object:?}");
+}
+
+/// WebSocket-disconnect counterpart of
+/// `test_debugger_projected_stream_record_emits_its_whole_inventory`.
+#[test]
+fn test_debugger_projected_ws_record_emits_its_whole_inventory() {
+    let config = json!({ "schema": {} });
+    let plugin = TransactionDebugger::new(&config).expect("schema compiles");
+    let rendered = plugin
+        .project_ws_for_tests(&websocket_summary())
+        .expect("ws projected");
+    let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let object = value.as_object().expect("object");
+
+    for key in [
+        "outcome",
+        "namespace",
+        "proxy_id",
+        "proxy_name",
+        "client_ip",
+        "listen_port",
+        "backend_target",
+        "consumer_username",
+        "auth_method",
+        "duration_ms",
+        "frames_client_to_backend",
+        "frames_backend_to_client",
+        "bytes_client_to_backend",
+        "bytes_backend_to_client",
+        "disconnect_direction",
+        "io_side",
+        "error_class",
+        "request_id",
+        "trace_id",
+        "metadata",
+    ] {
+        assert!(object.contains_key(key), "missing diagnostic field `{key}`");
+    }
+    assert_eq!(object.len(), 20, "unexpected diagnostic field: {object:?}");
+}
+
+#[test]
+fn test_debugger_schema_summary_type_scopes_entry_kinds() {
+    // `summary_type: stream` leaves HTTP and WebSocket diagnostics on the
+    // native path, exactly like every log-shipping plugin.
+    let plugin = TransactionDebugger::new(&json!({ "schema": { "summary_type": "stream" } }))
+        .expect("schema compiles");
+    assert!(
+        plugin
+            .project_http_for_tests(&create_test_transaction_summary())
+            .is_none()
+    );
+}
+
+#[test]
+fn test_debugger_schema_rejects_unrepresentable_shapes_with_field_diagnostics() {
+    for (config, needle) in [
+        (
+            json!({"schema": {"omit": ["request_user_agent"]}}),
+            "schema omit references unknown field 'request_user_agent'",
+        ),
+        (
+            json!({"schema": {"rename": {"outcome": "authorization"}}}),
+            "matches a sensitive-data substring",
+        ),
+        (
+            json!({"schema": {"static_fields": {"outcome": "x"}, "summary_type": "http"}}),
+            "duplicate output key 'outcome'",
+        ),
+        (
+            json!({"schema": {"derived_fields": [{"name": "k", "kind": "not_a_kind"}]}}),
+            "unknown derived kind 'not_a_kind'",
+        ),
+        (
+            json!({"schema": {"summary_type": "sideways"}}),
+            "'summary_type' must be 'http', 'stream', or 'both'",
+        ),
+    ] {
+        let err = TransactionDebugger::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("expected rejection for {config}"));
+        assert!(err.contains(needle), "needle={needle}, got: {err}");
+    }
 }

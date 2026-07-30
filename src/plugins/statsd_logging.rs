@@ -676,7 +676,10 @@ impl StatsdLogging {
             })),
             logger: DeferredBatchingLogger::new(),
             hostname: socket_host.warmup_hostname,
-            byte_budget: Arc::new(ByteBudget::new("statsd_logging", limits.buffer_max_bytes)),
+            byte_budget: Arc::new(ByteBudget::new_observability(
+                "statsd_logging",
+                limits.buffer_max_bytes,
+            )),
             max_entry_bytes: limits.max_entry_bytes,
         })
     }

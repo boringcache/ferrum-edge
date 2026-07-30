@@ -4592,6 +4592,10 @@ impl GatewayConfig {
             errors.extend(dedup_errors);
         }
 
+        if let Err(soap_errors) = crate::plugins::soap_ws_security::validate_composition(self) {
+            errors.extend(soap_errors);
+        }
+
         for plugin in &self.plugin_configs {
             // `transaction_log_schema` is process-global by design (it
             // registers named schemas into a single registry); reject
@@ -7261,10 +7265,32 @@ impl Proxy {
         }
 
         // DNS override
-        if let Some(ref dns) = self.dns_override
-            && let Err(e) = validate_string_field("dns_override", dns, MAX_BACKEND_HOST_LENGTH)
-        {
-            errors.push(e);
+        if let Some(ref dns) = self.dns_override {
+            if let Err(e) = validate_string_field("dns_override", dns, MAX_BACKEND_HOST_LENGTH) {
+                errors.push(e);
+            }
+            match dns.parse::<std::net::IpAddr>() {
+                Ok(override_ip) => {
+                    // reqwest/hyper-util skips custom DNS resolution for URL
+                    // hosts that parse as IP literals. Direct H2/H3 connectors
+                    // resolve independently, but an HTTP-family proxy may fall
+                    // back to reqwest, so reject a statically known direct
+                    // target that would bypass a different override.
+                    if !is_stream_proxy
+                        && self.upstream_id.is_none()
+                        && let Some(target_ip) = egress_literal_ip(&self.backend_host)
+                        && target_ip != override_ip
+                    {
+                        errors.push(format!(
+                            "dns_override IP {override_ip} differs from literal backend_host IP \
+                             {target_ip}; reqwest cannot apply DNS overrides to literal targets"
+                        ));
+                    }
+                }
+                Err(_) => {
+                    errors.push("dns_override must be a valid IPv4 or IPv6 address".to_string());
+                }
+            }
         }
 
         // Circuit breaker config
@@ -9217,18 +9243,6 @@ impl GatewayConfig {
                     for e in errs {
                         errors.push(format!("Proxy '{}': {}", proxy.id, e));
                     }
-                }
-                // A hostname `dns_override` cannot be classified at config time;
-                // it is screened at DNS-resolution time instead.
-                if let Some(ref dns_override) = proxy.dns_override
-                    && dns_override.parse::<std::net::IpAddr>().is_err()
-                {
-                    tracing::warn!(
-                        "Proxy '{}': dns_override '{}' is not an IP address, so startup cannot classify it under the backend egress policy ({})",
-                        proxy.id,
-                        dns_override,
-                        backend_allow_ips
-                    );
                 }
             }
             for upstream in &self.upstreams {

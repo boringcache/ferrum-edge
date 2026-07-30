@@ -221,7 +221,7 @@ pub(crate) fn extract_host_from_url(s: &str) -> Option<&str> {
     })
 }
 
-fn status_class(code: u16) -> &'static str {
+pub(crate) fn status_class(code: u16) -> &'static str {
     match code {
         100..=199 => "1xx",
         200..=299 => "2xx",
