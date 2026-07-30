@@ -169,8 +169,12 @@ plugins and after `compression` request decompression:
 - `ai_prompt_shield` (2925), `ai_semantic_firewall` (2968), and
   `ai_request_guard` (2975) see the original content — compression never blinds
   PII detection, prompt-injection detection, or request validation.
-- `ai_semantic_cache` (2996) computes its cache key from the original prompt, so
-  cache hit rates are unaffected.
+- `ai_semantic_cache` (4057) now looks up **after** this plugin, over the
+  compressed backend-visible prompt and after this plugin's final hook has
+  enforced any staged marker-sanitization rejection. A cached completion is
+  therefore keyed to the bytes the provider would actually receive, and a hit
+  can never bypass a rejection this plugin already decided on. Deployments that
+  enable compression will see keys change once, at cutover.
 - `compression` (4050) can decode opt-in gzip/brotli request bodies before the
   compressor rewrites the standard backend-dispatch body.
 

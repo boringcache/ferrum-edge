@@ -241,6 +241,24 @@ pub mod _test_support {
         ctx.clone_for_final_request_body_hooks()
     }
 
+    /// Install the route's precomputed credential-header registry so external
+    /// replay-partition tests can exercise stripped custom auth locations.
+    pub fn set_replay_credential_headers_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        headers: Vec<String>,
+    ) {
+        ctx.set_request_headers_to_redact(Arc::new(headers));
+    }
+
+    /// Model the transport-owned empty-body proof for direct plugin lifecycle
+    /// tests that do not enter through an HTTP proxy body-drain path.
+    pub fn set_replay_request_body_empty_proven_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        proven: bool,
+    ) {
+        ctx.set_replay_request_body_empty_proven(proven);
+    }
+
     pub fn gateway_response_compression_algorithm_for_test(
         ctx: &crate::plugins::RequestContext,
     ) -> Option<&'static str> {
@@ -702,6 +720,41 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
     ) {
         ctx.mark_gateway_deadline_response_selected();
+    }
+
+    /// Run the buffered request-body stage the way the proxy does: every
+    /// `transform_request_body` hook first, then every `on_final_request_body`
+    /// hook, over one shared `RequestContext`.
+    ///
+    /// This is the ordering that makes `ai_prompt_compressor`'s staged
+    /// marker-sanitization rejection (staged in the transform, enforced in the
+    /// final hook at 4055) fire ahead of `ai_semantic_cache` lookup (4057).
+    /// `plugins` must already be sorted by effective priority.
+    pub async fn run_request_body_stage_with_context_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> (Vec<u8>, crate::plugins::PluginResult) {
+        let deadline = ctx.grpc_deadline_at();
+        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            plugins,
+            Some(&mut *ctx),
+            deadline,
+            headers,
+            body.to_vec(),
+        )
+        .await;
+        let result = crate::proxy::run_final_request_body_hooks_with_provenance(
+            plugins,
+            Some(&mut *ctx),
+            deadline,
+            headers,
+            &transformed,
+        )
+        .await
+        .into_plugin_result(ctx);
+        (transformed, result)
     }
 
     pub async fn run_context_free_final_request_body_hooks_for_test(
