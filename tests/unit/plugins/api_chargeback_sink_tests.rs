@@ -7390,10 +7390,9 @@ fn a_zstd_artifact_this_build_writes_declares_its_decompressed_size() {
 }
 
 #[test]
-fn a_highly_compressible_zstd_artifact_this_build_writes_uses_its_declared_size() {
-    // A legitimate one-shot artifact can compress beyond the heuristic used
-    // for foreign/headerless frames. Its declared size remains authoritative
-    // up to the absolute artifact ceiling, so replay must not quarantine it.
+fn a_declared_zstd_size_cannot_bypass_the_decompression_ratio_limit() {
+    // Frame content sizes are unauthenticated. Even a truthful declaration
+    // must not let a planted high-ratio archive bypass the ratio limit.
     let temp = tempfile::tempdir().unwrap();
     let plain = vec![b'\n'; 2 * 1024 * 1024];
     let encoded = encode_spool_bytes_for_tests(&plain, SpoolCompression::Zstd).unwrap();
@@ -7406,9 +7405,12 @@ fn a_highly_compressible_zstd_artifact_this_build_writes_uses_its_declared_size(
 
     let path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FC3.ndjson.zst");
     fs::write(&path, encoded).unwrap();
-    let decoded = decode_spool_file_for_tests(&path)
-        .expect("a writer-owned frame with a safe declared size must decode");
-    assert_eq!(decoded.len(), plain.len());
+    let err = decode_spool_file_for_tests(&path)
+        .expect_err("a declared size must not bypass the decompression-ratio limit");
+    assert!(
+        err.contains("decompression bound"),
+        "unexpected error: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------

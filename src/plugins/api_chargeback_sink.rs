@@ -8192,15 +8192,14 @@ fn decode_spool_artifact(
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.contains(".ndjson.zst"));
-    // An uncompressed artifact decodes to exactly its on-disk size. A compressed
-    // one this build wrote records its decompressed size in the zstd frame
-    // header, which is the *tight* bound replay reserves; only a frame without
-    // one (a foreign or hand-planted archive) falls back to the ratio clamp.
+    // An uncompressed artifact decodes to exactly its on-disk size. Treat a
+    // zstd frame's declared content size only as a tighter bound: the header is
+    // unauthenticated, so it must never bypass the decompression-ratio limit.
     let mut file = file;
     let decoded_bound = if compressed {
         let ratio_limit = spool_decompression_limit(encoded_len);
         match read_zstd_frame_content_size(&mut file, path)? {
-            Some(declared) if declared <= SPOOL_MAX_ARTIFACT_BYTES => declared,
+            Some(declared) if declared <= SPOOL_MAX_ARTIFACT_BYTES => declared.min(ratio_limit),
             Some(declared) => {
                 return Err(SpoolDecodeError::Unreadable(format!(
                     "{PLUGIN_NAME}: spool file '{}' declares a {declared}-byte decoded size above the hard {SPOOL_MAX_ARTIFACT_BYTES}-byte artifact bound",
