@@ -8,11 +8,59 @@
 //! signature transform over the assertion), timestamp freshness checks, and
 //! nonce replay protection.
 //!
-//! Runs in `before_proxy` with request body buffering. Priority 1500 places
-//! it in the AuthN band after HMAC auth. When a co-located `compression`
-//! plugin enables `decompress_request`, configured gzip/Brotli decoding runs
-//! in the shared pre-`before_proxy` normalization phase so this plugin
-//! validates the same size-bounded plaintext the backend receives.
+//! ## Phases and identity
+//!
+//! Priority 1500 places this plugin in the AuthN band after HMAC auth. A
+//! configuration that establishes a principal — UsernameToken, X.509, or SAML —
+//! runs in the **`authenticate`** phase against a body buffered before
+//! authentication, and publishes `RequestContext::authenticated_identity` plus a
+//! namespace-correct `identified_consumer`. That is what lets `access_control`,
+//! consumer-scoped `rate_limiting`, logging, retries, and chargeback all see one
+//! authoritative SOAP identity; previously validation ran in `before_proxy`,
+//! after both central authentication *and* authorization had already decided,
+//! so ACL saw no consumer and consumer rate limits charged the source IP.
+//!
+//! A timestamp-only policy proves freshness and nothing about the caller. It has
+//! no principal to publish, must not join the authentication chain, and keeps
+//! validating in `before_proxy`. The two phases are selected by configuration
+//! and are mutually exclusive, so a message is never validated twice.
+//!
+//! Because authentication now precedes the shared buffered-body normalization
+//! phase, composing an identity-establishing policy with `compression`'s
+//! `decompress_request` is refused at admission (see [`validate_composition`]),
+//! and `on_final_request_body_with_context` refuses to dispatch any message
+//! whose bytes changed after validation.
+//!
+//! ## Governed representations
+//!
+//! Media types are parsed structurally — `type/subtype` plus parameters — never
+//! substring-matched. `content_type.mode` defaults to `strict`, under which
+//! every request on the proxy is a governed SOAP request and a missing,
+//! mislabelled, or unsupported representation is rejected before backend
+//! dispatch; `mixed_route` is the explicit opt-out for proxies that serve mixed
+//! traffic. SOAP 1.1 (`text/xml`), SOAP 1.2 (`application/soap+xml`),
+//! `application/xml`, `application/xop+xml`, and MTOM/XOP `multipart/related`
+//! are supported; MTOM validates the root part's envelope and refuses a root
+//! part that is mislabelled or re-encoded. Package framing is a strict MIME
+//! contract — see [`extract_mtom_root_part`] — because the parser is what
+//! decides which bytes are the envelope.
+//!
+//! An `x509_signature` policy claims *integrity* over the message the backend
+//! executes. Ferrum implements no WS-Security attachment-signature transform,
+//! so for a XOP representation the digest it verifies covers the `xop:Include`
+//! element and not the attachment octets that element stands for. An enabled
+//! `x509_signature` therefore refuses both MTOM `multipart/related` and bare
+//! `application/xop+xml` with `415`. `username_token` and `saml` keep accepting
+//! them: those mechanisms authenticate *who sent the message* and never claimed
+//! coverage of attachment octets.
+//!
+//! `reject_missing_security_header: false` is the opt-out for a governed
+//! message that genuinely carries no `wsse:Security` header. It is not an
+//! opt-out from *parsing*: once a representation is governed, malformed XML,
+//! unsupported or ambiguous envelope structure, and parsing-budget failures
+//! reject unconditionally, because a gateway/backend parser disagreement that
+//! became a pass-through would skip every check for a message the backend still
+//! executes.
 //!
 //! ## Configuration admission (strict, fail-closed)
 //!
@@ -184,22 +232,52 @@
 //! unknown algorithms and transform chains are rejected rather than falling
 //! back to wire-byte hashing.
 //!
-//! ## XML Signature Wrapping (XSW) mitigation
+//! ## Signature ordering and work bounds
 //!
-//! In addition to namespace-aware canonicalization, the X.509 path enforces
-//! that every signed `#id` Reference resolves to a
-//! UNIQUE decoded XML id-bearing attribute across the whole envelope (see
-//! `count_dom_id_occurrences`), rejecting any envelope carrying a duplicate id —
-//! the classic XSW vector where an attacker keeps the legitimately-signed
-//! element and injects a second element with the same id that the backend
-//! consumes. The duplicate scan includes WS-Security `wsu:Id` / prefixed `Id`,
-//! bare `Id`, and common alternative spellings (`xml:id`, `ID`, `id`) so
-//! backends with broader fragment-id rules fail closed instead of seeing a
-//! forwarded alternate referent. A raw-attribute scan remains as a second,
-//! independent guard. The SAML path retains its single-`<Assertion>`
-//! guard plus the Reference-URI-equals-assertion-id check. These structural
-//! checks remain defense-in-depth against a backend selecting a different
-//! same-local-name element than the gateway's namespace-aware resolver.
+//! Both signature paths settle **trust first**: the presented certificate's
+//! SHA-256 fingerprint must match configured trust material and
+//! `SignatureValue` must verify over the canonicalized `SignedInfo` before a
+//! single attacker-selected `<Reference>` is resolved, canonicalized, or
+//! digested. Trust is a fixed-size comparison and `SignedInfo` is a small
+//! bounded subtree, so an untrusted or forged signature costs constant work no
+//! matter how the References are shaped. Duplicate Reference URIs are rejected,
+//! the reference ceiling is 8, one bounded id index is built per message instead
+//! of one full-envelope scan per Reference, and every canonicalization is
+//! charged against an aggregate per-message byte budget derived from the body
+//! length.
+//!
+//! ## Structural binding (namespaces, coverage, XSW)
+//!
+//! Every structural selection is namespace-qualified and positional: exactly one
+//! SOAP `Envelope` in a known envelope namespace, at most one `Header` and
+//! exactly one `Body` as its direct children in that same namespace, and exactly
+//! one `wsse:Security` header targeting this receiver (absent/`next`/
+//! `ultimateReceiver` role) as a direct child of that `Header`. A second
+//! namespace-correct `Envelope`/`Header`/`Body` anywhere in the document, or a
+//! `wsse:Security` outside the `Header`, is rejected — those are the wrapping
+//! shapes that make the gateway and the backend resolve different elements.
+//!
+//! X.509 success additionally requires a Reference that resolves **uniquely to
+//! the backend-visible `Body`**, so a trusted signature over only the Timestamp
+//! can no longer authorize a rewritten operation, and a required signed
+//! Timestamp rejects a message that carries none (contradictory configuration is
+//! refused at admission). Reference ids must be unique under both the
+//! entity-decoded DOM view and a raw start-tag scan covering the broader id
+//! spellings (`wsu:Id`, prefixed `Id`, bare `Id`, `xml:id`, `ID`, `id`) a
+//! tolerant backend might resolve. The SAML path requires a single
+//! `<Assertion>` inside the Security header and exactly one Reference targeting
+//! its own id.
+//!
+//! ## SAML bearer semantics
+//!
+//! A signed assertion is a reusable bearer value whose outer WS-Security
+//! Timestamp is not covered by its signature. Accepting one therefore requires a
+//! mandatory bounded `Conditions` window, the configured service `Audience`, a
+//! supported `SubjectConfirmation` naming the configured `Recipient` with its
+//! own bounded `NotOnOrAfter`, and a single-use claim on the assertion id in the
+//! declared `nonce.replay_scope` — `process` (single-replica by declaration) or
+//! `shared` (atomic Redis `SET NX EX` across replicas). `OneTimeUse` needs no
+//! special case because every accepted assertion is claimed exactly once.
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -215,9 +293,13 @@ use std::time::Instant;
 use tracing::{debug, warn};
 use x509_parser::prelude::*;
 
-use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
+use crate::tls::source::{CertSource, MaterialKind, SecretString, load_material_blocking};
 use crate::util::unknown_keys::reject_unknown_keys;
 
+use crate::consumer_index::ConsumerIndex;
+
+use super::utils::auth_attempt::AuthenticationAttempt;
+use super::utils::auth_flow;
 use super::utils::auth_flow::constant_time_eq;
 use super::utils::cert_hash::sha256_hex_lower;
 use super::utils::http_client::PluginHttpClient;
@@ -238,13 +320,30 @@ const XMLDSIG_ENVELOPED_SIGNATURE: &str = "http://www.w3.org/2000/09/xmldsig#env
 const XML_EXCLUSIVE_C14N: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 const WSU_NAMESPACE_URI: &str =
     "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd";
+const WSSE_NAMESPACE_URI: &str =
+    "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd";
+const XMLDSIG_NAMESPACE_URI: &str = "http://www.w3.org/2000/09/xmldsig#";
+const SOAP11_ENVELOPE_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
+const SOAP12_ENVELOPE_NS: &str = "http://www.w3.org/2003/05/soap-envelope";
+const SOAP11_ACTOR_NEXT: &str = "http://schemas.xmlsoap.org/soap/actor/next";
+const SOAP12_ROLE_NEXT: &str = "http://www.w3.org/2003/05/soap-envelope/role/next";
+const SOAP12_ROLE_ULTIMATE_RECEIVER: &str =
+    "http://www.w3.org/2003/05/soap-envelope/role/ultimateReceiver";
+const SAML2_ASSERTION_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
+const SAML2_CM_BEARER: &str = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
+const SAML2_CM_HOLDER_OF_KEY: &str = "urn:oasis:names:tc:SAML:2.0:cm:holder-of-key";
 
 /// Upper bound on the number of `<Reference>` elements processed in a single
-/// `<SignedInfo>`. Each reference drives a full-envelope scan + digest before
-/// the signature is checked, so this caps attacker-controlled CPU on the
-/// unauthenticated request path. Real signatures reference a handful of
-/// elements; 64 is far above any legitimate use.
-const MAX_SIGNED_REFERENCES: usize = 64;
+/// `<SignedInfo>`.
+///
+/// References are only resolved *after* the certificate is trusted and
+/// `SignatureValue` verifies over `SignedInfo`, so this no longer bounds
+/// unauthenticated work — but it still bounds authenticated work, and the
+/// profiles Ferrum supports (Timestamp + Body + a small number of headers)
+/// never approach it. The previous ceiling of 64 was chosen when references
+/// were resolved before authentication and was the multiplier in the
+/// `O(references × body)` amplification GHSA-9g4v-h9hm-846r describes.
+const MAX_SIGNED_REFERENCES: usize = 8;
 
 /// Bounds for attacker-controlled XML work before signature trust exists.
 /// Legitimate SOAP and SAML signatures stay far below these ceilings.
@@ -252,6 +351,34 @@ const MAX_XML_NODES: u32 = 65_536;
 const MAX_CANONICALIZATION_DEPTH: usize = 256;
 const MAX_INCLUSIVE_NAMESPACE_PREFIXES: usize = 64;
 const MAX_INCLUSIVE_PREFIX_LIST_BYTES: usize = 4_096;
+
+/// Floor for the per-request canonicalization work budget (see
+/// [`WorkBudget::for_envelope`]). Small envelopes still get enough room to
+/// canonicalize `SignedInfo` plus the elements a real signature covers.
+const MIN_CANONICALIZATION_BUDGET_BYTES: usize = 65_536;
+
+/// Aggregate canonicalized/scanned-byte budget multiplier, applied to the
+/// decoded envelope length. Every `exclusive_canonicalize` call charges both
+/// the source subtree it walks and the canonical bytes it emits, so one request
+/// can never drive more than a small constant multiple of its own body through
+/// canonicalization regardless of how its References are shaped.
+const CANONICALIZATION_BUDGET_MULTIPLIER: usize = 2;
+
+/// Bounds for MTOM/XOP (`multipart/related`) unpacking. The gateway only ever
+/// walks part *headers* looking for the SOAP root part; attachment payloads are
+/// skipped, never decoded, and never validated as XML.
+const MAX_MULTIPART_PARTS: usize = 64;
+const MAX_MULTIPART_PART_HEADER_BYTES: usize = 8_192;
+const MAX_MULTIPART_BOUNDARY_BYTES: usize = 70;
+/// Header lines admitted per MIME part. A part header block is bounded by both
+/// this count and [`MAX_MULTIPART_PART_HEADER_BYTES`] so neither a few enormous
+/// lines nor very many tiny ones can drive unbounded work.
+const MAX_MULTIPART_PART_HEADERS: usize = 32;
+/// Delimiter-line candidates examined across one package. Every candidate that
+/// is rejected as payload advances the scan by at least `2 + boundary.len()`
+/// bytes, so this is a belt-and-braces ceiling on an adversarial package that
+/// embeds boundary-shaped bytes throughout its attachments.
+const MAX_MULTIPART_DELIMITER_CANDIDATES: usize = 4_096;
 
 // ── Configuration admission bounds ──────────────────────────────────────────
 
@@ -298,6 +425,29 @@ const NONCE_CLAIM_RETENTION_SECONDS: u64 =
 const _: () = assert!(
     NONCE_CLAIM_RETENTION_SECONDS > MAX_UT_CREATED_MAX_AGE_SECONDS + 2 * MAX_CLOCK_SKEW_SECONDS
 );
+
+/// The same fixed horizon retains SAML assertion-id claims. An assertion is
+/// acceptable at server time `t` only while
+/// `NotBefore - skew <= t <= NotOnOrAfter + skew`, and admission caps
+/// `NotOnOrAfter - NotBefore` at `max_assertion_lifetime_seconds`, so the widest
+/// span any admissible SAML policy can accept one unchanged assertion over is
+/// `MAX_SAML_ASSERTION_LIFETIME_SECONDS + 2 * MAX_CLOCK_SKEW_SECONDS`. Proving
+/// dominance here means no reload — however wide — can reopen an assertion
+/// replay window, exactly as for PasswordDigest nonces.
+const _: () = assert!(
+    NONCE_CLAIM_RETENTION_SECONDS
+        > MAX_SAML_ASSERTION_LIFETIME_SECONDS + 2 * MAX_CLOCK_SKEW_SECONDS
+);
+
+/// Bounds for the SAML assertion validity window (`NotOnOrAfter - NotBefore`).
+///
+/// GHSA-f44p-hfqr-cvcc: an assertion with absent or unbounded `Conditions` is
+/// an indefinite bearer credential. Both instants are now mandatory and their
+/// span is capped, so a captured assertion has a provably short life even
+/// before assertion-id replay protection is consulted.
+const DEFAULT_SAML_ASSERTION_LIFETIME_SECONDS: u64 = 300;
+const MIN_SAML_ASSERTION_LIFETIME_SECONDS: u64 = 1;
+const MAX_SAML_ASSERTION_LIFETIME_SECONDS: u64 = 86_400;
 
 /// Default retained-entry ceiling for `replay_scope: process`.
 ///
@@ -353,6 +503,55 @@ const MAX_NONCE_REPLAY_SCOPES: usize = 1_024;
 /// a `MONITOR` stream, or the Redis client's error logging.
 const SHARED_NONCE_CLAIM_RECORD: &[u8] = b"ferrum-edge/soap-ws-security/nonce-claim/v1";
 
+/// Client-visible replay rejections. Fixed strings: the nonce and the assertion
+/// id are credential-adjacent values and are never echoed.
+const REPLAY_DETECTED_MESSAGE: &str = "WS-Security: nonce replay detected";
+const SAML_REPLAY_DETECTED_MESSAGE: &str = "WS-Security: SAML assertion has already been used";
+
+/// Claim-kind prefixes for the one process-global replay map. PasswordDigest
+/// nonces are attacker-chosen strings and SAML claim keys are SHA-256 hex, so
+/// namespacing them keeps a chosen nonce from ever burning an assertion claim
+/// (or the reverse).
+const NONCE_PROCESS_CLAIM_PREFIX: &str = "n|";
+const SAML_PROCESS_CLAIM_PREFIX: &str = "s|";
+
+/// Byte width of a process claim-kind prefix. Both prefixes are the same width,
+/// asserted at compile time, so retained-byte accounting can charge exactly the
+/// claim payload without carrying the prefix kind alongside every key.
+const PROCESS_CLAIM_PREFIX_BYTES: usize = NONCE_PROCESS_CLAIM_PREFIX.len();
+const _: () = assert!(SAML_PROCESS_CLAIM_PREFIX.len() == PROCESS_CLAIM_PREFIX_BYTES);
+
+fn nonce_process_claim_key(nonce: &str) -> String {
+    let mut key = String::with_capacity(nonce.len() + PROCESS_CLAIM_PREFIX_BYTES);
+    key.push_str(NONCE_PROCESS_CLAIM_PREFIX);
+    key.push_str(nonce);
+    key
+}
+
+fn saml_process_claim_key(claim_digest: &str) -> String {
+    let mut key = String::with_capacity(claim_digest.len() + PROCESS_CLAIM_PREFIX_BYTES);
+    key.push_str(SAML_PROCESS_CLAIM_PREFIX);
+    key.push_str(claim_digest);
+    key
+}
+
+/// Bytes one retained claim key charges against `nonce.max_total_cache_bytes`.
+///
+/// The claim-kind prefix is gateway-internal namespacing and is deliberately
+/// **not** charged. `max_total_cache_bytes` is documented as the retained nonce
+/// payload; `max_encoded_length` may legitimately equal it (both admit 4096),
+/// and charging the prefix would make a maximum-length nonce permanently
+/// unadmissible even against a completely empty cache — a saturation answer to
+/// a request that carries no replay at all, and a violation of the
+/// `max_encoded_length <= max_total_cache_bytes` invariant
+/// [`SoapWsSecurity::reclaim_expired_nonce_room_locked`] relies on to tell
+/// genuine saturation from impossible index drift. Map/tree node and `Arc`
+/// control-block overhead is likewise uncharged, so this stays consistent with
+/// what the cap has always measured.
+fn charged_claim_key_bytes(claim_key: &str) -> usize {
+    claim_key.len().saturating_sub(PROCESS_CLAIM_PREFIX_BYTES)
+}
+
 /// WS-Security UsernameToken Profile nonces are short random values (16–32 raw
 /// bytes is typical). The ceiling is enforced on the *encoded* value before
 /// Base64 decoding, so an oversized nonce is never decoded or retained.
@@ -392,6 +591,7 @@ const MAX_PARSED_YEAR: i32 = 9999;
 
 const OWN_ROOT_CONFIG_KEYS: &[&str] = &[
     "reject_missing_security_header",
+    "content_type",
     "timestamp",
     "username_token",
     "x509_signature",
@@ -427,6 +627,7 @@ const USERNAME_TOKEN_CONFIG_KEYS: &[&str] = &[
     "require_timestamp_binding",
 ];
 const CREDENTIAL_CONFIG_KEYS: &[&str] = &["username", "password"];
+const CONTENT_TYPE_CONFIG_KEYS: &[&str] = &["mode", "allow_mtom"];
 const X509_CONFIG_KEYS: &[&str] = &[
     "enabled",
     "trusted_certs",
@@ -441,6 +642,9 @@ const SAML_CONFIG_KEYS: &[&str] = &[
     "allowed_signature_algorithms",
     "allowed_digest_algorithms",
     "audience",
+    "recipient",
+    "max_assertion_lifetime_seconds",
+    "allowed_subject_confirmation_methods",
     "clock_skew_seconds",
 ];
 // `cache_ttl_seconds` is deliberately absent: claim retention is the fixed
@@ -754,6 +958,14 @@ struct TrustedCert {
     public_key_der: Vec<u8>,
     /// SHA-256 fingerprint of the full DER-encoded certificate (for matching).
     fingerprint: Vec<u8>,
+    /// Stable request principal published when this certificate signs a
+    /// message: `x509:sha256:<lowercase-hex-fingerprint>`.
+    ///
+    /// Derived at admission from operator-supplied trust material, so it is
+    /// bounded, allocation-free at request time, and carries no attacker-
+    /// controlled or personally identifying value. Operators map it to a
+    /// Consumer by registering that string as the Consumer's username/id.
+    principal: String,
 }
 
 // ── Nonce cache entry ───────────────────────────────────────────────────────
@@ -769,8 +981,10 @@ struct NonceEntry {
 /// `cache` provides expected O(1) same-nonce decisions. `age_index` provides
 /// O(log n) expiration and exact-oldest selection without a full-cache scan.
 /// Both containers hold `Arc` handles to the same immutable nonce allocation;
-/// `retained_key_bytes` counts that allocation's UTF-8 payload exactly once
-/// per logical entry (not map/tree node or `Arc` control-block overhead).
+/// `retained_key_bytes` counts that allocation's UTF-8 payload exactly once per
+/// logical entry via [`charged_claim_key_bytes`] — the claim payload only, never
+/// the internal claim-kind prefix, and never map/tree node or `Arc`
+/// control-block overhead.
 ///
 /// Entry count, age order, and retained key bytes are updated under one mutex
 /// so concurrent admissions cannot overshoot either documented hard cap.
@@ -832,7 +1046,7 @@ impl NonceReplayState {
             if !self.age_entry_matches(age_key, nonce) {
                 return false;
             }
-            let Some(total) = retained_key_bytes.checked_add(nonce.len()) else {
+            let Some(total) = retained_key_bytes.checked_add(charged_claim_key_bytes(nonce)) else {
                 return false;
             };
             retained_key_bytes = total;
@@ -859,7 +1073,10 @@ impl NonceReplayState {
         if !self.age_entry_matches(age_key, nonce) {
             return Err(());
         }
-        let Some(retained_key_bytes) = self.retained_key_bytes.checked_sub(nonce.len()) else {
+        let Some(retained_key_bytes) = self
+            .retained_key_bytes
+            .checked_sub(charged_claim_key_bytes(nonce))
+        else {
             return Err(());
         };
 
@@ -1121,6 +1338,10 @@ pub(crate) struct NonceReplayObservationForTests {
 // ── Plugin struct ───────────────────────────────────────────────────────────
 
 pub struct SoapWsSecurity {
+    // Media-type governance
+    content_type_mode: ContentTypeMode,
+    allow_mtom: bool,
+
     // Timestamp validation
     require_timestamp: bool,
     timestamp_max_age_seconds: u64,
@@ -1161,7 +1382,16 @@ pub struct SoapWsSecurity {
     // SAML assertion validation
     saml_enabled: bool,
     saml_trusted_issuers: Vec<String>,
+    /// Service-specific audience binding. Required whenever SAML is enabled:
+    /// without it, an assertion minted by the same trusted IdP for a different
+    /// relying party is accepted here (GHSA-f44p-hfqr-cvcc).
     saml_audience: Option<String>,
+    /// Service-specific `SubjectConfirmationData/@Recipient` binding, also
+    /// required whenever SAML is enabled.
+    saml_recipient: Option<String>,
+    saml_max_assertion_lifetime: chrono::Duration,
+    saml_max_assertion_lifetime_seconds: u64,
+    saml_allowed_confirmation_methods: Vec<String>,
     saml_clock_skew: chrono::Duration,
     saml_trusted_signing_certs: Vec<TrustedCert>,
     saml_allowed_signature_algorithms: Vec<SignatureAlgorithm>,
@@ -1248,6 +1478,40 @@ impl SoapWsSecurity {
         // every misspelling an error instead of a silently weaker policy.
         let root = Some(config_obj);
         reject_unknown(root, "config", &ROOT_CONFIG_KEYS)?;
+
+        // ── Media-type governance (GHSA-435h-f785-wmm4) ─────────────────
+        //
+        // The default is `strict`: every request on a proxy carrying this
+        // plugin is a governed SOAP request. Selecting a representation the
+        // backend accepts but the gateway did not classify as SOAP was a
+        // complete bypass of authentication, integrity, freshness, and replay
+        // protection, so pass-through is now an explicit, named opt-out rather
+        // than the consequence of a client-chosen header value.
+        let content_type_cfg = soap_object(root, "config", "content_type")?;
+        reject_unknown(
+            content_type_cfg,
+            "config.content_type",
+            CONTENT_TYPE_CONFIG_KEYS,
+        )?;
+        let configured_mode = soap_string(content_type_cfg, "config.content_type", "mode")?;
+        let content_type_mode = match configured_mode.as_deref().unwrap_or("strict") {
+            "strict" => ContentTypeMode::Strict,
+            "mixed_route" => ContentTypeMode::MixedRoute,
+            _ => {
+                return Err(
+                    "soap_ws_security: 'config.content_type.mode' must be one of: strict, \
+                     mixed_route"
+                        .to_string(),
+                );
+            }
+        };
+        // Whether the operator *named* `allow_mtom`, as distinct from taking its
+        // default. An explicit `true` alongside an X.509 policy is a
+        // contradiction worth refusing at admission rather than silently
+        // rejecting every MTOM request at runtime.
+        let allow_mtom_explicit =
+            present(content_type_cfg, "config.content_type", "allow_mtom")?.is_some();
+        let allow_mtom = soap_bool(content_type_cfg, "config.content_type", "allow_mtom", true)?;
 
         // ── Timestamp config ────────────────────────────────────────────
         let ts_cfg = soap_object(root, "config", "timestamp")?;
@@ -1411,7 +1675,7 @@ impl SoapWsSecurity {
 
         let mut trusted_certs = Vec::with_capacity(trusted_cert_paths.len());
         for path in &trusted_cert_paths {
-            let source = CertSource::parse(path, MaterialKind::Cert);
+            let source = parse_trusted_certificate_source(path);
             let material = load_material_blocking(&source, MaterialKind::Cert)
                 .map_err(|e| format!("soap_ws_security: failed to load trusted cert: {e}"))?;
 
@@ -1455,10 +1719,12 @@ impl SoapWsSecurity {
             let fingerprint = digest::digest(&digest::SHA256, &der_bytes)
                 .as_ref()
                 .to_vec();
+            let principal = format!("x509:sha256:{}", sha256_hex_lower(&der_bytes));
 
             trusted_certs.push(TrustedCert {
                 public_key_der,
                 fingerprint,
+                principal,
             });
         }
 
@@ -1501,6 +1767,39 @@ impl SoapWsSecurity {
             true,
         )?;
 
+        // Contradictory configuration is refused at admission rather than
+        // satisfied vacuously at request time. `require_signed_timestamp` now
+        // rejects a message with no Timestamp, so pairing it with
+        // `timestamp.require: false` declares two incompatible policies: one
+        // says the Timestamp is optional, the other says it must be present and
+        // signed. The old behaviour — "no Timestamp, therefore nothing to
+        // check, therefore pass" — is the vacuous satisfaction described in
+        // GHSA-3mwq-c8j6-9xhp.
+        if x509_enabled && require_signed_timestamp && !require_timestamp {
+            return Err(
+                "soap_ws_security: 'config.x509_signature.require_signed_timestamp' requires \
+                 'config.timestamp.require' to be true — a signed Timestamp cannot be required \
+                 while the Timestamp itself is optional"
+                    .to_string(),
+            );
+        }
+
+        // Ferrum implements no WS-Security attachment-signature transform, so
+        // an X.509 policy cannot cover the octets an `xop:Include` stands for.
+        // Asking for both is asking for integrity Ferrum cannot establish;
+        // XOP/MTOM representations are refused at request time either way, and
+        // an explicit `allow_mtom: true` is refused here so the contradiction
+        // surfaces at admission instead of as a runtime 415.
+        if x509_enabled && allow_mtom_explicit && allow_mtom {
+            return Err(
+                "soap_ws_security: 'config.content_type.allow_mtom' cannot be true while \
+                 'config.x509_signature.enabled' is true — Ferrum implements no WS-Security \
+                 attachment-signature transform, so an X.509 signature cannot cover MTOM/XOP \
+                 attachment octets"
+                    .to_string(),
+            );
+        }
+
         // ── SAML config ─────────────────────────────────────────────────
         let saml_cfg = soap_object(root, "config", "saml")?;
         reject_unknown(saml_cfg, "config.saml", SAML_CONFIG_KEYS)?;
@@ -1517,8 +1816,77 @@ impl SoapWsSecurity {
         }
 
         // A wrong-typed audience used to become `None`, silently removing
-        // service binding while SAML stayed enabled.
+        // service binding while SAML stayed enabled. It is now also mandatory:
+        // an optional audience meant a signed assertion issued for a different
+        // relying party by the same trusted IdP was accepted here.
         let saml_audience = soap_string(saml_cfg, "config.saml", "audience")?;
+        if saml_enabled && saml_audience.is_none() {
+            return Err(
+                "soap_ws_security: 'config.saml.audience' is required when saml is enabled — \
+                 without a service-specific AudienceRestriction binding, an assertion minted by \
+                 the same trusted issuer for another service is accepted here"
+                    .to_string(),
+            );
+        }
+        let saml_recipient = soap_string(saml_cfg, "config.saml", "recipient")?;
+        if saml_enabled && saml_recipient.is_none() {
+            return Err(
+                "soap_ws_security: 'config.saml.recipient' is required when saml is enabled — it \
+                 is matched against SubjectConfirmationData/@Recipient so a captured assertion \
+                 cannot be presented to a different endpoint"
+                    .to_string(),
+            );
+        }
+        let saml_max_assertion_lifetime_seconds = soap_u64_bounded(
+            saml_cfg,
+            "config.saml",
+            "max_assertion_lifetime_seconds",
+            DEFAULT_SAML_ASSERTION_LIFETIME_SECONDS,
+            MIN_SAML_ASSERTION_LIFETIME_SECONDS,
+            MAX_SAML_ASSERTION_LIFETIME_SECONDS,
+        )?;
+        let saml_max_assertion_lifetime = admitted_duration(
+            "config.saml",
+            "max_assertion_lifetime_seconds",
+            saml_max_assertion_lifetime_seconds,
+        )?;
+        let saml_allowed_confirmation_methods = match soap_string_array(
+            saml_cfg,
+            "config.saml",
+            "allowed_subject_confirmation_methods",
+        )? {
+            None => vec![SAML2_CM_BEARER.to_string()],
+            Some(methods) if methods.is_empty() => {
+                return Err(type_error(
+                    "config.saml",
+                    "allowed_subject_confirmation_methods",
+                    "a non-empty array of supported SubjectConfirmation method URIs",
+                ));
+            }
+            Some(methods) => {
+                for method in &methods {
+                    // Only semantics Ferrum actually implements may be
+                    // configured. `holder-of-key` needs the confirmation key to
+                    // be proven against the message signature, which this
+                    // plugin does not do, so accepting it would be a policy the
+                    // gateway cannot enforce.
+                    if method != SAML2_CM_BEARER {
+                        let supported = if method == SAML2_CM_HOLDER_OF_KEY {
+                            "'urn:oasis:names:tc:SAML:2.0:cm:holder-of-key' is not supported \
+                             because the confirmation key is not bound to the message signature"
+                        } else {
+                            "only 'urn:oasis:names:tc:SAML:2.0:cm:bearer' is supported"
+                        };
+                        return Err(format!(
+                            "soap_ws_security: \
+                             'config.saml.allowed_subject_confirmation_methods' contains an \
+                             unsupported method; {supported}"
+                        ));
+                    }
+                }
+                methods
+            }
+        };
         let saml_clock_skew_seconds = soap_u64_bounded(
             saml_cfg,
             "config.saml",
@@ -1550,7 +1918,7 @@ impl SoapWsSecurity {
         let mut saml_trusted_signing_certs =
             Vec::with_capacity(saml_trusted_signing_cert_paths.len());
         for path in &saml_trusted_signing_cert_paths {
-            let source = CertSource::parse(path, MaterialKind::Cert);
+            let source = parse_trusted_certificate_source(path);
             let material = load_material_blocking(&source, MaterialKind::Cert).map_err(|e| {
                 format!("soap_ws_security: failed to load SAML trusted signing cert: {e}")
             })?;
@@ -1588,10 +1956,12 @@ impl SoapWsSecurity {
             let fingerprint = digest::digest(&digest::SHA256, &der_bytes)
                 .as_ref()
                 .to_vec();
+            let principal = format!("x509:sha256:{}", sha256_hex_lower(&der_bytes));
 
             saml_trusted_signing_certs.push(TrustedCert {
                 public_key_der,
                 fingerprint,
+                principal,
             });
         }
 
@@ -1718,16 +2088,29 @@ impl SoapWsSecurity {
 
         let digest_replay_active =
             username_token_enabled && password_type == PasswordType::PasswordDigest;
+        // A signed SAML assertion is a reusable bearer value: nothing in the
+        // assertion changes between presentations, and the outer WS-Security
+        // Timestamp it travels with is not covered by the assertion signature,
+        // so it can be reminted on every replay. Single-use enforcement is
+        // therefore mandatory, which means the deployment shape has to be
+        // declared for SAML exactly as it is for PasswordDigest
+        // (GHSA-f44p-hfqr-cvcc).
+        let replay_active = digest_replay_active || saml_enabled;
 
-        if digest_replay_active && replay_scope.is_none() {
-            return Err(
-                "soap_ws_security: 'config.nonce.replay_scope' is required when \
-                 username_token.password_type is 'PasswordDigest' — use 'shared' together with \
-                 sync_mode: 'redis' for any deployment running more than one gateway replica, or \
-                 'process' to declare a single-replica deployment whose replay protection is not \
-                 cross-replica"
-                    .to_string(),
-            );
+        if replay_active && replay_scope.is_none() {
+            let trigger = if digest_replay_active && saml_enabled {
+                "username_token.password_type is 'PasswordDigest' and saml is enabled"
+            } else if digest_replay_active {
+                "username_token.password_type is 'PasswordDigest'"
+            } else {
+                "saml is enabled"
+            };
+            return Err(format!(
+                "soap_ws_security: 'config.nonce.replay_scope' is required when {trigger} — use \
+                 'shared' together with sync_mode: 'redis' for any deployment running more than \
+                 one gateway replica, or 'process' to declare a single-replica deployment whose \
+                 replay protection is not cross-replica"
+            ));
         }
 
         // A blank id would collapse every plugin config in a namespace onto one
@@ -1771,8 +2154,18 @@ impl SoapWsSecurity {
                 )))
             }
             None => {
-                let scope_key =
-                    plugin_config_id.map(|config_id| nonce_replay_scope_key(namespace, config_id));
+                // Only a policy that can actually make process-local replay
+                // claims needs reload-stable registry state. Timestamp-only,
+                // PasswordText-only, and other replay-inactive policies keep
+                // private empty state so their operator-controlled config ids
+                // cannot consume the bounded registry reserved for live
+                // replay scopes.
+                let scope_key = if replay_active && replay_scope == Some(NonceReplayScope::Process)
+                {
+                    plugin_config_id.map(|config_id| nonce_replay_scope_key(namespace, config_id))
+                } else {
+                    None
+                };
                 NonceReplayBackend::Process(process_replay_state(scope_key.as_deref())?)
             }
         };
@@ -1790,6 +2183,8 @@ impl SoapWsSecurity {
         }
 
         Ok(Self {
+            content_type_mode,
+            allow_mtom,
             require_timestamp,
             timestamp_max_age_seconds,
             timestamp_require_expires,
@@ -1814,6 +2209,10 @@ impl SoapWsSecurity {
             saml_enabled,
             saml_trusted_issuers,
             saml_audience,
+            saml_recipient,
+            saml_max_assertion_lifetime,
+            saml_max_assertion_lifetime_seconds,
+            saml_allowed_confirmation_methods,
             saml_clock_skew,
             saml_trusted_signing_certs,
             saml_allowed_signature_algorithms,
@@ -1828,9 +2227,32 @@ impl SoapWsSecurity {
 
     // ── Timestamp validation ────────────────────────────────────────────
 
-    fn validate_timestamp(&self, security_block: &str, now: DateTime<Utc>) -> Result<(), String> {
-        let ts_block = match find_element_block(security_block, "Timestamp") {
-            Some(b) => b,
+    /// The single namespace-correct `wsu:Timestamp` inside the selected
+    /// Security header, if present.
+    fn timestamp_node<'a, 'input>(
+        security: Node<'a, 'input>,
+    ) -> Result<Option<Node<'a, 'input>>, String> {
+        unique_ns_child(security, WSU_NAMESPACE_URI, "Timestamp", "WS-Security")
+    }
+
+    fn timestamp_instant(
+        timestamp: Node<'_, '_>,
+        local_name: &str,
+    ) -> Result<Option<DateTime<Utc>>, String> {
+        let Some(node) = unique_ns_child(timestamp, WSU_NAMESPACE_URI, local_name, "WS-Security")?
+        else {
+            return Ok(None);
+        };
+        let raw = element_text(node)
+            .ok_or_else(|| format!("WS-Security: Timestamp {local_name} element is empty"))?;
+        let parsed = parse_ws_datetime(&raw)
+            .ok_or_else(|| format!("WS-Security: invalid {local_name} timestamp"))?;
+        Ok(Some(parsed))
+    }
+
+    fn validate_timestamp(&self, security: Node<'_, '_>, now: DateTime<Utc>) -> Result<(), String> {
+        let ts_node = match Self::timestamp_node(security)? {
+            Some(node) => node,
             None => {
                 return if self.require_timestamp {
                     Err("WS-Security: missing Timestamp element".to_string())
@@ -1840,11 +2262,8 @@ impl SoapWsSecurity {
             }
         };
 
-        let created_str = find_element_text(&ts_block, "Created")
+        let created = Self::timestamp_instant(ts_node, "Created")?
             .ok_or_else(|| "WS-Security: Timestamp missing Created element".to_string())?;
-
-        let created = parse_ws_datetime(&created_str)
-            .ok_or_else(|| "WS-Security: invalid Created timestamp".to_string())?;
 
         // Durations are pre-converted at config admission and `parse_ws_datetime`
         // clamps parsed instants to `MIN_PARSED_YEAR..=MAX_PARSED_YEAR`, so
@@ -1869,9 +2288,7 @@ impl SoapWsSecurity {
         }
 
         // Expires check
-        if let Some(expires_str) = find_element_text(&ts_block, "Expires") {
-            let expires = parse_ws_datetime(&expires_str)
-                .ok_or_else(|| "WS-Security: invalid Expires timestamp".to_string())?;
+        if let Some(expires) = Self::timestamp_instant(ts_node, "Expires")? {
             let expires_with_skew = expires.checked_add_signed(skew).ok_or_else(|| {
                 "WS-Security: Expires timestamp is outside the supported range".to_string()
             })?;
@@ -1918,7 +2335,7 @@ impl SoapWsSecurity {
     /// cannot be dropped by simply omitting the element.
     fn validate_username_token_created(
         &self,
-        security_block: &str,
+        security: Node<'_, '_>,
         created_raw: &str,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
@@ -1939,15 +2356,17 @@ impl SoapWsSecurity {
             ));
         }
 
-        let outer_created = find_element_block(security_block, "Timestamp").and_then(|ts_block| {
-            let outer_created = find_element_text(&ts_block, "Created")
-                .and_then(|value| parse_ws_datetime(value.trim()))?;
-            let outer_expires = find_element_text(&ts_block, "Expires")
-                .and_then(|value| parse_ws_datetime(value.trim()));
-            Some((outer_created, outer_expires))
-        });
+        let outer = match Self::timestamp_node(security)? {
+            Some(ts_node) => match Self::timestamp_instant(ts_node, "Created")? {
+                Some(outer_created) => {
+                    Some((outer_created, Self::timestamp_instant(ts_node, "Expires")?))
+                }
+                None => None,
+            },
+            None => None,
+        };
 
-        let Some((outer_created, outer_expires)) = outer_created else {
+        let Some((outer_created, outer_expires)) = outer else {
             return if self.require_timestamp_binding {
                 Err(
                     "WS-Security: PasswordDigest requires a Timestamp with a valid Created value \
@@ -1988,31 +2407,27 @@ impl SoapWsSecurity {
 
     async fn validate_username_token(
         &self,
-        security_block: &str,
+        security: Node<'_, '_>,
         now: DateTime<Utc>,
     ) -> Result<String, UsernameTokenError> {
-        let ut_block = find_element_block(security_block, "UsernameToken").ok_or_else(|| {
-            UsernameTokenError::Structural("WS-Security: missing UsernameToken element".to_string())
-        })?;
+        let structural = |message: &str| UsernameTokenError::Structural(message.to_string());
+        let ut_node = unique_ns_child(security, WSSE_NAMESPACE_URI, "UsernameToken", "WS-Security")
+            .map_err(UsernameTokenError::Structural)?
+            .ok_or_else(|| structural("WS-Security: missing UsernameToken element"))?;
 
-        let username = find_element_text(&ut_block, "Username").ok_or_else(|| {
-            UsernameTokenError::Structural(
-                "WS-Security: UsernameToken missing Username element".to_string(),
-            )
-        })?;
+        let username_node = unique_ns_child(ut_node, WSSE_NAMESPACE_URI, "Username", "WS-Security")
+            .map_err(UsernameTokenError::Structural)?
+            .ok_or_else(|| structural("WS-Security: UsernameToken missing Username element"))?;
+        let username = element_text(username_node)
+            .ok_or_else(|| structural("WS-Security: UsernameToken Username element is empty"))?;
 
-        let password_element = find_element_block(&ut_block, "Password").ok_or_else(|| {
-            UsernameTokenError::Structural(
-                "WS-Security: UsernameToken missing Password element".to_string(),
-            )
-        })?;
+        let password_element =
+            unique_ns_child(ut_node, WSSE_NAMESPACE_URI, "Password", "WS-Security")
+                .map_err(UsernameTokenError::Structural)?
+                .ok_or_else(|| structural("WS-Security: UsernameToken missing Password element"))?;
 
-        let password_value = extract_element_text_content(&password_element, "Password")
-            .ok_or_else(|| {
-                UsernameTokenError::Structural(
-                    "WS-Security: Password element has no content".to_string(),
-                )
-            })?;
+        let password_value = element_text(password_element)
+            .ok_or_else(|| structural("WS-Security: Password element has no content"))?;
 
         // The verification mode is dictated solely by the operator-configured
         // `password_type`, NEVER by the client-supplied `Type` attribute.
@@ -2021,7 +2436,7 @@ impl SoapWsSecurity {
         // (Nonce / Created / replay protection) to plain PasswordText by sending
         // `Type="...#PasswordText"`. If a recognized `Type` attribute is present
         // it must agree with the configured policy; a mismatch is rejected.
-        if let Some(type_attr) = find_attribute(&password_element, "Type") {
+        if let Some(type_attr) = password_element.attribute("Type") {
             let wire_type =
                 if type_attr.contains("PasswordDigest") || type_attr == PASSWORD_DIGEST_TYPE {
                     Some(PasswordType::PasswordDigest)
@@ -2077,18 +2492,21 @@ impl SoapWsSecurity {
                 // known/unknown credential branch so missing digest inputs cannot
                 // themselves become a username oracle.
                 // PasswordDigest = Base64(SHA-1(nonce + created + password))
-                let nonce_b64_raw = find_element_text(&ut_block, "Nonce").ok_or_else(|| {
-                    UsernameTokenError::Structural(
-                        "WS-Security: PasswordDigest requires Nonce element".to_string(),
-                    )
-                })?;
+                let nonce_node =
+                    unique_ns_child(ut_node, WSSE_NAMESPACE_URI, "Nonce", "WS-Security")
+                        .map_err(UsernameTokenError::Structural)?
+                        .ok_or_else(|| {
+                            structural("WS-Security: PasswordDigest requires Nonce element")
+                        })?;
+                let nonce_b64_raw = element_text(nonce_node)
+                    .ok_or_else(|| structural("WS-Security: Nonce element is empty"))?;
 
                 // One canonical form for both the digest input and the replay
-                // cache key (`find_element_text` already trims; being explicit
-                // keeps the two derivations from drifting apart). The length
-                // ceiling is enforced on the *encoded* value before Base64
-                // decoding, so an oversized nonce never allocates a decode
-                // buffer and is never retained.
+                // cache key (`element_text` already trims; being explicit keeps
+                // the two derivations from drifting apart). The length ceiling
+                // is enforced on the *encoded* value before Base64 decoding, so
+                // an oversized nonce never allocates a decode buffer and is
+                // never retained.
                 let nonce_b64 = nonce_b64_raw.trim();
                 if nonce_b64.len() > self.max_nonce_encoded_length {
                     return Err(UsernameTokenError::Structural(
@@ -2103,18 +2521,21 @@ impl SoapWsSecurity {
                     ))
                 })?;
 
-                let created = find_element_text(&ut_block, "Created").ok_or_else(|| {
-                    UsernameTokenError::Structural(
-                        "WS-Security: PasswordDigest requires Created element".to_string(),
-                    )
-                })?;
+                let created_node =
+                    unique_ns_child(ut_node, WSU_NAMESPACE_URI, "Created", "WS-Security")
+                        .map_err(UsernameTokenError::Structural)?
+                        .ok_or_else(|| {
+                            structural("WS-Security: PasswordDigest requires Created element")
+                        })?;
+                let created = element_text(created_node)
+                    .ok_or_else(|| structural("WS-Security: Created element is empty"))?;
 
                 // Freshness + outer-Timestamp binding are structural: the
                 // outcome does not depend on whether the principal exists, so
                 // running them here (before the known/unknown branch) cannot
                 // become a username oracle, and it keeps a stale token from
                 // reaching digest verification at all.
-                self.validate_username_token_created(security_block, &created, now)
+                self.validate_username_token_created(security, &created, now)
                     .map_err(UsernameTokenError::Structural)?;
 
                 // Compute expected digest: SHA-1(nonce + created + password)
@@ -2190,6 +2611,66 @@ impl SoapWsSecurity {
         }
     }
 
+    /// Claim a SAML assertion id for exactly one request inside the fixed
+    /// retention horizon (GHSA-f44p-hfqr-cvcc).
+    ///
+    /// The claim key binds the issuer to the id, so two IdPs cannot collide and
+    /// one cannot burn the other's ids. Retention is the same schema-wide
+    /// [`NONCE_CLAIM_RETENTION_SECONDS`] horizon, which a compile-time
+    /// assertion proves dominates
+    /// `MAX_SAML_ASSERTION_LIFETIME_SECONDS + 2 * MAX_CLOCK_SKEW_SECONDS` — the
+    /// widest span any admissible SAML policy can accept one unchanged
+    /// assertion over — so no reload generation can expire a claim while a
+    /// later generation would still accept the assertion.
+    ///
+    /// The claim scope is exactly what `nonce.replay_scope` declares. `process`
+    /// is single-replica by construction and makes no cross-replica claim;
+    /// `shared` is one atomic Redis `SET NX EX` across every replica. There is
+    /// deliberately no fallback between them: a per-replica fallback would
+    /// silently reinstate "one replay per replica".
+    async fn claim_saml_assertion(&self, issuer: &str, assertion_id: &str) -> Result<(), String> {
+        // The claim key is a fixed-width digest, never the issuer or the
+        // assertion id: both are credential-adjacent values that would
+        // otherwise reach a Redis keyspace, `MONITOR`, `SLOWLOG`, and the Redis
+        // client's error logging.
+        let mut material = Vec::with_capacity(issuer.len() + assertion_id.len() + 32);
+        material.extend_from_slice(b"soap-ws-security/saml-assertion/v1|");
+        material.extend_from_slice(issuer.as_bytes());
+        material.push(0);
+        material.extend_from_slice(assertion_id.as_bytes());
+        let claim_key = sha256_hex_lower(&material);
+
+        match &self.nonce_backend {
+            NonceReplayBackend::Process(_) => self
+                .check_replay_claim_at(&saml_process_claim_key(&claim_key), Instant::now())
+                .map_err(|error| {
+                    if error == REPLAY_DETECTED_MESSAGE {
+                        SAML_REPLAY_DETECTED_MESSAGE.to_string()
+                    } else {
+                        error
+                    }
+                }),
+            NonceReplayBackend::Shared(client) => {
+                if !client.is_available() {
+                    return Err(Self::shared_backend_unavailable());
+                }
+                let key = client.make_key(&["saml-assertion", claim_key.as_str()]);
+                match client
+                    .set_bytes_nx_with_expire(
+                        &key,
+                        SHARED_NONCE_CLAIM_RECORD,
+                        self.shared_claim_retention_seconds(),
+                    )
+                    .await
+                {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(SAML_REPLAY_DETECTED_MESSAGE.to_string()),
+                    Err(()) => Err(Self::shared_backend_unavailable()),
+                }
+            }
+        }
+    }
+
     /// TTL written with a shared claim: the fixed
     /// [`NONCE_CLAIM_RETENTION_SECONDS`] horizon, identical on every replica and
     /// in every generation.
@@ -2240,7 +2721,7 @@ impl SoapWsSecurity {
             .await;
         match claimed {
             Ok(true) => Ok(()),
-            Ok(false) => Err("WS-Security: nonce replay detected".to_string()),
+            Ok(false) => Err(REPLAY_DETECTED_MESSAGE.to_string()),
             Err(()) => Err(Self::shared_backend_unavailable()),
         }
     }
@@ -2320,7 +2801,15 @@ impl SoapWsSecurity {
         if nonce.len() > self.max_nonce_encoded_length {
             return Err(Self::nonce_too_long());
         }
+        self.check_replay_claim_at(&nonce_process_claim_key(nonce), now)
+    }
 
+    /// Process-local single-use claim for an already-namespaced key.
+    ///
+    /// Shared by PasswordDigest nonces and SAML assertion ids; the caller
+    /// supplies a key carrying its own claim-kind prefix so the two classes can
+    /// never collide in the one process-global map.
+    fn check_replay_claim_at(&self, nonce: &str, now: Instant) -> Result<(), String> {
         let NonceReplayBackend::Process(replay_state) = &self.nonce_backend else {
             // A shared-scope instance has no process-local state to consult;
             // answering from an empty local map would be a silent bypass.
@@ -2356,7 +2845,7 @@ impl SoapWsSecurity {
                 return Err(Self::nonce_state_saturated_after_unlock(state));
             }
             if Self::nonce_age_seconds(now, age_key.0) < retention_seconds {
-                return Err("WS-Security: nonce replay detected".to_string());
+                return Err(REPLAY_DETECTED_MESSAGE.to_string());
             }
 
             let Some(new_age_key) = state.allocate_age_key(now) else {
@@ -2380,7 +2869,7 @@ impl SoapWsSecurity {
             return Ok(());
         }
 
-        let incoming_bytes = nonce.len();
+        let incoming_bytes = charged_claim_key_bytes(nonce);
         if !state.has_capacity(
             incoming_bytes,
             self.max_nonce_cache_size,
@@ -2505,10 +2994,9 @@ impl SoapWsSecurity {
         let state = replay_state
             .lock()
             .map_err(|_| "soap_ws_security: nonce replay observation unavailable".to_string())?;
-        let recomputed_key_bytes = state
-            .cache
-            .keys()
-            .try_fold(0usize, |total, nonce| total.checked_add(nonce.len()));
+        let recomputed_key_bytes = state.cache.keys().try_fold(0usize, |total, nonce| {
+            total.checked_add(charged_claim_key_bytes(nonce))
+        });
         let Some(recomputed_key_bytes) = recomputed_key_bytes else {
             return Err(
                 "soap_ws_security: nonce replay observation accounting overflow".to_string(),
@@ -2550,7 +3038,42 @@ impl SoapWsSecurity {
         created_raw: &str,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
-        self.validate_username_token_created(security_block, created_raw, now)
+        // `security_block` is the *inner* content of a `wsse:Security` header;
+        // the wrapper (and its namespace bindings) is supplied here so a test
+        // fixture cannot accidentally exercise a differently-namespaced shape.
+        let wrapped = format!(
+            r#"<wsse:Security xmlns:wsse="{WSSE_NAMESPACE_URI}" xmlns:wsu="{WSU_NAMESPACE_URI}">{security_block}</wsse:Security>"#
+        );
+        let document = parse_bounded_xml(&wrapped, "test Security block")?;
+        self.validate_username_token_created(document.root_element(), created_raw, now)
+    }
+
+    /// Media-type classification outcome for external tests as a stable string:
+    /// `"xml"` / `"xop"` / `"mtom"` for a governed representation,
+    /// `"pass_through"`, or `"reject:<status>:<class>"`.
+    #[allow(dead_code)]
+    pub(crate) fn classify_request_for_tests(&self, content_type: Option<&str>) -> String {
+        match self.classify_request(content_type) {
+            SoapRequestDisposition::Governed(SoapMediaClass::Mtom { .. }) => "mtom".to_string(),
+            SoapRequestDisposition::Governed(SoapMediaClass::Xop) => "xop".to_string(),
+            SoapRequestDisposition::Governed(SoapMediaClass::Xml) => "xml".to_string(),
+            SoapRequestDisposition::PassThrough => "pass_through".to_string(),
+            SoapRequestDisposition::Reject(rejection) => {
+                let status = rejection.status_code();
+                format!("reject:{status}:{}", rejection.class())
+            }
+        }
+    }
+
+    /// One SAML assertion single-use claim, so replay across generations and
+    /// instances can be pinned without a live message.
+    #[allow(dead_code)]
+    pub(crate) async fn claim_saml_assertion_for_tests(
+        &self,
+        issuer: &str,
+        assertion_id: &str,
+    ) -> Result<(), String> {
+        self.claim_saml_assertion(issuer, assertion_id).await
     }
 
     /// The TTL a shared (Redis) claim is written with, without needing a live
@@ -2622,18 +3145,47 @@ impl SoapWsSecurity {
 
     // ── X.509 signature verification ────────────────────────────────────
 
-    fn validate_x509_signature(&self, security_block: &str, envelope: &str) -> Result<(), String> {
-        let document = parse_bounded_xml(envelope, "SOAP")?;
-        let security_node = selected_security_node(&document, envelope, security_block)?;
-        let sig_node = unique_child_element(security_node, "Signature", "WS-Security")?
-            .ok_or_else(|| "WS-Security: missing Signature element".to_string())?;
-        let signed_info_node = unique_child_element(sig_node, "SignedInfo", "WS-Security")?
-            .ok_or_else(|| "WS-Security: Signature missing SignedInfo element".to_string())?;
-        let sig_block = node_source(envelope, sig_node)?;
+    /// Verify the WS-Security X.509 message signature.
+    ///
+    /// Returns the request principal the trusted certificate stands for.
+    ///
+    /// **Ordering (GHSA-9g4v-h9hm-846r).** Certificate trust and
+    /// `SignatureValue`-over-`SignedInfo` are settled *before* a single
+    /// attacker-selected `<Reference>` is resolved, canonicalized, or digested.
+    /// Trust is a fixed-size fingerprint comparison and `SignedInfo` is a small
+    /// bounded subtree, so an untrusted or forged signature is refused after
+    /// constant work no matter how the References are shaped. Previously every
+    /// declared Reference drove two full-envelope id scans plus a subtree
+    /// canonicalization first, so 64 references to one large element multiplied
+    /// a 10 MiB body into gigabytes of unauthenticated work.
+    ///
+    /// **Coverage (GHSA-3mwq-c8j6-9xhp).** A valid signature is not enough: a
+    /// Reference must resolve uniquely to the *namespace-correct SOAP Body the
+    /// backend will consume*, so a trusted signature over only the Timestamp
+    /// can no longer authorize an arbitrary rewritten operation.
+    fn validate_x509_signature<'a, 'i>(
+        &self,
+        structure: &SoapEnvelopeStructure<'a, 'i>,
+        security: Node<'a, 'i>,
+        id_index: &DocumentIdIndex<'a, 'i>,
+        envelope: &str,
+        budget: &mut WorkBudget,
+    ) -> Result<&str, String> {
+        let sig_node =
+            unique_ns_child(security, XMLDSIG_NAMESPACE_URI, "Signature", "WS-Security")?
+                .ok_or_else(|| "WS-Security: missing Signature element".to_string())?;
+        let signed_info_node =
+            unique_ns_child(sig_node, XMLDSIG_NAMESPACE_URI, "SignedInfo", "WS-Security")?
+                .ok_or_else(|| "WS-Security: Signature missing SignedInfo element".to_string())?;
 
         // Determine signature algorithm
-        let sig_method = unique_child_element(signed_info_node, "SignatureMethod", "WS-Security")?
-            .ok_or_else(|| "WS-Security: SignedInfo missing SignatureMethod".to_string())?;
+        let sig_method = unique_ns_child(
+            signed_info_node,
+            XMLDSIG_NAMESPACE_URI,
+            "SignatureMethod",
+            "WS-Security",
+        )?
+        .ok_or_else(|| "WS-Security: SignedInfo missing SignatureMethod".to_string())?;
         let sig_algorithm_uri = sig_method.attribute("Algorithm").ok_or_else(|| {
             "WS-Security: SignatureMethod missing Algorithm attribute".to_string()
         })?;
@@ -2658,17 +3210,14 @@ impl SoapWsSecurity {
 
         let canonicalization = parse_signed_info_canonicalization(signed_info_node, "WS-Security")?;
 
-        // Verify Reference digests
-        self.verify_reference_digests(signed_info_node, security_node, sig_node, envelope)?;
-
-        // Check that Timestamp is signed (if required)
-        if self.require_signed_timestamp {
-            self.verify_timestamp_is_signed(signed_info_node, security_node)?;
-        }
-
         // Extract SignatureValue
-        let sig_value_node = unique_child_element(sig_node, "SignatureValue", "WS-Security")?
-            .ok_or_else(|| "WS-Security: Signature missing SignatureValue".to_string())?;
+        let sig_value_node = unique_ns_child(
+            sig_node,
+            XMLDSIG_NAMESPACE_URI,
+            "SignatureValue",
+            "WS-Security",
+        )?
+        .ok_or_else(|| "WS-Security: Signature missing SignatureValue".to_string())?;
         let sig_value_b64 = sig_value_node
             .text()
             .ok_or_else(|| "WS-Security: SignatureValue is empty".to_string())?;
@@ -2677,22 +3226,15 @@ impl SoapWsSecurity {
             .decode(sig_value_b64.replace(char::is_whitespace, "").as_bytes())
             .map_err(|e| format!("WS-Security: invalid SignatureValue base64: {}", e))?;
 
-        // Extract the certificate (BinarySecurityToken or inline KeyInfo)
-        let cert_der = self.extract_signing_cert(security_block, sig_block)?;
-
-        // Verify the cert is trusted
+        // ── Authenticate the signer BEFORE resolving any Reference ──────
+        let cert_der = self.extract_signing_cert(security, sig_node)?;
         let cert_fingerprint = digest::digest(&digest::SHA256, &cert_der).as_ref().to_vec();
-
         let trusted = self
             .trusted_certs
             .iter()
             .find(|tc| tc.fingerprint == cert_fingerprint);
-
-        let public_key_der = match trusted {
-            Some(tc) => &tc.public_key_der,
-            None => {
-                return Err("WS-Security: signing certificate is not trusted".to_string());
-            }
+        let Some(trusted) = trusted else {
+            return Err("WS-Security: signing certificate is not trusted".to_string());
         };
 
         // Verify the signature over the canonicalized SignedInfo node. Parsing
@@ -2703,6 +3245,7 @@ impl SoapWsSecurity {
             signed_info_node,
             &canonicalization.inclusive_prefixes,
             None,
+            budget,
         )?;
 
         let verify_algorithm: &dyn ring_sig::VerificationAlgorithm = match sig_algorithm {
@@ -2710,55 +3253,118 @@ impl SoapWsSecurity {
             SignatureAlgorithm::RsaSha1 => &ring_sig::RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY,
         };
 
-        let public_key = ring_sig::UnparsedPublicKey::new(verify_algorithm, public_key_der);
+        let public_key =
+            ring_sig::UnparsedPublicKey::new(verify_algorithm, &trusted.public_key_der);
 
         public_key
             .verify(&signed_info_bytes, &sig_bytes)
             .map_err(|_| "WS-Security: signature verification failed".to_string())?;
 
+        // ── Authenticated. Only now is Reference work performed ─────────
+        let coverage = self.verify_reference_digests(
+            signed_info_node,
+            security,
+            sig_node,
+            &ReferenceDigestDocument {
+                structure,
+                id_index,
+                envelope,
+            },
+            budget,
+        )?;
+
+        // A signature that does not commit to the operation the backend will
+        // execute authenticates nothing about that operation.
+        if !coverage.covers_body {
+            return Err(
+                "WS-Security: signature does not cover the SOAP Body — a Reference must resolve \
+                 uniquely to the backend-visible Body element"
+                    .to_string(),
+            );
+        }
+
+        // Check that Timestamp is signed (if required)
+        if self.require_signed_timestamp {
+            Self::verify_timestamp_is_signed(security, &coverage)?;
+        }
+
         debug!("soap_ws_security: X.509 signature verified successfully");
-        Ok(())
+        Ok(trusted.principal.as_str())
     }
 
-    fn verify_reference_digests(
+    fn verify_reference_digests<'a, 'i>(
         &self,
-        signed_info: Node<'_, '_>,
-        security_node: Node<'_, '_>,
-        signature_node: Node<'_, '_>,
-        envelope: &str,
-    ) -> Result<(), String> {
-        let mut reference_count = 0;
-        for reference in signed_info
+        signed_info: Node<'a, 'i>,
+        security: Node<'a, 'i>,
+        signature_node: Node<'a, 'i>,
+        document: &ReferenceDigestDocument<'_, 'a, 'i>,
+        budget: &mut WorkBudget,
+    ) -> Result<ReferenceCoverage, String> {
+        let references: Vec<Node<'a, 'i>> = signed_info
             .children()
-            .filter(|node| node.has_tag_name("Reference"))
-        {
-            reference_count += 1;
-            // Bound attacker-controlled work: each Reference triggers a
-            // full-envelope id-uniqueness scan plus an element resolution and a
-            // digest over the referenced bytes, all before the signature is
-            // verified. Capping the Reference count keeps an unauthenticated
-            // request from forcing O(references × body) CPU. A legitimate
-            // WS-Security signature covers a handful of elements (Timestamp,
-            // Body, a few headers); 64 is far above any real use.
-            if reference_count > MAX_SIGNED_REFERENCES {
-                return Err(format!(
-                    "WS-Security: too many Signature References (> {})",
-                    MAX_SIGNED_REFERENCES
-                ));
-            }
+            .filter(|node| node.has_tag_name((XMLDSIG_NAMESPACE_URI, "Reference")))
+            .collect();
+        // Bound authenticated work. References are resolved only after the
+        // signer is trusted, so this is no longer an unauthenticated
+        // amplification budget — but the profiles Ferrum supports (Timestamp,
+        // Body, a small number of headers) never approach it.
+        if references.len() > MAX_SIGNED_REFERENCES {
+            return Err(format!(
+                "WS-Security: too many Signature References (> {})",
+                MAX_SIGNED_REFERENCES
+            ));
+        }
+
+        // Collect and de-duplicate the fragment ids first, so the raw-attribute
+        // uniqueness guard is one bounded pass over the envelope for the whole
+        // SignedInfo rather than one pass per Reference.
+        let mut reference_ids: Vec<&str> = Vec::with_capacity(references.len());
+        for reference in &references {
             let uri = reference
                 .attribute("URI")
                 .ok_or_else(|| "WS-Security: Reference missing URI attribute".to_string())?;
+            let Some(ref_id) = uri.strip_prefix('#') else {
+                return Err("WS-Security: unsupported non-fragment Reference URI".to_string());
+            };
+            if ref_id.is_empty() {
+                return Err("WS-Security: empty fragment Reference URI is unsupported".to_string());
+            }
+            // Two References to one id are never meaningful and are exactly the
+            // shape that multiplied canonicalization work in
+            // GHSA-9g4v-h9hm-846r.
+            if reference_ids.contains(&ref_id) {
+                return Err(
+                    "WS-Security: duplicate Signature Reference URI is not allowed".to_string(),
+                );
+            }
+            reference_ids.push(ref_id);
+        }
+        let raw_occurrences = count_raw_id_occurrences(document.envelope, &reference_ids)?;
+
+        let mut coverage = ReferenceCoverage::default();
+        for (index, reference) in references.iter().enumerate() {
+            let reference = *reference;
+            let ref_id = reference_ids[index];
             // Determine the digest algorithm
-            let digest_method = unique_child_element(reference, "DigestMethod", "WS-Security")?
-                .ok_or_else(|| "WS-Security: Reference missing DigestMethod".to_string())?;
+            let digest_method = unique_ns_child(
+                reference,
+                XMLDSIG_NAMESPACE_URI,
+                "DigestMethod",
+                "WS-Security",
+            )?
+            .ok_or_else(|| "WS-Security: Reference missing DigestMethod".to_string())?;
             let digest_alg_uri = digest_method
                 .attribute("Algorithm")
                 .ok_or_else(|| "WS-Security: DigestMethod missing Algorithm".to_string())?;
 
             // Extract expected digest
-            let digest_value = unique_child_element(reference, "DigestValue", "WS-Security")?
-                .ok_or_else(|| "WS-Security: Reference missing DigestValue".to_string())?;
+            let digest_value = unique_ns_child(
+                reference,
+                XMLDSIG_NAMESPACE_URI,
+                "DigestValue",
+                "WS-Security",
+            )?
+            .ok_or_else(|| "WS-Security: Reference missing DigestValue".to_string())?;
             let expected_b64 = digest_value
                 .text()
                 .ok_or_else(|| "WS-Security: DigestValue is empty".to_string())?;
@@ -2767,57 +3373,57 @@ impl SoapWsSecurity {
                 .decode(expected_b64.replace(char::is_whitespace, "").as_bytes())
                 .map_err(|e| format!("WS-Security: invalid DigestValue base64: {}", e))?;
 
-            // Find the referenced element
-            let referenced_node = if let Some(ref_id) = uri.strip_prefix('#') {
-                if ref_id.is_empty() {
-                    return Err("WS-Security: empty fragment Reference URI is unsupported".into());
-                }
-                // XML Signature Wrapping defense: a signed reference must
-                // resolve to exactly ONE element in the whole envelope.
-                // WS-Security / XMLDSIG ids are document-unique, so a duplicate
-                // wsu:Id means an attacker wrapped the signed element — the bytes
-                // we digest (the first match) could then differ from the element a
-                // backend consumes. The count spans the FULL envelope, not just
-                // the regions the resolver searches, so a duplicate injected
-                // anywhere is caught. Mirrors the SAML single-Assertion guard.
-                let occurrences = count_wsu_id_occurrences(envelope, ref_id)?;
-                if occurrences > 1 {
-                    return Err(format!(
-                        "WS-Security: referenced id '{}' is not unique in the envelope \
-                         ({} occurrences) — possible XML signature wrapping",
-                        ref_id, occurrences
-                    ));
-                }
-                let decoded_occurrences =
-                    count_dom_id_occurrences(security_node.document(), ref_id);
-                if decoded_occurrences != 1 {
-                    return Err(format!(
-                        "WS-Security: decoded referenced id '{}' is not unique in the envelope \
-                         ({} occurrences) — possible XML signature wrapping",
-                        ref_id, decoded_occurrences
-                    ));
-                }
-                find_descendant_by_wsu_id(security_node, ref_id)
-                    .or_else(|| {
-                        envelope_body_node(security_node.document())
-                            .and_then(|body| find_descendant_by_wsu_id(body, ref_id))
-                    })
-                    .ok_or_else(|| {
-                        format!("WS-Security: referenced element '{}' not found", ref_id)
-                    })?
-            } else {
-                return Err(format!("WS-Security: unsupported Reference URI '{}'", uri));
-            };
+            // XML Signature Wrapping defense: a signed reference must resolve to
+            // exactly ONE element in the whole envelope. `resolve_unique` below
+            // is what enforces "exactly one" — it reads the entity-decoded DOM,
+            // so it sees the same value a backend's parser sees. The raw
+            // start-tag scan is the defence-in-depth *over-count* on top of it:
+            // it recognizes broader id spellings a tolerant backend might
+            // resolve but the DOM index does not index.
+            //
+            // It must stay an over-count check. A raw byte scan cannot see
+            // through character references, so `wsu:Id="TS&#x2D;1"` — one
+            // legitimate element whose decoded id is exactly `TS-1` — scans as
+            // zero raw occurrences. Requiring exactly one here would reject that
+            // message while adding nothing: any decoded duplicate is already
+            // caught by `resolve_unique`, and any raw duplicate under a spelling
+            // the DOM misses is caught by `> 1`.
+            if raw_occurrences[index] > 1 {
+                return Err(format!(
+                    "WS-Security: referenced id is not unique in the envelope ({} raw \
+                     occurrences) — possible XML signature wrapping",
+                    raw_occurrences[index]
+                ));
+            }
+            let referenced_node = document.id_index.resolve_unique(ref_id)?;
+
+            // The referenced element must live inside the Security header or
+            // inside the backend-visible Body. Anything else is a subtree the
+            // gateway does not govern and a backend does not consume.
+            let referenced_id = referenced_node.id();
+            let in_security = node_is_within(referenced_node, security);
+            let in_body = node_is_within(referenced_node, document.structure.body);
+            if !in_security && !in_body {
+                return Err(
+                    "WS-Security: Reference resolves outside the Security header and the SOAP Body"
+                        .to_string(),
+                );
+            }
+            if referenced_id == document.structure.body.id() {
+                coverage.covers_body = true;
+            }
+            coverage.covered.push(referenced_id);
 
             let transforms = parse_reference_transforms(reference, "WS-Security")?;
             let excluded_signature = transforms
                 .enveloped_signature
                 .then_some(signature_node.id());
             let referenced_content = exclusive_canonicalize(
-                envelope,
+                document.envelope,
                 referenced_node,
                 &transforms.inclusive_prefixes,
                 excluded_signature,
+                budget,
             )?;
 
             // Compute and compare digest. The allowed_digest_algorithms list
@@ -2860,10 +3466,7 @@ impl SoapWsSecurity {
             };
 
             if computed.as_ref() != expected_bytes.as_slice() {
-                return Err(format!(
-                    "WS-Security: digest mismatch for Reference URI '{}'",
-                    uri
-                ));
+                return Err("WS-Security: Reference digest mismatch".to_string());
             }
         }
 
@@ -2871,68 +3474,58 @@ impl SoapWsSecurity {
         // A signature with zero references would otherwise be considered
         // valid here even though it signs nothing meaningful — making it
         // trivial to bypass `require_signed_timestamp`.
-        if reference_count == 0 {
+        if references.is_empty() {
             return Err("WS-Security: SignedInfo contains no Reference elements".to_string());
         }
 
+        Ok(coverage)
+    }
+
+    /// A required signed Timestamp must actually exist and actually be covered.
+    ///
+    /// This used to return `Ok` when the selected Security header carried no
+    /// Timestamp at all, so `require_signed_timestamp: true` was satisfied
+    /// vacuously by omitting the element (GHSA-3mwq-c8j6-9xhp). Admission now
+    /// also refuses `require_signed_timestamp` alongside
+    /// `timestamp.require: false`, so the two policies cannot contradict.
+    fn verify_timestamp_is_signed(
+        security: Node<'_, '_>,
+        coverage: &ReferenceCoverage,
+    ) -> Result<(), String> {
+        let Some(timestamp) = Self::timestamp_node(security)? else {
+            return Err(
+                "WS-Security: a signed Timestamp is required but the Security header has none"
+                    .to_string(),
+            );
+        };
+        if !coverage.covered.contains(&timestamp.id()) {
+            return Err("WS-Security: Timestamp is not included in the signature".to_string());
+        }
         Ok(())
     }
 
-    fn verify_timestamp_is_signed(
-        &self,
-        signed_info: Node<'_, '_>,
-        security_node: Node<'_, '_>,
-    ) -> Result<(), String> {
-        let timestamp = match descendant_element(security_node, "Timestamp") {
-            Some(timestamp) => timestamp,
-            None => return Ok(()), // No timestamp to sign — timestamp validation handles this
-        };
-        let ts_id = timestamp
-            .attributes()
-            .find(|attribute| {
-                attribute.name() == "Id"
-                    && (attribute.namespace().is_none()
-                        || attribute.namespace() == Some(WSU_NAMESPACE_URI))
-            })
-            .map(|attribute| attribute.value())
-            .ok_or_else(|| {
-                "WS-Security: Timestamp has no wsu:Id — cannot verify it is signed".to_string()
-            })?;
-
-        // DOM attribute values are entity-decoded, matching Reference
-        // resolution and canonicalization semantics.
-        let expected = format!("#{}", ts_id);
-        for reference in signed_info
-            .children()
-            .filter(|node| node.has_tag_name("Reference"))
-        {
-            if reference.attribute("URI") == Some(expected.as_str()) {
-                return Ok(());
-            }
-        }
-
-        Err("WS-Security: Timestamp is not included in the signature".to_string())
-    }
-
+    /// Resolve the signing certificate from the namespace-correct
+    /// `wsse:BinarySecurityToken` child of the Security header, or from
+    /// `dsig:KeyInfo/dsig:X509Data/dsig:X509Certificate` inside the signature.
     fn extract_signing_cert(
         &self,
-        security_block: &str,
-        sig_block: &str,
+        security: Node<'_, '_>,
+        signature: Node<'_, '_>,
     ) -> Result<Vec<u8>, String> {
-        // Try BinarySecurityToken first
-        if let Some(bst) = find_element_block(security_block, "BinarySecurityToken") {
-            let cert_b64 = extract_element_text_content(&bst, "BinarySecurityToken")
+        if let Some(bst) = unique_ns_child(
+            security,
+            WSSE_NAMESPACE_URI,
+            "BinarySecurityToken",
+            "WS-Security",
+        )? {
+            let cert_b64 = element_text(bst)
                 .ok_or_else(|| "WS-Security: BinarySecurityToken has no content".to_string())?;
-
             return BASE64
                 .decode(cert_b64.replace(char::is_whitespace, "").as_bytes())
                 .map_err(|e| format!("WS-Security: invalid BinarySecurityToken base64: {}", e));
         }
 
-        // Try inline X509Certificate in KeyInfo
-        if let Some(key_info) = find_element_block(sig_block, "KeyInfo")
-            && let Some(cert_b64) = find_element_text(&key_info, "X509Certificate")
-        {
+        if let Some(cert_b64) = xmldsig_key_info_certificate(signature, "WS-Security")? {
             return BASE64
                 .decode(cert_b64.replace(char::is_whitespace, "").as_bytes())
                 .map_err(|e| format!("WS-Security: invalid X509Certificate base64: {}", e));
@@ -2945,174 +3538,371 @@ impl SoapWsSecurity {
 
     /// Validate the SAML assertion inside a WS-Security header.
     ///
-    /// Returns the assertion's Subject NameID on success (the "who" of the
-    /// assertion) so callers can stash it in request metadata.
+    /// Returns the assertion's Subject `NameID` on success — the "who" of the
+    /// assertion — which the caller publishes as the request principal. Exactly
+    /// one namespace-correct, nonblank `NameID` is required, and it is resolved
+    /// before the single-use claim, so an assertion that authenticates nobody
+    /// fails closed without consuming replay state.
     ///
     /// Verification order is signature-first: an attacker who can post a SOAP
     /// body controls every text node in the assertion, so issuer / conditions
-    /// / audience checks only mean something AFTER the assertion's XMLDSIG
-    /// signature has been verified against a configured trusted IdP cert.
-    fn validate_saml_assertion(
+    /// / audience / recipient checks only mean something AFTER the assertion's
+    /// XMLDSIG signature has been verified against a configured trusted IdP
+    /// cert.
+    ///
+    /// **GHSA-f44p-hfqr-cvcc.** A signed assertion is a bearer value: nothing
+    /// in it changes between presentations, and the outer WS-Security Timestamp
+    /// it travels beside is not covered by its signature, so an attacker can
+    /// remint that Timestamp and replay indefinitely. This path therefore
+    /// requires, in order: a bounded `Conditions` window (both instants
+    /// mandatory, span capped by `max_assertion_lifetime_seconds`), the
+    /// configured service `Audience`, a supported `SubjectConfirmation` whose
+    /// `SubjectConfirmationData` names the configured `Recipient` and carries
+    /// its own bounded `NotOnOrAfter`, a resolvable Subject `NameID`, and
+    /// finally an atomic single-use claim on the assertion id in the declared
+    /// replay scope. `OneTimeUse` needs no special case because every accepted
+    /// assertion is claimed exactly once; a replay backend outage fails closed
+    /// like every other replay decision.
+    async fn validate_saml_assertion<'a, 'i>(
         &self,
-        security_block: &str,
+        security: Node<'a, 'i>,
         envelope: &str,
         now: DateTime<Utc>,
-    ) -> Result<Option<String>, String> {
-        let document = parse_bounded_xml(envelope, "SAML SOAP")?;
-        let security_node = selected_security_node(&document, envelope, security_block)?;
-        let assertion_node = match descendant_element(security_node, "Assertion") {
-            Some(assertion) => assertion,
-            None => {
-                return if self.saml_enabled {
-                    Err("WS-Security: missing SAML Assertion element".to_string())
-                } else {
-                    Ok(None)
-                };
+        budget: &mut WorkBudget,
+    ) -> Result<String, String> {
+        let document = security.document();
+        let mut assertion_node = None;
+        for node in document.descendants().filter(Node::is_element) {
+            if !node.has_tag_name((SAML2_ASSERTION_NS, "Assertion")) {
+                continue;
             }
-        };
-
-        // Defense in depth: only ever validate a single assertion. If an
-        // attacker can wedge a second Assertion anywhere in the SOAP envelope,
-        // downstream consumers that walk all assertions could see an
-        // identity we never verified. Cheap insurance — reject and let the
-        // operator deal with malformed/multi-assertion messages explicitly.
-        if document
-            .descendants()
-            .filter(|node| node.has_tag_name("Assertion"))
-            .count()
-            > 1
-        {
-            return Err(
-                "WS-Security: multiple SAML Assertion elements are not allowed".to_string(),
-            );
+            // Only ever validate a single assertion. A second one anywhere in
+            // the envelope lets a downstream consumer that walks all assertions
+            // see an identity the gateway never verified.
+            if assertion_node.replace(node).is_some() {
+                return Err(
+                    "WS-Security: multiple SAML Assertion elements are not allowed".to_string(),
+                );
+            }
+            if !node_is_within(node, security) {
+                return Err(
+                    "WS-Security: SAML Assertion appears outside the wsse:Security header"
+                        .to_string(),
+                );
+            }
         }
+        // Only reached from an enabled SAML policy, so an absent assertion is
+        // always terminal.
+        let Some(assertion_node) = assertion_node else {
+            return Err("WS-Security: missing SAML Assertion element".to_string());
+        };
 
         // ── 1. Signature verification ─────────────────────────────────
         // Must run before any other check — every other field is
         // attacker-controlled until we know the IdP signed this assertion.
-        self.validate_saml_signature(assertion_node, envelope)?;
+        self.validate_saml_signature(assertion_node, envelope, budget)?;
 
         // ── 2. Issuer trust ───────────────────────────────────────────
-        let issuer_node = unique_child_element(assertion_node, "Issuer", "WS-Security: SAML")?
-            .ok_or_else(|| "WS-Security: SAML Assertion missing Issuer element".to_string())?;
-        let issuer = decoded_element_text(issuer_node)
+        let issuer_node = unique_ns_child(
+            assertion_node,
+            SAML2_ASSERTION_NS,
+            "Issuer",
+            "WS-Security: SAML",
+        )?
+        .ok_or_else(|| "WS-Security: SAML Assertion missing Issuer element".to_string())?;
+        let issuer = element_text(issuer_node)
             .ok_or_else(|| "WS-Security: SAML Issuer is empty".to_string())?;
 
+        // The rejected issuer is credential material presented by the caller
+        // and is never echoed to the client or written to a log line.
         if !self.saml_trusted_issuers.iter().any(|ti| ti == &issuer) {
-            return Err(format!(
-                "WS-Security: SAML Issuer '{}' is not trusted",
-                escape_xml_chars(&issuer)
-            ));
+            return Err("WS-Security: SAML Issuer is not trusted".to_string());
         }
 
-        // ── 3. Conditions: NotBefore / NotOnOrAfter / Audience ────────
-        if let Some(conditions) =
-            unique_child_element(assertion_node, "Conditions", "WS-Security: SAML")?
+        // ── 3. Conditions: bounded validity + service audience ────────
+        let skew = self.saml_clock_skew;
+        let conditions = unique_ns_child(
+            assertion_node,
+            SAML2_ASSERTION_NS,
+            "Conditions",
+            "WS-Security: SAML",
+        )?
+        .ok_or_else(|| {
+            "WS-Security: SAML Assertion has no Conditions — a bounded validity window is required"
+                .to_string()
+        })?;
+
+        let not_before = conditions
+            .attribute("NotBefore")
+            .ok_or_else(|| "WS-Security: SAML Conditions missing NotBefore".to_string())
+            .and_then(|raw| {
+                parse_ws_datetime(raw)
+                    .ok_or_else(|| "WS-Security: invalid SAML NotBefore".to_string())
+            })?;
+        let not_on_or_after = conditions
+            .attribute("NotOnOrAfter")
+            .ok_or_else(|| "WS-Security: SAML Conditions missing NotOnOrAfter".to_string())
+            .and_then(|raw| {
+                parse_ws_datetime(raw)
+                    .ok_or_else(|| "WS-Security: invalid SAML NotOnOrAfter".to_string())
+            })?;
+        if not_on_or_after <= not_before {
+            return Err("WS-Security: SAML Conditions window is empty or inverted".to_string());
+        }
+        // The cap is what keeps a captured assertion from being an effectively
+        // indefinite credential even before replay state is consulted, and it
+        // is what makes the fixed replay-claim horizon provably sufficient.
+        if not_on_or_after - not_before > self.saml_max_assertion_lifetime {
+            return Err(format!(
+                "WS-Security: SAML Assertion validity window exceeds the permitted {}s",
+                self.saml_max_assertion_lifetime_seconds
+            ));
+        }
+        if now + skew < not_before {
+            return Err("WS-Security: SAML Assertion is not yet valid".to_string());
+        }
+        let expiry_with_skew = not_on_or_after.checked_add_signed(skew).ok_or_else(|| {
+            "WS-Security: SAML NotOnOrAfter is outside the supported range".to_string()
+        })?;
+        if now > expiry_with_skew {
+            return Err("WS-Security: SAML Assertion has expired".to_string());
+        }
+
+        let expected_audience = self
+            .saml_audience
+            .as_deref()
+            .ok_or_else(|| "WS-Security: SAML audience binding is not configured".to_string())?;
+        let mut audience_matched = false;
+        let mut audience_restrictions = 0usize;
+        for restriction in conditions
+            .children()
+            .filter(|node| node.has_tag_name((SAML2_ASSERTION_NS, "AudienceRestriction")))
         {
-            // Pre-converted at admission. Attacker-supplied instants still use
-            // checked addition: overflow is unreachable under the current
-            // `parse_ws_datetime` year clamp (`MIN_PARSED_YEAR..=MAX_PARSED_YEAR`,
-            // upper bound 9999), and the checked operation keeps this path
-            // fail-closed if that admission invariant ever drifts.
-            let skew = self.saml_clock_skew;
-
-            if let Some(not_before_str) = conditions.attribute("NotBefore") {
-                let not_before = parse_ws_datetime(not_before_str).ok_or_else(|| {
-                    format!("WS-Security: invalid SAML NotBefore '{}'", not_before_str)
-                })?;
-                if now + skew < not_before {
-                    return Err("WS-Security: SAML Assertion is not yet valid".to_string());
+            audience_restrictions += 1;
+            // Every AudienceRestriction is a conjunct: each one must admit this
+            // service, so a second restriction naming only another relying
+            // party invalidates the assertion here.
+            let mut restriction_matched = false;
+            for audience in restriction
+                .children()
+                .filter(|node| node.has_tag_name((SAML2_ASSERTION_NS, "Audience")))
+            {
+                if element_text(audience).as_deref() == Some(expected_audience) {
+                    restriction_matched = true;
                 }
             }
-
-            if let Some(not_on_or_after_str) = conditions.attribute("NotOnOrAfter") {
-                let not_on_or_after = parse_ws_datetime(not_on_or_after_str).ok_or_else(|| {
-                    format!(
-                        "WS-Security: invalid SAML NotOnOrAfter '{}'",
-                        not_on_or_after_str
-                    )
-                })?;
-                let not_on_or_after_with_skew =
-                    not_on_or_after.checked_add_signed(skew).ok_or_else(|| {
-                        "WS-Security: SAML NotOnOrAfter is outside the supported range".to_string()
-                    })?;
-                if now > not_on_or_after_with_skew {
-                    return Err("WS-Security: SAML Assertion has expired".to_string());
-                }
+            if !restriction_matched {
+                return Err(
+                    "WS-Security: SAML AudienceRestriction does not admit this service".to_string(),
+                );
             }
-
-            if let Some(ref expected_audience) = self.saml_audience {
-                let Some(audience_restriction) =
-                    descendant_element(conditions, "AudienceRestriction")
-                else {
-                    return Err(
-                        "WS-Security: SAML AudienceRestriction is required when audience is configured"
-                            .to_string(),
-                    );
-                };
-
-                let audience_node =
-                    unique_child_element(audience_restriction, "Audience", "WS-Security: SAML")?
-                        .ok_or_else(|| {
-                            "WS-Security: AudienceRestriction missing Audience element".to_string()
-                        })?;
-                let audience = decoded_element_text(audience_node)
-                    .ok_or_else(|| "WS-Security: SAML Audience is empty".to_string())?;
-
-                if &audience != expected_audience {
-                    return Err(format!(
-                        "WS-Security: SAML Audience '{}' does not match expected '{}'",
-                        escape_xml_chars(&audience),
-                        expected_audience
-                    ));
-                }
-            }
-        } else if self.saml_audience.is_some() {
+            audience_matched = true;
+        }
+        if audience_restrictions == 0 || !audience_matched {
             return Err(
-                "WS-Security: SAML Conditions are required when audience is configured".to_string(),
+                "WS-Security: SAML Conditions must carry an AudienceRestriction naming this \
+                 service"
+                    .to_string(),
             );
         }
 
-        // ── 4. Extract Subject NameID for downstream identity use ─────
-        let name_id = unique_child_element(assertion_node, "Subject", "WS-Security: SAML")?
-            .and_then(|subject| descendant_element(subject, "NameID"))
-            .and_then(decoded_element_text);
+        // ── 4. SubjectConfirmation / Recipient binding ────────────────
+        let subject = unique_ns_child(
+            assertion_node,
+            SAML2_ASSERTION_NS,
+            "Subject",
+            "WS-Security: SAML",
+        )?
+        .ok_or_else(|| "WS-Security: SAML Assertion missing Subject element".to_string())?;
+        self.validate_saml_subject_confirmation(subject, now)?;
+
+        // ── 5. Subject NameID: the assertion's authoritative identity ─
+        //
+        // This runs *before* the single-use claim, not after it. An enabled
+        // SAML policy makes this instance an authentication plugin, and the
+        // documented principal it publishes is the Subject `NameID`. An
+        // assertion that satisfies every other check but names nobody cannot
+        // authenticate anything, so accepting it and returning no principal
+        // silently degraded the request to unauthenticated while still burning
+        // the assertion's replay id — which also let an attacker who observed a
+        // legitimate assertion id spend it on a principal-less lookalike.
+        // Requiring exactly one namespace-correct, nonblank `NameID` here makes
+        // that a semantic failure that consumes no replay state.
+        let name_id_node =
+            unique_ns_child(subject, SAML2_ASSERTION_NS, "NameID", "WS-Security: SAML")?;
+        let Some(name_id) = name_id_node.and_then(element_text) else {
+            return Err("WS-Security: SAML Subject has no nonblank NameID".to_string());
+        };
+
+        // ── 6. Single use ─────────────────────────────────────────────
+        // Claimed after every semantic check so a rejected assertion cannot
+        // burn a legitimate one's id, and before the identity is returned so no
+        // caller can act on an assertion whose claim was refused.
+        let assertion_id = assertion_node
+            .attribute("ID")
+            .or_else(|| assertion_node.attribute("AssertionID"))
+            .ok_or_else(|| "WS-Security: SAML Assertion missing ID attribute".to_string())?;
+        self.claim_saml_assertion(&issuer, assertion_id).await?;
 
         debug!("soap_ws_security: SAML assertion validated successfully");
         Ok(name_id)
     }
 
+    /// Enforce supported `SubjectConfirmation` semantics.
+    ///
+    /// Exactly one confirmation must be acceptable: its `Method` must be in the
+    /// configured allow list (bearer only, today), and its
+    /// `SubjectConfirmationData` must name the configured `Recipient`, carry
+    /// its own bounded `NotOnOrAfter`, honour any `NotBefore`, and omit
+    /// `InResponseTo` — there is no SAML request in a WS-Security bearer flow
+    /// to correlate one against, so a value Ferrum cannot check must not be
+    /// silently ignored.
+    fn validate_saml_subject_confirmation(
+        &self,
+        subject: Node<'_, '_>,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let expected_recipient = self
+            .saml_recipient
+            .as_deref()
+            .ok_or_else(|| "WS-Security: SAML recipient binding is not configured".to_string())?;
+        let skew = self.saml_clock_skew;
+        let mut accepted = false;
+
+        for confirmation in subject
+            .children()
+            .filter(|node| node.has_tag_name((SAML2_ASSERTION_NS, "SubjectConfirmation")))
+        {
+            let method = confirmation.attribute("Method").ok_or_else(|| {
+                "WS-Security: SAML SubjectConfirmation missing Method attribute".to_string()
+            })?;
+            if !self
+                .saml_allowed_confirmation_methods
+                .iter()
+                .any(|allowed| allowed == method)
+            {
+                continue;
+            }
+            let data = unique_ns_child(
+                confirmation,
+                SAML2_ASSERTION_NS,
+                "SubjectConfirmationData",
+                "WS-Security: SAML",
+            )?
+            .ok_or_else(|| {
+                "WS-Security: SAML SubjectConfirmation missing SubjectConfirmationData".to_string()
+            })?;
+
+            if data.attribute("InResponseTo").is_some() {
+                return Err(
+                    "WS-Security: SAML SubjectConfirmationData carries an InResponseTo value that \
+                     cannot be validated in a WS-Security bearer flow"
+                        .to_string(),
+                );
+            }
+            let recipient = data.attribute("Recipient").ok_or_else(|| {
+                "WS-Security: SAML SubjectConfirmationData missing Recipient".to_string()
+            })?;
+            if recipient.trim() != expected_recipient {
+                return Err(
+                    "WS-Security: SAML SubjectConfirmationData Recipient does not match this \
+                     service"
+                        .to_string(),
+                );
+            }
+            let not_on_or_after = data
+                .attribute("NotOnOrAfter")
+                .ok_or_else(|| {
+                    "WS-Security: SAML SubjectConfirmationData missing NotOnOrAfter".to_string()
+                })
+                .and_then(|raw| {
+                    parse_ws_datetime(raw).ok_or_else(|| {
+                        "WS-Security: invalid SAML SubjectConfirmationData NotOnOrAfter".to_string()
+                    })
+                })?;
+            let expiry_with_skew = not_on_or_after.checked_add_signed(skew).ok_or_else(|| {
+                "WS-Security: SAML SubjectConfirmationData NotOnOrAfter is outside the supported \
+                 range"
+                    .to_string()
+            })?;
+            if now > expiry_with_skew {
+                return Err("WS-Security: SAML SubjectConfirmationData has expired".to_string());
+            }
+            if let Some(raw) = data.attribute("NotBefore") {
+                let not_before = parse_ws_datetime(raw).ok_or_else(|| {
+                    "WS-Security: invalid SAML SubjectConfirmationData NotBefore".to_string()
+                })?;
+                if now + skew < not_before {
+                    return Err(
+                        "WS-Security: SAML SubjectConfirmationData is not yet valid".to_string()
+                    );
+                }
+            }
+            if accepted {
+                return Err(
+                    "WS-Security: SAML Subject carries multiple acceptable SubjectConfirmation \
+                     elements"
+                        .to_string(),
+                );
+            }
+            accepted = true;
+        }
+
+        if !accepted {
+            return Err(
+                "WS-Security: SAML Subject has no supported SubjectConfirmation for this service"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Verify the SAML assertion's XMLDSIG signature.
     ///
-    /// Steps:
-    /// 1. Locate `<Signature>` inside the assertion.
-    /// 2. Resolve the signing algorithm and confirm it is in the allow list.
-    /// 3. Verify each `<Reference>` digest after applying its declared
-    ///    enveloped-signature / exclusive-c14n transform chain.
-    /// 4. Extract the signing cert from `KeyInfo/X509Data/X509Certificate`
+    /// Steps, in this order:
+    /// 1. Locate `<Signature>` inside the assertion and resolve the signing
+    ///    algorithm, confirming it is in the allow list.
+    /// 2. Extract the signing cert from `KeyInfo/X509Data/X509Certificate`
     ///    (or `BinarySecurityToken`) and confirm its SHA-256 fingerprint
     ///    matches a configured trusted IdP cert.
-    /// 5. Verify `<SignatureValue>` over exclusive-canonicalized
+    /// 3. Verify `<SignatureValue>` over exclusive-canonicalized
     ///    `<SignedInfo>` using the matched cert's public key.
+    /// 4. Only then verify each `<Reference>` digest after applying its
+    ///    declared enveloped-signature / exclusive-c14n transform chain.
+    ///
+    /// Step 4 last is the GHSA-9g4v-h9hm-846r fix: the assertion subtree is
+    /// canonicalized once per Reference, so resolving References before trust
+    /// let an untrusted caller drive that work with duplicate References over a
+    /// large assertion.
     fn validate_saml_signature(
         &self,
         assertion_node: Node<'_, '_>,
         envelope: &str,
+        budget: &mut WorkBudget,
     ) -> Result<(), String> {
-        let sig_node = unique_child_element(assertion_node, "Signature", "WS-Security: SAML")?
-            .ok_or_else(|| "WS-Security: SAML Assertion missing Signature element".to_string())?;
-        let signed_info_node = unique_child_element(sig_node, "SignedInfo", "WS-Security: SAML")?
-            .ok_or_else(|| {
-            "WS-Security: SAML Signature missing SignedInfo element".to_string()
-        })?;
-        let sig_block = node_source(envelope, sig_node)?;
+        let sig_node = unique_ns_child(
+            assertion_node,
+            XMLDSIG_NAMESPACE_URI,
+            "Signature",
+            "WS-Security: SAML",
+        )?
+        .ok_or_else(|| "WS-Security: SAML Assertion missing Signature element".to_string())?;
+        let signed_info_node = unique_ns_child(
+            sig_node,
+            XMLDSIG_NAMESPACE_URI,
+            "SignedInfo",
+            "WS-Security: SAML",
+        )?
+        .ok_or_else(|| "WS-Security: SAML Signature missing SignedInfo element".to_string())?;
 
         // ── Resolve signature algorithm ───────────────────────────────
-        let sig_method =
-            unique_child_element(signed_info_node, "SignatureMethod", "WS-Security: SAML")?
-                .ok_or_else(|| {
-                    "WS-Security: SAML SignedInfo missing SignatureMethod".to_string()
-                })?;
+        let sig_method = unique_ns_child(
+            signed_info_node,
+            XMLDSIG_NAMESPACE_URI,
+            "SignatureMethod",
+            "WS-Security: SAML",
+        )?
+        .ok_or_else(|| "WS-Security: SAML SignedInfo missing SignatureMethod".to_string())?;
         let sig_algorithm_uri = sig_method.attribute("Algorithm").ok_or_else(|| {
             "WS-Security: SAML SignatureMethod missing Algorithm attribute".to_string()
         })?;
@@ -3141,12 +3931,14 @@ impl SoapWsSecurity {
         let canonicalization =
             parse_signed_info_canonicalization(signed_info_node, "WS-Security: SAML")?;
 
-        // ── Verify Reference digest(s) ────────────────────────────────
-        self.verify_saml_reference_digests(signed_info_node, assertion_node, sig_node, envelope)?;
-
         // ── Extract SignatureValue ────────────────────────────────────
-        let sig_value_node = unique_child_element(sig_node, "SignatureValue", "WS-Security: SAML")?
-            .ok_or_else(|| "WS-Security: SAML Signature missing SignatureValue".to_string())?;
+        let sig_value_node = unique_ns_child(
+            sig_node,
+            XMLDSIG_NAMESPACE_URI,
+            "SignatureValue",
+            "WS-Security: SAML",
+        )?
+        .ok_or_else(|| "WS-Security: SAML Signature missing SignatureValue".to_string())?;
         let sig_value_b64 = sig_value_node
             .text()
             .ok_or_else(|| "WS-Security: SAML SignatureValue is empty".to_string())?;
@@ -3155,7 +3947,7 @@ impl SoapWsSecurity {
             .map_err(|e| format!("WS-Security: SAML invalid SignatureValue base64: {}", e))?;
 
         // ── Resolve signing cert and confirm it is trusted ────────────
-        let cert_der = extract_saml_signing_cert(sig_block)?;
+        let cert_der = extract_saml_signing_cert(sig_node)?;
         let cert_fingerprint = digest::digest(&digest::SHA256, &cert_der).as_ref().to_vec();
 
         let trusted = self
@@ -3183,11 +3975,21 @@ impl SoapWsSecurity {
             signed_info_node,
             &canonicalization.inclusive_prefixes,
             None,
+            budget,
         )?;
 
         public_key
             .verify(&canonical_signed_info, &sig_bytes)
             .map_err(|_| "WS-Security: SAML signature verification failed".to_string())?;
+
+        // ── Authenticated. Only now is Reference work performed ───────
+        self.verify_saml_reference_digests(
+            signed_info_node,
+            assertion_node,
+            sig_node,
+            envelope,
+            budget,
+        )?;
 
         debug!("soap_ws_security: SAML assertion signature verified");
         Ok(())
@@ -3195,141 +3997,993 @@ impl SoapWsSecurity {
 
     /// Verify Reference digests inside the SAML SignedInfo.
     ///
-    /// At least one Reference must be present, and at least one Reference
-    /// must target the enclosing assertion via `URI="#<assertion-ID>"`. The
-    /// declared transform chain is applied for the assertion-targeted
-    /// Reference. Other References (e.g. SAML 2.0 SubjectConfirmationData)
-    /// are NOT supported here — they would require resolving arbitrary IDs
-    /// inside the assertion and applying additional transforms, which is
-    /// outside the scope of the current pragmatic implementation.
+    /// Exactly one Reference is supported and it must target the enclosing
+    /// assertion via `URI="#<assertion-ID>"`. Other References (e.g. SAML 2.0
+    /// SubjectConfirmationData) are NOT supported here — they would require
+    /// resolving arbitrary IDs inside the assertion and applying additional
+    /// transforms, which is outside the scope of the current implementation.
+    /// Permitting up to 64 same-URI References was the SAML half of
+    /// GHSA-9g4v-h9hm-846r; a duplicate now fails closed rather than
+    /// re-canonicalizing the assertion.
     fn verify_saml_reference_digests(
         &self,
         signed_info: Node<'_, '_>,
         assertion: Node<'_, '_>,
         signature: Node<'_, '_>,
         envelope: &str,
+        budget: &mut WorkBudget,
     ) -> Result<(), String> {
         let assertion_id = assertion
             .attribute("ID")
             .or_else(|| assertion.attribute("AssertionID"))
             .ok_or_else(|| "WS-Security: SAML Assertion missing ID attribute".to_string())?;
         let expected_uri = format!("#{}", assertion_id);
-        let mut reference_count = 0;
-        let mut covered_assertion = false;
 
-        for reference in signed_info
+        let references: Vec<Node<'_, '_>> = signed_info
             .children()
-            .filter(|node| node.has_tag_name("Reference"))
-        {
-            reference_count += 1;
-            if reference_count > MAX_SIGNED_REFERENCES {
-                return Err(format!(
-                    "WS-Security: too many SAML Signature References (> {})",
-                    MAX_SIGNED_REFERENCES
-                ));
-            }
-            let uri = reference
-                .attribute("URI")
-                .ok_or_else(|| "WS-Security: SAML Reference missing URI attribute".to_string())?;
-
-            // Only Reference URIs that target this assertion are accepted —
-            // an attacker who can choose the Reference URI would otherwise
-            // pick a stable subtree they can control.
-            if uri != expected_uri {
-                return Err(format!(
-                    "WS-Security: SAML Reference URI '{}' does not target Assertion ID '{}'",
-                    uri, expected_uri
-                ));
-            }
-
-            let digest_method =
-                unique_child_element(reference, "DigestMethod", "WS-Security: SAML")?.ok_or_else(
-                    || "WS-Security: SAML Reference missing DigestMethod".to_string(),
-                )?;
-            let digest_alg_uri = digest_method.attribute("Algorithm").ok_or_else(|| {
-                "WS-Security: SAML DigestMethod missing Algorithm attribute".to_string()
-            })?;
-
-            let digest_value = unique_child_element(reference, "DigestValue", "WS-Security: SAML")?
-                .ok_or_else(|| "WS-Security: SAML Reference missing DigestValue".to_string())?;
-            let expected_b64 = digest_value
-                .text()
-                .ok_or_else(|| "WS-Security: SAML DigestValue is empty".to_string())?;
-            let expected_bytes = BASE64
-                .decode(expected_b64.replace(char::is_whitespace, "").as_bytes())
-                .map_err(|e| format!("WS-Security: SAML invalid DigestValue base64: {}", e))?;
-
-            let transforms = parse_reference_transforms(reference, "WS-Security: SAML")?;
-            let excluded_signature = transforms.enveloped_signature.then_some(signature.id());
-            let canonical_assertion = exclusive_canonicalize(
-                envelope,
-                assertion,
-                &transforms.inclusive_prefixes,
-                excluded_signature,
-            )?;
-
-            let computed = match digest_alg_uri {
-                XMLDSIG_SHA256 => {
-                    if !self
-                        .saml_allowed_digest_algorithms
-                        .contains(&DigestAlgorithm::Sha256)
-                    {
-                        return Err(format!(
-                            "WS-Security: SAML digest algorithm '{}' is not allowed",
-                            digest_alg_uri
-                        ));
-                    }
-                    digest::digest(&digest::SHA256, &canonical_assertion)
-                }
-                XMLDSIG_SHA1 => {
-                    if !self
-                        .saml_allowed_digest_algorithms
-                        .contains(&DigestAlgorithm::Sha1)
-                    {
-                        return Err(format!(
-                            "WS-Security: SAML digest algorithm '{}' is not allowed",
-                            digest_alg_uri
-                        ));
-                    }
-                    digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &canonical_assertion)
-                }
-                other => {
-                    return Err(format!(
-                        "WS-Security: SAML unsupported digest algorithm '{}'",
-                        other
-                    ));
-                }
-            };
-
-            if computed.as_ref() != expected_bytes.as_slice() {
-                return Err("WS-Security: SAML assertion digest mismatch".to_string());
-            }
-
-            covered_assertion = true;
-        }
-
-        if reference_count == 0 {
+            .filter(|node| node.has_tag_name((XMLDSIG_NAMESPACE_URI, "Reference")))
+            .collect();
+        if references.is_empty() {
             return Err("WS-Security: SAML SignedInfo contains no Reference elements".to_string());
         }
-
-        // Defensive: if all References had matching URIs they already produced
-        // `covered_assertion = true`. This is a future-proofing check in case
-        // the URI-matching invariant above is ever relaxed.
-        if !covered_assertion {
+        if references.len() > 1 {
             return Err(
-                "WS-Security: SAML signature does not cover the enclosing assertion".to_string(),
+                "WS-Security: SAML SignedInfo must contain exactly one Reference to the enclosing \
+                 Assertion"
+                    .to_string(),
             );
+        }
+        let reference = references[0];
+
+        let uri = reference
+            .attribute("URI")
+            .ok_or_else(|| "WS-Security: SAML Reference missing URI attribute".to_string())?;
+
+        // Only a Reference URI that targets this assertion is accepted — an
+        // attacker who can choose the Reference URI would otherwise pick a
+        // stable subtree they control.
+        if uri != expected_uri {
+            return Err(
+                "WS-Security: SAML Reference URI does not target the enclosing Assertion"
+                    .to_string(),
+            );
+        }
+
+        let digest_method = unique_ns_child(
+            reference,
+            XMLDSIG_NAMESPACE_URI,
+            "DigestMethod",
+            "WS-Security: SAML",
+        )?
+        .ok_or_else(|| "WS-Security: SAML Reference missing DigestMethod".to_string())?;
+        let digest_alg_uri = digest_method.attribute("Algorithm").ok_or_else(|| {
+            "WS-Security: SAML DigestMethod missing Algorithm attribute".to_string()
+        })?;
+
+        let digest_value = unique_ns_child(
+            reference,
+            XMLDSIG_NAMESPACE_URI,
+            "DigestValue",
+            "WS-Security: SAML",
+        )?
+        .ok_or_else(|| "WS-Security: SAML Reference missing DigestValue".to_string())?;
+        let expected_b64 = digest_value
+            .text()
+            .ok_or_else(|| "WS-Security: SAML DigestValue is empty".to_string())?;
+        let expected_bytes = BASE64
+            .decode(expected_b64.replace(char::is_whitespace, "").as_bytes())
+            .map_err(|e| format!("WS-Security: SAML invalid DigestValue base64: {}", e))?;
+
+        let transforms = parse_reference_transforms(reference, "WS-Security: SAML")?;
+        let excluded_signature = transforms.enveloped_signature.then_some(signature.id());
+        let canonical_assertion = exclusive_canonicalize(
+            envelope,
+            assertion,
+            &transforms.inclusive_prefixes,
+            excluded_signature,
+            budget,
+        )?;
+
+        let computed = match digest_alg_uri {
+            XMLDSIG_SHA256 => {
+                if !self
+                    .saml_allowed_digest_algorithms
+                    .contains(&DigestAlgorithm::Sha256)
+                {
+                    return Err(format!(
+                        "WS-Security: SAML digest algorithm '{}' is not allowed",
+                        digest_alg_uri
+                    ));
+                }
+                digest::digest(&digest::SHA256, &canonical_assertion)
+            }
+            XMLDSIG_SHA1 => {
+                if !self
+                    .saml_allowed_digest_algorithms
+                    .contains(&DigestAlgorithm::Sha1)
+                {
+                    return Err(format!(
+                        "WS-Security: SAML digest algorithm '{}' is not allowed",
+                        digest_alg_uri
+                    ));
+                }
+                digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &canonical_assertion)
+            }
+            other => {
+                return Err(format!(
+                    "WS-Security: SAML unsupported digest algorithm '{}'",
+                    other
+                ));
+            }
+        };
+
+        if computed.as_ref() != expected_bytes.as_slice() {
+            return Err("WS-Security: SAML assertion digest mismatch".to_string());
         }
 
         Ok(())
     }
 
-    // ── Content-type check ──────────────────────────────────────────────
+    // ── Content-type classification (GHSA-435h-f785-wmm4) ───────────────
 
-    fn is_soap_content_type(content_type: &str) -> bool {
-        contains_ascii_case_insensitive(content_type, "text/xml")
-            || contains_ascii_case_insensitive(content_type, "application/soap+xml")
-            || contains_ascii_case_insensitive(content_type, "application/xml")
+    /// Decide how this request's declared representation is governed.
+    ///
+    /// Substring matching used to decide this ("does the header text contain
+    /// `application/xml` anywhere?"), which both under- and over-matched: a
+    /// SOAP envelope labelled `application/octet-stream` skipped the whole
+    /// policy while a `multipart/form-data; boundary=application/xml` request
+    /// was raw-scanned as if it were an envelope. Classification is now
+    /// structural — the media type is parsed into `type/subtype` plus
+    /// parameters, and only exact essences are recognized.
+    fn classify_request(&self, content_type: Option<&str>) -> SoapRequestDisposition {
+        let Some(content_type) = content_type else {
+            return match self.content_type_mode {
+                // Strict routes govern every request. An absent Content-Type on
+                // a SOAP-protected proxy is exactly the bypass the advisory
+                // describes: a backend that routes by path or SOAPAction still
+                // executes the operation.
+                ContentTypeMode::Strict => SoapRequestDisposition::Reject(
+                    MediaTypeRejection::MissingContentTypeOnProtectedRoute,
+                ),
+                ContentTypeMode::MixedRoute => SoapRequestDisposition::PassThrough,
+            };
+        };
+        let classified = classify_soap_media_type(content_type, self.allow_mtom);
+
+        // An X.509 policy claims *integrity* over the message the backend
+        // executes. Ferrum implements no WS-Security attachment transform, so
+        // for a XOP representation the digest it verifies covers the
+        // `xop:Include` element and not the attachment octets that element
+        // stands for — an attacker-selected attachment substituted before
+        // validation is never detected. Refusing the representation is the
+        // honest outcome; claiming coverage Ferrum cannot establish is not.
+        let xop = matches!(&classified, Ok(Some(class)) if class.is_xop());
+        if self.x509_enabled && xop {
+            let refusal = MediaTypeRejection::XopUnsupportedUnderX509;
+            return SoapRequestDisposition::Reject(refusal);
+        }
+
+        match classified {
+            Ok(Some(class)) => SoapRequestDisposition::Governed(class),
+            Ok(None) => match self.content_type_mode {
+                ContentTypeMode::Strict => SoapRequestDisposition::Reject(
+                    MediaTypeRejection::UnsupportedMediaTypeOnProtectedRoute,
+                ),
+                ContentTypeMode::MixedRoute => SoapRequestDisposition::PassThrough,
+            },
+            // Malformed or hostile media-type syntax always fails closed, even
+            // on a mixed route: an unparsable label cannot be proven non-SOAP.
+            Err(rejection) => SoapRequestDisposition::Reject(rejection),
+        }
+    }
+
+    /// Whether this request's body must be buffered for SOAP validation.
+    fn request_body_is_governed(&self, content_type: Option<&str>) -> bool {
+        matches!(
+            self.classify_request(content_type),
+            SoapRequestDisposition::Governed(_)
+        )
+    }
+
+    /// True when an accepted message yields a request principal.
+    ///
+    /// UsernameToken, X.509 and SAML each establish "who" sent the message, so
+    /// those configurations run in the `authenticate` phase and populate the
+    /// authoritative request identity (GHSA-gfrx-43w6-jq3c). A timestamp-only
+    /// policy proves freshness and nothing about the caller; it has no identity
+    /// to publish, must not join the authentication chain (it would turn every
+    /// request into "Authentication required"), and keeps validating in
+    /// `before_proxy`. The two phases are mutually exclusive by configuration,
+    /// so no message is ever validated twice.
+    fn establishes_identity(&self) -> bool {
+        self.username_token_enabled || self.x509_enabled || self.saml_enabled
+    }
+}
+
+// ── Media-type classification ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentTypeMode {
+    /// Every request on this proxy is a governed SOAP request. Missing or
+    /// unsupported media types are rejected before backend dispatch.
+    Strict,
+    /// Only requests whose media type is a recognized SOAP representation are
+    /// governed; everything else passes through. The explicit, documented
+    /// opt-out for proxies that intentionally serve mixed traffic.
+    MixedRoute,
+}
+
+/// How a governed SOAP message is packaged on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SoapMediaClass {
+    /// `text/xml`, `application/soap+xml`, or `application/xml`: the whole body
+    /// is the SOAP envelope and nothing it references lives outside it.
+    Xml,
+    /// A bare `application/xop+xml` infoset: the whole body is the envelope,
+    /// but it declares the XOP optimization, so `xop:Include` elements in it
+    /// stand for octets Ferrum has no packaged source for.
+    Xop,
+    /// MTOM/XOP `multipart/related`: the envelope is the root part and the
+    /// remaining parts are binary attachments the gateway never decodes.
+    Mtom {
+        boundary: String,
+        start: Option<String>,
+    },
+}
+
+impl SoapMediaClass {
+    /// Whether this representation declares the XOP optimization, i.e. whether
+    /// the envelope may reference octets that live outside the bytes Ferrum
+    /// validates. Only relevant to policies that claim message integrity.
+    fn is_xop(&self) -> bool {
+        matches!(self, Self::Xop | Self::Mtom { .. })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaTypeRejection {
+    MissingContentTypeOnProtectedRoute,
+    UnsupportedMediaTypeOnProtectedRoute,
+    MalformedMediaType,
+    MalformedMultipartPackaging,
+    /// A XOP/MTOM representation on a route whose `x509_signature` policy
+    /// claims message integrity Ferrum cannot establish over attachment octets.
+    XopUnsupportedUnderX509,
+}
+
+impl MediaTypeRejection {
+    fn status_code(self) -> u16 {
+        match self {
+            Self::MissingContentTypeOnProtectedRoute
+            | Self::UnsupportedMediaTypeOnProtectedRoute
+            | Self::XopUnsupportedUnderX509 => 415,
+            Self::MalformedMediaType | Self::MalformedMultipartPackaging => 400,
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::MissingContentTypeOnProtectedRoute => {
+                "SOAP request is missing a Content-Type on a SOAP-protected route"
+            }
+            Self::UnsupportedMediaTypeOnProtectedRoute => {
+                "SOAP request uses an unsupported media type on a SOAP-protected route"
+            }
+            Self::MalformedMediaType => "SOAP request Content-Type is malformed",
+            Self::MalformedMultipartPackaging => {
+                "SOAP request MTOM/XOP packaging is malformed or unsupported"
+            }
+            Self::XopUnsupportedUnderX509 => {
+                "SOAP request uses MTOM/XOP; attachment octets are outside X.509 coverage"
+            }
+        }
+    }
+
+    /// Fixed-cardinality telemetry class. The rejected header value is operator-
+    /// and attacker-controlled and is never logged.
+    fn class(self) -> &'static str {
+        match self {
+            Self::MissingContentTypeOnProtectedRoute => "missing_content_type",
+            Self::UnsupportedMediaTypeOnProtectedRoute => "unsupported_media_type",
+            Self::MalformedMediaType => "malformed_media_type",
+            Self::MalformedMultipartPackaging => "malformed_multipart",
+            Self::XopUnsupportedUnderX509 => "xop_unsupported_under_x509",
+        }
+    }
+}
+
+enum SoapRequestDisposition {
+    Governed(SoapMediaClass),
+    PassThrough,
+    Reject(MediaTypeRejection),
+}
+
+/// Exact media-type essences that carry a SOAP envelope directly.
+const SOAP_XML_ESSENCES: &[&str] = &[
+    // SOAP 1.1
+    "text/xml",
+    // SOAP 1.2
+    "application/soap+xml",
+    // Generic XML, accepted by many SOAP stacks
+    "application/xml",
+];
+
+/// A bare XOP infoset (MTOM without the multipart wrapper). Classified apart
+/// from [`SOAP_XML_ESSENCES`] because it declares the XOP optimization, which
+/// matters to any policy claiming coverage of the whole message.
+const XOP_INFOSET_ESSENCE: &str = "application/xop+xml";
+
+/// Essences accepted as an MTOM root part's own type.
+const MTOM_ROOT_ESSENCES: &[&str] = &["application/xop+xml", "text/xml", "application/soap+xml"];
+
+/// Parse `content_type` structurally and decide whether it names a SOAP
+/// representation this plugin can validate.
+///
+/// `Ok(None)` means "definitely not SOAP". `Err` means the label itself is
+/// malformed, ambiguous, or names a SOAP packaging Ferrum cannot unpack — those
+/// always fail closed rather than falling through to a pass-through decision.
+fn classify_soap_media_type(
+    content_type: &str,
+    allow_mtom: bool,
+) -> Result<Option<SoapMediaClass>, MediaTypeRejection> {
+    let essence = media_type_essence(content_type)?;
+    if SOAP_XML_ESSENCES.contains(&essence.as_str()) {
+        return Ok(Some(SoapMediaClass::Xml));
+    }
+    if essence == XOP_INFOSET_ESSENCE {
+        return Ok(Some(SoapMediaClass::Xop));
+    }
+    if essence != "multipart/related" {
+        return Ok(None);
+    }
+
+    // MTOM/XOP. The packaging is only SOAP when it says so: `type` must name a
+    // SOAP root part. Without that parameter the multipart is some other
+    // related-part payload and is not this plugin's business.
+    let mut boundary = None;
+    let mut root_type = None;
+    let mut start = None;
+    let mut rest = skip_content_type_media_type(content_type)
+        .map_err(|_| MediaTypeRejection::MalformedMediaType)?;
+    while let Some((name, value, next)) =
+        next_content_type_parameter(rest).map_err(|_| MediaTypeRejection::MalformedMediaType)?
+    {
+        rest = next;
+        if name.eq_ignore_ascii_case("boundary") {
+            if boundary.replace(value.to_string()).is_some() {
+                return Err(MediaTypeRejection::MalformedMultipartPackaging);
+            }
+        } else if name.eq_ignore_ascii_case("type") {
+            if root_type.replace(value.to_ascii_lowercase()).is_some() {
+                return Err(MediaTypeRejection::MalformedMultipartPackaging);
+            }
+        } else if name.eq_ignore_ascii_case("start")
+            && start.replace(normalize_content_id(value)).is_some()
+        {
+            return Err(MediaTypeRejection::MalformedMultipartPackaging);
+        }
+    }
+
+    let Some(root_type) = root_type else {
+        return Ok(None);
+    };
+    if !MTOM_ROOT_ESSENCES.contains(&root_type.as_str()) {
+        return Ok(None);
+    }
+    if !allow_mtom {
+        // The operator declared this route does not accept MTOM. A SOAP-bearing
+        // multipart must not silently stream past the policy.
+        return Err(MediaTypeRejection::UnsupportedMediaTypeOnProtectedRoute);
+    }
+    let Some(boundary) = boundary else {
+        return Err(MediaTypeRejection::MalformedMultipartPackaging);
+    };
+    if boundary.is_empty()
+        || boundary.len() > MAX_MULTIPART_BOUNDARY_BYTES
+        || boundary.ends_with(' ')
+        || !boundary.bytes().all(is_multipart_boundary_byte)
+    {
+        return Err(MediaTypeRejection::MalformedMultipartPackaging);
+    }
+    Ok(Some(SoapMediaClass::Mtom { boundary, start }))
+}
+
+/// RFC 2046 `bcharsnospace` plus space. The caller separately rejects a final
+/// space, which is forbidden by the boundary grammar.
+fn is_multipart_boundary_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"'()+_,-./:=? ".contains(&byte)
+}
+
+/// Lowercased `type/subtype`, rejecting anything that is not a single
+/// well-formed media type token pair.
+fn media_type_essence(content_type: &str) -> Result<String, MediaTypeRejection> {
+    let head = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim_matches(|ch: char| ch.is_ascii_whitespace());
+    if head.is_empty() {
+        return Err(MediaTypeRejection::MalformedMediaType);
+    }
+    let Some((kind, subtype)) = head.split_once('/') else {
+        return Err(MediaTypeRejection::MalformedMediaType);
+    };
+    if kind.is_empty() || subtype.is_empty() {
+        return Err(MediaTypeRejection::MalformedMediaType);
+    }
+    if !kind.bytes().all(is_media_type_token_byte) || !subtype.bytes().all(is_media_type_token_byte)
+    {
+        return Err(MediaTypeRejection::MalformedMediaType);
+    }
+    Ok(head.to_ascii_lowercase())
+}
+
+/// RFC 9110 `token` characters. Quotes, backslashes, whitespace, and `/` are
+/// excluded so a parameter value can never be mistaken for an essence.
+fn is_media_type_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+/// Strip the optional `<...>` wrapper from a MIME `Content-ID` / `start` value.
+fn normalize_content_id(value: &str) -> String {
+    let trimmed = value.trim();
+    trimmed
+        .strip_prefix('<')
+        .and_then(|inner| inner.strip_suffix('>'))
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+// ── Message validation orchestration ────────────────────────────────────────
+
+/// A validated SOAP message's authoritative request principal.
+///
+/// `principal` is what becomes `RequestContext::authenticated_identity` and, on
+/// a namespace-correct match, `identified_consumer`. `metadata` carries the
+/// mechanism-specific values downstream logging has always seen.
+#[derive(Default)]
+struct SoapPrincipal {
+    principal: Option<String>,
+    username: Option<String>,
+    saml_subject: Option<String>,
+}
+
+/// A terminal SOAP rejection: status, client-visible body, and the fixed
+/// telemetry class that is safe to log.
+struct SoapRejection {
+    status_code: u16,
+    body: String,
+    failure_class: &'static str,
+}
+
+impl SoapRejection {
+    fn new(status_code: u16, message: &str, failure_class: &'static str) -> Self {
+        Self {
+            status_code,
+            body: format!(r#"{{"error":"{}"}}"#, escape_json_chars(message)),
+            failure_class,
+        }
+    }
+
+    fn into_plugin_result(self) -> PluginResult {
+        // Fixed-cardinality class only. The envelope, the credential, and the
+        // rejected header value never reach a log line.
+        debug!(
+            failure_class = self.failure_class,
+            status_code = self.status_code,
+            "soap_ws_security: request rejected"
+        );
+        PluginResult::Reject {
+            status_code: self.status_code,
+            body: self.body,
+            headers: HashMap::new(),
+        }
+    }
+}
+
+impl SoapWsSecurity {
+    /// Validate one SOAP message end to end.
+    ///
+    /// Everything that borrows the decoded body stays inside this function and
+    /// only an owned [`SoapPrincipal`] escapes, so no partially-authenticated
+    /// state can outlive a later rejection and the caller is free to mutate the
+    /// request context afterwards.
+    async fn validate_message(
+        &self,
+        ctx: &RequestContext,
+        content_type: &str,
+        media_class: &SoapMediaClass,
+    ) -> Result<Option<SoapPrincipal>, SoapRejection> {
+        let body = match resolve_soap_request_body(ctx, content_type, media_class) {
+            Ok(Some(body)) => body,
+            Ok(None) => {
+                // An empty body carries no `wsse:Security` header because it
+                // carries nothing at all. This is the one shape
+                // `reject_missing_security_header: false` may still forward —
+                // it is a genuinely absent header, not a parse disagreement.
+                if self.reject_missing_security_header {
+                    return Err(SoapRejection::new(
+                        400,
+                        "SOAP request body is empty",
+                        "empty_body",
+                    ));
+                }
+                return Ok(None);
+            }
+            Err(err) => {
+                // Fail closed on hostile/unsupported encodings. Never log the
+                // body, attacker-controlled Content-Type parameters, or
+                // credential material — only the stable error class.
+                return Err(SoapRejection::new(
+                    err.status_code(),
+                    err.message(),
+                    err.class(),
+                ));
+            }
+        };
+
+        let envelope = body.trim();
+        if contains_forbidden_xml_declaration(envelope) {
+            return Err(SoapRejection::new(
+                400,
+                "SOAP request contains forbidden XML declaration",
+                "forbidden_xml_declaration",
+            ));
+        }
+
+        // One bounded parse for the whole message. Every structural selection
+        // below is namespace-qualified against this single document, so the
+        // gateway and the backend cannot be steered to different elements
+        // (GHSA-3mwq-c8j6-9xhp), and the previous three independent parses of
+        // the same envelope are gone.
+        //
+        // Neither failure below is gated on `reject_missing_security_header`.
+        // That option exists to allow a governed message that genuinely carries
+        // no `wsse:Security` header; it is not a licence to forward a
+        // representation the gateway could not parse. Treating a parse
+        // disagreement as pass-through is the bypass itself: Ferrum declines to
+        // read the envelope, the backend reads it fine, and every check below
+        // — timestamp, credentials, signature, replay — is skipped for a
+        // message the backend still executes. Once a representation is
+        // governed, malformed XML, a node/DTD budget failure, and unsupported
+        // or ambiguous envelope structure are terminal.
+        let document = match parse_bounded_xml(envelope, "SOAP") {
+            Ok(document) => document,
+            Err(error) => return Err(SoapRejection::new(400, &error, "malformed_xml")),
+        };
+        let structure = match resolve_soap_envelope(&document) {
+            Ok(structure) => structure,
+            Err(error) => return Err(SoapRejection::new(400, &error, "malformed_envelope")),
+        };
+
+        let security = resolve_security_node(&document, &structure)
+            .map_err(|error| SoapRejection::new(400, &error, "ambiguous_security_header"))?;
+        let Some(security) = security else {
+            if self.reject_missing_security_header {
+                return Err(SoapRejection::new(
+                    401,
+                    "WS-Security header is missing",
+                    "missing_security_header",
+                ));
+            }
+            return Ok(None);
+        };
+
+        let now = Utc::now();
+        let mut budget = WorkBudget::for_envelope(envelope);
+        let mut principal = SoapPrincipal::default();
+
+        // Validate Timestamp.
+        //
+        // This runs unconditionally (the helper is a no-op for an absent
+        // Timestamp when `timestamp.require` is false) so that a *present*
+        // Timestamp is always independently validated. The UsernameToken
+        // PasswordDigest binding compares against this same element, and binding
+        // against an unvalidated instant would be no binding at all.
+        if let Err(error) = self.validate_timestamp(security, now) {
+            warn!(
+                failure_class = "timestamp",
+                "soap_ws_security: timestamp validation failed"
+            );
+            return Err(SoapRejection::new(401, &error, "timestamp"));
+        }
+
+        // Validate UsernameToken
+        if self.username_token_enabled {
+            match self.validate_username_token(security, now).await {
+                Ok(username) => {
+                    debug!("soap_ws_security: UsernameToken validated");
+                    principal.principal.get_or_insert_with(|| username.clone());
+                    principal.username = Some(username);
+                }
+                Err(UsernameTokenError::InvalidCredentials) => {
+                    // Generic response + stable failure class: do not log the
+                    // candidate username or password/digest verification detail.
+                    warn!(
+                        failure_class = UsernameTokenError::INVALID_CREDENTIALS_CLASS,
+                        "soap_ws_security: UsernameToken authentication failed"
+                    );
+                    return Err(SoapRejection {
+                        status_code: 401,
+                        body: UsernameTokenError::INVALID_CREDENTIALS_BODY.to_string(),
+                        failure_class: UsernameTokenError::INVALID_CREDENTIALS_CLASS,
+                    });
+                }
+                Err(UsernameTokenError::Structural(detail)) => {
+                    warn!(
+                        failure_class = UsernameTokenError::STRUCTURAL_CLASS,
+                        "soap_ws_security: UsernameToken structural validation failed"
+                    );
+                    return Err(SoapRejection::new(
+                        401,
+                        &detail,
+                        UsernameTokenError::STRUCTURAL_CLASS,
+                    ));
+                }
+            }
+        }
+
+        // Validate X.509 signature. The id index is built once here — after the
+        // structure is settled and before the first Reference is resolved —
+        // instead of rescanning the whole envelope per Reference.
+        if self.x509_enabled {
+            let id_index = DocumentIdIndex::build(&document);
+            match self.validate_x509_signature(
+                &structure,
+                security,
+                &id_index,
+                envelope,
+                &mut budget,
+            ) {
+                Ok(cert_principal) => {
+                    principal
+                        .principal
+                        .get_or_insert_with(|| cert_principal.to_string());
+                }
+                Err(error) => {
+                    warn!(
+                        failure_class = "x509_signature",
+                        "soap_ws_security: X.509 signature validation failed"
+                    );
+                    return Err(SoapRejection::new(401, &error, "x509_signature"));
+                }
+            }
+        }
+
+        // Validate SAML assertion
+        if self.saml_enabled {
+            match self
+                .validate_saml_assertion(security, envelope, now, &mut budget)
+                .await
+            {
+                Ok(name_id) => {
+                    debug!("soap_ws_security: SAML assertion accepted");
+                    principal.principal.get_or_insert_with(|| name_id.clone());
+                    principal.saml_subject = Some(name_id);
+                }
+                Err(error) => {
+                    warn!(
+                        failure_class = "saml",
+                        "soap_ws_security: SAML validation failed"
+                    );
+                    return Err(SoapRejection::new(401, &error, "saml"));
+                }
+            }
+        }
+
+        Ok(Some(principal))
+    }
+
+    /// Common request entry point for both phases.
+    ///
+    /// `commit_identity` is `false` for the timestamp-only configuration, which
+    /// runs in `before_proxy` and has no principal to publish.
+    async fn run_soap_policy(
+        &self,
+        ctx: &mut RequestContext,
+        content_type_header: Option<String>,
+        consumer_index: Option<&ConsumerIndex>,
+    ) -> PluginResult {
+        let media_class = match self.classify_request(content_type_header.as_deref()) {
+            SoapRequestDisposition::Governed(class) => class,
+            SoapRequestDisposition::PassThrough => return PluginResult::Continue,
+            SoapRequestDisposition::Reject(rejection) => {
+                warn!(
+                    failure_class = rejection.class(),
+                    "soap_ws_security: request representation rejected on a SOAP-protected route"
+                );
+                return SoapRejection::new(
+                    rejection.status_code(),
+                    rejection.message(),
+                    rejection.class(),
+                )
+                .into_plugin_result();
+            }
+        };
+        // `classify_request` only returns `Governed` for a present header.
+        let content_type = content_type_header.unwrap_or_default();
+
+        let principal = match self
+            .validate_message(ctx, &content_type, &media_class)
+            .await
+        {
+            Ok(Some(principal)) => principal,
+            Ok(None) => return PluginResult::Continue,
+            Err(rejection) => return rejection.into_plugin_result(),
+        };
+
+        // Record the exact representation that was authenticated so a later
+        // request-body transform cannot silently substitute a different message
+        // for the one this policy accepted.
+        //
+        // Only the identity-establishing form records it, matching
+        // `requires_final_request_body_before_backend_dispatch`. A timestamp-only
+        // policy authenticates nobody and claims no integrity over the Body: it
+        // proves the message was fresh when it arrived, and it runs in
+        // `before_proxy` rather than ahead of the shared body-normalization
+        // phase, so there is no ordering hazard to close. Binding its
+        // representation anyway would protect nothing while turning an ordinary
+        // composition with a request-body transformer — whose rewrite lands
+        // immediately before the final-body hooks — into an unconditional `500`
+        // for every governed SOAP request.
+        if self.establishes_identity() {
+            let authenticated_digest = ctx
+                .request_body_bytes
+                .as_ref()
+                .map(|bytes| sha256_array(bytes));
+            ctx.soap_ws_security_authenticated_body_digest = authenticated_digest;
+        }
+
+        if let Some(username) = principal.username.clone() {
+            ctx.metadata
+                .insert("soap_ws_username".to_string(), username);
+        }
+        if let Some(subject) = principal.saml_subject.clone() {
+            ctx.metadata
+                .insert("soap_ws_saml_subject".to_string(), subject);
+        }
+
+        let Some(consumer_index) = consumer_index else {
+            return PluginResult::Continue;
+        };
+        let Some(identity) = principal.principal else {
+            return PluginResult::Continue;
+        };
+
+        // Namespace-correct Consumer mapping: a Consumer resolved by identity
+        // only counts when it belongs to the matched proxy's namespace. A
+        // cross-namespace match is treated as "no Consumer", so the request
+        // still runs under the verified external principal rather than under
+        // another tenant's Consumer record.
+        let proxy_namespace = ctx
+            .matched_proxy
+            .as_ref()
+            .map(|proxy| proxy.namespace.clone());
+        let consumer = proxy_namespace.and_then(|namespace| {
+            consumer_index
+                .find_by_identity(&identity)
+                .filter(|consumer| consumer.namespace == namespace)
+        });
+
+        match auth_flow::commit_authentication_attempt(
+            ctx,
+            AuthenticationAttempt::new(),
+            auth_flow::VerifyOutcome::Success {
+                consumer,
+                external_identity: Some(identity),
+                external_identity_header: None,
+            },
+            SOAP_WS_SECURITY_AUTH_METHOD,
+            true,
+        ) {
+            Ok(_) => PluginResult::Continue,
+            Err(auth_flow::VerifyOutcome::Forbidden(body)) => PluginResult::Reject {
+                status_code: 403,
+                body,
+                headers: HashMap::new(),
+            },
+            Err(_) => PluginResult::Reject {
+                status_code: 401,
+                body: r#"{"error":"WS-Security: identity could not be established"}"#.to_string(),
+                headers: HashMap::new(),
+            },
+        }
+    }
+}
+
+/// `auth_method` published for a SOAP-authenticated request.
+const SOAP_WS_SECURITY_AUTH_METHOD: &str = "soap_ws_security";
+
+// ── Composition admission (GHSA-gfrx-43w6-jq3c, GHSA-435h-f785-wmm4) ────────
+
+/// Auth plugin names that participate in the central authentication chain.
+///
+/// Kept as a literal list rather than derived from constructed plugins because
+/// composition is validated at config admission, before any plugin is built.
+const CENTRAL_AUTH_PLUGIN_NAMES: &[&str] = &[
+    "mtls_auth",
+    "jwks_auth",
+    "oauth2_introspection",
+    "oidc_relying_party",
+    "jwt_auth",
+    "key_auth",
+    "ldap_auth",
+    "basic_auth",
+    "hmac_auth",
+];
+
+/// Whether a `soap_ws_security` plugin config establishes a request principal
+/// and therefore joins the authentication chain.
+///
+/// Read from raw JSON: composition is checked before construction, and a config
+/// that fails its own admission is reported by that admission rather than here.
+fn soap_config_establishes_identity(plugin: &crate::config::types::PluginConfig) -> bool {
+    let inner_enabled = |key: &str| {
+        plugin
+            .config
+            .get(key)
+            .and_then(|section| section.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    inner_enabled("username_token") || inner_enabled("x509_signature") || inner_enabled("saml")
+}
+
+/// Whether a `compression` plugin config decodes the request body.
+fn compression_config_decompresses_request(plugin: &crate::config::types::PluginConfig) -> bool {
+    plugin
+        .config
+        .get("decompress_request")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Refuse compositions this plugin's ordering guarantees cannot survive.
+///
+/// Two of them:
+///
+/// 1. **Another authentication plugin in either auth mode.** Both modes stop
+///    after the first mechanism establishes an identity, and single-auth also
+///    makes the first rejection terminal. WS-Security is a message *gate*, not
+///    one of several interchangeable credentials: since `soap_ws_security` is
+///    the highest-numbered priority in the AuthN band, an earlier mechanism's
+///    success would normally skip SOAP validation entirely. Multi-auth can also
+///    let a later success override an earlier SOAP rejection when priorities
+///    are overridden. A second identity-establishing SOAP instance is another
+///    message gate with the same problem. The composition is refused rather
+///    than silently reordered.
+/// 2. **Request decompression on the same proxy.** SOAP authentication now runs
+///    in the `authenticate` phase, which precedes the shared buffered-body
+///    normalization phase where `compression`'s `decompress_request` decodes
+///    the body. The plugin would therefore validate the encoded bytes rather
+///    than the plaintext the backend parses. The runtime digest guard in
+///    `on_final_request_body_with_context` would catch this on every request;
+///    refusing it at admission turns a guaranteed 500 into a configuration
+///    error the operator can act on.
+pub fn validate_composition(
+    config: &crate::config::types::GatewayConfig,
+) -> Result<(), Vec<String>> {
+    use crate::config::types::{AuthMode, PluginConfig, PluginScope};
+
+    let plugin_by_scoped_id: HashMap<(&str, &str), &PluginConfig> = config
+        .plugin_configs
+        .iter()
+        .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
+        .collect();
+
+    // Resolve the effective instances of `name` for `proxy` exactly the way the
+    // runtime merge does: a scoped instance shadows the same-named global by
+    // its outer `enabled` flag alone.
+    let effective = |proxy: &crate::config::types::Proxy, name: &str| -> Vec<&PluginConfig> {
+        let local: Vec<&PluginConfig> = proxy
+            .plugins
+            .iter()
+            .filter_map(|association| {
+                let plugin = *plugin_by_scoped_id.get(&(
+                    proxy.namespace.as_str(),
+                    association.plugin_config_id.as_str(),
+                ))?;
+                let scope_applies = match plugin.scope {
+                    PluginScope::Proxy => plugin.proxy_id.as_deref() == Some(proxy.id.as_str()),
+                    PluginScope::ProxyGroup => true,
+                    PluginScope::Global => false,
+                };
+                (plugin.enabled && plugin.plugin_name == name && scope_applies).then_some(plugin)
+            })
+            .collect();
+        if !local.is_empty() {
+            return local;
+        }
+        config
+            .plugin_configs
+            .iter()
+            .filter(|plugin| {
+                plugin.enabled && plugin.scope == PluginScope::Global && plugin.plugin_name == name
+            })
+            .collect()
+    };
+
+    let mut errors = Vec::new();
+    for proxy in &config.proxies {
+        let soap: Vec<&PluginConfig> = effective(proxy, "soap_ws_security");
+        if soap.is_empty() {
+            continue;
+        }
+        let identity_soap: Vec<&PluginConfig> = soap
+            .iter()
+            .copied()
+            .filter(|plugin| soap_config_establishes_identity(plugin))
+            .collect();
+
+        if !identity_soap.is_empty() {
+            // A second identity-establishing SOAP instance is another
+            // authentication plugin too. Every authentication mode may stop
+            // after the first success, so every SOAP message gate must be the
+            // sole identity mechanism on its effective proxy chain.
+            let mut others: Vec<String> = identity_soap
+                .iter()
+                .skip(1)
+                .map(|plugin| plugin.id.clone())
+                .collect();
+            others.extend(
+                CENTRAL_AUTH_PLUGIN_NAMES
+                    .iter()
+                    .flat_map(|name| effective(proxy, name))
+                    .map(|plugin| plugin.id.clone()),
+            );
+            if !others.is_empty() {
+                let auth_mode = match &proxy.auth_mode {
+                    AuthMode::Single => "single",
+                    AuthMode::Multi => "multi",
+                };
+                errors.push(format!(
+                    "soap_ws_security must be the sole authentication mechanism on proxy '{}' \
+                     while auth_mode is '{}': both authentication modes stop after the first \
+                     mechanism establishes an identity, single-auth also makes the first rejection \
+                     terminal, and multi-auth can let a later success override an earlier rejection, \
+                     so one or more WS-Security message gates would be skipped or ignored. \
+                     soap_ws_security: {}; other auth plugins: {}. Disable the other mechanisms \
+                     on this proxy",
+                    proxy.id,
+                    auth_mode,
+                    identity_soap
+                        .iter()
+                        .map(|plugin| plugin.id.clone())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    others.join(", ")
+                ));
+            }
+        }
+
+        let decompressors: Vec<String> = effective(proxy, "compression")
+            .into_iter()
+            .filter(|plugin| compression_config_decompresses_request(plugin))
+            .map(|plugin| plugin.id.clone())
+            .collect();
+        if !identity_soap.is_empty() && !decompressors.is_empty() {
+            errors.push(format!(
+                "soap_ws_security cannot be composed with compression 'decompress_request' on \
+                 proxy '{}': SOAP identity is established in the authenticate phase, which runs \
+                 before request-body decompression, so the gateway would validate the encoded \
+                 bytes rather than the plaintext the backend parses. soap_ws_security: {}; \
+                 compression: {}. Decompress upstream of the gateway, or disable \
+                 decompress_request on this proxy",
+                proxy.id,
+                identity_soap
+                    .iter()
+                    .map(|plugin| plugin.id.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                decompressors.join(", ")
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
     }
 }
 
@@ -3349,14 +5003,34 @@ impl Plugin for SoapWsSecurity {
         super::HTTP_ONLY_PROTOCOLS
     }
 
+    /// The timestamp-only configuration keeps validating in `before_proxy`; an
+    /// identity-establishing one moves to `authenticate` instead. The two are
+    /// mutually exclusive, so no message is validated twice.
     fn requires_request_body_before_before_proxy(&self) -> bool {
-        true
+        !self.establishes_identity()
+    }
+
+    /// Body-aware authentication (GHSA-gfrx-43w6-jq3c).
+    ///
+    /// SOAP identity used to be established in `before_proxy`, after central
+    /// authentication *and* authorization had already run — so `access_control`
+    /// saw no consumer and consumer-scoped `rate_limiting` charged the source
+    /// IP. Buffering before the authenticate phase lets the SOAP principal be
+    /// the request's one authoritative identity for authorization, rate
+    /// limiting, logging, retries, and chargeback.
+    fn requires_request_body_before_authenticate(&self) -> bool {
+        self.establishes_identity()
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        self.establishes_identity()
     }
 
     fn needs_request_body_bytes(&self) -> bool {
-        // SOAP may arrive as UTF-16 (or other non-UTF-8 XML encodings). The
-        // shared proxy handoff only populates metadata["request_body"] when
-        // std::str::from_utf8 succeeds, so this plugin must retain raw bytes.
+        // SOAP may arrive as UTF-16 (or other non-UTF-8 XML encodings), and
+        // MTOM/XOP packaging is binary framing. The shared proxy handoff only
+        // populates metadata["request_body"] when std::str::from_utf8 succeeds,
+        // so this plugin must retain raw bytes.
         true
     }
 
@@ -3367,9 +5041,33 @@ impl Plugin for SoapWsSecurity {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        ctx.headers
-            .get("content-type")
-            .is_some_and(|ct| Self::is_soap_content_type(ct))
+        self.request_body_is_governed(ctx.headers.get("content-type").map(String::as_str))
+    }
+
+    fn should_buffer_request_body_before_authenticate(
+        &self,
+        ctx: &RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> bool {
+        self.should_buffer_request_body(ctx)
+    }
+
+    /// The authenticated representation must still be the representation the
+    /// backend receives. Running this hook unconditionally before dispatch is
+    /// what makes the digest comparison below reachable for every governed
+    /// request rather than only for requests some other plugin already forced
+    /// the hook on.
+    fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
+        self.establishes_identity()
+    }
+
+    /// Only the identity-establishing form records an authenticated-representation
+    /// digest, so only it needs the request context in the final-body hook. A
+    /// timestamp-only policy's hook can answer nothing but `Continue`, and
+    /// returning `true` for it would make the proxy clone a request context on
+    /// every governed request for no decision.
+    fn needs_final_request_body_context(&self) -> bool {
+        self.establishes_identity()
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -3379,194 +5077,71 @@ impl Plugin for SoapWsSecurity {
         }
     }
 
+    async fn authenticate(
+        &self,
+        ctx: &mut RequestContext,
+        consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        if !self.establishes_identity() {
+            return PluginResult::Continue;
+        }
+        let content_type = ctx.headers.get("content-type").cloned();
+        self.run_soap_policy(ctx, content_type, Some(consumer_index))
+            .await
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Only process SOAP content types
-        // Read from `headers` param (not `ctx.headers`) because the handler may
-        // temporarily move headers out of ctx when no plugin modifies them.
-        let content_type = match headers.get("content-type") {
-            Some(ct) if Self::is_soap_content_type(ct) => ct.clone(),
-            _ => return PluginResult::Continue,
-        };
-
-        // Prefer bounded raw bytes (H1/H2/H3 handoff). Fall back to the UTF-8
-        // metadata key only for fixtures that pre-seed text without bytes.
-        let body = match resolve_soap_request_body(ctx, &content_type) {
-            Ok(Some(body)) => body,
-            Ok(None) => {
-                if self.reject_missing_security_header {
-                    return PluginResult::Reject {
-                        status_code: 400,
-                        body: r#"{"error":"SOAP request body is empty"}"#.to_string(),
-                        headers: HashMap::new(),
-                    };
-                }
-                return PluginResult::Continue;
-            }
-            Err(err) => {
-                // Fail closed on hostile/unsupported encodings. Never log the
-                // body, attacker-controlled Content-Type parameters, or
-                // credential material — only the stable error class.
-                warn!(
-                    error_class = err.class(),
-                    "soap_ws_security: SOAP body encoding rejected"
-                );
-                return PluginResult::Reject {
-                    status_code: err.status_code(),
-                    body: format!(r#"{{"error":"{}"}}"#, escape_json_chars(err.message())),
-                    headers: HashMap::new(),
-                };
-            }
-        };
-
-        // Find the SOAP envelope
-        let envelope = body.trim();
-        if contains_forbidden_xml_declaration(envelope) {
-            return PluginResult::Reject {
-                status_code: 400,
-                body: r#"{"error":"SOAP request contains forbidden XML declaration"}"#.to_string(),
-                headers: HashMap::new(),
-            };
-        }
-        if !envelope.contains("Envelope") {
-            if self.reject_missing_security_header {
-                return PluginResult::Reject {
-                    status_code: 400,
-                    body: r#"{"error":"Request is not a SOAP envelope"}"#.to_string(),
-                    headers: HashMap::new(),
-                };
-            }
+        // An identity-establishing policy already ran in `authenticate`.
+        if self.establishes_identity() {
             return PluginResult::Continue;
         }
+        // Read from `headers` param (not `ctx.headers`) because the handler may
+        // temporarily move headers out of ctx when no plugin modifies them.
+        let content_type = headers.get("content-type").cloned();
+        self.run_soap_policy(ctx, content_type, None).await
+    }
 
-        // Extract the SOAP Header and Body
-        let soap_header = find_element_block(envelope, "Header");
-
-        // Find the WS-Security header
-        let security_block = soap_header
-            .as_deref()
-            .and_then(|h| find_element_block(h, "Security"));
-
-        let security_block = match security_block {
-            Some(s) => s,
-            None => {
-                if self.reject_missing_security_header {
-                    return PluginResult::Reject {
-                        status_code: 401,
-                        body: r#"{"error":"WS-Security header is missing"}"#.to_string(),
-                        headers: HashMap::new(),
-                    };
-                }
-                return PluginResult::Continue;
-            }
+    /// Refuse to dispatch a message whose backend-visible bytes are no longer
+    /// the bytes this policy authenticated.
+    ///
+    /// SOAP authentication now precedes the shared buffered-body normalization
+    /// phase, so a later request-body transform could otherwise hand the
+    /// backend an operation that was never signed. Admission additionally
+    /// refuses the one composition that would do this systematically (see
+    /// [`validate_composition`]); this is the runtime backstop for every other
+    /// transform, including custom plugins.
+    ///
+    /// Only the identity-establishing form records the digest this compares
+    /// against, so a timestamp-only policy — which authenticates nobody and
+    /// makes no integrity claim — stays composable with request-body
+    /// transformers instead of failing every governed request closed.
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        let Some(expected) = ctx.soap_ws_security_authenticated_body_digest else {
+            return PluginResult::Continue;
         };
-
-        let now = Utc::now();
-
-        // Validate Timestamp.
-        //
-        // This runs unconditionally (the helper is a no-op for an absent
-        // Timestamp when `timestamp.require` is false) so that a *present*
-        // Timestamp is always independently validated. The UsernameToken
-        // PasswordDigest binding compares against this same element, and binding
-        // against an unvalidated instant would be no binding at all.
-        if let Err(e) = self.validate_timestamp(&security_block, now) {
-            warn!("soap_ws_security: timestamp validation failed: {}", e);
-            return PluginResult::Reject {
-                status_code: 401,
-                body: format!(r#"{{"error":"{}"}}"#, escape_json_chars(&e)),
-                headers: HashMap::new(),
-            };
+        if sha256_array(body) == expected {
+            return PluginResult::Continue;
         }
-
-        // Keep authenticated identities local until every validation that
-        // borrows the decoded request body has completed. Besides avoiding a
-        // mutable borrow of `ctx` while `body` may borrow its raw bytes, this
-        // prevents partially-authenticated metadata from escaping a later
-        // X.509 or SAML rejection.
-        let mut authenticated_username = None;
-        let mut authenticated_saml_subject = None;
-
-        // Validate UsernameToken
-        if self.username_token_enabled {
-            match self.validate_username_token(&security_block, now).await {
-                Ok(username) => {
-                    authenticated_username = Some(username);
-                    debug!(
-                        content_type = %content_type,
-                        "soap_ws_security: UsernameToken validated"
-                    );
-                }
-                Err(UsernameTokenError::InvalidCredentials) => {
-                    // Generic response + stable failure class: do not log the
-                    // candidate username or password/digest verification detail.
-                    warn!(
-                        failure_class = UsernameTokenError::INVALID_CREDENTIALS_CLASS,
-                        "soap_ws_security: UsernameToken authentication failed"
-                    );
-                    return PluginResult::Reject {
-                        status_code: 401,
-                        body: UsernameTokenError::INVALID_CREDENTIALS_BODY.to_string(),
-                        headers: HashMap::new(),
-                    };
-                }
-                Err(UsernameTokenError::Structural(detail)) => {
-                    warn!(
-                        failure_class = UsernameTokenError::STRUCTURAL_CLASS,
-                        "soap_ws_security: UsernameToken validation failed: {}", detail
-                    );
-                    return PluginResult::Reject {
-                        status_code: 401,
-                        body: format!(r#"{{"error":"{}"}}"#, escape_json_chars(&detail)),
-                        headers: HashMap::new(),
-                    };
-                }
-            }
+        warn!(
+            failure_class = "authenticated_body_mutated",
+            "soap_ws_security: refusing to dispatch a SOAP message whose body changed after \
+             WS-Security validation"
+        );
+        PluginResult::Reject {
+            status_code: 500,
+            body: r#"{"error":"WS-Security: the authenticated SOAP message was modified before backend dispatch"}"#
+                .to_string(),
+            headers: HashMap::new(),
         }
-
-        // Validate X.509 signature
-        if self.x509_enabled
-            && let Err(e) = self.validate_x509_signature(&security_block, envelope)
-        {
-            warn!("soap_ws_security: X.509 signature validation failed: {}", e);
-            return PluginResult::Reject {
-                status_code: 401,
-                body: format!(r#"{{"error":"{}"}}"#, escape_json_chars(&e)),
-                headers: HashMap::new(),
-            };
-        }
-
-        // Validate SAML assertion
-        if self.saml_enabled {
-            match self.validate_saml_assertion(&security_block, envelope, now) {
-                Ok(name_id) => {
-                    authenticated_saml_subject = name_id;
-                    debug!("soap_ws_security: SAML assertion accepted");
-                }
-                Err(e) => {
-                    warn!("soap_ws_security: SAML validation failed: {}", e);
-                    return PluginResult::Reject {
-                        status_code: 401,
-                        body: format!(r#"{{"error":"{}"}}"#, escape_json_chars(&e)),
-                        headers: HashMap::new(),
-                    };
-                }
-            }
-        }
-
-        if let Some(username) = authenticated_username {
-            ctx.metadata
-                .insert("soap_ws_username".to_string(), username);
-        }
-        if let Some(subject) = authenticated_saml_subject {
-            ctx.metadata
-                .insert("soap_ws_saml_subject".to_string(), subject);
-        }
-
-        PluginResult::Continue
     }
 }
 
@@ -3579,40 +5154,6 @@ struct CanonicalizationSpec {
 struct ReferenceTransforms {
     enveloped_signature: bool,
     inclusive_prefixes: Vec<String>,
-}
-
-fn descendant_element<'a, 'input>(
-    parent: Node<'a, 'input>,
-    local_name: &str,
-) -> Option<Node<'a, 'input>> {
-    parent
-        .descendants()
-        .skip(1)
-        .find(|node| node.has_tag_name(local_name))
-}
-
-fn unique_child_element<'a, 'input>(
-    parent: Node<'a, 'input>,
-    local_name: &str,
-    context: &str,
-) -> Result<Option<Node<'a, 'input>>, String> {
-    let mut matches = parent
-        .children()
-        .filter(|node| node.has_tag_name(local_name));
-    let first = matches.next();
-    if matches.next().is_some() {
-        return Err(format!(
-            "{}: multiple {} elements are not allowed",
-            context, local_name
-        ));
-    }
-    Ok(first)
-}
-
-fn node_source<'a>(xml: &'a str, node: Node<'_, '_>) -> Result<&'a str, String> {
-    let range = node.range();
-    xml.get(range)
-        .ok_or_else(|| "WS-Security: XML parser returned an invalid source range".to_string())
 }
 
 fn parse_bounded_xml<'a>(xml: &'a str, context: &str) -> Result<Document<'a>, String> {
@@ -3631,67 +5172,348 @@ fn parse_bounded_xml<'a>(xml: &'a str, context: &str) -> Result<Document<'a>, St
     })
 }
 
-fn selected_security_node<'a, 'input>(
+// ── Namespace-correct SOAP structure (GHSA-3mwq-c8j6-9xhp) ─────────────────
+//
+// Header / Security / Body used to be located by *local name* anywhere in the
+// document, so a signed element under a namespace-confusable `<Body>` could be
+// selected while the backend consumed the real, unsigned `soap:Body`. Every
+// structural selection below is bound to an exact namespace URI and to an exact
+// position in the envelope, and the whole document is checked for additional
+// namespace-correct occurrences so a wrapped duplicate fails closed rather than
+// creating a gateway/backend parser differential.
+
+/// The one namespace-correct SOAP envelope this request is validated against.
+///
+/// Lifetimes mirror `roxmltree::Node<'a, 'input: 'a>`: `'a` is the borrow of
+/// the parsed `Document`, and `'input` is the original XML text that document
+/// borrows. Namespace URIs from `tag_name().namespace()` are `&'a str`.
+struct SoapEnvelopeStructure<'a, 'input: 'a> {
+    envelope_ns: &'a str,
+    header: Option<Node<'a, 'input>>,
+    /// The SOAP `Body` the backend will consume. X.509 signature coverage is
+    /// proven against exactly this node.
+    body: Node<'a, 'input>,
+}
+
+fn is_soap_envelope_namespace(namespace: &str) -> bool {
+    namespace == SOAP11_ENVELOPE_NS || namespace == SOAP12_ENVELOPE_NS
+}
+
+/// Resolve exactly one `Envelope` / optional `Header` / exactly one `Body`,
+/// all in the same SOAP envelope namespace, and reject any additional
+/// namespace-correct `Envelope`/`Header`/`Body` element anywhere in the
+/// document.
+fn resolve_soap_envelope<'a, 'input: 'a>(
     document: &'a Document<'input>,
-    xml: &str,
-    selected_source: &str,
-) -> Result<Node<'a, 'input>, String> {
-    let header = document
-        .descendants()
-        .find(|node| node.has_tag_name("Header"))
-        .ok_or_else(|| "WS-Security: SOAP Header element could not be located".to_string())?;
-    header
-        .descendants()
-        .skip(1)
-        .filter(|node| node.has_tag_name("Security"))
-        .find(|node| node_source(xml, *node).is_ok_and(|source| source == selected_source))
-        .ok_or_else(|| {
-            "WS-Security: selected Security element could not be located in SOAP Header".to_string()
-        })
-}
+) -> Result<SoapEnvelopeStructure<'a, 'input>, String> {
+    let envelope = document.root_element();
+    let envelope_tag = envelope.tag_name();
+    let Some(envelope_ns) = envelope_tag
+        .namespace()
+        .filter(|ns| is_soap_envelope_namespace(ns))
+    else {
+        return Err(
+            "WS-Security: request root element is not a namespace-qualified SOAP Envelope"
+                .to_string(),
+        );
+    };
+    if envelope_tag.name() != "Envelope" {
+        return Err(
+            "WS-Security: request root element is not a namespace-qualified SOAP Envelope"
+                .to_string(),
+        );
+    }
 
-fn envelope_body_node<'a, 'input>(document: &'a Document<'input>) -> Option<Node<'a, 'input>> {
-    document
-        .descendants()
-        .find(|node| node.has_tag_name("Body"))
-}
+    let mut header = None;
+    let mut body = None;
+    for child in envelope.children().filter(Node::is_element) {
+        let tag = child.tag_name();
+        if tag.namespace() != Some(envelope_ns) {
+            return Err(
+                "WS-Security: SOAP Envelope contains a child outside the SOAP envelope namespace"
+                    .to_string(),
+            );
+        }
+        match tag.name() {
+            "Header" => {
+                if header.replace(child).is_some() {
+                    return Err("WS-Security: SOAP Envelope has multiple Header elements".into());
+                }
+            }
+            "Body" => {
+                if body.replace(child).is_some() {
+                    return Err("WS-Security: SOAP Envelope has multiple Body elements".into());
+                }
+            }
+            _ => {
+                return Err(
+                    "WS-Security: SOAP Envelope contains an element other than Header and Body"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    let Some(body) = body else {
+        return Err("WS-Security: SOAP Envelope has no Body element".to_string());
+    };
+    if header.is_some_and(|header| header.next_sibling_element() != Some(body)) {
+        return Err("WS-Security: SOAP Header must immediately precede the Body".to_string());
+    }
 
-fn find_descendant_by_wsu_id<'a, 'input>(
-    parent: Node<'a, 'input>,
-    id: &str,
-) -> Option<Node<'a, 'input>> {
-    parent.descendants().find(|node| {
-        node.is_element()
-            && node.attributes().any(|attribute| {
-                attribute.value() == id
-                    && ((attribute.name() == "Id" && attribute.namespace().is_none())
-                        || (attribute.name() == "Id"
-                            && attribute.namespace() == Some(WSU_NAMESPACE_URI)))
-            })
+    // A second namespace-correct Envelope/Header/Body anywhere else in the
+    // document is the wrapping vector: the gateway would resolve one and a
+    // tolerant backend the other. Nothing legitimate carries one.
+    for node in document.descendants().filter(Node::is_element) {
+        let tag = node.tag_name();
+        if !tag.namespace().is_some_and(is_soap_envelope_namespace) {
+            continue;
+        }
+        if !matches!(tag.name(), "Envelope" | "Header" | "Body") {
+            continue;
+        }
+        let resolved = node == envelope || Some(node) == header || node == body;
+        if !resolved {
+            return Err(format!(
+                "WS-Security: envelope contains a duplicate namespace-qualified SOAP {} element \
+                 — possible XML signature wrapping",
+                tag.name()
+            ));
+        }
+    }
+
+    Ok(SoapEnvelopeStructure {
+        envelope_ns,
+        header,
+        body,
     })
 }
 
-fn count_dom_id_occurrences(document: &Document<'_>, id: &str) -> usize {
-    document
-        .descendants()
-        .filter(Node::is_element)
-        .flat_map(|node| node.attributes())
-        .filter(|attribute| {
-            attribute.value() == id && matches!(attribute.name(), "Id" | "ID" | "id")
-        })
-        .count()
+/// Whether a `wsse:Security` header targets this receiver.
+///
+/// An absent `actor`/`role` means the ultimate receiver, which is the gateway
+/// acting for the backend. `next` and (SOAP 1.2) `ultimateReceiver` also target
+/// it. Headers addressed to some other intermediary are left alone — they are
+/// not this policy's to enforce and must not be mistaken for it.
+fn security_header_targets_receiver(node: Node<'_, '_>, envelope_ns: &str) -> bool {
+    let addressed = if envelope_ns == SOAP11_ENVELOPE_NS {
+        node.attribute((SOAP11_ENVELOPE_NS, "actor"))
+    } else {
+        node.attribute((SOAP12_ENVELOPE_NS, "role"))
+    };
+    match addressed.map(str::trim) {
+        None | Some("") => true,
+        Some(SOAP11_ACTOR_NEXT) | Some(SOAP12_ROLE_NEXT) | Some(SOAP12_ROLE_ULTIMATE_RECEIVER) => {
+            true
+        }
+        Some(_) => false,
+    }
 }
 
-fn decoded_element_text(node: Node<'_, '_>) -> Option<String> {
-    node.text().map(|text| text.trim().to_string())
+/// Resolve the single `wsse:Security` header this gateway enforces.
+///
+/// Every `wsse:Security` element in the document must be a direct child of the
+/// SOAP `Header`; one placed anywhere else (inside the Body, inside another
+/// header block) is a wrapping attempt. Exactly one of them may target this
+/// receiver.
+fn resolve_security_node<'a, 'input: 'a>(
+    document: &'a Document<'input>,
+    structure: &SoapEnvelopeStructure<'a, 'input>,
+) -> Result<Option<Node<'a, 'input>>, String> {
+    let mut selected = None;
+    for node in document.descendants().filter(Node::is_element) {
+        let tag = node.tag_name();
+        if tag.namespace() != Some(WSSE_NAMESPACE_URI) || tag.name() != "Security" {
+            continue;
+        }
+        if structure.header != node.parent() {
+            return Err(
+                "WS-Security: a wsse:Security element appears outside the SOAP Header".to_string(),
+            );
+        }
+        if !security_header_targets_receiver(node, structure.envelope_ns) {
+            continue;
+        }
+        if selected.replace(node).is_some() {
+            return Err(
+                "WS-Security: multiple wsse:Security headers target this receiver".to_string(),
+            );
+        }
+    }
+    Ok(selected)
+}
+
+/// Exactly-one child element in a required namespace.
+fn unique_ns_child<'a, 'input>(
+    parent: Node<'a, 'input>,
+    namespace: &str,
+    local_name: &str,
+    context: &str,
+) -> Result<Option<Node<'a, 'input>>, String> {
+    let mut matches = parent
+        .children()
+        .filter(|node| node.has_tag_name((namespace, local_name)));
+    let first = matches.next();
+    if matches.next().is_some() {
+        return Err(format!(
+            "{context}: multiple {local_name} elements are not allowed"
+        ));
+    }
+    Ok(first)
+}
+
+/// Trimmed text of the single text child, or `None` when the element is empty.
+fn element_text(node: Node<'_, '_>) -> Option<String> {
+    let text = node.text()?.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// Bounded, single-pass index of every XML id-bearing attribute in the
+/// document.
+///
+/// Built once per validated message, after the signature is trusted, instead of
+/// re-scanning the whole envelope per `<Reference>` — the
+/// `O(references × body)` amplification of GHSA-9g4v-h9hm-846r. Counting spans
+/// the broad set of id spellings a tolerant backend might resolve (`wsu:Id`,
+/// bare `Id`, `ID`, `id`, `xml:id`) so a duplicate under any of them fails
+/// closed.
+///
+/// Keys are `&'a str` because `roxmltree::Attribute::value()` returns a borrow
+/// of the document (`&'a str`), not a direct `&'input str`.
+struct DocumentIdIndex<'a, 'input: 'a> {
+    entries: HashMap<&'a str, (usize, Node<'a, 'input>)>,
+}
+
+impl<'a, 'input: 'a> DocumentIdIndex<'a, 'input> {
+    fn build(document: &'a Document<'input>) -> Self {
+        let mut entries: HashMap<&'a str, (usize, Node<'a, 'input>)> = HashMap::new();
+        for node in document.descendants().filter(Node::is_element) {
+            for attribute in node.attributes() {
+                if !is_xml_id_attribute(attribute.name(), attribute.namespace()) {
+                    continue;
+                }
+                entries
+                    .entry(attribute.value())
+                    .and_modify(|(count, _)| *count += 1)
+                    .or_insert((1, node));
+            }
+        }
+        Self { entries }
+    }
+
+    /// The unique element bearing `id`, or an error naming how many carry it.
+    fn resolve_unique(&self, id: &str) -> Result<Node<'a, 'input>, String> {
+        match self.entries.get(id) {
+            Some((1, node)) => Ok(*node),
+            Some((count, _)) => Err(format!(
+                "WS-Security: referenced id is not unique in the envelope ({count} occurrences) \
+                 — possible XML signature wrapping"
+            )),
+            None => Err("WS-Security: referenced element not found".to_string()),
+        }
+    }
+}
+
+fn is_xml_id_attribute(name: &str, namespace: Option<&str>) -> bool {
+    match namespace {
+        None => matches!(name, "Id" | "ID" | "id"),
+        Some(WSU_NAMESPACE_URI) => name == "Id",
+        Some("http://www.w3.org/XML/1998/namespace") => name == "id",
+        // Any other namespace-qualified `Id` a backend might resolve.
+        Some(_) => name == "Id",
+    }
+}
+
+/// Borrowed envelope state for [`SoapWsSecurity::verify_reference_digests`].
+struct ReferenceDigestDocument<'ctx, 'a, 'i: 'a> {
+    structure: &'ctx SoapEnvelopeStructure<'a, 'i>,
+    id_index: &'ctx DocumentIdIndex<'a, 'i>,
+    envelope: &'ctx str,
+}
+
+/// What a verified `SignedInfo` actually protects.
+#[derive(Default)]
+struct ReferenceCoverage {
+    /// Node ids of every element a verified Reference resolved to.
+    covered: Vec<NodeId>,
+    /// Whether one of them is the namespace-correct backend-visible SOAP Body.
+    covers_body: bool,
+}
+
+/// Whether `node` is `ancestor` or a descendant of it.
+fn node_is_within(node: Node<'_, '_>, ancestor: Node<'_, '_>) -> bool {
+    let ancestor_id = ancestor.id();
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate.id() == ancestor_id {
+            return true;
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+/// `KeyInfo/X509Data/X509Certificate` text, all three namespace-qualified and
+/// each required to be unique.
+fn xmldsig_key_info_certificate(
+    signature: Node<'_, '_>,
+    context: &str,
+) -> Result<Option<String>, String> {
+    let Some(key_info) = unique_ns_child(signature, XMLDSIG_NAMESPACE_URI, "KeyInfo", context)?
+    else {
+        return Ok(None);
+    };
+    let Some(x509_data) = unique_ns_child(key_info, XMLDSIG_NAMESPACE_URI, "X509Data", context)?
+    else {
+        return Ok(None);
+    };
+    let Some(certificate) =
+        unique_ns_child(x509_data, XMLDSIG_NAMESPACE_URI, "X509Certificate", context)?
+    else {
+        return Ok(None);
+    };
+    Ok(element_text(certificate))
+}
+
+/// Aggregate canonicalization/scan work budget for one validated message.
+///
+/// Every `exclusive_canonicalize` charges both the source subtree it walks and
+/// the canonical bytes it emits, so the total XML work one request can drive is
+/// a small constant multiple of its own decoded body regardless of how many
+/// References it declares or how they nest (GHSA-9g4v-h9hm-846r).
+struct WorkBudget {
+    remaining: usize,
+}
+
+impl WorkBudget {
+    fn for_envelope(envelope: &str) -> Self {
+        Self {
+            remaining: envelope
+                .len()
+                .saturating_mul(CANONICALIZATION_BUDGET_MULTIPLIER)
+                .max(MIN_CANONICALIZATION_BUDGET_BYTES),
+        }
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<(), String> {
+        self.remaining = self.remaining.checked_sub(bytes).ok_or_else(|| {
+            "WS-Security: message exceeds the permitted XML canonicalization work budget"
+                .to_string()
+        })?;
+        Ok(())
+    }
 }
 
 fn parse_signed_info_canonicalization(
     signed_info: Node<'_, '_>,
     context: &str,
 ) -> Result<CanonicalizationSpec, String> {
-    let method = unique_child_element(signed_info, "CanonicalizationMethod", context)?
-        .ok_or_else(|| format!("{}: SignedInfo missing CanonicalizationMethod", context))?;
+    let method = unique_ns_child(
+        signed_info,
+        XMLDSIG_NAMESPACE_URI,
+        "CanonicalizationMethod",
+        context,
+    )?
+    .ok_or_else(|| format!("{}: SignedInfo missing CanonicalizationMethod", context))?;
     let algorithm = method.attribute("Algorithm").ok_or_else(|| {
         format!(
             "{}: CanonicalizationMethod missing Algorithm attribute",
@@ -3714,15 +5536,16 @@ fn parse_reference_transforms(
     reference: Node<'_, '_>,
     context: &str,
 ) -> Result<ReferenceTransforms, String> {
-    let transforms = unique_child_element(reference, "Transforms", context)?.ok_or_else(|| {
-        format!(
-            "{}: Reference missing required exclusive-c14n Transform",
-            context
-        )
-    })?;
+    let transforms = unique_ns_child(reference, XMLDSIG_NAMESPACE_URI, "Transforms", context)?
+        .ok_or_else(|| {
+            format!(
+                "{}: Reference missing required exclusive-c14n Transform",
+                context
+            )
+        })?;
 
     for child in transforms.children().filter(Node::is_element) {
-        if !child.has_tag_name("Transform") {
+        if !child.has_tag_name((XMLDSIG_NAMESPACE_URI, "Transform")) {
             return Err(format!(
                 "{}: unsupported element '{}' inside Transforms",
                 context,
@@ -3736,7 +5559,7 @@ fn parse_reference_transforms(
     let mut transform_count = 0usize;
     for transform in transforms
         .children()
-        .filter(|node| node.has_tag_name("Transform"))
+        .filter(|node| node.has_tag_name((XMLDSIG_NAMESPACE_URI, "Transform")))
     {
         transform_count += 1;
         if transform_count > 2 {
@@ -3861,12 +5684,21 @@ fn exclusive_canonicalize(
     root: Node<'_, '_>,
     inclusive_prefixes: &[String],
     excluded_node: Option<NodeId>,
+    budget: &mut WorkBudget,
 ) -> Result<Vec<u8>, String> {
     if !root.is_element() {
         return Err("WS-Security: exclusive c14n requires an element node".to_string());
     }
 
-    let mut output = String::with_capacity(root.range().len());
+    // Charge the subtree before walking it, so an over-budget request is
+    // refused without doing the work, then charge the complete emitted
+    // canonical representation. Both sides are needed: the source bounds the
+    // walk, while the output bounds the allocation and digest input. Charging
+    // only output expansion would account for max(source, output), not the
+    // documented source + output work.
+    let source_len = root.range().len();
+    budget.charge(source_len)?;
+    let mut output = String::with_capacity(source_len);
     let mut rendered_namespaces = HashMap::new();
     rendered_namespaces.insert(
         "xml".to_string(),
@@ -3881,6 +5713,7 @@ fn exclusive_canonicalize(
         &mut rendered_namespaces,
         &mut output,
     )?;
+    budget.charge(output.len())?;
     Ok(output.into_bytes())
 }
 
@@ -3908,7 +5741,8 @@ pub(crate) fn exclusive_canonicalize_element_for_test(
             }
         })
         .collect::<Vec<_>>();
-    let canonical = exclusive_canonicalize(xml, root, &prefixes, None)?;
+    let mut budget = WorkBudget::for_envelope(xml);
+    let canonical = exclusive_canonicalize(xml, root, &prefixes, None, &mut budget)?;
     String::from_utf8(canonical).map_err(|_| "WS-Security: canonical XML was not UTF-8".to_string())
 }
 
@@ -4110,188 +5944,6 @@ fn push_canonical_attribute_value(output: &mut String, value: &str) {
     }
 }
 
-// ── XML extraction helpers ──────────────────────────────────────────────────
-//
-// These helpers find elements by local name (ignoring namespace prefixes) to
-// support various SOAP toolkit prefix conventions (wsse:, WSSE:, soap:, etc.).
-
-/// Find an element block by local name, starting from position 0.
-/// Returns the full element including its content and closing tag.
-fn find_element_block(xml: &str, local_name: &str) -> Option<String> {
-    find_element_block_from(xml, local_name, 0)
-}
-
-/// Find an element block by local name, starting from a given byte offset.
-fn find_element_block_from(xml: &str, local_name: &str, start: usize) -> Option<String> {
-    find_element_block_from_with_end(xml, local_name, start).map(|(block, _)| block)
-}
-
-/// Find an element block and also return the absolute end offset (within `xml`)
-/// of the matched block. Callers that iterate over multiple sibling elements
-/// must use this and advance their cursor with the returned end offset —
-/// otherwise they will re-find the same element on the next iteration and
-/// loop forever.
-fn find_element_block_from_with_end(
-    xml: &str,
-    local_name: &str,
-    start: usize,
-) -> Option<(String, usize)> {
-    if start > xml.len() {
-        return None;
-    }
-    let search = &xml[start..];
-
-    // Match <prefix:localName or <localName
-    let open_pos = find_tag_start(search, local_name)?;
-
-    let tag_start = open_pos;
-    let after_open = &search[tag_start..];
-
-    // Find the actual tag name (with optional prefix)
-    let full_tag_name = extract_full_tag_name(after_open)?;
-
-    // Check for self-closing tag
-    let tag_header_end = after_open.find('>')?;
-    if after_open.as_bytes().get(tag_header_end.checked_sub(1)?) == Some(&b'/') {
-        let end = start + tag_start + tag_header_end + 1;
-        return Some((after_open[..=tag_header_end].to_string(), end));
-    }
-
-    // Find matching closing tag </prefix:localName> or </localName>
-    let closing = format!("</{}>", full_tag_name);
-    let close_pos = search[tag_start..].find(&closing)?;
-    let end_in_search = tag_start + close_pos + closing.len();
-    let end = start + end_in_search;
-
-    Some((search[tag_start..end_in_search].to_string(), end))
-}
-
-/// Find the text content of a direct child element by local name.
-fn find_element_text(xml: &str, local_name: &str) -> Option<String> {
-    let block = find_element_block(xml, local_name)?;
-    extract_element_text_content(&block, local_name)
-}
-
-/// Extract text content between the opening and closing tags of an element.
-fn extract_element_text_content(element: &str, local_name: &str) -> Option<String> {
-    // Find end of opening tag
-    let content_start = element.find('>')? + 1;
-
-    // Find start of closing tag (search for </...localName>)
-    let close_idx = find_closing_tag_pos(element, local_name)?;
-
-    let content = &element[content_start..close_idx];
-    Some(content.trim().to_string())
-}
-
-/// Find the position of a closing tag for the given local name.
-fn find_closing_tag_pos(element: &str, local_name: &str) -> Option<usize> {
-    let bytes = element.as_bytes();
-    let name_bytes = local_name.as_bytes();
-    let len = bytes.len();
-    let name_len = name_bytes.len();
-
-    let mut i = 0;
-    while i + 2 + name_len < len {
-        if bytes[i] == b'<' && bytes[i + 1] == b'/' {
-            // Check for </localName> or </prefix:localName>
-            let after_slash = &bytes[i + 2..];
-            // Direct match: </localName
-            if after_slash.starts_with(name_bytes) {
-                let next = after_slash.get(name_len)?;
-                if *next == b'>' {
-                    return Some(i);
-                }
-            }
-            // Prefixed match: </prefix:localName
-            if let Some(colon_pos) = after_slash.iter().position(|&b| b == b':')
-                && colon_pos + 1 + name_len <= after_slash.len()
-            {
-                let after_colon = &after_slash[colon_pos + 1..];
-                if after_colon.starts_with(name_bytes) && after_colon.get(name_len) == Some(&b'>') {
-                    return Some(i);
-                }
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Find the starting position of a tag with the given local name.
-/// Matches both `<localName` and `<prefix:localName` patterns.
-fn find_tag_start(xml: &str, local_name: &str) -> Option<usize> {
-    let bytes = xml.as_bytes();
-    let name_bytes = local_name.as_bytes();
-    let len = bytes.len();
-    let name_len = name_bytes.len();
-
-    let mut i = 0;
-    while i + 1 + name_len <= len {
-        if bytes[i] == b'<' && !matches!(bytes[i + 1], b'/' | b'!' | b'?') {
-            let after_lt = &bytes[i + 1..];
-
-            // Direct match: <localName followed by space, >, or /
-            if after_lt.starts_with(name_bytes)
-                && let Some(&next) = after_lt.get(name_len)
-                && matches!(next, b' ' | b'>' | b'/' | b'\t' | b'\n')
-            {
-                return Some(i);
-            }
-
-            // Prefixed match: <prefix:localName
-            if let Some(colon_offset) = after_lt.iter().take(64).position(|&b| b == b':') {
-                let prefix_part = &after_lt[..colon_offset];
-                if prefix_part
-                    .iter()
-                    .all(|&b| !matches!(b, b' ' | b'>' | b'/'))
-                {
-                    let after_colon = &after_lt[colon_offset + 1..];
-                    if after_colon.starts_with(name_bytes)
-                        && let Some(&next) = after_colon.get(name_len)
-                        && matches!(next, b' ' | b'>' | b'/' | b'\t' | b'\n')
-                    {
-                        return Some(i);
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Extract the full tag name (including prefix) from a tag start: `<prefix:Name ...>`.
-fn extract_full_tag_name(from_tag_start: &str) -> Option<String> {
-    let after_lt = &from_tag_start[1..]; // skip '<'
-    let end = after_lt.find([' ', '>', '/', '\t', '\n'])?;
-    Some(after_lt[..end].to_string())
-}
-
-/// Find an attribute value in an element's opening tag.
-fn find_attribute(element: &str, attr_name: &str) -> Option<String> {
-    // Find the opening tag (up to the first >)
-    let tag_end = element.find('>')?;
-    let tag = &element[..tag_end];
-
-    // Search for attr_name="value" or attr_name='value'
-    // Also handle namespaced attributes like wsu:Id
-    let patterns = [format!("{}=\"", attr_name), format!("{}='", attr_name)];
-
-    for pattern in &patterns {
-        if let Some(pos) = tag.find(pattern.as_str()) {
-            let value_start = pos + pattern.len();
-            let quote = tag.as_bytes()[value_start - 1]; // " or '
-            let remaining = &tag[value_start..];
-            if let Some(value_end) = remaining.find(quote as char) {
-                return Some(remaining[..value_end].to_string());
-            }
-        }
-    }
-
-    None
-}
-
 fn extract_full_tag_name_from_tag(tag: &str) -> Option<&str> {
     let trimmed = tag.trim_start();
     let end = trimmed
@@ -4380,8 +6032,26 @@ where
 /// skipped as non-element spans. Unlike the narrower extraction helpers, this
 /// full-envelope scan treats malformed start tags as errors rather than
 /// returning a partial count.
+///
+/// Single-id convenience wrapper over [`count_raw_id_occurrences`], reached only
+/// through `lib::_test_support`; the request path scans the whole `SignedInfo` in
+/// one pass. The binary target compiles this module without that facade.
+#[allow(dead_code)]
 pub(crate) fn count_wsu_id_occurrences(xml: &str, id: &str) -> Result<usize, String> {
-    let mut count = 0usize;
+    Ok(count_raw_id_occurrences(xml, &[id])?[0])
+}
+
+/// Count raw start-tag id occurrences for several ids in **one** pass.
+///
+/// Scanning per Reference made the guard itself `O(references × body)`, which
+/// is half of what GHSA-9g4v-h9hm-846r measures. One pass answers the whole
+/// `SignedInfo` at once; the returned counts are positionally aligned with
+/// `ids`.
+pub(crate) fn count_raw_id_occurrences(xml: &str, ids: &[&str]) -> Result<Vec<usize>, String> {
+    let mut counts = vec![0usize; ids.len()];
+    if ids.is_empty() {
+        return Ok(counts);
+    }
     let mut search_from = 0usize;
     while let Some(rel) = xml[search_from..].find('<') {
         let tag_start = search_from + rel;
@@ -4407,10 +6077,10 @@ pub(crate) fn count_wsu_id_occurrences(xml: &str, id: &str) -> Result<usize, Str
             "WS-Security: malformed XML start tag while scanning referenced ids".to_string()
         })?;
         let tag = &xml[tag_start + 1..tag_start + tag_end_rel];
-        count += count_id_attributes_in_tag(tag, id);
+        count_id_attributes_in_tag(tag, ids, &mut counts);
         search_from = tag_start + tag_end_rel + 1;
     }
-    Ok(count)
+    Ok(counts)
 }
 
 fn skip_markup_declaration(xml: &str, tag_start: usize) -> Result<usize, String> {
@@ -4513,15 +6183,17 @@ fn find_start_tag_end(xml: &str, tag_start: usize) -> Option<usize> {
     None
 }
 
-fn count_id_attributes_in_tag(tag: &str, id: &str) -> usize {
-    let mut count = 0usize;
+fn count_id_attributes_in_tag(tag: &str, ids: &[&str], counts: &mut [usize]) {
     scan_tag_attributes(tag, |name, value| {
-        if is_xml_id_attribute_name(name) && value == id {
-            count += 1;
+        if is_xml_id_attribute_name(name) {
+            for (index, id) in ids.iter().enumerate() {
+                if value == *id {
+                    counts[index] += 1;
+                }
+            }
         }
         false
     });
-    count
 }
 
 fn is_xml_id_attribute_name(name: &str) -> bool {
@@ -4537,17 +6209,25 @@ fn is_xml_id_attribute_name(name: &str) -> bool {
 /// `KeyInfo/X509Data/X509Certificate`. A `BinarySecurityToken` reference is
 /// also accepted for symmetry with the WS-Security X.509 path, though that
 /// is unusual for SAML.
-fn extract_saml_signing_cert(sig_block: &str) -> Result<Vec<u8>, String> {
-    if let Some(key_info) = find_element_block(sig_block, "KeyInfo")
-        && let Some(cert_b64) = find_element_text(&key_info, "X509Certificate")
-    {
+fn extract_saml_signing_cert(signature: Node<'_, '_>) -> Result<Vec<u8>, String> {
+    if let Some(cert_b64) = xmldsig_key_info_certificate(signature, "WS-Security: SAML")? {
         return BASE64
             .decode(cert_b64.replace(char::is_whitespace, "").as_bytes())
             .map_err(|e| format!("WS-Security: SAML invalid X509Certificate base64: {}", e));
     }
 
-    if let Some(bst) = find_element_block(sig_block, "BinarySecurityToken") {
-        let cert_b64 = extract_element_text_content(&bst, "BinarySecurityToken")
+    if let Some(key_info) = unique_ns_child(
+        signature,
+        XMLDSIG_NAMESPACE_URI,
+        "KeyInfo",
+        "WS-Security: SAML",
+    )? && let Some(bst) = unique_ns_child(
+        key_info,
+        WSSE_NAMESPACE_URI,
+        "BinarySecurityToken",
+        "WS-Security: SAML",
+    )? {
+        let cert_b64 = element_text(bst)
             .ok_or_else(|| "WS-Security: SAML BinarySecurityToken has no content".to_string())?;
         return BASE64
             .decode(cert_b64.replace(char::is_whitespace, "").as_bytes())
@@ -4563,26 +6243,6 @@ fn extract_saml_signing_cert(sig_block: &str) -> Result<Vec<u8>, String> {
         "WS-Security: SAML signature has no signing certificate (expected X509Certificate in KeyInfo)"
             .to_string(),
     )
-}
-
-/// Apply the XMLDSIG enveloped-signature transform: return a copy of `xml`
-/// with the first `<Signature>` element (and its contents) removed.
-///
-/// This is what XMLDSIG verifiers do before hashing the referenced element
-/// for an enveloped signature — the signer hashed the element with the
-/// (then-empty) Signature placeholder excised, so the verifier has to remove
-/// it too. For SAML assertions there is exactly one Signature child, so
-/// taking the first `<Signature>` match is correct.
-#[cfg(test)]
-fn remove_envelope_signature(xml: &str) -> String {
-    let Some((block, end)) = find_element_block_from_with_end(xml, "Signature", 0) else {
-        return xml.to_string();
-    };
-    let start = end - block.len();
-    let mut out = String::with_capacity(xml.len() - block.len());
-    out.push_str(&xml[..start]);
-    out.push_str(&xml[end..]);
-    out
 }
 
 /// Extract a bare RFC 8017 `RSAPublicKey` DER from a parsed X.509 cert,
@@ -4635,13 +6295,13 @@ fn load_rsa_public_key_from_cert(cert: &X509Certificate<'_>) -> Result<Vec<u8>, 
     // the key and reject every signature regardless of validity.
     let public_key_der = public_key_info.subject_public_key.data.to_vec();
 
-    // Structural regression guard: an `RSAPublicKey` DER is a top-level
-    // SEQUENCE whose declared length matches the buffer length. A future
-    // refactor that accidentally went back to `public_key().raw` (the full
-    // SPKI) would also start with 0x30 — so a tag-only check is
-    // insufficient — but its declared length would not agree with the
-    // buffer. Verifying both tag and length encoding here catches that
-    // class of mistake at load time rather than at request time.
+    // Structural framing guard: an `RSAPublicKey` DER is a top-level
+    // SEQUENCE whose declared length matches the buffer length. This rejects
+    // truncated data, trailing bytes, and invalid DER length encodings before
+    // the key reaches ring. It cannot distinguish a bare `RSAPublicKey` from
+    // a complete `SubjectPublicKeyInfo`, because both are independently
+    // well-formed SEQUENCE values; the extraction above and end-to-end
+    // signature tests enforce that distinction.
     validate_rsa_public_key_der_shape(&public_key_der)
         .map_err(|e| format!("has malformed RSA public key DER: {}", e))?;
 
@@ -4649,13 +6309,12 @@ fn load_rsa_public_key_from_cert(cert: &X509Certificate<'_>) -> Result<Vec<u8>, 
 }
 
 /// Structural sanity check: `der` must be a top-level DER `SEQUENCE` whose
-/// declared length matches the buffer length exactly. This is intentionally
-/// the narrow shape of an RFC 8017 `RSAPublicKey ::= SEQUENCE { modulus,
-/// publicExponent }`. It does NOT parse the inner integers — ring does that
-/// at verify time. The check exists specifically to catch a regression where
-/// the full `SubjectPublicKeyInfo` (which also starts with 0x30, but whose
-/// length header omits the wrapping `AlgorithmIdentifier` bytes that are
-/// still present in the buffer) is passed in place of the bare `RSAPublicKey`.
+/// declared length matches the buffer length exactly. This checks only the
+/// outer framing of an RFC 8017 `RSAPublicKey ::= SEQUENCE { modulus,
+/// publicExponent }`; ring parses the inner integers at verify time. This
+/// framing check rejects invalid DER length encodings, truncation, and
+/// trailing bytes. It does not by itself distinguish this sequence from
+/// another well-formed DER sequence such as a complete `SubjectPublicKeyInfo`.
 fn validate_rsa_public_key_der_shape(der: &[u8]) -> Result<(), String> {
     if der.is_empty() {
         return Err("public key DER is empty".to_string());
@@ -4702,8 +6361,7 @@ fn validate_rsa_public_key_der_shape(der: &[u8]) -> Result<(), String> {
     if expected_total != der.len() {
         return Err(format!(
             "length mismatch: header declares {declared_content_len} content bytes \
-             ({expected_total}-byte total), buffer is {} bytes \
-             (regression: looks like a full SubjectPublicKeyInfo, not a bare RSAPublicKey)",
+             ({expected_total}-byte total), buffer is {} bytes",
             der.len()
         ));
     }
@@ -4717,10 +6375,25 @@ fn extract_pem_der(pem: &str) -> Option<Vec<u8>> {
     let end_marker = "-----END CERTIFICATE-----";
 
     let start = pem.find(start_marker)? + start_marker.len();
-    let end = pem.find(end_marker)?;
+    // Search only after the matching BEGIN marker. An attacker-controlled
+    // inline source may contain an earlier END marker; slicing with that
+    // offset would otherwise panic during configuration admission.
+    let end = start + pem.get(start..)?.find(end_marker)?;
 
     let b64 = pem[start..end].replace(char::is_whitespace, "");
     BASE64.decode(b64.as_bytes()).ok()
+}
+
+/// Classify certificate-shaped input as inline material even when its PEM
+/// markers are malformed or out of order. Passing such hostile input through
+/// the generic path fallback would make the filesystem error echo the entire
+/// configured value before the redacted PEM parser can reject it.
+fn parse_trusted_certificate_source(raw: &str) -> CertSource {
+    if raw.contains("-----BEGIN CERTIFICATE-----") || raw.contains("-----END CERTIFICATE-----") {
+        CertSource::InlinePem(SecretString::new(raw.to_string()))
+    } else {
+        CertSource::parse(raw, MaterialKind::Cert)
+    }
 }
 
 fn contains_forbidden_xml_declaration(xml: &str) -> bool {
@@ -4800,15 +6473,35 @@ enum DeclaredCharset {
 fn resolve_soap_request_body<'a>(
     ctx: &'a RequestContext,
     content_type: &str,
+    media_class: &SoapMediaClass,
 ) -> Result<Option<Cow<'a, str>>, SoapBodyDecodeError> {
     if let Some(bytes) = ctx.request_body_bytes.as_ref() {
         if bytes.is_empty() {
             return Ok(None);
         }
-        return decode_soap_xml_body(bytes, content_type).map(Some);
+        let (envelope_bytes, envelope_content_type) = match media_class {
+            // A bare XOP infoset has no package around it, so like plain XML the
+            // whole body is the envelope. It is only classified apart so an
+            // integrity-claiming policy can refuse it.
+            SoapMediaClass::Xml | SoapMediaClass::Xop => (&bytes[..], Cow::Borrowed(content_type)),
+            SoapMediaClass::Mtom { boundary, start } => {
+                let part = extract_mtom_root_part(bytes, boundary, start.as_deref())?;
+                (part.body, Cow::Owned(part.content_type))
+            }
+        };
+        if envelope_bytes.is_empty() {
+            return Ok(None);
+        }
+        return decode_soap_xml_body(envelope_bytes, &envelope_content_type).map(Some);
     }
     // Fixture-only fallback: production prefers raw bytes. Still enforce the
     // UTF-8 XML-declaration contract so encoding validation is not bypassed.
+    // MTOM is never reachable here: the multipart wrapper is binary framing and
+    // the shared UTF-8 metadata copy is not a representation it can be unpacked
+    // from, so it fails closed rather than validating the wrong bytes.
+    if matches!(media_class, SoapMediaClass::Mtom { .. }) {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    }
     match ctx.metadata.get("request_body") {
         Some(body) if body.is_empty() => Ok(None),
         Some(body) => {
@@ -4817,6 +6510,396 @@ fn resolve_soap_request_body<'a>(
         }
         None => Ok(None),
     }
+}
+
+/// The SOAP root part of an MTOM/XOP `multipart/related` body.
+#[derive(Debug, PartialEq, Eq)]
+struct MtomRootPart<'a> {
+    body: &'a [u8],
+    /// The part's own `Content-Type`, which carries the envelope's charset.
+    content_type: String,
+}
+
+/// One framed MIME part of an MTOM/XOP package.
+///
+/// Only the three headers that decide *which* envelope is validated are kept;
+/// every other header is syntax-checked and discarded. Attachment payloads are
+/// never read, decoded, or validated.
+struct MtomPart<'a> {
+    content_type: Option<&'a str>,
+    content_id: Option<String>,
+    transfer_encoding: Option<&'a str>,
+    body: &'a [u8],
+}
+
+/// A recognized boundary delimiter *line*.
+struct MtomDelimiter {
+    /// Offset of the first `-` of `--boundary`.
+    line_start: usize,
+    /// Offset just past the delimiter line, i.e. past its terminating CRLF (or
+    /// at end of input for a closing delimiter that ends the body).
+    next: usize,
+    closing: bool,
+}
+
+/// Classify what follows `--boundary` on a candidate delimiter line.
+///
+/// Returns how many bytes the line occupies after the boundary token plus
+/// whether this is the closing delimiter, or `None` when the candidate is not a
+/// delimiter line at all — in which case those bytes are payload and the scan
+/// continues past them.
+///
+/// Framing is exact CRLF and nothing else. RFC 2046 transport padding is
+/// deliberately *not* accepted: a padded delimiter is precisely the construct
+/// one parser treats as framing and another as payload, and rejecting it fails
+/// closed instead of choosing a reading the backend may not share.
+fn mtom_delimiter_tail(rest: &[u8]) -> Option<(usize, bool)> {
+    let Some(after_dashes) = rest.strip_prefix(b"--") else {
+        // A part delimiter line ends in exactly CRLF and nothing else.
+        return rest.starts_with(b"\r\n").then_some((2, false));
+    };
+    // Close-delimiter. RFC 2046 allows an epilogue after its CRLF, and allows
+    // the body to simply end here.
+    if after_dashes.starts_with(b"\r\n") {
+        return Some((4, true));
+    }
+    if after_dashes.is_empty() {
+        return Some((2, true));
+    }
+    None
+}
+
+/// A bounded, line-anchored scanner over one package's delimiter lines.
+///
+/// A delimiter line exists only at the very start of the body or immediately
+/// after a CRLF. That anchoring is what makes an embedded `--boundary`
+/// substring inside a preamble, a header value, or an attachment payload inert
+/// here — exactly as it is inert for a conforming backend parser. An unanchored
+/// byte-substring search would instead let an attacker plant a fake part inside
+/// a payload and have Ferrum validate it while the backend consumed the real
+/// root part (GHSA-435h-f785-wmm4).
+struct MtomScanner<'a> {
+    bytes: &'a [u8],
+    dash_boundary: Vec<u8>,
+    crlf_dash_boundary: Vec<u8>,
+    /// Delimiter-line candidates examined so far, across the whole package.
+    candidates: usize,
+}
+
+impl<'a> MtomScanner<'a> {
+    fn new(bytes: &'a [u8], boundary: &str) -> Self {
+        let dash_boundary = format!("--{boundary}").into_bytes();
+        let mut crlf_dash_boundary = Vec::with_capacity(dash_boundary.len() + 2);
+        crlf_dash_boundary.extend_from_slice(b"\r\n");
+        crlf_dash_boundary.extend_from_slice(&dash_boundary);
+        Self {
+            bytes,
+            dash_boundary,
+            crlf_dash_boundary,
+            candidates: 0,
+        }
+    }
+
+    /// The next delimiter line at or after `from`, or `Ok(None)` when the
+    /// package has none left.
+    fn next_from(&mut self, from: usize) -> Result<Option<MtomDelimiter>, SoapBodyDecodeError> {
+        let mut search = from;
+        loop {
+            let line_start = if search == 0 && self.bytes.starts_with(&self.dash_boundary) {
+                0
+            } else {
+                let Some(tail) = self.bytes.get(search..) else {
+                    return Ok(None);
+                };
+                match find_subslice(tail, &self.crlf_dash_boundary) {
+                    // The line starts *after* the CRLF that introduces it.
+                    Some(offset) => search + offset + 2,
+                    None => return Ok(None),
+                }
+            };
+            self.candidates += 1;
+            if self.candidates > MAX_MULTIPART_DELIMITER_CANDIDATES {
+                return Err(SoapBodyDecodeError::MalformedEncoding);
+            }
+            let after_boundary = line_start + self.dash_boundary.len();
+            let rest = self
+                .bytes
+                .get(after_boundary..)
+                .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+            if let Some((tail_len, closing)) = mtom_delimiter_tail(rest) {
+                return Ok(Some(MtomDelimiter {
+                    line_start,
+                    next: after_boundary + tail_len,
+                    closing,
+                }));
+            }
+            // Boundary-shaped bytes that are not a delimiter line. Skip past
+            // them and keep scanning; they belong to whatever part is being
+            // framed. `dash_boundary` is at least three bytes, so the scan
+            // always advances.
+            search = after_boundary;
+        }
+    }
+
+    /// Whether the boundary token occurs anywhere in `bytes[from..]`, anchored
+    /// or not. Used for the epilogue, where any boundary-shaped bytes are
+    /// ambiguous rather than ignorable.
+    fn boundary_occurs_after(&self, from: usize) -> bool {
+        self.bytes
+            .get(from..)
+            .is_some_and(|tail| find_subslice(tail, &self.dash_boundary).is_some())
+    }
+}
+
+/// Parse one MIME part from its exact framed content.
+///
+/// Strict by construction: the header block ends at the first `CRLF CRLF`,
+/// obsolete folded continuation lines are refused rather than unfolded, every
+/// line must be a well-formed `token ":" value`, header bytes must be US-ASCII
+/// with no bare CR or LF, and each of the three headers that decide which
+/// envelope is validated may appear at most once. A first-wins rule over
+/// duplicated or foldable headers is exactly the kind of ambiguity a backend
+/// can resolve differently, so it fails closed here instead.
+fn parse_mtom_part(content: &[u8]) -> Result<MtomPart<'_>, SoapBodyDecodeError> {
+    let header_len =
+        find_subslice(content, b"\r\n\r\n").ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+    if header_len > MAX_MULTIPART_PART_HEADER_BYTES {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    }
+    let header_bytes = &content[..header_len];
+    if !header_bytes
+        .iter()
+        .all(|&byte| matches!(byte, b'\t' | b'\r' | b'\n' | 0x20..=0x7e))
+    {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    }
+    let Ok(headers) = std::str::from_utf8(header_bytes) else {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    };
+
+    let mut content_type: Option<&str> = None;
+    let mut content_id_raw: Option<&str> = None;
+    let mut transfer_encoding: Option<&str> = None;
+    let mut lines = 0usize;
+    for line in headers.split("\r\n") {
+        // A part with no headers at all, or an empty line inside the block,
+        // re-frames the part for a lenient parser.
+        if line.is_empty() {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+        // A bare CR or LF would end this line for some parsers and not others.
+        if line.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+        // Obsolete folding (RFC 5322 obs-fold): refused, not joined.
+        if line.starts_with([' ', '\t']) {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+        lines += 1;
+        if lines > MAX_MULTIPART_PART_HEADERS {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+        if name.is_empty() || !name.bytes().all(is_media_type_token_byte) {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+        let value = value.trim_matches([' ', '\t']);
+        let slot = if name.eq_ignore_ascii_case("content-type") {
+            &mut content_type
+        } else if name.eq_ignore_ascii_case("content-id") {
+            &mut content_id_raw
+        } else if name.eq_ignore_ascii_case("content-transfer-encoding") {
+            &mut transfer_encoding
+        } else {
+            continue;
+        };
+        if slot.replace(value).is_some() {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+    }
+
+    let content_id = match content_id_raw {
+        Some(raw) => {
+            let normalized = normalize_content_id(raw);
+            if normalized.is_empty() {
+                return Err(SoapBodyDecodeError::MalformedEncoding);
+            }
+            Some(normalized)
+        }
+        None => None,
+    };
+
+    let body = content
+        .get(header_len + 4..)
+        .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+    Ok(MtomPart {
+        content_type,
+        content_id,
+        transfer_encoding,
+        body,
+    })
+}
+
+/// Locate and return the SOAP root part of an MTOM/XOP package.
+///
+/// Only part *headers* are parsed; attachment payloads are skipped without
+/// being read, decoded, or validated. The whole package is framed and every
+/// part parsed *before* a root is selected, so no ambiguity later in the
+/// package can be missed by an early return.
+///
+/// The contract this enforces, so that Ferrum and the backend cannot disagree
+/// about which bytes are the envelope (GHSA-435h-f785-wmm4):
+///
+/// * Delimiter lines are recognized only at the body start or immediately after
+///   a CRLF, with exact CRLF framing and no transport padding.
+/// * Exactly one close-delimiter must be present, and the epilogue after it
+///   must not contain the boundary token at all.
+/// * Part headers are strict: US-ASCII, no obsolete folding, well-formed field
+///   names, and at most one `Content-Type` / `Content-ID` /
+///   `Content-Transfer-Encoding` per part.
+/// * `Content-ID` values are unique across the package (RFC 2387).
+/// * The root is the part whose `Content-ID` matches `start`, or the first part
+///   when `start` is absent — and with `start` supplied exactly one part may
+///   match.
+/// * The root part must itself declare a SOAP/XOP infoset and must not declare
+///   a re-encoding `Content-Transfer-Encoding`.
+///
+/// Every other shape — no parts, no matching root, LF-only framing, a missing
+/// or malformed closure, a part header block over its byte/line ceiling, more
+/// than [`MAX_MULTIPART_PARTS`] parts, or more than
+/// [`MAX_MULTIPART_DELIMITER_CANDIDATES`] boundary-shaped candidates — fails
+/// closed.
+fn extract_mtom_root_part<'a>(
+    bytes: &'a [u8],
+    boundary: &str,
+    start: Option<&str>,
+) -> Result<MtomRootPart<'a>, SoapBodyDecodeError> {
+    let mut scanner = MtomScanner::new(bytes, boundary);
+
+    // Anything before the first delimiter line is the RFC 2046 preamble, which
+    // every conforming parser ignores; it is skipped rather than inspected.
+    let first = scanner
+        .next_from(0)?
+        .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+    if first.closing {
+        // `--boundary--` with no parts: there is no envelope to validate.
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    }
+
+    let mut parts: Vec<MtomPart<'a>> = Vec::new();
+    let mut cursor = first.next;
+    let epilogue_start = loop {
+        if parts.len() >= MAX_MULTIPART_PARTS {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+        let next = scanner
+            .next_from(cursor)?
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+        // The CRLF immediately before a delimiter line is framing, not content.
+        let content_end = next
+            .line_start
+            .checked_sub(2)
+            .filter(|end| *end >= cursor)
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+        if &bytes[content_end..next.line_start] != b"\r\n" {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+        parts.push(parse_mtom_part(&bytes[cursor..content_end])?);
+        cursor = next.next;
+        if next.closing {
+            break cursor;
+        }
+    };
+    // A parser that keeps reading past the close-delimiter would frame more
+    // parts than this one did, so any boundary token in the epilogue is
+    // ambiguous rather than ignorable.
+    if scanner.boundary_occurs_after(epilogue_start) {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    }
+
+    // RFC 2387 requires package-unique Content-IDs. Two parts claiming one id
+    // let the gateway and the backend resolve `start` to different envelopes.
+    for (index, part) in parts.iter().enumerate() {
+        let Some(id) = part.content_id.as_deref() else {
+            continue;
+        };
+        if parts[..index]
+            .iter()
+            .any(|earlier| earlier.content_id.as_deref() == Some(id))
+        {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+    }
+
+    let root = match start {
+        Some(start) => {
+            let mut matching = parts
+                .iter()
+                .filter(|part| part.content_id.as_deref() == Some(start));
+            let Some(selected) = matching.next() else {
+                return Err(SoapBodyDecodeError::MalformedEncoding);
+            };
+            if matching.next().is_some() {
+                return Err(SoapBodyDecodeError::MalformedEncoding);
+            }
+            selected
+        }
+        None => parts
+            .first()
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?,
+    };
+
+    // The root part must itself declare a SOAP/XOP infoset. A root part
+    // labelled `application/octet-stream` is the same client-selected
+    // mislabelling GHSA-435h-f785-wmm4 describes, one layer down.
+    let root_content_type = root.content_type.unwrap_or("");
+    let Ok(essence) = media_type_essence(root_content_type) else {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    };
+    if !MTOM_ROOT_ESSENCES.contains(&essence.as_str()) {
+        return Err(SoapBodyDecodeError::UnsupportedCharset);
+    }
+    // MTOM mandates a binary-safe transfer encoding. Anything that re-encodes
+    // the payload would make the bytes Ferrum validates differ from the bytes
+    // the backend decodes.
+    if let Some(encoding) = root.transfer_encoding
+        && !matches!(
+            encoding.trim().to_ascii_lowercase().as_str(),
+            "7bit" | "8bit" | "binary"
+        )
+    {
+        return Err(SoapBodyDecodeError::UnsupportedCharset);
+    }
+
+    Ok(MtomRootPart {
+        body: root.body,
+        content_type: root_content_type.to_string(),
+    })
+}
+
+/// The strict MTOM package parser, reached through the lib target's
+/// `_test_support` shim so hostile-package regressions live in the external
+/// unit suite rather than inline in this module.
+#[allow(dead_code)]
+pub(crate) fn extract_mtom_root_part_for_test(
+    bytes: &[u8],
+    boundary: &str,
+    start: Option<&str>,
+) -> Result<(Vec<u8>, String), &'static str> {
+    extract_mtom_root_part(bytes, boundary, start)
+        .map(|part| (part.body.to_vec(), part.content_type))
+        .map_err(SoapBodyDecodeError::class)
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Decode a buffered SOAP body into UTF-8 text for XML validation.
@@ -4865,7 +6948,7 @@ fn skip_content_type_media_type(content_type: &str) -> Result<&str, SoapBodyDeco
         match bytes[i] {
             b';' => return Ok(&content_type[i..]),
             // Media type tokens are not quoted; a quote here is hostile metadata.
-            b'"' | b'\'' | b'\\' => return Err(SoapBodyDecodeError::ConflictingCharset),
+            b'"' | b'\\' => return Err(SoapBodyDecodeError::ConflictingCharset),
             _ => i += 1,
         }
     }
@@ -4882,11 +6965,21 @@ fn next_content_type_parameter(
 ) -> Result<Option<(&str, &str, &str)>, SoapBodyDecodeError> {
     let bytes = rest.as_bytes();
     let mut i = 0;
-    while i < bytes.len() && (bytes[i] == b';' || bytes[i].is_ascii_whitespace()) {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
     }
     if i >= bytes.len() {
         return Ok(None);
+    }
+    if bytes[i] != b';' {
+        return Err(SoapBodyDecodeError::ConflictingCharset);
+    }
+    i += 1;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] == b';' {
+        return Err(SoapBodyDecodeError::ConflictingCharset);
     }
 
     let name_start = i;
@@ -4898,36 +6991,38 @@ fn next_content_type_parameter(
         return Err(SoapBodyDecodeError::ConflictingCharset);
     }
     let name = &rest[name_start..i];
+    if !name.bytes().all(is_media_type_token_byte) {
+        return Err(SoapBodyDecodeError::ConflictingCharset);
+    }
 
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
     }
     if i >= bytes.len() || bytes[i] != b'=' {
-        // Parameter without a value — ignore and continue after the next ';'.
-        while i < bytes.len() && bytes[i] != b';' {
-            i += 1;
-        }
-        return Ok(Some((name, "", &rest[i..])));
+        return Err(SoapBodyDecodeError::ConflictingCharset);
     }
     i += 1;
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
     }
     if i >= bytes.len() {
-        return Ok(Some((name, "", "")));
+        return Err(SoapBodyDecodeError::ConflictingCharset);
     }
 
-    let (value, after_value) = if bytes[i] == b'"' || bytes[i] == b'\'' {
+    let (value, after_value) = if bytes[i] == b'"' {
         parse_quoted_parameter_value(&rest[i..])?
     } else {
         let value_start = i;
         while i < bytes.len() && bytes[i] != b';' {
-            if matches!(bytes[i], b'"' | b'\'' | b'\\') {
+            if matches!(bytes[i], b'"' | b'\\') {
                 return Err(SoapBodyDecodeError::ConflictingCharset);
             }
             i += 1;
         }
         let raw = rest[value_start..i].trim_end();
+        if raw.is_empty() || !raw.bytes().all(is_media_type_token_byte) {
+            return Err(SoapBodyDecodeError::ConflictingCharset);
+        }
         (raw, &rest[i..])
     };
     Ok(Some((name, value, after_value)))
@@ -4939,7 +7034,7 @@ fn parse_quoted_parameter_value(raw: &str) -> Result<(&str, &str), SoapBodyDecod
         return Err(SoapBodyDecodeError::ConflictingCharset);
     }
     let quote = bytes[0];
-    if quote != b'"' && quote != b'\'' {
+    if quote != b'"' {
         return Err(SoapBodyDecodeError::ConflictingCharset);
     }
     let mut i = 1;
@@ -5313,15 +7408,6 @@ fn escape_json_chars(s: &str) -> String {
     escaped
 }
 
-/// Escape XML special characters for safe interpolation.
-fn escape_xml_chars(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5337,147 +7423,232 @@ mod tests {
         assert!(!escape_json_chars(raw).chars().any(|ch| ch < '\u{20}'));
     }
 
+    const TEST_NS_DECLS: &str = concat!(
+        r#" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/""#,
+        r#" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd""#,
+        r#" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd""#,
+        r#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#""#,
+    );
+
+    fn timestamp_only_plugin() -> SoapWsSecurity {
+        SoapWsSecurity::new(&serde_json::json!({ "timestamp": { "require": true } }))
+            .expect("timestamp-only config should construct")
+    }
+
+    /// Namespace-correct envelope whose Security header carries a Timestamp and
+    /// a `ds:Signature` with the supplied `SignedInfo` children.
+    fn signed_envelope(signed_info_children: &str) -> String {
+        format!(
+            "<soap:Envelope{decls}><soap:Header><wsse:Security>\
+             <wsu:Timestamp wsu:Id=\"TS-1\"></wsu:Timestamp>\
+             <ds:Signature><ds:SignedInfo>{children}</ds:SignedInfo></ds:Signature>\
+             </wsse:Security></soap:Header><soap:Body></soap:Body></soap:Envelope>",
+            decls = TEST_NS_DECLS,
+            children = signed_info_children
+        )
+    }
+
+    fn timestamp_reference() -> String {
+        format!(
+            r##"<ds:Reference URI="#TS-1"><ds:Transforms><ds:Transform Algorithm="{}"/></ds:Transforms><ds:DigestMethod Algorithm="{}"/><ds:DigestValue>ZGVhZGJlZWY=</ds:DigestValue></ds:Reference>"##,
+            XML_EXCLUSIVE_C14N, XMLDSIG_SHA256
+        )
+    }
+
+    fn reference_digest_error(envelope: &str) -> String {
+        let plugin = timestamp_only_plugin();
+        let document = parse_bounded_xml(envelope, "test envelope").expect("fixture should parse");
+        let structure = resolve_soap_envelope(&document).expect("fixture envelope should resolve");
+        let security = resolve_security_node(&document, &structure)
+            .expect("fixture Security should resolve")
+            .expect("fixture should carry a Security header");
+        let signature = unique_ns_child(security, XMLDSIG_NAMESPACE_URI, "Signature", "test")
+            .expect("Signature")
+            .expect("Signature");
+        let signed_info = unique_ns_child(signature, XMLDSIG_NAMESPACE_URI, "SignedInfo", "test")
+            .expect("SignedInfo")
+            .expect("SignedInfo");
+        let id_index = DocumentIdIndex::build(&document);
+        let mut budget = WorkBudget::for_envelope(envelope);
+        plugin
+            .verify_reference_digests(
+                signed_info,
+                security,
+                signature,
+                &ReferenceDigestDocument {
+                    structure: &structure,
+                    id_index: &id_index,
+                    envelope,
+                },
+                &mut budget,
+            )
+            .err()
+            .expect("fixture must be rejected")
+    }
+
+    /// GHSA-9g4v-h9hm-846r: the Reference ceiling is enforced before any
+    /// Reference is resolved, canonicalized, or digested.
     #[test]
     fn too_many_x509_signature_references_are_rejected() {
-        let plugin = SoapWsSecurity::new(&serde_json::json!({
-            "timestamp": { "require": true }
-        }))
-        .expect("timestamp-only config should construct");
-        let timestamp = r#"<wsu:Timestamp xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd" wsu:Id="TS-1"></wsu:Timestamp>"#;
-        let canonical_timestamp =
-            exclusive_canonicalize_element_for_test(timestamp, "Timestamp", "")
-                .expect("timestamp should canonicalize");
-        let digest = digest::digest(&digest::SHA256, canonical_timestamp.as_bytes());
-        let digest_b64 = BASE64.encode(digest.as_ref());
-        let reference = format!(
-            r##"<Reference URI="#TS-1"><Transforms><Transform Algorithm="{}"/></Transforms><DigestMethod Algorithm="{}"/><DigestValue>{}</DigestValue></Reference>"##,
-            XML_EXCLUSIVE_C14N, XMLDSIG_SHA256, digest_b64
-        );
-        let references =
-            std::iter::repeat_n(reference.as_str(), MAX_SIGNED_REFERENCES + 1).collect::<String>();
-        let envelope = format!(
-            "<Envelope><Security>{}<Signature><SignedInfo>{}</SignedInfo></Signature></Security><Body></Body></Envelope>",
-            timestamp, references
-        );
-        let document = Document::parse(&envelope).expect("test envelope should parse");
-        let security = descendant_element(document.root(), "Security").expect("Security");
-        let signature = descendant_element(security, "Signature").expect("Signature");
-        let signed_info = descendant_element(signature, "SignedInfo").expect("SignedInfo");
-
-        let err = plugin
-            .verify_reference_digests(signed_info, security, signature, &envelope)
-            .expect_err("reference cap must reject");
-
-        assert!(err.contains("too many Signature References"), "got: {err}");
-    }
-
-    #[test]
-    fn too_many_saml_signature_references_are_rejected() {
-        let plugin = SoapWsSecurity::new(&serde_json::json!({
-            "timestamp": { "require": true }
-        }))
-        .expect("timestamp-only config should construct");
-        let assertion = r#"<Assertion ID="assertion-1"><Issuer>https://idp.example.com</Issuer><Signature></Signature><Subject><NameID>alice@example.com</NameID></Subject></Assertion>"#;
-        let assertion_without_signature = remove_envelope_signature(assertion);
-        let canonical_assertion =
-            exclusive_canonicalize_element_for_test(&assertion_without_signature, "Assertion", "")
-                .expect("assertion should canonicalize");
-        let digest = digest::digest(&digest::SHA256, canonical_assertion.as_bytes());
-        let digest_b64 = BASE64.encode(digest.as_ref());
-        let reference = format!(
-            r##"<Reference URI="#assertion-1"><Transforms><Transform Algorithm="{}"/><Transform Algorithm="{}"/></Transforms><DigestMethod Algorithm="{}"/><DigestValue>{}</DigestValue></Reference>"##,
-            XMLDSIG_ENVELOPED_SIGNATURE, XML_EXCLUSIVE_C14N, XMLDSIG_SHA256, digest_b64
-        );
-        let references =
-            std::iter::repeat_n(reference.as_str(), MAX_SIGNED_REFERENCES + 1).collect::<String>();
-        let envelope = assertion.replacen(
-            "<Signature></Signature>",
-            &format!(
-                "<Signature><SignedInfo>{}</SignedInfo></Signature>",
-                references
-            ),
-            1,
-        );
-        let document = Document::parse(&envelope).expect("test assertion should parse");
-        let assertion = descendant_element(document.root(), "Assertion").expect("Assertion");
-        let signature = descendant_element(assertion, "Signature").expect("Signature");
-        let signed_info = descendant_element(signature, "SignedInfo").expect("SignedInfo");
-
-        let err = plugin
-            .verify_saml_reference_digests(signed_info, assertion, signature, &envelope)
-            .expect_err("SAML reference cap must reject");
-
+        let references = std::iter::repeat_n(timestamp_reference(), MAX_SIGNED_REFERENCES + 1)
+            .collect::<String>();
+        let error = reference_digest_error(&signed_envelope(&references));
         assert!(
-            err.contains("too many SAML Signature References"),
-            "got: {err}"
+            error.contains("too many Signature References"),
+            "got: {error}"
         );
     }
 
-    /// Iterating over multiple `<Reference>` elements with
-    /// `find_element_block_from_with_end` must advance the cursor far enough
-    /// to skip past each match — the previous implementation incremented by
-    /// just 1 byte and looped forever on signed SOAP envelopes.
+    /// GHSA-9g4v-h9hm-846r: two References to one id multiply canonicalization
+    /// work over the same subtree and are never meaningful.
     #[test]
-    fn multiple_reference_iteration_terminates_and_finds_each_block() {
-        // Use a `r##"..."##` raw string so the embedded `#` characters in URI
-        // attributes don't terminate the literal early.
-        let signed_info = r##"<SignedInfo>
-            <Reference URI="#alpha"><DigestValue>aGVsbG8=</DigestValue></Reference>
-            <Reference URI="#beta"><DigestValue>d29ybGQ=</DigestValue></Reference>
-            <Reference URI="#gamma"><DigestValue>IQ==</DigestValue></Reference>
-        </SignedInfo>"##;
-
-        let mut search_from = 0;
-        let mut uris = Vec::new();
-        let mut iterations = 0;
-        while let Some((block, next_start)) =
-            find_element_block_from_with_end(signed_info, "Reference", search_from)
-        {
-            iterations += 1;
-            assert!(
-                iterations < 50,
-                "iteration must terminate (regression: infinite loop)"
-            );
-            uris.push(find_attribute(&block, "URI").unwrap_or_default());
-            search_from = next_start.max(search_from + 1);
-        }
-        assert_eq!(uris, vec!["#alpha", "#beta", "#gamma"]);
+    fn duplicate_x509_reference_uris_are_rejected() {
+        let references = format!("{}{}", timestamp_reference(), timestamp_reference());
+        let error = reference_digest_error(&signed_envelope(&references));
+        assert!(
+            error.contains("duplicate Signature Reference URI"),
+            "got: {error}"
+        );
     }
 
-    /// The end offset must point past the closing `</Reference>` so the next
-    /// search starts after the just-matched element, not inside it.
+    /// GHSA-9g4v-h9hm-846r (SAML half): exactly one Reference to the enclosing
+    /// assertion is supported, so duplicates cannot re-canonicalize it.
     #[test]
-    fn end_offset_points_past_closing_tag() {
-        let xml = "prefix<Reference URI=\"#a\"></Reference>middle<Reference URI=\"#b\"></Reference>suffix";
-        let Some((first_block, end1)) = find_element_block_from_with_end(xml, "Reference", 0)
-        else {
-            panic!("first Reference match should be present");
-        };
-        assert!(first_block.contains("#a"));
-        // The remainder should still contain the second Reference.
-        let remainder = &xml[end1..];
-        assert!(remainder.contains("#b"));
-        assert!(!remainder.contains("#a"));
+    fn duplicate_saml_signature_references_are_rejected() {
+        let plugin = timestamp_only_plugin();
+        let reference = format!(
+            r##"<ds:Reference URI="#assertion-1"><ds:Transforms><ds:Transform Algorithm="{}"/><ds:Transform Algorithm="{}"/></ds:Transforms><ds:DigestMethod Algorithm="{}"/><ds:DigestValue>ZGVhZGJlZWY=</ds:DigestValue></ds:Reference>"##,
+            XMLDSIG_ENVELOPED_SIGNATURE, XML_EXCLUSIVE_C14N, XMLDSIG_SHA256
+        );
+        let envelope = format!(
+            r#"<saml:Assertion xmlns:saml="{}" xmlns:ds="{}" ID="assertion-1"><ds:Signature><ds:SignedInfo>{}{}</ds:SignedInfo></ds:Signature></saml:Assertion>"#,
+            SAML2_ASSERTION_NS, XMLDSIG_NAMESPACE_URI, reference, reference
+        );
+        let document = parse_bounded_xml(&envelope, "test assertion").expect("fixture parses");
+        let assertion = document.root_element();
+        let signature = unique_ns_child(assertion, XMLDSIG_NAMESPACE_URI, "Signature", "test")
+            .expect("Signature")
+            .expect("Signature");
+        let signed_info = unique_ns_child(signature, XMLDSIG_NAMESPACE_URI, "SignedInfo", "test")
+            .expect("SignedInfo")
+            .expect("SignedInfo");
+        let mut budget = WorkBudget::for_envelope(&envelope);
+        let error = plugin
+            .verify_saml_reference_digests(
+                signed_info,
+                assertion,
+                signature,
+                &envelope,
+                &mut budget,
+            )
+            .expect_err("duplicate SAML references must reject");
+        assert!(error.contains("exactly one Reference"), "got: {error}");
     }
 
-    /// Self-closing tags (e.g. `<Reference URI="#x"/>`) also yield a valid
-    /// end offset so subsequent iterations advance past them.
+    /// GHSA-3mwq-c8j6-9xhp: a namespace-confusable second `Body` fails closed
+    /// rather than becoming a resolvable alternate referent.
     #[test]
-    fn self_closing_tag_returns_correct_end() {
-        let xml = "before<Foo/>after";
-        let Some((block, end)) = find_element_block_from_with_end(xml, "Foo", 0) else {
-            panic!("self-closing Foo match should be present");
+    fn duplicate_namespace_correct_body_is_rejected() {
+        let envelope = format!(
+            "<soap:Envelope{decls}><soap:Header></soap:Header><soap:Body>\
+             <soap:Body></soap:Body></soap:Body></soap:Envelope>",
+            decls = TEST_NS_DECLS
+        );
+        let document = parse_bounded_xml(&envelope, "test envelope").expect("fixture parses");
+        // Avoid `expect_err`: SoapEnvelopeStructure is intentionally not Debug.
+        let error = match resolve_soap_envelope(&document) {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate Body must reject"),
         };
-        assert_eq!(block, "<Foo/>");
-        assert_eq!(&xml[end..], "after");
+        assert!(
+            error.contains("duplicate namespace-qualified"),
+            "got: {error}"
+        );
+    }
+
+    /// GHSA-3mwq-c8j6-9xhp: a `wsse:Security` element outside the SOAP Header
+    /// is a wrapping attempt, not an alternate policy location.
+    #[test]
+    fn security_header_outside_soap_header_is_rejected() {
+        let envelope = format!(
+            "<soap:Envelope{decls}><soap:Header></soap:Header><soap:Body>\
+             <wsse:Security></wsse:Security></soap:Body></soap:Envelope>",
+            decls = TEST_NS_DECLS
+        );
+        let document = parse_bounded_xml(&envelope, "test envelope").expect("fixture parses");
+        let structure = resolve_soap_envelope(&document).expect("envelope resolves");
+        let error = resolve_security_node(&document, &structure)
+            .expect_err("misplaced Security must reject");
+        assert!(error.contains("outside the SOAP Header"), "got: {error}");
+    }
+
+    /// GHSA-9g4v-h9hm-846r: the aggregate budget charges both the source
+    /// subtree walk and the complete emitted canonical representation.
+    #[test]
+    fn canonicalization_budget_refuses_over_budget_work() {
+        let xml = "<root>value</root>";
+        let document = parse_bounded_xml(xml, "test fixture").expect("fixture parses");
+        let root = document.root_element();
+        let source_len = root.range().len();
+        let mut budget = WorkBudget {
+            remaining: source_len.saturating_mul(2).saturating_sub(1),
+        };
+        let error = exclusive_canonicalize(xml, root, &[], None, &mut budget)
+            .expect_err("source plus full canonical output must exceed the budget");
+        assert!(
+            error.contains("canonicalization work budget"),
+            "got: {error}"
+        );
+    }
+
+    /// GHSA-435h-f785-wmm4: classification is structural, so a parameter value
+    /// that merely contains a SOAP essence is not a SOAP request, and a
+    /// mislabelled one is refused on a strict route.
+    #[test]
+    fn media_type_classification_is_structural() {
+        assert_eq!(
+            classify_soap_media_type("text/xml; charset=utf-8", true),
+            Ok(Some(SoapMediaClass::Xml))
+        );
+        assert_eq!(
+            classify_soap_media_type("multipart/form-data; boundary=application/xml", true),
+            Ok(None)
+        );
+        assert_eq!(
+            classify_soap_media_type("application/octet-stream", true),
+            Ok(None)
+        );
+        assert_eq!(
+            classify_soap_media_type("text/xml\u{7f}", true),
+            Err(MediaTypeRejection::MalformedMediaType)
+        );
+        assert_eq!(
+            classify_soap_media_type(
+                "multipart/related; type=\"application/xop+xml\"; boundary=MIME_boundary; start=\"<root@example.com>\"",
+                true
+            ),
+            Ok(Some(SoapMediaClass::Mtom {
+                boundary: "MIME_boundary".to_string(),
+                start: Some("root@example.com".to_string()),
+            }))
+        );
+        assert_eq!(
+            classify_soap_media_type(
+                "multipart/related; type=\"application/xop+xml\"; boundary=MIME_boundary",
+                false
+            ),
+            Err(MediaTypeRejection::UnsupportedMediaTypeOnProtectedRoute)
+        );
+        assert_eq!(
+            classify_soap_media_type("multipart/related; type=\"application/xop+xml\"", true),
+            Err(MediaTypeRejection::MalformedMultipartPackaging)
+        );
     }
 
     // ── RSA public-key DER shape validator ──────────────────────────────────
     //
-    // These tests pin the structural regression guard that catches a future
-    // refactor accidentally routing the full SubjectPublicKeyInfo (instead of
-    // the bare RSAPublicKey) into `ring::signature::UnparsedPublicKey::new` —
-    // the original PR #844 bug class.
+    // These tests pin the structural framing guard applied before the bare
+    // RSAPublicKey reaches `ring::signature::UnparsedPublicKey::new`.
 
     #[test]
     fn rsa_pk_shape_accepts_short_form_sequence_with_matching_length() {
@@ -5539,12 +7710,7 @@ mod tests {
     }
 
     #[test]
-    fn rsa_pk_shape_rejects_full_spki_shape_via_length_mismatch() {
-        // The exact regression: build a synthetic blob that resembles a
-        // SubjectPublicKeyInfo's outer wrapping. Its top-level SEQUENCE length
-        // header declares a content size that excludes the trailing bytes the
-        // buffer still carries — the length check must reject this.
-        //
+    fn rsa_pk_shape_rejects_trailing_bytes_after_sequence() {
         // Layout: 0x30 0x09 [9 content bytes] [4 extra trailing bytes].
         // 9 + 2 (header) = 11, but the buffer length is 15, so this rejects.
         let der = [
@@ -5554,9 +7720,6 @@ mod tests {
         ];
         let err = validate_rsa_public_key_der_shape(&der).unwrap_err();
         assert!(err.contains("length mismatch"), "got: {err}");
-        // The hint about the SPKI regression class is included so the
-        // failure mode is recognizable to future maintainers.
-        assert!(err.contains("SubjectPublicKeyInfo"), "got: {err}");
     }
 
     #[test]
