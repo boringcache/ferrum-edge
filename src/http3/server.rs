@@ -2974,6 +2974,15 @@ async fn handle_h3_request(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
+    // Native H3 has no trustworthy header-only empty-body signal: a GET/HEAD
+    // stream may still deliver DATA. Replay lookup is eligible only after this
+    // phase drained the complete upload and any early normalizer left the
+    // final pre-before_proxy representation empty.
+    ctx.set_replay_request_body_empty_proven(
+        before_proxy_body_requirements.required
+            && prebuffered_body_data.as_ref().is_some_and(Vec::is_empty),
+    );
+
     // before_proxy hooks — only clone headers if at least one plugin modifies them.
     // When no plugin modifies headers, use std::mem::take to avoid a per-request HashMap clone.
     let needs_header_clone =

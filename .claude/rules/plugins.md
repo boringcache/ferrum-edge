@@ -48,12 +48,34 @@ paths:
   (`commit_authentication_attempt`); anything still needing a bound inside
   chargeback uses `chargeback::bounded_billing_identity` (prefix + SHA-256
   digest of the complete value; marker-bearing values always digested).
-- Exception: `request_deduplication` and `mcp_gateway` may not be effective on
-  the same proxy. A dedup replay is a finalized representation served before
-  `mcp_gateway` runs, and MCP's public-URI rewrite comes from live upstream
-  discovery state that no persisted digest can witness
-  (`request_deduplication::validate_composition`, mirrored at runtime by
-  `ResponsePresentationPolicy::Dynamic`).
+- Exception: `request_deduplication` may not be effective on the same proxy as
+  `mcp_gateway`; its response rewrite comes from live upstream discovery state
+  that no persisted digest can witness (`DYNAMIC_RESPONSE_PRESENTATION_PLUGINS`,
+  mirrored at runtime by `ResponsePresentationPolicy::Dynamic`).
+  Deduplication runs at priority 3010, after route dispatch and
+  `request_transformer` header/query rules but before terminate-mode
+  `serverless_function`. Plugin-cache admission rejects every same-protocol
+  header/query mutator at or after deduplication, including priority overrides,
+  and rejects any deferred request-body transformer whose final bytes are not
+  exactly the body produced by the pre-`before_proxy` normalization phase.
+- `response_caching` likewise requires the proxy's private proof that the
+  complete GET/HEAD upload is empty before lookup, binds the complete
+  backend-visible request target (including the effective outbound query),
+  rejects later header/query mutation, and rejects deferred body transforms that
+  could synthesize bytes after lookup. Configured request decompression remains
+  compatible because its exact final body is published during pre-`before_proxy`
+  normalization. Its request-header dimension is the complete `Vary` tuple, not
+  the raw header view: RFC 9111 §4.1 selection is target + `Vary`, and a
+  conditional revalidation, a client `no-cache` refresh, and `Content-Length: 0`
+  are addressed to an entry rather than selecting a different one — keying the
+  raw view would put each of them in a partition the entry cannot be reached
+  from and make the `Vary` index unreachable. Cross-caller isolation is the
+  mandatory caller partition. `Authorization`, `Proxy-Authorization`, and
+  `Cookie` remain mandatory Vary names even for anonymous entries because
+  downstream shared caches cannot observe Ferrum's private caller partition;
+  present values are hashed and absence is a distinct keyed state. The RFC
+  shared-cache authorization admission checks both pristine inbound and live
+  backend-visible `Authorization`, so request transforms cannot erase it.
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order
@@ -65,7 +87,7 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
 3. `authorize`: ACL, mesh_authz, rate limiting
 4. `normalize_buffered_request_body_before_before_proxy`: configured request decompression (and any future early body normalizers) after the pre-`before_proxy` buffer is stored
 5. `before_proxy`: SOAP, AI plugins, workload metrics, transformers, mock, gRPC deadline, load, cache, compression
-6. `on_final_request_body`: body validator, gRPC-Web validation, WAF body rules, OpenAPI request schema, post-transform request-size ceiling
+6. `on_final_request_body`: body validator, gRPC-Web validation, WAF body rules, OpenAPI request schema, post-transform request-size ceiling, `ai_prompt_compressor` staged marker-sanitization rejection (4055), and `ai_semantic_cache` exact/semantic lookup (4057). `ai_semantic_cache` looks up here — not in `before_proxy` — so its replay partition binds the finalized outbound headers/query/destination and fully transformed request body, and a hit cannot bypass fail-closed final-body policy.
 6b. `dispatch_finalized_request_egress`: irreversible outbound request egress
     (`request_mirror`, `serverless_function`, `ai_federation`) over the immutable
     backend-visible body and finalized pre-egress header snapshot, after every

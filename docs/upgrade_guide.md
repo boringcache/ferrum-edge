@@ -250,6 +250,139 @@ Runtime behavior also tightens:
   relied on sending an uninitialized proto2 message must be fixed before
   upgrade.
 
+### Retained-Response Replay Partition (breaking)
+
+`response_caching`, `request_deduplication`, and `ai_semantic_cache` now share
+one fail-closed replay-partition contract
+(`plugins::utils::replay_partition`). Plan for four operational changes:
+
+- **All three caches start cold after upgrade.** Key derivation changed in every
+  plugin, so entries and idempotency records written by an earlier build are
+  unreachable. That is deliberate: anything keyed under the weaker partition
+  must not be replayable. Expect a transient origin-load spike proportional to
+  your cache hit rate, and expect idempotency keys that were mid-flight across
+  the upgrade to be re-executable exactly once.
+- **`response_caching` accepts only bodyless retrieval methods.** A
+  `cacheable_methods` list containing `POST`, `PUT`, `PATCH`, `DELETE`, or any
+  other body-bearing method now fails admission in database, control-plane,
+  data-plane, and file modes. Audit every enabled `response_caching` plugin row
+  before cutover and reduce the list to `GET` / `HEAD`. At runtime, any request
+  that declares a body (`Transfer-Encoding`, or a non-zero/unparsable
+  `Content-Length`) bypasses lookup and storage.
+- **Every caller is partitioned by canonical peer address.** The origin
+  observes it through Ferrum's regenerated `X-Forwarded-For`, for authenticated
+  callers as much as anonymous ones. The new `anonymous_caller_scope` option
+  (default `caller_address`) lets you attest that a route's origin does not vary
+  by caller address and restore the previous sharing with
+  `anonymous_caller_scope: "shared"` — but that attestation covers **anonymous**
+  callers only; authenticated callers always bind their address, and there is no
+  opt-out. A caller whose canonical address cannot be derived bypasses the cache
+  (and is not deduplicated).
+- **`request_deduplication` moved from priority `2750` to `3010`.** It now runs
+  after route dispatch and request-transformer header/query rules, so its
+  logical key binds the effective destination and its fingerprint binds the
+  outbound headers/query. It remains before terminate-mode
+  `serverless_function`, preserving ownership before that external operation.
+  Audit compositions and priority overrides: every same-protocol header/query
+  mutator at or after deduplication is rejected. A deferred request-body
+  transformer is also rejected because `before_proxy` cannot witness its final
+  wire bytes; the exception is a transformer that proves its final output is
+  exactly the body already produced by pre-`before_proxy` normalization. A
+  plugin that still changes headers later remains incompatible even when its
+  body normalization is observable. `mcp_gateway` remains incompatible because
+  its skipped response rewrite depends on mutable live discovery state.
+- **`ai_semantic_cache` lookup moved to the final-request-body stage, priority
+  `2996` → `4057`.** Lookup previously ran in `before_proxy`, ahead of
+  `request_transformer` (3000) and every `transform_request_body` hook, so the
+  headers, query, and prompt bytes it keyed were *pre-transform* — not what the
+  provider would receive — and a hit could bypass a fail-closed final-body
+  validator. It now runs in `on_final_request_body_with_context`, after
+  `ai_prompt_compressor` (4055) enforces its staged marker-sanitization
+  rejection and before `ai_federation` (4060) performs provider I/O. Practical
+  consequences:
+  - keys change; every previously retained entry is unreachable (intended
+    fail-closed outcome);
+  - a request whose headers, query, or body a transform rewrites now keys on the
+    rewritten form, so deployments running `request_transformer`,
+    `compression` request decode, or `ai_prompt_compressor` alongside the cache
+    will see a one-time key change and possibly a different hit distribution;
+  - a `before_proxy` short-circuit that previously lost to a cache hit
+    (`serverless_function` 3025, `response_mock` 3030) now wins, because it runs
+    first;
+  - a priority override that places an `ai_semantic_cache` instance at or before
+    a co-located `ai_prompt_compressor` re-opens the bypass and should not be
+    used.
+- **`ai_semantic_cache` keys bind more of the request.** They now use the shared
+  destination contract (which includes the proxy **namespace**, previously
+  omitted) plus a backend-visible request-context digest covering the original
+  client authority, the effective outbound query, and every non-credential
+  request header. Deployments that varied only by header or query parameter and
+  were previously sharing one completion will now miss. Only transport/hop-by-hop
+  framing fields Ferrum provably regenerates for the backend hop are excluded;
+  `Host`/authority is bound as its own field.
+- **`response_caching` now binds the complete request target too.** The
+  backend-effective query is a mandatory key dimension.
+  `cache_key_include_query: false` remains accepted only to rotate/partition
+  legacy keyspaces; it no longer allows responses to be shared across
+  origin-visible query values. Its request-header dimension is unchanged — the
+  complete `Vary` tuple (backend-nominated dimensions, `vary_by_headers`, and
+  the mandatory credential/session auto-Vary) — because RFC 9111 §4.1 selection
+  is target + `Vary` and a conditional revalidation, a client `no-cache`
+  refresh, and `Content-Length: 0` are addressed to a stored entry rather than
+  selecting a different one. Header/query priority overrides that run at or
+  after `response_caching` and deferred request-body transformers now fail
+  configuration admission. `Authorization`, `Proxy-Authorization`, and
+  `Cookie` are mandatory Vary dimensions even when absent, so anonymous cache
+  HITs now include those names in `Vary`; present values remain hashed.
+  Authorization storage admission also checks both the pristine inbound and
+  live backend-visible header views, so a transformer that removes or adds the
+  field cannot bypass the origin shared-cache opt-in requirement.
+- **GET/HEAD cache lookup now requires an observed empty upload.** Ferrum drains
+  the complete H1/H2/H3 request body before cache lookup and bypasses when it is
+  non-empty or cannot be proven empty. This closes H2/H3 GET-with-DATA replay
+  even when no `Content-Length` is present. Expect those requests to reach the
+  origin instead of receiving or populating a cached response.
+- **Tracing and correlation request headers are now `ai_semantic_cache` key
+  dimensions.** An earlier revision excluded `traceparent`, `tracestate`, `b3`,
+  `X-B3-*`, `X-Request-Id`, `X-Correlation-Id` and friends from the shared
+  request-header partition by reusing the *response*-cache sanitation classifier
+  and arguing they are fresh "by construction". That proof does not hold on the
+  request side: `correlation_id` preserves a valid client-supplied ID, the plugin
+  may not be configured at all, and the value reaches the origin either way.
+  Wherever that partition is used they are bound like any other backend-visible
+  header, so a client that varies its trace header per request will now miss per
+  request. **Plan for this before enabling `ai_semantic_cache` alongside request
+  tracing.** `otel_tracing` injects a `traceparent` carrying a freshly generated
+  span ID into the backend-visible header map on *every* request (in both
+  `trace_context_trust` modes, whenever `generate_trace_id` is `true`), and
+  `correlation_id` injects a generated identifier whenever the client supplied
+  none. Either one makes the exact key and the semantic scope key unique per
+  request, so the cache cannot hit at all — and it still pays for an embedding
+  call and a store on every miss. `trace_context_trust: untrusted` does **not**
+  help: it generates a fresh root rather than normalizing to a shared value. To
+  keep both, either run the cached route on a proxy that does not inject a
+  per-request identifier (`otel_tracing` with `generate_trace_id: false` and no
+  trusted inbound parent, or no `correlation_id` instance), or remove the
+  identifier from the backend-visible view with a `request_transformer` header
+  rule at priority `3000` — which also removes it from what the provider
+  receives, so downstream propagation is lost. `response_caching` is unaffected:
+  it keys request headers through `Vary`, so a trace header is a dimension there
+  only when the origin nominates it or an operator lists it in
+  `vary_by_headers`. Response-header replay sanitation still strips trace
+  identifiers from a retained response; that contract is unchanged.
+- **`scope_by_consumer: false` and `cache_key_include_consumer` no longer
+  disable caller isolation.** Every key now binds an authorization-context
+  fingerprint (mechanism, identity, consumer, peer SPIFFE identity, and digests
+  of the credentials presented), so two credentials that render as one display
+  subject with different scopes never share a retained result. The credential
+  registry includes configured custom header locations for `key_auth`,
+  `jwt_auth`, `jwks_auth`, and `oauth2_introspection`; credential-bearing query
+  parameters are privately digested before authentication or transformer
+  stripping, even when `response_caching.cache_key_include_query` is `false`.
+  Routes that intentionally shared entries across distinct credentials will see
+  a lower hit rate; there is no opt-out, because that sharing was the
+  vulnerability.
+
 ### Response Cache Shared-Storage Hardening
 
 `response_caching` now applies RFC 9111 shared-cache rules that earlier

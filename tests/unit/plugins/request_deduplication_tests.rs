@@ -443,6 +443,11 @@ fn test_new_default_config() {
     let plugin = make_plugin(config);
     assert_eq!(plugin.name(), "request_deduplication");
     assert_eq!(plugin.priority(), priority::REQUEST_DEDUPLICATION);
+    const _: () = {
+        assert!(priority::MESH_ROUTE_DISPATCH < priority::REQUEST_TRANSFORMER);
+        assert!(priority::REQUEST_TRANSFORMER < priority::REQUEST_DEDUPLICATION);
+        assert!(priority::REQUEST_DEDUPLICATION < priority::SERVERLESS_FUNCTION);
+    };
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
     assert!(plugin.requires_response_body_buffering());
     assert!(!plugin.is_auth_plugin());
@@ -4977,7 +4982,10 @@ async fn test_replay_strips_set_cookie_session_hijack_protection() {
 
     // Second client (anonymous, same idempotency key): must NOT receive
     // user A's Set-Cookie even though replay returns user A's body.
-    let mut ctx2 = new_ctx_from("10.0.0.99", "POST", "/api/checkout");
+    // Same canonical caller: the anonymous replay partition binds the
+    // gateway-resolved peer address, so this test isolates response-header
+    // stripping rather than cross-caller replay.
+    let mut ctx2 = new_ctx_from("127.0.0.1", "POST", "/api/checkout");
     let mut headers2 = HashMap::new();
     headers2.insert("idempotency-key".to_string(), "shared-key".to_string());
 
@@ -5050,7 +5058,9 @@ async fn test_replay_strips_authorization_and_trace_headers() {
         .on_final_response_body(&mut ctx1, 200, &response_headers, b"{}")
         .await;
 
-    let mut ctx2 = new_ctx_from("10.0.0.99", "POST", "/api");
+    // Same canonical caller (see the anonymous replay partition above); this
+    // test isolates response-header stripping, not cross-caller replay.
+    let mut ctx2 = new_ctx_from("127.0.0.1", "POST", "/api");
     let mut headers2 = HashMap::new();
     headers2.insert("idempotency-key".to_string(), "auth-key".to_string());
 
@@ -5125,7 +5135,9 @@ async fn test_replay_strips_set_cookie_case_insensitively() {
         .on_final_response_body(&mut ctx1, 200, &response_headers, b"{}")
         .await;
 
-    let mut ctx2 = new_ctx_from("10.0.0.99", "POST", "/api");
+    // Same canonical caller (see the anonymous replay partition above); this
+    // test isolates response-header stripping, not cross-caller replay.
+    let mut ctx2 = new_ctx_from("127.0.0.1", "POST", "/api");
     let mut headers2 = HashMap::new();
     headers2.insert("idempotency-key".to_string(), "case-key".to_string());
     let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
@@ -5324,6 +5336,33 @@ async fn test_reused_key_different_raw_query_returns_409() {
 }
 
 #[tokio::test]
+async fn test_reused_key_different_outbound_query_returns_409() {
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    first_ctx.set_raw_query_string("tenant=client".to_string());
+    first_ctx.publish_transformed_query(
+        "tenant=blue".to_string(),
+        HashMap::from([("tenant".to_string(), "blue".to_string())]),
+    );
+    let mut first_headers = keyed_headers("outbound-query-key", "api.example", 11);
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    second_ctx.set_raw_query_string("tenant=client".to_string());
+    second_ctx.publish_transformed_query(
+        "tenant=green".to_string(),
+        HashMap::from([("tenant".to_string(), "green".to_string())]),
+    );
+    let mut second_headers = keyed_headers("outbound-query-key", "api.example", 11);
+
+    assert_reused_key_for_different_request_conflicts(
+        &mut first_ctx,
+        &mut first_headers,
+        &mut second_ctx,
+        &mut second_headers,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_reused_key_different_route_affecting_header_returns_409() {
     let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
     let mut first_headers = keyed_headers("route-header-key", "api.example", 11);
@@ -5402,8 +5441,21 @@ async fn test_reused_key_different_client_trace_headers_replays() {
     assert!(matches!(result, PluginResult::RejectBinary { .. }));
 }
 
+/// A rotated credential for one display subject is a *different authorization
+/// context* and must not replay (GHSA-w27g-65rf-h7xm).
+///
+/// This previously replayed: credential headers were excluded from the
+/// fingerprint whenever `scope_by_consumer` had resolved an identity, so two
+/// tokens that render as one `sub` — with different scopes, audiences, or
+/// tenancy claims — produced an identical fingerprint. Credential material is
+/// now bound as digests in *both* the mandatory caller partition of the logical
+/// key and the request fingerprint, while the raw secret still never enters a
+/// key. The caller partition is the outer boundary, so the rotated credential
+/// claims its own operation rather than conflicting with the stored one — which
+/// is the stronger outcome: it neither replays nor reports another caller's key
+/// as taken.
 #[tokio::test]
-async fn test_scoped_credential_rotation_replays_cached_response() {
+async fn test_scoped_credential_rotation_cannot_replay() {
     let plugin = make_plugin(json!({}));
 
     let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
@@ -5430,11 +5482,28 @@ async fn test_scoped_credential_rotation_replays_cached_response() {
     let result = plugin
         .before_proxy(&mut second_ctx, &mut second_headers)
         .await;
-    assert!(matches!(result, PluginResult::RejectBinary { .. }));
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a rotated credential must not replay the stored response"
+    );
+
+    // The unchanged credential context still replays.
+    let mut same_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    same_ctx.authenticated_identity = Some("consumer-1".to_string());
+    let mut same_headers = keyed_headers("credential-rotation-key", "api.example", 11);
+    same_headers.insert("authorization".to_string(), "Bearer old-token".to_string());
+    same_headers.insert("cookie".to_string(), "session=old".to_string());
+    same_headers.insert("x-api-key".to_string(), "old-api-key".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut same_ctx, &mut same_headers).await,
+        PluginResult::RejectBinary { .. }
+    ));
 }
 
+/// Same boundary with `scope_by_consumer` disabled: the display identity leaves
+/// the key, but the credential digests in the caller partition remain.
 #[tokio::test]
-async fn test_unscoped_credentials_remain_in_fingerprint() {
+async fn test_unscoped_credential_rotation_cannot_replay() {
     let plugin = make_plugin(json!({
         "scope_by_consumer": false
     }));
@@ -5459,11 +5528,16 @@ async fn test_unscoped_credentials_remain_in_fingerprint() {
     let result = plugin
         .before_proxy(&mut second_ctx, &mut second_headers)
         .await;
-    assert_fingerprint_conflict(result);
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a rotated credential must not replay the stored response"
+    );
 }
 
+/// Same boundary for a caller Ferrum never authenticated: the presented
+/// credential headers are still the caller's authorization context.
 #[tokio::test]
-async fn test_anonymous_credentials_remain_in_fingerprint() {
+async fn test_anonymous_credential_rotation_cannot_replay() {
     let plugin = make_plugin(json!({}));
 
     let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
@@ -5486,7 +5560,10 @@ async fn test_anonymous_credentials_remain_in_fingerprint() {
     let result = plugin
         .before_proxy(&mut second_ctx, &mut second_headers)
         .await;
-    assert_fingerprint_conflict(result);
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a rotated credential must not replay the stored response"
+    );
 }
 
 #[tokio::test]
@@ -5980,7 +6057,7 @@ async fn test_fingerprints_and_logical_keys_do_not_expose_secrets() {
     assert!(matches!(result, PluginResult::Continue));
 
     let (logical_key, fingerprint) = request_identity(&plugin, &ctx).unwrap();
-    assert!(logical_key.starts_with("v4:"));
+    assert!(logical_key.starts_with("v6:"));
     assert!(fingerprint.starts_with("sha256-"));
     for secret in [
         "super-secret-body",
@@ -6104,4 +6181,234 @@ async fn test_local_and_redis_modes_compute_identical_request_identity() {
         request_identity(&local_plugin, &local_ctx).map(|identity| identity.1),
         request_identity(&redis_plugin, &redis_ctx).map(|identity| identity.1)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Replay-partition contract (GHSA-w27g-65rf-h7xm)
+// ---------------------------------------------------------------------------
+
+/// Drive one dedup lifecycle: `before_proxy` then store the completion.
+async fn dedup_cycle(
+    plugin: &RequestDeduplication,
+    ctx: &mut RequestContext,
+    body: &[u8],
+) -> PluginResult {
+    let mut headers = ctx.headers.clone();
+    let result = plugin.before_proxy(ctx, &mut headers).await;
+    if matches!(result, PluginResult::Continue) {
+        plugin
+            .on_final_response_body(ctx, 200, &HashMap::new(), body)
+            .await;
+    }
+    result
+}
+
+fn dedup_ctx(client_ip: &str, key: &str) -> RequestContext {
+    let mut ctx = new_ctx_from(client_ip, "POST", "/orders");
+    ctx.headers
+        .insert("idempotency-key".to_string(), key.to_string());
+    ctx
+}
+
+#[tokio::test]
+async fn dedup_isolates_same_subject_different_credential_scope() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 60 }));
+
+    let mut narrow = dedup_ctx("127.0.0.1", "order-1");
+    narrow.authenticated_identity = Some("alice@example.com".to_string());
+    narrow.headers.insert(
+        "authorization".to_string(),
+        "Bearer scope-read-only".to_string(),
+    );
+    assert!(matches!(
+        dedup_cycle(&plugin, &mut narrow, b"narrow-result").await,
+        PluginResult::Continue
+    ));
+
+    // Same idempotency key, same display subject, different credential scope.
+    let mut broad = dedup_ctx("127.0.0.1", "order-1");
+    broad.authenticated_identity = Some("alice@example.com".to_string());
+    broad.headers.insert(
+        "authorization".to_string(),
+        "Bearer scope-read-write-admin".to_string(),
+    );
+    let mut broad_headers = broad.headers.clone();
+    assert!(
+        matches!(
+            plugin.before_proxy(&mut broad, &mut broad_headers).await,
+            PluginResult::Continue
+        ),
+        "a different credential scope must not replay the earlier result"
+    );
+}
+
+#[tokio::test]
+async fn dedup_isolates_anonymous_callers_by_canonical_address() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 60 }));
+
+    let mut first = dedup_ctx("203.0.113.7", "order-2");
+    assert!(matches!(
+        dedup_cycle(&plugin, &mut first, b"first-result").await,
+        PluginResult::Continue
+    ));
+
+    let mut second = dedup_ctx("198.51.100.9", "order-2");
+    let mut second_headers = second.headers.clone();
+    assert!(
+        matches!(
+            plugin.before_proxy(&mut second, &mut second_headers).await,
+            PluginResult::Continue
+        ),
+        "an anonymous caller at a different canonical address must not replay"
+    );
+
+    // The original caller still replays.
+    let mut same = dedup_ctx("203.0.113.7", "order-2");
+    let mut same_headers = same.headers.clone();
+    let replay = plugin.before_proxy(&mut same, &mut same_headers).await;
+    assert!(
+        matches!(replay, PluginResult::RejectBinary { .. }),
+        "the same canonical caller must still replay its own result"
+    );
+}
+
+#[tokio::test]
+async fn dedup_anonymous_caller_scope_shared_is_an_explicit_opt_out() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 60,
+        "anonymous_caller_scope": "shared"
+    }));
+
+    let mut first = dedup_ctx("203.0.113.7", "order-3");
+    assert!(matches!(
+        dedup_cycle(&plugin, &mut first, b"shared-result").await,
+        PluginResult::Continue
+    ));
+
+    let mut second = dedup_ctx("198.51.100.9", "order-3");
+    let mut second_headers = second.headers.clone();
+    assert!(
+        matches!(
+            plugin.before_proxy(&mut second, &mut second_headers).await,
+            PluginResult::RejectBinary { .. }
+        ),
+        "the explicit shared attestation must let anonymous callers share"
+    );
+
+    assert!(
+        RequestDeduplication::new(
+            &json!({ "anonymous_caller_scope": "everyone" }),
+            PluginHttpClient::default()
+        )
+        .is_err(),
+        "an unknown anonymous_caller_scope must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn dedup_isolates_effective_route_destination() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 60 }));
+
+    let mut tenant_a = dedup_ctx("127.0.0.1", "order-4");
+    tenant_a.route_override_upstream_id = Some("tenant-a".to_string());
+    assert!(matches!(
+        dedup_cycle(&plugin, &mut tenant_a, b"tenant-a-result").await,
+        PluginResult::Continue
+    ));
+
+    let mut tenant_b = dedup_ctx("127.0.0.1", "order-4");
+    tenant_b.route_override_upstream_id = Some("tenant-b".to_string());
+    let mut tenant_b_headers = tenant_b.headers.clone();
+    assert!(
+        matches!(
+            plugin
+                .before_proxy(&mut tenant_b, &mut tenant_b_headers)
+                .await,
+            PluginResult::Continue
+        ),
+        "a different effective destination must not replay"
+    );
+}
+
+/// The origin receives Ferrum's regenerated forwarding identity for an
+/// authenticated caller too, so an idempotent operation claimed from one
+/// address must not be replayable from another.
+#[tokio::test]
+async fn dedup_isolates_authenticated_callers_by_canonical_address() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 60 }));
+
+    let mut office = dedup_ctx("203.0.113.7", "order-addr-1");
+    office.authenticated_identity = Some("alice@example.com".to_string());
+    office.headers.insert(
+        "authorization".to_string(),
+        "Bearer alice-token".to_string(),
+    );
+    assert!(matches!(
+        dedup_cycle(&plugin, &mut office, b"office-result").await,
+        PluginResult::Continue
+    ));
+
+    let mut cafe = dedup_ctx("198.51.100.9", "order-addr-1");
+    cafe.authenticated_identity = Some("alice@example.com".to_string());
+    cafe.headers.insert(
+        "authorization".to_string(),
+        "Bearer alice-token".to_string(),
+    );
+    let mut cafe_headers = cafe.headers.clone();
+    assert!(
+        matches!(
+            plugin.before_proxy(&mut cafe, &mut cafe_headers).await,
+            PluginResult::Continue
+        ),
+        "one authenticated caller at two canonical addresses must not replay"
+    );
+}
+
+/// `anonymous_caller_scope: shared` attests about anonymous callers only.
+#[tokio::test]
+async fn dedup_shared_anonymous_scope_does_not_relax_authenticated_callers() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 60,
+        "anonymous_caller_scope": "shared"
+    }));
+
+    let mut office = dedup_ctx("203.0.113.7", "order-addr-2");
+    office.authenticated_identity = Some("alice@example.com".to_string());
+    office.headers.insert(
+        "authorization".to_string(),
+        "Bearer alice-token".to_string(),
+    );
+    assert!(matches!(
+        dedup_cycle(&plugin, &mut office, b"office-result").await,
+        PluginResult::Continue
+    ));
+
+    let mut cafe = dedup_ctx("198.51.100.9", "order-addr-2");
+    cafe.authenticated_identity = Some("alice@example.com".to_string());
+    cafe.headers.insert(
+        "authorization".to_string(),
+        "Bearer alice-token".to_string(),
+    );
+    let mut cafe_headers = cafe.headers.clone();
+    assert!(
+        matches!(
+            plugin.before_proxy(&mut cafe, &mut cafe_headers).await,
+            PluginResult::Continue
+        ),
+        "the shared attestation covers anonymous callers only"
+    );
+}
+
+#[tokio::test]
+async fn dedup_config_admits_anonymous_caller_scope_key() {
+    for value in ["caller_address", "caller-address", "shared", " SHARED "] {
+        assert!(
+            RequestDeduplication::new(
+                &json!({ "anonymous_caller_scope": value }),
+                PluginHttpClient::default()
+            )
+            .is_ok(),
+            "anonymous_caller_scope must accept {value:?}"
+        );
+    }
 }
