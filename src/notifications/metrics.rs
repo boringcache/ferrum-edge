@@ -47,16 +47,14 @@ impl Default for DeliveryMetrics {
 
 impl DeliveryMetrics {
     pub const fn new() -> Self {
-        const ZERO_U: AtomicU64 = AtomicU64::new(0);
-        const ZERO_I: AtomicI64 = AtomicI64::new(0);
         Self {
-            attempted: [ZERO_U; 5],
-            succeeded: [ZERO_U; 5],
-            failed_transient: [ZERO_U; 5],
-            failed_permanent: [ZERO_U; 5],
-            backpressure_dropped: [ZERO_U; 5],
-            abandoned_at_deadline: [ZERO_U; 5],
-            in_flight: [ZERO_I; 5],
+            attempted: [const { AtomicU64::new(0) }; 5],
+            succeeded: [const { AtomicU64::new(0) }; 5],
+            failed_transient: [const { AtomicU64::new(0) }; 5],
+            failed_permanent: [const { AtomicU64::new(0) }; 5],
+            backpressure_dropped: [const { AtomicU64::new(0) }; 5],
+            abandoned_at_deadline: [const { AtomicU64::new(0) }; 5],
+            in_flight: [const { AtomicI64::new(0) }; 5],
         }
     }
 

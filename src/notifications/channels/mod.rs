@@ -461,10 +461,10 @@ async fn drain_response_body_redacted(
         ));
     }
 
-    // Reached only from `finalize_dispatch_response` after a 2xx status check,
-    // so this is the size-bounded drain on a successful response: it measures
-    // chunk lengths and discards the bytes, never buffering anything we will
-    // not inspect.
+    // Reached only from `finalize_dispatch_response_classified` after a 2xx
+    // status check, so this is the size-bounded drain on a successful response:
+    // it measures chunk lengths and discards the bytes, never buffering
+    // anything we will not inspect.
     measure_response_body_bounded(resp, RESPONSE_BODY_DRAIN_LIMIT_BYTES)
         .await
         .map(|_| ())
@@ -482,17 +482,6 @@ async fn drain_response_body_redacted(
                 )
             }
         })
-}
-
-pub(super) async fn finalize_dispatch_response(
-    resp: reqwest::Response,
-    channel: &str,
-    redacted_url: &str,
-) -> Result<(), String> {
-    match finalize_dispatch_response_classified(resp, channel, redacted_url).await {
-        DeliveryAttempt::Success => Ok(()),
-        DeliveryAttempt::Failed { message, .. } => Err(message),
-    }
 }
 
 pub(super) async fn finalize_dispatch_response_classified(
