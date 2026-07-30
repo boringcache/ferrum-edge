@@ -3322,13 +3322,9 @@ async fn handle_h3_request(
     // contract by rebasing the request path used to build the backend URL when
     // `mesh_route_dispatch` set `ctx.route_override_path`. Keep in sync with
     // `src/proxy/mod.rs::handle_proxy_request_inner`.
-    let path = match ctx.route_override_path.take() {
-        Some(rewritten) => {
-            ctx.path = rewritten.clone();
-            rewritten
-        }
-        None => path,
-    };
+    // Preserve the private override for finalized-egress plugins. The shared
+    // helper also keeps H3 path selection in lockstep with H1/H2.
+    let path = crate::proxy::rebase_route_override_path(&mut ctx, path);
 
     // Enforce request body size limit via Content-Length fast path. Apply
     // the gRPC-specific ceiling to gRPC requests so H3 matches H1/H2.

@@ -4443,6 +4443,25 @@ pub(crate) fn finalized_request_rejection_phase(rejected_by_egress: bool) -> &'s
     }
 }
 
+/// Rebase dispatch onto a plugin-selected backend path while preserving the
+/// private override for finalized-egress plugins.
+///
+/// Finalized-egress hooks deliberately receive the client-visible `ctx.path`
+/// for compatibility. Security-sensitive hooks such as `request_mirror` use
+/// `route_override_path` to recover the exact mesh-selected path instead. Do
+/// not consume the override here: doing so makes the primary use the rewrite
+/// while a later mirror silently falls back to the original client path.
+pub(crate) fn rebase_route_override_path(
+    ctx: &mut RequestContext,
+    original_path: String,
+) -> String {
+    let Some(rewritten) = ctx.route_override_path.clone() else {
+        return original_path;
+    };
+    ctx.path.clone_from(&rewritten);
+    rewritten
+}
+
 /// Outcome of the finalized-request-egress phase (GHSA-4vr5-4wm3-x5xv).
 pub(crate) struct FinalizedRequestEgressOutcome {
     /// `Continue`, or the rejection an egress plugin used to terminate the
@@ -22165,15 +22184,11 @@ async fn handle_proxy_request_inner(
     // local `path`; the WS / HBONE branches read `ctx.path`, so mirror the
     // override onto `ctx.path` too). The original path was already used for
     // route selection; VS-derived proxies never set `strip_listen_path`, so
-    // the rewritten value is the literal forwarded path. No allocation when no
-    // rewrite is set.
-    let path = match ctx.route_override_path.take() {
-        Some(rewritten) => {
-            ctx.path = rewritten.clone();
-            rewritten
-        }
-        None => path,
-    };
+    // the rewritten value is the literal forwarded path. Preserve the private
+    // override so finalized-egress plugins can recover the selected backend
+    // path while their public `ctx.path` view is temporarily restored to the
+    // client path. No allocation when no rewrite is set.
+    let path = rebase_route_override_path(&mut ctx, path);
 
     // Resolve upstream target and hash key from the request epoch.
     // `ctx.orig_dst` (the captured SO_ORIGINAL_DST on mesh capture listeners)
@@ -36628,6 +36643,27 @@ async fn proxy_to_backend_http3_retry(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn route_rebase_preserves_rewrite_for_finalized_egress() {
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/shadow/ping".to_string(),
+        );
+        ctx.route_override_path = Some("/internal/ping".to_string());
+
+        let backend_path =
+            super::rebase_route_override_path(&mut ctx, "/shadow/ping".to_string());
+
+        assert_eq!(backend_path, "/internal/ping");
+        assert_eq!(ctx.path, "/internal/ping");
+        assert_eq!(
+            ctx.route_override_path.as_deref(),
+            Some("/internal/ping"),
+            "the finalized-egress phase still needs the mesh-selected path"
+        );
+    }
+
     #[test]
     fn request_signature_authority_normalization_preserves_identity() {
         assert_eq!(
