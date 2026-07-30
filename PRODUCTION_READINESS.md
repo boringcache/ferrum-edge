@@ -100,7 +100,7 @@ issue body alone.
 | Provenance-complete mesh/HBONE/DNS perf baselines | #3332 | Harnesses exist; baseline tables still `_TBD_` |
 | Live OIDC / OAuth2 introspection coverage | #3333 | |
 | NodeWaypoint observability + promotion gates | #3334 | |
-| Vendored-patch upstream filing / retirement | #3335 | |
+| Vendored-patch upstream filing / retirement | `docs/vendored-patch-lifecycle.json` + weekly `dependency-audit` | Repository-owned lifecycle inventory; closes #3335 |
 | SPIFFE Workload API JWT-SVID mint/validate | #2110 (historical) | X.509 complete; JWT-SVID still deferred in code |
 | Admin CRUD refactor (retired plan remainder) | #2110 (historical) | Discretionary; fold into future admin-surface work |
 
