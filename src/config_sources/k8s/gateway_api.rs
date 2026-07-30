@@ -9391,9 +9391,10 @@ mod tests {
             "the middle GRPCRoute loses on the first listener and must be withdrawn whole"
         );
         assert!(
-            result.materialized_route_parents.iter().any(|entry| {
-                entry.route.kind == "HTTPRoute" && entry.route.name == "survivor"
-            }),
+            result
+                .materialized_route_parents
+                .iter()
+                .any(|entry| { entry.route.kind == "HTTPRoute" && entry.route.name == "survivor" }),
             "a withdrawn GRPCRoute must not displace the later HTTPRoute on the second listener"
         );
         assert!(
