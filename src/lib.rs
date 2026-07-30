@@ -179,6 +179,28 @@ pub mod _test_support {
         ctx.mcp_trusted_tool_name_rewrite.is_none()
     }
 
+    /// Whether a routed `tools/call` pinned a private outputSchema validator.
+    pub fn mcp_validate_tool_result_is_some_for_test(ctx: &crate::plugins::RequestContext) -> bool {
+        ctx.mcp_validate_tool_result.is_some()
+    }
+
+    /// Whether two contexts hold the same pinned outputSchema validator Arc
+    /// (pointer equality). Used to prove compatibility clones and in-flight
+    /// requests keep the dispatch-time snapshot.
+    pub fn mcp_validate_tool_result_ptr_eq_for_test(
+        left: &crate::plugins::RequestContext,
+        right: &crate::plugins::RequestContext,
+    ) -> bool {
+        match (
+            left.mcp_validate_tool_result.as_ref(),
+            right.mcp_validate_tool_result.as_ref(),
+        ) {
+            (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     /// Read-only view of the private aggregate-batch upstream-dispatch guard.
     /// Intentionally has no setter: tests must prove the guard cannot be forged
     /// from public metadata, so nothing outside `mcp_gateway` may set it.

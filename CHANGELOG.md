@@ -71,6 +71,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a decoding or expanding transform cannot escape the route policy.
   This completes the advisory; [PR #3176](https://github.com/ferrum-edge/ferrum-edge/pull/3176)
   had previously closed only the direct-H2/SNI early-response timing window.
+- `mcp_gateway` aggregate-router mode now validates `tools/call` results against
+  discovered tool `outputSchema` values when
+  `validation.validate_tool_results` is enabled
+  (#3296). Schemas are audited and compiled at catalog construction (local
+  references only; depth/node budgets), invalid schemas are refused at admission
+  with field-specific diagnostics, and bounded caller-visible results are checked
+  before release or audit publication. `structuredContent` and JSON text
+  `content` variants are covered without validating a different representation
+  than the caller receives; tool `isError` results and well-formed, error-only
+  upstream JSON-RPC errors are preserved; event-stream / non-JSON / oversized
+  results fail closed with JSON-RPC `-32012`. Transparent mode rejects the
+  option because it has no mediated tool catalog. Result bodies are never
+  logged.
 - Plugin egress no longer inherits ambient proxy configuration
   (GHSA-c4pj-vq6x-53rw). Backend dispatch `reqwest` clients (via
   `BackendTlsConfigBuilder::build_reqwest`), active health-check clients
