@@ -36768,8 +36768,7 @@ mod tests {
         );
         ctx.route_override_path = Some("/internal/ping".to_string());
 
-        let backend_path =
-            super::rebase_route_override_path(&mut ctx, "/shadow/ping".to_string());
+        let backend_path = super::rebase_route_override_path(&mut ctx, "/shadow/ping".to_string());
 
         assert_eq!(backend_path, "/internal/ping");
         assert_eq!(ctx.path, "/internal/ping");
