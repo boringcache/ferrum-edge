@@ -385,12 +385,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not the literal `parentRefs[]` selector: a wildcard reference and a reference
   pinning that listener by `sectionName` or `port` contend with each other,
   while two wildcard references that `allowedRoutes.kinds` sends to different
-  listeners do not. A wildcard reference spanning several listeners emits one
-  shared conflict claim, and Ferrum's HTTP-family route representation is
-  port-agnostic, so a claim kept for the listener it won would still route on
-  the listener it lost: such a claim is conservatively withdrawn whole as soon
-  as it loses on **any** listener it reaches. Route status always echoes the
-  parentRef the operator wrote. Two Routes of different kinds that Gateway API
+  listeners do not. Ferrum's HTTP-family route representation is
+  port-agnostic, so retaining any second parentRef or hostname claim after one
+  loss would also retain the Route's proxy on the listener where it lost: the
+  entire Route is conservatively withdrawn across every claim as soon as it
+  loses on **any** listener. Whole-Route arbitration runs in the same total
+  Gateway API order, so a withdrawn Route cannot displace a later valid Route
+  elsewhere. Route status always echoes each parentRef the operator wrote. Two
+  Routes of different kinds that Gateway API
   requires be accepted *together* — because `allowedRoutes.kinds`, a
   `sectionName`/`port` pin, or separate Gateways send them to different
   listeners — still share Ferrum's single port-agnostic `(hosts, listen path)`
