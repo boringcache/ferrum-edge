@@ -181,6 +181,6 @@ pub fn smoke_invariants() -> Result<(), String> {
     let config =
         r#"{"version":"1","proxies":[],"consumers":[],"plugin_configs":[],"upstreams":[]}"#;
     fuzz_decode_config_document(config)?;
-    fuzz_validate_plugin_config(b"0{\"origins\":[\"*\"]}")?;
+    fuzz_validate_plugin_config(b"0{\"allowed_origins\":[\"*\"]}")?;
     Ok(())
 }
