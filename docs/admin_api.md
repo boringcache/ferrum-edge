@@ -682,7 +682,7 @@ Returns:
 }
 ```
 
-See [admin_metrics.md](admin_metrics.md) for the full metrics reference.
+See [admin_metrics.md](admin_metrics.md) for the JSON `/admin/metrics` reference and [prometheus_metrics.md](prometheus_metrics.md) for the DOC-10 Prometheus family contract.
 
 ### Prometheus `/metrics` (gated)
 

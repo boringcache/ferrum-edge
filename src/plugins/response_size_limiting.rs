@@ -4,7 +4,7 @@
 //! `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`. Rejects responses that exceed the
 //! configured `max_bytes` with HTTP 502 Bad Gateway.
 //!
-//! Two enforcement paths:
+//! Enforcement paths:
 //! 1. **Content-Length fast path** (`after_proxy`): rejects immediately when the
 //!    backend response Content-Length header declares a transferable body larger
 //!    than allowed. Bodyless responses (`HEAD`, `1xx`, `204`/`205`/`304`) skip
@@ -14,10 +14,15 @@
 //!    active (either from `require_buffered_check: true` or because another plugin
 //!    requires buffering), the final client-visible byte length is verified after
 //!    any body transforms have run.
+//! 3. **Core and synthetic checks**: every response collector/streaming adapter
+//!    uses the effective route ceiling, and already-buffered gateway-generated
+//!    responses are checked independently of the body-hook scheduling gate.
 //!
-//! Set `require_buffered_check: true` to force response body buffering so that
-//! chunked/streaming responses without Content-Length are also checked. This adds
-//! memory overhead — only enable when needed.
+//! Unknown-length streaming responses are always bounded frame by frame by the
+//! core ceiling. Set `require_buffered_check: true` only when the policy must
+//! prove the complete final post-transform size before committing a response;
+//! this adds route-bounded buffering overhead and refuses indefinite SSE streams
+//! whose complete size cannot be proven.
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
@@ -25,7 +30,8 @@ use std::collections::HashMap;
 use tracing::debug;
 
 use super::utils::size_limit::{
-    SizeLimiter, reject_with_limit, required_positive_u64, transferable_content_length_over_limit,
+    ContentLengthRefusal, SizeLimiter, reject_with_limit, required_positive_u64,
+    transferable_content_length_refusal,
 };
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::{Plugin, PluginResult, RequestContext};
@@ -97,6 +103,21 @@ impl Plugin for ResponseSizeLimiting {
         self.require_buffered_check && self.is_enabled()
     }
 
+    /// Publish the configured ceiling to the proxy core (`GHSA-xrfj-852f-645j`).
+    ///
+    /// This is deliberately independent of `require_buffered_check`. It gives the
+    /// core two things the hooks below cannot express:
+    /// 1. strict buffered collection aborts at *this* limit rather than
+    ///    retaining up to the larger global allowance before the final check, so
+    ///    concurrent requests cannot amplify retained memory to nearly the
+    ///    global allowance each; and
+    /// 2. a default (non-buffering) instance still governs an already-buffered
+    ///    synthetic body, which previously required some other plugin to
+    ///    independently activate the response body-hook gate.
+    fn enforced_response_body_limit(&self) -> Option<u64> {
+        self.is_enabled().then_some(self.max_bytes)
+    }
+
     fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
         // A request Accept value cannot waive the configured route ceiling.
         // Buffer ordinary responses conservatively until pristine backend
@@ -152,19 +173,38 @@ impl Plugin for ResponseSizeLimiting {
         // Fast path: reject oversized Content-Length only when the response can
         // transfer a body. HEAD / 1xx / 204 / 205 / 304 may advertise a
         // representation length while sending zero body bytes.
-        if let Some(len) = transferable_content_length_over_limit(
+        // Hyper accepts a backend response whose `Content-Length` repeats with
+        // identical values, and the shared collector folds those repeats with
+        // `", "`. Parse every member so a coalesced declaration cannot read as
+        // an absent length and skip this bound.
+        match transferable_content_length_refusal(
             &ctx.method,
             response_status,
             response_headers,
             self.max_size_bytes(),
         ) {
-            debug!(
-                plugin = self.plugin_name(),
-                content_length = len,
-                max_bytes = self.max_size_bytes(),
-                "Response rejected: Content-Length exceeds limit"
-            );
-            return reject_with_limit(502, "Response body too large", self.max_size_bytes());
+            Some(ContentLengthRefusal::OverLimit(len)) => {
+                debug!(
+                    plugin = self.plugin_name(),
+                    content_length = len,
+                    max_bytes = self.max_size_bytes(),
+                    "Response rejected: Content-Length exceeds limit"
+                );
+                return reject_with_limit(502, "Response body too large", self.max_size_bytes());
+            }
+            Some(ContentLengthRefusal::Ambiguous) => {
+                debug!(
+                    plugin = self.plugin_name(),
+                    max_bytes = self.max_size_bytes(),
+                    "Response rejected: Content-Length is ambiguous"
+                );
+                return reject_with_limit(
+                    502,
+                    "Response Content-Length is ambiguous",
+                    self.max_size_bytes(),
+                );
+            }
+            None => {}
         }
 
         if self.require_buffered_check && original_response_is_event_stream(ctx, response_headers) {
