@@ -29786,35 +29786,55 @@ async fn proxy_to_backend(
         return backend_egress_denied_dispatch_result(effective_host);
     }
 
-    // Resolve backend IP from DNS cache (O(1) cached lookup, <1μs).
-    // When `dns_override` is set, this returns the override IP for the
-    // selected host — the same address the pooled reqwest client's
-    // `DnsCacheResolver::with_dns_override` will dial for that hostname
-    // (including load-balanced targets that differ from `backend_host`).
-    // Without an override, both paths consult the shared cache.
-    let resolve_backend_ip = state.dns_cache.resolve(
-        effective_host,
-        proxy.dns_override.as_deref(),
-        proxy.dns_cache_ttl_seconds,
-    );
-    let resolved_ip_result = if let Some(deadline) = request_ctx.grpc_deadline_at() {
-        match tokio::time::timeout_at(deadline, resolve_backend_ip).await {
-            Ok(result) => result,
-            Err(_) => {
-                return backend_dispatch_response(
-                    client_grpc_deadline_exceeded_response_for_request(request_ctx, headers, None),
-                    None,
-                    None,
-                );
-            }
-        }
+    // Cross-cluster Ambient HBONE targets deliberately use a scoped synthetic
+    // load-balancer identity (`mesh-xc-hbone|gateway|port|pod`) rather than a
+    // DNS name. The HBONE pool reads and policy-screens the real dial and inner
+    // authority hosts from the target tags. Sending that identity through the
+    // reqwest-oriented preflight would reject every healthy cross-cluster route
+    // before the HBONE connector could inspect those authoritative fields.
+    //
+    // Every ordinary host still fails closed here. Retry dispatch is always a
+    // reqwest path and retains the unconditional preflight above.
+    let resolved_ip = if dispatch_hbone
+        && effective_host
+            .starts_with(hbone_pool::HBONE_CROSS_CLUSTER_SYNTHETIC_HOST_PREFIX)
+    {
+        None
     } else {
-        resolve_backend_ip.await
-    };
-    let resolved_ip = match resolved_ip_result {
-        Ok(ip) => Some(ip.to_string()),
-        Err(error) => {
-            return backend_dns_resolution_failed_dispatch_result(effective_host, &error);
+        // Resolve backend IP from DNS cache (O(1) cached lookup, <1μs).
+        // When `dns_override` is set, this returns the override IP for the
+        // selected host — the same address the pooled reqwest client's
+        // `DnsCacheResolver::with_dns_override` will dial for that hostname
+        // (including load-balanced targets that differ from `backend_host`).
+        // Without an override, both paths consult the shared cache.
+        let resolve_backend_ip = state.dns_cache.resolve(
+            effective_host,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        );
+        let resolved_ip_result = if let Some(deadline) = request_ctx.grpc_deadline_at() {
+            match tokio::time::timeout_at(deadline, resolve_backend_ip).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return backend_dispatch_response(
+                        client_grpc_deadline_exceeded_response_for_request(
+                            request_ctx,
+                            headers,
+                            None,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+            }
+        } else {
+            resolve_backend_ip.await
+        };
+        match resolved_ip_result {
+            Ok(ip) => Some(ip.to_string()),
+            Err(error) => {
+                return backend_dns_resolution_failed_dispatch_result(effective_host, &error);
+            }
         }
     };
 

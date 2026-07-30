@@ -3456,7 +3456,11 @@ fn reqwest_dispatch_fails_closed_when_proxy_ttl_dns_preflight_fails() {
             .find(start_marker)
             .unwrap_or_else(|| panic!("{label}: missing start marker"));
         let preflight_start = source[function_start..]
-            .find("let resolved_ip = match resolved_ip_result {")
+            .find(if label == "retry" {
+                "let resolved_ip = match resolved_ip_result {"
+            } else {
+                "let resolved_ip = if dispatch_hbone"
+            })
             .map(|offset| function_start + offset)
             .unwrap_or_else(|| panic!("{label}: missing DNS preflight result handling"));
         let resume = source[preflight_start..]
@@ -3474,4 +3478,36 @@ fn reqwest_dispatch_fails_closed_when_proxy_ttl_dns_preflight_fails() {
             "{label} must not discard the proxy-specific DNS error"
         );
     }
+}
+
+#[test]
+fn cross_cluster_hbone_identity_bypasses_only_the_reqwest_dns_preflight() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let initial = source
+        .split("async fn proxy_to_backend(")
+        .nth(1)
+        .expect("initial backend dispatch")
+        .split("if dispatch_hbone {")
+        .next()
+        .expect("bounded pre-HBONE dispatch section");
+    let synthetic_gate = initial
+        .find("hbone_pool::HBONE_CROSS_CLUSTER_SYNTHETIC_HOST_PREFIX")
+        .expect("cross-cluster HBONE synthetic-host gate");
+    let dns_preflight = initial[synthetic_gate..]
+        .find("state.dns_cache.resolve(")
+        .map(|offset| synthetic_gate + offset)
+        .expect("ordinary-host DNS preflight");
+    let hard_failure = initial[dns_preflight..]
+        .find("return backend_dns_resolution_failed_dispatch_result(effective_host, &error);")
+        .map(|offset| dns_preflight + offset)
+        .expect("ordinary-host fail-closed result");
+
+    assert!(
+        synthetic_gate < dns_preflight && dns_preflight < hard_failure,
+        "only the scoped HBONE identity may skip the reqwest-oriented DNS preflight"
+    );
+    assert!(
+        initial[synthetic_gate..dns_preflight].contains("None"),
+        "the synthetic identity must carry no fabricated resolved IP into HBONE dispatch"
+    );
 }
