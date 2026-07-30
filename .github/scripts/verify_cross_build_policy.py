@@ -1685,6 +1685,12 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
         with:
           persist-credentials: false
 
+      - name: Install required build dependency
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
       - name: Install pinned nightly toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
@@ -22410,6 +22416,15 @@ pre_build = []
         "unpinned cargo-fuzz": (
             "cargo install cargo-fuzz --locked --version 0.13.1",
             "cargo install cargo-fuzz",
+        ),
+        "missing protoc setup": (
+            "      - name: Install required build dependency\n"
+            "        run: |\n"
+            "          set -euo pipefail\n"
+            "          sudo apt-get update\n"
+            "          sudo apt-get install -y --no-install-recommends "
+            "protobuf-compiler\n\n",
+            "",
         ),
         "mutable toolchain pin": ("nightly-2025-07-01", "nightly"),
         "repository-supplied script": (
