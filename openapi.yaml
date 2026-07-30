@@ -20486,7 +20486,7 @@ components:
         forward_body:
           type: boolean
           default: false
-          description: "Include one authoritative lossless request-body representation in the function payload for every HTTP method. Ferrum never parses JSON into a structured value: exact UTF-8 bytes are carried as a string with body_encoding=utf8, arbitrary bytes are base64 with body_encoding=base64, and the active hook Content-Type is carried separately as body_content_type. The plugin buffers before invocation and fails closed if bytes are unavailable or the active request headers use a non-identity Content-Encoding. Candidate admission and runtime cache construction reject combination with a request-body transformer on the same protocol chain."
+          description: "Include one authoritative lossless finalized request-body representation in the function payload for every HTTP method. Ferrum never parses JSON into a structured value: exact UTF-8 bytes are carried as a string with body_encoding=utf8, arbitrary bytes are base64 with body_encoding=base64, and the active hook Content-Type is carried separately as body_content_type. The plugin buffers before invocation and fails closed if bytes are unavailable or either the original or active request headers use a non-identity Content-Encoding. Because invocation occurs after request-body transforms and final request-policy acceptance, this plugin may share a protocol chain with a request-body transformer and observes the exact backend-visible bytes. Candidate admission and runtime cache construction retain the fail-closed composition refusal only for registered custom plugins that declare pre-finalization request-body egress."
         forward_headers:
           type: array
           items:
