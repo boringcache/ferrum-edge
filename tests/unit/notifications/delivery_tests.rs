@@ -7,10 +7,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ferrum_edge::notifications::channels::{NotificationChannel, parse_channels};
+use ferrum_edge::notifications::channels::email::{SmtpFailure, SmtpPhase};
 use ferrum_edge::notifications::dispatch::{DeliveryRetryPolicy, dispatch_one};
 use ferrum_edge::notifications::generation::{DispatchGeneration, DispatchSettle};
 use ferrum_edge::notifications::metrics::DeliveryMetrics;
-use ferrum_edge::notifications::outcome::{FailureClass, classify_http_status};
+use ferrum_edge::notifications::outcome::{
+    FailureClass, classify_http_status, classify_smtp_failure,
+};
 use ferrum_edge::notifications::{EventAction, Notification, NotificationField, Severity};
 use ferrum_edge::plugins::proxy_alerts::ProxyAlerts;
 use ferrum_edge::plugins::proxy_alerts::cooldown::RuleState;
@@ -124,6 +127,20 @@ fn http_status_classification_is_bounded_and_stable() {
     );
     assert_eq!(
         classify_http_status(reqwest::StatusCode::UNAUTHORIZED),
+        FailureClass::Permanent
+    );
+    assert_eq!(
+        classify_smtp_failure(&SmtpFailure::UnexpectedCode {
+            phase: SmtpPhase::Data,
+            code: 451,
+        }),
+        FailureClass::Transient
+    );
+    assert_eq!(
+        classify_smtp_failure(&SmtpFailure::UnexpectedCode {
+            phase: SmtpPhase::Data,
+            code: 550,
+        }),
         FailureClass::Permanent
     );
 }
@@ -390,7 +407,7 @@ async fn proxy_alerts_successful_trigger_commits_active_and_cooldown() {
 }
 
 #[tokio::test]
-async fn reload_retirement_cancels_in_flight_and_counts_abandoned() {
+async fn reload_retirement_drain_times_out_then_settles_abandoned_once() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     // Accept but never respond — keep the dispatch in-flight.
@@ -404,6 +421,8 @@ async fn reload_retirement_cancels_in_flight_and_counts_abandoned() {
     let generation = DispatchGeneration::with_metrics(99, Arc::clone(&metrics));
     let sem = Arc::new(Semaphore::new(1));
     let channel = webhook_channel_to(format!("http://{addr}/slow"));
+    let settles = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let callback_settles = Arc::clone(&settles);
 
     assert!(dispatch_one(
         Arc::new(fixed_notification()),
@@ -417,7 +436,12 @@ async fn reload_retirement_cancels_in_flight_and_counts_abandoned() {
             ..DeliveryRetryPolicy::DEFAULT
         },
         "test",
-        None,
+        Some(Arc::new(move |settle| {
+            callback_settles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(settle);
+        })),
     ));
 
     timeout(Duration::from_secs(2), async {
@@ -429,14 +453,11 @@ async fn reload_retirement_cancels_in_flight_and_counts_abandoned() {
     .expect("dispatch should become in-flight");
 
     generation.cancel();
-    // Cooperative cancel is observed between attempts; with max_retries=0 the
-    // in-flight request may still complete or hang until abort. Force abandon
-    // accounting by dropping the generation wait with cancelled flag checked
-    // on the next cancel_wait wake — cancel the hanging server task instead
-    // and rely on Drop of the delivery guard when the observability task is
-    // aborted via process registry in production. Here we assert cancel stops
-    // admission of new work:
     assert!(!generation.is_admitting());
+    assert!(
+        !generation.wait_drain(Duration::from_millis(25)).await,
+        "a live transport attempt must report a bounded drain timeout"
+    );
     let rejected = dispatch_one(
         Arc::new(fixed_notification()),
         Arc::new(Default::default()),
@@ -450,6 +471,20 @@ async fn reload_retirement_cancels_in_flight_and_counts_abandoned() {
     );
     assert!(!rejected, "retired generation must not admit new work");
     blocker.abort();
+    assert!(
+        generation.wait_drain(Duration::from_secs(2)).await,
+        "closing the in-flight transport must complete generation drain"
+    );
+    let snapshot = metrics.channel_snapshot("webhook");
+    assert_eq!(snapshot.abandoned_at_deadline, 1);
+    assert_eq!(snapshot.in_flight, 0);
+    assert_eq!(
+        *settles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        vec![DispatchSettle::Abandoned],
+        "retirement must roll producer state back exactly once"
+    );
 }
 
 #[tokio::test]

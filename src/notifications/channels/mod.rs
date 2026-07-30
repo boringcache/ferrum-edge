@@ -15,6 +15,7 @@ use url::Url;
 
 use crate::plugins::utils::http_client::PluginHttpClient;
 use crate::plugins::utils::response_body::{BoundedReadError, measure_response_body_bounded};
+use crate::retry::{ErrorClass, classify_reqwest_error};
 use crate::util::unknown_keys::{near_miss_for_missing_key, reject_unknown_keys};
 
 use super::notification::Notification;
@@ -150,52 +151,46 @@ impl NotificationChannel {
         http: &PluginHttpClient,
     ) -> DeliveryAttempt {
         match self {
-            Self::Slack(c) => match c.dispatch(notification, http).await {
-                Ok(()) => DeliveryAttempt::Success,
-                Err(message) => classify_legacy_channel_error("slack", &message),
-            },
-            Self::Teams(c) => match c.dispatch(notification, http).await {
-                Ok(()) => DeliveryAttempt::Success,
-                Err(message) => classify_legacy_channel_error("teams", &message),
-            },
-            Self::Discord(c) => match c.dispatch(notification, http).await {
-                Ok(()) => DeliveryAttempt::Success,
-                Err(message) => classify_legacy_channel_error("discord", &message),
-            },
-            Self::Webhook(c) => match c.dispatch_with_vars(notification, extras, http).await {
-                Ok(()) => DeliveryAttempt::Success,
-                Err(message) => classify_legacy_channel_error("webhook", &message),
-            },
+            Self::Slack(c) => {
+                let payload = c.build_payload(notification);
+                dispatch_json_payload_classified(
+                    c.webhook_url(),
+                    "slack",
+                    "notification_slack",
+                    &payload,
+                    http,
+                )
+                .await
+            }
+            Self::Teams(c) => {
+                let payload = c.build_payload(notification);
+                dispatch_json_payload_classified(
+                    c.webhook_url(),
+                    "teams",
+                    "notification_teams",
+                    &payload,
+                    http,
+                )
+                .await
+            }
+            Self::Discord(c) => {
+                let payload = c.build_payload(notification);
+                dispatch_json_payload_classified(
+                    c.webhook_url(),
+                    "discord",
+                    "notification_discord",
+                    &payload,
+                    http,
+                )
+                .await
+            }
+            Self::Webhook(c) => {
+                c.dispatch_with_vars_classified(notification, extras, http)
+                    .await
+            }
             Self::Email(c) => c.dispatch_classified(notification, extras, http).await,
         }
     }
-}
-
-/// Best-effort classification for channel helpers that still return `String`.
-///
-/// Status-bearing messages from [`finalize_dispatch_response`] embed
-/// `non-success status <code>`; transport failures are treated as transient.
-fn classify_legacy_channel_error(channel: &str, message: &str) -> DeliveryAttempt {
-    if let Some(status) = parse_embedded_http_status(message) {
-        return DeliveryAttempt::failed(
-            super::outcome::classify_http_status(status),
-            message.to_string(),
-        );
-    }
-    let _ = channel;
-    DeliveryAttempt::failed(FailureClass::Transient, message.to_string())
-}
-
-fn parse_embedded_http_status(message: &str) -> Option<reqwest::StatusCode> {
-    const MARKER: &str = "non-success status ";
-    let start = message.find(MARKER)? + MARKER.len();
-    let rest = message.get(start..)?;
-    let code_str: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    let code = code_str.parse::<u16>().ok()?;
-    reqwest::StatusCode::from_u16(code).ok()
 }
 
 /// Parse a `{ name -> ChannelDef }` JSON object into typed channels.
@@ -418,23 +413,32 @@ pub(super) async fn dispatch_json_payload_classified(
     let redacted_url = redacted_endpoint_url(webhook_url);
     let req = http.get().post(webhook_url).json(payload);
     let resp = match http
-        .execute_redacted(req, client_label, &redacted_url)
+        .execute_with_redacted_url(req, client_label, &redacted_url)
         .await
     {
         Ok(resp) => resp,
-        Err(e) => {
-            // execute_redacted returns a String (already redacted). Transport
-            // failures are transient; egress denials are permanent.
-            let class = if e.contains("refused") || e.contains("denied") || e.contains("blocked")
-            {
-                FailureClass::Permanent
-            } else {
-                FailureClass::Transient
-            };
-            return DeliveryAttempt::failed(class, format!("{channel} dispatch failed: {e}"));
-        }
+        Err(error) => return transport_failure(channel, &error, &redacted_url),
     };
     finalize_dispatch_response_classified(resp, channel, &redacted_url).await
+}
+
+pub(super) fn transport_failure(
+    channel: &str,
+    error: &reqwest::Error,
+    redacted_url: &str,
+) -> DeliveryAttempt {
+    let error_class = classify_reqwest_error(error);
+    let class = if error.is_builder() || error_class == ErrorClass::DispatchPolicyRejected {
+        FailureClass::Permanent
+    } else {
+        FailureClass::Transient
+    };
+    // Never render `reqwest::Error`: its Display includes the complete request
+    // URL, whose path/query commonly contains webhook credentials.
+    DeliveryAttempt::failed(
+        class,
+        format!("{channel} dispatch failed ({error_class}) calling {redacted_url}"),
+    )
 }
 
 async fn drain_response_body_redacted(

@@ -20,6 +20,7 @@ use tracing::warn;
 use crate::plugins::utils::http_client::PluginHttpClient;
 
 use super::channels::NotificationChannel;
+pub use super::generation::DeliveryCallback;
 use super::generation::{DispatchGeneration, DispatchSettle};
 use super::metrics::global as global_metrics;
 use super::notification::Notification;
@@ -86,14 +87,6 @@ static JITTER_SEED: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0xA5A5_A5A5_A5A5_A5A5)
 });
-
-/// Optional completion callback invoked after the final delivery settle
-/// (success, permanent failure, exhausted transient retries, or abandon).
-///
-/// Used by `proxy_alerts` to arm cooldown / commit incident state only on a
-/// defined outcome. The callback must not await and must not take locks that
-/// the request hot path also holds across awaits.
-pub type DeliveryCallback = Arc<dyn Fn(DispatchSettle) + Send + Sync>;
 
 /// Fan `notification` out to every channel in `targets`.
 ///
@@ -162,18 +155,21 @@ pub fn dispatch_one(
         }
     };
 
-    let spawned = generation.spawn(channel_type, {
+    let spawned = generation.spawn(channel_type, on_settle, {
         let channel = Arc::clone(&channel);
         let generation = Arc::clone(&generation);
-        let on_settle = on_settle.clone();
         async move {
-            let settle =
-                run_with_retries(channel, notification, extras, http, permit, retry, &generation, log_source)
-                    .await;
-            if let Some(cb) = on_settle {
-                cb(settle);
-            }
-            settle
+            run_with_retries(
+                channel,
+                notification,
+                extras,
+                http,
+                permit,
+                retry,
+                &generation,
+                log_source,
+            )
+            .await
         }
     });
 
@@ -184,9 +180,6 @@ pub fn dispatch_one(
             channel_type,
             "notification dispatch rejected by delivery generation or shutdown registry"
         );
-        if let Some(cb) = on_settle {
-            cb(DispatchSettle::Abandoned);
-        }
         return false;
     }
     true
@@ -214,6 +207,12 @@ pub(crate) async fn run_with_retries(
         let outcome = channel
             .dispatch_classified(&notification, &extras, &http)
             .await;
+        // Reload retirement can race an already-running network attempt. The
+        // bytes cannot be unsent, but the retired generation must not commit
+        // success/failure into incident state or start another retry.
+        if generation.is_cancelled() {
+            return DispatchSettle::Abandoned;
+        }
         match outcome {
             DeliveryAttempt::Success => return DispatchSettle::Succeeded,
             DeliveryAttempt::Failed { class, message } => {

@@ -123,13 +123,18 @@ impl CooldownGate {
     }
 
     /// Clear a previously acquired cooldown so a failed delivery does not
-    /// silently consume the window. No-op when the slot is already clear.
+    /// silently consume the window.
+    ///
+    /// The compare-and-swap is load-bearing: a slow delivery may settle after
+    /// its cooldown elapsed and a newer dispatch rearmed the same slot. That
+    /// stale settle must not clear the newer dispatch's reservation.
     pub fn release(
         &self,
         rule_id: u32,
         proxy_id: &str,
         channel_id: u32,
         ownership_generation: u64,
+        reserved_at_ms: u64,
     ) {
         let Some(per_proxy) = self.last_sent.get(&(rule_id, channel_id)) else {
             return;
@@ -138,7 +143,12 @@ impl CooldownGate {
             return;
         };
         if let Some(atomic) = per_generation.get_cloned(&ownership_generation) {
-            atomic.store(0, Ordering::Release);
+            let _ = atomic.compare_exchange(
+                reserved_at_ms,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
     }
 
@@ -217,7 +227,10 @@ pub enum RuleState {
     /// Resolve accepted for dispatch but delivery has not settled yet.
     /// Suppresses duplicate Resolve admissions until success (→ Healthy) or
     /// failure/abandon (→ Recovering, so the next healthy sample can retry).
-    PendingResolve { left_threshold_at_ms: u64 },
+    PendingResolve {
+        left_threshold_at_ms: u64,
+        reserved_at_ms: u64,
+    },
 }
 
 /// Outcome of evaluating a single observation against the recovery state
@@ -400,6 +413,7 @@ impl RecoveryGate {
                     if elapsed >= recovery_ms {
                         *state = RuleState::PendingResolve {
                             left_threshold_at_ms,
+                            reserved_at_ms: now_ms,
                         };
                         LifecycleOutcome::Resolve
                     } else {
@@ -449,6 +463,7 @@ impl RecoveryGate {
         rule_id: u32,
         proxy_id: &str,
         ownership_generation: u64,
+        reserved_at_ms: u64,
         fired_at_ms: u64,
     ) {
         let per_generation = self.per_proxy_generations(rule_id, proxy_id);
@@ -456,7 +471,12 @@ impl RecoveryGate {
             ownership_generation,
             || RuleState::Healthy,
             |state| {
-                if matches!(state, RuleState::PendingTrigger { .. }) {
+                if matches!(
+                    state,
+                    RuleState::PendingTrigger {
+                        reserved_at_ms: current,
+                    } if *current == reserved_at_ms
+                ) {
                     *state = RuleState::Active { fired_at_ms };
                 }
                 LifecycleOutcome::Quiet
@@ -470,13 +490,19 @@ impl RecoveryGate {
         rule_id: u32,
         proxy_id: &str,
         ownership_generation: u64,
+        reserved_at_ms: u64,
     ) {
         let per_generation = self.per_proxy_generations(rule_id, proxy_id);
         let _ = per_generation.with_mut(
             ownership_generation,
             || RuleState::Healthy,
             |state| {
-                if matches!(state, RuleState::PendingTrigger { .. }) {
+                if matches!(
+                    state,
+                    RuleState::PendingTrigger {
+                        reserved_at_ms: current,
+                    } if *current == reserved_at_ms
+                ) {
                     *state = RuleState::Healthy;
                 }
                 LifecycleOutcome::Quiet
@@ -490,13 +516,20 @@ impl RecoveryGate {
         rule_id: u32,
         proxy_id: &str,
         ownership_generation: u64,
+        reserved_at_ms: u64,
     ) {
         let per_generation = self.per_proxy_generations(rule_id, proxy_id);
         let _ = per_generation.with_mut(
             ownership_generation,
             || RuleState::Healthy,
             |state| {
-                if matches!(state, RuleState::PendingResolve { .. }) {
+                if matches!(
+                    state,
+                    RuleState::PendingResolve {
+                        reserved_at_ms: current,
+                        ..
+                    } if *current == reserved_at_ms
+                ) {
                     *state = RuleState::Healthy;
                 }
                 LifecycleOutcome::Quiet
@@ -511,13 +544,20 @@ impl RecoveryGate {
         proxy_id: &str,
         ownership_generation: u64,
         left_threshold_at_ms: u64,
+        reserved_at_ms: u64,
     ) {
         let per_generation = self.per_proxy_generations(rule_id, proxy_id);
         let _ = per_generation.with_mut(
             ownership_generation,
             || RuleState::Healthy,
             |state| {
-                if matches!(state, RuleState::PendingResolve { .. }) {
+                if matches!(
+                    state,
+                    RuleState::PendingResolve {
+                        reserved_at_ms: current,
+                        ..
+                    } if *current == reserved_at_ms
+                ) {
                     *state = RuleState::Recovering {
                         left_threshold_at_ms,
                     };

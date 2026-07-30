@@ -264,7 +264,7 @@ impl ProxyAlerts {
         // observe now lands on PendingTrigger; commit Active for seeders that
         // need a fully-delivered incident (plugin-cache retention tests).
         self.recovery
-            .settle_trigger_success(0, proxy_id, generation, 1);
+            .settle_trigger_success(0, proxy_id, generation, 1, 1);
     }
 
     /// Whether this instance currently holds lifecycle state for `proxy_id`
@@ -307,7 +307,7 @@ impl ProxyAlerts {
             .recovery
             .observe(0, proxy_id, true, 5_000, 1, generation);
         self.recovery
-            .settle_trigger_success(0, proxy_id, generation, 1);
+            .settle_trigger_success(0, proxy_id, generation, 1, 1);
     }
     /// waiting for its one-minute cadence.
     #[doc(hidden)]
@@ -532,19 +532,22 @@ impl ProxyAlerts {
                         proxy_id,
                         *channel_id,
                         ownership_generation,
+                        now_ms,
                     );
                 }
             }
             return;
         }
-        let left_threshold_at_ms = match self
+        let (left_threshold_at_ms, recovery_reserved_at_ms) = match self
             .recovery
             .current_state(rule.id(), proxy_id, ownership_generation)
         {
             Some(RuleState::PendingResolve {
                 left_threshold_at_ms,
-            }) => left_threshold_at_ms,
-            _ => now_ms,
+                reserved_at_ms,
+            }) => (left_threshold_at_ms, reserved_at_ms),
+            Some(RuleState::PendingTrigger { reserved_at_ms }) => (now_ms, reserved_at_ms),
+            _ => (now_ms, now_ms),
         };
         let notification = render::build_notification(rule, observation, sample, event_action, now);
         let extras = render::build_webhook_vars(rule, observation, sample, event_action, now);
@@ -559,6 +562,8 @@ impl ProxyAlerts {
             ownership_generation,
             fired_at_ms: now_ms,
             left_threshold_at_ms,
+            recovery_reserved_at_ms,
+            cooldown_reserved_at_ms: now_ms,
             cooldowns: Arc::clone(&self.cooldowns),
             recovery: Arc::clone(&self.recovery),
         });
@@ -607,7 +612,6 @@ impl ProxyAlerts {
         let generation = Arc::clone(&self.dispatch_generation);
         let retry = self.delivery_retry;
         let http = self.http_client.clone();
-        let sem = Arc::clone(&self.dispatch_sem);
         // Re-insert the already-acquired permit by transferring ownership into
         // the spawned task via the dispatch helper's permit parameter. We
         // already hold `permit`; dispatch_one would try_acquire again. Run the
@@ -619,12 +623,11 @@ impl ProxyAlerts {
             }
         });
         let channel_type = channel.kind();
-        let spawned = generation.spawn(channel_type, {
+        let spawned = generation.spawn(channel_type, Some(on_settle), {
             let channel = Arc::clone(&channel);
             let generation = Arc::clone(&generation);
-            let on_settle = Arc::clone(&on_settle);
             async move {
-                let settle = crate::notifications::dispatch::run_with_retries(
+                crate::notifications::dispatch::run_with_retries(
                     channel,
                     notification,
                     extras,
@@ -634,16 +637,17 @@ impl ProxyAlerts {
                     &generation,
                     "proxy_alerts",
                 )
-                .await;
-                on_settle(settle);
-                settle
+                .await
             }
         });
         if !spawned {
-            // Future (and permit) dropped without running; roll pending state.
-            on_settle(DispatchSettle::Abandoned);
+            warn!(
+                plugin = "proxy_alerts",
+                channel = %channel.name(),
+                channel_type,
+                "notification dispatch rejected by delivery generation or shutdown registry"
+            );
         }
-        let _ = sem;
     }
 
     /// Snapshot delivery metrics for external tests (process-wide registry).
@@ -679,6 +683,8 @@ struct PendingDeliveryFanout {
     ownership_generation: u64,
     fired_at_ms: u64,
     left_threshold_at_ms: u64,
+    recovery_reserved_at_ms: u64,
+    cooldown_reserved_at_ms: u64,
     cooldowns: Arc<CooldownGate>,
     recovery: Arc<RecoveryGate>,
 }
@@ -695,6 +701,7 @@ impl PendingDeliveryFanout {
                 &self.proxy_id,
                 channel_id,
                 self.ownership_generation,
+                self.cooldown_reserved_at_ms,
             );
         }
         if self.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
@@ -708,6 +715,7 @@ impl PendingDeliveryFanout {
                         self.rule_id,
                         &self.proxy_id,
                         self.ownership_generation,
+                        self.recovery_reserved_at_ms,
                     );
                 } else {
                     self.recovery.settle_resolve_failure(
@@ -715,6 +723,7 @@ impl PendingDeliveryFanout {
                         &self.proxy_id,
                         self.ownership_generation,
                         self.left_threshold_at_ms,
+                        self.recovery_reserved_at_ms,
                     );
                 }
             }
@@ -727,6 +736,7 @@ impl PendingDeliveryFanout {
                         self.rule_id,
                         &self.proxy_id,
                         self.ownership_generation,
+                        self.recovery_reserved_at_ms,
                         self.fired_at_ms,
                     );
                 } else {
@@ -734,6 +744,7 @@ impl PendingDeliveryFanout {
                         self.rule_id,
                         &self.proxy_id,
                         self.ownership_generation,
+                        self.recovery_reserved_at_ms,
                     );
                 }
             }
@@ -1241,6 +1252,7 @@ mod tests {
             0,
             "ferrum|p1",
             UNARMED_PROXY_LIFECYCLE_GENERATION,
+            1,
             1,
         );
         plugin.recovery.observe(

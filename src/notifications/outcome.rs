@@ -123,6 +123,9 @@ pub fn classify_smtp_failure(failure: &super::channels::email::SmtpFailure) -> F
         | SmtpFailure::Io(_)
         | SmtpFailure::ClosedEarly(_)
         | SmtpFailure::TlsHandshake => FailureClass::Transient,
+        SmtpFailure::UnexpectedCode { code, .. } if (400..500).contains(code) => {
+            FailureClass::Transient
+        }
         SmtpFailure::EgressDenied(_)
         | SmtpFailure::TlsSetup
         | SmtpFailure::StartTlsUnsupported

@@ -17,6 +17,13 @@ use tokio::sync::Notify;
 
 use super::metrics::{DeliveryMetrics, global as global_metrics};
 
+/// Optional completion callback invoked exactly once after a delivery settles.
+///
+/// The generation owns this callback, rather than the user future, so a task
+/// rejected during admission or hard-aborted before its first poll still rolls
+/// back producer state.
+pub type DeliveryCallback = Arc<dyn Fn(DispatchSettle) + Send + Sync>;
+
 /// Tracks in-flight dispatch tasks for one plugin-instance generation.
 #[derive(Debug)]
 pub struct DispatchGeneration {
@@ -24,6 +31,11 @@ pub struct DispatchGeneration {
     admitting: AtomicBool,
     /// Cooperative cancel: set on retire/Drop so retry loops stop.
     cancelled: AtomicBool,
+    /// Spawn calls between method entry and completed registry handoff/reject.
+    /// Drain waits for these registrations so closing admission cannot race a
+    /// caller that observed the old `admitting=true` value but has not yet
+    /// incremented `in_flight`.
+    active_spawns: AtomicUsize,
     in_flight: AtomicUsize,
     drained: Notify,
     metrics: Arc<DeliveryMetrics>,
@@ -40,6 +52,7 @@ impl DispatchGeneration {
             id,
             admitting: AtomicBool::new(true),
             cancelled: AtomicBool::new(false),
+            active_spawns: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
             drained: Notify::new(),
             metrics,
@@ -89,17 +102,34 @@ impl DispatchGeneration {
         }
     }
 
-    /// Wait until in-flight reaches zero or `timeout` elapses.
+    fn end_spawn(&self) {
+        let prev = self.active_spawns.fetch_sub(1, Ordering::AcqRel);
+        if prev <= 1 {
+            self.drained.notify_waiters();
+        }
+    }
+
+    fn is_drained(&self) -> bool {
+        self.active_spawns.load(Ordering::Acquire) == 0
+            && self.in_flight.load(Ordering::Acquire) == 0
+    }
+
+    /// Wait until spawn handoffs and in-flight tasks reach zero or `timeout`
+    /// elapses.
     pub async fn wait_drain(&self, timeout: std::time::Duration) -> bool {
-        if self.in_flight.load(Ordering::Acquire) == 0 {
+        if self.is_drained() {
             return true;
         }
         let wait = async {
             loop {
-                if self.in_flight.load(Ordering::Acquire) == 0 {
+                // Construct the notification future before checking the
+                // counters so a zero transition cannot land between the check
+                // and waiter registration.
+                let notified = self.drained.notified();
+                if self.is_drained() {
                     return true;
                 }
-                self.drained.notified().await;
+                notified.await;
             }
         };
         matches!(tokio::time::timeout(timeout, wait).await, Ok(true))
@@ -109,13 +139,25 @@ impl DispatchGeneration {
     ///
     /// Returns `false` when this generation is closed or the global registry
     /// rejects admission (shutdown / capacity). Rejection is a visible drop —
-    /// never queued. On rejection the caller is responsible for any
-    /// pending-state rollback; metrics record `abandoned_at_deadline`.
-    pub fn spawn<F>(self: &Arc<Self>, channel_type: &'static str, future: F) -> bool
+    /// never queued. The generation invokes `on_settle(Abandoned)` on every
+    /// rejection path; admitted attempts also record `abandoned_at_deadline`.
+    pub fn spawn<F>(
+        self: &Arc<Self>,
+        channel_type: &'static str,
+        on_settle: Option<DeliveryCallback>,
+        future: F,
+    ) -> bool
     where
         F: Future<Output = DispatchSettle> + Send + 'static,
     {
+        self.active_spawns.fetch_add(1, Ordering::AcqRel);
+        let _spawn_registration = SpawnRegistration {
+            generation: self.as_ref(),
+        };
         if !self.is_admitting() || self.is_cancelled() {
+            if let Some(callback) = on_settle {
+                invoke_delivery_callback(&callback, DispatchSettle::Abandoned, channel_type);
+            }
             return false;
         }
         let generation = Arc::clone(self);
@@ -126,19 +168,22 @@ impl DispatchGeneration {
         generation.begin_task();
         generation.metrics.record_attempted(channel_type);
 
-        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+        // Construct the settlement guard before handing the future to the
+        // process registry. If admission rejects, shutdown aborts the task
+        // before its first poll, or the task panics, dropping the captured guard
+        // still records abandonment and invokes the producer callback.
+        let settlement = Arc::new(DeliveryTaskSettlement {
+            generation: Arc::clone(&generation),
+            channel_type,
+            on_settle,
+            settled: AtomicBool::new(false),
+        });
+        let guard = DeliveryTaskGuard {
+            settlement: Arc::clone(&settlement),
+        };
         let admitted = crate::observability_delivery::spawn_terminal({
             let generation = Arc::clone(&generation);
             async move {
-                if start_rx.await.is_err() {
-                    // Caller rolled back admission; do not settle again.
-                    return;
-                }
-                let mut guard = DeliveryTaskGuard {
-                    generation: Arc::clone(&generation),
-                    channel_type,
-                    settled: false,
-                };
                 let settle = if generation.is_cancelled() {
                     DispatchSettle::Abandoned
                 } else {
@@ -149,15 +194,23 @@ impl DispatchGeneration {
         });
 
         if !admitted {
-            // Reverse attempted/in-flight. The terminal future was dropped
-            // without polling, so its guard never ran.
-            generation.metrics.record_abandoned_at_deadline(channel_type);
-            generation.end_task();
-            drop(start_tx);
+            // The registry may drop/abort its future asynchronously. Settle
+            // synchronously here; the captured guard is protected by the same
+            // atomic exactly-once edge and becomes a no-op when it is dropped.
+            settlement.settle(DispatchSettle::Abandoned);
             return false;
         }
-        let _ = start_tx.send(());
         true
+    }
+}
+
+struct SpawnRegistration<'a> {
+    generation: &'a DispatchGeneration,
+}
+
+impl Drop for SpawnRegistration<'_> {
+    fn drop(&mut self) {
+        self.generation.end_spawn();
     }
 }
 
@@ -170,20 +223,24 @@ pub enum DispatchSettle {
     Abandoned,
 }
 
-/// Ensures a cancelled/aborted dispatch task still decrements in-flight and
-/// records abandonment when the future is dropped without settling.
-struct DeliveryTaskGuard {
+/// Shared exactly-once settlement edge. The caller keeps a reference until the
+/// process registry confirms admission; the task guard owns the other reference.
+struct DeliveryTaskSettlement {
     generation: Arc<DispatchGeneration>,
     channel_type: &'static str,
-    settled: bool,
+    on_settle: Option<DeliveryCallback>,
+    settled: AtomicBool,
 }
 
-impl DeliveryTaskGuard {
-    fn settle(&mut self, outcome: DispatchSettle) {
-        if self.settled {
+impl DeliveryTaskSettlement {
+    fn settle(&self, outcome: DispatchSettle) {
+        if self
+            .settled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return;
         }
-        self.settled = true;
         match outcome {
             DispatchSettle::Succeeded => {
                 self.generation.metrics.record_succeeded(self.channel_type);
@@ -204,19 +261,45 @@ impl DeliveryTaskGuard {
                     .record_abandoned_at_deadline(self.channel_type);
             }
         }
+        if let Some(callback) = self.on_settle.as_ref() {
+            invoke_delivery_callback(callback, outcome, self.channel_type);
+        }
+        // A drained generation guarantees producer settlement is complete, not
+        // merely that the transport future returned.
         self.generation.end_task();
+    }
+}
+
+fn invoke_delivery_callback(
+    callback: &DeliveryCallback,
+    outcome: DispatchSettle,
+    channel_type: &'static str,
+) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(outcome))).is_err() {
+        tracing::warn!(
+            channel_type,
+            ?outcome,
+            "notification delivery settle callback panicked; state rollback may be incomplete"
+        );
+    }
+}
+
+/// Ensures a cancelled/aborted dispatch task still decrements in-flight,
+/// records abandonment, and rolls back producer state when its future is
+/// dropped without returning a settle outcome.
+struct DeliveryTaskGuard {
+    settlement: Arc<DeliveryTaskSettlement>,
+}
+
+impl DeliveryTaskGuard {
+    fn settle(&self, outcome: DispatchSettle) {
+        self.settlement.settle(outcome);
     }
 }
 
 impl Drop for DeliveryTaskGuard {
     fn drop(&mut self) {
-        if self.settled {
-            return;
-        }
         // Hard abort (shutdown deadline) or panic: count as abandoned.
-        self.generation
-            .metrics
-            .record_abandoned_at_deadline(self.channel_type);
-        self.generation.end_task();
+        self.settlement.settle(DispatchSettle::Abandoned);
     }
 }
