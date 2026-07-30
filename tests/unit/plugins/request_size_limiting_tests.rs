@@ -106,14 +106,16 @@ async fn test_no_content_length_header_passes() {
 }
 
 #[tokio::test]
-async fn test_invalid_content_length_header_passes() {
+async fn test_invalid_content_length_header_fails_closed() {
     let plugin = RequestSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
     let mut ctx = make_ctx("POST", "/api");
     ctx.headers
         .insert("content-length".to_string(), "not-a-number".to_string());
 
-    let result = plugin.on_request_received(&mut ctx).await;
-    assert!(matches!(result, PluginResult::Continue));
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("Expected 400 Reject, got {other:?}"),
+    }
 }
 
 #[tokio::test]

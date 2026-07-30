@@ -159,14 +159,16 @@ async fn test_no_content_length_header_passes() {
 }
 
 #[tokio::test]
-async fn test_invalid_content_length_passes() {
+async fn test_invalid_content_length_fails_closed() {
     let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
     let mut ctx = make_ctx();
     let mut headers = HashMap::new();
     headers.insert("content-length".to_string(), "bad".to_string());
 
-    let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
-    assert!(matches!(result, PluginResult::Continue));
+    match plugin.after_proxy(&mut ctx, 200, &mut headers).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 502),
+        other => panic!("Expected 502 Reject, got {other:?}"),
+    }
 }
 
 // === Bodyless response semantics (issue #2343) ===
