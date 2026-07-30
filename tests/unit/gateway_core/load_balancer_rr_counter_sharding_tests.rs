@@ -97,9 +97,8 @@ fn rr_contention_bench_uses_exact_same_shard_control() {
     // 1.50x→0.44x).
     let bench = std::fs::read_to_string("tests/performance/mesh/benches/rr_selection.rs")
         .expect("rr_selection bench must be readable from crate root");
-    let verifier =
-        std::fs::read_to_string(".github/scripts/verify_rr_selection_benchmark.py")
-            .expect("RR verifier must be readable from crate root");
+    let verifier = std::fs::read_to_string(".github/scripts/verify_rr_selection_benchmark.py")
+        .expect("RR verifier must be readable from crate root");
 
     assert!(
         bench.contains("select_round_robin_from_shard_for_test")
