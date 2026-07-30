@@ -14,7 +14,7 @@ coverage matrix is emitted by the conformance suite to
 
 | Tier | Meaning | Enforcement |
 |---|---|---|
-| **GA** (equivalent to `docs/mesh.md` "Stable") | Production-suitable; exercised end-to-end against a live data path. A product promise. | **Prescriptive, at both layers.** Listed in `tests/conformance/ga_contract.yaml` and tagged `Maturity::Ga`; a semantic regression to anything but `Supported` fails CI (`tests/conformance/ga_scope.rs`). The **live** half is equally blocking: the `mesh-e2e-sidecar` suite runs on every relevant PR and every main push, its emitted `live-assertions.json` is validated against the contract (`tests/conformance/live_contract.rs` — required IDs present + passed for the exact suite/profile/commit, no duplicate or stale artifacts), the result is a merge-blocking required check (the dedicated workflow's `Mesh E2E Sidecar Live` gate job, required via branch protection), and `release.yml` refuses to ship a tag whose SHA lacks a green live run. |
+| **GA** (equivalent to `docs/mesh.md` "Stable") | Production-suitable; exercised end-to-end against a live data path. A product promise. | **Prescriptive, at both layers.** Listed in `tests/conformance/ga_contract.yaml` and tagged `Maturity::Ga`; a semantic regression to anything but `Supported` fails CI (`tests/conformance/ga_scope.rs`). The **live** half is equally blocking: the `mesh-e2e-sidecar` and `multicluster-federation` suites run on every relevant PR and every main push, the results are merge-blocking required checks (the dedicated workflows' `Mesh E2E Sidecar Live` and `Multicluster Federation Live` gate jobs, required via branch protection), and `release.yml` refuses to ship a tag whose SHA lacks green live runs for both suites. Both suites validate their emitted `live-assertions.json` against the contract — required IDs present + passed for the exact suite/profile/commit, no duplicate or stale artifacts — but by different mechanisms, because the trusted Cross build policy freezes each workflow's existing Cross-sensitive surfaces. `mesh-e2e-sidecar` validates in-workflow inside its live job (`tests/conformance/live_contract.rs::live_contract_artifact_gate`). `multicluster-federation` cannot add a cargo step to its frozen live job, so its `gate` job — the job that publishes the required check — downloads the published artifact with a SHA-pinned `actions/download-artifact` and validates it with the standard-library `.github/scripts/validate_live_assertions.py` (exact schema/suite/commit/platform profile, six-hour freshness ceiling, no duplicates, exactly the required id set, every required id `pass`). The fixture additionally fails closed on its own `ferrum_live_assertions_require_all_passed`, and the hosted conformance suite (`live_contract.rs`, `mesh_multicluster_federation.rs`) pins both required sets to the enforced, non-`live_deferred` contract rows in the `Tests` aggregate. |
 | **Beta** | Feature-complete and tested, with a documented sharp edge or an owed verification step. | Observational — may be `Deferred` without failing CI. |
 | **Experimental** | Usable with a safety-relevant caveat (plaintext, partial enforcement) or live-datapath-unverified. Opt-in; not recommended without compensating controls. | Observational. |
 | **Dev-only** | Gated behind a build feature or dev opt-in; not in the default published image. | Observational. |
@@ -84,9 +84,30 @@ CI today."
   (PeerAuthentication DISABLE, or no usable server identity) is refused in
   production, and a configured-but-unloadable SVID verifier (TLS without
   trust-domain verification) is fatal regardless of mode.
-- **Beta.** xDS ADS (Ferrum-CP↔Ferrum-DP), `Ambient` HBONE, `EastWestGateway`
-  SNI passthrough, HTTP-family `EgressGateway`, `ServiceWaypoint` (GAMMA),
-  trust-bundle federation.
+- **GA track — cross-cluster east-west federation.** `EastWestGateway` SNI
+  passthrough + SPIRE trust-bundle federation are enrolled vertically as well
+  (issue #2459): `mesh.multicluster.spire_trust_federation`,
+  `mesh.multicluster.eastwest_authenticated_datapath`,
+  `mesh.multicluster.untrusted_peer_rejected`,
+  `mesh.multicluster.trust_revocation_recovery`, and
+  `mesh.multicluster.endpoint_failure_recovery` in
+  `tests/conformance/ga_contract.yaml`, with semantics pinned by the
+  `mesh_multicluster_federation` conformance module (fail-closed federated-bundle
+  requirement, federated trust-domain uniqueness, `local_cluster` /
+  `RemoteCluster` canonical-identity rejection, peer-trust withdrawal, and the
+  east-west gateway host/port floor) plus the `mesh_topology_matrix`
+  `EastWestGateway topology` row. The live half is the `multicluster-federation`
+  suite on the `kind-spire-multicluster-federation` profile: two SPIRE-federated
+  kind clusters proving bidirectional authenticated east-west traffic,
+  untrusted-peer rejection, trust revocation → fail-closed → restore → recover,
+  and destination black-hole → recover, gated on all thirteen required
+  `multicluster.*` assertions by the fixture, by the workflow `gate` job's
+  emitted-artifact validation, and by `release.yml` SHA validation. **Excluded
+  and still Experimental:** poller-driven cross-cluster *endpoint discovery*
+  (see below); the poller partition / last-good-retention live gate stays
+  deferred under [#3331](https://github.com/ferrum-edge/ferrum-edge/issues/3331).
+- **Beta.** xDS ADS (Ferrum-CP↔Ferrum-DP), `Ambient` HBONE, HTTP-family
+  `EgressGateway`, `ServiceWaypoint` (GAMMA).
 - **Experimental.** `NodeWaypoint` sidecarless capture (IPv4 and IPv6 capture
   paths gated by a privileged live job; secured node-to-node transport,
   production SPIRE, stale source-IP reuse, and inbound direct-pod enforcement

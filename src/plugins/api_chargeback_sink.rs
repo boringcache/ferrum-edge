@@ -59,6 +59,11 @@ use super::utils::{
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
 use crate::observability_delivery::DeliveryWorkerControl;
+use crate::plugins::utils::log_schema::view::status_class;
+use crate::plugins::utils::log_schema::{
+    DerivedKind, FieldSpec, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
+    SummarySchema, TimestampFormat, resolve_schema,
+};
 use tokio::sync::mpsc;
 
 const PLUGIN_NAME: &str = "api_chargeback_sink";
@@ -1221,6 +1226,15 @@ pub struct ApiChargebackSinkConfig {
     pub bandwidth_pricing: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_connection_pricing: Option<Value>,
+    /// Inline transaction-log schema projecting the exported charge event.
+    /// Validated and compiled by [`resolve_schema`]; retained here only so the
+    /// `deny_unknown_fields` config struct admits the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Value>,
+    /// Named schema reference resolved against the global
+    /// `transaction_log_schema` registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_ref: Option<String>,
 }
 
 impl Default for ApiChargebackSinkConfig {
@@ -1239,6 +1253,8 @@ impl Default for ApiChargebackSinkConfig {
             pricing_tiers: None,
             bandwidth_pricing: None,
             stream_connection_pricing: None,
+            schema: None,
+            schema_ref: None,
         }
     }
 }
@@ -1283,6 +1299,226 @@ pub struct ChargeEvent {
     pub snapshot_id: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Charge-event schema projection
+// ---------------------------------------------------------------------------
+
+/// Worst-case rendered bytes of a derived value for this family.
+///
+/// `backend_host` (the only unbounded derived kind) is rejected at compile time
+/// for the charge-event family, so every derived value is one of the fixed
+/// tokens `"1xx"`…`"other"`, `"ok"` / `"error"`, or `"charge_event"`.
+const MAX_DERIVED_VALUE_BYTES: usize = 24;
+
+/// `"key":value,` framing charged on top of an added member's key and value.
+const JSON_MEMBER_FRAMING_BYTES: usize = 4;
+
+/// A compiled charge-event projection plus the extra worst-case bytes one
+/// projected row costs beyond its native rendering.
+///
+/// The retained-byte reservation for a JSONEachRow body is taken **before** a
+/// single byte is serialized, so the bound has to account for renamed keys and
+/// injected static / derived members up front. The overhead is computed once at
+/// construction — never on a flush path — and a schema whose overhead cannot be
+/// bounded fails closed at construction rather than blowing the reservation
+/// later.
+#[derive(Debug)]
+pub struct ChargeEventProjection {
+    schema: Arc<SummarySchema>,
+    row_overhead_bytes: usize,
+}
+
+impl ChargeEventProjection {
+    fn new(schema: Arc<SummarySchema>) -> Result<Self, String> {
+        let row_overhead_bytes = projection_row_overhead_bytes(&schema).ok_or_else(|| {
+            format!("{PLUGIN_NAME}: schema adds an unboundable number of bytes per exported row")
+        })?;
+        Ok(Self {
+            schema,
+            row_overhead_bytes,
+        })
+    }
+
+    /// The compiled schema. Test-visible so parity assertions can inspect it.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn schema(&self) -> &SummarySchema {
+        &self.schema
+    }
+
+    /// Worst-case extra bytes one projected row costs.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn row_overhead_bytes(&self) -> usize {
+        self.row_overhead_bytes
+    }
+}
+
+/// Resolve and compile a charge-event projection straight from a raw plugin
+/// config. Test-facing mirror of what the constructor does.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn compile_charge_event_projection(
+    config: &Value,
+) -> Result<Option<ChargeEventProjection>, String> {
+    match resolve_schema(config, PLUGIN_NAME, SchemaCapabilities::API_CHARGEBACK_SINK)? {
+        Some(schema) => ChargeEventProjection::new(schema).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Worst-case JSON cost of an output key, assuming maximal escaping.
+fn json_key_bound(key: &str) -> Option<usize> {
+    key.len()
+        .checked_mul(JSON_STRING_WORST_CASE_EXPANSION)?
+        .checked_add(2)
+}
+
+/// Worst-case extra bytes a compiled schema adds to one serialized row.
+///
+/// Omissions and shortened rename targets only shrink the row, so they are
+/// deliberately not credited back — the result is an upper bound.
+fn projection_row_overhead_bytes(schema: &SummarySchema) -> Option<usize> {
+    let mut extra: usize = 0;
+    for spec in &schema.fields {
+        match spec {
+            FieldSpec::Native { out_key, .. } => {
+                extra = extra.checked_add(json_key_bound(out_key)?)?;
+            }
+            FieldSpec::Static { out_key, value } => {
+                let rendered = serde_json::to_string(value).ok()?;
+                extra = extra
+                    .checked_add(json_key_bound(out_key)?)?
+                    .checked_add(rendered.len())?
+                    .checked_add(JSON_MEMBER_FRAMING_BYTES)?;
+            }
+            FieldSpec::Derived { out_key, .. } => {
+                extra = extra
+                    .checked_add(json_key_bound(out_key)?)?
+                    .checked_add(MAX_DERIVED_VALUE_BYTES)?
+                    .checked_add(JSON_MEMBER_FRAMING_BYTES)?;
+            }
+        }
+    }
+    Some(extra)
+}
+
+impl SchemaSerializable for ChargeEvent {
+    fn owns_native(&self, source: &str) -> bool {
+        crate::plugins::utils::log_schema::CHARGE_EVENT_FIELDS
+            .iter()
+            .any(|field| field.name == source)
+    }
+
+    fn serialize_native<S>(
+        &self,
+        source: &'static str,
+        out_key: &str,
+        _ts_format: TimestampFormat,
+        map: &mut S,
+    ) -> Result<(), S::Error>
+    where
+        S: serde::ser::SerializeMap,
+    {
+        // Optional members preserve their native `skip_serializing_if` shape so
+        // a projected row and a native row agree on presence, not just naming.
+        match source {
+            "event_id" => map.serialize_entry(out_key, &self.event_id),
+            "received_at" => map.serialize_entry(out_key, &self.received_at),
+            "node_id" => map.serialize_entry(out_key, &self.node_id),
+            "namespace" => map.serialize_entry(out_key, &self.namespace),
+            "consumer_id" => map.serialize_entry(out_key, &self.consumer_id),
+            "consumer_name" => match &self.consumer_name {
+                Some(value) => map.serialize_entry(out_key, value),
+                None => Ok(()),
+            },
+            "proxy_id" => map.serialize_entry(out_key, &self.proxy_id),
+            "proxy_name" => map.serialize_entry(out_key, &self.proxy_name),
+            "route_id" => match &self.route_id {
+                Some(value) => map.serialize_entry(out_key, value),
+                None => Ok(()),
+            },
+            "status_code" => map.serialize_entry(out_key, &self.status_code),
+            "http_status_code" => match &self.http_status_code {
+                Some(value) => map.serialize_entry(out_key, value),
+                None => Ok(()),
+            },
+            "grpc_status" => match &self.grpc_status {
+                Some(value) => map.serialize_entry(out_key, value),
+                None => Ok(()),
+            },
+            "protocol" => map.serialize_entry(out_key, &self.protocol),
+            "call_count" => map.serialize_entry(out_key, &self.call_count),
+            "charge_call" => map.serialize_entry(out_key, &self.charge_call),
+            "bytes_sent" => map.serialize_entry(out_key, &self.bytes_sent),
+            "bytes_received" => map.serialize_entry(out_key, &self.bytes_received),
+            "charge_bytes_sent" => map.serialize_entry(out_key, &self.charge_bytes_sent),
+            "charge_bytes_received" => map.serialize_entry(out_key, &self.charge_bytes_received),
+            "charge_total" => map.serialize_entry(out_key, &self.charge_total),
+            "currency" => map.serialize_entry(out_key, &self.currency),
+            "pricing_version" => map.serialize_entry(out_key, &self.pricing_version),
+            "request_id" => match &self.request_id {
+                Some(value) => map.serialize_entry(out_key, value),
+                None => Ok(()),
+            },
+            "trace_id" => match &self.trace_id {
+                Some(value) => map.serialize_entry(out_key, value),
+                None => Ok(()),
+            },
+            "snapshot_id" => match &self.snapshot_id {
+                Some(value) => map.serialize_entry(out_key, value),
+                None => Ok(()),
+            },
+            _ => Ok(()),
+        }
+    }
+
+    fn serialize_derived<S>(
+        &self,
+        kind: DerivedKind,
+        out_key: &str,
+        map: &mut S,
+    ) -> Result<bool, S::Error>
+    where
+        S: serde::ser::SerializeMap,
+    {
+        match kind {
+            DerivedKind::StatusClass => {
+                map.serialize_entry(out_key, status_class(self.status_code))?;
+                Ok(true)
+            }
+            DerivedKind::SummaryKind => {
+                map.serialize_entry(out_key, "charge_event")?;
+                Ok(true)
+            }
+            DerivedKind::Outcome => {
+                let is_error =
+                    self.status_code >= 500 || self.grpc_status.is_some_and(|status| status != 0);
+                map.serialize_entry(out_key, if is_error { "error" } else { "ok" })?;
+                Ok(true)
+            }
+            // Rejected at compile time for this family — a charge event has no
+            // backend target to extract a host from.
+            DerivedKind::BackendHost => Ok(false),
+        }
+    }
+
+    fn serialize_metadata<S>(
+        &self,
+        _policy: &MetadataPolicy,
+        _emitted: &mut std::collections::HashSet<String>,
+        _map: &mut S,
+    ) -> Result<(), S::Error>
+    where
+        S: serde::ser::SerializeMap,
+    {
+        // Charge events carry no metadata map; the compiler rejects a
+        // `metadata` policy for this family, so the default `Nested` policy is
+        // the only value that reaches here and it has nothing to emit.
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct SinkSummary {
     mode: SinkMode,
@@ -1324,6 +1560,10 @@ fn worst_case_inter_attempt_delay_ms(
 pub struct ApiChargebackSink {
     pricing: PricingConfig,
     config: Arc<ApiChargebackSinkConfig>,
+    /// Compiled charge-event projection resolved at construction. `None` keeps
+    /// the exported JSONEachRow representation byte-for-byte native with no
+    /// added allocation.
+    projection: Option<Arc<ChargeEventProjection>>,
     node_id: Arc<str>,
     /// Stable plugin-config resource id used for accepted-generation
     /// observability. Production cache supplies `PluginConfig.id`; standalone
@@ -2364,6 +2604,9 @@ struct ClickHouseFlushConfig {
     /// queued `ChargeEvent`s already hold a per-instance lease; the serialized
     /// body is a second attacker-shaped copy that coexists with them.
     ceiling: &'static RetainedByteCeiling,
+    /// Compiled charge-event projection for the emitted representation.
+    /// `None` keeps the native JSONEachRow rows byte-for-byte.
+    projection: Option<Arc<ChargeEventProjection>>,
 }
 
 #[derive(Clone)]
@@ -2421,13 +2664,17 @@ impl ApiChargebackSink {
         if !raw_config.is_object() {
             return Err(format!("{PLUGIN_NAME}: config must be an object"));
         }
-        if raw_config.get("schema").is_some() || raw_config.get("schema_ref").is_some() {
-            return Err(format!(
-                "{PLUGIN_NAME}: 'schema' / 'schema_ref' is not supported \
-                 (transaction-log schema customization applies only to log-shipping plugins; \
-                 see docs/plugins.md)"
-            ));
-        }
+        // Compile / resolve once here — never on a flush path. `schema_ref`
+        // keeps the global-first lifecycle and fails closed when the named
+        // definition is missing or is not representable for charge events.
+        let projection = match resolve_schema(
+            raw_config,
+            PLUGIN_NAME,
+            SchemaCapabilities::API_CHARGEBACK_SINK,
+        )? {
+            Some(schema) => Some(Arc::new(ChargeEventProjection::new(schema)?)),
+            None => None,
+        };
 
         let plugin_config_id = match plugin_config_id {
             Some(id) if id.trim().is_empty() => {
@@ -2470,6 +2717,7 @@ impl ApiChargebackSink {
         Ok(Self {
             pricing,
             config: Arc::new(config),
+            projection,
             node_id: Arc::<str>::from(resolve_node_id()),
             plugin_config_id,
             ferrum_namespace,
@@ -2528,6 +2776,7 @@ impl ApiChargebackSink {
                     claim_lease_secs: spool_claim_lease_secs(&self.config),
                     fs_ops: SpoolFsOps::REAL,
                     ceiling: process_ceiling(),
+                    projection: self.projection.clone(),
                 },
             )?))
         } else {
@@ -2543,6 +2792,7 @@ impl ApiChargebackSink {
             timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
             metrics: Arc::clone(&metrics),
             ceiling: process_ceiling(),
+            projection: self.projection.clone(),
         };
 
         let snapshot_events_are_pre_spooled = self.config.mode == SinkMode::Snapshot;
@@ -2685,6 +2935,7 @@ impl ApiChargebackSink {
                     timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
                     metrics: Arc::clone(&runtime.metrics),
                     ceiling: process_ceiling(),
+                    projection: self.projection.clone(),
                 },
                 self.config.batch.size,
                 self.config.spool.replay_interval_secs,
@@ -4104,14 +4355,22 @@ const CHARGE_ROW_JSON_OVERHEAD_BYTES: usize = 1_024;
 /// Conservative upper bound on the JSONEachRow request body for `batch`.
 ///
 /// Charge-event strings are raw, so JSON escaping can expand each byte six-fold.
-fn charge_body_byte_bound(batch: &[ChargeEvent]) -> Option<usize> {
+fn charge_body_byte_bound(
+    batch: &[ChargeEvent],
+    projection: Option<&ChargeEventProjection>,
+) -> Option<usize> {
+    // A projection can only ADD bytes per row (renamed keys, injected static /
+    // derived members). The per-row surcharge is precomputed at construction so
+    // the reservation still precedes serialization.
+    let projection_row_bytes = projection.map_or(0, |p| p.row_overhead_bytes);
     let mut total = CHARGE_ROW_JSON_OVERHEAD_BYTES;
     for event in batch {
         total = total
             .checked_add(
                 charge_event_retained_bytes(event).checked_mul(JSON_STRING_WORST_CASE_EXPANSION)?,
             )?
-            .checked_add(CHARGE_ROW_JSON_OVERHEAD_BYTES)?;
+            .checked_add(CHARGE_ROW_JSON_OVERHEAD_BYTES)?
+            .checked_add(projection_row_bytes)?;
     }
     Some(total)
 }
@@ -4126,7 +4385,7 @@ fn materialize_charge_body(
     cfg: &ClickHouseFlushConfig,
     batch: &[ChargeEvent],
 ) -> Result<ReservedPayload, String> {
-    materialize_json_each_row(cfg.ceiling, batch)
+    materialize_json_each_row(cfg.ceiling, batch, cfg.projection.as_deref())
 }
 
 /// Reject a batch whose charges cannot be represented in JSON before any
@@ -4152,15 +4411,35 @@ fn validate_charge_batch(batch: &[ChargeEvent]) -> Result<(), String> {
 
 /// Write `batch` as JSONEachRow into `writer` without ever building an
 /// intermediate owned row `String`.
-fn write_json_each_row<W: Write>(writer: &mut W, batch: &[ChargeEvent]) -> Result<(), String> {
+/// This is the single funnel every externally emitted charge-event
+/// representation goes through — the HTTP INSERT body and the durable spool
+/// artifact alike — so the projection is applied here exactly once. The spool
+/// artifact is a durable copy of the delivery body and is replayed verbatim, so
+/// a file written before a schema change replays under the schema in force when
+/// it was written. Internal identities (`SnapshotEntry` keys, spool ownership,
+/// accumulator keys) never pass through here and are untouched by projection.
+fn write_json_each_row<W: Write>(
+    writer: &mut W,
+    batch: &[ChargeEvent],
+    projection: Option<&ChargeEventProjection>,
+) -> Result<(), String> {
     for (index, event) in batch.iter().enumerate() {
         if index > 0 {
             writer
                 .write_all(b"\n")
                 .map_err(|error| format!("failed to write row separator: {error}"))?;
         }
-        serde_json::to_writer(&mut *writer, event)
-            .map_err(|error| format!("failed to serialize charge event: {error}"))?;
+        let result = match projection {
+            None => serde_json::to_writer(&mut *writer, event),
+            Some(projection) => serde_json::to_writer(
+                &mut *writer,
+                &SchemaView {
+                    summary: event,
+                    schema: &projection.schema,
+                },
+            ),
+        };
+        result.map_err(|error| format!("failed to serialize charge event: {error}"))?;
     }
     Ok(())
 }
@@ -4175,16 +4454,19 @@ fn write_json_each_row<W: Write>(writer: &mut W, batch: &[ChargeEvent]) -> Resul
 fn materialize_json_each_row(
     ceiling: &'static RetainedByteCeiling,
     batch: &[ChargeEvent],
+    projection: Option<&ChargeEventProjection>,
 ) -> Result<ReservedPayload, String> {
     validate_charge_batch(batch)?;
-    let bound = charge_body_byte_bound(batch).ok_or_else(|| {
+    let bound = charge_body_byte_bound(batch, projection).ok_or_else(|| {
         format!(
             "{PLUGIN_NAME}: {}",
             PayloadMaterializationError::BoundOverflowed.reason()
         )
     })?;
-    materialize_reserved_payload(ceiling, bound, |writer| write_json_each_row(writer, batch))
-        .map_err(|error| format!("{PLUGIN_NAME}: {}", error.reason()))
+    materialize_reserved_payload(ceiling, bound, |writer| {
+        write_json_each_row(writer, batch, projection)
+    })
+    .map_err(|error| format!("{PLUGIN_NAME}: {}", error.reason()))
 }
 
 async fn send_batch(cfg: &ClickHouseFlushConfig, batch: Vec<ChargeEvent>) -> Result<(), String> {
@@ -4438,9 +4720,23 @@ fn replay_split_len(len: usize, batch_size: usize) -> usize {
 /// to build expected wire bytes.
 #[allow(dead_code)]
 pub fn serialize_json_each_row(batch: &[ChargeEvent]) -> Result<String, String> {
+    serialize_json_each_row_projected(batch, None)
+}
+
+/// [`serialize_json_each_row`] under an optional compiled projection.
+///
+/// External unit tests use this to assert that a projected wire representation
+/// matches the operator's schema while the native shape is unchanged.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn serialize_json_each_row_projected(
+    batch: &[ChargeEvent],
+    projection: Option<&ChargeEventProjection>,
+) -> Result<String, String> {
     validate_charge_batch(batch)?;
     let mut output: Vec<u8> = Vec::new();
-    write_json_each_row(&mut output, batch).map_err(|error| format!("{PLUGIN_NAME}: {error}"))?;
+    write_json_each_row(&mut output, batch, projection)
+        .map_err(|error| format!("{PLUGIN_NAME}: {error}"))?;
     String::from_utf8(output)
         .map_err(|error| format!("{PLUGIN_NAME}: failed to serialize charge event: {error}"))
 }
@@ -5642,6 +5938,8 @@ pub struct SpoolManager {
     /// serialized (and optionally compressed) artifact exists, so both are
     /// attacker-shaped copies that must be reserved before they are built.
     ceiling: &'static RetainedByteCeiling,
+    /// Charge-event projection applied to the durable artifact.
+    projection: Option<Arc<ChargeEventProjection>>,
 }
 
 struct SpoolManagerOptions {
@@ -5650,6 +5948,10 @@ struct SpoolManagerOptions {
     claim_lease_secs: u64,
     fs_ops: SpoolFsOps,
     ceiling: &'static RetainedByteCeiling,
+    /// Projection applied to the durable spool artifact. The spool is a durable
+    /// copy of the delivery body and is replayed verbatim, so it must carry the
+    /// same representation the live INSERT path emits.
+    projection: Option<Arc<ChargeEventProjection>>,
 }
 
 impl SpoolManager {
@@ -5675,6 +5977,7 @@ impl SpoolManager {
             claim_lease_secs: options.claim_lease_secs,
             fs_ops: options.fs_ops,
             ceiling: options.ceiling,
+            projection: options.projection,
         })
     }
 
@@ -5781,6 +6084,7 @@ impl SpoolManager {
                 claim_lease_secs,
                 fs_ops: SpoolFsOps::REAL,
                 ceiling,
+                projection: None,
             },
         )?;
         // Test callers model a committed/live sink and retain the historical
@@ -5997,7 +6301,7 @@ impl SpoolManager {
         // model real compression/write/fsync latency without changing the
         // request-path enqueue contract. Snapshot the hook once so AfterWrite
         // cannot observe a different (later-installed) hook than BeforeWrite.
-        let _after_hook = SpoolWriteHookAfterGuard::enter();
+        let _after_hook = SpoolWriteHookAfterGuard::enter(&self.namespace_root);
         self.prepare_live_storage_locked()?;
         let bytes = self.materialize_spool_artifact(events)?;
         let incoming_len = bytes.len() as u64;
@@ -6071,7 +6375,7 @@ impl SpoolManager {
         &self,
         events: &[ChargeEvent],
     ) -> Result<ReservedPayload, String> {
-        let json = materialize_json_each_row(self.ceiling, events)?;
+        let json = materialize_json_each_row(self.ceiling, events, self.projection.as_deref())?;
         let decoded_len = json.len() as u64;
         if decoded_len > SPOOL_MAX_ARTIFACT_BYTES {
             return Err(format!(
@@ -6443,7 +6747,10 @@ impl SpoolManager {
             // "already fits" return so the common admission path is untouched,
             // and on a pass that has already paid for a full directory walk.
             if let Some(hook) = snapshot_spool_write_hook_for_tests() {
-                hook(SpoolWriteHookPoint::QuotaInventoryTaken);
+                hook(
+                    SpoolWriteHookPoint::QuotaInventoryTaken,
+                    &self.namespace_root,
+                );
             }
 
             let wall_clock = SystemTime::now();
@@ -7679,7 +7986,14 @@ pub enum SpoolWriteHookPoint {
     QuotaInventoryTaken,
 }
 
-type SpoolWriteHookForTests = Arc<dyn Fn(SpoolWriteHookPoint) + Send + Sync + 'static>;
+/// The hook carries the namespace root of the [`SpoolManager`] that reached the
+/// point, so a hook installed by one test is inert for every other manager.
+///
+/// The slot is process-global and the test binary runs tests in parallel, so
+/// without that discriminator an unrelated test's eviction or write fires the
+/// installed closure — which is an extra, unaccounted invocation for the test
+/// that owns it, not a bug in the code under test.
+type SpoolWriteHookForTests = Arc<dyn Fn(SpoolWriteHookPoint, &Path) + Send + Sync + 'static>;
 
 fn spool_write_hook_slot() -> &'static Mutex<Option<SpoolWriteHookForTests>> {
     static HOOK: OnceLock<Mutex<Option<SpoolWriteHookForTests>>> = OnceLock::new();
@@ -7688,8 +8002,9 @@ fn spool_write_hook_slot() -> &'static Mutex<Option<SpoolWriteHookForTests>> {
 
 /// Install or clear a process-global hook around spool filesystem writes.
 ///
-/// Tests must clear the hook before finishing (including panic paths) and
-/// serialize against other chargeback-sink tests that publish ACTIVE_SINKS.
+/// Tests must clear the hook before finishing (including panic paths), serialize
+/// against other chargeback-sink tests that publish ACTIVE_SINKS, and ignore
+/// every point whose namespace root is not their own spool.
 #[doc(hidden)]
 #[allow(dead_code)]
 pub fn set_spool_write_hook_for_tests(hook: Option<SpoolWriteHookForTests>) {
@@ -7714,22 +8029,26 @@ fn snapshot_spool_write_hook_for_tests() -> Option<SpoolWriteHookForTests> {
 /// generation has not finished.
 struct SpoolWriteHookAfterGuard {
     hook: Option<SpoolWriteHookForTests>,
+    namespace_root: PathBuf,
 }
 
 impl SpoolWriteHookAfterGuard {
-    fn enter() -> Self {
+    fn enter(namespace_root: &Path) -> Self {
         let hook = snapshot_spool_write_hook_for_tests();
         if let Some(ref hook) = hook {
-            hook(SpoolWriteHookPoint::BeforeWrite);
+            hook(SpoolWriteHookPoint::BeforeWrite, namespace_root);
         }
-        Self { hook }
+        Self {
+            hook,
+            namespace_root: namespace_root.to_path_buf(),
+        }
     }
 }
 
 impl Drop for SpoolWriteHookAfterGuard {
     fn drop(&mut self) {
         if let Some(hook) = self.hook.take() {
-            hook(SpoolWriteHookPoint::AfterWrite);
+            hook(SpoolWriteHookPoint::AfterWrite, &self.namespace_root);
         }
     }
 }
@@ -8283,6 +8602,7 @@ pub async fn replay_spool_once_with_ceiling_for_tests(
         timeout: Duration::from_secs(5),
         metrics: Arc::clone(&spool.metrics),
         ceiling,
+        projection: spool.projection.clone(),
     };
     replay_spool_once(spool, &flush_config, batch_size.max(1)).await
 }
@@ -8297,6 +8617,19 @@ pub fn probe_charge_body_materialization_for_tests(
     ceiling: &'static RetainedByteCeiling,
     batch: &[ChargeEvent],
 ) -> Result<(usize, usize, usize), String> {
+    probe_charge_body_materialization_with_projection_for_tests(ceiling, batch, None)
+}
+
+/// [`probe_charge_body_materialization_for_tests`] under a compiled projection,
+/// so a schema's reservation bound can be asserted to still precede — and cover
+/// — the projected serialization.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn probe_charge_body_materialization_with_projection_for_tests(
+    ceiling: &'static RetainedByteCeiling,
+    batch: &[ChargeEvent],
+    projection: Option<Arc<ChargeEventProjection>>,
+) -> Result<(usize, usize, usize), String> {
     let metrics = Arc::new(SinkMetrics::default());
     let cfg = ClickHouseFlushConfig {
         http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
@@ -8307,9 +8640,10 @@ pub fn probe_charge_body_materialization_for_tests(
         timeout: Duration::from_secs(1),
         metrics,
         ceiling,
+        projection: projection.clone(),
     };
-    let bound =
-        charge_body_byte_bound(batch).ok_or_else(|| format!("{PLUGIN_NAME}: bound overflowed"))?;
+    let bound = charge_body_byte_bound(batch, projection.as_deref())
+        .ok_or_else(|| format!("{PLUGIN_NAME}: bound overflowed"))?;
     let body = materialize_charge_body(&cfg, batch)?;
     let held = ceiling.used();
     drop(body);
@@ -8365,6 +8699,7 @@ pub fn classify_clickhouse_acknowledgement_for_tests(
         timeout: Duration::from_secs(1),
         metrics,
         ceiling: process_ceiling(),
+        projection: None,
     };
     classify_clickhouse_delivery(
         &cfg,

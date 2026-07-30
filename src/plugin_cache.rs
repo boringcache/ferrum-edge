@@ -269,6 +269,31 @@ fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), Stri
 /// cannot preserve the configured enforcement contract.
 fn validate_plugin_security_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
     for protocol in ALL_PROXY_PROTOCOLS {
+        let identity_soap_count = plugins
+            .iter()
+            .filter(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && plugin.name() == "soap_ws_security"
+                    && plugin.is_auth_plugin()
+            })
+            .count();
+        if identity_soap_count > 0 {
+            let auth_plugins: Vec<&str> = plugins
+                .iter()
+                .filter(|plugin| {
+                    plugin.supported_protocols().contains(&protocol) && plugin.is_auth_plugin()
+                })
+                .map(|plugin| plugin.name())
+                .collect();
+            if auth_plugins.len() != 1 {
+                return Err(format!(
+                    "identity-establishing soap_ws_security must be the sole authentication \
+                     mechanism for protocol {protocol:?} on its effective plugin chain; found: {}",
+                    auth_plugins.join(", ")
+                ));
+            }
+        }
+
         let has_hmac = plugins
             .iter()
             .filter(|plugin| plugin.supported_protocols().contains(&protocol))
@@ -609,6 +634,9 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn initial_response_header_policy_names(&self) -> &[String] {
         self.inner.initial_response_header_policy_names()
+    }
+    fn response_trailer_policy(&self) -> crate::plugins::ResponseTrailerPolicy<'_> {
+        self.inner.response_trailer_policy()
     }
     fn may_modify_response_content_type(
         &self,
@@ -1441,6 +1469,72 @@ fn body_validator_descriptor_preload_required_for_scope(
 ) -> bool {
     config.plugin_configs.iter().any(|plugin_config| {
         body_validator_descriptor_is_active(config, plugin_config)
+            && match &plugin_config.scope {
+                PluginScope::Global => rebuild_globals,
+                PluginScope::Proxy => plugin_config.proxy_id.as_ref().is_some_and(|proxy_id| {
+                    proxy_ids_to_rebuild.contains(&NamespacedResourceId::new(
+                        plugin_config.namespace.as_str(),
+                        proxy_id.as_str(),
+                    ))
+                }),
+                PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
+                    proxy.namespace == plugin_config.namespace
+                        && proxy_ids_to_rebuild.contains(&proxy_namespaced_id(proxy))
+                        && proxy
+                            .plugins
+                            .iter()
+                            .any(|association| association.plugin_config_id == plugin_config.id)
+                }),
+            }
+    })
+}
+
+fn ai_response_guard_descriptor_is_active(
+    config: &GatewayConfig,
+    plugin_config: &PluginConfig,
+) -> bool {
+    if !plugin_config.enabled
+        || plugin_config.plugin_name != "ai_response_guard"
+        || plugin_config
+            .config
+            .get("grpc")
+            .and_then(|grpc| grpc.get("descriptor_path"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .is_none()
+    {
+        return false;
+    }
+    match &plugin_config.scope {
+        PluginScope::Global => true,
+        PluginScope::Proxy => plugin_config.proxy_id.as_ref().is_some_and(|proxy_id| {
+            config.proxies.iter().any(|proxy| {
+                proxy.namespace == plugin_config.namespace
+                    && &proxy.id == proxy_id
+                    && proxy
+                        .plugins
+                        .iter()
+                        .any(|association| association.plugin_config_id == plugin_config.id)
+            })
+        }),
+        PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
+            proxy.namespace == plugin_config.namespace
+                && proxy
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == plugin_config.id)
+        }),
+    }
+}
+
+fn ai_response_guard_descriptor_preload_required_for_scope(
+    config: &GatewayConfig,
+    proxy_ids_to_rebuild: &HashSet<NamespacedResourceId>,
+    rebuild_globals: bool,
+) -> bool {
+    config.plugin_configs.iter().any(|plugin_config| {
+        ai_response_guard_descriptor_is_active(config, plugin_config)
             && match &plugin_config.scope {
                 PluginScope::Global => rebuild_globals,
                 PluginScope::Proxy => plugin_config.proxy_id.as_ref().is_some_and(|proxy_id| {
@@ -2736,6 +2830,7 @@ const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "correlation_id",
     "hmac_auth",
     "request_deduplication",
+    "soap_ws_security",
     "serverless_function",
     "request_transformer",
     "compression",
@@ -2765,6 +2860,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
 ) -> Result<(), String> {
     validate_api_chargeback_ownership(config)?;
     validate_replay_provenance_composition(config)?;
+    validate_soap_ws_security_composition(config)?;
     let mut errors = Vec::new();
     let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
     let mut scoped_plugins: SecurityCompositionPluginMap<'_> = HashMap::new();
@@ -2942,6 +3038,16 @@ impl PluginCapabilities {
     pub const HAS_DEFERRED_ROUTING_HEADER_HOOKS: u16 = 1 << 12;
     pub const FINAL_BODY_BEFORE_BACKEND_DISPATCH: u16 = 1 << 13;
     pub const NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY: u16 = 1 << 14;
+    /// At least one plugin declared `ResponseTrailerPolicy::Unbounded`, so
+    /// buffered and streaming paths that forward backend trailers must fail
+    /// closed and drop the whole trailer section rather than reconcile field by
+    /// field.
+    ///
+    /// Bit 15 is the LAST bit of the `u16` backing store. A sixteenth flag must
+    /// widen `PluginCapabilities` (to `u32`) rather than shift further; `1 << 16`
+    /// would be a const-eval overflow, so the failure is a compile error, not a
+    /// silently dropped capability.
+    pub const UNBOUNDED_RESPONSE_TRAILER_POLICY: u16 = 1 << 15;
 
     #[inline(always)]
     pub fn has(self, flag: u16) -> bool {
@@ -2970,6 +3076,28 @@ pub struct PluginPhaseData {
     pub initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Unique canonical field names touched by initial-response policy.
     pub initial_response_header_policy_names: Arc<Vec<String>>,
+    /// Unique canonical field names whose response-header policy also binds the
+    /// TRAILER section, unioned from `Plugin::response_trailer_policy()`.
+    /// Trailer-forwarding paths drop exactly these names, so an
+    /// auth/logging-only chain contributes nothing and keeps its trailers.
+    ///
+    /// Built-in coverage is the response-header owners, not a partial sample:
+    /// `security_headers`, `sse`, `compression`, `grpc_web`,
+    /// `correlation_id`, `otel_tracing`,
+    /// `workload_metrics`, `response_caching`, `ai_semantic_cache`,
+    /// `rate_limiting`, and `ai_rate_limiter` all declare bounded name sets;
+    /// `cors` (+ the cache-internal finalizer) declares the open-ended
+    /// `access-control-` prefix together with `vary`;
+    /// `ai_stream_router` declares its bounded representation-metadata names
+    /// plus the open-ended checksum prefixes; `response_transformer` declares
+    /// `Unbounded` because route-override transforms are published at request
+    /// time.
+    pub response_trailer_policy_names: Arc<Vec<String>>,
+    /// Case-insensitive ASCII prefixes whose response-header policy also binds
+    /// the TRAILER section, unioned from
+    /// `Plugin::response_trailer_policy()` `NamesAndPrefixes` declarations.
+    /// Empty for every chain that does not own an open-ended family.
+    pub response_trailer_policy_prefixes: Arc<Vec<String>>,
     /// Final committed-response observers only, in configured priority order.
     pub response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Capability bitset for fast boolean checks.
@@ -3004,6 +3132,8 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut request_headers_to_redact = Vec::new();
     let mut initial_response_header_policy_plugins = Vec::new();
     let mut initial_response_header_policy_names = Vec::new();
+    let mut response_trailer_policy_names: Vec<String> = Vec::new();
+    let mut response_trailer_policy_prefixes: Vec<String> = Vec::new();
     let mut response_committed = Vec::new();
     // Ordered because response header/body rules are not commutative: the same
     // instances in a different order produce a different client-visible
@@ -3048,6 +3178,40 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
                 if !initial_response_header_policy_names.contains(name) {
                     initial_response_header_policy_names.push(name.clone());
                 }
+            }
+        }
+        match p.response_trailer_policy() {
+            crate::plugins::ResponseTrailerPolicy::None => {}
+            crate::plugins::ResponseTrailerPolicy::Names(names) => {
+                for name in names {
+                    if !response_trailer_policy_names
+                        .iter()
+                        .any(|known: &String| known.eq_ignore_ascii_case(name))
+                    {
+                        response_trailer_policy_names.push(name.to_ascii_lowercase());
+                    }
+                }
+            }
+            crate::plugins::ResponseTrailerPolicy::NamesAndPrefixes { names, prefixes } => {
+                for name in names {
+                    if !response_trailer_policy_names
+                        .iter()
+                        .any(|known: &String| known.eq_ignore_ascii_case(name))
+                    {
+                        response_trailer_policy_names.push(name.to_ascii_lowercase());
+                    }
+                }
+                for prefix in prefixes {
+                    if !response_trailer_policy_prefixes
+                        .iter()
+                        .any(|known: &String| known.eq_ignore_ascii_case(prefix))
+                    {
+                        response_trailer_policy_prefixes.push(prefix.to_ascii_lowercase());
+                    }
+                }
+            }
+            crate::plugins::ResponseTrailerPolicy::Unbounded => {
+                caps |= PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY;
             }
         }
         for header in p.request_headers_to_redact() {
@@ -3105,6 +3269,8 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         request_headers_to_redact: Arc::new(request_headers_to_redact),
         initial_response_header_policy_plugins: Arc::new(initial_response_header_policy_plugins),
         initial_response_header_policy_names: Arc::new(initial_response_header_policy_names),
+        response_trailer_policy_names: Arc::new(response_trailer_policy_names),
+        response_trailer_policy_prefixes: Arc::new(response_trailer_policy_prefixes),
         response_committed_plugins: Arc::new(response_committed),
         capabilities: PluginCapabilities(caps),
         response_presentation_policy_digest: (!presentation_policy_unprovable)
@@ -3124,6 +3290,81 @@ fn filter_for_protocol(
             .cloned()
             .collect(),
     )
+}
+
+/// Config-side state of global `mesh_authz` rows for one generation.
+///
+/// `managed` is `true` only for the exact reserved row the mesh runtime injects
+/// (`id == MESH_AUTHZ_PLUGIN_ID`, `plugin_name == "mesh_authz"`, enabled,
+/// global scope) — an operator-authored global `mesh_authz` never satisfies it.
+/// `enabled_global` counts every enabled global `mesh_authz` row, managed or
+/// operator-authored, which is what makes the presence proof below exact.
+fn mesh_authz_global_config_state(config: &GatewayConfig) -> (bool, usize) {
+    let mut managed = false;
+    let mut enabled_global = 0usize;
+    for plugin in &config.plugin_configs {
+        if !plugin.enabled
+            || plugin.scope != PluginScope::Global
+            || plugin.plugin_name != "mesh_authz"
+        {
+            continue;
+        }
+        enabled_global += 1;
+        if plugin.id == crate::modes::mesh::MESH_AUTHZ_PLUGIN_ID {
+            managed = true;
+        }
+    }
+    (managed, enabled_global)
+}
+
+/// Decide NodeWaypoint destination-authz readiness from the three generation
+/// counts, with no per-connection work.
+///
+/// The built plugin list holds trait objects, so an instance cannot be traced
+/// back to the config row that produced it. Counting closes that gap exactly:
+/// the global chain is built from enabled global rows at **most one instance
+/// per row** (plus the CORS / mesh-route-dispatch finalizers, neither of which
+/// is a `mesh_authz`). Requiring exact equality plus a managed row means the
+/// managed instance itself constructed AND survived the TCP protocol filter.
+/// Any construction failure, protocol-filter drop, or unexpected extra runtime
+/// instance fails closed rather than weakening this proof.
+///
+/// `pub(crate)` so `_test_support` can pin the "managed row configured but its
+/// runtime policy never reached the prebuilt TCP chain" arm directly, without
+/// forging a plugin construction failure. A dedicated `_for_test` wrapper would
+/// be dead code in the binary target, which does not compile `lib.rs`.
+pub(crate) fn node_waypoint_destination_authz_ready_from_counts(
+    managed_config_present: bool,
+    enabled_global_mesh_authz_configs: usize,
+    built_global_tcp_mesh_authz_plugins: usize,
+) -> bool {
+    managed_config_present
+        && enabled_global_mesh_authz_configs > 0
+        && built_global_tcp_mesh_authz_plugins == enabled_global_mesh_authz_configs
+}
+
+/// Precompute the generation-level NodeWaypoint destination-authz readiness
+/// bit against the *actual* prebuilt global TCP protocol entry — the exact
+/// entry `plugins_for_protocol` resolves for the dynamically synthesized
+/// capture relay proxy, which is never in `config.proxies` and therefore always
+/// falls back to the global chain.
+///
+/// Runs once per plugin-cache generation (build or reload), so the captured
+/// connection path only ever reads a `bool`.
+fn compute_node_waypoint_destination_authz_ready(
+    config: &GatewayConfig,
+    global: &HashMap<ProxyProtocol, ProtocolEntry>,
+) -> bool {
+    let (managed, enabled_global) = mesh_authz_global_config_state(config);
+    let built = match global.get(&ProxyProtocol::Tcp) {
+        Some(entry) => entry
+            .plugins
+            .iter()
+            .filter(|p| p.name() == "mesh_authz")
+            .count(),
+        None => 0,
+    };
+    node_waypoint_destination_authz_ready_from_counts(managed, enabled_global, built)
 }
 
 // ---------------------------------------------------------------------------
@@ -3151,6 +3392,16 @@ struct ProtocolSnapshot {
     grpc_web_proxy: HashMap<String, ProtocolEntry>,
     /// Global fallback for the composed H3 gRPC-Web view.
     grpc_web_global: ProtocolEntry,
+    /// Generation-level readiness bit for NodeWaypoint transparent-capture
+    /// destination authorization: the mesh-managed `__mesh_authz` reserved
+    /// global row is enabled AND its runtime policy is provably present in
+    /// `global[Tcp]` — the chain the synthesized capture relay resolves.
+    ///
+    /// Precomputed here so `build_node_waypoint_capture_relay_entry` and the
+    /// captured-connection handler are O(1) bool reads with no config-vector or
+    /// plugin-vector scan (hot-path invariant). See
+    /// [`compute_node_waypoint_destination_authz_ready`].
+    node_waypoint_destination_authz_ready: bool,
 }
 
 const ALL_PROXY_PROTOCOLS: [ProxyProtocol; 5] = [
@@ -3194,6 +3445,7 @@ fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
 
 /// Build the full protocol snapshot from the plugin map + global fallback.
 fn build_protocol_snapshot(
+    config: &GatewayConfig,
     proxy_map: &ProxyPluginMap,
     globals: &[Arc<dyn Plugin>],
 ) -> ProtocolSnapshot {
@@ -3215,11 +3467,15 @@ fn build_protocol_snapshot(
 
     let grpc_web_global = build_grpc_web_protocol_entry(globals);
 
+    let node_waypoint_destination_authz_ready =
+        compute_node_waypoint_destination_authz_ready(config, &global);
+
     ProtocolSnapshot {
         proxy,
         global,
         grpc_web_proxy,
         grpc_web_global,
+        node_waypoint_destination_authz_ready,
     }
 }
 
@@ -3275,14 +3531,25 @@ fn start_background_tasks(
 /// generation has been installed. Must stay infallible and idempotent.
 fn commit_background_tasks(proxy_map: &ProxyPluginMap, globals: &[Arc<dyn Plugin>]) {
     let mut committed = HashSet::new();
+    let mut saw_api_chargeback = false;
     for plugin in globals
         .iter()
         .chain(proxy_map.values().flat_map(|plugins| plugins.iter()))
     {
         let pointer = Arc::as_ptr(plugin) as *const () as usize;
         if committed.insert(pointer) {
+            if plugin.name() == "api_chargeback" {
+                saw_api_chargeback = true;
+            }
             plugin.commit_background_tasks();
         }
+    }
+    // Instance commit publishes the `/charges` projection while at least one
+    // enabled api_chargeback exists. A generation with zero instances has no
+    // plugin callback, so publish absence explicitly after atomic installation
+    // (never during candidate construction/validation).
+    if !saw_api_chargeback {
+        crate::plugins::api_chargeback::publish_render_schema_absence();
     }
 }
 
@@ -3590,6 +3857,17 @@ impl PluginCacheInner {
     /// [`Self::grpc_web_request_view`], or a namespace-taking accessor such as
     /// [`Self::initial_response_header_policy_plugins`] instead of passing
     /// `proxy.id` here.
+    /// Whether this generation can enforce NodeWaypoint transparent-capture
+    /// destination authorization.
+    ///
+    /// O(1) read of a bit precomputed at cache construction/reload — the
+    /// captured-connection path must never re-derive this by scanning
+    /// `config.plugin_configs` or the built plugin chain.
+    #[inline]
+    pub(crate) fn node_waypoint_destination_authz_ready(&self) -> bool {
+        self.protocol_snapshot.node_waypoint_destination_authz_ready
+    }
+
     fn protocol_entry(&self, proxy_key: &str, protocol: ProxyProtocol) -> Option<&ProtocolEntry> {
         self.protocol_snapshot
             .proxy
@@ -3744,6 +4022,36 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    /// Response-header policy names that also bind the trailer section, for a
+    /// composed `proxy_key` + protocol.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
+    /// proxy ID — see [`Self::protocol_entry`].
+    pub(crate) fn get_response_trailer_policy_names(
+        &self,
+        proxy_key: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<String>> {
+        self.protocol_entry(proxy_key, protocol)
+            .map(|entry| Arc::clone(&entry.phase.response_trailer_policy_names))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
+    /// Case-insensitive ASCII prefixes whose response-header policy also binds
+    /// the trailer section for a composed `proxy_key` + protocol.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
+    /// proxy ID — see [`Self::protocol_entry`].
+    pub(crate) fn get_response_trailer_policy_prefixes(
+        &self,
+        proxy_key: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<String>> {
+        self.protocol_entry(proxy_key, protocol)
+            .map(|entry| Arc::clone(&entry.phase.response_trailer_policy_prefixes))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
     /// Response-committed hook plugins for a composed `proxy_key` + protocol.
     ///
     /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
@@ -3875,6 +4183,10 @@ impl PluginCacheInner {
                     .get_initial_response_header_policy_plugins(proxy_key, protocol),
                 initial_response_header_policy_names: self
                     .get_initial_response_header_policy_names(proxy_key, protocol),
+                response_trailer_policy_names: self
+                    .get_response_trailer_policy_names(proxy_key, protocol),
+                response_trailer_policy_prefixes: self
+                    .get_response_trailer_policy_prefixes(proxy_key, protocol),
                 response_committed_plugins: self
                     .get_response_committed_plugins(proxy_key, protocol),
                 response_presentation_policy_digest: self
@@ -3919,6 +4231,12 @@ impl PluginCacheInner {
                 initial_response_header_policy_names: Arc::clone(
                     &entry.phase.initial_response_header_policy_names,
                 ),
+                response_trailer_policy_names: Arc::clone(
+                    &entry.phase.response_trailer_policy_names,
+                ),
+                response_trailer_policy_prefixes: Arc::clone(
+                    &entry.phase.response_trailer_policy_prefixes,
+                ),
                 response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
                 response_presentation_policy_digest: entry
                     .phase
@@ -3948,6 +4266,8 @@ pub struct PluginCacheRequestView {
     request_headers_to_redact: Arc<Vec<String>>,
     initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     initial_response_header_policy_names: Arc<Vec<String>>,
+    response_trailer_policy_names: Arc<Vec<String>>,
+    response_trailer_policy_prefixes: Arc<Vec<String>>,
     response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     response_presentation_policy_digest: Option<[u8; 32]>,
     capabilities: PluginCapabilities,
@@ -4003,6 +4323,33 @@ impl PluginCacheRequestView {
     /// Get canonical field names touched by initial-response policy.
     pub fn initial_response_header_policy_names(&self) -> Arc<Vec<String>> {
         Arc::clone(&self.initial_response_header_policy_names)
+    }
+
+    /// Canonical field names whose response-header policy also binds the
+    /// trailer section. Empty for chains that only observe, authenticate, or
+    /// authorize, so those chains forward backend trailers untouched.
+    pub fn response_trailer_policy_names(&self) -> &[String] {
+        self.response_trailer_policy_names.as_slice()
+    }
+
+    /// Shared handle to the same list, for relays whose trailer boundary is
+    /// enforced by a response BODY that outlives the request handler (the
+    /// streaming HTTP/2 arm). One `Arc` bump, no per-request allocation.
+    pub fn response_trailer_policy_names_shared(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.response_trailer_policy_names)
+    }
+
+    /// Case-insensitive ASCII prefixes whose response-header policy also binds
+    /// the trailer section. Empty unless a plugin declared
+    /// `ResponseTrailerPolicy::NamesAndPrefixes`.
+    pub fn response_trailer_policy_prefixes(&self) -> &[String] {
+        self.response_trailer_policy_prefixes.as_slice()
+    }
+
+    /// Shared handle to the same prefix list, for the streaming HTTP/2 body
+    /// governor. One `Arc` bump, no per-request allocation.
+    pub fn response_trailer_policy_prefixes_shared(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.response_trailer_policy_prefixes)
     }
 
     /// Get the pre-filtered committed-response observer chain.
@@ -4113,6 +4460,15 @@ fn validate_replay_provenance_composition(config: &GatewayConfig) -> Result<(), 
         .map_err(|errors| errors.join("; "))
 }
 
+/// `soap_ws_security` establishes SOAP identity in the `authenticate` phase, so
+/// multi-auth composition would skip or override it and request decompression
+/// would run after the message was already validated. Reject both before
+/// constructing a generation whose ordering guarantees cannot hold.
+fn validate_soap_ws_security_composition(config: &GatewayConfig) -> Result<(), String> {
+    crate::plugins::soap_ws_security::validate_composition(config)
+        .map_err(|errors| errors.join("; "))
+}
+
 /// `__mesh_bpf_metrics` is a single scrape exporter per process. Require at
 /// most one enabled global instance so reload never registers duplicate
 /// collectors / double-emits series on authenticated `/metrics`.
@@ -4204,6 +4560,7 @@ impl PluginCache {
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
         validate_replay_provenance_composition(config)?;
+        validate_soap_ws_security_composition(config)?;
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let (
             proxy_map,
@@ -4225,7 +4582,7 @@ impl PluginCache {
             current_adaptive_states,
             current_tcp_throttle_states,
         )?;
-        let snapshot = build_protocol_snapshot(&proxy_map, &globals);
+        let snapshot = build_protocol_snapshot(config, &proxy_map, &globals);
         let (proxy_lifecycle_generations, proxy_lifecycle_generation_high_water) =
             build_proxy_lifecycle_generations(
                 previous_lifecycle_generations,
@@ -4562,6 +4919,27 @@ impl PluginCache {
         )
     }
 
+    /// Whether the exact delta-build scope, including adaptive-concurrency
+    /// route-definition expansion, reconstructs an active `ai_response_guard`
+    /// with a node-local `grpc.descriptor_path` dependency.
+    pub(crate) fn ai_response_guard_descriptor_preload_required(
+        &self,
+        config: &GatewayConfig,
+        proxy_ids_to_rebuild: &HashSet<NamespacedResourceId>,
+        rebuild_globals: bool,
+    ) -> bool {
+        let (expanded_proxy_ids, rebuild_globals) = self.expanded_file_dependency_rebuild_scope(
+            config,
+            proxy_ids_to_rebuild,
+            rebuild_globals,
+        );
+        ai_response_guard_descriptor_preload_required_for_scope(
+            config,
+            &expanded_proxy_ids,
+            rebuild_globals,
+        )
+    }
+
     /// Incrementally update the plugin cache, only rebuilding plugins for
     /// proxies identified in `proxy_ids_to_rebuild`. All other proxy plugin
     /// lists — including their stateful plugin instances (rate limiters, etc.)
@@ -4589,6 +4967,7 @@ impl PluginCache {
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
         validate_replay_provenance_composition(config)?;
+        validate_soap_ws_security_composition(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         let restrict_country_mmdb_refresh_to_rebuild_scope =
             matches!(country_mmdb_load_mode, CountryMmdbLoadMode::PreloadedOnly);
@@ -4631,6 +5010,7 @@ impl PluginCache {
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
         validate_replay_provenance_composition(config)?;
+        validate_soap_ws_security_composition(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         if paths.is_empty() {
             return Ok(None);
@@ -5394,6 +5774,13 @@ impl PluginCache {
                 &lifecycle_advances,
             )?;
 
+        // Recomputed against the incoming config and the NEW global TCP entry
+        // on every delta, including the `global_plugins_changed == false` reuse
+        // path: a plugin-config row can be enabled or disabled without the
+        // built global chain being rebuilt, and this bit derives from both.
+        let node_waypoint_destination_authz_ready =
+            compute_node_waypoint_destination_authz_ready(config, &new_global_proto);
+
         Ok(Arc::new(PluginCacheInner::new(
             new_map,
             new_globals,
@@ -5402,6 +5789,7 @@ impl PluginCache {
             new_req_buffering,
             new_global_requires_request_buffering,
             ProtocolSnapshot {
+                node_waypoint_destination_authz_ready,
                 proxy: new_proxy_proto,
                 global: new_global_proto,
                 grpc_web_proxy: new_grpc_web_proxy,

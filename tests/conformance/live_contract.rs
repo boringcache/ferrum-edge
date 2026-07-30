@@ -649,3 +649,230 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
         "ga_capabilities must return GA rows"
     );
 }
+
+#[test]
+fn live_contract_real_contract_declares_the_multicluster_suite_rows() {
+    // Pin the real ga_contract.yaml against this validator for the
+    // multicluster-federation suite (issue #2459): SPIRE trust federation,
+    // bidirectional authenticated east-west traffic, untrusted-peer rejection,
+    // trust revocation/recovery, and destination blackhole/recovery are all
+    // ENFORCED and emitted by tests/k8s/multicluster-federation/run.sh.
+    let contract = load_contract().expect("real contract loads");
+    let multicluster_rows: Vec<_> = contract
+        .ga_capabilities()
+        .into_iter()
+        .filter(|capability| capability.live_suite == "multicluster-federation")
+        .collect();
+    assert!(
+        !multicluster_rows.is_empty(),
+        "the multicluster-federation suite must have GA contract rows"
+    );
+    let enforced_ids: Vec<&str> = multicluster_rows
+        .iter()
+        .filter(|capability| capability.live_deferred.is_none())
+        .flat_map(|capability| capability.live_assertions.iter().map(String::as_str))
+        .collect();
+    for required in [
+        "multicluster.spire.federation_ready_a",
+        "multicluster.spire.federation_ready_b",
+        "multicluster.federation.trust_bundle_exchange",
+        "multicluster.spire.workload_entries",
+        "multicluster.eastwest.gateway_reachable",
+        "multicluster.eastwest.a_to_b_authenticated",
+        "multicluster.eastwest.b_to_a_authenticated",
+        "multicluster.eastwest.bidirectional_authenticated_traffic",
+        "multicluster.eastwest.untrusted_peer_rejected",
+        "multicluster.federation.bundle_revoked_rejected",
+        "multicluster.federation.trust_restored_recovers",
+        "multicluster.eastwest.endpoint_blackhole_when_dest_down",
+        "multicluster.eastwest.endpoint_recovers_when_dest_returns",
+    ] {
+        assert!(
+            enforced_ids.contains(&required),
+            "`{required}` must be an enforced GA live assertion"
+        );
+    }
+    let deferred: Vec<&str> = multicluster_rows
+        .iter()
+        .filter(|capability| capability.live_deferred.is_some())
+        .map(|capability| capability.id.as_str())
+        .collect();
+    assert!(
+        deferred.is_empty(),
+        "no multicluster row should remain live-deferred (found: {deferred:?})"
+    );
+    for capability in multicluster_rows
+        .iter()
+        .filter(|capability| capability.live_deferred.is_none())
+    {
+        assert_eq!(
+            capability.platform_profile, "kind-spire-multicluster-federation",
+            "enforced multicluster rows must pin the fixture's platform profile"
+        );
+    }
+}
+
+/// The `multicluster-federation` live suite has two fail-closed required-
+/// assertion gates. The first is the fixture's own
+/// `ferrum_live_assertions_require_all_passed` call over the run.sh-local
+/// `REQUIRED_LIVE_ASSERTIONS` array, which proves what the fixture process
+/// observed. The second is the `gate` job of
+/// `.github/workflows/multicluster-federation-live.yml`, which downloads the
+/// published artifact and validates the emitted `live-assertions.json` against
+/// the same id set (see
+/// `live_contract_multicluster_release_gate_requires_exactly_the_enforced_rows`).
+///
+/// Either only gates the GA contract if its id set and the contract stay the
+/// same set, so this hosted test is the binding for the fixture half: drop an
+/// id from the array (weakening the live gate) or add an enforced contract row
+/// the fixture never requires, and this test fails in the ordinary `Tests`
+/// aggregate.
+#[test]
+fn live_contract_multicluster_fixture_requires_exactly_the_enforced_rows() {
+    const RUN_SH: &str = include_str!("../k8s/multicluster-federation/run.sh");
+
+    let mut lines = RUN_SH.lines();
+    assert!(
+        lines.any(|line| line.trim_end() == "REQUIRED_LIVE_ASSERTIONS=("),
+        "tests/k8s/multicluster-federation/run.sh must declare REQUIRED_LIVE_ASSERTIONS=( \
+         on its own line — the fixture's fail-closed gate is what this test binds \
+         to the GA contract"
+    );
+    let mut fixture_required: BTreeSet<&str> = BTreeSet::new();
+    let mut closed = false;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == ")" {
+            closed = true;
+            break;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        assert!(
+            fixture_required.insert(trimmed),
+            "run.sh REQUIRED_LIVE_ASSERTIONS lists `{trimmed}` more than once"
+        );
+    }
+    assert!(
+        closed,
+        "run.sh REQUIRED_LIVE_ASSERTIONS array is unterminated — refusing to \
+         validate a partially parsed required set"
+    );
+
+    let contract = load_contract().expect("real contract loads");
+    let contract_required: BTreeSet<&str> = contract
+        .ga_capabilities()
+        .into_iter()
+        .filter(|capability| {
+            capability.live_suite == "multicluster-federation" && capability.live_deferred.is_none()
+        })
+        .flat_map(|capability| capability.live_assertions.iter().map(String::as_str))
+        .collect();
+    assert!(
+        !contract_required.is_empty(),
+        "the multicluster-federation suite must have enforced GA contract rows"
+    );
+
+    let missing_in_fixture: Vec<&&str> = contract_required.difference(&fixture_required).collect();
+    assert!(
+        missing_in_fixture.is_empty(),
+        "GA-contract assertions the live fixture does not REQUIRE (they could be \
+         skipped or absent without failing the live job): {missing_in_fixture:?}"
+    );
+    let missing_in_contract: Vec<&&str> = fixture_required.difference(&contract_required).collect();
+    assert!(
+        missing_in_contract.is_empty(),
+        "live fixture requires assertions with no enforced GA-contract row \
+         (add the row, or drop the id from REQUIRED_LIVE_ASSERTIONS): \
+         {missing_in_contract:?}"
+    );
+}
+
+/// The second fail-closed gate: the `gate` job of
+/// `.github/workflows/multicluster-federation-live.yml` downloads the artifact
+/// the live run PUBLISHED and validates it with
+/// `.github/scripts/validate_live_assertions.py`. The fixture-side check cannot
+/// prove the published artifact belongs to this commit, this platform profile,
+/// or this run at all; the workflow gate can, and does.
+///
+/// The workflow spells its required ids explicitly, which is only a contract if
+/// the spelling and `ga_contract.yaml` stay the same set. This test is that
+/// binding, in both directions, so neither dropping an id from the workflow nor
+/// adding an enforced contract row the workflow never checks can pass hosted
+/// CI. It also pins the exactness flags, so the gate cannot be relaxed into a
+/// shape that accepts a stale or foreign artifact.
+#[test]
+fn live_contract_multicluster_release_gate_requires_exactly_the_enforced_rows() {
+    const WORKFLOW: &str = include_str!("../../.github/workflows/multicluster-federation-live.yml");
+
+    let gate_start = WORKFLOW
+        .find("\n  gate:\n")
+        .expect("multicluster-federation-live.yml must declare a `gate` job");
+    let gate_body = &WORKFLOW[gate_start..];
+
+    for pinned in [
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        "name: multicluster-federation-results",
+        "python3 .github/scripts/validate_live_assertions.py --self-test",
+        "--artifact multicluster-federation-artifact/live-assertions.json",
+        "--schema-version 1",
+        "--suite multicluster-federation",
+        "--platform-profile kind-spire-multicluster-federation",
+        "--commit \"$EXPECTED_COMMIT\"",
+        "EXPECTED_COMMIT: ${{ github.sha }}",
+        "--max-age-seconds 21600",
+        "--required-namespace multicluster.",
+        "if: steps.summarize.outputs.validate == 'true'",
+    ] {
+        assert!(
+            gate_body.contains(pinned),
+            "the multicluster live release gate must keep `{pinned}` — without it the \
+             emitted artifact is no longer bound to this commit, this profile, this \
+             freshness window, or this contract"
+        );
+    }
+    assert!(
+        !gate_body.contains("cargo "),
+        "the aggregate gate must carry no build or toolchain surface"
+    );
+
+    let workflow_required: BTreeSet<&str> = gate_body
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("--require "))
+        .map(|rest| rest.trim().trim_end_matches('\\').trim())
+        .collect();
+    assert!(
+        !workflow_required.is_empty(),
+        "the multicluster live release gate must pass an explicit --require id set"
+    );
+
+    let contract = load_contract().expect("real contract loads");
+    let contract_required: BTreeSet<&str> = contract
+        .ga_capabilities()
+        .into_iter()
+        .filter(|capability| {
+            capability.live_suite == "multicluster-federation" && capability.live_deferred.is_none()
+        })
+        .flat_map(|capability| capability.live_assertions.iter().map(String::as_str))
+        .collect();
+    assert!(
+        !contract_required.is_empty(),
+        "the multicluster-federation suite must have enforced GA contract rows"
+    );
+
+    let missing_in_workflow: Vec<&&str> =
+        contract_required.difference(&workflow_required).collect();
+    assert!(
+        missing_in_workflow.is_empty(),
+        "GA-contract assertions the release gate does not validate in the emitted \
+         artifact: {missing_in_workflow:?}"
+    );
+    let missing_in_contract: Vec<&&str> =
+        workflow_required.difference(&contract_required).collect();
+    assert!(
+        missing_in_contract.is_empty(),
+        "release gate requires assertion ids with no enforced GA-contract row \
+         (add the row, or drop the --require): {missing_in_contract:?}"
+    );
+}

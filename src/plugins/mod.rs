@@ -265,7 +265,7 @@ pub fn apply_initial_response_header_policies(
 
 /// Representation metadata that becomes invalid whenever a buffered response
 /// transform replaces the client-visible bytes.
-const TRANSFORM_INVALIDATED_RESPONSE_HEADERS: &[&str] = &[
+pub(crate) const TRANSFORM_INVALIDATED_RESPONSE_HEADERS: &[&str] = &[
     "accept-ranges",
     "content-range",
     "content-md5",
@@ -282,7 +282,16 @@ const TRANSFORM_INVALIDATED_RESPONSE_HEADERS: &[&str] = &[
     "content-signature",
     "content-signature-input",
     "content-checksum",
+    "x-goog-hash",
+    "x-ms-content-crc64",
 ];
+
+/// Open-ended response-header families invalidated by a representation rewrite.
+///
+/// Kept beside [`TRANSFORM_INVALIDATED_RESPONSE_HEADERS`] so response
+/// transformers and trailer-policy declarations consume the same inventory.
+pub(crate) const TRANSFORM_INVALIDATED_RESPONSE_HEADER_PREFIXES: &[&str] =
+    &["x-amz-checksum-", "x-checksum-"];
 
 fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
     value
@@ -295,10 +304,9 @@ fn is_transform_invalidated_response_header(name: &str) -> bool {
     TRANSFORM_INVALIDATED_RESPONSE_HEADERS
         .iter()
         .any(|header| name.eq_ignore_ascii_case(header))
-        || starts_with_ascii_case_insensitive(name, "x-amz-checksum-")
-        || starts_with_ascii_case_insensitive(name, "x-checksum-")
-        || name.eq_ignore_ascii_case("x-goog-hash")
-        || name.eq_ignore_ascii_case("x-ms-content-crc64")
+        || TRANSFORM_INVALIDATED_RESPONSE_HEADER_PREFIXES
+            .iter()
+            .any(|prefix| starts_with_ascii_case_insensitive(name, prefix))
 }
 
 /// Whether buffered response bytes may be rewritten while preserving the
@@ -1147,6 +1155,54 @@ impl BufferedInitialResponseHeaderPolicyState {
     }
 }
 
+/// How far a plugin's response-header policy binds the response TRAILER
+/// section.
+///
+/// `after_proxy` and every buffered response-header phase see only the INITIAL
+/// header map. On protocol paths that forward backend trailers after those
+/// phases (buffered and streaming native HTTP/3), a backend trailer carrying a
+/// governed field name re-opens the policy those phases applied — the classic
+/// case is a `security_headers` removal that was a no-op on the initial map
+/// because the backend only ever sent the field as a trailer, so no
+/// observed-mutation diff can see it.
+///
+/// This is a config-time declaration: the plugin cache unions it once per
+/// reload so the request path reads a precomputed name list instead of scanning
+/// the chain.
+#[derive(Debug, Clone, Copy)]
+pub enum ResponseTrailerPolicy<'a> {
+    /// This plugin applies no response-header policy a backend trailer could
+    /// re-open. Correct for observers (logging), authentication, and
+    /// authorization plugins — and the default, because realized response-header
+    /// mutations are reconciled per request regardless of this declaration.
+    None,
+    /// Policy is limited to these canonical lowercase field names. Backend
+    /// trailers carrying one of them are dropped; every other trailer field is
+    /// forwarded unchanged.
+    Names(&'a [String]),
+    /// Exact names plus case-insensitive ASCII prefixes. Use when the sanitizer
+    /// owns an open-ended family together with discrete fields outside it —
+    /// CORS removes every `access-control-*` response header and also rewrites
+    /// `vary`. A trailer whose name equals any `names` entry or starts with any
+    /// `prefixes` entry is dropped; every other trailer field is forwarded.
+    NamesAndPrefixes {
+        names: &'a [String],
+        prefixes: &'a [String],
+    },
+    /// The governed field set is not enumerable at config time. The built-in
+    /// example is `response_transformer`, whose route-override rules are
+    /// published at request time. Trailer-forwarding paths fail closed and drop
+    /// the whole backend trailer section.
+    Unbounded,
+}
+
+/// Shared one-element declaration for the plugins whose `after_proxy` echoes
+/// the gateway-authored `traceparent` (`otel_tracing`, and `workload_metrics`
+/// when it is the mesh tracing plugin). Built once per process so both can hand
+/// out a bounded slice with no per-request allocation.
+pub(crate) static TRACEPARENT_RESPONSE_POLICY_NAMES: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| vec!["traceparent".to_string()]);
+
 /// How plugin construction or validation failures affect cache publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginFailurePolicy {
@@ -1761,6 +1817,40 @@ impl std::fmt::Debug for PeerConnectionSignal {
     }
 }
 
+/// The complete native-gRPC unary representation a validated
+/// `serverless_function` terminate invocation authored.
+///
+/// `frame` is the exact uncompressed unary DATA frame and `trailers` is the
+/// terminal metadata the plugin's fail-closed contract validation produced
+/// (`grpc-status`, optional `grpc-message` / `grpc-status-details-bin`, and the
+/// operator's custom trailers). Terminal trailers are taken from here rather
+/// than promoted out of the reject header map, so gateway-managed response
+/// headers a decorator added — CORS, header policy, internal bridge fields —
+/// stay in the initial HEADERS block and can never surface as client-visible
+/// custom trailers.
+///
+/// `http_status` is the HTTP status the plugin authored alongside the frame
+/// (always 200 for a native gRPC terminate). Authorization checks it as well as
+/// the frame bytes so a *later, unrelated* rejection on the same request cannot
+/// inherit the original successful trailers just because its body happens to
+/// match: a replacement rejection carries its own status, and a rejection that
+/// matched on bytes alone would otherwise present as the original success.
+///
+/// An EMPTY `frame` is the status-only contract shape — the function asked for
+/// a trailers-only reply and authored no message at all. That representation can
+/// never authorize DATA (`FramedGrpcUnaryProvenance::authorized_trailers`
+/// refuses an empty frame), but recording it is what lets the normalizer tell an
+/// unchanged status-only reply from one a response-body policy rewrote or
+/// re-statused: unchanged keeps the contract's own terminal metadata, changed
+/// fails closed instead of falling back to a possibly-successful `grpc-status`
+/// read out of the mutable reject header map.
+#[derive(Debug, Clone)]
+pub(crate) struct ServerlessGrpcTerminateFrame {
+    pub(crate) http_status: u16,
+    pub(crate) frame: bytes::Bytes,
+    pub(crate) trailers: HashMap<String, String>,
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -1882,6 +1972,13 @@ pub struct RequestContext {
     /// `&'static str` because every `AuthMechanism::mechanism_name()` returns a
     /// compiled-in literal — zero allocation on the hot path.
     pub auth_method: Option<&'static str>,
+    /// SHA-256 of the exact SOAP representation accepted by an
+    /// identity-establishing `soap_ws_security` policy. The final request-body
+    /// hook compares this private proof with the bytes dispatched to the
+    /// backend, so a later/custom plugin cannot forge it through public
+    /// metadata. Keeping a credential/body-derived digest here also prevents
+    /// transaction-log serialization.
+    soap_ws_security_authenticated_body_digest: Option<[u8; 32]>,
     pub timestamp_received: DateTime<Utc>,
     /// Whether the request's gRPC deadline state has been initialized from the
     /// inbound `grpc-timeout` value. Initialization happens once, immediately
@@ -2122,6 +2219,19 @@ pub struct RequestContext {
     /// of public metadata so a custom plugin cannot opt an unrelated rejection
     /// into that contract.
     pub(crate) serverless_terminate_response: bool,
+    /// The framed unary DATA payload and terminal trailers a validated
+    /// `serverless_function` terminate invocation authored for this request.
+    ///
+    /// This is the ONLY provenance that authorizes native-gRPC reject
+    /// normalization to emit DATA + terminal trailers instead of the
+    /// trailers-only error contract. Reject body shape and reject
+    /// `content-type`/`grpc-status` headers are reachable by any plugin, so they
+    /// are never treated as provenance. Authorization is byte-exact
+    /// (`FramedGrpcUnaryProvenance`), which keeps an `after_proxy` decorator
+    /// that rewrites the reject body — and any later unrelated rejection on the
+    /// same request — on the trailers-only path. Kept out of public metadata so
+    /// a custom plugin cannot mint it.
+    pub(crate) serverless_grpc_terminate_frame: Option<Arc<ServerlessGrpcTerminateFrame>>,
     /// Deduplication instance currently publishing an owned terminal response
     /// from the observe-only committed hook. This transient private marker lets
     /// the ordinary publication path retain in-flight protection when no replay
@@ -2218,6 +2328,26 @@ pub struct RequestContext {
     /// under the public name only when the final wire name exactly matches
     /// this trusted upstream alias.
     pub(crate) mcp_trusted_tool_name_rewrite: Option<(String, String)>,
+    /// When set, `mcp_gateway` must validate the buffered `tools/call` result
+    /// against this exact compiled `outputSchema` validator before any
+    /// caller-visible response or audit publication. The `Arc` is pinned from
+    /// the routed catalog entry at dispatch so public
+    /// `mcp.response_rewrite.*` metadata cannot substitute or clear
+    /// enforcement, and a later catalog refresh cannot change the in-flight
+    /// snapshot. Kept out of public metadata so forgeable keys cannot opt a
+    /// response into or out of enforcement.
+    pub(crate) mcp_validate_tool_result: Option<Arc<jsonschema::Validator>>,
+    /// Set while `mcp_gateway` dispatches a member of an aggregate JSON-RPC
+    /// batch. Routed handlers then validate policy without dialing upstream or
+    /// returning `Continue`, because executing a batch member from
+    /// `before_proxy` would bypass every later configured plugin phase.
+    ///
+    /// This is a network-dispatch boundary, so it is deliberately **not** in
+    /// `metadata`: that map is public plugin scratch space that inbound
+    /// request data and sibling plugins can write. Keeping it private means no
+    /// forged `mcp.*` key can either force or clear the guard, and it never
+    /// reaches transaction metadata.
+    pub(crate) mcp_batch_forbids_upstream: bool,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -2563,6 +2693,7 @@ impl RequestContext {
             authenticated_identity_header: None,
             backend_geo_country: None,
             auth_method: None,
+            soap_ws_security_authenticated_body_digest: None,
             timestamp_received: Utc::now(),
             grpc_deadline_initialized: false,
             grpc_deadline_had_valid_client_timeout: false,
@@ -2606,6 +2737,7 @@ impl RequestContext {
             serverless_pre_invocation_rejection_owners: HashSet::new(),
             serverless_external_side_effect_owners: HashSet::new(),
             serverless_terminate_response: false,
+            serverless_grpc_terminate_frame: None,
             serverless_owned_dedup_publication: None,
             ai_prompt_compressor_staged: HashMap::new(),
             ai_prompt_compressor_classification_path: None,
@@ -2627,6 +2759,8 @@ impl RequestContext {
             a2a_gateway_streaming: false,
             mcp_response_resource_binding: None,
             mcp_trusted_tool_name_rewrite: None,
+            mcp_validate_tool_result: None,
+            mcp_batch_forbids_upstream: false,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
             waf_instance_scores: HashMap::new(),
@@ -3366,6 +3500,8 @@ impl RequestContext {
             authenticated_identity_header: self.authenticated_identity_header.clone(),
             backend_geo_country: self.backend_geo_country,
             auth_method: self.auth_method,
+            soap_ws_security_authenticated_body_digest: self
+                .soap_ws_security_authenticated_body_digest,
             timestamp_received: self.timestamp_received,
             grpc_deadline_initialized: self.grpc_deadline_initialized,
             grpc_deadline_had_valid_client_timeout: self.grpc_deadline_had_valid_client_timeout,
@@ -3432,6 +3568,7 @@ impl RequestContext {
                 .serverless_external_side_effect_owners
                 .clone(),
             serverless_terminate_response: self.serverless_terminate_response,
+            serverless_grpc_terminate_frame: self.serverless_grpc_terminate_frame.clone(),
             serverless_owned_dedup_publication: self.serverless_owned_dedup_publication,
             // Transfer rather than clone the potentially body-sized compressor
             // stage. The final wire hook consumes it from this compatibility
@@ -3472,6 +3609,8 @@ impl RequestContext {
             a2a_gateway_streaming: self.a2a_gateway_streaming,
             mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             mcp_trusted_tool_name_rewrite: self.mcp_trusted_tool_name_rewrite.clone(),
+            mcp_validate_tool_result: self.mcp_validate_tool_result.clone(),
+            mcp_batch_forbids_upstream: self.mcp_batch_forbids_upstream,
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
             waf_instance_scores: self.waf_instance_scores.clone(),
@@ -6911,6 +7050,43 @@ pub trait Plugin: Send + Sync {
         &[]
     }
 
+    /// Declare how far this plugin's response-header policy binds the response
+    /// TRAILER section.
+    ///
+    /// Protocol paths that forward backend trailers after the response-header
+    /// phases (buffered and streaming native HTTP/3) reconcile the trailer
+    /// section against the union of these declarations.
+    ///
+    /// Override this whenever the plugin OWNS a response field — that is,
+    /// whenever a backend trailer carrying the same name would contradict or
+    /// undo the decision — AND the per-request mutation witness could fail to
+    /// see it. The witness only proves "this field changed on the initial header
+    /// map", so it misses exactly two shapes, and both are common:
+    ///
+    /// * A **no-op removal**: the policy removes a field the backend sent only
+    ///   as a trailer, so nothing changes on the initial map (`sse` with
+    ///   `strip_content_length`, `security_headers` with a configured `remove`,
+    ///   `grpc_web` stripping its internal bridge headers).
+    /// * An **idempotent write**: the gateway writes a value the backend already
+    ///   sent verbatim, so the diff is empty (`response_caching`'s guessable
+    ///   `x-cache-status: MISS`, an echoed `traceparent`, a `vary` token merge
+    ///   that was already nominated).
+    ///
+    /// Mutations that do land visibly on the initial headers are reconciled per
+    /// request without any declaration, so plugins that only observe, log,
+    /// authenticate, or authorize correctly keep the
+    /// [`ResponseTrailerPolicy::None`] default and preserve backend trailers
+    /// (issue #2941). Declare the enumerable name set wherever it is
+    /// enumerable; use [`ResponseTrailerPolicy::NamesAndPrefixes`] when an
+    /// open-ended prefix family is owned together with discrete names outside
+    /// it (CORS `access-control-*` plus `vary`); reserve
+    /// [`ResponseTrailerPolicy::Unbounded`] when the governed set cannot be
+    /// listed even that way — currently request-time route overrides from
+    /// `response_transformer`.
+    fn response_trailer_policy(&self) -> ResponseTrailerPolicy<'_> {
+        ResponseTrailerPolicy::None
+    }
+
     /// Returns `true` when this plugin may change the response `Content-Type`
     /// in `after_proxy` for the current request.
     ///
@@ -8432,7 +8608,12 @@ pub const REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT: &[&str] = &[
 /// protobuf request/response *targets* come from the config shape, not from the
 /// descriptor file), so `Plugin::requires_request_body_buffering()` on the
 /// shape-only instance is the authoritative runtime answer.
-pub const REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY: &[&str] = &["body_validator"];
+///
+/// `ai_response_guard` is here for the same reason: its runtime constructor
+/// reads the `grpc.descriptor_path` `FileDescriptorSet`, while its request-body
+/// answer is the trait default and never depends on that file.
+pub const REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY: &[&str] =
+    &["ai_response_guard", "body_validator"];
 
 /// Why the request-body-buffering screen could not evaluate a plugin config.
 ///
@@ -8571,6 +8752,8 @@ impl RequestBodyBufferingScreener {
     /// through its shape-only constructor.
     fn screen_shape_only(plugin_name: &str, config: &Value) -> RequestBodyBufferingScreen {
         let answer = match plugin_name {
+            "ai_response_guard" => ai_response_guard::AiResponseGuard::new_shape_only(config)
+                .map(|plugin| plugin.requires_request_body_buffering()),
             "body_validator" => body_validator::BodyValidator::new_shape_only(config)
                 .map(|plugin| plugin.requires_request_body_buffering()),
             // Unreachable today. A name added to the shape-only list without a
@@ -8633,6 +8816,12 @@ pub(crate) fn validate_plugin_config_with_http_client(
         // installed on data-plane nodes. Mode-aware dependency validation and
         // runtime construction handle the local FileDescriptorSet.
         return body_validator::BodyValidator::validate_config(config);
+    }
+    if name == "ai_response_guard" {
+        // Shape-only: CP/admin admission must not require gRPC descriptor
+        // files installed on data-plane nodes. Mode-aware dependency
+        // validation and runtime construction handle the FileDescriptorSet.
+        return ai_response_guard::AiResponseGuard::validate_config(config);
     }
     if name == "udp_logging" {
         // Shape-only: shared Admin / CP validation must not open node-local

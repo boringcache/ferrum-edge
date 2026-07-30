@@ -12573,6 +12573,11 @@ components:
         HTTP summaries include the normalized terminal `grpc_status` field
         (separate from `response_status_code`) when the request is gRPC. It
         can be renamed, omitted, or ordered like every other native field.
+        `api_chargeback`, `api_chargeback_sink`, and `transaction_debugger`
+        reuse this same shape against their own record families; whatever a
+        family cannot express (`summary_type`, `timestamp_format`, `metadata`,
+        `order`, or a derived kind with no source field) is rejected at
+        construction with a plugin- and field-specific diagnostic.
         See docs/log_schema.md.
       additionalProperties: false
       properties:
@@ -12667,6 +12672,54 @@ components:
     # Per-plugin configuration schemas. The `config` field on PluginConfig
     # accepts one of these depending on the `plugin_name` value.
 
+    AccessLogFilterExpression:
+      description: >-
+        Bounded boolean predicate tree for stdout logging. Runtime validation
+        rejects trees larger than 32 nodes. This form is mutually exclusive
+        with the flat stdout filter predicates. Status-code nodes evaluate
+        false for stream summaries, which do not carry an HTTP status; duration
+        and error nodes continue to evaluate against stream fields.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [op, left, right]
+          properties:
+            op:
+              type: string
+              enum: [and, or]
+            left:
+              $ref: "#/components/schemas/AccessLogFilterExpression"
+            right:
+              $ref: "#/components/schemas/AccessLogFilterExpression"
+        - type: object
+          additionalProperties: false
+          required: [op, value]
+          properties:
+            op:
+              type: string
+              enum: [status_code_min, status_code_max]
+            value:
+              type: integer
+              minimum: 0
+              maximum: 65535
+        - type: object
+          additionalProperties: false
+          required: [op, value]
+          properties:
+            op:
+              type: string
+              const: min_latency_ms
+            value:
+              type: integer
+              minimum: 0
+        - type: object
+          additionalProperties: false
+          required: [op]
+          properties:
+            op:
+              type: string
+              const: errors_only
+
     StdoutLoggingConfig:
       type: [object, "null"]
       additionalProperties: false
@@ -12678,7 +12731,8 @@ components:
           description: >-
             Optional predicate that suppresses log entries before they are
             serialized. All present fields must match for an entry to be
-            logged. When omitted, every transaction is logged.
+            logged. The expression form is mutually exclusive with the flat
+            predicates. When omitted, every transaction is logged.
           properties:
             status_code_min:
               type: integer
@@ -12704,6 +12758,8 @@ components:
                 grpc_status. Stream summaries require error_class or
                 connection_error. Status and latency predicates remain
                 independent and must also match.
+            expression:
+              $ref: "#/components/schemas/AccessLogFilterExpression"
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -13743,6 +13799,20 @@ components:
             Additional body field names (compared case-insensitively) to redact
             beyond the built-in credential markers. Requires log_request_body or
             log_response_body true.
+        schema:
+          $ref: "#/components/schemas/SummaryLogSchema"
+        schema_ref:
+          type: string
+          description: >-
+            Name of a schema registered by a `transaction_log_schema` plugin.
+            Mutually exclusive with `schema`. Projects the terminal diagnostic
+            records (HTTP, stream, WebSocket disconnect) emitted on the
+            `transaction_debug` target; the diagnostic field inventory is the
+            plugin's own (`outcome`, `method`, `path`, `status`,
+            `rejection_phase`, `latency_plugin_ms`, …), not the transaction
+            summary's. A portable named schema can only reference names shared
+            with the summary registry, so use an inline `schema:` for
+            diagnostic-only fields. See docs/log_schema.md.
 
     CorrelationIdConfig:
       type: object
@@ -16409,7 +16479,7 @@ components:
 
     SoapWsSecurityConfig:
       type: object
-      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers SOAP content types (text/xml, application/soap+xml, application/xml) as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims. PasswordDigest additionally validates the UsernameToken's own wsu:Created against a bounded freshness window and binds it to the independently validated outer wsu:Timestamp, and requires an explicit nonce.replay_scope ('process' for a declared single-replica deployment, or 'shared' with sync_mode=redis for cross-replica atomic claims). A shared-backend outage fails closed."
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation, timestamp freshness, and nonce/assertion replay protection. Media types are parsed STRUCTURALLY (type/subtype plus parameters) and matched by exact essence, never substring-matched; content_type.mode defaults to 'strict', under which every request on the proxy is governed and a missing/unsupported/malformed representation is rejected (415/415/400) before backend dispatch, while 'mixed_route' is the explicit pass-through opt-out. Recognized representations are text/xml, application/soap+xml, application/xml, application/xop+xml, and MTOM/XOP multipart/related (root part validated, attachments never decoded). MTOM package framing is strict and line-anchored: delimiter lines only at body start or immediately after CRLF with exact CRLF framing, exactly one close-delimiter with a boundary-free epilogue, strict US-ASCII unfolded part headers with unique Content-Type/Content-ID/Content-Transfer-Encoding, package-unique nonblank Content-IDs, exactly one part matching `start`, and root selection only after the whole package is framed — every other shape fails closed under bounded part/header/candidate ceilings. Because Ferrum implements no WS-Security attachment-signature transform, an enabled x509_signature refuses both MTOM multipart/related and bare application/xop+xml with 415 (and an explicit content_type.allow_mtom=true alongside it is refused at admission); username_token and saml keep accepting MTOM/XOP because they authenticate identity and never claimed attachment integrity. Buffers governed bodies as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. A configuration that establishes a principal (username_token, x509_signature, or saml) is an AUTH PLUGIN: it buffers the body before the authenticate phase, validates there, and publishes authenticated_identity plus a namespace-correct identified_consumer so access_control, consumer rate limiting, logging, retries, and chargeback all observe one SOAP identity. A timestamp-only configuration establishes no principal and keeps validating in before_proxy; the two phases never both run. Composition admission requires an identity-establishing instance to be the proxy's sole authentication mechanism in either auth mode, rejects it alongside compression decompress_request, and rejects an explicit content_type.allow_mtom=true alongside an enabled x509_signature; for that identity-establishing form on_final_request_body refuses to dispatch a message whose bytes changed after validation (a timestamp-only policy authenticates nobody, claims no integrity over the Body, and therefore does not bind the representation). Because an identity-establishing instance is the proxy's sole authentication mechanism, a request the SOAP policy passes through — a non-SOAP media type under mixed_route, or a governed envelope with no wsse:Security header under reject_missing_security_header=false — reaches the authentication chain with no identity and is answered 401 rather than forwarded anonymously; pair those options with a timestamp-only instance or separate the proxies. At least one security feature must be enabled. Both signature paths settle TRUST FIRST: certificate fingerprint match and SignatureValue-over-SignedInfo verify before any attacker-selected Reference is resolved, canonicalized, or digested. Duplicate Reference URIs are rejected, the X.509 Reference ceiling is 8, one bounded id index is built per message, and every canonicalization is charged against an aggregate per-message byte budget. Structural selection is namespace-qualified and positional: one SOAP Envelope, at most one Header and exactly one Body as its direct children in the same envelope namespace, and one wsse:Security header targeting this receiver as a direct child of that Header; duplicates or misplaced elements fail closed. X.509 success additionally requires a Reference resolving uniquely to the backend-visible Body, and require_signed_timestamp rejects a missing Timestamp (pairing it with timestamp.require=false is refused at admission). SAML requires a mandatory bounded Conditions window, the configured service audience on every AudienceRestriction, a supported SubjectConfirmation naming the configured recipient with its own bounded NotOnOrAfter and no InResponseTo, exactly one namespace-correct nonblank Subject NameID resolved BEFORE the single-use claim (so an assertion that authenticates nobody fails closed with 401 without consuming replay state), and a single-use claim on the assertion id — so nonce.replay_scope is required when saml is enabled. Both signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). On a governed representation, malformed XML, unsupported/ambiguous envelope structure, and XML parsing-budget failures reject with 400 regardless of reject_missing_security_header, which governs an absent header only. Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims. PasswordDigest additionally validates the UsernameToken's own wsu:Created against a bounded freshness window and binds it to the independently validated outer wsu:Timestamp, and requires an explicit nonce.replay_scope ('process' for a declared single-replica deployment, or 'shared' with sync_mode=redis for cross-replica atomic claims). A shared-backend outage fails closed."
       additionalProperties: false
       allOf:
         - if:
@@ -16432,6 +16502,48 @@ components:
               nonce:
                 type: object
                 required: [replay_scope]
+        - if:
+            properties:
+              saml:
+                allOf:
+                  - properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
+            required: [saml]
+          then:
+            required: [nonce, saml]
+            properties:
+              nonce:
+                type: object
+                required: [replay_scope]
+              saml:
+                type: object
+                required: [audience, recipient, trusted_issuers, trusted_signing_certs]
+        - if:
+            properties:
+              x509_signature:
+                allOf:
+                  - properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
+                  - not:
+                      properties:
+                        require_signed_timestamp:
+                          const: false
+                      required: [require_signed_timestamp]
+            required: [x509_signature]
+          then:
+            not:
+              properties:
+                timestamp:
+                  type: object
+                  properties:
+                    require:
+                      const: false
+                  required: [require]
+              required: [timestamp]
         - if:
             properties:
               nonce:
@@ -16464,7 +16576,79 @@ components:
         reject_missing_security_header:
           type: boolean
           default: true
-          description: Reject SOAP requests that lack a WS-Security header
+          description: |
+            Reject SOAP requests that lack a WS-Security header. This governs an
+            ABSENT HEADER ONLY. On a governed representation, malformed XML,
+            unsupported or ambiguous SOAP envelope structure (duplicate or
+            misplaced Envelope/Header/Body/Security), and XML parsing-budget
+            failures always reject with 400 regardless of this setting: a
+            gateway/backend parser disagreement must never become a
+            pass-through.
+        content_type:
+          type: object
+          description: |
+            Which requests this proxy governs. Media types are parsed
+            structurally (type/subtype plus RFC 9110 parameters) and matched by
+            exact essence; they are never substring-matched, so a
+            `multipart/form-data; boundary=application/xml` request is not SOAP
+            and a SOAP envelope labelled `application/octet-stream` is not
+            exempt. Recognized representations: text/xml (SOAP 1.1),
+            application/soap+xml (SOAP 1.2), application/xml,
+            application/xop+xml, and MTOM/XOP multipart/related whose `type`
+            parameter names a SOAP/XOP root essence.
+          additionalProperties: false
+          properties:
+            mode:
+              type: string
+              enum: [strict, mixed_route]
+              default: strict
+              description: |
+                'strict' (default) governs every request on this proxy: a
+                missing Content-Type returns 415, an unsupported media type
+                returns 415, and a malformed one returns 400 — all before
+                backend dispatch. 'mixed_route' is the explicit opt-out that
+                passes non-SOAP media types through the SOAP policy; a
+                malformed media-type label still fails closed in that mode
+                because an unparsable
+                label cannot be proven non-SOAP. With an identity-establishing
+                configuration the pass-through still reaches the authentication
+                chain, where the absence of a SOAP principal is answered 401,
+                so mixed anonymous traffic belongs on a timestamp-only instance
+                or a separate proxy.
+            allow_mtom:
+              type: boolean
+              default: true
+              description: |
+                Accept MTOM/XOP multipart/related packaging. The gateway locates
+                the root part (by the `start` parameter, else the first part),
+                validates that part's envelope, and never reads or decodes
+                attachment payloads. Set false to declare that this route does
+                not accept MTOM at all; a SOAP-bearing multipart then returns
+                415. Package framing is STRICT because the parser decides which
+                bytes are the envelope: delimiter LINES are recognized only at
+                the body start or immediately after a CRLF with exact CRLF
+                framing and no transport padding (so a `--boundary` sequence in
+                a preamble, header value, attachment payload, or the envelope
+                itself is inert payload); exactly one close-delimiter is
+                required and the epilogue must not contain the boundary token;
+                part headers must be US-ASCII with no obsolete folding, must be
+                well-formed `token: value` pairs, and may carry at most one
+                Content-Type / Content-ID / Content-Transfer-Encoding each;
+                Content-ID values must be package-unique and nonblank, and with
+                `start` supplied exactly one part may match; and the root part
+                must declare a SOAP/XOP essence and must not declare a
+                re-encoding Content-Transfer-Encoding (anything other than
+                7bit/8bit/binary). The whole package is framed and every part
+                parsed before a root is selected, so no later ambiguity is
+                missed by an early return. Bounds are fail-closed (at most 64
+                parts; at most 8 KiB and 32 header lines per part; a ceiling on
+                boundary-shaped candidates per package). MUST NOT be explicitly
+                true when x509_signature.enabled is true — that pairing is
+                refused at admission, and XOP representations (multipart/related
+                and bare application/xop+xml) return 415 under an enabled
+                x509_signature regardless, because Ferrum implements no
+                WS-Security attachment-signature transform and an X.509
+                signature therefore cannot cover attachment octets.
         sync_mode:
           type: string
           enum: [local, redis]
@@ -16639,35 +16823,58 @@ components:
             require_signed_timestamp:
               type: boolean
               default: true
-              description: Require the Timestamp to be included in the signature's references
+              description: |
+                Require a wsu:Timestamp to be PRESENT and covered by the
+                signature. A message with no Timestamp is rejected rather than
+                passing vacuously, and pairing this with timestamp.require=false
+                is refused at admission as a contradiction.
         saml:
           type: object
           description: |
             SAML 2.0 assertion validation. The plugin cryptographically verifies
-            the assertion's `<Signature>` element (XMLDSIG) BEFORE checking any
-            attacker-controlled fields. Verification steps, in order:
+            the assertion's `<Signature>` element (XMLDSIG) before resolving
+            signature references or trusting assertion claims. Verification
+            steps, in order:
               1. Locate `<Signature>` inside the assertion (rejected if absent).
                  More than one `<Assertion>` inside the WS-Security block is
                  rejected outright.
               2. Resolve the signing algorithm and confirm it is in `allowed_signature_algorithms`.
-              3. Verify each `<Reference>` digest after the supported transform chain
-                 (XMLDSIG enveloped-signature followed by Exclusive XML Canonicalization
-                 `xml-exc-c14n#`, including `InclusiveNamespaces PrefixList`).
-                 The digest algorithm must be in `allowed_digest_algorithms`. At
-                 least one Reference must target the enclosing Assertion ID.
-              4. Match the signing certificate from `KeyInfo/X509Data/X509Certificate`
+              3. Match the signing certificate from `KeyInfo/X509Data/X509Certificate`
                  against `trusted_signing_certs` by SHA-256 fingerprint of the full DER
                  (leaf-cert trust — no CA chain validation; operators supply the IdP's
                  actual signing certificate(s) as published in IdP metadata).
-              5. Verify `<SignatureValue>` over exclusive-canonicalized `<SignedInfo>`
+              4. Verify `<SignatureValue>` over exclusive-canonicalized `<SignedInfo>`
                  (`xml-exc-c14n#`, including `InclusiveNamespaces PrefixList`) using the
                  matched cert's RSA public key.
-              6. Validate Issuer (must match `trusted_issuers`), NotBefore /
-                 NotOnOrAfter (with `clock_skew_seconds` tolerance), and Audience
-                 (if `audience` is configured).
-              7. Extract the Subject NameID into `ctx.metadata["soap_ws_saml_subject"]`
-                 for downstream plugins.
-            On any failure the request is rejected with HTTP 401. Unsupported
+              5. ONLY THEN verify the single `<Reference>` digest after the supported
+                 transform chain (XMLDSIG enveloped-signature followed by Exclusive XML
+                 Canonicalization `xml-exc-c14n#`, including `InclusiveNamespaces
+                 PrefixList`). The digest algorithm must be in
+                 `allowed_digest_algorithms` and the Reference must target the enclosing
+                 Assertion ID. Exactly one Reference is supported, so a duplicate cannot
+                 re-canonicalize the assertion.
+              6. Validate Issuer (must match `trusted_issuers`), the MANDATORY bounded
+                 Conditions window (both NotBefore and NotOnOrAfter required, span capped
+                 by `max_assertion_lifetime_seconds`, `clock_skew_seconds` tolerance), the
+                 service `audience` on every AudienceRestriction, and one supported
+                 SubjectConfirmation naming `recipient`.
+              7. Resolve exactly one namespace-correct, nonblank Subject NameID.
+                 This happens before replay state is consumed, so an otherwise
+                 valid assertion that authenticates nobody fails with 401
+                 without burning its assertion id.
+              8. Claim the assertion id for single use in the declared
+                 nonce.replay_scope, which is REQUIRED when SAML is enabled. Every
+                 accepted assertion is claimed exactly once, so OneTimeUse needs no
+                 special case; a replay-backend outage fails closed. Claims are retained
+                 for the fixed 93601s horizon, which dominates
+                 max_assertion_lifetime_seconds + 2 x clock_skew_seconds. 'process' scope
+                 is a single-replica declaration and makes NO cross-replica claim;
+                 multi-replica SAML deployments must use 'shared'.
+              9. Publish the Subject NameID as the request principal
+                 (authenticated_identity plus a namespace-correct identified_consumer) and
+                 mirror it into `ctx.metadata["soap_ws_saml_subject"]`.
+            On any failure the request is rejected with HTTP 401. Rejections never echo
+            the issuer, audience, recipient, subject, or assertion id. Unsupported
             canonicalization or transform algorithms fail closed; inclusive c14n,
             comments, XPath, XSLT, and other XMLDSIG transforms are not supported.
           additionalProperties: false
@@ -16725,12 +16932,45 @@ components:
               type: string
               minLength: 1
               description: |
-                Optional. When set, the assertion's
-                `Conditions/AudienceRestriction/Audience` must match this
-                string exactly. Use this to bind assertions to the specific
-                service this proxy fronts. Must be a non-empty string when
-                present — a wrong-typed value is rejected rather than silently
-                removing audience binding.
+                Required when `enabled` is true. Every
+                `Conditions/AudienceRestriction` in the assertion must name this
+                exact value (each restriction is a conjunct). Without it, an
+                assertion minted by the same trusted issuer for another relying
+                party is accepted here.
+            recipient:
+              type: string
+              minLength: 1
+              description: |
+                Required when `enabled` is true. Matched against
+                `Subject/SubjectConfirmation/SubjectConfirmationData/@Recipient`
+                so a captured assertion cannot be presented to a different
+                endpoint.
+            max_assertion_lifetime_seconds:
+              type: integer
+              format: uint64
+              default: 300
+              minimum: 1
+              maximum: 86400
+              description: |
+                Maximum permitted `Conditions/@NotOnOrAfter - @NotBefore` span.
+                Both instants are mandatory and the window must be non-empty,
+                so an assertion with absent or unbounded Conditions is refused
+                rather than becoming an indefinite bearer credential.
+            allowed_subject_confirmation_methods:
+              type: array
+              minItems: 1
+              items:
+                type: string
+              default: ["urn:oasis:names:tc:SAML:2.0:cm:bearer"]
+              description: |
+                Accepted SubjectConfirmation @Method URIs. Only
+                'urn:oasis:names:tc:SAML:2.0:cm:bearer' is implemented;
+                'urn:oasis:names:tc:SAML:2.0:cm:holder-of-key' is rejected at
+                admission because the confirmation key is not bound to the
+                message signature. Exactly one acceptable SubjectConfirmation
+                must be present, its SubjectConfirmationData must name
+                `recipient`, carry its own NotOnOrAfter, honour NotBefore when
+                present, and omit InResponseTo.
             clock_skew_seconds:
               type: integer
               format: uint64
@@ -16741,8 +16981,8 @@ components:
         nonce:
           type: object
           description: |
-            Nonce replay protection cache (PasswordDigest only). A nonce is
-            retained only after its PasswordDigest verifies, and the cache is
+            Replay protection cache. A nonce is retained only after its
+            PasswordDigest verifies, and the cache is
             bounded on three independent axes: per-nonce encoded length,
             retained entries, and retained key UTF-8 payload bytes counted once
             per shared immutable key allocation. An exact ordered age index
@@ -16755,9 +16995,18 @@ components:
             or unprotecting one that was already claimed. This is the only
             canonical shape; there is no `nonce_replay_protection` alias.
 
+            Accepted SAML assertion-id claims share this same bounded state for
+            the same fixed horizon, under a separate internal claim-kind
+            namespace so an attacker-chosen nonce can never burn an assertion
+            claim or the reverse. They count against max_cache_size and
+            max_total_cache_bytes (a fixed 64-byte SHA-256 hex claim key each),
+            so a SAML-enabled process scope must be sized for peak accepted
+            assertion rate as well as peak PasswordDigest rate.
+
             replay_scope declares where those claims live and is REQUIRED when
-            username_token is enabled with password_type PasswordDigest. It has
-            no default because a gateway cannot observe its own replica count.
+            username_token is enabled with password_type PasswordDigest, and
+            whenever saml is enabled. It has no default because a gateway
+            cannot observe its own replica count.
             The entry/byte caps and bounded expiry maintenance described above
             apply to replay_scope=process; under replay_scope=shared the bounds
             that apply are Redis's own memory policy plus the fixed expiry on
@@ -16786,9 +17035,10 @@ components:
               type: string
               enum: [process, shared]
               description: >-
-                Where PasswordDigest replay claims live. REQUIRED when
-                username_token.enabled is true and password_type is
-                PasswordDigest; there is no default. "process" registers state
+                Where PasswordDigest nonce and SAML assertion-id replay
+                claims live. REQUIRED when username_token.enabled is true and
+                password_type is PasswordDigest, and whenever saml.enabled is
+                true; there is no default. "process" registers state
                 under a stable {namespace}|{plugin-config-id} scope so a reload
                 generation inherits the previous generation's claims instead of
                 starting from an empty cache — it is explicitly NOT cross-replica
@@ -16826,7 +17076,7 @@ components:
               default: 100000
               minimum: 1
               maximum: 1000000
-              description: "Maximum retained nonce entries (replay_scope=process only). Zero is rejected because it would make replay detection inert. Capacity maintenance uses an ordered age index and reclaims at most 64 entries per request, and only entries already past the fixed 93601-second retention horizon. A nonce inside that horizon is never evicted, so a claim that cannot be recorded is rejected with 401 instead of admitting an unprotected nonce. Size this (and max_total_cache_bytes) for peak authenticated PasswordDigest rate × 93601 s — roughly 1 request/second sustained at the default, and about 10/second at the 1000000 ceiling. Higher sustained PasswordDigest rates need replay_scope=shared, where retention is Redis's cost rather than the gateway's."
+              description: "Maximum retained replay entries — PasswordDigest nonces plus accepted SAML assertion-id claims (replay_scope=process only). Zero is rejected because it would make replay detection inert. Capacity maintenance uses an ordered age index and reclaims at most 64 entries per request, and only entries already past the fixed 93601-second retention horizon. A nonce inside that horizon is never evicted, so a claim that cannot be recorded is rejected with 401 instead of admitting an unprotected nonce. Size this (and max_total_cache_bytes) for peak authenticated PasswordDigest rate — plus peak accepted SAML assertion rate when saml is enabled — × 93601 s, roughly 1 claim/second sustained at the default and about 10/second at the 1000000 ceiling. Higher sustained rates need replay_scope=shared, where retention is Redis's cost rather than the gateway's."
             max_encoded_length:
               type: integer
               format: uint64
@@ -16859,8 +17109,25 @@ components:
         - $ref: '#/components/schemas/CorsExactOrigin'
         - type: string
           minLength: 3
+          maxLength: 512
           pattern: '^\*\.[^*/:\s]+$'
           description: Native wildcard-subdomain matcher such as `*.example.com`.
+
+    CorsLiteralExactOrigin:
+      type: string
+      minLength: 1
+      maxLength: 512
+      # At least one non-whitespace character: a whitespace-only literal can
+      # never equal a real Origin header, so the runtime rejects it too.
+      pattern: '\S'
+      description: >-
+        Istio `StringMatch.exact` origin matcher. LITERAL semantics: compared
+        byte-for-byte and case-sensitively against the request `Origin` header
+        with NO canonicalization and NO wildcard interpretation, so a value such
+        as `*.example.com` stays the exact string upstream assigns it instead of
+        becoming the native wildcard-subdomain matcher. The single exception is
+        `*`, which Istio itself defines as allow-all. Whitespace-only values are
+        rejected; the value is bounded at 512 bytes.
 
     CorsConfig:
       type: object
@@ -16891,6 +17158,7 @@ components:
         allowed_origins:
           type: array
           minItems: 1
+          maxItems: 64
           items:
             oneOf:
               - $ref: '#/components/schemas/CorsAllowedOriginString'
@@ -16904,32 +17172,37 @@ components:
                   multi-key objects are rejected at config time.
                 properties:
                   exact:
-                    $ref: '#/components/schemas/CorsExactOrigin'
-                    description: >-
-                      Exact origin, canonicalized at config time (scheme/host
-                      case, IDNA, IP serialization, and default ports). The
-                      exact value `*` has Istio's documented allow-all meaning.
+                    $ref: '#/components/schemas/CorsLiteralExactOrigin'
                   prefix:
                     type: string
                     minLength: 1
+                    maxLength: 512
                     description: >-
                       Literal byte-prefix of the request Origin header
                       (case-sensitive), e.g. "https://app.".
                   regex:
                     type: string
                     minLength: 1
+                    maxLength: 512
                     description: >-
                       RE2 pattern that must FULLY match the request Origin
-                      header. Compiled (and size-bounded) at config time; an
-                      invalid pattern is rejected.
+                      header. Compiled once at config construction/reload (never
+                      per request) under explicit bounds — 512 pattern bytes, a
+                      64 KiB compiled-program limit, a 64 KiB lazy-DFA limit,
+                      and an AST nesting limit of 24. An invalid or over-budget
+                      pattern is rejected with a field-specific error.
           description: >-
-            Required permitted-origin policy. Each entry is either a string
-            (`"*"` for intentional allow-all, an exact `scheme://host[:port]`
-            origin canonicalized on the cold config path, or a
-            `*.suffix.com` wildcard-subdomain pattern)
-            or an Istio `StringMatch`-shaped object carrying exactly one of
-            `exact` / `prefix` / `regex`. Prefix and regex retain literal Istio
-            matcher semantics and are not broadened by exact canonicalization.
+            Required permitted-origin policy, bounded at 64 entries. Each entry
+            is either a string — NATIVE syntax: `"*"` for intentional allow-all,
+            an exact `scheme://host[:port]` origin canonicalized on the cold
+            config path, or a `*.suffix.com` wildcard-subdomain pattern — or an
+            Istio `StringMatch`-shaped object carrying exactly one of `exact` /
+            `prefix` / `regex`. The two families are SEPARATE matcher semantics:
+            object `exact`, `prefix`, and `regex` all retain literal Istio
+            semantics and are never broadened by the native form's
+            canonicalization or wildcard interpretation, so
+            `{"exact": "*.example.com"}` matches only that literal string while
+            the plain string `"*.example.com"` matches every subdomain.
         allowed_methods:
           type: array
           items:
@@ -18745,7 +19018,7 @@ components:
     FaultInjectionConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: fault_injection — Probabilistic aborts and latency injection for chaos testing. HTTP-family faults run in before_proxy; raw TCP faults run on stream connect. UDP and DTLS are not supported."
+      description: "Plugin: fault_injection — Probabilistic aborts and latency injection for chaos testing. HTTP-family faults run in before_proxy; TCP/UDP/DTLS session admission faults run on stream connect; UDP/DTLS also apply per-datagram faults on on_udp_datagram (client→backend) in isolated session workers without blocking the shared recv loop."
       properties:
         abort:
           type: [object, "null"]
@@ -20005,9 +20278,50 @@ components:
         Google Cloud Functions as middleware in the proxy pipeline. In
         `pre_proxy` mode the function response can inject request headers and
         metadata before the backend call. In `terminate` mode the function
-        response is returned directly to the client (HTTP only — gRPC
-        rejection normalization would drop the body, so terminate mode on
-        gRPC requests is rejected with 500). Cloud credential fields fall
+        response is returned directly to the client. Native gRPC terminate
+        requires a JSON contract with `grpc_status` plus optional
+        `message_base64` (raw protobuf bytes), `grpc_message`,
+        `status_details_base64`, and custom `trailers`; the gateway frames an
+        uncompressed unary DATA message and owns reserved terminal metadata.
+        The request is classified as native gRPC by the HTTP flavor the
+        frontend stamps at intake, not by a mutable effective content-type.
+        Every terminal trailer value is bounded by an 8 KiB wire-value
+        ceiling, measured after sanitization and after base64 or
+        percent-encoding, and the complete terminal metadata block —
+        `grpc-status`, `grpc-message`, `grpc-status-details-bin`, every
+        custom trailer, and `content-type` — is bounded by a separate 16 KiB
+        aggregate budget charged as name + value + 32 bytes per field, the
+        way HTTP/2 charges `SETTINGS_MAX_HEADER_LIST_SIZE` and HTTP/3 charges
+        `SETTINGS_MAX_FIELD_SECTION_SIZE`. Custom trailers are additionally
+        capped at 32 entries. `grpc_message` is authored as human-readable text
+        and emitted in the canonical percent-encoded `grpc-message` wire form
+        (uppercase hex for `%` and every byte outside the grammar's
+        unescaped range). Custom trailers use the gRPC Custom-Metadata name
+        alphabet and printable-ASCII value grammar; `-bin` values must be
+        standard base64 with or without padding. Names are case-insensitive,
+        so two `trailers` members differing only in case are rejected rather
+        than one silently overwriting the other. The raw function output is
+        also screened for duplicate JSON object member names before parsing —
+        byte-identical, escaped-equivalent, or nested inside `trailers` — so a
+        document whose terminal outcome depends on which parser reads it is
+        refused instead of resolved.
+        gRPC-Web terminate is rejected with 500. Streaming and compression
+        contract shapes fail closed. Malformed or oversized function output
+        fails closed without reflecting untrusted bodies. The validated
+        framed response enters the shared response-body policy lifecycle, so
+        configured gRPC response validators and limits still apply; if a body
+        policy or transform invalidates that authorized representation, the
+        response fails closed to a nonzero gRPC error rather than degrading to
+        an empty successful trailers-only reply. The status-only shape carries
+        the same provenance: unchanged, it stays trailers-only and restores its
+        complete terminal metadata (grpc-status, optional grpc-message,
+        grpc-status-details-bin, and validated custom trailers) from the
+        validated contract rather than the reject header map, with an omitted
+        grpc-message emitted as omission rather than a synthesized reason; a
+        changed status or an unauthored body fails closed the same way and
+        discards every authored terminal key with it, and it can never
+        authorize DATA. Cloud credential
+        fields fall
         back to well-known environment variables. Terminate mode forwards
         applicable end-to-end response headers, preserving repeated Set-Cookie
         and list-valued Link while requiring Location, Content-Location, and
@@ -20057,7 +20371,8 @@ components:
         and enforcing
         redaction-dependent plugins reject governed content when those bytes
         cannot be safely rewritten.
-        Proven pre-invocation payload-validation, unsupported-gRPC, DNS-policy,
+        Proven pre-invocation payload-validation, unsupported-gRPC-Web,
+        DNS-policy,
         and literal-IP-policy rejections release every acquired deduplication
         owner after commit. Real remote 502 responses remain application
         responses; uncertain post-invocation failures retain their protection.
@@ -20093,7 +20408,8 @@ components:
           default: pre_proxy
           description: |
             pre_proxy: invoke and inject headers/metadata, then continue.
-            terminate: invoke and return response to client (HTTP only).
+            terminate: invoke and return response to client (HTTP body
+            passthrough, or native-gRPC JSON unary contract).
         function_url:
           type: string
           format: uri
@@ -21093,6 +21409,17 @@ components:
               enum: [cut_with_error_event, cut_silent]
               default: cut_with_error_event
               description: Whether a cut emits an OpenAI-compatible terminal SSE error event or ends the stream silently. Applies to enforcement=block only (detect never cuts).
+            max_hold_ms:
+              type: integer
+              format: uint
+              minimum: 1
+              maximum: 300000
+              description: "Absolute deadline, in milliseconds, on how long response content may be held awaiting a semantic verdict. Independent of max_window_bytes, provider.request_timeout_ms, and any transport timeout: the budget covers the time the bytes have already been held plus the semantic round-trip (including queueing for a detect-mode admission permit). The clock is anchored when un-released content first enters the hold and is never refreshed by further chunks or by a partial release that leaves older bytes held, so a drip-feeding backend cannot extend it. It clears only when the current hold is fully released, so the next hold receives a fresh budget. On expiry the in-flight evaluation is cancelled and streaming.on_hold_timeout decides. Omit the field to leave the hold unbounded (the historic behavior); 0 and values above 300000 are rejected."
+            on_hold_timeout:
+              type: string
+              enum: [on_error, cut, forward]
+              default: on_error
+              description: "Policy when streaming.max_hold_ms expires before a verdict. on_error inherits the plugin's on_error policy (reject fails closed by cutting, warn/allow fail open by forwarding every byte that caused the hold uninspected — complete events and any un-terminated partial SSE event — then passing the remainder of that partial event through until the next event boundary), matching how a provider error or an exhausted inspection budget is handled. cut always fails closed (discards all held/partial bytes); forward always fails open. Requires streaming.max_hold_ms to be set. cut is rejected with enforcement=detect, whose bytes were already forwarded before the evaluation began — an expired detect hold can only abandon the evaluation and release its admission permit. A cut is client-indistinguishable from a policy cut (same terminal error event), and every expiry folds into the fixed-cardinality ai_semantic_firewall.stream_hold_timeouts count (saturating-summed across active instances) and ai_semantic_firewall.stream_hold_timeout_action (most restrictive of cut > forward > detect_abandoned) transaction metadata; a zero-expiry instance neither synthesizes nor erases those keys."
             enforcement:
               type: string
               enum: [block, detect]
@@ -21900,7 +22227,7 @@ components:
     AiResponseGuardConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_response_guard — HTTP-only validation and filtering for AI/LLM API responses. Enforcing actions fail closed when a governed buffered response is oversized or uninspectable. Native gRPC protobuf messages are not supported."
+      description: "Plugin: ai_response_guard — validation and filtering for AI/LLM API responses. Enforcing actions fail closed when a governed buffered response is oversized or uninspectable. Native gRPC protobuf responses are inspected only for methods enrolled in the descriptor-based grpc block; unenrolled methods are never decoded and never buffered. require_json and required_fields are JSON-only and are rejected when combined with grpc."
       anyOf:
         - required: [pii_patterns]
           properties:
@@ -21997,7 +22324,11 @@ components:
           type: integer
           minimum: 1
           default: 1048576
-          description: Maximum governed buffered response size. Reject/redact and structural rules fail closed above this limit; warn-only content rules record a bounded warning and pass through.
+          description: >-
+            Maximum governed buffered response size, including the aggregate
+            decoded/decompressed native-gRPC payload across frames.
+            Reject/redact and structural rules fail closed above this limit;
+            warn-only content rules record a bounded warning and pass through.
         require_json:
           type: boolean
           default: false
@@ -22014,6 +22345,85 @@ components:
           minimum: 0
           default: 0
           description: "Maximum allowed length of completion content, measured in characters (Unicode scalar values, not UTF-8 bytes). 0 = no limit"
+        grpc:
+          type: object
+          additionalProperties: false
+          required: [descriptor_path, methods]
+          description: >-
+            Native-gRPC response inspection contract. Present means the plugin
+            also applies to native gRPC, but only for the enrolled methods:
+            every other gRPC method is left undecoded, uninspected, and
+            unbuffered. Enrolled methods fail closed for reject/redact actions
+            when the descriptor is unavailable, the payload does not decode as
+            the configured type, the message carries fields outside the
+            descriptor, the framing is malformed or truncated, the message
+            encoding is not gzip/identity, or a bound is exceeded. Requires at
+            least one detection pattern, blocked phrase, or
+            max_completion_length, and may not be combined with require_json or
+            required_fields.
+          properties:
+            descriptor_path:
+              type: string
+              minLength: 1
+              pattern: '\S'
+              description: >-
+                Node-local path to a compiled protobuf FileDescriptorSet.
+                Validated shape-only at Admin/CP admission and against the real
+                descriptor by mode-aware file-dependency validation. A readable
+                but invalid descriptor rejects the candidate configuration; an
+                absent or unreadable descriptor retains enrollment and fails
+                closed for enforcing actions at request time.
+            methods:
+              type: object
+              minProperties: 1
+              description: >-
+                Map of "/package.Service/Method" to that method's response
+                inspection contract. Only these methods are inspected.
+                Leading/trailing whitespace and one optional leading slash are
+                normalized by the runtime; every dotted service segment and the
+                method identifier must be a protobuf/gRPC identifier. Duplicate
+                normalized forms are rejected at runtime.
+              propertyNames:
+                pattern: '^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$'
+              additionalProperties:
+                type: object
+                additionalProperties: false
+                required: [response_type]
+                properties:
+                  response_type:
+                    type: string
+                    minLength: 1
+                    pattern: '\S'
+                    description: Fully-qualified protobuf response message type.
+                  text_fields:
+                    type: array
+                    minItems: 1
+                    items:
+                      type: string
+                      minLength: 1
+                      pattern: '\S'
+                    description: >-
+                      Dotted field paths restricting what is scanned and
+                      rewritten. Each path must end at a string field and may
+                      not traverse a map field. Omit to cover every string
+                      field and known extension value recursively.
+            max_message_bytes:
+              type: integer
+              minimum: 1
+              default: 1048576
+              description: >-
+                Per-message ceiling, applied to the declared frame length and
+                enforced while inflating a gzip-compressed frame; inflation
+                stops at the tighter of this ceiling and the remaining
+                max_scan_bytes budget. Aggregate decoded payload across frames
+                is additionally capped by max_scan_bytes.
+            max_messages:
+              type: integer
+              minimum: 1
+              default: 64
+              description: >-
+                Maximum number of length-prefixed frames one buffered gRPC
+                response may carry.
 
     AiToolGovernorConfig:
       type: object
@@ -22753,7 +23163,7 @@ components:
 
     McpGatewayConfig:
       type: object
-      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, tool argument JSON Schema validation, and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping."
+      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, bounded JSON-RPC batch admission with per-item validation and ordered synthetic response assembly. Aggregate upstream-routed members such as tools/call must be singleton requests so later plugin phases are preserved; batch request members return JSON-RPC -32009, while notification-only batches report the restriction once at batch level. MCP initialize must also be a singleton HTTP request: initialize batch members return JSON-RPC -32010 before any session mint or eviction, so no batch mints or evicts a session or returns a session header. A notification-only batch whose gateway dispatch otherwise fails reports JSON-RPC -32011. A batch member whose session is no longer live contributes a per-item JSON-RPC -32004 element because the singleton bare HTTP 404 cannot be expressed per item. Aggregate batches always answer HTTP 200 with a response array, so an unsupported MCP-Protocol-Version surfaces per item rather than as the singleton HTTP 400; transparent_proxy batches cannot be partially forwarded and are rejected whole with HTTP 400. The plugin also supports tool argument JSON Schema validation and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping."
       required: [mode, endpoint, servers]
       properties:
         enabled:
@@ -22775,7 +23185,7 @@ components:
               items:
                 type: string
               default: ["2025-11-25"]
-              description: Supported MCP protocol versions, in preference order. The first entry is the gateway's preferred version, returned by aggregate-mode initialize when the client requests an unsupported version.
+              description: Supported MCP protocol versions, in preference order. The first entry is the gateway's preferred version, returned by aggregate-mode initialize when the client requests an unsupported version. Includes 2025-03-26 when JSON-RPC batches are desired; batches are admitted under validation.max_batch_* limits.
         discovery:
           type: object
           properties:
@@ -22922,8 +23332,21 @@ components:
             validate_tool_results:
               type: boolean
               default: false
-              enum: [false]
-              description: Reserved; tool result validation is not implemented yet, so true is rejected at config validation.
+              description: >
+                Aggregate-router only. When true, compile each discovered tool
+                outputSchema at catalog construction, pin the exact validator
+                selected for each dispatched call, and validate bounded tools/call
+                results against it before releasing the caller-visible response
+                or publishing audit metadata.
+                structuredContent is preferred; a single JSON text
+                content block is accepted when structuredContent is absent; mixed
+                disagreeing variants and exact response bytes with duplicate
+                object members fail closed. Well-formed tool execution errors
+                (result.isError true with array content) and upstream JSON-RPC
+                errors are preserved; non-boolean or bare isError values,
+                event-stream, and non-JSON tool results fail closed. Invalid or unrepresentable
+                outputSchema values are refused at catalog admission with
+                field-specific diagnostics. Default false.
             max_upstream_response_bytes:
               type: integer
               format: int64
@@ -22942,6 +23365,30 @@ components:
               minimum: 1
               default: 8388608
               description: "Maximum total serialized bytes accumulated across paginated catalog list pages before the aggregation is rejected. Must be greater than 0."
+            max_batch_items:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 32
+              description: "Maximum JSON-RPC batch array members admitted before session, catalog, or upstream work. Empty batches are rejected separately as Invalid Request. Must be greater than 0."
+            max_batch_bytes:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 1048576
+              description: "Maximum aggregate request-body bytes admitted for a JSON-RPC batch. Enforced on the raw request body before any JSON parsing, using the first non-whitespace byte to detect array-shaped input. Must be greater than 0 and at least max_batch_item_bytes."
+            max_batch_item_bytes:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 262144
+              description: "Maximum raw wire bytes admitted for one JSON-RPC batch member. Measured on the member's exact raw JSON slice as received (internal whitespace and escape sequences included, array separators and surrounding inter-member whitespace excluded), before the member is deserialized, so a member cannot shrink under the cap by normalizing. Oversized members yield a bounded per-item Invalid Request with id null (their id is never materialized or reflected) while siblings continue. Must be greater than 0 and must not exceed max_batch_bytes."
+            max_batch_response_bytes:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 1048576
+              description: "Maximum serialized bytes admitted for an assembled JSON-RPC batch response array (including array framing). Oversized aggregates fail closed without returning a partial body. Must be greater than 0."
         observability:
           type: object
           properties:
@@ -23139,6 +23586,22 @@ components:
             billing rows and aggregate overflow rows together. 0 is rejected.
             Process-global: every enabled api_chargeback instance must use the
             same value.
+        schema:
+          $ref: "#/components/schemas/SummaryLogSchema"
+        schema_ref:
+          type: string
+          description: >-
+            Name of a schema registered by a `transaction_log_schema` plugin.
+            Mutually exclusive with `schema`. Projects the per-proxy billing row
+            inside the `GET /charges` document (`proxy_id`, `namespace`,
+            `proxy_name`, `currency`, `protocol_family`, `total_calls`,
+            `total_charges`, `by_status`, `bandwidth`, `stream`). Billing
+            identity, charge accounting, registry keys, and the Prometheus
+            exposition are unaffected. `summary_type`, `timestamp_format`,
+            `metadata`, `order`, and every derived kind except `summary_kind`
+            are rejected for this surface. Process-global: every enabled
+            api_chargeback instance must resolve to the same projection because
+            one render cache serves them all. See docs/log_schema.md.
 
     ApiChargebackSinkConfig:
       type: object
@@ -23644,6 +24107,21 @@ components:
                 async delivery-worker spool strategy as max_entries. Runtime
                 additionally requires the value to be at least one bounded
                 charge-event size.
+        schema:
+          $ref: "#/components/schemas/SummaryLogSchema"
+        schema_ref:
+          type: string
+          description: >-
+            Name of a schema registered by a `transaction_log_schema` plugin.
+            Mutually exclusive with `schema`. Projects the exported charge-event
+            record (the JSONEachRow row delivered to ClickHouse and the durable
+            spool artifact that replays it), not the pricing, the accumulator
+            identities, or the snapshot keys. Renaming a field renames the
+            ClickHouse column the row inserts into, so the target table must
+            agree. `summary_type`, `timestamp_format`, the `metadata` policy,
+            and the `backend_host` derived kind are rejected for this surface:
+            a charge event has no RFC3339 timestamp field, no metadata map, and
+            no backend target. See docs/log_schema.md.
 
     ChargebackResponse:
       type: object
