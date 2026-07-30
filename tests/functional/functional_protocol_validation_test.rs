@@ -473,6 +473,11 @@ fn build_config(echo_port: u16, with_host: bool) -> String {
     )
 }
 
+/// Valid gateway-error response policy for the H3 wire-boundary test.
+///
+/// Protocol-managed destinations are rejected at plugin construction (covered
+/// exhaustively in `security_headers_tests`), so this fixture sets only fields
+/// the policy owns and lets the gateway derive/strip framing on the final wire.
 fn build_config_with_h3_gateway_policy(echo_port: u16) -> String {
     format!(
         "version: \"1\"\nproxies:\n\
@@ -492,9 +497,7 @@ fn build_config_with_h3_gateway_policy(echo_port: u16) -> String {
          \x20     override_existing: false\n\
          \x20     set:\n\
          \x20       X-H3-Gateway-Policy: enforced\n\
-         \x20       Content-Type: text/plain\n\
-         \x20       Content-Length: \"999\"\n\
-         \x20       Transfer-Encoding: chunked\n",
+         \x20       Content-Type: text/plain\n",
     )
 }
 
