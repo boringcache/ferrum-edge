@@ -593,9 +593,9 @@ async fn test_ws_frame_logging_connection_id_correlates_frame_and_disconnect() {
     let captured = gateway
         .wait_for_captured_output(
             |output| {
-                output.lines().any(|line| {
-                    line.contains("ws_frame_log") || line.contains("connection_id")
-                })
+                output
+                    .lines()
+                    .any(|line| line.contains("ws_frame_log") || line.contains("connection_id"))
             },
             Duration::from_secs(5),
         )
