@@ -67,15 +67,19 @@ REAFFIRMATION_RE = re.compile(
     r"re-affirmed\s+(\d{4}-\d{2}-\d{2})\s+by\s+([^:\n]+):\s*(.+)",
     re.IGNORECASE,
 )
-# Inventory rows: | `lifecycle-id` | `crate` | ver | Patch | Upstream | Owner | Reason | Removal | Docs |
-INVENTORY_ROW_RE = re.compile(
-    r"^\|\s*`([^`]+)`\s*\|\s*`[^`]+`\s*\|\s*[^|\n]+\|\s*[^|\n]+\|\s*[^|\n]+\|\s*[^|\n]+\|\s*[^|\n]+\|\s*[^|\n]+\|\s*\["
+INVENTORY_HEADER = (
+    "| Lifecycle ID | Crate | Vendored ver. | Patch | Upstream issue / PR | "
+    "Owner | Reason | Removal trigger | Docs |"
 )
 GITHUB_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 # Crate names and versions are interpolated into crates.io URLs and into the
 # expected vendor directory name, so keep them to the registry's own alphabet.
 CRATE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 CRATE_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]*$")
+DOCS_PATH_RE = re.compile(
+    r"^docs/upstream-[A-Za-z0-9][A-Za-z0-9._-]*-patches"
+    r"(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*/?$"
+)
 # Upstream-reported strings are echoed into the Actions log, where a stray
 # `::error::` would forge a workflow command. Only print recognizable versions.
 CRATES_IO_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]{0,63}$")
@@ -262,6 +266,7 @@ def validate_lifecycle_shape(data: Any) -> list[str]:
         crate = patch.get("crate")
         version = patch.get("vendored_version")
         vendor_path = patch.get("vendor_path")
+        docs_path = patch.get("docs_path")
         if _is_nonempty_str(crate) and not CRATE_NAME_RE.fullmatch(str(crate)):
             errors.append(f"{prefix}.crate: must be a registry crate name")
             crate = None
@@ -277,6 +282,11 @@ def validate_lifecycle_shape(data: Any) -> list[str]:
                     f"{prefix}.vendor_path: must be {expected_vendor_path!r} for "
                     f"crate {crate!r} at vendored version {version!r}"
                 )
+        if _is_nonempty_str(docs_path) and not DOCS_PATH_RE.fullmatch(str(docs_path)):
+            errors.append(
+                f"{prefix}.docs_path: must be a repository-relative "
+                "docs/upstream-<dependency>-patches path"
+            )
 
         upstream = patch.get("upstream")
         if not isinstance(upstream, dict):
@@ -459,16 +469,52 @@ def wrapper_delegation_errors(script_text: str) -> list[str]:
     return errors
 
 
-def policy_lifecycle_ids(policy_text: str) -> tuple[list[str], list[str]]:
-    """Extract inventory Lifecycle IDs; report duplicate rows as errors."""
-    ids: list[str] = []
+def policy_inventory_rows(policy_text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Extract rows only from the canonical nine-column lifecycle table."""
+    rows: list[tuple[str, str]] = []
     errors: list[str] = []
-    seen: set[str] = set()
-    for line in policy_text.splitlines():
-        match = INVENTORY_ROW_RE.match(line)
-        if not match:
+    in_inventory = False
+    found_header = False
+
+    for line_number, line in enumerate(policy_text.splitlines(), start=1):
+        stripped = line.strip()
+        if not in_inventory:
+            if stripped == INVENTORY_HEADER:
+                in_inventory = True
+                found_header = True
             continue
-        lifecycle_id = match.group(1)
+        if stripped and all(char in "|-: " for char in stripped):
+            continue
+        if not stripped.startswith("|"):
+            break
+        raw_cells = stripped.split("|")
+        if raw_cells[0] or raw_cells[-1] or len(raw_cells[1:-1]) != 9:
+            errors.append(
+                f"dependency-policy.md lifecycle inventory row {line_number}: "
+                "must contain exactly nine columns"
+            )
+            continue
+        cells = [cell.strip() for cell in raw_cells[1:-1]]
+        id_match = re.fullmatch(r"`([^`\n]+)`", cells[0])
+        if id_match is None:
+            errors.append(
+                f"dependency-policy.md lifecycle inventory row {line_number}: "
+                "Lifecycle ID must be one backticked value"
+            )
+            continue
+        rows.append((id_match.group(1), stripped))
+
+    if not found_header:
+        errors.append("docs/dependency-policy.md lifecycle inventory header is missing")
+    return rows, errors
+
+
+def policy_lifecycle_ids(policy_text: str) -> tuple[list[str], list[str]]:
+    """Extract canonical inventory Lifecycle IDs; report duplicate rows."""
+    rows, errors = policy_inventory_rows(policy_text)
+    ids: list[str] = []
+    seen: set[str] = set()
+    for lifecycle_id, _ in rows:
         if lifecycle_id in seen:
             errors.append(
                 f"duplicate lifecycle id in dependency-policy.md inventory: {lifecycle_id!r}"
@@ -504,15 +550,23 @@ def policy_reference_errors(
 ) -> list[str]:
     """Require the policy inventory to name each patch's docs path and upstream refs."""
     errors: list[str] = []
+    rows, _ = policy_inventory_rows(policy_text)
+    row_by_id = {lifecycle_id: row for lifecycle_id, row in rows}
     for patch in patches:
         pid = patch.get("id", "<unknown>")
+        row = row_by_id.get(pid)
+        if row is None:
+            errors.append(
+                f"{pid}: matching dependency-policy.md lifecycle inventory row is missing"
+            )
+            continue
         docs_path = patch.get("docs_path")
         if _is_nonempty_str(docs_path):
             docs_fragment = str(docs_path).removeprefix("docs/").rstrip("/")
-            if docs_fragment not in policy_text:
+            if docs_fragment not in row:
                 errors.append(
                     f"{pid}: docs path fragment {docs_fragment!r} missing from "
-                    "dependency-policy.md"
+                    "its dependency-policy.md inventory row"
                 )
         upstream = patch.get("upstream")
         if not isinstance(upstream, dict):
@@ -529,10 +583,10 @@ def policy_reference_errors(
             if not _is_positive_int(number):
                 continue
             reference = f"{repo}#{number}"
-            if reference not in policy_text:
+            if reference not in row:
                 errors.append(
                     f"{pid}: upstream {label} reference {reference!r} missing from "
-                    "dependency-policy.md inventory"
+                    "its dependency-policy.md inventory row"
                 )
     return errors
 
@@ -937,10 +991,16 @@ def _valid_patch(**overrides: Any) -> dict[str, Any]:
     return patch
 
 
-def _inventory_row(lifecycle_id: str, crate: str = "example") -> str:
+def _inventory_row(
+    lifecycle_id: str,
+    crate: str = "example",
+    upstream: str = "upstream",
+    docs_path: str | None = None,
+) -> str:
+    docs_path = docs_path or f"path/{lifecycle_id}/README.md"
     return (
-        f"| `{lifecycle_id}` | `{crate}` | 1.0.0 | patch | upstream | owner | reason | "
-        f"trigger | [docs](path/{lifecycle_id}/README.md) |"
+        f"| `{lifecycle_id}` | `{crate}` | 1.0.0 | patch | {upstream} | owner | "
+        f"reason | trigger | [docs]({docs_path}) |"
     )
 
 
@@ -1344,6 +1404,16 @@ true
         "vendored version with path separator",
     )
 
+    bad_docs_path = {
+        **base,
+        "patches": [_valid_patch(docs_path="../../outside-repository")],
+    }
+    expect_contains(
+        validate_lifecycle_shape(bad_docs_path),
+        "docs_path: must be a repository-relative",
+        "docs path traversal",
+    )
+
     dot_repo = {
         **base,
         "patches": [
@@ -1521,10 +1591,21 @@ true
     # --- policy inventory references -------------------------------------
     reference_policy = "\n".join(
         [
-            _inventory_row("example-001"),
-            "docs path: upstream-example-patches/001",
-            "tracked as [example/example#7](https://github.com/example/example/pull/7)",
-            "issue [example/example#6](https://github.com/example/example/issues/6)",
+            INVENTORY_HEADER,
+            "|---|---|---|---|---|---|---|---|---|",
+            _inventory_row(
+                "example-001",
+                upstream=(
+                    "[example/example#7](https://github.com/example/example/pull/7), "
+                    "issue [example/example#6]"
+                    "(https://github.com/example/example/issues/6)"
+                ),
+                docs_path=(
+                    "upstream-example-patches/001/README.md"
+                ),
+            ),
+            # A reference outside the matching row must not satisfy parity.
+            "unrelated prose mentions example/example#8 and example/example#99",
         ]
     )
     referenced_patch = _valid_patch(
@@ -1556,8 +1637,21 @@ true
     )
     expect_contains(
         policy_reference_errors("| no rows here |", [referenced_patch]),
-        "docs path fragment 'upstream-example-patches/001' missing",
-        "docs path fragment absent from policy",
+        "matching dependency-policy.md lifecycle inventory row is missing",
+        "matching inventory row absent from policy",
+    )
+
+    unrelated_table = "\n".join(
+        [
+            "| Other ID | A | B | C | D | E | F | G | H |",
+            "|---|---|---|---|---|---|---|---|---|",
+            _inventory_row("example-001"),
+        ]
+    )
+    expect_contains(
+        policy_id_parity_errors(unrelated_table, {"example-001"}),
+        "lifecycle inventory header is missing",
+        "unrelated nine-column table must not be treated as lifecycle inventory",
     )
 
     if failures:
