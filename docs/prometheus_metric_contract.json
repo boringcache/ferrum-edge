@@ -1711,6 +1711,7 @@
     "type": "gauge",
     "help": "Monotonic version of observed mesh trust bundles.",
     "labels": [
+      "trust_domain",
       "source",
       "gateway_namespace"
     ],
