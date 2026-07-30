@@ -1612,6 +1612,28 @@ pub mod _test_support {
         crate::plugins::soap_ws_security::decode_soap_xml_body_for_test(bytes, content_type)
     }
 
+    /// Frame an MTOM/XOP `multipart/related` package with the strict MIME
+    /// parser and return the selected root part as `(body, content_type)`, or
+    /// the fail-closed decode class.
+    pub fn soap_extract_mtom_root_part_for_test(
+        bytes: &[u8],
+        boundary: &str,
+        start: Option<&str>,
+    ) -> Result<(Vec<u8>, String), &'static str> {
+        crate::plugins::soap_ws_security::extract_mtom_root_part_for_test(bytes, boundary, start)
+    }
+
+    /// Media-type classification for a built plugin, as a stable string:
+    /// `"xml"` / `"xop"` / `"mtom"` for a governed representation,
+    /// `"pass_through"`, or `"reject:<status>:<class>"`.
+    pub fn soap_classify_request_for_test(
+        config: &serde_json::Value,
+        content_type: Option<&str>,
+    ) -> Result<String, String> {
+        let plugin = crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?;
+        Ok(plugin.classify_request_for_tests(content_type))
+    }
+
     /// Exact replay-state observation for deterministic external tests.
     ///
     /// `retained_key_bytes` counts each nonce string once. `shared_key_entries`
