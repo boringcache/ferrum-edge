@@ -4279,18 +4279,17 @@ async fn federation_usageless_response_kept_when_guard_rejects() {
 // connection-fields-only data-source baseline against the same shape with
 // `role_information` so the reserved delta equals the instruction text.
 
-/// A minimal Azure chat-completions request. The `messages` content is `"abcd"`
-/// (4 chars); together with the `"user"` role value the recognized prompt fields
-/// total a multiple of 4 characters. Because `div_ceil(4)` distributes over a
-/// base that is a multiple of 4, the reserved-token delta after adding
-/// `role_information` is exactly `ceil(instruction_chars / 4)` — independent of
-/// the exact base count — which keeps the assertions below robust.
+/// A minimal Azure chat-completions request used by the delta comparisons below.
 fn azure_base_messages() -> serde_json::Value {
     json!({
         "model": "gpt-4o-mini",
         "messages": [{"role": "user", "content": "abcd"}]
     })
 }
+
+/// A 32-character instruction keeps token deltas exact under `div_ceil(4)`
+/// regardless of the baseline's remainder.
+const AZURE_INSTRUCTION_32: &str = "0123456789abcdef0123456789abcdef";
 
 /// Reserved prompt-token estimate for `body` under a `prompt_tokens`-mode limiter
 /// with a budget far above any test request, so the reservation always succeeds
@@ -4328,7 +4327,7 @@ async fn prompt_estimate_counts_azure_on_your_data_role_information() {
     // `role_information`. Compare against the same connection-field shape so the
     // delta isolates the instruction (endpoint/index/key strings are already in
     // the baseline and therefore cancel out of the delta).
-    let instruction = "You are a helpful assistant answering only from the indexed docs.";
+    let instruction = AZURE_INSTRUCTION_32;
     let mut baseline = azure_base_messages();
     baseline["data_sources"] = json!([{
         "type": "azure_search",
@@ -4361,7 +4360,7 @@ async fn prompt_estimate_counts_azure_extensions_api_role_information_camelcase(
     // The original extensions API used camelCase for BOTH the outer array
     // (`dataSources`) and the inner field (`roleInformation`); both casings must be
     // recognized by the whole-body walk.
-    let instruction = "Answer in formal English and cite the source document id.";
+    let instruction = AZURE_INSTRUCTION_32;
     let mut baseline = azure_base_messages();
     baseline["dataSources"] = json!([{
         "type": "AzureCognitiveSearch",
@@ -4386,7 +4385,7 @@ async fn prompt_estimate_does_not_short_circuit_on_empty_role_information() {
     // Distinct Azure role-information casings are distinct JSON keys, so an empty
     // `role_information` decoy cannot hide a real `roleInformation` sibling under
     // the whole-body walk (each string value is visited independently).
-    let instruction = "Stay strictly within the retrieved enterprise knowledge base.";
+    let instruction = AZURE_INSTRUCTION_32;
     let mut baseline = azure_base_messages();
     baseline["data_sources"] = json!([{
         "type": "azure_search",
@@ -4415,7 +4414,7 @@ async fn prompt_estimate_counts_whitespace_role_information_without_hiding_sibli
     // value is counted as its characters rather than trimmed away — and, like the
     // empty-string case, it must not hide a real sibling in the other casing.
     let whitespace = "   "; // 3 chars: neither None nor empty.
-    let instruction = "Respond concisely.";
+    let instruction = AZURE_INSTRUCTION_32;
     let mut baseline = azure_base_messages();
     baseline["data_sources"] = json!([{
         "type": "azure_search",
