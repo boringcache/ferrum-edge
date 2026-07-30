@@ -48,6 +48,16 @@ spec:
       serviceAccountName: src-a
       nodeSelector:
         ferrum.io/live-node: a
+      # Ambient daemonset rollouts can briefly interrupt the first DNS packet
+      # even after workload and NodeWaypoint readiness converge. Keep the
+      # security assertions single-shot while making libc resolution tolerate
+      # that bounded dataplane transition.
+      dnsConfig:
+        options:
+          - name: timeout
+            value: "1"
+          - name: attempts
+            value: "10"
       containers:
         - name: curl
           image: curlimages/curl:8.10.1
@@ -72,6 +82,13 @@ spec:
       serviceAccountName: src-b
       nodeSelector:
         ferrum.io/live-node: b
+      # Match src-a so allow and deny assertions see the same resolver policy.
+      dnsConfig:
+        options:
+          - name: timeout
+            value: "1"
+          - name: attempts
+            value: "10"
       containers:
         - name: curl
           image: curlimages/curl:8.10.1

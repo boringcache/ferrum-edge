@@ -647,6 +647,178 @@ pub fn load_config_from_file(
     Ok(config)
 }
 
+/// Decode and validate a config document from in-memory bytes.
+///
+/// Skips filesystem stability and plugin file-dependency checks, plus namespace
+/// filtering. Intended for the adversarial fuzz lane and deterministic parser
+/// tests — not production load. Keeping this entry point free of file reads
+/// prevents generated paths from turning a pure parser target into runner I/O.
+#[cfg(feature = "fuzzing")]
+pub fn decode_and_validate_config_document(
+    content: &str,
+    cert_expiry_warning_days: u64,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<GatewayConfig, anyhow::Error> {
+    if content.len() as u64 > MAX_CONFIG_FILE_BYTES {
+        anyhow::bail!("config document exceeds maximum size of {MAX_CONFIG_FILE_BYTES} bytes");
+    }
+
+    let is_yaml = serde_yaml::from_str::<serde_yaml::Value>(content).is_ok()
+        && !content.trim_start().starts_with('{');
+
+    let (mut value, mut yaml_value): (serde_json::Value, Option<serde_yaml::Value>) = if is_yaml {
+        let yaml_val: serde_yaml::Value = serde_yaml::from_str(content)?;
+        (serde_json::to_value(&yaml_val)?, Some(yaml_val))
+    } else {
+        (serde_json::from_str(content)?, None)
+    };
+
+    let resource_counts = take_resource_counts_from_json(&mut value)?;
+    strip_resource_counts_from_yaml(&mut yaml_value);
+
+    let file_version = match value.get_mut("version") {
+        None => anyhow::bail!("Configuration file missing required 'version' field"),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(other) => {
+            if let Some(n) = other.as_u64() {
+                let s = n.to_string();
+                *other = serde_json::Value::String(s.clone());
+                if let Some(serde_yaml::Value::Mapping(mapping)) = yaml_value.as_mut()
+                    && let Some(yaml_version) =
+                        mapping.get_mut(serde_yaml::Value::String("version".to_string()))
+                {
+                    *yaml_version = serde_yaml::Value::String(s.clone());
+                }
+                s
+            } else {
+                let value_type = match other {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "boolean",
+                    serde_json::Value::Number(number) if number.is_i64() => "negative integer",
+                    serde_json::Value::Number(_) => "floating-point number",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                    serde_json::Value::String(_) => "string",
+                };
+                anyhow::bail!(
+                    "field 'version' must be a string or non-negative integer (got {value_type}); use version: \"1\" or version: 1"
+                );
+            }
+        }
+    };
+
+    if file_version != CURRENT_CONFIG_VERSION {
+        ConfigMigrator::migrate_in_memory(&mut value)?;
+    }
+
+    let mut config: GatewayConfig = if is_yaml && file_version == CURRENT_CONFIG_VERSION {
+        serde_yaml::from_value(yaml_value.ok_or_else(|| {
+            anyhow::anyhow!("internal error: parsed YAML value was not retained")
+        })?)?
+    } else {
+        serde_json::from_value(value)?
+    };
+
+    if let Some(ref expected) = resource_counts {
+        validate_resource_counts(&config, expected)?;
+    }
+
+    ValidationPipeline::new(&mut config)
+        .validate_resource_ids(ValidationAction::FatalCount(
+            "Configuration validation failed: {} invalid resource ID(s) found",
+        ))
+        .validate_all_fields_with_ip_policy(
+            cert_expiry_warning_days,
+            backend_allow_ips,
+            ValidationAction::FatalCount(
+                "Configuration validation failed: {} invalid field(s) found",
+            ),
+        )
+        .validate_unique_resource_ids(ValidationAction::FatalCount(
+            "Configuration validation failed: {} duplicate resource ID(s) found",
+        ))
+        .normalize_fields()
+        .resolve_upstream_tls()
+        .validate_hosts(ValidationAction::FatalCount(
+            "Configuration validation failed: {} invalid host(s) found",
+        ))
+        .validate_regex_listen_paths(ValidationAction::FatalCount(
+            "Configuration validation failed: {} invalid regex listen_path(s) found",
+        ))
+        .validate_listen_path_encodings(ValidationAction::FatalCount(
+            "Configuration validation failed: {} non-canonical listen_path(s) found",
+        ))
+        .run()?;
+
+    let plaintext_basic_auth_consumers: Vec<&str> = config
+        .consumers
+        .iter()
+        .filter(|consumer| {
+            consumer
+                .credentials
+                .get("basicauth")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|entries| entries.iter().any(|entry| entry.get("password").is_some()))
+        })
+        .map(|consumer| consumer.id.as_str())
+        .collect();
+    if !plaintext_basic_auth_consumers.is_empty() {
+        anyhow::bail!(
+            "Configuration validation failed: file-mode Basic-auth credentials must use \
+             'password_hash'; plaintext 'password' is accepted only by Admin API writes \
+             (consumer IDs: {})",
+            plaintext_basic_auth_consumers.join(", ")
+        );
+    }
+
+    if let Err(errors) = config.validate_operator_provided_fields() {
+        anyhow::bail!(
+            "Configuration validation failed: {} mesh-projected upstream field(s) \
+             cannot be set in file config: {}",
+            errors.len(),
+            errors.join("; ")
+        );
+    }
+
+    ValidationPipeline::new(&mut config)
+        .validate_unique_listen_paths(ValidationAction::FatalCount(
+            "Configuration validation failed: {} duplicate listen_path(s) found",
+        ))
+        .validate_unique_consumer_identities(ValidationAction::FatalCount(
+            "Configuration validation failed: {} duplicate consumer identity(ies) found. Each consumer must have a unique username and unique custom_id.",
+        ))
+        .validate_unique_consumer_credentials(ValidationAction::FatalCount(
+            "Configuration validation failed: {} duplicate consumer credential(s) found. Each consumer must have a unique keyauth API key.",
+        ))
+        .validate_unique_upstream_names(ValidationAction::FatalCount(
+            "Configuration validation failed: {} duplicate upstream name(s) found",
+        ))
+        .validate_unique_proxy_names(ValidationAction::FatalCount(
+            "Configuration validation failed: {} duplicate proxy name(s) found",
+        ))
+        .validate_upstream_references(ValidationAction::FatalCount(
+            "Configuration validation failed: {} invalid upstream reference(s) found",
+        ))
+        .validate_mesh_route_dispatch_references(ValidationAction::FatalCount(
+            "Configuration validation failed: {} invalid mesh_route_dispatch upstream reference(s) found",
+        ))
+        .validate_plugin_references(ValidationAction::FatalCount(
+            "Configuration validation failed: {} invalid plugin reference(s) found",
+        ))
+        .validate_plugin_configs(
+            backend_allow_ips,
+            ValidationAction::FatalCount(
+                "Configuration validation failed: {} plugin config error(s) found",
+            ),
+        )
+        .validate_stream_proxies(ValidationAction::FatalCount(
+            "Configuration validation failed: {} stream proxy error(s) found",
+        ))
+        .run()?;
+
+    Ok(config)
+}
+
 /// Load and validate an owned file-mode candidate without blocking an async
 /// runtime worker on filesystem parsing or MMDB verification.
 pub async fn load_config_from_file_off_thread(
