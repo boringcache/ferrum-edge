@@ -603,6 +603,11 @@ fn representative_exposition() -> String {
     let registry = MetricsRegistry::new();
     registry.configure(60, 3600, 0, "contract-ns");
     registry.record(&make_summary("contract-proxy"));
+    let mut grpc_summary = make_summary("contract-grpc-proxy");
+    grpc_summary
+        .metadata
+        .insert("grpc_status".to_string(), "0".to_string());
+    registry.record(&grpc_summary);
     registry.record_rate_limit_exceeded();
     registry.record_request_mirror_dispatched();
     registry.record_mesh_tcp_egress_connection("hbone", true);
