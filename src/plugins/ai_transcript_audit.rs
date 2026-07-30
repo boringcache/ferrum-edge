@@ -1999,7 +1999,7 @@ impl AiTranscriptAudit {
             namespace,
             staging: Arc::new(DashMap::with_shard_amount(shard_amount)),
             staging_permits: Arc::new(Semaphore::new(MAX_STAGING_ENTRIES)),
-            retained_budget: Arc::new(ByteBudget::new(
+            retained_budget: Arc::new(ByteBudget::new_observability(
                 "ai_transcript_audit",
                 limits.buffer_max_bytes,
             )),

@@ -9,11 +9,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
 use tokio::net::UdpSocket;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
+use ferrum_edge::_test_support::prepend_proxy_plugin_for_test;
 use ferrum_edge::adaptive_buffer::AdaptiveBufferTracker;
 use ferrum_edge::circuit_breaker::CircuitBreakerCache;
 use ferrum_edge::config::types::{
@@ -24,7 +26,10 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::modes::mesh::outbound_enforcement::empty_slot;
 use ferrum_edge::overload::OverloadState;
 use ferrum_edge::plugin_cache::PluginCache;
-use ferrum_edge::plugins::ProxyProtocol;
+use ferrum_edge::plugins::{
+    Plugin, PluginResult, ProxyProtocol, StreamConnectionContext, UDP_ONLY_PROTOCOLS,
+    UdpDatagramContext, UdpDatagramVerdict,
+};
 use ferrum_edge::proxy::udp_proxy::{UdpListenerConfig, UdpProxyMetrics, start_udp_listener};
 use ferrum_edge::request_epoch::RequestEpochStore;
 
@@ -35,6 +40,63 @@ const PLUGIN_CONFIG_ID: &str = "udp-fault-plugin";
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const PER_ATTEMPT_STARTED_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_GATEWAY_ATTEMPTS: u32 = 3;
+
+/// Deterministic ordering seam for the first-datagram setup path.
+///
+/// A rejected stream must signal `stream_entered` before any datagram hook can
+/// signal `datagram_entered`. The old datagram-first ordering does the reverse,
+/// without relying on a scheduler-sensitive sleep or a real fault-delay timer.
+struct RejectingStreamOrderingProbe {
+    stream_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    datagram_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+}
+
+#[async_trait]
+impl Plugin for RejectingStreamOrderingProbe {
+    fn name(&self) -> &str {
+        "test_udp_stream_ordering_probe"
+    }
+
+    fn priority(&self) -> u16 {
+        0
+    }
+
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        UDP_ONLY_PROTOCOLS
+    }
+
+    fn requires_udp_datagram_hooks(&self) -> bool {
+        true
+    }
+
+    async fn on_stream_connect(&self, _ctx: &mut StreamConnectionContext) -> PluginResult {
+        if let Some(tx) = self
+            .stream_entered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = tx.send(());
+        }
+        PluginResult::Reject {
+            status_code: 403,
+            body: String::new(),
+            headers: std::collections::HashMap::new(),
+        }
+    }
+
+    async fn on_udp_datagram(&self, _ctx: &UdpDatagramContext<'_>) -> UdpDatagramVerdict {
+        if let Some(tx) = self
+            .datagram_entered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = tx.send(());
+        }
+        UdpDatagramVerdict::Drop
+    }
+}
 
 fn fault_plugin_config(config: serde_json::Value) -> PluginConfig {
     PluginConfig {
@@ -136,12 +198,14 @@ struct SpawnedUdpGateway {
     listen_port: u16,
     shutdown_tx: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
+    ordering_signals: Option<(oneshot::Receiver<()>, oneshot::Receiver<()>)>,
 }
 
 async fn try_spawn_udp_gateway(
     backend_port: u16,
     listen_port: u16,
     fault_config: serde_json::Value,
+    reject_unauthenticated: bool,
 ) -> Option<SpawnedUdpGateway> {
     let proxy = udp_proxy(listen_port, backend_port);
     let proxy_namespace = proxy.namespace.clone();
@@ -158,6 +222,23 @@ async fn try_spawn_udp_gateway(
     let plugin_cache = Arc::new(
         PluginCache::new(&gateway_config).expect("PluginCache builds with fault_injection"),
     );
+    let ordering_signals = if reject_unauthenticated {
+        let (stream_entered_tx, stream_entered_rx) = oneshot::channel();
+        let (datagram_entered_tx, datagram_entered_rx) = oneshot::channel();
+        prepend_proxy_plugin_for_test(
+            &plugin_cache,
+            &proxy_namespace,
+            PROXY_ID,
+            Arc::new(RejectingStreamOrderingProbe {
+                stream_entered: std::sync::Mutex::new(Some(stream_entered_tx)),
+                datagram_entered: std::sync::Mutex::new(Some(datagram_entered_tx)),
+            }),
+        )
+        .expect("inject UDP stream-ordering probe");
+        Some((stream_entered_rx, datagram_entered_rx))
+    } else {
+        None
+    };
     let attached =
         plugin_cache.get_plugins_for_protocol(&proxy_namespace, PROXY_ID, ProxyProtocol::Udp);
     assert!(
@@ -168,6 +249,14 @@ async fn try_spawn_udp_gateway(
         attached.iter().any(|p| p.requires_udp_datagram_hooks()),
         "fault_injection must opt into on_udp_datagram"
     );
+    if reject_unauthenticated {
+        assert!(
+            attached
+                .iter()
+                .any(|p| p.name() == "test_udp_stream_ordering_probe"),
+            "stream-ordering probe must attach to UDP"
+        );
+    }
 
     let consumer_index = Arc::new(ferrum_edge::consumer_index::ConsumerIndex::new(
         &gateway_config.consumers,
@@ -237,6 +326,7 @@ async fn try_spawn_udp_gateway(
                 listen_port,
                 shutdown_tx,
                 join,
+                ordering_signals,
             });
         }
         if join.is_finished() {
@@ -257,11 +347,24 @@ async fn spawn_udp_gateway_with_retry(
     backend_port: u16,
     fault_config: serde_json::Value,
 ) -> SpawnedUdpGateway {
+    spawn_udp_gateway_with_policy(backend_port, fault_config, false).await
+}
+
+async fn spawn_udp_gateway_with_policy(
+    backend_port: u16,
+    fault_config: serde_json::Value,
+    reject_unauthenticated: bool,
+) -> SpawnedUdpGateway {
     for attempt in 1..=MAX_GATEWAY_ATTEMPTS {
         let frontend = reserve_udp_port().await.expect("reserve frontend UDP port");
         let listen_port = frontend.drop_and_take_port();
-        if let Some(gateway) =
-            try_spawn_udp_gateway(backend_port, listen_port, fault_config.clone()).await
+        if let Some(gateway) = try_spawn_udp_gateway(
+            backend_port,
+            listen_port,
+            fault_config.clone(),
+            reject_unauthenticated,
+        )
+        .await
         {
             return gateway;
         }
@@ -274,6 +377,52 @@ async fn spawn_udp_gateway_with_retry(
         }
     }
     panic!("udp listener never reported started=true after {MAX_GATEWAY_ATTEMPTS} attempts");
+}
+
+#[tokio::test]
+async fn udp_stream_rejection_precedes_first_datagram_fault_delay() {
+    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
+    let backend_port = backend.local_addr().expect("backend addr").port();
+    let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
+
+    let mut gateway = spawn_udp_gateway_with_policy(
+        backend_port,
+        json!({ "delay": { "duration_ms": 2_000, "percentage": 100.0 } }),
+        true,
+    )
+    .await;
+    let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway.listen_port);
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+
+    client
+        .send_to(b"unauthorized", gateway_addr)
+        .await
+        .expect("send unauthorized datagram");
+
+    let (mut stream_entered, mut datagram_entered) = gateway
+        .ordering_signals
+        .take()
+        .expect("rejecting gateway must expose ordering signals");
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        tokio::select! {
+            biased;
+            result = &mut stream_entered => {
+                result.expect("stream-ordering probe sender must remain live");
+            }
+            result = &mut datagram_entered => {
+                result.expect("datagram-ordering probe sender must remain live");
+                panic!("first-datagram hook ran before stream admission rejected the client");
+            }
+        }
+    })
+    .await
+    .expect("UDP setup must reach one ordering probe");
+
+    let _ = gateway.shutdown_tx.send(true);
+    tokio::time::timeout(TEST_TIMEOUT, gateway.join)
+        .await
+        .expect("rejected setup must not retain a worker")
+        .expect("UDP listener task must shut down cleanly");
 }
 
 async fn echo_round_trip(

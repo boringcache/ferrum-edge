@@ -227,6 +227,30 @@ fn per_instance_byte_budget_also_charges_the_shared_ceiling() {
 }
 
 #[test]
+fn generic_byte_budget_does_not_charge_the_observability_ceiling() {
+    let ceiling = test_ceiling(16);
+    let observability = ByteBudget::with_ceiling("http_logging", 16, ceiling);
+    let cache = ByteBudget::new("ai_semantic_cache", 16);
+
+    let cache_lease = cache.try_acquire(16).expect("cache admission");
+    assert_eq!(
+        ceiling.used(),
+        0,
+        "cache bytes must not consume log capacity"
+    );
+
+    let log_lease = observability
+        .try_acquire(16)
+        .expect("observability admission remains available");
+    assert_eq!(ceiling.used(), 16);
+
+    drop(log_lease);
+    drop(cache_lease);
+    assert_eq!(ceiling.used(), 0);
+    assert_eq!(cache.used(), 0);
+}
+
+#[test]
 fn two_instances_cannot_exceed_the_shared_ceiling_between_them() {
     // The multi-instance clause: each sink is individually within its own
     // budget, yet the process total still holds.

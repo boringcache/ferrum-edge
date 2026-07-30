@@ -5200,7 +5200,7 @@ config:
 
 ### `ai_semantic_firewall`
 
-Semantically inspects LLM request and response bodies for prompt injection, jailbreaks, system/developer prompt exfiltration, sensitive data exfiltration intent, indirect prompt injection in RAG/tool/document content, tool-call abuse, business-topic allowlists/denylists, and response leakage. This plugin does not implement generic request/response size limits, timeouts, retries, circuit breaking, token budgets, or regex PII scanning; use the native gateway controls and existing AI guard plugins for those surfaces.
+Semantically inspects LLM request and response bodies for prompt injection, jailbreaks, system/developer prompt exfiltration, sensitive data exfiltration intent, indirect prompt injection in RAG/tool/document content, tool-call abuse (including modern `tool_calls` and legacy `function_call` request history), business-topic allowlists/denylists, and response leakage. This plugin does not implement generic request/response size limits, timeouts, retries, circuit breaking, token budgets, or regex PII scanning; use the native gateway controls and existing AI guard plugins for those surfaces.
 
 **Priority:** 2968
 
