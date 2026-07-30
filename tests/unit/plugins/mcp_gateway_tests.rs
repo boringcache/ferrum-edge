@@ -3949,6 +3949,36 @@ async fn aggregate_tools_family_outage_keeps_prompts_healthy_and_recovers_on_ttl
 }
 
 #[tokio::test]
+async fn aggregate_total_catalog_outage_is_cached_until_ttl() {
+    let server = MockServer::start().await;
+    let tool_requests = Arc::new(AtomicUsize::new(0));
+    let tool_counter = Arc::clone(&tool_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            tool_counter.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(500)
+        })
+        .mount(&server)
+        .await;
+    let config = single_server_family_config(&format!("{}/mcp", server.uri()), true, false, false);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (_, first, _) = tools_list_with_metadata(&plugin, &session_id, 106).await;
+    assert_eq!(first["error"]["code"], -32006);
+    let (_, second, _) = tools_list_with_metadata(&plugin, &session_id, 107).await;
+    assert_eq!(second["error"]["code"], -32006);
+    assert_eq!(tool_requests.load(Ordering::SeqCst), 1);
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, third, _) = tools_list_with_metadata(&plugin, &session_id, 108).await;
+    assert_eq!(third["error"]["code"], -32006);
+    assert_eq!(tool_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn aggregate_prompts_family_outage_keeps_tools_healthy() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
