@@ -13,7 +13,8 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
     clickhouse_insert_url_for_tests, compact_recovery_probe_for_tests,
     compile_charge_event_projection, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
-    encode_spool_bytes_without_content_size_for_tests, new_ulid,
+    encode_spool_bytes_without_content_size_for_tests,
+    encode_spool_bytes_without_ratio_padding_for_tests, new_ulid,
     probe_charge_body_materialization_for_tests,
     probe_charge_body_materialization_with_projection_for_tests,
     probe_compact_recovery_retry_for_tests, render_prometheus, render_status_json,
@@ -7369,9 +7370,8 @@ fn a_zstd_artifact_without_a_frame_content_size_still_decodes_via_the_ratio_clam
 
 #[test]
 fn a_zstd_artifact_this_build_writes_declares_its_decompressed_size() {
-    // The declared size is what replay reserves instead of the 200x heuristic,
-    // so an ordinary compressible batch no longer reserves two orders of
-    // magnitude more than it needs.
+    // Ordinary one-shot artifacts carry a declared size, but replay still
+    // applies the ratio limit because the frame header is unauthenticated.
     let plain = vec![b'\n'; 512 * 1024];
     let one_shot = encode_spool_bytes_for_tests(&plain, SpoolCompression::Zstd).unwrap();
     let streamed =
@@ -7390,13 +7390,12 @@ fn a_zstd_artifact_this_build_writes_declares_its_decompressed_size() {
 }
 
 #[test]
-fn a_highly_compressible_zstd_artifact_this_build_writes_uses_its_declared_size() {
-    // A legitimate one-shot artifact can compress beyond the heuristic used
-    // for foreign/headerless frames. Its declared size remains authoritative
-    // up to the absolute artifact ceiling, so replay must not quarantine it.
+fn a_declared_zstd_size_cannot_bypass_the_decompression_ratio_limit() {
+    // Frame content sizes are unauthenticated. Even a truthful declaration
+    // must not let a planted high-ratio archive bypass the ratio limit.
     let temp = tempfile::tempdir().unwrap();
     let plain = vec![b'\n'; 2 * 1024 * 1024];
-    let encoded = encode_spool_bytes_for_tests(&plain, SpoolCompression::Zstd).unwrap();
+    let encoded = encode_spool_bytes_without_ratio_padding_for_tests(&plain).unwrap();
     let ratio_bound = spool_decompression_limit_for_tests(encoded.len() as u64);
     assert!(
         ratio_bound < plain.len() as u64,
@@ -7406,9 +7405,47 @@ fn a_highly_compressible_zstd_artifact_this_build_writes_uses_its_declared_size(
 
     let path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FC3.ndjson.zst");
     fs::write(&path, encoded).unwrap();
-    let decoded = decode_spool_file_for_tests(&path)
-        .expect("a writer-owned frame with a safe declared size must decode");
-    assert_eq!(decoded.len(), plain.len());
+    let err = decode_spool_file_for_tests(&path)
+        .expect_err("a declared size must not bypass the decompression-ratio limit");
+    assert!(
+        err.contains("decompression bound"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn a_legitimate_high_ratio_batch_is_padded_and_remains_replayable() {
+    let ceiling = leaked_chargeback_test_ceiling(16 * 1024 * 1024);
+    let temp = tempfile::tempdir().unwrap();
+    let mut settings = spool_settings(temp.path(), 4 * 1024 * 1024);
+    settings.compression = SpoolCompression::Zstd;
+    let spool = SpoolManager::for_tests_with_ceiling(settings, "node-a", ceiling).unwrap();
+    let mut event = sample_event("evt-high-ratio");
+    event.request_id = Some("a".repeat(2 * 1024 * 1024));
+    let decoded_len = serialize_json_each_row(std::slice::from_ref(&event))
+        .unwrap()
+        .len() as u64;
+
+    let path = spool
+        .write_events(&[event])
+        .expect("a legitimate high-ratio batch must remain durable");
+    assert!(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".ndjson.zst")),
+        "a high-ratio batch must remain a zstd artifact: {}",
+        path.display()
+    );
+    let encoded_len = fs::metadata(&path).unwrap().len();
+    assert!(
+        spool_decompression_limit_for_tests(encoded_len) >= decoded_len,
+        "writer padding must make its own artifact satisfy the replay ratio"
+    );
+    let decoded = decode_spool_file_for_tests(&path).expect("the padded artifact must replay");
+    assert!(
+        decoded.contains("evt-high-ratio"),
+        "the padded artifact must preserve the billing event"
+    );
 }
 
 // ---------------------------------------------------------------------------

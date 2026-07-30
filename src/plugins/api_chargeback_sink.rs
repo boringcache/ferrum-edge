@@ -130,10 +130,13 @@ const MAX_RETRY_MAX_ATTEMPTS: u32 = 32;
 const MAX_RETRY_DELAY_MS: u64 = 60_000;
 /// Bound on how far one compressed spool record may expand during replay.
 ///
-/// JSONEachRow charge batches compress at roughly 5-20x, so a 200x allowance
-/// never rejects a record this plugin wrote, while a planted high-ratio archive
-/// inside the managed tree can no longer expand without limit inside the billing
-/// process. An over-limit record is quarantined, never silently dropped.
+/// JSONEachRow charge batches normally compress at roughly 5-20x, so a 200x
+/// allowance accepts ordinary zstd artifacts while a planted high-ratio archive
+/// inside the managed tree cannot expand without limit inside the billing
+/// process. The writer pads an unusually compressible legitimate frame with a
+/// zstd skippable frame when needed, so every compressed artifact it publishes
+/// remains within this ratio and replayable. An over-limit planted record is
+/// quarantined, never silently dropped.
 const SPOOL_MAX_DECOMPRESSION_RATIO: u64 = 200;
 /// Floor for the expansion allowance so a very small legitimate record is never
 /// bounded below its own framing overhead.
@@ -2891,7 +2894,7 @@ impl ApiChargebackSink {
             },
         );
 
-        let byte_budget = Arc::new(ByteBudget::new(
+        let byte_budget = Arc::new(ByteBudget::new_observability(
             PLUGIN_NAME,
             self.config
                 .batch
@@ -6367,10 +6370,12 @@ impl SpoolManager {
     /// survives into the blocking durable write.
     ///
     /// The artifact is additionally refused unless replaying it would fit under
-    /// the same configured ceiling (see [`spool_replay_peak_bytes`]): writing a
-    /// file this process could never read back is a permanent loss, whereas
-    /// refusing it here is reported through the existing spool-write failure
-    /// accounting.
+    /// the same configured ceiling (see [`spool_replay_peak_bytes`]). When a
+    /// legitimate zstd payload exceeds the untrusted-archive expansion ratio,
+    /// materialization pads it with an ignored zstd skippable frame until the
+    /// encoded size satisfies that ratio. Writing a file this process could
+    /// never read back is a permanent loss; every artifact returned here is
+    /// structurally replayable.
     fn materialize_spool_artifact(
         &self,
         events: &[ChargeEvent],
@@ -6403,10 +6408,11 @@ impl SpoolManager {
 
                 let encoded = materialize_reserved_buffer(self.ceiling, bound, |buffer| {
                     // One-shot compression records the decompressed size in the
-                    // zstd frame header, which is what replay reserves against
-                    // instead of the ratio heuristic.
-                    zstd::bulk::compress_to_buffer(json.as_slice(), buffer, 0)
-                        .map_err(|error| format!("zstd compression failed: {error}"))
+                    // zstd frame header. Replay uses it only when the whole file
+                    // also satisfies the untrusted-archive ratio limit.
+                    let written = zstd::bulk::compress_to_buffer(json.as_slice(), buffer, 0)
+                        .map_err(|error| format!("zstd compression failed: {error}"))?;
+                    pad_zstd_to_replay_ratio(buffer, written, decoded_len)
                 })
                 .map_err(|error| {
                     format!(
@@ -7947,10 +7953,30 @@ fn is_spool_owned_file(path: &Path) -> bool {
 #[allow(dead_code)] // external unit tests only
 fn encode_spool_bytes(bytes: &[u8], compression: SpoolCompression) -> Result<Vec<u8>, String> {
     match compression {
-        SpoolCompression::Zstd => zstd::bulk::compress(bytes, 0)
-            .map_err(|error| format!("{PLUGIN_NAME}: zstd compression failed: {error}")),
+        SpoolCompression::Zstd => {
+            let bound = zstd::zstd_safe::compress_bound(bytes.len())
+                .checked_add(SPOOL_ZSTD_FRAME_SLACK_BYTES)
+                .ok_or_else(|| format!("{PLUGIN_NAME}: spool compression byte bound overflowed"))?;
+            let mut encoded = vec![0u8; bound];
+            let written = zstd::bulk::compress_to_buffer(bytes, &mut encoded, 0)
+                .map_err(|error| format!("{PLUGIN_NAME}: zstd compression failed: {error}"))?;
+            let written = pad_zstd_to_replay_ratio(&mut encoded, written, bytes.len() as u64)?;
+            encoded.truncate(written);
+            Ok(encoded)
+        }
         SpoolCompression::None => Ok(bytes.to_vec()),
     }
+}
+
+/// Encode a raw one-shot zstd frame without the writer's ratio padding.
+///
+/// External tests use this to model a planted frame whose truthful declared
+/// size would exceed the replay ratio. Production must never call it.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn encode_spool_bytes_without_ratio_padding_for_tests(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    zstd::bulk::compress(bytes, 0)
+        .map_err(|error| format!("{PLUGIN_NAME}: zstd compression failed: {error}"))
 }
 
 /// Encode a spool artifact with the *streaming* zstd encoder, which omits the
@@ -8192,15 +8218,14 @@ fn decode_spool_artifact(
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.contains(".ndjson.zst"));
-    // An uncompressed artifact decodes to exactly its on-disk size. A compressed
-    // one this build wrote records its decompressed size in the zstd frame
-    // header, which is the *tight* bound replay reserves; only a frame without
-    // one (a foreign or hand-planted archive) falls back to the ratio clamp.
+    // An uncompressed artifact decodes to exactly its on-disk size. Treat a
+    // zstd frame's declared content size only as a tighter bound: the header is
+    // unauthenticated, so it must never bypass the decompression-ratio limit.
     let mut file = file;
     let decoded_bound = if compressed {
         let ratio_limit = spool_decompression_limit(encoded_len);
         match read_zstd_frame_content_size(&mut file, path)? {
-            Some(declared) if declared <= SPOOL_MAX_ARTIFACT_BYTES => declared,
+            Some(declared) if declared <= SPOOL_MAX_ARTIFACT_BYTES => declared.min(ratio_limit),
             Some(declared) => {
                 return Err(SpoolDecodeError::Unreadable(format!(
                     "{PLUGIN_NAME}: spool file '{}' declares a {declared}-byte decoded size above the hard {SPOOL_MAX_ARTIFACT_BYTES}-byte artifact bound",
@@ -8326,6 +8351,73 @@ fn spool_decompression_limit(encoded_len: u64) -> u64 {
     encoded_len
         .saturating_mul(SPOOL_MAX_DECOMPRESSION_RATIO)
         .clamp(SPOOL_MIN_DECOMPRESSED_BYTES, SPOOL_MAX_ARTIFACT_BYTES)
+}
+
+/// Make one writer-owned zstd artifact satisfy the same expansion-ratio bound
+/// replay applies to untrusted files.
+///
+/// Zstd skippable frames are explicitly ignored by decoders but count toward
+/// the on-disk encoded length. Appending a zero-filled skippable frame therefore
+/// preserves the decoded JSON exactly while preventing an unusually
+/// compressible legitimate batch from becoming an artifact replay would
+/// quarantine. A local actor who removes the padding only makes the file fail
+/// closed at replay.
+fn pad_zstd_to_replay_ratio(
+    buffer: &mut [u8],
+    encoded_len: usize,
+    decoded_len: u64,
+) -> Result<usize, String> {
+    let encoded_len_u64 = u64::try_from(encoded_len)
+        .map_err(|_| format!("{PLUGIN_NAME}: zstd encoded length exceeds u64"))?;
+    if decoded_len <= spool_decompression_limit(encoded_len_u64) {
+        return Ok(encoded_len);
+    }
+
+    const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
+    const SKIPPABLE_HEADER_BYTES: usize = 8;
+
+    let required_encoded_len = decoded_len.div_ceil(SPOOL_MAX_DECOMPRESSION_RATIO);
+    let required_encoded_len = usize::try_from(required_encoded_len)
+        .map_err(|_| format!("{PLUGIN_NAME}: zstd ratio padding length exceeds this platform"))?;
+    let final_len = required_encoded_len.max(
+        encoded_len
+            .checked_add(SKIPPABLE_HEADER_BYTES)
+            .ok_or_else(|| format!("{PLUGIN_NAME}: zstd ratio padding length overflowed"))?,
+    );
+    let padding = buffer.get_mut(encoded_len..final_len).ok_or_else(|| {
+        format!("{PLUGIN_NAME}: reserved zstd buffer is too small for ratio padding")
+    })?;
+    let payload_len = padding
+        .len()
+        .checked_sub(SKIPPABLE_HEADER_BYTES)
+        .ok_or_else(|| format!("{PLUGIN_NAME}: zstd ratio padding header is incomplete"))?;
+    let payload_len = u32::try_from(payload_len)
+        .map_err(|_| format!("{PLUGIN_NAME}: zstd ratio padding payload is too large"))?;
+    {
+        let header = padding
+            .get_mut(..SKIPPABLE_HEADER_BYTES)
+            .ok_or_else(|| format!("{PLUGIN_NAME}: zstd ratio padding header is incomplete"))?;
+        let magic = header
+            .get_mut(..4)
+            .ok_or_else(|| format!("{PLUGIN_NAME}: zstd ratio padding magic is incomplete"))?;
+        magic.copy_from_slice(&SKIPPABLE_MAGIC.to_le_bytes());
+        let size = header
+            .get_mut(4..SKIPPABLE_HEADER_BYTES)
+            .ok_or_else(|| format!("{PLUGIN_NAME}: zstd ratio padding size is incomplete"))?;
+        size.copy_from_slice(&payload_len.to_le_bytes());
+    }
+    let payload = padding
+        .get_mut(SKIPPABLE_HEADER_BYTES..)
+        .ok_or_else(|| format!("{PLUGIN_NAME}: zstd ratio padding payload is missing"))?;
+    payload.fill(0);
+    let final_len_u64 = u64::try_from(final_len)
+        .map_err(|_| format!("{PLUGIN_NAME}: padded zstd length exceeds u64"))?;
+    if decoded_len > spool_decompression_limit(final_len_u64) {
+        return Err(format!(
+            "{PLUGIN_NAME}: zstd ratio padding did not satisfy the replay bound"
+        ));
+    }
+    Ok(final_len)
 }
 
 /// Read at most `limit` bytes, growing geometrically but never allocating past

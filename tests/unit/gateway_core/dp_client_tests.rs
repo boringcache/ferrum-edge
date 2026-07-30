@@ -31,6 +31,31 @@ fn grpc_jwt_secret_clone() {
 }
 
 #[test]
+fn grpc_jwt_external_token_errors_do_not_disclose_source_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("missing-token-source-sentinel");
+    let secret = GrpcJwtSecret::new("unused".to_string())
+        .with_token_file(Some(missing.to_string_lossy().into_owned()));
+    let error = secret
+        .mint("node-1", Some("default"), None)
+        .expect_err("a missing external token must fail")
+        .to_string();
+    assert!(error.contains("failed to read FERRUM_DP_CP_GRPC_TOKEN_FILE"));
+    assert!(!error.contains("missing-token-source-sentinel"), "{error}");
+
+    let empty = temp.path().join("empty-token-source-sentinel");
+    std::fs::write(&empty, b" \n").unwrap();
+    let secret = GrpcJwtSecret::new("unused".to_string())
+        .with_token_file(Some(empty.to_string_lossy().into_owned()));
+    let error = secret
+        .mint("node-1", Some("default"), None)
+        .expect_err("an empty external token must fail")
+        .to_string();
+    assert_eq!(error, "FERRUM_DP_CP_GRPC_TOKEN_FILE is empty");
+    assert!(!error.contains("empty-token-source-sentinel"), "{error}");
+}
+
+#[test]
 fn generate_dp_jwt_produces_valid_token() {
     let token = generate_dp_jwt("test-secret", "node-1").unwrap();
     assert!(!token.is_empty());
