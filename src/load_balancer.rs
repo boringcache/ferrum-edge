@@ -2838,7 +2838,9 @@ impl LoadBalancer {
         if self.targets.is_empty() {
             return None;
         }
-        Some(Arc::clone(&self.targets[(ticket as usize) % self.targets.len()]))
+        Some(Arc::clone(
+            &self.targets[(ticket as usize) % self.targets.len()],
+        ))
     }
 
     /// One RoundRobin pick driven by the production thread-to-shard selector.
