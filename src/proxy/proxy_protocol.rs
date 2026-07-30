@@ -44,9 +44,24 @@ pub enum ProxyProtocolResult {
     NoAddress,
 }
 
+/// Maximum in-memory PROXY header size accepted by [`parse_proxy_protocol_header_bytes`].
+#[cfg(feature = "fuzzing")]
+pub(crate) const PROXY_PROTOCOL_MAX_HEADER_BYTES: usize = {
+    const V2_MAX_LEN: usize = V2_SIG.len() + 4 + V2_MAX_ADDR_LEN as usize;
+    if V1_MAX_LEN > V2_MAX_LEN {
+        V1_MAX_LEN
+    } else {
+        V2_MAX_LEN
+    }
+};
+
 /// Error variants for PROXY protocol parsing.
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyProtocolError {
+    /// The supplied byte slice exceeded the safety cap for in-memory parsing.
+    #[error("PROXY protocol header exceeds safety cap of {0} bytes")]
+    #[cfg(feature = "fuzzing")]
+    InputTooLong(usize),
     /// The header did not begin with a valid v1 or v2 signature.
     #[error("invalid PROXY protocol signature")]
     InvalidSignature,
@@ -286,6 +301,84 @@ where
             // PROXY: forwarded connection, parse address family.
             parse_v2_addresses(af, transport, &addr_block)
         }
+        other => Err(ProxyProtocolError::Malformed(format!(
+            "unsupported PROXY v2 command 0x{other:02x}"
+        ))),
+    }
+}
+
+/// Parse a complete PROXY protocol v1 or v2 header from an in-memory byte slice.
+///
+/// Production listeners use the async stream reader; this entry point exists for
+/// unit tests and the adversarial fuzz lane. Oversized inputs fail closed before
+/// allocation beyond the declared address block.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn parse_proxy_protocol_header_bytes(
+    data: &[u8],
+) -> Result<ProxyProtocolResult, ProxyProtocolError> {
+    if data.len() > PROXY_PROTOCOL_MAX_HEADER_BYTES {
+        return Err(ProxyProtocolError::InputTooLong(
+            PROXY_PROTOCOL_MAX_HEADER_BYTES,
+        ));
+    }
+    if data.starts_with(V1_PREFIX) {
+        if data.len() > V1_MAX_LEN {
+            return Err(ProxyProtocolError::V1TooLong);
+        }
+        if data.len() < 2 || data[data.len() - 2] != b'\r' || data[data.len() - 1] != b'\n' {
+            return Err(ProxyProtocolError::Malformed(
+                "v1 header missing CRLF terminator".into(),
+            ));
+        }
+        let line = std::str::from_utf8(&data[..data.len() - 2])
+            .map_err(|_| ProxyProtocolError::Malformed("non-UTF-8 v1 header".into()))?;
+        return parse_v1_line(line);
+    }
+    if data.len() < 6 {
+        return Err(ProxyProtocolError::InvalidSignature);
+    }
+    if data[..6] != V2_SIG[..6] {
+        return Err(ProxyProtocolError::InvalidSignature);
+    }
+    if data.len() < V2_SIG.len() + 4 {
+        return Err(ProxyProtocolError::Malformed(
+            "truncated PROXY v2 fixed header".into(),
+        ));
+    }
+    if &data[..V2_SIG.len()] != V2_SIG {
+        return Err(ProxyProtocolError::InvalidSignature);
+    }
+    let fixed = &data[V2_SIG.len()..V2_SIG.len() + 4];
+    let ver_cmd = fixed[0];
+    let fam_transport = fixed[1];
+    let addr_len = u16::from_be_bytes([fixed[2], fixed[3]]);
+    let version = ver_cmd >> 4;
+    if version != 2 {
+        return Err(ProxyProtocolError::Malformed(format!(
+            "unsupported PROXY v2 version {version}"
+        )));
+    }
+    if addr_len > V2_MAX_ADDR_LEN {
+        return Err(ProxyProtocolError::V2LengthExceeded(addr_len));
+    }
+    let total = V2_SIG.len() + 4 + addr_len as usize;
+    if data.len() < total {
+        return Err(ProxyProtocolError::Malformed(
+            "truncated PROXY v2 address block".into(),
+        ));
+    }
+    if data.len() > total {
+        return Err(ProxyProtocolError::Malformed(
+            "trailing bytes after PROXY v2 address block".into(),
+        ));
+    }
+    let command = ver_cmd & 0x0f;
+    let af = fam_transport >> 4;
+    let transport = fam_transport & 0x0f;
+    let addr_block = &data[V2_SIG.len() + 4..];
+    match command {
+        0x00 => Ok(ProxyProtocolResult::NoAddress),
+        0x01 => parse_v2_addresses(af, transport, addr_block),
         other => Err(ProxyProtocolError::Malformed(format!(
             "unsupported PROXY v2 command 0x{other:02x}"
         ))),

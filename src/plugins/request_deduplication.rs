@@ -3281,7 +3281,48 @@ impl Plugin for RequestDeduplication {
         ) {
             LocalDeduplicationAction::Replay(cached) => {
                 if let Some(ownership) = redis_lock_token.as_ref() {
-                    self.redis_release_inflight(&key, ownership).await;
+                    // Redis had no record, so this request acquired fresh
+                    // distributed ownership before discovering a still-live
+                    // local completion. Releasing that ownership before
+                    // replaying creates a cross-instance split: this gateway
+                    // returns the completed response while a peer immediately
+                    // acquires the now-empty Redis key and executes the same
+                    // side effect again.
+                    //
+                    // Repair the missing distributed completion through the
+                    // same fenced transition used by the original publisher.
+                    // Redis absence means distributed authority for the richer
+                    // representation cannot be proven, so publish only the
+                    // fixed non-replayable tombstone. This gateway may still
+                    // return its retained local bytes after the ordinary live
+                    // response-policy check below; peers remain fail-closed.
+                    match self
+                        .redis_publish_completed(&key, &fingerprint, ownership, None, true)
+                        .await
+                    {
+                        RedisPublication::Published { .. } => {}
+                        RedisPublication::NotOwner => {
+                            // Ownership changed after admission. The local
+                            // completion is no longer authoritative for the
+                            // deployment, so refuse rather than racing the new
+                            // owner or replaying a value Redis does not
+                            // recognize.
+                            return PluginResult::Reject {
+                                status_code: 409,
+                                body: NON_REPLAYABLE_COMPLETION_BODY.to_string(),
+                                headers: HashMap::new(),
+                            };
+                        }
+                        RedisPublication::Unavailable => {
+                            if self.on_redis_unavailable == RedisUnavailablePolicy::FailClosed {
+                                return PluginResult::Reject {
+                                    status_code: 503,
+                                    body: REDIS_UNAVAILABLE_BODY.to_string(),
+                                    headers: HashMap::new(),
+                                };
+                            }
+                        }
+                    }
                 }
                 debug!("request_deduplication: local cache hit, replaying response");
                 // Defense-in-depth: re-sanitize on replay even though insert

@@ -3382,6 +3382,7 @@ jobs:
       - mesh-e2e-sidecar
       - helm-chart
       - lint
+      - fuzz-smoke
       - build-ebpf
       - build-ebpf-userspace
       - ebpf-live
@@ -3469,6 +3470,7 @@ jobs:
           add_row "Mesh e2e sidecar" "${{ needs.mesh-e2e-sidecar.result }}"
           add_row "Helm chart" "${{ needs.helm-chart.result }}"
           add_row "Lint" "${{ needs.lint.result }}"
+          add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"
           add_row "eBPF programs" "${{ needs.build-ebpf.result }}"
           add_row "eBPF userspace loader" "${{ needs.build-ebpf-userspace.result }}"
           add_row "eBPF live-kernel" "${{ needs.ebpf-live.result }}"
@@ -3494,6 +3496,7 @@ jobs:
           require_planned_gate "Mesh e2e sidecar" "${{ needs.mesh-e2e-sidecar.result }}" "${{ needs.ci-plan.outputs.run_mesh_sidecar_smoke }}"
           require_planned_gate "Helm chart" "${{ needs.helm-chart.result }}" "${{ needs.ci-plan.outputs.run_helm }}"
           require_success "Lint" "${{ needs.lint.result }}"
+          require_success "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"
           require_planned_gate "eBPF programs" "${{ needs.build-ebpf.result }}" "${{ needs.ci-plan.outputs.run_ebpf_build }}"
           require_success "eBPF userspace loader" "${{ needs.build-ebpf-userspace.result }}"
           require_live_gate "eBPF live-kernel" "${{ needs.ebpf-live.result }}"
@@ -3532,6 +3535,71 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  fuzz-smoke:
+    # Byte-frozen by the trusted Cross build policy
+    # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
+    # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
+    # this is its entire permitted shape. Every command, action pin, toolchain
+    # pin, tool version, target name, and libFuzzer bound below is part of the
+    # contract, so a pull request cannot widen the budget, change the target
+    # list, add a step, or redirect this job at a repository-supplied script.
+    name: Fuzz Smoke
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    # The repository-root Cargo config selects sccache and host linker flags,
+    # but this isolated fuzz job installs neither sccache nor mold. Disable both
+    # Cargo wrapper inputs and inherited rustflags explicitly.
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install required build dependency
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2025-07-01
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-smoke
+
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.1
+
+      - name: Run deterministic property smoke tests
+        working-directory: fuzz
+        run: cargo test --locked
+
+      - name: Run bounded libFuzzer smoke budget
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+
+          for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
+            echo "Fuzz smoke target: ${fuzz_target}"
+            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
+              -runs=512 \
+              -max_total_time=8 \
+              -max_len=4096 \
+              -timeout=2 \
+              -rss_limit_mb=1024
+          done
 
   build-ebpf:
     name: Build eBPF Programs

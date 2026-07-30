@@ -189,6 +189,57 @@ async fn redis_key_count_by_prefix(prefix: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Decode every flat request-deduplication record under `prefix` (DB 15).
+///
+/// Request-deduplication keys are opaque digests, so functional tests cannot
+/// derive the exact suffix without reproducing the whole live request context.
+/// Callers first isolate a UUID-scoped prefix; requiring exactly one decoded
+/// record under it then proves the state of that operation instead of accepting
+/// a broad "some key exists" observation.
+async fn redis_dedup_records_by_prefix(prefix: &str) -> Vec<serde_json::Value> {
+    let client = redis::Client::open(REDIS_URL).expect("valid Redis test URL");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect to Redis test instance");
+    let mut keys: Vec<String> = redis::cmd("KEYS")
+        .arg(format!("{prefix}*"))
+        .query_async(&mut connection)
+        .await
+        .expect("list request-deduplication records");
+    keys.sort_unstable();
+
+    let mut records = Vec::with_capacity(keys.len());
+    for key in keys {
+        let payload: Vec<u8> = redis::cmd("GET")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await
+            .expect("read request-deduplication record");
+        records.push(
+            serde_json::from_slice(&payload).expect("request-deduplication record must be JSON"),
+        );
+    }
+    records
+}
+
+fn assert_single_non_replayable_completion(records: &[serde_json::Value], phase: &str) {
+    assert_eq!(
+        records.len(),
+        1,
+        "{phase}: expected exactly one request-deduplication operation record"
+    );
+    assert_eq!(
+        records[0].get("state").and_then(serde_json::Value::as_str),
+        Some("completed"),
+        "{phase}: operation record must be completed"
+    );
+    assert!(
+        records[0].get("replay").is_none(),
+        "{phase}: oversized completion must not carry a Redis replay payload"
+    );
+}
+
 /// Sum integer Redis counters under `prefix` (DB 15).
 ///
 /// Used to observe the post-reconcile `ai_rate_limiter` token bucket without
@@ -2572,9 +2623,22 @@ plugin_configs:
         LARGE_FUNCTION_BODY_LEN
     );
     assert_eq!(function_hits.load(Ordering::SeqCst), 1);
-    assert!(
-        redis_key_count_by_prefix(&record_prefix).await > 0,
-        "oversized Redis serialization must publish a non-replayable completion record"
+    assert_single_non_replayable_completion(
+        &redis_dedup_records_by_prefix(&record_prefix).await,
+        "original terminal completion",
+    );
+
+    // Reproduce Redis/local retention divergence deterministically. A Redis
+    // restart, eviction, or earlier record expiry can remove the distributed
+    // value while this gateway still retains the authoritative local response.
+    // The retry below must repair Redis through its newly acquired ownership
+    // before serving that local replay; releasing the ownership would leave a
+    // peer free to execute the completed side effect again.
+    delete_redis_keys_by_prefix(&unique_prefix).await;
+    assert_eq!(
+        redis_key_count_by_prefix(&record_prefix).await,
+        0,
+        "test precondition: distributed completion must be absent before local replay"
     );
 
     let local_replay = client
@@ -2604,6 +2668,10 @@ plugin_configs:
         LARGE_FUNCTION_BODY_LEN
     );
     assert_eq!(function_hits.load(Ordering::SeqCst), 1);
+    assert_single_non_replayable_completion(
+        &redis_dedup_records_by_prefix(&record_prefix).await,
+        "local replay repair",
+    );
 
     let peer_retry = client
         .post(&terminal_url2)
