@@ -149,8 +149,7 @@ impl DbOutageTestHarness {
                 .expect("Failed to open live SHM file for in-place restore");
             shm.write_all(&backup)
                 .expect("Failed to restore SHM bytes in place");
-            shm.sync_all()
-                .expect("Failed to sync restored SHM bytes");
+            shm.sync_all().expect("Failed to sync restored SHM bytes");
         }
         println!("  DB file restored from backup");
     }
