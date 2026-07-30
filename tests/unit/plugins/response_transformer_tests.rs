@@ -1569,9 +1569,7 @@ fn test_request_transformer_gate_key_does_not_bind_response_transformer() {
         )]),
     };
     assert!(
-        runtime_overlay::scope_gates(&cross_namespace)
-            .get("gated")
-            .is_none(),
+        !runtime_overlay::scope_gates(&cross_namespace).contains_key("gated"),
         "a request_transformer key must not appear in the response gate namespace"
     );
 }
