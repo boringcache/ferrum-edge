@@ -3,8 +3,7 @@
 use ferrum_edge::_test_support::{
     apply_synthetic_response_body_hooks_for_test,
     discard_grpc_application_trailers_after_body_rewrite_for_test,
-    set_response_presentation_policy_digest_for_test,
-    stamp_original_response_metadata_for_test,
+    set_response_presentation_policy_digest_for_test, stamp_original_response_metadata_for_test,
     transform_buffered_response_body_with_deadline_full_for_test,
 };
 use ferrum_edge::plugins::response_caching::ResponseCaching;
