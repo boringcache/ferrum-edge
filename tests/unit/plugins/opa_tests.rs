@@ -426,6 +426,37 @@ async fn opa_delegate_mode_omits_flat_query_and_reports_ambiguity() {
     );
 }
 
+#[tokio::test]
+async fn opa_delegate_mode_still_redacts_query_credentials() {
+    // Opting into `delegate` must never widen what OPA is told. The ordered
+    // occurrence view is redacted exactly like the flat map, so a duplicated
+    // credential reaches the policy only as a classification token.
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({"query_ambiguity_policy": "delegate"}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string(
+        "api_key=first-secret&api_key=second-secret&scope=read".to_string(),
+    );
+
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    assert!(payload["input"].get("query").is_none());
+    assert_eq!(
+        payload["input"]["query_ambiguity"],
+        json!(["duplicate_name"])
+    );
+    assert_eq!(
+        payload["input"]["query_pairs"],
+        json!([{"name": "scope", "value": "read", "bare": false}]),
+        "credential occurrences must be redacted from the ordered view too"
+    );
+    let serialized = serde_json::to_string(&payload).unwrap();
+    assert!(!serialized.contains("first-secret"));
+    assert!(!serialized.contains("second-secret"));
+}
+
 #[test]
 fn opa_rejects_unknown_query_ambiguity_policy() {
     let mut config = base_config("http://localhost:8181");

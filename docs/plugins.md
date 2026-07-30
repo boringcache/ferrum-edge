@@ -2827,7 +2827,7 @@ Delegates HTTP request authorization to [Open Policy Agent](https://www.openpoli
 | `include_consumer` | Boolean | `true` | Include mapped Consumer data or external authenticated identity. |
 | `include_client_ip` | Boolean | `true` | Include `input.client_ip`. |
 | `include_service` | Boolean | `true` | Include matched proxy/service data. |
-| `query_ambiguity_policy` | String | `reject` | What to do when the query cannot be decoded to one value OPA and the backend are guaranteed to read identically. `reject` denies with `deny_status` / `deny_body` before calling OPA. `delegate` calls OPA anyway and lets Rego decide from `input.query_pairs` + `input.query_ambiguity`; `input.query` is omitted in that case. |
+| `query_ambiguity_policy` | String | `reject` | What to do when the query cannot be decoded to one value OPA and the backend are guaranteed to read identically. `reject` denies with `deny_status` / `deny_body` before calling OPA. `delegate` calls OPA anyway and lets Rego decide from `input.query_pairs` + `input.query_ambiguity`; `input.query` is omitted in that case, and the policy itself must deny on a classification it does not handle. |
 | `redact_headers` | String[] | built-ins | Additional request headers to omit from `input.headers`; built-in sensitive headers and active authentication credential headers are always omitted. |
 | `redact_query_keys` | String[] | `[]` | Additional query parameter names to omit from `input.query` and `input.query_pairs`, matched case-insensitively. Built-in credential names and query locations used by authentication plugins are omitted automatically. |
 
@@ -2850,9 +2850,11 @@ Under the default `query_ambiguity_policy: reject`, such a request is denied bef
 
 - `input.query_pairs` — every occurrence in wire order as `{"name": …, "value": …, "bare": …}`. `bare` distinguishes `?flag` from `?flag=`; both decode to an empty `value`. A non-UTF-8 component is replacement-decoded and classified in `input.query_ambiguity`; a policy that needs exact bytes must reject that class.
 - `input.query_ambiguity` — the classification tokens above, in the order encountered. Empty for an unambiguous query.
-- `input.query` — **omitted** when `input.query_ambiguity` is non-empty, so a rule written against the flat map cannot authorize a value the backend does not execute.
+- `input.query` — **omitted** when `input.query_ambiguity` is non-empty, so no rule can read from the flat map a value the backend does not execute.
 
 `%20` and `%2B` are unambiguous and decode to a space and a `+` respectively; only a *literal* `+` byte is ambiguous. Use `delegate` only when the backend's duplicate-parameter and `+` conventions are known and encoded in Rego.
+
+**`delegate` moves the fail-closed decision into your policy.** Withholding `input.query` removes the misleading value, but it does not by itself deny the request: an `allow` rule that reads `input.query` becomes undefined and denies, while the common deny-list idiom (`deny { input.query.action == "delete record" }` with `allow { not deny }`) leaves `deny` undefined and therefore *allows*. A `delegate` policy must gate on the classifications explicitly — for example `deny { count(input.query_ambiguity) > 0 }`, or a narrower rule that denies every classification it cannot resolve against the backend's own duplicate-parameter and `+` conventions — before reading `input.query_pairs`. `query_ambiguity_policy: reject` needs no such rule.
 
 Allow decisions:
 
@@ -2878,7 +2880,8 @@ config:
   include_body: true
   max_body_bytes: 1048576
   # Array-style API: let Rego resolve repeated keys such as id=1&id=2 from
-  # input.query_pairs instead of denying at the gateway.
+  # input.query_pairs instead of denying at the gateway. The policy must then
+  # deny on any input.query_ambiguity classification it does not handle.
   query_ambiguity_policy: delegate
   redact_query_keys: [session_id]
   headers:

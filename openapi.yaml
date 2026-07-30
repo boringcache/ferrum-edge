@@ -17475,9 +17475,12 @@ components:
             lets the policy decide from the ordered, occurrence-complete
             input.query_pairs array and the input.query_ambiguity
             classifications; non-UTF-8 components are replacement-decoded and
-            explicitly classified. input.query is omitted in that case so a
-            rule written against the flat map cannot authorize a value the
-            backend does not execute.
+            explicitly classified. input.query is omitted in that case so no
+            rule can read from the flat map a value the backend does not
+            execute. Omission is not itself a denial: an undefined input.query
+            makes a deny-style Rego rule undefined rather than true, so a
+            'delegate' policy must deny on any input.query_ambiguity
+            classification it does not handle.
         redact_headers:
           type: array
           items:

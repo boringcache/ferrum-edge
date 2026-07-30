@@ -140,8 +140,15 @@ enum QueryAmbiguityPolicy {
     Reject,
     /// Call OPA anyway and let Rego decide, using the ordered occurrence list
     /// in `input.query_pairs` plus the `input.query_ambiguity` classifications.
-    /// `input.query` is omitted for an ambiguous query so a rule written
-    /// against the flat map cannot silently authorize the wrong value.
+    /// `input.query` is omitted for an ambiguous query so no rule can read a
+    /// flat value the backend may not execute.
+    ///
+    /// Omission is not itself a denial, and this mode moves that decision to
+    /// the operator by design: an `allow` rule that reads `input.query`
+    /// becomes undefined and denies, but the deny-list idiom
+    /// (`deny { input.query.x == "bad" }` with `allow { not deny }`) leaves
+    /// `deny` undefined and therefore allows. A `delegate` policy must deny
+    /// on a non-empty `input.query_ambiguity` it does not handle.
     Delegate,
 }
 
@@ -248,9 +255,11 @@ impl Opa {
         if let Some(query) = query {
             // `input.query` is the convenient flat view and is emitted only
             // when the canonical decoding is the one the backend must also
-            // read. For an ambiguous query it is omitted entirely: a Rego rule
-            // written against it would otherwise authorize a value the backend
-            // does not execute, which is the whole of both advisories.
+            // read. For an ambiguous query it is omitted entirely, so a Rego
+            // rule can never read from it a value the backend does not
+            // execute — the whole of both advisories. Under `delegate` the
+            // policy itself must still deny on a non-empty
+            // `input.query_ambiguity`; see `QueryAmbiguityPolicy::Delegate`.
             if query.is_unambiguous() {
                 input.insert("query".to_string(), self.query_map_input(ctx, query));
             }
