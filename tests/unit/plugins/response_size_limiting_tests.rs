@@ -531,9 +531,8 @@ async fn synthetic_response_uses_strictest_global_and_route_ceiling() {
         (4usize, Some(10u64), b"1234".as_slice(), 200u16),
     ] {
         let plugin_limit = route_limit.unwrap_or(10);
-        let plugin: Arc<dyn Plugin> = Arc::new(
-            ResponseSizeLimiting::new(&json!({"max_bytes": plugin_limit})).unwrap(),
-        );
+        let plugin: Arc<dyn Plugin> =
+            Arc::new(ResponseSizeLimiting::new(&json!({"max_bytes": plugin_limit})).unwrap());
         let plugins = vec![plugin];
         let mut ctx = make_ctx();
         ctx.max_response_body_size_bytes = global_limit;
@@ -552,7 +551,8 @@ async fn synthetic_response_uses_strictest_global_and_route_ceiling() {
         .await;
 
         assert_eq!(
-            status, expected_status,
+            status,
+            expected_status,
             "global={global_limit}, route={route_limit:?}, body_len={}",
             body.len()
         );

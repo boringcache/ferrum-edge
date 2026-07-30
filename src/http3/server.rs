@@ -3360,7 +3360,7 @@ async fn handle_h3_request(
     // trust a declared length.
     if content_length_limit > 0
         && crate::proxy::declared_request_content_length_over_limit(
-            proxy_headers,
+            &proxy_headers,
             content_length_limit,
         )
     {

@@ -3496,11 +3496,9 @@ async fn handle_h3_grpc_streaming_response<S>(
 where
     S: SendStream<Bytes>,
 {
-    // Effective client-facing ceilings for this request: each global knob
-    // narrowed by any active route ceiling, `0` still meaning unlimited. The H3
-    // cross-protocol bridge buffers request bodies and coalesces responses, so
-    // both directions must be bounded by the route policy the client was
-    // admitted under (`GHSA-xrfj-852f-645j`).
+    // Effective client-facing response ceiling, with the global knob narrowed
+    // by any active route ceiling and `0` still meaning unlimited
+    // (`GHSA-xrfj-852f-645j`).
     let effective_max_response_body_size_bytes = ctx.effective_max_response_body_size_bytes();
     let current_target_ref: Option<&UpstreamTarget> = current_target.map(|t| t.as_ref());
     // Pre-head late-overflow guard (codex P2): if the client upload already tripped
@@ -5696,17 +5694,15 @@ pub(crate) async fn dispatch_grpc_streaming(
     sticky_cookie_needed: bool,
     response_trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error> {
-    // Effective client-facing ceilings for this request: each global knob
-    // narrowed by any active route ceiling, `0` still meaning unlimited. The H3
-    // cross-protocol bridge buffers request bodies and coalesces responses, so
-    // both directions must be bounded by the route policy the client was
-    // admitted under (`GHSA-xrfj-852f-645j`).
+    // Effective client-facing request ceiling, with the global knob narrowed by
+    // any active route ceiling and `0` still meaning unlimited. The response
+    // handler derives its own effective ceiling from this same request context
+    // before streaming (`GHSA-xrfj-852f-645j`).
     let route_request_body_limit = ctx.route_request_body_limit();
     let effective_max_grpc_recv_size_bytes = crate::proxy::effective_request_body_limit(
         state.max_grpc_recv_size_bytes,
         route_request_body_limit,
     );
-    let effective_max_response_body_size_bytes = ctx.effective_max_response_body_size_bytes();
     let mut stream = stream;
     let current_target = upstream_target.cloned().map(Arc::new);
     let current_cb_target_key = cb_target_key.map(str::to_owned);
