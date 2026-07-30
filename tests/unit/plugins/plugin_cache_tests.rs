@@ -9397,13 +9397,8 @@ fn test_waf_sets_needs_final_request_body_context_capability() {
 
 #[test]
 fn test_priority_override_preserves_finalized_request_policy_capability() {
-    let mut waf = make_plugin_config_with_json(
-        "ps1",
-        "waf",
-        json!({}),
-        PluginScope::Proxy,
-        Some("p1"),
-    );
+    let mut waf =
+        make_plugin_config_with_json("ps1", "waf", json!({}), PluginScope::Proxy, Some("p1"));
     waf.priority_override = Some(2081);
     let config = make_config(vec![make_proxy("p1", "/api", vec!["ps1"])], vec![waf]);
     let cache = PluginCache::new(&config).unwrap();
