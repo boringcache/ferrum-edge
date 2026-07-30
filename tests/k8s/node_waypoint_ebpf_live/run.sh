@@ -2795,10 +2795,20 @@ expect_attributed_forged_assertion_blocked() {
   fi
   before_count="$(policy_deny_count_for_source_and_reasons "$before_file" "$expected_assertor" scope_missing untrusted_assertor)"
 
-  set +e
-  output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
-  status=$?
-  set -e
+  # A daemonset rollout can briefly race kube-dns propagation in the source
+  # pod even after every ambient readiness marker is present. Retry only
+  # curl's name-resolution failure; any transport or HTTP result is the
+  # security assertion's real outcome and must be evaluated immediately.
+  for _ in $(seq 1 15); do
+    set +e
+    output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
+    status=$?
+    set -e
+    if [[ "$status" -ne 6 ]]; then
+      break
+    fi
+    sleep 2
+  done
   code="${output##*$'\n'}"
   body="${output%$'\n'*}"
   printf '%s\n' "$output" >"$out_dir/curl.out"
