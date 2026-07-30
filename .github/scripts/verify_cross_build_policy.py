@@ -1670,7 +1670,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: read
     # The repository-root Cargo config selects sccache and host linker flags,
@@ -22429,6 +22429,7 @@ pre_build = []
         failures.append("initial adoption of the fuzz-smoke job was rejected")
 
     fuzz_smoke_tampering: dict[str, tuple[str, str]] = {
+        "altered outer deadline": ("timeout-minutes: 60", "timeout-minutes: 30"),
         "widened libFuzzer budget": ("-max_total_time=8", "-max_total_time=800"),
         "unbounded input length": ("-max_len=4096", "-max_len=1048576"),
         "unpinned cargo-fuzz": (

@@ -3998,6 +3998,26 @@ and `global_exemptions.consumers` available to request metadata rules.
 Request-body inspection runs on the final backend-visible body after request
 body transforms. It buffers only matching methods/content types. Response
 inspection is opt-in and can scan response headers and final response bodies.
+A configuration that can enforce response-header policy drops the backend
+trailer section on the trailer-forwarding paths (buffered and streaming HTTP/3,
+streaming HTTP/2, gRPC and gRPC-Web), because those fields arrive after
+inspection and cannot be proven safe. Native gRPC's reserved terminal fields
+(`grpc-status`, `grpc-message`, `grpc-status-details-bin`) always survive.
+Global monitor mode and monitor-action-only response header rules preserve
+trailers. Anomaly scoring counts as enforcing when it can block.
+
+That drop is decided **per request**, not per configuration. A request matched
+by `global_exemptions` (path, method, IP, or consumer) never reaches a WAF
+response-header scan, so it keeps its backend trailers exactly as it would with
+no WAF configured — the same request-level contract that governs body buffering
+and the buffered gRPC-Web trailer policy. Because a consumer exemption is only
+known after authentication, every trailer-forwarding response boundary resolves
+the decision from the finalized request context after the request-side phases.
+Exemption is per instance and never subtractive: with several WAF instances, or
+alongside another plugin whose own response policy is non-enumerable
+(`response_transformer`), the trailer section is still dropped whenever any one
+of them governs that request.
+
 WAF scans raw query pairs even after the proxy has materialized the parsed
 query map, so duplicate keys remain visible before the parsed `HashMap` can
 collapse them; synthetic contexts without a raw query string fall back to

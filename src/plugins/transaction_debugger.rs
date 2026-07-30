@@ -1956,21 +1956,37 @@ fn escape_for_diagnostics(text: &str) -> (String, bool) {
 /// that carried it.
 fn looks_like_credential(value: &str) -> bool {
     let trimmed = value.trim();
-    if trimmed.len() >= 8 {
-        let lowered_prefix = trimmed.get(..7).map(str::to_ascii_lowercase);
-        if lowered_prefix.as_deref() == Some("bearer ") {
-            return true;
-        }
-        let lowered_basic = trimmed.get(..6).map(str::to_ascii_lowercase);
-        if lowered_basic.as_deref() == Some("basic ") {
-            return true;
-        }
+    if contains_ignore_ascii_case(trimmed, "bearer ")
+        || contains_ignore_ascii_case(trimmed, "basic ")
+    {
+        return true;
     }
     // JWT / JWS compact serialization: `eyJ…` header, at least two dots.
-    if trimmed.len() >= 20 && trimmed.starts_with("eyJ") {
-        return trimmed.bytes().filter(|byte| *byte == b'.').count() >= 2;
-    }
-    false
+    //
+    // Scan each maximal base64url/compact-token run once. Re-scanning the full
+    // suffix for every `eyJ` occurrence would make an attacker-shaped captured
+    // value quadratic even though the total capture is byte-bounded.
+    trimmed
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+        .any(|token| {
+            let Some(start) = token.find("eyJ") else {
+                return false;
+            };
+            let candidate = &token[start..];
+            if candidate.len() < 20 {
+                return false;
+            }
+            let mut dots = 0u8;
+            for byte in candidate.bytes() {
+                if byte == b'.' {
+                    dots += 1;
+                    if dots == 2 {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
 }
 
 /// Decode one `application/x-www-form-urlencoded` component for sensitivity

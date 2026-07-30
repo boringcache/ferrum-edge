@@ -7413,6 +7413,178 @@ fn test_priority_override_delegates_spec_rejection_replacement_capability() {
     assert!(!plugins[0].warn_on_rejection_response_replacement());
 }
 
+/// Request context for the trailer-policy resolution tests below.
+fn trailer_policy_ctx(method: &str, path: &str) -> RequestContext {
+    RequestContext::new("203.0.113.10".into(), method.into(), path.into())
+}
+
+/// Enforcing WAF response-header configuration for a proxy, with the supplied
+/// `global_exemptions` object.
+fn enforcing_response_header_waf(
+    id: &str,
+    proxy_id: &str,
+    global_exemptions: serde_json::Value,
+) -> PluginConfig {
+    make_plugin_config_with_json(
+        id,
+        "waf",
+        json!({
+            "mode": "enforce",
+            "include_default_rules": false,
+            "response_inspection": true,
+            "global_exemptions": global_exemptions,
+            "custom_rules": [{
+                "id": format!("CUSTOM-RESP-HEADER-{}", id.to_uppercase()),
+                "name": "blocked response metadata",
+                "category": "custom",
+                "severity": "high",
+                "target": "response_headers",
+                "match_kind": "contains",
+                "pattern": "leak-secret",
+                "action": "enforce"
+            }]
+        }),
+        PluginScope::Proxy,
+        Some(proxy_id),
+    )
+}
+
+/// An enforcing WAF governs trailers it cannot inspect — but per request, not per
+/// cache generation. The declaration must therefore NOT land in the
+/// unconditional capability bit, and the request-aware resolver must answer
+/// `false` for a request `global_exemptions` waives (its backend trailers are
+/// preserved exactly as they were before trailer governance existed) and `true`
+/// for every other request.
+#[test]
+fn test_request_conditional_unbounded_trailer_policy_follows_waf_exemptions() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["waf1"])],
+        vec![enforcing_response_header_waf(
+            "waf1",
+            "p1",
+            json!({ "paths": ["/internal/*"], "consumers": ["trusted-partner"] }),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert!(
+        !view
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+        "a request-conditional declaration must not be frozen into the unconditional bit"
+    );
+
+    let governed = trailer_policy_ctx("GET", "/api/orders");
+    assert!(
+        view.unbounded_response_trailer_policy_applies(&governed),
+        "a non-exempt request must keep the fail-closed arm active"
+    );
+
+    let by_path = trailer_policy_ctx("GET", "/internal/metrics");
+    assert!(
+        !view.unbounded_response_trailer_policy_applies(&by_path),
+        "a path-exempt request must preserve its backend trailers"
+    );
+
+    // Consumer identity is established by the authentication phase, so this case
+    // only resolves correctly because the request paths defer the decision to the
+    // finalized request context instead of reading it at intake.
+    let mut by_consumer = trailer_policy_ctx("GET", "/api/orders");
+    by_consumer.authenticated_identity = Some("trusted-partner".to_string());
+    assert!(
+        !view.unbounded_response_trailer_policy_applies(&by_consumer),
+        "a consumer-exempt request must preserve its backend trailers"
+    );
+}
+
+/// An exempt WAF must not suppress a co-configured plugin whose unbounded policy
+/// is unconditional; the contributors are OR-ed, never intersected.
+#[test]
+fn test_exempt_waf_does_not_suppress_another_unbounded_trailer_policy() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["waf1", "rt"])],
+        vec![
+            enforcing_response_header_waf("waf1", "p1", json!({ "paths": ["/internal/*"] })),
+            make_plugin_config_with_json(
+                "rt",
+                "response_transformer",
+                json!({"rules": [{
+                    "target": "header",
+                    "operation": "add",
+                    "key": "x-gateway-note",
+                    "value": "transformed",
+                }]}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert!(
+        view.capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+        "response_transformer still contributes the unconditional bit"
+    );
+    let exempt_for_waf = trailer_policy_ctx("GET", "/internal/metrics");
+    assert!(
+        view.unbounded_response_trailer_policy_applies(&exempt_for_waf),
+        "the WAF exemption must not waive response_transformer's own fail-closed arm"
+    );
+}
+
+/// Multiple WAF instances combine correctly: a request one instance exempts is
+/// still governed while another enforcing instance applies to it.
+#[test]
+fn test_multiple_waf_instances_or_their_conditional_trailer_policies() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["waf1", "waf2"])],
+        vec![
+            enforcing_response_header_waf(
+                "waf1",
+                "p1",
+                json!({ "paths": ["/internal/*", "/shared/*"] }),
+            ),
+            enforcing_response_header_waf(
+                "waf2",
+                "p1",
+                json!({ "paths": ["/public/*", "/shared/*"] }),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert!(
+        !view
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+        "neither instance is unconditional"
+    );
+
+    let exempt_for_waf1 = trailer_policy_ctx("GET", "/internal/metrics");
+    assert!(
+        view.unbounded_response_trailer_policy_applies(&exempt_for_waf1),
+        "waf2 still enforces here, so the fail-closed arm stays active"
+    );
+
+    let exempt_for_waf2 = trailer_policy_ctx("GET", "/public/docs");
+    assert!(
+        view.unbounded_response_trailer_policy_applies(&exempt_for_waf2),
+        "waf1 still enforces here, so the fail-closed arm stays active"
+    );
+
+    // Exempt from BOTH: nothing can inspect this response's headers, so its
+    // trailers must survive.
+    let exempt_for_both = trailer_policy_ctx("GET", "/shared/asset");
+    assert!(
+        !view.unbounded_response_trailer_policy_applies(&exempt_for_both),
+        "a request every instance exempts must preserve its backend trailers"
+    );
+}
+
 #[test]
 fn test_priority_override_delegates_response_trailer_policy() {
     // The priority-override wrapper hand-forwards the `Plugin` trait, so a
@@ -7468,6 +7640,27 @@ fn test_priority_override_delegates_response_trailer_policy() {
             .capabilities()
             .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
         "the priority-override wrapper must delegate the fail-closed unbounded arm"
+    );
+
+    // The request-conditional arm needs TWO delegations: the config-time
+    // declaration and its per-request predicate. If the wrapper forgets the
+    // latter, the trait's fail-closed default (`true`) would silently drop
+    // trailers for a request this WAF instance exempts.
+    let mut waf = enforcing_response_header_waf("waf1", "p1", json!({ "paths": ["/internal/*"] }));
+    waf.priority_override = Some(323);
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["waf1"])], vec![waf]);
+    let cache = PluginCache::new(&config).unwrap();
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+    assert!(
+        view.unbounded_response_trailer_policy_applies(&trailer_policy_ctx("GET", "/api/orders")),
+        "the priority-override wrapper must preserve the governed request arm"
+    );
+    assert!(
+        !view.unbounded_response_trailer_policy_applies(&trailer_policy_ctx(
+            "GET",
+            "/internal/metrics"
+        )),
+        "the priority-override wrapper must delegate the request exemption predicate"
     );
 }
 

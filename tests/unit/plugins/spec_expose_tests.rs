@@ -1562,33 +1562,36 @@ async fn test_failed_fetch_burst_is_single_flight_with_bounded_waiters() {
     assert_eq!(headers.get("retry-after").map(String::as_str), Some("1"));
 }
 
-#[tokio::test(start_paused = true)]
-async fn test_cached_failure_retry_after_reports_remaining_backoff() {
-    let plugin = SpecExpose::new(
-        &json!({
-            "spec_url": "http://127.0.0.1/openapi.yaml",
-            "cache_ttl_seconds": 0
-        }),
-        PluginHttpClient::default(),
-    )
-    .unwrap();
+#[test]
+fn test_cached_failure_retry_after_reports_remaining_backoff() {
+    use ferrum_edge::_test_support::{
+        spec_expose_failure_backoff_seconds_for_test, spec_expose_retry_after_seconds_for_test,
+    };
 
-    assert_eq!(plugin.record_failure_backoff_for_tests(), 1);
+    for (previous_failures, expected) in [(0, 1), (1, 2), (2, 4), (5, 30), (6, 30), (u32::MAX, 30)]
+    {
+        assert_eq!(
+            spec_expose_failure_backoff_seconds_for_test(previous_failures),
+            expected
+        );
+    }
 
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    assert_eq!(
-        plugin.cached_failure_backoff_for_tests(),
-        None,
-        "the first negative-cache window must expire at its deadline"
-    );
-    assert_eq!(plugin.record_failure_backoff_for_tests(), 2);
-
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    assert_eq!(
-        plugin.cached_failure_backoff_for_tests(),
-        Some(1),
-        "cached failures must advertise only the remaining backoff"
-    );
+    for (remaining, expected) in [
+        (std::time::Duration::ZERO, 0),
+        (std::time::Duration::from_nanos(1), 1),
+        (std::time::Duration::from_secs(1), 1),
+        (
+            std::time::Duration::from_secs(1) + std::time::Duration::from_nanos(1),
+            2,
+        ),
+        (std::time::Duration::from_secs(2), 2),
+    ] {
+        assert_eq!(
+            spec_expose_retry_after_seconds_for_test(remaining),
+            expected,
+            "cached failures must advertise only the rounded-up remaining backoff"
+        );
+    }
 }
 
 // TTL zero disables durable positive caching, but it must retain admission and
