@@ -2323,6 +2323,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "unsafe-libyaml",
  "url",
  "uuid",
  "vaultrs",

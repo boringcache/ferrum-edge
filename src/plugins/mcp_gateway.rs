@@ -61,6 +61,23 @@ const MCP_BATCH_SESSION_LIFECYCLE_AMBIGUOUS: i64 = -32010;
 /// processed. Notifications carry no per-item response element, so the failure
 /// is surfaced once at batch level instead of silently claiming success.
 const MCP_BATCH_NOTIFICATION_FAILED: i64 = -32011;
+/// JSON-RPC application error: a `tools/call` result failed declared
+/// `outputSchema` validation (or could not be decoded for validation).
+const MCP_INVALID_TOOL_RESULT: i64 = -32012;
+/// Maximum nesting depth admitted for a discovered tool `outputSchema`.
+const MAX_OUTPUT_SCHEMA_DEPTH: usize = 32;
+/// Maximum JSON nodes admitted while auditing a discovered tool `outputSchema`.
+const MAX_OUTPUT_SCHEMA_NODES: usize = 20_000;
+/// Maximum recursion depth admitted for the *schema* walk that resolves local
+/// `$ref` / `$dynamicRef` targets.
+///
+/// [`MAX_OUTPUT_SCHEMA_DEPTH`] bounds only the raw JSON nesting of the schema
+/// document. A chain of sibling `$defs` that each reference the next is flat in
+/// the document — it costs two nodes and three levels per link — so the nesting
+/// budget alone admits a chain thousands of links long, and following it would
+/// recurse one worker-stack frame per link during catalog construction on the
+/// request path. This budget is what actually bounds that walk.
+const MAX_OUTPUT_SCHEMA_REF_DEPTH: usize = 64;
 const MAX_UPSTREAM_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MCP_STREAMABLE_HTTP_ACCEPT: &str = "application/json, text/event-stream";
 const MCP_TEMPLATE_RESOURCE_URI_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
@@ -238,6 +255,10 @@ impl McpPolicy {
 #[derive(Debug, Clone)]
 struct McpValidationConfig {
     validate_tool_arguments: bool,
+    /// When true, compile discovered tool `outputSchema` values into validators
+    /// and fail closed before releasing a `tools/call` result that does not
+    /// conform (or cannot be decoded for validation).
+    validate_tool_results: bool,
     /// Max bytes read from a single non-SSE upstream `application/json`
     /// response before the read is aborted (DoS backstop).
     max_upstream_response_bytes: usize,
@@ -358,6 +379,8 @@ struct ToolCatalogEntry {
     // tools, which the per-refresh schema check would otherwise re-enable.
     hidden_by_schema_change: bool,
     input_validator: Arc<jsonschema::Validator>,
+    /// Compiled `outputSchema` when the tool declared one that passed admission.
+    output_validator: Option<Arc<jsonschema::Validator>>,
     #[allow(dead_code)] // Stored for drift/operational metadata extensions.
     discovered_at: DateTime<Utc>,
     schema_hash: String,
@@ -422,6 +445,8 @@ struct RequestRewrite<'a> {
     downstream_session_id: &'a str,
     catalog_version: u64,
     response_resource_rewrite_possible: bool,
+    /// Buffer and inspect the JSON-RPC response for `outputSchema` validation.
+    validate_tool_results: bool,
 }
 
 #[derive(Clone, Default)]
@@ -643,6 +668,12 @@ impl McpGateway {
         let policy = parse_policy(object)?;
         let validation = parse_validation(object)?;
         let observability = parse_observability(object)?;
+        if mode == McpGatewayMode::TransparentProxy && validation.validate_tool_results {
+            return Err(
+                "mcp_gateway: 'validation.validate_tool_results' requires mode 'aggregate_router' because transparent_proxy has no mediated tool catalog"
+                    .to_string(),
+            );
+        }
         let servers = parse_servers(object, sessions.initialize_upstreams)?;
         if servers.is_empty() {
             return Err("mcp_gateway: 'servers' must not be empty".to_string());
@@ -1002,13 +1033,16 @@ impl McpGateway {
                 rewrite.upstream_value.to_string(),
             ));
         }
-        if !rewrite.response_resource_rewrite_possible {
+        let inspect_response =
+            rewrite.response_resource_rewrite_possible || rewrite.validate_tool_results;
+        if !inspect_response {
             return;
         }
 
         // Routed JSON results must remain identity-encoded so the response
-        // transform can inspect them. A non-compliant upstream that still sends
-        // Content-Encoding is handled defensively on the response path.
+        // transform / result validator can inspect them. A non-compliant
+        // upstream that still sends Content-Encoding is handled defensively on
+        // the response path.
         remove_header(headers, "accept-encoding");
         ctx.metadata.insert(
             METADATA_RESPONSE_REWRITE_KEY.to_string(),
@@ -2349,7 +2383,18 @@ impl McpGateway {
             .get("inputSchema")
             .cloned()
             .unwrap_or_else(|| json!({"type": "object"}));
-        let schema_hash = hash_value(&input_schema);
+        let output_schema = item.get("outputSchema").cloned();
+        let schema_hash = if self.validation.validate_tool_results {
+            hash_value(&json!({
+                "inputSchema": input_schema,
+                "outputSchema": output_schema,
+            }))
+        } else {
+            // Preserve the pre-enforcement catalog contract when result
+            // validation is disabled: an upstream outputSchema is descriptive
+            // only, so it cannot hide or remove an otherwise valid tool.
+            hash_value(&input_schema)
+        };
         let input_validator = match jsonschema::validator_for(&input_schema) {
             Ok(validator) => Arc::new(validator),
             Err(error) => {
@@ -2361,6 +2406,25 @@ impl McpGateway {
                 );
                 return None;
             }
+        };
+        let output_validator = if self.validation.validate_tool_results {
+            match output_schema.as_ref() {
+                Some(schema) => match compile_tool_output_schema(schema) {
+                    Ok(validator) => Some(validator),
+                    Err(error) => {
+                        warn!(
+                            server_id = %server.server_id,
+                            tool = %name,
+                            error = %error,
+                            "Skipping MCP tool with invalid outputSchema"
+                        );
+                        return None;
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
         };
         let description = item
             .get("description")
@@ -2406,7 +2470,7 @@ impl McpGateway {
             server_id: server.server_id.clone(),
             namespace: server.namespace.clone(),
             input_schema,
-            output_schema: item.get("outputSchema").cloned(),
+            output_schema,
             title: item
                 .get("title")
                 .and_then(Value::as_str)
@@ -2418,6 +2482,7 @@ impl McpGateway {
             hidden_from_discovery,
             hidden_by_schema_change,
             input_validator,
+            output_validator,
             discovered_at,
             schema_hash,
             description_hash,
@@ -2921,6 +2986,16 @@ impl McpGateway {
             self.prepare_response_resource_bindings(ctx, downstream_session_id, &server.server_id)
                 .await;
         }
+        let pinned_output_validator = if self.validation.validate_tool_results {
+            entry.output_validator.clone()
+        } else {
+            None
+        };
+        let validate_tool_results = pinned_output_validator.is_some();
+        // Pin the exact compiled validator for this routed call. Final-body
+        // enforcement must not re-resolve identity through public
+        // `mcp.response_rewrite.*` metadata or a later catalog refresh.
+        ctx.mcp_validate_tool_result = pinned_output_validator;
         let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
             return session_not_found_response();
         };
@@ -2949,6 +3024,7 @@ impl McpGateway {
                 downstream_session_id,
                 catalog_version,
                 response_resource_rewrite_possible,
+                validate_tool_results,
             },
         );
         PluginResult::Continue
@@ -3050,6 +3126,7 @@ impl McpGateway {
                 downstream_session_id,
                 catalog_version,
                 response_resource_rewrite_possible,
+                validate_tool_results: false,
             },
         );
         PluginResult::Continue
@@ -3246,6 +3323,7 @@ impl McpGateway {
                 catalog_version,
                 response_resource_rewrite_possible: self
                     .resource_response_rewrite_possible(&server_id),
+                validate_tool_results: false,
             },
         );
         PluginResult::Continue
@@ -3951,6 +4029,7 @@ impl McpGateway {
         ctx.route_override_authority = None;
         ctx.mcp_trusted_tool_name_rewrite = None;
         ctx.mcp_response_resource_binding = None;
+        ctx.mcp_validate_tool_result = None;
         ctx.mcp_batch_forbids_upstream = false;
         ctx.metadata.remove("mcp.server_id");
         ctx.metadata.remove("mcp.item_type");
@@ -3966,6 +4045,7 @@ impl McpGateway {
         ctx.metadata.remove("mcp.arguments_hash");
         ctx.metadata.remove("mcp.input_schema_hash");
         ctx.metadata.remove("mcp.schema_validation");
+        ctx.metadata.remove("mcp.result_schema_validation");
         ctx.metadata.remove("mcp.policy_decision");
         ctx.metadata.remove("mcp.catalog_hit");
         ctx.metadata.remove("mcp.catalog_version");
@@ -4251,6 +4331,48 @@ impl McpGateway {
             _ => json_rpc_error(envelope.id.clone(), -32601, "MCP method not found", None),
         }
     }
+
+    fn reject_invalid_tool_result(
+        &self,
+        ctx: &mut RequestContext,
+        id: Option<Value>,
+        reason: &str,
+    ) -> PluginResult {
+        if self.observability.emit_metadata {
+            ctx.metadata.insert(
+                "mcp.result_schema_validation".to_string(),
+                "fail".to_string(),
+            );
+            ctx.metadata
+                .insert("mcp.route_decision".to_string(), "deny".to_string());
+        }
+        // Reason is a gateway-controlled category string — never a result body.
+        warn!(
+            reason,
+            "MCP gateway rejecting tools/call result that failed outputSchema validation"
+        );
+        let error = json!({
+            "code": MCP_INVALID_TOOL_RESULT,
+            "message": "Invalid MCP tool result",
+        });
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": id.unwrap_or(Value::Null),
+            "error": error,
+        });
+        match serde_json::to_string(&body) {
+            Ok(body) => PluginResult::Reject {
+                status_code: 200,
+                body,
+                headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            },
+            Err(_) => PluginResult::Reject {
+                status_code: 200,
+                body: "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32012,\"message\":\"Invalid MCP tool result\"}}".to_string(),
+                headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            },
+        }
+    }
 }
 
 #[async_trait]
@@ -4329,10 +4451,11 @@ impl Plugin for McpGateway {
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.requires_response_body_buffering()
-            && ctx
-                .metadata
-                .get(METADATA_RESPONSE_REWRITE_KEY)
-                .is_some_and(|value| value == "true")
+            && (ctx.mcp_validate_tool_result.is_some()
+                || ctx
+                    .metadata
+                    .get(METADATA_RESPONSE_REWRITE_KEY)
+                    .is_some_and(|value| value == "true"))
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
@@ -4660,6 +4783,14 @@ impl Plugin for McpGateway {
             );
             return None;
         }
+        // Screen the exact upstream bytes before any serde materialization can
+        // collapse duplicate members. Returning `None` preserves those bytes
+        // for the authoritative final hook, which will reject the same
+        // ambiguity (reusing the bounded memo for larger bodies) when
+        // outputSchema enforcement is active.
+        if ctx.json_scan_memo.ambiguity(body).is_some() {
+            return None;
+        }
 
         let method = ctx.metadata.get(METADATA_RESPONSE_REWRITE_METHOD_KEY)?;
         if !matches!(
@@ -4723,6 +4854,193 @@ impl Plugin for McpGateway {
         // hashes describe the upstream-native bytes, not the public-URI body.
         for header in MCP_REWRITTEN_RESPONSE_VALIDATORS {
             remove_header(response_headers, header);
+        }
+    }
+
+    fn may_replace_rejection_response(&self) -> bool {
+        // SSE / uninspectable tool-result responses must be replaceable when
+        // `validation.validate_tool_results` is enforcing.
+        true
+    }
+
+    fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
+        self.enabled
+            && self.mode == McpGatewayMode::AggregateRouter
+            && self.validation.validate_tool_results
+            && ctx.mcp_validate_tool_result.is_some()
+    }
+
+    fn enforces_response_body_policy(
+        &self,
+        ctx: &RequestContext,
+        _response_content_type: Option<&str>,
+        _response_body: &[u8],
+    ) -> bool {
+        self.may_enforce_response_body_policy(ctx)
+    }
+
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if ctx.mcp_validate_tool_result.is_none() {
+            return PluginResult::Continue;
+        }
+        // Streamed SSE cannot be validated against a compiled output schema
+        // without a separate streaming validator. Fail closed rather than
+        // releasing an unvalidated tool result.
+        if super::utils::sse::original_response_is_event_stream(ctx, response_headers) {
+            return self.reject_invalid_tool_result(
+                ctx,
+                None,
+                "event-stream tool results require a bounded JSON representation",
+            );
+        }
+        if header_value(response_headers, "content-type")
+            .is_some_and(|value| !mcp_content_type_is_json(value))
+        {
+            return self.reject_invalid_tool_result(
+                ctx,
+                None,
+                "tool result content-type is not inspectable JSON",
+            );
+        }
+        if !Self::response_encoding_allows_rewrite(response_headers) {
+            return self.reject_invalid_tool_result(
+                ctx,
+                None,
+                "encoded tool results require an identity representation",
+            );
+        }
+        // Header-time buffer refinement deliberately releases responses whose
+        // declared size is missing, malformed, or above the plugin's cap. Once
+        // released, `on_final_response_body` cannot validate them, so reject
+        // here instead of allowing that optimization to become an enforcement
+        // bypass. The actual collected length is checked again in the final
+        // hook to cover a lying upstream.
+        if !self.response_length_allows_rewrite(response_headers) {
+            return self.reject_invalid_tool_result(
+                ctx,
+                None,
+                "tool result lacks a bounded acceptable content-length",
+            );
+        }
+        PluginResult::Continue
+    }
+
+    async fn on_final_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        // Authoritative enforcement identity is the validator Arc pinned at
+        // route time — never re-resolved through public rewrite metadata.
+        let Some(validator) = ctx.mcp_validate_tool_result.clone() else {
+            return PluginResult::Continue;
+        };
+        if body.len() > self.validation.max_upstream_response_bytes {
+            return self.reject_invalid_tool_result(
+                ctx,
+                None,
+                "tool result exceeded validation.max_upstream_response_bytes",
+            );
+        }
+        if header_value(response_headers, "content-type").is_some_and(|value| {
+            super::utils::body_transform::is_event_stream_content_type(value)
+                || !mcp_content_type_is_json(value)
+        }) {
+            return self.reject_invalid_tool_result(
+                ctx,
+                None,
+                "tool result content-type is not inspectable JSON",
+            );
+        }
+        // Screen the exact decoded bytes before `serde_json` collapses
+        // duplicate members (last-wins). Other MCP clients may keep the first,
+        // so an ambiguous document would make the gateway validate a different
+        // `result` / `structuredContent` / nested value than the caller sees.
+        // `reason` is fixed-cardinality and never echoes body bytes.
+        if let Some(reason) = ctx.json_scan_memo.ambiguity(body) {
+            return self.reject_invalid_tool_result(ctx, None, reason);
+        }
+        let value: Value = match serde_json::from_slice(body) {
+            Ok(value) => value,
+            Err(_) => {
+                return self.reject_invalid_tool_result(ctx, None, "tool result is not valid JSON");
+            }
+        };
+        let response_id = valid_json_rpc_response_id(&value);
+        // Preserve only well-formed, error-only JSON-RPC responses. Merely
+        // adding an `error` key must not let an upstream bypass validation of
+        // a simultaneously supplied tool result.
+        if is_well_formed_json_rpc_error_response(&value) {
+            return PluginResult::Continue;
+        }
+        if !is_well_formed_json_rpc_result_response(&value) {
+            return self.reject_invalid_tool_result(
+                ctx,
+                response_id,
+                "tools/call response has a malformed JSON-RPC result envelope",
+            );
+        }
+        let result = &value["result"];
+        // Legitimate tool execution errors are reported in-band with isError.
+        // A non-boolean isError must not collapse to success, and isError:true
+        // requires an array `content` representation (MCP CallToolResult shape)
+        // rather than escaping with a bare flag.
+        match result.get("isError") {
+            None | Some(Value::Bool(false)) => {}
+            Some(Value::Bool(true)) => {
+                if !result.get("content").is_some_and(Value::is_array) {
+                    return self.reject_invalid_tool_result(
+                        ctx,
+                        response_id,
+                        "isError tool result requires array content",
+                    );
+                }
+                return PluginResult::Continue;
+            }
+            Some(_) => {
+                return self.reject_invalid_tool_result(
+                    ctx,
+                    response_id,
+                    "isError must be a boolean",
+                );
+            }
+        }
+
+        let payload = match extract_tool_result_validation_payload(
+            result,
+            self.validation.max_upstream_response_bytes,
+        ) {
+            Ok(payload) => payload,
+            Err(reason) => {
+                return self.reject_invalid_tool_result(ctx, response_id, reason);
+            }
+        };
+        match validate_json_schema(&validator, &payload) {
+            Ok(()) => {
+                if self.observability.emit_metadata {
+                    ctx.metadata.insert(
+                        "mcp.result_schema_validation".to_string(),
+                        "pass".to_string(),
+                    );
+                }
+                PluginResult::Continue
+            }
+            Err(_) => {
+                // Never log the result body or schema instance paths that may
+                // embed credentials; only a coarse failure marker is emitted.
+                self.reject_invalid_tool_result(
+                    ctx,
+                    response_id,
+                    "tool result failed outputSchema validation",
+                )
+            }
         }
     }
 
@@ -5043,6 +5361,42 @@ fn parse_mcp_envelope_value(value: &Value) -> Result<McpEnvelope, String> {
     })
 }
 
+fn valid_json_rpc_response_id(value: &Value) -> Option<Value> {
+    value
+        .as_object()?
+        .get("id")
+        .filter(|id| id.is_null() || id.is_string() || id.is_number())
+        .cloned()
+}
+
+fn is_well_formed_json_rpc_error_response(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || object.contains_key("result")
+        || valid_json_rpc_response_id(value).is_none()
+    {
+        return false;
+    }
+    object.get("error").is_some_and(|error| {
+        error.as_object().is_some_and(|error| {
+            error.get("code").and_then(Value::as_i64).is_some()
+                && error.get("message").and_then(Value::as_str).is_some()
+        })
+    })
+}
+
+fn is_well_formed_json_rpc_result_response(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && object.contains_key("result")
+        && !object.contains_key("error")
+        && valid_json_rpc_response_id(value).is_some()
+}
+
 async fn upstream_response_json(
     response: reqwest::Response,
     server_id: &str,
@@ -5253,6 +5607,276 @@ fn validate_json_schema(validator: &jsonschema::Validator, instance: &Value) -> 
     validator
         .validate(instance)
         .map_err(|error| format!("schema validation failed: {error}"))
+}
+
+/// Audit and compile a discovered tool `outputSchema` at catalog construction.
+///
+/// External `$ref` / `$dynamicRef` targets are refused (the `jsonschema` crate
+/// is built without retrievers). Document depth, document node count, and local
+/// reference-resolution depth budgets bound both the audit and compile work.
+fn compile_tool_output_schema(schema: &Value) -> Result<Arc<jsonschema::Validator>, String> {
+    if !schema.is_object() && !schema.is_boolean() {
+        return Err("outputSchema must be a JSON Schema object or boolean".to_string());
+    }
+    audit_output_schema(schema)?;
+    jsonschema::draft202012::options()
+        .should_validate_formats(true)
+        .build(schema)
+        .map(Arc::new)
+        .map_err(|error| format!("outputSchema is not a valid JSON Schema: {error}"))
+}
+
+fn audit_output_schema(schema: &Value) -> Result<(), String> {
+    let mut nodes = 0usize;
+    audit_output_schema_structure(schema, 0, &mut nodes)?;
+    let mut max_depth_seen = HashMap::new();
+    let mut active = HashSet::new();
+    audit_output_schema_node(schema, schema, 0, &mut max_depth_seen, &mut active)
+}
+
+fn audit_output_schema_structure(
+    node: &Value,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<(), String> {
+    if depth > MAX_OUTPUT_SCHEMA_DEPTH {
+        return Err(format!(
+            "outputSchema nests deeper than the {MAX_OUTPUT_SCHEMA_DEPTH}-level schema budget"
+        ));
+    }
+    *nodes += 1;
+    if *nodes > MAX_OUTPUT_SCHEMA_NODES {
+        return Err(format!(
+            "outputSchema exceeds the {MAX_OUTPUT_SCHEMA_NODES}-node schema budget"
+        ));
+    }
+    match node {
+        Value::Array(items) => {
+            for item in items {
+                audit_output_schema_structure(item, depth + 1, nodes)?;
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                audit_output_schema_structure(value, depth + 1, nodes)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn audit_output_schema_node(
+    node: &Value,
+    document: &Value,
+    depth: usize,
+    max_depth_seen: &mut HashMap<usize, usize>,
+    active: &mut HashSet<usize>,
+) -> Result<(), String> {
+    if depth > MAX_OUTPUT_SCHEMA_REF_DEPTH {
+        return Err(format!(
+            "outputSchema exceeds the {MAX_OUTPUT_SCHEMA_REF_DEPTH}-level schema-walk budget"
+        ));
+    }
+    let identity = std::ptr::from_ref(node) as usize;
+    if active.contains(&identity) {
+        return Ok(());
+    }
+    if max_depth_seen
+        .get(&identity)
+        .is_some_and(|seen_depth| *seen_depth >= depth)
+    {
+        return Ok(());
+    }
+    max_depth_seen.insert(identity, depth);
+    let Value::Object(map) = node else {
+        return Ok(());
+    };
+    active.insert(identity);
+    for key in ["$ref", "$dynamicRef"] {
+        if let Some(value) = map.get(key) {
+            let Some(reference) = value.as_str() else {
+                return Err(format!("outputSchema has a non-string '{key}'"));
+            };
+            if !reference.starts_with('#') {
+                return Err(format!(
+                    "outputSchema has a non-local '{key}'; only local references (starting with '#') are supported and no external reference is ever retrieved"
+                ));
+            }
+            if let Some(target) = local_output_schema_pointer_target(document, reference, key)? {
+                audit_output_schema_node(target, document, depth + 1, max_depth_seen, active)?;
+            }
+        }
+    }
+    for key in ["$id", "id"] {
+        if let Some(value) = map.get(key) {
+            let Some(id) = value.as_str() else {
+                return Err(format!("outputSchema has a non-string '{key}'"));
+            };
+            if !id.starts_with('#') && !id.is_empty() {
+                return Err(format!(
+                    "outputSchema has a non-local '{key}'; only fragment identifiers are supported"
+                ));
+            }
+        }
+    }
+    if map.contains_key("$vocabulary") {
+        return Err("outputSchema declares '$vocabulary', which is not supported".to_string());
+    }
+    for (key, value) in map {
+        match key.as_str() {
+            "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas" => {
+                if let Some(object) = value.as_object() {
+                    for child in object.values() {
+                        audit_output_schema_node(
+                            child,
+                            document,
+                            depth + 1,
+                            max_depth_seen,
+                            active,
+                        )?;
+                    }
+                }
+            }
+            "items" => match value {
+                Value::Array(items) => {
+                    for child in items {
+                        audit_output_schema_node(
+                            child,
+                            document,
+                            depth + 1,
+                            max_depth_seen,
+                            active,
+                        )?;
+                    }
+                }
+                other => {
+                    audit_output_schema_node(other, document, depth + 1, max_depth_seen, active)?
+                }
+            },
+            "additionalProperties"
+            | "unevaluatedProperties"
+            | "unevaluatedItems"
+            | "contains"
+            | "propertyNames"
+            | "not"
+            | "if"
+            | "then"
+            | "else"
+            | "contentSchema" => {
+                audit_output_schema_node(value, document, depth + 1, max_depth_seen, active)?;
+            }
+            "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
+                if let Some(items) = value.as_array() {
+                    for child in items {
+                        audit_output_schema_node(
+                            child,
+                            document,
+                            depth + 1,
+                            max_depth_seen,
+                            active,
+                        )?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    active.remove(&identity);
+    Ok(())
+}
+
+fn local_output_schema_pointer_target<'a>(
+    document: &'a Value,
+    reference: &str,
+    key: &str,
+) -> Result<Option<&'a Value>, String> {
+    let Some(pointer) = reference.strip_prefix('#') else {
+        return Ok(None);
+    };
+    if pointer.is_empty() {
+        return Ok(Some(document));
+    }
+    let pointer = percent_decode_str(pointer).decode_utf8().map_err(|_| {
+        format!("outputSchema '{key}' has a local JSON Pointer fragment that is not valid UTF-8")
+    })?;
+    if !pointer.starts_with('/') {
+        return Err(format!(
+            "outputSchema '{key}' must be a JSON Pointer fragment (starting with '#/')"
+        ));
+    }
+    match document.pointer(pointer.as_ref()) {
+        Some(target) => Ok(Some(target)),
+        None => Err(format!(
+            "outputSchema '{key}' target '{reference}' was not found"
+        )),
+    }
+}
+
+/// Select the caller-visible representation that `outputSchema` constrains.
+///
+/// Prefer `structuredContent` when present. Fall back to a single JSON text
+/// content block when structured content is absent. When both are present they
+/// must agree so validation never accepts a different representation than the
+/// caller receives.
+fn extract_tool_result_validation_payload(
+    result: &Value,
+    max_json_text_bytes: usize,
+) -> Result<Value, &'static str> {
+    let structured = result.get("structuredContent").cloned();
+    let content_json =
+        extract_tool_result_content_json(result.get("content"), max_json_text_bytes)?;
+    match (structured, content_json) {
+        (Some(structured), Some(content)) => {
+            if structured == content {
+                Ok(structured)
+            } else {
+                Err("structuredContent and content JSON disagree")
+            }
+        }
+        (Some(structured), None) => Ok(structured),
+        (None, Some(content)) => Ok(content),
+        (None, None) => Err("tool result missing structuredContent and JSON text content"),
+    }
+}
+
+fn extract_tool_result_content_json(
+    content: Option<&Value>,
+    max_json_text_bytes: usize,
+) -> Result<Option<Value>, &'static str> {
+    let Some(content) = content else {
+        return Ok(None);
+    };
+    let Some(items) = content.as_array() else {
+        return Err("tool result content must be an array");
+    };
+    let mut parsed_json: Option<Value> = None;
+    for item in items {
+        let Some(kind) = item.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if kind != "text" {
+            continue;
+        }
+        let Some(text) = item.get("text").and_then(Value::as_str) else {
+            return Err("tool result text content missing text");
+        };
+        if text.len() > max_json_text_bytes {
+            return Err("tool result text content exceeded decode budget");
+        }
+        if crate::util::json_dup_keys::str_ambiguity(text).is_some() {
+            return Err("tool result JSON text content is ambiguous");
+        }
+        let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+            // Non-JSON text is ordinary unstructured companion content.
+            continue;
+        };
+        if parsed_json.is_some() {
+            return Err("tool result has multiple JSON text content blocks");
+        }
+        parsed_json = Some(parsed);
+    }
+    Ok(parsed_json)
 }
 
 fn json_rpc_error(
@@ -6067,14 +6691,8 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
 
 fn parse_validation(object: &Map<String, Value>) -> Result<McpValidationConfig, String> {
     let validation = optional_object(object, "validation")?;
-    // Tool result validation is not implemented in V1. Reject it rather than
-    // silently accepting a config that advertises enforcement that never runs.
-    if optional_bool_from_object(validation, "validate_tool_results")?.unwrap_or(false) {
-        return Err(
-            "mcp_gateway: 'validation.validate_tool_results' is not supported yet; tool result validation is not implemented"
-                .to_string(),
-        );
-    }
+    let validate_tool_results =
+        optional_bool_from_object(validation, "validate_tool_results")?.unwrap_or(false);
     let max_upstream_response_bytes =
         optional_u64_from_object(validation, "max_upstream_response_bytes")?
             .map(|value| value as usize)
@@ -6143,6 +6761,7 @@ fn parse_validation(object: &Map<String, Value>) -> Result<McpValidationConfig, 
     Ok(McpValidationConfig {
         validate_tool_arguments: optional_bool_from_object(validation, "validate_tool_arguments")?
             .unwrap_or(true),
+        validate_tool_results,
         max_upstream_response_bytes,
         max_catalog_items_per_list,
         max_catalog_bytes_per_list,
