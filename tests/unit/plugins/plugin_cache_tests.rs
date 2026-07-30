@@ -3409,6 +3409,10 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
         candidate_names.contains("\"soap_ws_security\""),
         "candidate construction must include SOAP so custom auth capabilities cannot bypass its sole-auth gate"
     );
+    assert!(
+        candidate_names.contains("\"workload_metrics\""),
+        "candidate construction must include every built-in request-header mutator so replay plugins cannot pass admission ahead of workload tracing rewrites"
+    );
     let effective_chain_start = source
         .find("fn validate_plugin_security_composition(")
         .expect("effective-chain security validator must exist");

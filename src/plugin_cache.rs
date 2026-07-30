@@ -2954,6 +2954,7 @@ const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "serverless_function",
     "soap_ws_security",
     "sse",
+    "workload_metrics",
 ];
 
 fn is_security_composition_candidate_plugin(
