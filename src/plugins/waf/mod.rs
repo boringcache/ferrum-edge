@@ -183,9 +183,7 @@ impl Waf {
     }
 
     fn has_enforcing_response_header_policy(&self) -> bool {
-        if self.config.mode != GlobalMode::Enforce
-            || !self.compiled.response_header_rules_active
-        {
+        if self.config.mode != GlobalMode::Enforce || !self.compiled.response_header_rules_active {
             return false;
         }
         if self.config.scoring.is_some() {
@@ -193,10 +191,7 @@ impl Waf {
         }
         self.compiled.rules.iter().any(|rule| {
             rule.action == RuleAction::Enforce
-                && matches!(
-                    &rule.target,
-                    self::rules::RuleTarget::ResponseHeaders
-                )
+                && matches!(&rule.target, self::rules::RuleTarget::ResponseHeaders)
         })
     }
 
