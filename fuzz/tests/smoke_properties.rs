@@ -55,7 +55,7 @@ fn k8s_minimal_virtual_service() {
 
 #[test]
 fn plugin_config_cors_minimal() {
-    let input = br#"0{"origins":["*"]}"#;
+    let input = br#"0{"allowed_origins":["*"]}"#;
     fuzz_validate_plugin_config(input).expect("minimal CORS config");
 }
 
