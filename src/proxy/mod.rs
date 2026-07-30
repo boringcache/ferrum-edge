@@ -4472,11 +4472,17 @@ impl FinalizedRequestEgressOutcome {
 /// byte-identical to what the backend would receive, and every local policy
 /// that could still reject the request has already accepted it.
 ///
+/// A request that finalizes nowhere — nothing required buffering, or it carries
+/// no body at all — has no transform and no final-body hook to run, so its
+/// client representation is already the backend-visible one and the H1/H2 and H3
+/// pre-dispatch boundaries invoke the phase with an empty body instead.
+///
 /// The phase is reachable from several dispatch ladders (H1/H2 terminal
-/// preparation, H1/H2 ordinary preparation, the native-gRPC branch, and the H3
-/// terminal preparation). `RequestContext::finalized_request_egress_dispatched`
-/// makes the external side effect exactly-once across all of them, including
-/// across retries, which replay the already-finalized body.
+/// preparation, H1/H2 ordinary preparation, the native-gRPC branch, the H1/H2
+/// pre-dispatch boundary, and the H3 boundary after terminal preparation).
+/// `RequestContext::finalized_request_egress_dispatched` makes the external side
+/// effect exactly-once across all of them, including across retries, which
+/// replay the already-finalized body.
 pub(crate) async fn run_finalized_request_egress_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -22608,13 +22614,28 @@ async fn handle_proxy_request_inner(
         };
     }
 
-    // Requests that never buffer a body have no `transform_request_body` and no
-    // `on_final_request_body` phase, so the client representation is already the
-    // backend-visible one and this is the finalized-egress boundary for them.
-    // Buffered requests reach the phase at a finalization site instead and are
-    // skipped here by `finalized_request_egress_dispatched`.
+    // A request that never reaches a body-finalization site has no
+    // `transform_request_body` and no `on_final_request_body` phase, so its
+    // client representation is already the backend-visible one and this is the
+    // finalized-egress boundary for it. Two shapes land here:
+    //
+    // - nothing required buffering at all (WebSocket handshakes, streamed
+    //   requests with no body policy), and
+    // - a request that carries no body whatsoever on a proxy that *does*
+    //   require buffering. `buffer_request_body_for_before_proxy` deliberately
+    //   leaves such a request streaming, so the terminal preparation above falls
+    //   to its `bodyless` arm and runs neither transforms, nor final-body hooks,
+    //   nor an egress boundary of its own. Without this the whole phase would be
+    //   unreachable for, say, a bodyless `GET` on a `request_mirror` proxy
+    //   (`mirror_request_body` defaults to true, which requires buffering).
+    //
+    // A request that did finalize has already dispatched and is excluded by
+    // `finalized_request_egress_dispatched` before the header snapshot is
+    // cloned. Only a buffering native-gRPC chain is left out: its branch
+    // collects the message and reaches the boundary with those exact bytes.
     if capabilities.has(PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS)
-        && !requires_request_body_buffering
+        && !ctx.finalized_request_egress_dispatched
+        && !(is_grpc_request && requires_request_body_buffering)
     {
         let phase_start = Instant::now();
         let egress_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();

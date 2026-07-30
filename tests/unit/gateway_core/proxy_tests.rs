@@ -3501,16 +3501,31 @@ fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch
          finalized_request_egress transaction phase"
     );
 
-    // The no-buffering fallback is the only unguarded-by-final-hooks site, and
-    // it must be conditioned on this request having no buffered finalization.
+    // The fallback site is the only one not preceded by a final-body hook pass.
+    // It must be exactly-once gated rather than gated on "this chain never
+    // buffers": a request that carries no body at all is left streaming by
+    // `buffer_request_body_for_before_proxy`, so the terminal preparation runs
+    // neither transforms nor final-body hooks for it and reaches no boundary of
+    // its own. Gating the fallback on `!requires_request_body_buffering` made the
+    // whole phase unreachable for a bodyless request on any buffering chain —
+    // e.g. a `GET` on a `request_mirror` proxy, whose `mirror_request_body`
+    // default requires buffering.
     let fallback = handler
-        .find("&& !requires_request_body_buffering")
-        .expect("the no-buffering egress fallback gate must remain present");
+        .find("&& !ctx.finalized_request_egress_dispatched")
+        .expect("the fallback egress site must remain exactly-once gated");
     assert!(
         handler[..fallback]
             .rfind("DISPATCHES_FINALIZED_REQUEST_EGRESS")
             .is_some_and(|capability| fallback - capability < 200),
-        "the no-buffering egress fallback must not fire for a request that still finalizes"
+        "the fallback egress site must stay capability-gated"
+    );
+    assert!(
+        handler[fallback..]
+            .find("!(is_grpc_request && requires_request_body_buffering)")
+            .is_some_and(|offset| offset < 200),
+        "only a buffering native-gRPC chain may defer to the gRPC branch's own egress \
+         boundary; every other request that reaches no finalization site must still be \
+         dispatched here (GHSA-4vr5-4wm3-x5xv)"
     );
 
     // A buffered request on an egress chain finalizes before backend dispatch
