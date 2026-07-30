@@ -163,6 +163,11 @@ fn conditional_buffering_matrix() -> Vec<Row> {
         row("request_mirror", no_body_mirroring, Exactly(Streams)),
         base("request_transformer", Exactly(Streams)),
         row("request_transformer", body_rules, Exactly(Buffers)),
+        // The shared cache only replays for an upload the transport has proven
+        // empty, so it requires the pre-`before_proxy` buffer unconditionally
+        // at config level; the per-request `should_buffer_request_body`
+        // predicate narrows it to cacheable methods.
+        base("response_caching", Exactly(Buffers)),
         base("serverless_function", ParityOnly),
         row("serverless_function", no_body_forward, ParityOnly),
         base("soap_ws_security", Exactly(Buffers)),

@@ -2762,6 +2762,30 @@ fn can_attempt_hbone_backend(
         && registry_ok
 }
 
+/// Whether `target.host` is the scoped, non-dialable load-balancer identity
+/// minted for a cross-cluster Ambient HBONE target. Keep this stricter than a
+/// prefix check: operator-supplied or malformed HBONE targets must not inherit
+/// the synthetic-host DNS exemption unless every field that redirects the
+/// outer dial and inner CONNECT authority is present. Field contents are
+/// validated by `proxy_to_backend_hbone` before the real dial.
+fn is_synthetic_cross_cluster_hbone_dispatch_target(target: &UpstreamTarget) -> bool {
+    target
+        .host
+        .starts_with(hbone_pool::HBONE_CROSS_CLUSTER_SYNTHETIC_HOST_PREFIX)
+        && hbone_pool::target_hbone_enabled(target)
+        && hbone_pool::target_hbone_cross_cluster(target)
+        && target.tags.contains_key(hbone_pool::HBONE_DIAL_HOST_TAG)
+        && target
+            .tags
+            .contains_key(hbone_pool::HBONE_AUTHORITY_HOST_TAG)
+        && target
+            .tags
+            .contains_key(mesh_mtls_pool::MESH_EASTWEST_SNI_TAG)
+        && target
+            .tags
+            .contains_key(mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG)
+}
+
 /// Whether a target dispatches over the Sidecar egress SVID-mTLS HTTP/2 pool
 /// (`mesh.mtls=true` tag). Unlike HBONE there is no capability-registry gate:
 /// `mesh.mtls` targets are produced only by the mesh outbound materializer and
@@ -21945,6 +21969,22 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
+    // A replay lookup may run before final request-body hooks, so it needs a
+    // transport-owned proof that the complete body is empty. Method/framing
+    // headers alone are insufficient for H2 GET/HEAD streams that carry DATA
+    // without Content-Length. Publish the proof only after any early body
+    // normalization has produced the representation every before_proxy hook
+    // will observe.
+    ctx.set_replay_request_body_empty_proven(
+        before_proxy_body_requirements.required
+            && match &client_request_body {
+                ClientRequestBody::Streaming(request) => {
+                    hyper::body::Body::is_end_stream(request.body())
+                }
+                ClientRequestBody::Buffered(buffered) => buffered.body.is_empty(),
+            },
+    );
+
     // before_proxy hooks — only clone headers if at least one plugin modifies them.
     // When no plugin modifies headers, pass &mut ctx.headers directly to avoid
     // an expensive per-request HashMap clone on the hot path.
@@ -22584,6 +22624,12 @@ async fn handle_proxy_request_inner(
                     ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
                     ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
                     ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
+                    // `ai_semantic_cache` stages its semantic miss (scope key +
+                    // embedding) from the final-request-body hook, and its store hook
+                    // runs later against the real context. Without carrying these two
+                    // maps back, every semantic miss would silently store as exact-only.
+                    ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
+                    ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
                 }
                 match final_body_result {
                     PluginResult::Continue => {
@@ -22895,6 +22941,12 @@ async fn handle_proxy_request_inner(
                     ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
                     ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
                     ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
+                    // `ai_semantic_cache` stages its semantic miss (scope key +
+                    // embedding) from the final-request-body hook, and its store hook
+                    // runs later against the real context. Without carrying these two
+                    // maps back, every semantic miss would silently store as exact-only.
+                    ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
+                    ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
                 }
                 match final_body_result {
                     PluginResult::Continue => {
@@ -23544,6 +23596,12 @@ async fn handle_proxy_request_inner(
                 ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
                 ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
                 ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
+                // `ai_semantic_cache` stages its semantic miss (scope key +
+                // embedding) from the final-request-body hook, and its store hook
+                // runs later against the real context. Without carrying these two
+                // maps back, every semantic miss would silently store as exact-only.
+                ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
+                ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
             }
             match final_body_result {
                 PluginResult::Continue => {}
@@ -26431,6 +26489,12 @@ async fn handle_proxy_request_inner(
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
             ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
             ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
+            // `ai_semantic_cache` stages its semantic miss (scope key +
+            // embedding) from the final-request-body hook, and its store hook
+            // runs later against the real context. Without carrying these two
+            // maps back, every semantic miss would silently store as exact-only.
+            ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
+            ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
         }
         let (mut result, retained_body) = match initial_dispatch {
             BackendDispatchResult::Response {
@@ -26851,6 +26915,12 @@ async fn handle_proxy_request_inner(
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
             ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
             ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
+            // `ai_semantic_cache` stages its semantic miss (scope key +
+            // embedding) from the final-request-body hook, and its store hook
+            // runs later against the real context. Without carrying these two
+            // maps back, every semantic miss would silently store as exact-only.
+            ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
+            ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
         }
         let resp = match dispatch {
             BackendDispatchResult::Response {
@@ -29156,7 +29226,12 @@ pub(crate) async fn proxy_to_backend_retry(
     } else {
         resolve_backend_ip.await
     };
-    let resolved_ip = resolved_ip_result.ok().map(|ip| ip.to_string());
+    let resolved_ip = match resolved_ip_result {
+        Ok(ip) => Some(ip.to_string()),
+        Err(error) => {
+            return backend_dns_resolution_failed_response(effective_host, &error);
+        }
+    };
 
     let client_result = crate::plugins::await_grpc_deadline(
         request_ctx.grpc_deadline_at(),
@@ -29998,6 +30073,45 @@ fn backend_egress_denied_dispatch_result(host: &str) -> BackendDispatchResult {
     backend_dispatch_response(backend_egress_denied_response(host), None, None)
 }
 
+/// Fail a reqwest dispatch before it can perform a second DNS lookup with the
+/// resolver's default TTL. The preflight lookup carries the proxy-specific TTL
+/// and egress policy, so proceeding after it fails could let reqwest reuse a
+/// shared address that is stale for this proxy.
+fn backend_dns_resolution_failed_response(
+    host: &str,
+    error: &anyhow::Error,
+) -> retry::BackendResponse {
+    let policy_rejected = crate::dns::is_egress_policy_denial(error);
+    warn!(
+        backend = %host,
+        error = %error,
+        "Backend DNS preflight failed; not dialing"
+    );
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::buffered(br#"{"error":"Backend DNS resolution failed"}"#.to_vec()),
+        headers: HashMap::new(),
+        connection_error: !policy_rejected,
+        backend_resolved_ip: None,
+        error_class: Some(if policy_rejected {
+            retry::ErrorClass::DispatchPolicyRejected
+        } else {
+            retry::ErrorClass::DnsLookupError
+        }),
+    }
+}
+
+fn backend_dns_resolution_failed_dispatch_result(
+    host: &str,
+    error: &anyhow::Error,
+) -> BackendDispatchResult {
+    backend_dispatch_response(
+        backend_dns_resolution_failed_response(host, error),
+        None,
+        None,
+    )
+}
+
 /// Single authoritative `Content-Length` from a raw header map, or `None` when
 /// absent or unusable.
 ///
@@ -30228,32 +30342,56 @@ async fn proxy_to_backend(
         return backend_egress_denied_dispatch_result(effective_host);
     }
 
-    // Resolve backend IP from DNS cache (O(1) cached lookup, <1μs).
-    // When `dns_override` is set, this returns the override IP for the
-    // selected host — the same address the pooled reqwest client's
-    // `DnsCacheResolver::with_dns_override` will dial for that hostname
-    // (including load-balanced targets that differ from `backend_host`).
-    // Without an override, both paths consult the shared cache.
-    let resolve_backend_ip = state.dns_cache.resolve(
-        effective_host,
-        proxy.dns_override.as_deref(),
-        proxy.dns_cache_ttl_seconds,
-    );
-    let resolved_ip_result = if let Some(deadline) = request_ctx.grpc_deadline_at() {
-        match tokio::time::timeout_at(deadline, resolve_backend_ip).await {
-            Ok(result) => result,
-            Err(_) => {
-                return backend_dispatch_response(
-                    client_grpc_deadline_exceeded_response_for_request(request_ctx, headers, None),
-                    None,
-                    None,
-                );
+    // Cross-cluster Ambient HBONE targets deliberately use a scoped synthetic
+    // load-balancer identity (`mesh-xc-hbone|gateway|port|pod`) rather than a
+    // DNS name. The HBONE pool reads and policy-screens the real dial and inner
+    // authority hosts from the target tags. Sending that identity through the
+    // reqwest-oriented preflight would reject every healthy cross-cluster route
+    // before the HBONE connector could inspect those authoritative fields.
+    //
+    // Every ordinary host still fails closed here. Retry dispatch is always a
+    // reqwest path and retains the unconditional preflight above.
+    let resolved_ip = if dispatch_hbone
+        && upstream_target.is_some_and(is_synthetic_cross_cluster_hbone_dispatch_target)
+    {
+        None
+    } else {
+        // Resolve backend IP from DNS cache (O(1) cached lookup, <1μs).
+        // When `dns_override` is set, this returns the override IP for the
+        // selected host — the same address the pooled reqwest client's
+        // `DnsCacheResolver::with_dns_override` will dial for that hostname
+        // (including load-balanced targets that differ from `backend_host`).
+        // Without an override, both paths consult the shared cache.
+        let resolve_backend_ip = state.dns_cache.resolve(
+            effective_host,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        );
+        let resolved_ip_result = if let Some(deadline) = request_ctx.grpc_deadline_at() {
+            match tokio::time::timeout_at(deadline, resolve_backend_ip).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return backend_dispatch_response(
+                        client_grpc_deadline_exceeded_response_for_request(
+                            request_ctx,
+                            headers,
+                            None,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+            }
+        } else {
+            resolve_backend_ip.await
+        };
+        match resolved_ip_result {
+            Ok(ip) => Some(ip.to_string()),
+            Err(error) => {
+                return backend_dns_resolution_failed_dispatch_result(effective_host, &error);
             }
         }
-    } else {
-        resolve_backend_ip.await
     };
-    let resolved_ip = resolved_ip_result.ok().map(|ip| ip.to_string());
 
     if dispatch_hbone {
         // 413 on an oversized declared Content-Length BEFORE admission, so a
@@ -39215,13 +39353,20 @@ mod tests {
             "model": "gpt-test",
             "messages": [{"role": "user", "content": "hello"}]
         });
-
-        let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
-        let mut request_headers =
+        let request_body_bytes = serde_json::to_vec(&request_body).unwrap();
+        let request_headers =
             HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+        // Lookup lives in on_final_request_body (priority 4057), after final
+        // request transforms and before provider I/O — not in before_proxy.
+        let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
         assert!(matches!(
             cache
-                .before_proxy(&mut miss_ctx, &mut request_headers)
+                .on_final_request_body_with_context(
+                    &mut miss_ctx,
+                    &request_headers,
+                    &request_body_bytes
+                )
                 .await,
             PluginResult::Continue
         ));
@@ -39237,9 +39382,9 @@ mod tests {
             .await;
 
         let mut hit_ctx = request_ctx_with_ai_body(request_body);
-        let mut hit_headers =
-            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-        let synthetic = cache.before_proxy(&mut hit_ctx, &mut hit_headers).await;
+        let synthetic = cache
+            .on_final_request_body_with_context(&mut hit_ctx, &request_headers, &request_body_bytes)
+            .await;
         assert!(matches!(synthetic, PluginResult::RejectBinary { .. }));
 
         let response = normalize_synthetic_reject_for_test(&plugins, &mut hit_ctx, synthetic).await;
@@ -39261,13 +39406,20 @@ mod tests {
             "model": "gpt-test",
             "messages": [{"role": "user", "content": "hello"}]
         });
-
-        let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
-        let mut request_headers =
+        let request_body_bytes = serde_json::to_vec(&request_body).unwrap();
+        let request_headers =
             HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+        // Lookup lives in on_final_request_body (priority 4057), after final
+        // request transforms and before provider I/O — not in before_proxy.
+        let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
         assert!(matches!(
             cache
-                .before_proxy(&mut miss_ctx, &mut request_headers)
+                .on_final_request_body_with_context(
+                    &mut miss_ctx,
+                    &request_headers,
+                    &request_body_bytes
+                )
                 .await,
             PluginResult::Continue
         ));
@@ -39283,9 +39435,9 @@ mod tests {
             .await;
 
         let mut hit_ctx = request_ctx_with_ai_body(request_body);
-        let mut hit_headers =
-            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-        let synthetic = cache.before_proxy(&mut hit_ctx, &mut hit_headers).await;
+        let synthetic = cache
+            .on_final_request_body_with_context(&mut hit_ctx, &request_headers, &request_body_bytes)
+            .await;
         assert!(matches!(synthetic, PluginResult::RejectBinary { .. }));
 
         let response = normalize_synthetic_reject_for_test(&plugins, &mut hit_ctx, synthetic).await;

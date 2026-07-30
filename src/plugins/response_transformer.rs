@@ -40,16 +40,31 @@
 //!
 //! ## RTDS overlay
 //!
-//! When `runtime_overlay_scope: "<scope>"` is set, the plugin reads
-//! `ferrum.response_transformer.<scope>.enabled` from the mesh runtime
-//! overlay at request time. A `false` value short-circuits rule
-//! application (static rules AND route-overlay overrides). A missing
-//! entry falls back to `default_enabled` (defaults to `true` —
-//! fail-open).
+//! When `runtime_overlay_scope: "<scope>"` is set, the effective value of
+//! `ferrum.response_transformer.<scope>.enabled` is bound into this
+//! instance's configuration by mesh preparation and resolved ONCE,
+//! immutably, at construction. A `false` value short-circuits rule
+//! application (static rules AND route-overlay overrides). A scope the
+//! accepted overlay does not name falls back to `default_enabled`
+//! (defaults to `true` — fail-open).
 //!
-//! Because that gate can flip without a config reload, a cached
-//! representation could otherwise outlive the policy that produced it. This
-//! plugin does not try to detect that from the replay path: a finalized replay
+//! The gate is deliberately NOT read at request time (GHSA-83rc-23c9-3g9x).
+//! That matters most on this side, because the response pipeline consults the
+//! gate at four points that are separated by real time — buffering preflight
+//! (before backend headers), the header capability simulation, `after_proxy`
+//! (after backend latency), and body transformation. A request-time gate let
+//! those disagree: a `false` preflight selected streaming and a later `true`
+//! header phase then applied header rules to a response whose body rules had no
+//! buffered body left to run on, shipping a response marked as sanitized but
+//! unredacted. Resolving from configuration makes buffer/stream selection and
+//! every later hook read one immutable decision by construction, so the
+//! preflight answer and the enforcement answer cannot diverge.
+//!
+//! A gate change is now a new plugin generation rather than a mutation of live
+//! state, but that does not by itself protect a representation which OUTLIVES
+//! the generation that produced it — a `response_caching` entry or a
+//! Redis-persisted `request_deduplication` replay. This plugin does not try to
+//! detect that from the replay path: a finalized replay
 //! carries no evidence of which policy shaped it, and re-running rules on a
 //! guess would double-apply non-idempotent `add` sequences. Instead the
 //! plugins that retain a representation stamp it with the policy it was
@@ -104,6 +119,7 @@ use super::utils::route_header_transform::{
     apply_route_header_transforms_tracked,
 };
 use super::utils::sse::is_text_event_stream_media_type;
+use super::utils::transformer_gate;
 use super::{Plugin, PluginResult, RequestContext};
 use crate::util::http_headers::{cache_control_has_directive, etag_value_is_strong};
 
@@ -115,6 +131,10 @@ const CONFIG_KEYS: &[&str] = &[
     "apply_route_overrides",
     "runtime_overlay_scope",
     "default_enabled",
+    // Reserved: written by mesh preparation from the accepted RTDS overlay so
+    // the gate rides the same generation as the rules. See
+    // `crate::plugins::utils::transformer_gate::RESOLVED_ENABLED_KEY`.
+    transformer_gate::RESOLVED_ENABLED_KEY,
 ];
 
 /// Per-rule keys accepted for both header and body rules.
@@ -148,13 +168,16 @@ pub struct ResponseTransformer {
     /// once so the deadline-provenance path allocates nothing per request.
     static_update_keys: Vec<String>,
     body_rules: Vec<BodyRule>,
-    /// When `Some`, the plugin reads
-    /// `ferrum.response_transformer.<scope>.enabled` from the mesh
-    /// runtime overlay on every request before applying rules.
-    runtime_overlay_scope: Option<String>,
-    /// Fallback when [`runtime_overlay_scope`] is set but the overlay
-    /// does not carry the matching key. Defaults to `true` (fail-open).
-    default_enabled: bool,
+    /// The one immutable effective gate decision for this instance, resolved at
+    /// construction from `runtime_overlay_scope`, the mesh-materialized
+    /// `runtime_overlay_resolved_enabled`, and `default_enabled`.
+    ///
+    /// `true` for every instance that did not opt into an RTDS scope. Every
+    /// phase — buffering preflight, retry release, header simulation,
+    /// `after_proxy`, and body transformation — reads this one field, so the
+    /// buffer/stream selection and the later header/body hooks are guaranteed to
+    /// agree (GHSA-83rc-23c9-3g9x).
+    rules_enabled: bool,
     /// Content-derived digest of this instance's whole accepted static config.
     ///
     /// Computed once at construction from the canonical form of the validated
@@ -165,6 +188,14 @@ pub struct ResponseTransformer {
     /// representation bind this value so a retained replay can never outlive
     /// the rules that produced it. Only the digest is ever exposed; the source
     /// config (which may carry operator-authored header values) is not retained.
+    ///
+    /// Since the accepted RTDS gate is now materialized INTO that configuration
+    /// as `runtime_overlay_resolved_enabled`, this digest also covers the
+    /// effective gate — per instance, which is strictly finer than the
+    /// process-global gate-map fingerprint `request_deduplication` folds
+    /// alongside it. Do not "simplify" that fingerprint away on the grounds that
+    /// the gate is now in the config: the two are independent provenance inputs
+    /// and the Redis-persisted replay contract binds both.
     static_policy_digest: [u8; 32],
 }
 
@@ -174,15 +205,6 @@ pub struct ResponseTransformer {
 const STATIC_POLICY_DIGEST_DOMAIN: &str = "ferrum.plugin.response_transformer.static.v1";
 
 impl ResponseTransformer {
-    fn rules_enabled(&self) -> bool {
-        let Some(scope) = self.runtime_overlay_scope.as_deref() else {
-            return true;
-        };
-        runtime_overlay::current_gates()
-            .gate(scope)
-            .unwrap_or(self.default_enabled)
-    }
-
     fn static_rules_may_modify_content_type(&self) -> bool {
         self.header_rules.iter().any(|rule| match rule.operation {
             HeaderOp::Add | HeaderOp::Update | HeaderOp::Remove => rule.key == "content-type",
@@ -634,6 +656,24 @@ impl ResponseTransformer {
             }
         };
 
+        let resolved_enabled = match config.get(transformer_gate::RESOLVED_ENABLED_KEY) {
+            Some(Value::Bool(b)) => Some(*b),
+            Some(Value::Null) | None => None,
+            Some(_) => {
+                return Err(format!(
+                    "response_transformer: {} must be a boolean",
+                    transformer_gate::RESOLVED_ENABLED_KEY
+                ));
+            }
+        };
+
+        // Resolve the gate exactly once, here — see the struct field docs.
+        let rules_enabled = if runtime_overlay_scope.is_some() {
+            resolved_enabled.unwrap_or(default_enabled)
+        } else {
+            true
+        };
+
         let static_update_keys = header_rules
             .iter()
             .filter(|rule| rule.operation == HeaderOp::Update)
@@ -651,8 +691,7 @@ impl ResponseTransformer {
             header_rules,
             static_update_keys,
             body_rules,
-            runtime_overlay_scope,
-            default_enabled,
+            rules_enabled,
             static_policy_digest,
         })
     }
@@ -809,18 +848,19 @@ impl Plugin for ResponseTransformer {
     }
 
     /// This plugin *is* the presentation policy a finalized replay skips, so it
-    /// enrolls unconditionally — including when its rules are currently gated
-    /// off. Enrolling only while enabled would make an instance appear and
-    /// disappear from the per-proxy digest based on live gate state, which the
-    /// gate fingerprint already covers, and would hide the static rules of a
+    /// enrolls unconditionally — including when its rules are gated off for this
+    /// generation. Enrolling only while enabled would hide the static rules of a
     /// disabled instance from a representation stored while it was disabled.
     ///
-    /// `Static` is accurate: every rule this plugin applies to a response body
-    /// comes from its accepted configuration, and the instance holds no
-    /// interior mutable state. The one runtime input, the RTDS gate, is carried
-    /// by the separate gate fingerprint; the one non-config input,
-    /// `ctx.route_override_response_transform`, is header-only and is consumed
-    /// without being applied on a finalized replay.
+    /// `Static` is accurate, and since GHSA-83rc-23c9-3g9x it is accurate
+    /// without qualification: every rule this plugin applies to a response body
+    /// comes from its accepted configuration, the effective RTDS gate is now
+    /// part of that configuration (`runtime_overlay_resolved_enabled`, folded
+    /// into [`Self::static_policy_digest`]), and the instance holds no interior
+    /// mutable state. So this digest — not the separately published gate map —
+    /// is the complete witness of what this instance does to a representation.
+    /// The one non-config input, `ctx.route_override_response_transform`, is
+    /// header-only and is consumed without being applied on a finalized replay.
     fn response_presentation_policy(&self) -> Option<super::ResponsePresentationPolicy> {
         Some(super::ResponsePresentationPolicy::Static(
             self.static_policy_digest,
@@ -828,12 +868,15 @@ impl Plugin for ResponseTransformer {
     }
 
     fn requires_buffered_grpc_web_trailer_policy(&self, ctx: &RequestContext) -> bool {
-        self.rules_enabled()
+        self.rules_enabled
             && (!self.header_rules.is_empty() || ctx.route_override_response_transform.is_some())
     }
 
     fn requires_response_body_buffering(&self) -> bool {
-        !self.body_rules.is_empty()
+        // `rules_enabled` is immutable for this generation, so a disabled
+        // instance has no body hook to schedule and need not advertise the
+        // cache-level buffering capability.
+        self.rules_enabled && !self.body_rules.is_empty()
     }
 
     fn may_modify_response_content_type(
@@ -843,7 +886,7 @@ impl Plugin for ResponseTransformer {
     ) -> bool {
         // Whether a rule fires is decided by config/route state, not the
         // backend response type, so the backend `Content-Type` is not consulted.
-        self.rules_enabled()
+        self.rules_enabled
             && (self.static_rules_may_modify_content_type()
                 || Self::route_rules_may_modify_content_type(ctx))
     }
@@ -853,7 +896,7 @@ impl Plugin for ResponseTransformer {
         ctx: &RequestContext,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
-        self.rules_enabled()
+        self.rules_enabled
             && (self.static_rules_may_add_cache_control_no_transform()
                 || Self::route_rules_may_add_cache_control_no_transform(ctx))
     }
@@ -863,7 +906,7 @@ impl Plugin for ResponseTransformer {
         ctx: &RequestContext,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
-        self.rules_enabled()
+        self.rules_enabled
             && (self.static_rules_may_add_strong_etag()
                 || Self::route_rules_may_add_strong_etag(ctx))
     }
@@ -873,7 +916,7 @@ impl Plugin for ResponseTransformer {
         ctx: &mut RequestContext,
         response_headers: &mut HashMap<String, String>,
     ) {
-        if !self.rules_enabled() {
+        if !self.rules_enabled {
             return;
         }
         // Finalized cache/idempotent replays already carry post-transform
@@ -895,9 +938,12 @@ impl Plugin for ResponseTransformer {
         // into the buffered path — otherwise a disabled transform still buffers
         // a large/streaming non-SSE response until the max-response-body limit
         // and then 502s, defeating the very buffering relief the kill-switch is
-        // meant to provide. `rules_enabled()` reads request-time overlay state,
-        // so it belongs in this per-request gate (not the cache-level
-        // `requires_response_body_buffering` upper bound). (Finding #64.)
+        // meant to provide. (Finding #64.) `self.rules_enabled` is the SAME
+        // immutable decision `after_proxy` and `transform_response_body` read, so
+        // this preflight answer and the later enforcement answer are identical by
+        // construction: a gate that moves after this point cannot leave a
+        // streaming-selected response to be header-marked as transformed while
+        // its body rules have no buffered body to run on (GHSA-83rc-23c9-3g9x).
         //
         // Do NOT key this pre-header decision off the client-controlled Accept
         // header. A client can ask for SSE while the selected backend response
@@ -905,7 +951,7 @@ impl Plugin for ResponseTransformer {
         // configured body rule. Buffer conservatively until response headers
         // arrive, then let `should_buffer_response_body_for_content_type`
         // release a response that actually declares itself as event-stream.
-        !self.body_rules.is_empty() && self.rules_enabled()
+        !self.body_rules.is_empty() && self.rules_enabled
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
@@ -1041,7 +1087,7 @@ impl Plugin for ResponseTransformer {
         // relabelling instead of being overridden by it, while a pristine framed
         // type and genuinely framed bytes both still decline.
         !self.body_rules.is_empty()
-            && self.rules_enabled()
+            && self.rules_enabled
             && !framed_grpc_request_without_proven_media_type(ctx, response_body)
             && media_type_admits_body_rules(ctx, response_content_type, response_body)
     }
@@ -1078,7 +1124,7 @@ impl Plugin for ResponseTransformer {
     /// no request-path allocation; answering `false` too eagerly costs
     /// correctness, so this predicate errs wide by construction.
     fn may_enforce_response_body_policy(&self, _ctx: &RequestContext) -> bool {
-        !self.body_rules.is_empty() && self.rules_enabled()
+        !self.body_rules.is_empty() && self.rules_enabled
     }
 
     /// Fail closed: the governed field set is not enumerable at config time.
@@ -1093,7 +1139,15 @@ impl Plugin for ResponseTransformer {
     /// buffered path that forwards backend trailers drops the whole trailer
     /// section instead of guessing which names are governed.
     fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
-        super::ResponseTrailerPolicy::Unbounded
+        if self.rules_enabled {
+            super::ResponseTrailerPolicy::Unbounded
+        } else {
+            // A fully disabled generation runs no response-header rules,
+            // including request-time route overrides. Publishing an unbounded
+            // policy here would still drop every backend trailer even though
+            // the transformer is supposed to be a complete no-op.
+            super::ResponseTrailerPolicy::None
+        }
     }
 
     async fn after_proxy(
@@ -1102,7 +1156,7 @@ impl Plugin for ResponseTransformer {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.rules_enabled() {
+        if !self.rules_enabled {
             return PluginResult::Continue;
         }
         // `response_caching` HIT/REVALIDATED and idempotent replays store the
@@ -1262,7 +1316,7 @@ impl Plugin for ResponseTransformer {
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        if !self.rules_enabled() {
+        if !self.rules_enabled {
             return None;
         }
         // Framed gRPC is declined explicitly rather than left to fail inside

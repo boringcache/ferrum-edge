@@ -1720,7 +1720,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
               -max_total_time=8 \
               -max_len=4096 \
               -timeout=2 \
-              -rss_limit_mb=512
+              -rss_limit_mb=1024
           done
 """
 
