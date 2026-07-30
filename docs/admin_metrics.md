@@ -2,6 +2,8 @@
 
 The Ferrum Edge Admin API exposes a comprehensive runtime metrics endpoint that provides a real-time snapshot of the gateway's internal state. This endpoint is designed for building dashboards, monitoring integrations, and operational visibility.
 
+For the DOC-10 executable Prometheus family contract — exact names, types, HELP text, stable label keys, owning subsystem, and bundled alert/dashboard classification — see [prometheus_metrics.md](prometheus_metrics.md) and the machine-readable inventory [`prometheus_metric_contract.json`](prometheus_metric_contract.json).
+
 ## Overview
 
 | Endpoint | Method | Auth | Cache | Description |

@@ -5733,6 +5733,49 @@ pub mod _test_support {
         )
     }
 
+    /// Fold a global body ceiling with a route/plugin ceiling exactly as every
+    /// request path does (`GHSA-xrfj-852f-645j`).
+    pub fn effective_request_body_limit_for_test(
+        global_limit: usize,
+        plugin_limit: Option<usize>,
+    ) -> usize {
+        crate::proxy::effective_request_body_limit(global_limit, plugin_limit)
+    }
+
+    /// Compose a phase's own buffering cap with the route ceiling.
+    pub fn stricter_optional_limit_for_test(a: Option<usize>, b: Option<usize>) -> Option<usize> {
+        crate::proxy::stricter_optional_limit(a, b)
+    }
+
+    /// Canonical declared `Content-Length` from a raw header map, honoring
+    /// standards-valid repeated identical values and refusing ambiguity.
+    pub fn canonical_header_content_length_for_test(headers: &http::HeaderMap) -> Option<u64> {
+        crate::proxy::canonical_header_content_length(headers)
+    }
+
+    /// Canonical declared `Content-Length` from a comma-folded header map.
+    pub fn canonical_header_content_length_from_map_for_test(
+        headers: &std::collections::HashMap<String, String>,
+    ) -> Option<u64> {
+        crate::proxy::canonical_header_content_length_from_map(headers)
+    }
+
+    /// Request-side declared-length reject predicate used by every dispatch path.
+    pub fn declared_request_content_length_over_limit_for_test(
+        headers: &std::collections::HashMap<String, String>,
+        max_bytes: usize,
+    ) -> bool {
+        crate::proxy::declared_request_content_length_over_limit(headers, max_bytes)
+    }
+
+    /// Response-side declared-length reject predicate used by every dispatch path.
+    pub fn declared_response_length_exceeds_limit_for_test(
+        headers: &std::collections::HashMap<String, String>,
+        max_response_body_size_bytes: usize,
+    ) -> Option<usize> {
+        crate::proxy::declared_response_length_exceeds_limit(headers, max_response_body_size_bytes)
+    }
+
     pub async fn collect_h1h2_request_body_with_deadline_for_test<F, T, E>(
         collect: F,
         deadline: Option<tokio::time::Instant>,
@@ -6177,6 +6220,17 @@ pub mod _test_support {
         crate::plugins::mesh::workload_metrics::WorkloadMetrics::new_with_env_lookup_for_test(
             config, env_lookup,
         )
+    }
+
+    /// Deterministic `Retry-After` rounding and exponential-backoff helpers
+    /// used by the spec-expose failure-cache tests.
+    pub fn spec_expose_retry_after_seconds_for_test(remaining: Duration) -> u64 {
+        crate::plugins::spec_expose::spec_expose_retry_after_seconds(remaining)
+    }
+
+    /// Return the bounded exponential delay after `previous_failures`.
+    pub fn spec_expose_failure_backoff_seconds_for_test(previous_failures: u32) -> u64 {
+        crate::plugins::spec_expose::spec_expose_failure_backoff_seconds(previous_failures)
     }
 
     /// Build an email channel with deterministic `*_env` resolution for unit

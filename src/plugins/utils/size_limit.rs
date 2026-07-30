@@ -2,6 +2,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::plugins::PluginResult;
+use crate::util::body_limit::{ContentLength, declared_content_length};
 
 pub trait SizeLimiter {
     fn plugin_name(&self) -> &'static str;
@@ -52,33 +53,59 @@ pub fn required_positive_usize(
     }
 }
 
-pub fn content_length_over_limit(
-    headers: &HashMap<String, String>,
-    max_bytes: u128,
-) -> Option<u64> {
-    headers
-        .get("content-length")
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|len| (*len as u128) > max_bytes)
+/// Why a `Content-Length` fast path refuses a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentLengthRefusal {
+    /// The declared length exceeds `max_bytes`.
+    OverLimit(u64),
+    /// The field is present but cannot be reduced to one agreed value, so no
+    /// bound can be proven from it. Fail closed rather than forwarding a body
+    /// whose declared framing the gateway and backend may read differently.
+    Ambiguous,
 }
 
-/// Content-Length fast-path overrun for responses that actually transfer a body.
+/// `Content-Length` overrun check that understands comma-folded repeats.
+///
+/// Plugin-facing header maps fold repeated fields with `", "`, so a
+/// standards-valid `Content-Length: 2048, 2048` (or two identical `2048`
+/// fields) reaches plugins as one folded string. Parsing that whole string as a
+/// single integer fails and used to read as "no declared length", skipping the
+/// bound entirely (`GHSA-xrfj-852f-645j`). Every member is now parsed and must
+/// agree; disagreement or malformed members are
+/// [`ContentLengthRefusal::Ambiguous`] rather than silently ignored.
+pub fn content_length_refusal(
+    headers: &HashMap<String, String>,
+    max_bytes: u128,
+) -> Option<ContentLengthRefusal> {
+    match declared_content_length(headers)? {
+        ContentLength::Exact(len) => {
+            ((len as u128) > max_bytes).then_some(ContentLengthRefusal::OverLimit(len))
+        }
+        ContentLength::Ambiguous => Some(ContentLengthRefusal::Ambiguous),
+    }
+}
+
+/// Response-side counterpart of [`content_length_refusal`] that skips bodyless
+/// semantics.
 ///
 /// Bodyless semantics (`HEAD`, `1xx`, `204`/`205`/`304`) may advertise a
 /// representation `Content-Length` while transferring zero body bytes
-/// (RFC 9110 §8.6 / §6.4.1). Those declarations must not trip a body-size
-/// limit. Body-bearing responses (including `206`) keep exact-boundary
-/// enforcement (`Content-Length == max_bytes` passes).
-pub fn transferable_content_length_over_limit(
+/// (RFC 9110 §8.6 / §6.4.1), so neither an oversized value nor an ambiguous fold
+/// is a body-size violation there. Body-bearing responses (including `206`) keep
+/// exact-boundary enforcement (`Content-Length == max_bytes` passes) and fail
+/// closed on an ambiguous fold: a declared length the gateway cannot reduce to
+/// one value is exactly the coalescing case that used to bypass the bound
+/// (`GHSA-xrfj-852f-645j`).
+pub fn transferable_content_length_refusal(
     method: &str,
     status: u16,
     headers: &HashMap<String, String>,
     max_bytes: u128,
-) -> Option<u64> {
+) -> Option<ContentLengthRefusal> {
     if super::synthetic_response::synthetic_response_omits_body(method, status) {
         None
     } else {
-        content_length_over_limit(headers, max_bytes)
+        content_length_refusal(headers, max_bytes)
     }
 }
 
@@ -158,19 +185,52 @@ mod tests {
     }
 
     #[test]
-    fn content_length_over_limit_parses_only_oversized_numeric_values() {
+    fn content_length_refusal_parses_only_oversized_numeric_values() {
         let mut headers = HashMap::new();
 
-        assert_eq!(content_length_over_limit(&headers, 10), None);
+        assert_eq!(content_length_refusal(&headers, 10), None);
 
         headers.insert("content-length".to_string(), "10".to_string());
-        assert_eq!(content_length_over_limit(&headers, 10), None);
+        assert_eq!(content_length_refusal(&headers, 10), None);
 
         headers.insert("content-length".to_string(), "11".to_string());
-        assert_eq!(content_length_over_limit(&headers, 10), Some(11));
+        assert_eq!(
+            content_length_refusal(&headers, 10),
+            Some(ContentLengthRefusal::OverLimit(11))
+        );
 
+        // A non-numeric field is not a usable bound: fail closed instead of
+        // reading as an absent length.
         headers.insert("content-length".to_string(), "not-a-number".to_string());
-        assert_eq!(content_length_over_limit(&headers, 10), None);
+        assert_eq!(
+            content_length_refusal(&headers, 10),
+            Some(ContentLengthRefusal::Ambiguous)
+        );
+    }
+
+    /// A standards-valid repeated identical `Content-Length` reaches plugins
+    /// comma-folded. It must still be compared against the limit rather than
+    /// failing to parse and silently skipping the bound.
+    #[test]
+    fn content_length_refusal_honors_repeated_identical_values() {
+        let mut headers = HashMap::new();
+
+        headers.insert("content-length".to_string(), "11, 11".to_string());
+        assert_eq!(
+            content_length_refusal(&headers, 10),
+            Some(ContentLengthRefusal::OverLimit(11))
+        );
+
+        // Exact boundary still passes when every member agrees.
+        headers.insert("content-length".to_string(), "10, 10".to_string());
+        assert_eq!(content_length_refusal(&headers, 10), None);
+
+        // Disagreeing members cannot bound anything.
+        headers.insert("content-length".to_string(), "10, 4096".to_string());
+        assert_eq!(
+            content_length_refusal(&headers, 10),
+            Some(ContentLengthRefusal::Ambiguous)
+        );
     }
 
     #[test]
@@ -178,30 +238,21 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("content-length".to_string(), "11".to_string());
 
-        assert_eq!(
-            transferable_content_length_over_limit("HEAD", 200, &headers, 10),
-            None
-        );
-        assert_eq!(
-            transferable_content_length_over_limit("GET", 304, &headers, 10),
-            None
-        );
-        assert_eq!(
-            transferable_content_length_over_limit("GET", 100, &headers, 10),
-            None
-        );
-        assert_eq!(
-            transferable_content_length_over_limit("GET", 204, &headers, 10),
-            None
-        );
+        for (method, status) in [("HEAD", 200), ("GET", 304), ("GET", 100), ("GET", 204)] {
+            assert_eq!(
+                transferable_content_length_refusal(method, status, &headers, 10),
+                None,
+                "bodyless {method} {status} must not trip a body-size limit"
+            );
+        }
         // Body-bearing control (including 206) retains exact-boundary enforcement.
         assert_eq!(
-            transferable_content_length_over_limit("GET", 206, &headers, 10),
-            Some(11)
+            transferable_content_length_refusal("GET", 206, &headers, 10),
+            Some(ContentLengthRefusal::OverLimit(11))
         );
         headers.insert("content-length".to_string(), "10".to_string());
         assert_eq!(
-            transferable_content_length_over_limit("GET", 206, &headers, 10),
+            transferable_content_length_refusal("GET", 206, &headers, 10),
             None
         );
     }

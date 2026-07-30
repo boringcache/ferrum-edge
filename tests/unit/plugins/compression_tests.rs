@@ -5248,6 +5248,75 @@ async fn test_content_encoding_ows_is_trimmed_and_decoded() {
 }
 
 #[tokio::test]
+async fn test_request_decompression_is_bounded_by_route_size_ceiling() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let original = vec![b'a'; 256];
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&original).unwrap();
+    let compressed = encoder.finish().unwrap();
+    assert!(
+        compressed.len() < 64,
+        "fixture must fit under the encoded route ceiling"
+    );
+
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+    ctx.route_request_body_limit_bytes = Some(64);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let mut body = compressed.clone();
+
+    let result = plugin
+        .normalize_buffered_request_body_before_before_proxy(&mut ctx, &mut headers, &mut body)
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 400,
+                ..
+            }
+        ),
+        "plaintext larger than the route ceiling must fail before retention, got {result:?}"
+    );
+    assert_eq!(
+        body, compressed,
+        "failed decode must not replace the bounded wire body"
+    );
+    assert!(
+        headers.contains_key("content-encoding"),
+        "failed decode must preserve representation metadata"
+    );
+}
+
+#[tokio::test]
+async fn test_request_decompression_exact_route_boundary_passes() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let original = vec![b'a'; 64];
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&original).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+    ctx.route_request_body_limit_bytes = Some(64);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let mut body = compressed;
+
+    let result = plugin
+        .normalize_buffered_request_body_before_before_proxy(&mut ctx, &mut headers, &mut body)
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue), "got {result:?}");
+    assert_eq!(body, original);
+}
+
+#[tokio::test]
 async fn test_content_encoding_chain_decodes_in_reverse_order() {
     use flate2::write::GzEncoder;
     use std::io::Write;
