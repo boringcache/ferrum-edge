@@ -5879,6 +5879,24 @@ fn password_text_does_not_require_a_replay_scope() {
     assert!(SoapWsSecurity::new(&username_token_config()).is_ok());
 }
 
+#[tokio::test]
+async fn replay_inactive_policy_does_not_consume_a_registry_scope() {
+    let scope = "soap-replay-inactive";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    let plugin = SoapWsSecurity::new_with_http_client_and_config_id(
+        &timestamp_only_config(),
+        PluginHttpClient::default(),
+        Some(scope),
+    )
+    .expect("timestamp-only plugin must construct");
+
+    assert!(
+        !soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "a policy that cannot make replay claims must keep private state"
+    );
+    drop(plugin);
+}
+
 #[test]
 fn openapi_requires_replay_scope_for_password_digest_only() {
     let spec: Value =
@@ -6950,6 +6968,18 @@ mod advisory_regressions {
             Some("multipart/form-data; boundary=application/soap+xml")
         )));
         assert!(!plugin.should_buffer_request_body(&ctx_with("", Some("application/xmlish"))));
+    }
+
+    #[test]
+    fn multipart_boundary_must_not_end_in_space() {
+        use ferrum_edge::_test_support::soap_classify_request_for_test as classify;
+        let content_type =
+            "multipart/related; type=\"application/xop+xml\"; boundary=\"MIME boundary \"";
+
+        assert_eq!(
+            classify(&strict_username_token_config(), Some(content_type)),
+            Ok("reject:400:malformed_multipart".to_string())
+        );
     }
 
     /// Classification names the representation. A bare `application/xop+xml`

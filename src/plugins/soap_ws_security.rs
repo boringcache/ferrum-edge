@@ -2154,8 +2154,19 @@ impl SoapWsSecurity {
                 )))
             }
             None => {
-                let scope_key =
-                    plugin_config_id.map(|config_id| nonce_replay_scope_key(namespace, config_id));
+                // Only a policy that can actually make process-local replay
+                // claims needs reload-stable registry state. Timestamp-only,
+                // PasswordText-only, and other replay-inactive policies keep
+                // private empty state so their operator-controlled config ids
+                // cannot consume the bounded registry reserved for live
+                // replay scopes.
+                let scope_key = if replay_active
+                    && replay_scope == Some(NonceReplayScope::Process)
+                {
+                    plugin_config_id.map(|config_id| nonce_replay_scope_key(namespace, config_id))
+                } else {
+                    None
+                };
                 NonceReplayBackend::Process(process_replay_state(scope_key.as_deref())?)
             }
         };
@@ -4370,6 +4381,7 @@ fn classify_soap_media_type(
     };
     if boundary.is_empty()
         || boundary.len() > MAX_MULTIPART_BOUNDARY_BYTES
+        || boundary.ends_with(' ')
         || !boundary.bytes().all(is_multipart_boundary_byte)
     {
         return Err(MediaTypeRejection::MalformedMultipartPackaging);
@@ -4377,8 +4389,8 @@ fn classify_soap_media_type(
     Ok(Some(SoapMediaClass::Mtom { boundary, start }))
 }
 
-/// RFC 2046 `bcharsnospace` plus space (space is only illegal as the final
-/// character, which the emptiness/trailing checks below already exclude).
+/// RFC 2046 `bcharsnospace` plus space. The caller separately rejects a final
+/// space, which is forbidden by the boundary grammar.
 fn is_multipart_boundary_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"'()+_,-./:=? ".contains(&byte)
 }
