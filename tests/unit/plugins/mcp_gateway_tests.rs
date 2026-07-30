@@ -1560,6 +1560,32 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
         }
     }))
     .unwrap();
+    let ambiguous_response = br#"{"jsonrpc":"2.0","id":10,"result":{"contents":[{"uri":"file:///project/README.md","text":"read me"}]},"result":{"contents":[]}}"#;
+    let ambiguous_headers = known_json_response_headers(ambiguous_response);
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                ambiguous_response,
+                Some("application/json"),
+                &ambiguous_headers,
+            )
+            .await
+            .is_none()
+    );
+    let (status, rejected, _) = reject_json(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &ambiguous_headers, ambiguous_response)
+            .await,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(rejected["error"]["code"], -32603);
+    assert_eq!(
+        rejected["error"]["message"],
+        "Invalid upstream MCP response"
+    );
+    assert!(!rejected.to_string().contains("file:///project/README.md"));
+
     let mut response_headers = HashMap::from([
         ("content-type".to_string(), "application/json".to_string()),
         (
@@ -3946,6 +3972,39 @@ async fn aggregate_tools_family_outage_keeps_prompts_healthy_and_recovers_on_ttl
     assert_eq!(sorted_tool_names(&body), vec!["github.recovered_tool"]);
     assert!(!ctx.metadata.contains_key("mcp.catalog_degraded"));
     assert_eq!(tool_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn aggregate_total_catalog_outage_is_negative_cached() {
+    let server = MockServer::start().await;
+    let tool_requests = Arc::new(AtomicUsize::new(0));
+    let tool_counter = Arc::clone(&tool_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            tool_counter.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(500)
+        })
+        .mount(&server)
+        .await;
+    let mut config =
+        single_server_family_config(&format!("{}/mcp", server.uri()), true, false, false);
+    // This test proves suppression inside the refresh window. Give the window
+    // ample scheduler headroom so a loaded hosted runner cannot accidentally
+    // turn an "immediate" second request into an expiry test; the neighboring
+    // recovery test owns the separate after-TTL behavior.
+    config["discovery"]["cache_ttl_seconds"] = json!(300);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (_, first, _) = tools_list_with_metadata(&plugin, &session_id, 106).await;
+    assert_eq!(first["error"]["code"], -32006);
+    for request_id in 107..=109 {
+        let (_, cached, _) = tools_list_with_metadata(&plugin, &session_id, request_id).await;
+        assert_eq!(cached["error"]["code"], -32006);
+    }
+    assert_eq!(tool_requests.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
