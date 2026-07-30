@@ -1146,6 +1146,7 @@ impl GrpcPoolManager {
     /// There is no timeout here by design: the caller runs inside
     /// `dns::connect_candidates`, whose per-candidate share of
     /// `backend_connect_timeout_ms` bounds this wait and moves on to the next
+    /// address.
     async fn await_h2c_peer_settings(
         conn: &mut http2::Connection<TokioIo<H2cSettingsIo>, GrpcBody, TokioExecutor>,
         settings_received: &AtomicBool,
