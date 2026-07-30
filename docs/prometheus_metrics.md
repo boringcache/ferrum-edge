@@ -239,7 +239,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_requests_total` | counter | `proxy_id`, `method`, `status_code`, `grpc_status`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Total number of requests processed. |
 | `ferrum_stream_connections_total` | counter | `proxy_id`, `protocol`, `namespace` | `stream` | `dashboard` | `conditional` | Total stream connections (TCP/UDP). |
 | `ferrum_stream_disconnects_total` | counter | `proxy_id`, `protocol`, `cause`, `direction`, `namespace` | `stream` | `dashboard` | `conditional` | Stream disconnects (TCP/UDP) by cause and direction. |
-| `ferrum_stream_duration_ms` | histogram | `proxy_id`, `protocol`, `le`, `namespace` | `stream` | `documented_only` | `conditional` | Stream connection duration in milliseconds. |
+| `ferrum_stream_duration_ms` | histogram | `proxy_id`, `le`, `namespace` | `stream` | `documented_only` | `conditional` | Stream connection duration in milliseconds. |
 | `ferrum_tls_cert_expiry_seconds` | gauge | `cert_id`, `source`, `namespace` | `tls` | `documented_only` | `conditional` | Seconds until the certificate leaf not_after timestamp. Negative means expired. |
 | `ferrum_tls_cert_not_before_seconds` | gauge | `cert_id`, `source`, `namespace` | `tls` | `documented_only` | `conditional` | Certificate leaf not_before timestamp as Unix seconds. |
 | `ferrum_tls_cert_rotations_total` | counter | `cert_id`, `reason`, `outcome`, `namespace` | `tls` | `documented_only` | `conditional` | TLS certificate rotation outcomes by cert ID, reason, and outcome. |

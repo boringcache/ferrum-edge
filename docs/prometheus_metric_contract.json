@@ -2174,7 +2174,6 @@
     "help": "Stream connection duration in milliseconds.",
     "labels": [
       "proxy_id",
-      "protocol",
       "le",
       "namespace"
     ],
