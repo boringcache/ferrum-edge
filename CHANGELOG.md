@@ -338,6 +338,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Kubernetes controller Gateway API and Istio status patch batches now have a
+  60-second wall-clock ceiling. A stalled Kubernetes API request can no longer
+  retain the reconcile loop indefinitely; unfinished status updates are
+  cancelled and retried by a later watch event or periodic full sync.
+
 - Kubernetes controller Gateway API and Istio status writers now share one
   immutable `Arc<[K8sObject]>` generation per reconcile instead of each
   deep-cloning the full unstructured object snapshot. Status semantics,
