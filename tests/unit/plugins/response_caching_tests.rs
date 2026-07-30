@@ -5616,6 +5616,7 @@ async fn test_observe_then_after_proxy_does_not_double_invalidate() {
 /// context, then return that context's staged base key.
 async fn seed_public_entry(plugin: &ResponseCaching, ctx: &mut RequestContext, body: &[u8]) {
     set_replay_request_body_empty_proven_for_test(ctx, true);
+    set_response_presentation_policy_digest_for_test(ctx, Some([0x51; 32]));
     let mut headers = ctx.headers.clone();
     assert!(matches!(
         plugin.before_proxy(ctx, &mut headers).await,
@@ -5633,6 +5634,7 @@ async fn seed_public_entry(plugin: &ResponseCaching, ctx: &mut RequestContext, b
 
 async fn lookup_is_hit(plugin: &ResponseCaching, ctx: &mut RequestContext) -> bool {
     set_replay_request_body_empty_proven_for_test(ctx, true);
+    set_response_presentation_policy_digest_for_test(ctx, Some([0x51; 32]));
     let mut headers = ctx.headers.clone();
     is_reject(&plugin.before_proxy(ctx, &mut headers).await)
 }
