@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
 
@@ -56,6 +57,91 @@ use crate::tls::backend::{
     append_pool_key_component, backend_svid_generation_for_client_cert,
 };
 use crate::util::body_limit::is_length_limit_error;
+
+/// Observes the first server frame without interfering with hyper's parser.
+/// HTTP/2 requires that frame to be SETTINGS, so completing it is independent
+/// proof of the peer preface even when MAX_CONCURRENT_STREAMS is zero.
+struct H2cSettingsIo {
+    inner: TcpStream,
+    settings_received: Arc<AtomicBool>,
+    first_frame_header: [u8; 9],
+    header_len: usize,
+    frame_remaining: Option<usize>,
+}
+
+impl H2cSettingsIo {
+    fn new(inner: TcpStream, settings_received: Arc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            settings_received,
+            first_frame_header: [0; 9],
+            header_len: 0,
+            frame_remaining: None,
+        }
+    }
+
+    fn observe(&mut self, mut bytes: &[u8]) {
+        if self.settings_received.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.header_len < self.first_frame_header.len() {
+            let copied = bytes
+                .len()
+                .min(self.first_frame_header.len() - self.header_len);
+            self.first_frame_header[self.header_len..self.header_len + copied]
+                .copy_from_slice(&bytes[..copied]);
+            self.header_len += copied;
+            bytes = &bytes[copied..];
+            if self.header_len == self.first_frame_header.len() {
+                let payload_len = (usize::from(self.first_frame_header[0]) << 16)
+                    | (usize::from(self.first_frame_header[1]) << 8)
+                    | usize::from(self.first_frame_header[2]);
+                self.frame_remaining = Some(payload_len);
+            }
+        }
+        if let Some(remaining) = self.frame_remaining.as_mut() {
+            *remaining = remaining.saturating_sub(bytes.len());
+            if *remaining == 0 && self.first_frame_header[3] == 0x4 {
+                self.settings_received.store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
+impl AsyncRead for H2cSettingsIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let filled_before = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                self.observe(&buf.filled()[filled_before..]);
+                Poll::Ready(Ok(()))
+            }
+            result => result,
+        }
+    }
+}
+
+impl AsyncWrite for H2cSettingsIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
 
 /// Canonical terminal message for a gateway-owned client RPC deadline.
 ///
@@ -958,15 +1044,7 @@ impl GrpcPoolManager {
 
     /// Build an HTTP/2 client builder with keepalive and flow-control settings.
     ///
-    /// `settings_readiness_sentinel` is set only for h2c, where there is no
-    /// ALPN proof and `create_h2c_connection` needs a value that cannot be
-    /// confused with a peer-supplied one. ALPN-proven TLS keeps the previous
-    /// pre-SETTINGS outbound bound so its first request is never gated on the
-    /// peer's SETTINGS arriving.
-    fn build_h2_builder(
-        pool_config: &PoolConfig,
-        settings_readiness_sentinel: bool,
-    ) -> http2::Builder<TokioExecutor> {
+    fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {
         let mut builder = http2::Builder::new(TokioExecutor::new());
 
         // Timer is required for keep_alive_interval and keep_alive_timeout to work
@@ -996,13 +1074,7 @@ impl GrpcPoolManager {
             builder.max_concurrent_streams(max_streams);
         }
 
-        if settings_readiness_sentinel {
-            // Zero is a pre-SETTINGS sentinel only. h2 replaces it when the
-            // peer's *initial* SETTINGS is applied, using the advertised value
-            // or `usize::MAX` when the parameter is absent, so any non-zero
-            // reading proves the peer completed its half of the preface.
-            builder.initial_max_send_streams(0);
-        } else if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
+        if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
             // Preserve the configured initial outbound bound until the peer's
             // SETTINGS frame replaces it.
             builder.initial_max_send_streams(max_streams as usize);
@@ -1017,8 +1089,9 @@ impl GrpcPoolManager {
         tcp: TcpStream,
         pool_config: &PoolConfig,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
-        let io = TokioIo::new(tcp);
-        let builder = Self::build_h2_builder(pool_config, true);
+        let settings_received = Arc::new(AtomicBool::new(false));
+        let io = TokioIo::new(H2cSettingsIo::new(tcp, Arc::clone(&settings_received)));
+        let builder = Self::build_h2_builder(pool_config);
 
         let (sender, mut conn) = builder.handshake(io).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
@@ -1028,7 +1101,7 @@ impl GrpcPoolManager {
             )
         })?;
 
-        if let Err(message) = Self::await_h2c_peer_settings(&mut conn).await {
+        if let Err(message) = Self::await_h2c_peer_settings(&mut conn, &settings_received).await {
             return Err(GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::H2cHandshake,
                 message.clone(),
@@ -1050,24 +1123,20 @@ impl GrpcPoolManager {
     /// Unlike TLS-backed H2, h2c has no ALPN proof, so a peer that merely
     /// accepts TCP must not pin this pool to its DNS address. `handshake()`
     /// resolves once the *client* preface is written; readiness is the peer's
-    /// initial SETTINGS having been applied, which lifts the zero-stream
-    /// sentinel installed by `build_h2_builder`.
+    /// complete initial SETTINGS frame having been observed by the transport.
     ///
     /// `conn` is hyper's connection-driver future. Polling it drives the peer's
     /// preface and SETTINGS processing and surfaces a protocol error or close,
     /// but the future does not resolve merely because SETTINGS arrived. The
     /// short timeout therefore supplies a bounded recheck cadence for the
-    /// sentinel while also continuing to drive the connection.
+    /// transport observation flag while also continuing to drive the connection.
     ///
     /// There is no timeout here by design: the caller runs inside
     /// `dns::connect_candidates`, whose per-candidate share of
     /// `backend_connect_timeout_ms` bounds this wait and moves on to the next
-    /// address. A peer whose initial SETTINGS explicitly advertises
-    /// `MAX_CONCURRENT_STREAMS: 0` is indistinguishable from one that has sent
-    /// nothing and is rejected the same way — it could not carry a stream
-    /// either.
     async fn await_h2c_peer_settings(
-        conn: &mut http2::Connection<TokioIo<TcpStream>, GrpcBody, TokioExecutor>,
+        conn: &mut http2::Connection<TokioIo<H2cSettingsIo>, GrpcBody, TokioExecutor>,
+        settings_received: &AtomicBool,
     ) -> Result<(), String> {
         // First re-read delay; the common case resolves on the first or second
         // pass over a loopback or same-datacenter RTT.
@@ -1078,7 +1147,7 @@ impl GrpcPoolManager {
 
         let mut recheck = FIRST_RECHECK;
         loop {
-            if conn.current_max_send_streams() > 0 {
+            if settings_received.load(Ordering::Acquire) {
                 return Ok(());
             }
             match tokio::time::timeout(recheck, &mut *conn).await {
@@ -1116,7 +1185,7 @@ impl GrpcPoolManager {
         }
 
         let io = TokioIo::new(tls_stream);
-        let builder = Self::build_h2_builder(pool_config, false);
+        let builder = Self::build_h2_builder(pool_config);
         let (sender, conn) = builder.handshake(io).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::H2Handshake,
