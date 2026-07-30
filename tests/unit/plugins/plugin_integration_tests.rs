@@ -1318,6 +1318,97 @@ async fn test_response_cache_revalidation_respects_gate_change() {
     harness::reset_gates();
 }
 
+/// The published gate identity alone is not a sufficient provenance witness
+/// (GHSA-83rc-23c9-3g9x).
+///
+/// Mesh publishes the gate map from `record_applied_slice`, i.e. AFTER
+/// `ProxyState::update_config` has published the new `RequestEpoch`. A request
+/// that pinned the previous plugin generation can therefore still pin the NEW
+/// publication identity — its authenticate/authorize phase runs before
+/// `response_caching::before_proxy` and can span an entire mesh apply — and its
+/// response is shaped by the OLD generation's transformer instances, because a
+/// request now stays wholly on the generation it pinned. A `response_caching`
+/// instance that survives the apply (a global instance is not rebuilt when only
+/// a proxy-scoped transformer changes) would otherwise keep replaying those
+/// bytes as if the current policy had produced them.
+///
+/// The entry is therefore also bound to its own generation's effective
+/// presentation-policy digest, which since the gate is materialized into the
+/// transformer's configuration covers the gate as well as the static rules.
+/// This test holds the gate publication IDENTICAL throughout, so only the
+/// generation digest can retire the entry.
+#[tokio::test]
+async fn test_response_cache_retires_entry_from_a_superseded_plugin_generation() {
+    use self::runtime_overlay_cache_provenance as harness;
+    use ferrum_edge::_test_support::set_response_presentation_policy_digest_for_test;
+
+    let _policy_guard = response_cache_replay_policy_guard();
+    harness::reset_gates();
+
+    let scope = "cache_provenance_generation";
+    let rules = json!([
+        {"target": "body", "operation": "update", "key": "secret", "value": "[redacted]"}
+    ]);
+    // One accepted generation, published once. `apply_gate_generation` moves the
+    // publication identity exactly once here and is never called again, so every
+    // lookup below pins the same stamp.
+    let plugins = harness::apply_gate_generation(
+        &harness::plugins_with_gated_transformer(scope, rules.clone()),
+        scope,
+        rules,
+        true,
+    );
+    let path = "/cache-provenance-generation";
+
+    let generation_a = [0xA1u8; 32];
+    let generation_b = [0xB2u8; 32];
+
+    let mut miss_ctx = create_response_context(path);
+    set_response_presentation_policy_digest_for_test(&mut miss_ctx, Some(generation_a));
+    let (status, headers, _) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut miss_ctx,
+        200,
+        harness::origin_headers(&[]),
+        br#"{"secret":"TOPSECRET"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("MISS"),
+        "the first request must reach the origin and store under generation A"
+    );
+
+    // Same generation, same publication identity: the entry is replayable.
+    let mut same_generation_ctx = create_response_context(path);
+    set_response_presentation_policy_digest_for_test(&mut same_generation_ctx, Some(generation_a));
+    let hit = harness::lookup(&plugins, &mut same_generation_ctx)
+        .await
+        .expect("an entry from the live generation must still HIT");
+    let (status, _, headers) = reject_parts(hit).expect("expected a rejection");
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("HIT")
+    );
+
+    // A later generation whose effective presentation policy differs, with the
+    // gate publication identity unchanged. The stored representation was shaped
+    // by generation A's rules/gate, so it must be retired rather than replayed.
+    let mut next_generation_ctx = create_response_context(path);
+    set_response_presentation_policy_digest_for_test(&mut next_generation_ctx, Some(generation_b));
+    assert!(
+        harness::lookup(&plugins, &mut next_generation_ctx)
+            .await
+            .is_none(),
+        "an entry from a superseded plugin generation must not be replayed even \
+         while the published gate identity is unchanged"
+    );
+
+    harness::reset_gates();
+}
+
 /// #2381: store final post-transform representation; full synthetic HIT
 /// finalizer must not re-apply non-idempotent body or header sequences.
 #[tokio::test]

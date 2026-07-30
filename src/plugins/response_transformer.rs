@@ -806,18 +806,19 @@ impl Plugin for ResponseTransformer {
     }
 
     /// This plugin *is* the presentation policy a finalized replay skips, so it
-    /// enrolls unconditionally — including when its rules are currently gated
-    /// off. Enrolling only while enabled would make an instance appear and
-    /// disappear from the per-proxy digest based on live gate state, which the
-    /// gate fingerprint already covers, and would hide the static rules of a
+    /// enrolls unconditionally — including when its rules are gated off for this
+    /// generation. Enrolling only while enabled would hide the static rules of a
     /// disabled instance from a representation stored while it was disabled.
     ///
-    /// `Static` is accurate: every rule this plugin applies to a response body
-    /// comes from its accepted configuration, and the instance holds no
-    /// interior mutable state. The one runtime input, the RTDS gate, is carried
-    /// by the separate gate fingerprint; the one non-config input,
-    /// `ctx.route_override_response_transform`, is header-only and is consumed
-    /// without being applied on a finalized replay.
+    /// `Static` is accurate, and since GHSA-83rc-23c9-3g9x it is accurate
+    /// without qualification: every rule this plugin applies to a response body
+    /// comes from its accepted configuration, the effective RTDS gate is now
+    /// part of that configuration (`runtime_overlay_resolved_enabled`, folded
+    /// into [`Self::static_policy_digest`]), and the instance holds no interior
+    /// mutable state. So this digest — not the separately published gate map —
+    /// is the complete witness of what this instance does to a representation.
+    /// The one non-config input, `ctx.route_override_response_transform`, is
+    /// header-only and is consumed without being applied on a finalized replay.
     fn response_presentation_policy(&self) -> Option<super::ResponsePresentationPolicy> {
         Some(super::ResponsePresentationPolicy::Static(
             self.static_policy_digest,
