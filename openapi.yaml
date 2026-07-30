@@ -5247,6 +5247,24 @@ paths:
         other or missing Content-Type → autodetect by first non-whitespace byte
         (`{` → JSON, else YAML).
 
+        **YAML anchors and aliases**: supported under bounded expansion. The
+        importer composes a libyaml event graph that preserves alias edges, then
+        expands into JSON under node, depth, alias-reference, expanded-byte
+        (32 MiB fail-closed upper bound on the compact JSON representation,
+        including string/key escaping), and work budgets with cycle /
+        undefined-alias / duplicate-anchor / duplicate-mapping-key detection.
+        Merge keys (`<<`) are applied during expansion when present. Failures
+        are fail-closed `400` diagnostics (never silent drop). JSON and YAML
+        share the same expanded-node admission cap.
+
+        Expansion additionally returns `400` for a non-core or local YAML tag,
+        a non-finite number (`.inf` / `.nan` / an overflowing exponent), an
+        integer outside the exact JSON `i64` / `u64` range, and a mapping key
+        with no JSON object-key spelling (null, sequence, or mapping). Scalar
+        number and boolean keys keep their historical stringified spelling
+        (`200:` → `"200"`), so YAML that leaves status codes unquoted is still
+        accepted.
+
         **Body size limit**: controlled by `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB`
         (default 25 MiB). Returns 413 when exceeded.
 
