@@ -71,21 +71,6 @@ pub fn encode_datagram(out: &mut BytesMut, payload: &[u8]) -> std::io::Result<()
     Ok(())
 }
 
-/// Read exactly one complete framed datagram off `reader`, using `buf` as the
-/// stateful accumulator that persists across calls (the tunnel byte stream has
-/// no message boundaries). Returns:
-///
-/// - `Ok(Some(payload))` — one whole datagram (possibly empty) was decoded; any
-///   trailing bytes that began the next frame stay in `buf` for the next call.
-/// - `Ok(None)` — the tunnel reached EOF. This covers BOTH a clean half-close
-///   between frames AND an EOF in the middle of a frame: a partial datagram is
-///   never emitted (returning truncated bytes would corrupt the datagram).
-/// - `Err(_)` — a transport read error.
-///
-/// The buffer is drained by exactly one frame per successful `Some` return, so a
-/// caller that received whole back-to-back frames in one underlying read drains
-/// them one call at a time without another syscall (the inner reads short-circuit
-/// on the buffered bytes).
 /// Try to decode one complete length-prefixed datagram from `buf` without I/O.
 ///
 /// Returns `Some(payload)` when a full frame is present (payload may be empty),
@@ -102,6 +87,21 @@ pub(crate) fn pop_framed_datagram(buf: &mut BytesMut) -> Option<Bytes> {
     Some(buf.split_to(payload_len).freeze())
 }
 
+/// Read exactly one complete framed datagram off `reader`, using `buf` as the
+/// stateful accumulator that persists across calls (the tunnel byte stream has
+/// no message boundaries). Returns:
+///
+/// - `Ok(Some(payload))` — one whole datagram (possibly empty) was decoded; any
+///   trailing bytes that began the next frame stay in `buf` for the next call.
+/// - `Ok(None)` — the tunnel reached EOF. This covers BOTH a clean half-close
+///   between frames AND an EOF in the middle of a frame: a partial datagram is
+///   never emitted (returning truncated bytes would corrupt the datagram).
+/// - `Err(_)` — a transport read error.
+///
+/// The buffer is drained by exactly one frame per successful `Some` return, so a
+/// caller that received whole back-to-back frames in one underlying read drains
+/// them one call at a time without another syscall (the inner reads short-circuit
+/// on the buffered bytes).
 pub async fn read_datagram<R: AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut BytesMut,
