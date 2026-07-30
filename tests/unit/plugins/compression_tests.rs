@@ -1116,8 +1116,8 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
             "/cache-vary-order".to_string(),
         );
         miss_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
-    prove_empty_request_body(&mut miss_ctx);
-    seed_response_cache_presentation_policy(&mut miss_ctx);
+        prove_empty_request_body(&mut miss_ctx);
+        seed_response_cache_presentation_policy(&mut miss_ctx);
         miss_ctx
             .headers
             .insert("accept-encoding".to_string(), accept_encoding.to_string());
@@ -1231,8 +1231,8 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
             "/cache-vary-order".to_string(),
         );
         miss_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
-    prove_empty_request_body(&mut miss_ctx);
-    seed_response_cache_presentation_policy(&mut miss_ctx);
+        prove_empty_request_body(&mut miss_ctx);
+        seed_response_cache_presentation_policy(&mut miss_ctx);
         if let Some(ae) = accept_encoding {
             miss_ctx
                 .headers
@@ -1412,8 +1412,8 @@ async fn test_response_cache_hit_preserves_identity_when_acceptable() {
             "/cache-identity-ok".to_string(),
         );
         hit_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
-    prove_empty_request_body(&mut hit_ctx);
-    seed_response_cache_presentation_policy(&mut hit_ctx);
+        prove_empty_request_body(&mut hit_ctx);
+        seed_response_cache_presentation_policy(&mut hit_ctx);
         if let Some(ae) = accept_encoding {
             hit_ctx
                 .headers
