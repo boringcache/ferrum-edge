@@ -1196,9 +1196,9 @@ impl GrpcPoolManager {
                 // cached and suppressing DNS-candidate failover.
                 let post_observation = std::future::poll_fn(|cx| {
                     Poll::Ready(match Pin::new(&mut *conn).poll(cx) {
-                        Poll::Ready(Ok(())) => Some(Err(
-                            "h2c connection closed after peer SETTINGS".to_string(),
-                        )),
+                        Poll::Ready(Ok(())) => {
+                            Some(Err("h2c connection closed after peer SETTINGS".to_string()))
+                        }
                         Poll::Ready(Err(error)) => {
                             Some(Err(format!("h2c handshake failed: {error}")))
                         }
