@@ -2762,6 +2762,30 @@ fn can_attempt_hbone_backend(
         && registry_ok
 }
 
+/// Whether `target.host` is the scoped, non-dialable load-balancer identity
+/// minted for a cross-cluster Ambient HBONE target. Keep this stricter than a
+/// prefix check: operator-supplied or malformed HBONE targets must not inherit
+/// the synthetic-host DNS exemption unless every field that redirects the
+/// outer dial and inner CONNECT authority is present. Field contents are
+/// validated by `proxy_to_backend_hbone` before the real dial.
+fn is_synthetic_cross_cluster_hbone_dispatch_target(target: &UpstreamTarget) -> bool {
+    target
+        .host
+        .starts_with(hbone_pool::HBONE_CROSS_CLUSTER_SYNTHETIC_HOST_PREFIX)
+        && hbone_pool::target_hbone_enabled(target)
+        && hbone_pool::target_hbone_cross_cluster(target)
+        && target.tags.contains_key(hbone_pool::HBONE_DIAL_HOST_TAG)
+        && target
+            .tags
+            .contains_key(hbone_pool::HBONE_AUTHORITY_HOST_TAG)
+        && target
+            .tags
+            .contains_key(mesh_mtls_pool::MESH_EASTWEST_SNI_TAG)
+        && target
+            .tags
+            .contains_key(mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG)
+}
+
 /// Whether a target dispatches over the Sidecar egress SVID-mTLS HTTP/2 pool
 /// (`mesh.mtls=true` tag). Unlike HBONE there is no capability-registry gate:
 /// `mesh.mtls` targets are produced only by the mesh outbound materializer and
@@ -29796,7 +29820,7 @@ async fn proxy_to_backend(
     // Every ordinary host still fails closed here. Retry dispatch is always a
     // reqwest path and retains the unconditional preflight above.
     let resolved_ip = if dispatch_hbone
-        && effective_host.starts_with(hbone_pool::HBONE_CROSS_CLUSTER_SYNTHETIC_HOST_PREFIX)
+        && upstream_target.is_some_and(is_synthetic_cross_cluster_hbone_dispatch_target)
     {
         None
     } else {

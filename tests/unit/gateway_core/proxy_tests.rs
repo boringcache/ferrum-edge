@@ -3483,6 +3483,28 @@ fn reqwest_dispatch_fails_closed_when_proxy_ttl_dns_preflight_fails() {
 #[test]
 fn cross_cluster_hbone_identity_bypasses_only_the_reqwest_dns_preflight() {
     let source = include_str!("../../../src/proxy/mod.rs");
+    let helper = source
+        .split("fn is_synthetic_cross_cluster_hbone_dispatch_target(")
+        .nth(1)
+        .expect("synthetic cross-cluster HBONE shape helper")
+        .split("/// Whether a target dispatches over the Sidecar")
+        .next()
+        .expect("bounded synthetic cross-cluster HBONE shape helper");
+    for required in [
+        "HBONE_CROSS_CLUSTER_SYNTHETIC_HOST_PREFIX",
+        "target_hbone_enabled(target)",
+        "target_hbone_cross_cluster(target)",
+        "HBONE_DIAL_HOST_TAG",
+        "HBONE_AUTHORITY_HOST_TAG",
+        "MESH_EASTWEST_SNI_TAG",
+        "MESH_TRUST_DOMAIN_TAG",
+    ] {
+        assert!(
+            helper.contains(required),
+            "synthetic-host exemption must require {required}"
+        );
+    }
+
     let initial = source
         .split("async fn proxy_to_backend(")
         .nth(1)
@@ -3491,7 +3513,7 @@ fn cross_cluster_hbone_identity_bypasses_only_the_reqwest_dns_preflight() {
         .next()
         .expect("bounded pre-HBONE dispatch section");
     let synthetic_gate = initial
-        .find("hbone_pool::HBONE_CROSS_CLUSTER_SYNTHETIC_HOST_PREFIX")
+        .find("is_synthetic_cross_cluster_hbone_dispatch_target")
         .expect("cross-cluster HBONE synthetic-host gate");
     let dns_preflight = initial[synthetic_gate..]
         .find("state.dns_cache.resolve(")
