@@ -242,7 +242,7 @@ pub fn batch_materialization_fallbacks() -> u64 {
 
 /// One reservation against a [`RetainedByteCeiling`].
 ///
-/// Every observability sink budget — the shared [`ByteBudget`] and the
+/// Every observability sink budget — [`ByteBudget::new_observability`] and the
 /// sink-private budgets in `loki_logging`, `ws_logging`, `kafka_logging`, and
 /// `otel_tracing` — reserves against the process ceiling in addition to its own
 /// per-instance budget, so N configured instances cannot multiply past the
@@ -432,30 +432,38 @@ pub const SUMMARY_ENTRY_FRAMING_BYTES: usize = 1;
 const DROP_WARN_EVERY: u64 = 100;
 
 /// Atomic aggregate byte budget with lease-based release.
-///
-/// Every reservation is charged twice: once against this per-instance budget
-/// and once against the shared `ceiling`. The instance budget bounds one sink;
-/// the ceiling bounds the sum across all of them.
 #[derive(Debug)]
 pub struct ByteBudget {
     used_bytes: Arc<AtomicUsize>,
     max_bytes: usize,
     drops: AtomicU64,
     plugin_name: &'static str,
-    ceiling: &'static RetainedByteCeiling,
+    ceiling: Option<&'static RetainedByteCeiling>,
 }
 
 impl ByteBudget {
     pub fn new(plugin_name: &'static str, max_bytes: usize) -> Self {
+        Self {
+            used_bytes: Arc::new(AtomicUsize::new(0)),
+            max_bytes: max_bytes.max(1),
+            drops: AtomicU64::new(0),
+            plugin_name,
+            ceiling: None,
+        }
+    }
+
+    /// Construct an observability budget charged against the process ceiling.
+    pub fn new_observability(plugin_name: &'static str, max_bytes: usize) -> Self {
         Self::with_ceiling(plugin_name, max_bytes, process_ceiling())
     }
 
     /// Construct a budget bound to an explicit ceiling.
     ///
-    /// Production always uses [`process_ceiling`]. External tests pass their
-    /// own leaked ceiling so saturation and byte-accounting assertions stay
-    /// exact while other tests in the same binary run concurrently.
-    // The binary target only calls `new`; external unit tests use this.
+    /// Observability production callers use [`new_observability`](Self::new_observability).
+    /// External tests pass their own leaked ceiling so saturation and
+    /// byte-accounting assertions stay exact while other tests in the same
+    /// binary run concurrently.
+    // The binary target uses the named constructors; external unit tests use this.
     #[allow(dead_code)]
     pub fn with_ceiling(
         plugin_name: &'static str,
@@ -467,7 +475,7 @@ impl ByteBudget {
             max_bytes: max_bytes.max(1),
             drops: AtomicU64::new(0),
             plugin_name,
-            ceiling,
+            ceiling: Some(ceiling),
         }
     }
 
@@ -493,14 +501,19 @@ impl ByteBudget {
             return Some(Arc::new(ByteLease {
                 used_bytes: Arc::clone(&self.used_bytes),
                 bytes: AtomicUsize::new(0),
-                process: self.ceiling.try_acquire(0)?,
+                process: self.ceiling.and_then(|ceiling| ceiling.try_acquire(0)),
             }));
         }
         // The shared ceiling is taken first so a per-instance reservation is
         // never left held while the aggregate reservation fails.
-        let Some(process) = self.ceiling.try_acquire(bytes) else {
-            self.record_drop("process-wide retained-byte ceiling exhausted");
-            return None;
+        let process = if let Some(ceiling) = self.ceiling {
+            let Some(process) = ceiling.try_acquire(bytes) else {
+                self.record_drop("process-wide retained-byte ceiling exhausted");
+                return None;
+            };
+            Some(process)
+        } else {
+            None
         };
         let reserved = self
             .used_bytes
@@ -541,9 +554,9 @@ impl ByteBudget {
 pub struct ByteLease {
     used_bytes: Arc<AtomicUsize>,
     bytes: AtomicUsize,
-    /// Matching reservation against the process-wide ceiling. Shrunk and
-    /// released in lockstep with the per-instance reservation.
-    process: ProcessByteReservation,
+    /// Optional matching reservation against the process-wide ceiling. When
+    /// present, it is shrunk and released with the per-instance reservation.
+    process: Option<ProcessByteReservation>,
 }
 
 impl ByteLease {
@@ -560,7 +573,9 @@ impl ByteLease {
         {
             Ok(_) => {
                 self.used_bytes.fetch_sub(release, Ordering::AcqRel);
-                self.process.shrink_to(exact);
+                if let Some(process) = &self.process {
+                    process.shrink_to(exact);
+                }
             }
             Err(_) => {
                 // Concurrent shrink/release already moved the lease; ignore.
@@ -574,7 +589,9 @@ impl ByteLease {
         if bytes != 0 {
             self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
         }
-        self.process.release();
+        if let Some(process) = &self.process {
+            process.release();
+        }
     }
 }
 

@@ -53,17 +53,18 @@ jobs:
             base_ref="origin/${BASE_REF}"
             git fetch --no-tags origin \
               "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+            # Never execute the pull request's verifier in this security-
+            # sensitive planning job. The separate read-only candidate-policy
+            # workflow parses and exercises the proposed source without
+            # producing any output consumed by CI planning.
             if git cat-file -e "${base_ref}:${policy}" 2>/dev/null; then
               trusted_policy="$RUNNER_TEMP/verify-cross-build-policy.py"
               git show "${base_ref}:${policy}" > "$trusted_policy"
               policy="$trusted_policy"
-            else
-              # One-time bootstrap: the base has no verifier to execute yet.
-              # Compile, then run this reviewed proposal in isolated mode. All
-              # later PRs take the trusted-base branch above.
-              PYTHONPYCACHEPREFIX="$RUNNER_TEMP/cross-policy-pyc" \
-                python3 -I -m py_compile "$policy"
             fi
+            # Otherwise this is the one-time bootstrap where the base has no
+            # verifier to execute yet: `policy` stays the reviewed proposal and
+            # runs in isolated mode. All later PRs take the trusted-base branch.
           fi
 
           python3 -I "$policy" \
@@ -649,6 +650,7 @@ jobs:
               integration::k8s_controller_gateway_status_tests
               integration::k8s_controller_istio_status_tests
               integration::k8s_controller_shutdown_tests
+              integration::k8s_controller_status_snapshot_tests
               integration::mesh_telemetry_k8s_provider_lookup_tests
               integration::mesh_telemetry_tracing_tests
               integration::mesh_bpf_metrics_scrape_tests
@@ -703,6 +705,7 @@ jobs:
               integration::tcp_frontend_tls_order_tests
               integration::tcp_fast_path_l4_plugins_tests
               integration::udp_hook_concurrency_tests
+              integration::udp_fault_injection_tests
               integration::gateway_hbone_pool_tests
               integration::gateway_svid_identity_tests
               integration::graceful_shutdown_tests
@@ -865,6 +868,12 @@ jobs:
         # exception is rejected at PR time, not only by the weekly workflow.
         run: bash scripts/check_advisory_expiry.sh
 
+      - name: Vendored-patch lifecycle parity
+        # Fails when docs/vendored-patch-lifecycle.json drifts from Cargo.toml,
+        # vendor/, dependency-policy.md, or per-patch READMEs. The checker runs
+        # synthetic self-tests before repository parity.
+        run: python3 scripts/check_vendored_patch_lifecycle.py
+
   test-vendor-patches:
     name: Vendored Patch Regressions
     needs: build-test-artifacts
@@ -974,6 +983,7 @@ jobs:
               functional_spec_expose_test
               functional_prometheus_test
               functional_serverless_mirror_test
+              functional_serverless_grpc_terminate_test
               functional_ws_plugins_test
               functional_circuit_breaker_retry_test
               functional_dns_cache_test

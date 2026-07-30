@@ -3,8 +3,10 @@
 This document is the single policy for how Ferrum Edge manages third-party
 dependencies and, in particular, the **vendored, patched copies** of upstream
 crates it carries in `vendor/**`. It is the human half of the governance; the
-machine half is `deny.toml`, the scheduled `.github/workflows/dependency-audit.yml`
-workflow, and the drift guard in `tests/integration/vendor_integrity_tests.rs`.
+machine half is `deny.toml`, [`docs/vendored-patch-lifecycle.json`](vendored-patch-lifecycle.json),
+the scheduled `.github/workflows/dependency-audit.yml` workflow,
+`scripts/check_vendored_patch_lifecycle.py`, and the drift guard in
+`tests/integration/vendor_integrity_tests.rs`.
 
 > TL;DR — vendored patches must be **auditable** (pinned + drift-tested),
 > **tracked** (an upstream PR — or a governed [deliberate-fork record](#deliberate-fork-policy-and-sla)
@@ -28,28 +30,45 @@ tool when:
 Vendoring without a retirement plan is not allowed. Prefer a dependency bump, a
 feature flag, or a gateway-side workaround first.
 
+## Direct pins of otherwise-transitive crates
+
+Some crates are already pulled in transitively but are also listed directly in
+`Cargo.toml` when Ferrum calls their API itself (not only through a parent
+crate). Keep the version aligned with the transitive copy already in
+`Cargo.lock` unless an intentional bump is part of the change.
+
+| Crate | Why pinned directly |
+|---|---|
+| `crossbeam-utils` | `CachePadded` on hot overload atomics |
+| `crossbeam-queue` | lock-free MPMC ring for router-cache eviction samples |
+| `unsafe-libyaml` | API-spec YAML event composition + bounded alias expansion (#3307); already transitive via `serde_yaml` |
+
 ## Vendored crate inventory
 
-Each row is the authoritative tracking record. Keep this table, the
-`[patch.crates-io]` block in `Cargo.toml`, the per-patch docs, and the
-`PATCHES` array in `scripts/check_vendored_patch_status.sh` in sync.
+Each row is the authoritative human summary. The **Lifecycle ID** column is the
+stable identity shared with
+[`docs/vendored-patch-lifecycle.json`](vendored-patch-lifecycle.json); CI
+requires the exact set of IDs (duplicates fail closed). Keep this table, the
+machine inventory, the `[patch.crates-io]` block in `Cargo.toml`, the per-patch
+docs, and `scripts/check_vendored_patch_lifecycle.py` in sync. CI fails when any
+surface drifts.
 
-| Crate | Vendored ver. | Patch | Upstream issue / PR | Owner | Reason | Removal trigger | Docs |
-|---|---|---|---|---|---|---|---|
-| `reqwest` | 0.13.3 | Per-request `RequestBuilder::connect_timeout` | [seanmonstar/reqwest#3017](https://github.com/seanmonstar/reqwest/pull/3017) (OPEN) | Ferrum Edge maintainers | Pool keys exclude request-only connect/read timeouts, so sibling proxies can share one client; without per-request connect timeout the first proxy's timeout leaks to all | PR #3017 merges and ships in a release we consume | [docs/upstream-reqwest-patches/001-…](upstream-reqwest-patches/001-per-request-connect-timeout/README.md) |
-| `h3` | 0.0.8 | Drain buffered frames before propagating QUIC `CONNECTION_CLOSE` | issue [hyperium/h3#338](https://github.com/hyperium/h3/issues/338), PR [hyperium/h3#339](https://github.com/hyperium/h3/pull/339) | Ferrum Edge maintainers | io_uring batching of `STREAM(FIN)` + `CONNECTION_CLOSE(H3_NO_ERROR)` dropped a buffered HEADERS frame → false 502 on graceful close | Fix ships in an `h3` release **and** patches 002/003 are also retired | [docs/upstream-h3-patches/001-…](upstream-h3-patches/001-recv-frame-drain-on-quic-close/README.md) |
-| `h3` | 0.0.8 | Add `Protocol::WEB_SOCKET` (RFC 9220 Extended CONNECT) | **Deliberate fork** — unfiled upstream; branch `feat/extended-connect-websocket-protocol` on `jeremyjpj0916/h3` ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | Stock `h3` 0.0.8 rejects `:protocol=websocket` at the HEADERS layer, making WebSocket-over-HTTP/3 unreachable | Upstream files + merges the variant **and** patches 001/003 are also retired | [docs/upstream-h3-patches/002-…](upstream-h3-patches/002-extended-connect-websocket-protocol/README.md) |
-| `h3` | 0.0.8 | Add `RequestStream::peek_recv_trailers()` for already-buffered trailers before FIN | **Deliberate fork** — unfiled upstream; branch `feat/peek-buffered-trailers-before-fin` on `jeremyjpj0916/h3` ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | `poll_recv_trailers` buffers trailer HEADERS but waits for terminal FIN; gateway trailer-timeout collapse dropped trailers delivered before delayed FIN | Upstream files + merges the API **and** patches 001/002 are also retired | [docs/upstream-h3-patches/003-…](upstream-h3-patches/003-peek-buffered-trailers-before-fin/README.md) |
-| `tungstenite` | 0.29.0 | `WebSocket::into_inner_with_read_buffer()` (lossless raw takeover) | [snapview/tungstenite-rs#556](https://github.com/snapview/tungstenite-rs/pull/556) | Ferrum Edge maintainers | Tunnel mode lost backend bytes coalesced with the `101` response when dropping to raw relay | **Both** this and tokio-tungstenite#380 ship in compatible releases | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
-| `tungstenite` | 0.29.0 | Distinct `FrameTooLong` origin for pre-reservation frame policy | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Equal frame/message ceilings otherwise lose which parser boundary rejected input and can emit the wrong configured close reason | Upstream ships equivalent frame-vs-message capacity attribution, or the gateway no longer needs distinct policy reasons | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
-| `tungstenite` | 0.29.0 | `WebSocketConfig::auto_pong` opt-out for transparent Ping relay | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Stock framer auto-answers Ping while the gateway also forwards it, so one Ping yields two Pongs and a hung backend still looks healthy | Upstream ships equivalent default-true auto-Pong opt-out, or the gateway no longer needs transparent Ping/Pong | [docs/upstream-tungstenite-patches/003-…](upstream-tungstenite-patches/003-optional-auto-pong/README.md) |
-| `tokio-tungstenite` | 0.29.0 | `WebSocketStream::into_inner_with_read_buffer()` | [snapview/tokio-tungstenite#380](https://github.com/snapview/tokio-tungstenite/pull/380) | Ferrum Edge maintainers | Same lossless-takeover gap on the async wrapper | **Both** this and tungstenite#556 ship in compatible releases | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
-| `tungstenite` | 0.29.0 | `FragmentMeter` + `max_incomplete_message_frames` / `max_incomplete_message_duration` (physical-fragment accounting and bounds) | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | The reader only sees reassembled messages, so fragmented (including zero-length continuation) frames bypass per-message admission policy and are unbounded in count and duration | Upstream ships an equivalent pre-reassembly fragment hook **and** independent incomplete-message count/duration bounds | [docs/upstream-tungstenite-patches/004-…](upstream-tungstenite-patches/004-fragment-accounting/README.md) |
-| `tokio-tungstenite` | 0.29.0 | `WebSocketStream::set_fragment_accounting()` | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Same accounting gap on the async wrapper, which hides the codec behind `SplitStream` after `split()` | Upstream ships the equivalent delegator alongside the tungstenite hook | [docs/upstream-tungstenite-patches/004-…](upstream-tungstenite-patches/004-fragment-accounting/README.md) |
-| `dimpl` | 0.6.1 | Full leaf-first certificate-chain transport and zeroizing private-key ownership | **Deliberate fork** — unfiled upstream; base commit `37bb0fa83f4167420729de5ea71c61852f82e9ed` ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Published releases expose only one local certificate and retain endpoint/fallback credential bytes in ordinary `Vec<u8>` owners | Upstream ships compatible full-chain DTLS 1.2/1.3 transport, peer-chain output, and drop-time key zeroization on all ownership paths | [docs/upstream-dimpl-patches/001-…](upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md) |
+| Lifecycle ID | Crate | Vendored ver. | Patch | Upstream issue / PR | Owner | Reason | Removal trigger | Docs |
+|---|---|---|---|---|---|---|---|---|
+| `reqwest-001-per-request-connect-timeout` | `reqwest` | 0.13.3 | Per-request `RequestBuilder::connect_timeout` | [seanmonstar/reqwest#3017](https://github.com/seanmonstar/reqwest/pull/3017) (OPEN) | Ferrum Edge maintainers | Pool keys exclude request-only connect/read timeouts, so sibling proxies can share one client; without per-request connect timeout the first proxy's timeout leaks to all | PR #3017 merges and ships in a release we consume | [docs/upstream-reqwest-patches/001-…](upstream-reqwest-patches/001-per-request-connect-timeout/README.md) |
+| `h3-001-recv-frame-drain-on-quic-close` | `h3` | 0.0.8 | Drain buffered frames before propagating QUIC `CONNECTION_CLOSE` | issue [hyperium/h3#338](https://github.com/hyperium/h3/issues/338), PR [hyperium/h3#339](https://github.com/hyperium/h3/pull/339) | Ferrum Edge maintainers | io_uring batching of `STREAM(FIN)` + `CONNECTION_CLOSE(H3_NO_ERROR)` dropped a buffered HEADERS frame → false 502 on graceful close | Fix ships in an `h3` release **and** patches 002/003 are also retired | [docs/upstream-h3-patches/001-…](upstream-h3-patches/001-recv-frame-drain-on-quic-close/README.md) |
+| `h3-002-extended-connect-websocket-protocol` | `h3` | 0.0.8 | Add `Protocol::WEB_SOCKET` (RFC 9220 Extended CONNECT) | **Deliberate fork** — unfiled upstream; branch `feat/extended-connect-websocket-protocol` on `jeremyjpj0916/h3` ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | Stock `h3` 0.0.8 rejects `:protocol=websocket` at the HEADERS layer, making WebSocket-over-HTTP/3 unreachable | Upstream files + merges the variant **and** patches 001/003 are also retired | [docs/upstream-h3-patches/002-…](upstream-h3-patches/002-extended-connect-websocket-protocol/README.md) |
+| `h3-003-peek-buffered-trailers-before-fin` | `h3` | 0.0.8 | Add `RequestStream::peek_recv_trailers()` for already-buffered trailers before FIN | **Deliberate fork** — unfiled upstream; branch `feat/peek-buffered-trailers-before-fin` on `jeremyjpj0916/h3` ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | `poll_recv_trailers` buffers trailer HEADERS but waits for terminal FIN; gateway trailer-timeout collapse dropped trailers delivered before delayed FIN | Upstream files + merges the API **and** patches 001/002 are also retired | [docs/upstream-h3-patches/003-…](upstream-h3-patches/003-peek-buffered-trailers-before-fin/README.md) |
+| `tungstenite-001-lossless-takeover` | `tungstenite` | 0.29.0 | `WebSocket::into_inner_with_read_buffer()` (lossless raw takeover) | [snapview/tungstenite-rs#556](https://github.com/snapview/tungstenite-rs/pull/556) | Ferrum Edge maintainers | Tunnel mode lost backend bytes coalesced with the `101` response when dropping to raw relay | **Both** this and tokio-tungstenite#380 ship in compatible releases | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
+| `tungstenite-002-frame-limit-origin` | `tungstenite` | 0.29.0 | Distinct `FrameTooLong` origin for pre-reservation frame policy | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Equal frame/message ceilings otherwise lose which parser boundary rejected input and can emit the wrong configured close reason | Upstream ships equivalent frame-vs-message capacity attribution, or the gateway no longer needs distinct policy reasons | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
+| `tungstenite-003-optional-auto-pong` | `tungstenite` | 0.29.0 | `WebSocketConfig::auto_pong` opt-out for transparent Ping relay | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Stock framer auto-answers Ping while the gateway also forwards it, so one Ping yields two Pongs and a hung backend still looks healthy | Upstream ships equivalent default-true auto-Pong opt-out, or the gateway no longer needs transparent Ping/Pong | [docs/upstream-tungstenite-patches/003-…](upstream-tungstenite-patches/003-optional-auto-pong/README.md) |
+| `tokio-tungstenite-001-lossless-takeover` | `tokio-tungstenite` | 0.29.0 | `WebSocketStream::into_inner_with_read_buffer()` | [snapview/tokio-tungstenite#380](https://github.com/snapview/tokio-tungstenite/pull/380) | Ferrum Edge maintainers | Same lossless-takeover gap on the async wrapper | **Both** this and tungstenite#556 ship in compatible releases | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
+| `tungstenite-004-fragment-accounting` | `tungstenite` | 0.29.0 | `FragmentMeter` + `max_incomplete_message_frames` / `max_incomplete_message_duration` (physical-fragment accounting and bounds) | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | The reader only sees reassembled messages, so fragmented (including zero-length continuation) frames bypass per-message admission policy and are unbounded in count and duration | Upstream ships an equivalent pre-reassembly fragment hook **and** independent incomplete-message count/duration bounds | [docs/upstream-tungstenite-patches/004-…](upstream-tungstenite-patches/004-fragment-accounting/README.md) |
+| `tokio-tungstenite-004-fragment-accounting-delegator` | `tokio-tungstenite` | 0.29.0 | `WebSocketStream::set_fragment_accounting()` | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Same accounting gap on the async wrapper, which hides the codec behind `SplitStream` after `split()` | Upstream ships the equivalent delegator alongside the tungstenite hook | [docs/upstream-tungstenite-patches/004-…](upstream-tungstenite-patches/004-fragment-accounting/README.md) |
+| `dimpl-001-certificate-chain-and-key-zeroization` | `dimpl` | 0.6.1 | Full leaf-first certificate-chain transport and zeroizing private-key ownership | **Deliberate fork** — unfiled upstream; base commit `37bb0fa83f4167420729de5ea71c61852f82e9ed` ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Published releases expose only one local certificate and retain endpoint/fallback credential bytes in ordinary `Vec<u8>` owners | Upstream ships compatible full-chain DTLS 1.2/1.3 transport, peer-chain output, and drop-time key zeroization on all ownership paths | [docs/upstream-dimpl-patches/001-…](upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md) |
 
-> Ownership note: `vendor/`, `deny.toml`, this doc, `docs/upstream-*-patches/`,
-> and the vendored-patch scripts are owned via
+> Ownership note: `vendor/`, `deny.toml`, this doc, `docs/vendored-patch-lifecycle.json`,
+> `docs/upstream-*-patches/`, and the vendored-patch scripts are owned via
 > [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`). Upstream `h3`
 > work is staged from the `jeremyjpj0916/h3` fork referenced in the h3 patch
 > docs. Patches carried without an upstream PR, including the tungstenite frame
@@ -62,7 +81,8 @@ Each row is the authoritative tracking record. Keep this table, the
 
 Most vendored patches ride an **open upstream PR** (reqwest #3017, h3 #339,
 tungstenite #556 / tokio-tungstenite #380); the weekly
-`scripts/check_vendored_patch_status.sh` polls those and goes red when one
+`scripts/check_vendored_patch_status.sh` (backed by
+`docs/vendored-patch-lifecycle.json`) polls those and goes red when one
 merges. Fork-only patches currently include **h3 002** (Extended CONNECT
 `:protocol=websocket`), **h3 003** (`peek_recv_trailers`), the tungstenite
 frame-limit origin extension, **tungstenite `auto_pong`** (transparent Ping
@@ -78,8 +98,8 @@ zeroization). They are not untracked TODOs; they are carried as
 - **Review cadence (SLA).** Every weekly `dependency-audit` run lists each
   fork-only patch as `NOT YET FILED`. At each run the owner either (a) files the
   upstream issue/PR and records the numbers in the inventory table, the per-patch
-  `README.md` Status block, **and** the `PATCHES` array in
-  `scripts/check_vendored_patch_status.sh`, or (b) leaves it as a conscious
+  `README.md` Status block, **and**
+  [`docs/vendored-patch-lifecycle.json`](vendored-patch-lifecycle.json), or (b) leaves it as a conscious
   re-affirmation that the fork is still the right call.
 - **Hard checkpoint — no unfiled fork ships in a stable release.** A fork-only
   patch (no upstream PR link) may **not** survive the first tagged stable release
@@ -88,8 +108,12 @@ zeroization). They are not untracked TODOs; they are carried as
   without either a filed upstream issue/PR link recorded in the inventory table,
   or an explicit dated re-affirmation
   (`Deliberate fork — re-affirmed YYYY-MM-DD by <owner>: <reason>`) in the
-  patch's `README.md`. This keeps "not yet filed" from silently becoming
-  permanent in a released product.
+  patch's `README.md`, mirrored into the `reaffirmation` object of the matching
+  `docs/vendored-patch-lifecycle.json` entry. A reaffirmation is a
+  deliberate-fork record only: CI rejects one on a patch whose `upstream.filing`
+  is `filed`, so reaffirming a fork that shares a `README.md` with filed patches
+  (as `tungstenite-002-frame-limit-origin` does) does not drag them in. This
+  keeps "not yet filed" from silently becoming permanent in a released product.
 - **Retirement is unchanged.** Whether upstreamed via PR or carried as a fork,
   each patch retires per its `README.md` retirement plan and the co-vendoring
   rule (all three h3 patches retire together — see the inventory `Removal
@@ -163,9 +187,23 @@ demand:
 - **advisories** — re-runs the `cargo deny` gate against the freshly-fetched
   advisory DB (catches new advisories with no PR), runs the expiry check, and
   runs `cargo audit` as an independent second opinion.
-- **upstream-patch-status** — `scripts/check_vendored_patch_status.sh` queries
-  each tracked upstream PR. The run goes **red when an upstream PR has merged**
-  (a retirement signal) and reports each crate's latest crates.io release.
+- **upstream-patch-status** — two steps. *Vendored-patch lifecycle parity* runs
+  `scripts/check_vendored_patch_lifecycle.py`, which self-tests its validators
+  and then verifies that every patch in `docs/vendored-patch-lifecycle.json`
+  matches `Cargo.toml`, `vendor/`, the inventory Lifecycle ID set and upstream
+  PR/issue numbers here, the upstream-status wrapper delegation, and per-patch
+  READMEs. *Check upstream status* then runs
+  `scripts/check_vendored_patch_status.sh`, which delegates to the same checker's
+  `--upstream-status` mode and queries each tracked upstream PR. The run goes
+  **red when an upstream PR has merged** (a retirement signal — run the
+  compatible-release test before deleting vendor copies) and reports each crate's
+  latest crates.io release plus deliberate-fork reaffirmation gaps.
+
+The per-PR `dependency-audit` job in `ci.yml` runs the same parity gate. Because
+that job is required to stay behind `mode == 'full'`,
+`.github/scripts/pr_ci_plan.py` keeps `docs/dependency-policy.md`,
+`docs/vendored-patch-lifecycle.json`, and `docs/upstream-*-patches/` on full CI —
+a governance-doc-only pull request cannot skip the gate that guards it.
 
 ### 5. Behavioral regression tests for the patched behaviors
 
@@ -223,8 +261,9 @@ adding, retiring, or changing a vendored patch.
 5. Add a behavioral regression test for the fixed behavior and wire it into the
    `Vendored Patch Regressions` CI job when it lives outside the normal root
    test matrix.
-6. Add a row to the inventory table above and to the `PATCHES` array in
-   `scripts/check_vendored_patch_status.sh`.
+6. Add a row to the inventory table above (with a unique Lifecycle ID) and a
+   matching entry to
+   [`docs/vendored-patch-lifecycle.json`](vendored-patch-lifecycle.json).
 7. Regenerate the drift manifest: `scripts/update_vendor_integrity.sh`.
 8. File the upstream issue/PR and record the numbers.
 
@@ -249,7 +288,8 @@ and tungstenite, *both* co-vendored patches must be ready — see the table).
 4. Move `docs/upstream-<crate>-patches/NNN-…/` to `…/_retired/NNN-…/` with a
    `STATUS.md` (merge commit + registry version), or delete per that crate's
    README.
-5. Remove the inventory row + the `scripts/check_vendored_patch_status.sh` entry.
+5. Remove the inventory row (Lifecycle ID) and the matching `docs/vendored-patch-lifecycle.json`
+   entry.
 6. Regenerate the drift manifest (now smaller) and keep the gateway call sites —
    they use the upstream API by design.
 7. Run the behavioral regression tests; they must still pass.
@@ -368,6 +408,8 @@ a shell as a shortcut.
 
 ## See also
 
+- `docs/vendored-patch-lifecycle.json` — machine-readable owner/upstream/retirement
+  inventory enforced by `scripts/check_vendored_patch_lifecycle.py`.
 - `deny.toml` — the gate configuration and current exceptions.
 - `SECURITY.md` — vulnerability reporting and severity timelines.
 - `docs/upstream-reqwest-patches/`, `docs/upstream-h3-patches/`,

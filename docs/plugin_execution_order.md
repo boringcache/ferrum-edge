@@ -617,7 +617,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
 | **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `kafka_logging` (9150), `loki_logging` (9155), `udp_logging` (9160), `ws_logging` (9175), `transaction_debugger` (9200), `proxy_alerts` (9250), `prometheus_metrics` (9300), `api_chargeback` (9350), `api_chargeback_sink` (9351), `workload_metrics` (9360), `__mesh_bpf_metrics` (9365), `transaction_log_schema` (9999, config-only) |
 
-`soap_ws_security` keeps AuthN-band priority 1500 for ordering, but validates SOAP bodies in `before_proxy` after request-body buffering is available.
+`soap_ws_security` keeps AuthN-band priority 1500. A configuration that establishes a principal (`username_token`, `x509_signature`, or `saml`) is an auth plugin: it opts into `requires_request_body_before_authenticate` and validates the SOAP message in the `authenticate` phase, publishing `authenticated_identity` and a namespace-correct `identified_consumer` so `access_control` (2000) and consumer-scoped `rate_limiting` (2900) evaluate the SOAP principal rather than the source IP. A timestamp-only configuration establishes no principal, is not an auth plugin, and keeps validating in `before_proxy` after request-body buffering — the two phases are selected by configuration and never both run. The identity-establishing form additionally runs `on_final_request_body` before backend dispatch to refuse a message whose bytes changed after validation; the timestamp-only form authenticates nobody and claims no integrity over the Body, so it does not bind the representation and stays composable with request-body transformers. Composition admission requires an identity-establishing instance to be the proxy's sole authentication mechanism in both auth modes (each mode stops after the first successful identity, while their rejection behavior also cannot preserve multiple mandatory message gates) and rejects it alongside `compression` with `decompress_request` (authentication precedes body normalization).
 
 `serverless_function` also runs in `before_proxy`. With `forward_body: true` it receives the exact lossless client representation before any request-body transform. Candidate admission and cache construction therefore reject a same-protocol chain that also contains a body transformer (including request decompression); the same capability-based validation covers registered custom body-egress plugins. Candidate admission derives the built-in serverless protocol, effective priority, `mode`, and `forward_body` capabilities without constructing its environment-bound HTTP/AWS client, so a CP can validate composition without requiring credentials that intentionally exist only on DPs. Runtime cache construction still resolves and validates those node-local values as a fail-closed backstop. Ferrum does not allow an external decision to govern bytes different from those ultimately dispatched. Non-identity encoded bodies fail closed before function egress. When a terminate-mode instance shares a protocol chain with `request_deduplication`, every deduplication instance must have a strictly lower effective priority so retry ownership exists before the function can execute; candidate admission and cache construction reject equal or reversed ordering.
 
@@ -667,7 +667,7 @@ Given all built-in plugins enabled, the execution order is:
 | 20 | `ldap_auth` | 1250 | authenticate |
 | 21 | `basic_auth` | 1300 | authenticate |
 | 22 | `hmac_auth` | 1400 | authenticate |
-| 23 | `soap_ws_security` | 1500 | before_proxy |
+| 23 | `soap_ws_security` | 1500 | authenticate, before_proxy, on_final_request_body |
 | 24 | `access_control` | 2000 | authorize, on_stream_connect |
 | 25 | `tcp_connection_throttle` | 2050 | on_stream_connect (opaque connection permit releases on rejection/teardown) |
 | 26 | `mesh_authz` | 2075 | authorize, on_stream_connect |
@@ -683,7 +683,7 @@ Given all built-in plugins enabled, the execution order is:
 | 36 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 37 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body, on_final_request_body |
 | 38 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body, on_stream_connect, on_udp_datagram |
-| 39 | `fault_injection` | 2940 | before_proxy, on_stream_connect |
+| 39 | `fault_injection` | 2940 | before_proxy, on_stream_connect, on_udp_datagram |
 | 40 | `body_validator` | 2950 | before_proxy, on_final_request_body, after_proxy, on_final_response_body |
 | 41 | `openapi_validator` | 2960 | before_proxy, on_final_request_body, after_proxy, on_final_response_body |
 | 42 | `ai_semantic_firewall` | 2968 | before_proxy, on_final_request_body, on_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
@@ -858,7 +858,7 @@ Request transformers run after authentication and authorization, so they only mo
 
 ### Compression runs after response transformation (4050)
 
-The `compression` plugin runs at priority 4050 — after `response_transformer` (4000) so it compresses the final transformed response body, before `ai_prompt_compressor` (4055) so opt-in request decompression exposes plaintext prompt JSON before prompt compression, and before `ai_token_metrics` (4100) and `ai_rate_limiter` (4200). Gateway-owned compression therefore presents normalized bytes to the later AI hooks. If an origin nevertheless returns an encoded JSON/SSE body, `ai_token_metrics` performs its own bounded inspection-only decoding without normalizing the client-visible bytes or headers. Configured request decompression (`decompress_request`) additionally runs in the shared pre-`before_proxy` body-normalization phase on H1/H2 and native H3 so earlier `before_proxy` body consumers (including `soap_ws_security` at priority 1500) observe the same size-bounded plaintext that is forwarded upstream. In `before_proxy`, compression can strip `Accept-Encoding` from the backend request so the backend sends uncompressed responses for the gateway to compress. Response body buffering is required when this plugin is enabled.
+The `compression` plugin runs at priority 4050 — after `response_transformer` (4000) so it compresses the final transformed response body, before `ai_prompt_compressor` (4055) so opt-in request decompression exposes plaintext prompt JSON before prompt compression, and before `ai_token_metrics` (4100) and `ai_rate_limiter` (4200). Gateway-owned compression therefore presents normalized bytes to the later AI hooks. If an origin nevertheless returns an encoded JSON/SSE body, `ai_token_metrics` performs its own bounded inspection-only decoding without normalizing the client-visible bytes or headers. Configured request decompression (`decompress_request`) additionally runs in the shared pre-`before_proxy` body-normalization phase on H1/H2 and native H3 so `before_proxy` body consumers observe the same size-bounded plaintext that is forwarded upstream. It therefore runs *after* the `authenticate` phase, so composing it with an identity-establishing `soap_ws_security` instance is rejected at admission rather than validating encoded bytes. In `before_proxy`, compression can strip `Accept-Encoding` from the backend request so the backend sends uncompressed responses for the gateway to compress. Response body buffering is required when this plugin is enabled.
 
 ### Logging runs last (9000+)
 
@@ -1019,7 +1019,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `ldap_auth` | ✓ | ✓ | ✓ | | | Requires HTTP Basic auth header; authenticates against LDAP directory |
 | `basic_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers and a buffered request body; HBONE CONNECT fails closed as incompatible |
-| `soap_ws_security` | ✓ | | | | | SOAP XML body parsing (text/xml, application/soap+xml) |
+| `soap_ws_security` | ✓ | | | | | SOAP XML body parsing (text/xml, application/soap+xml, application/xml, application/xop+xml, MTOM multipart/related) |
 | `access_control` | ✓ | ✓ | ✓ | ✓ | ✓ | Needs authenticated identity from an auth plugin; supports consumer username and ACL group allow/deny lists |
 | `tcp_connection_throttle` | | | | ✓ | | Tracks process-local active TCP/TCP+TLS connections per Consumer or canonical client IP; each replica enforces independently |
 | `mesh_authz` | ✓ | ✓ | ✓ | ✓ | ✓ | Applies Layer 2 mesh policy using SPIFFE or HBONE identities |
@@ -1035,7 +1035,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `ai_transcript_audit` | ✓ | | | | | HTTP-only AI transcript capture to a configured sink |
 | `ai_prompt_shield` | ✓ | | | | | HTTP-only PII detection/redaction for bare JSON prompts; native gRPC unsupported (gRPC-Web framed bodies are skipped) |
 | `waf` | ✓ | ✓ | ✓ | ✓ | ✓ | HTTP-family always; TCP/UDP first-bytes and datagram inspection when a `stream` block is configured |
-| `fault_injection` | ✓ | ✓ | ✓ | ✓ | | Probabilistic aborts and delays; raw TCP only for stream hooks (no UDP/DTLS) |
+| `fault_injection` | ✓ | ✓ | ✓ | ✓ | ✓ | Probabilistic aborts and delays across HTTP-family, TCP stream connect, and UDP/DTLS session + datagram hooks |
 | `body_validator` | ✓ | ✓ | | | | Validates request and response bodies |
 | `openapi_validator` | ✓ | | | | | Validates bodies against generated OpenAPI operation schemas |
 | `ai_semantic_firewall` | ✓ | | | | | HTTP-only semantic inspection for LLM JSON request and response bodies |
@@ -1047,8 +1047,8 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `a2a_gateway` | ✓ | ✓ | | | | Detects A2A HTTP/REST/gRPC methods, rewrites HTTP Agent Cards, applies method policy, and emits `a2a.*` metadata |
 | `mesh_route_dispatch` | ✓ | ✓ | ✓ | | | Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing |
 | `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/query/body |
-| `serverless_function` | ✓ | ✓ | | | | Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions) |
-| `response_mock` | ✓ | | ✓ | | | Short-circuits HTTP and WebSocket upgrade handshakes; native gRPC unsupported (Reject cannot carry framed unary payloads) |
+| `serverless_function` | ✓ | ✓ | | | | Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions); terminate supports HTTP and native unary gRPC |
+| `response_mock` | ✓ | | ✓ | | | Short-circuits HTTP and WebSocket upgrade handshakes; native gRPC unsupported by design — only the validated serverless_function terminate contract carries provenance-authorized framed unary Reject semantics |
 | `grpc_deadline` | | ✓ | | | | gRPC timeout enforcement and propagation |
 | `load_testing` | ✓ | | | | | On-demand load testing via header trigger with multi-node fan-out |
 | `request_mirror` | ✓ | ✓ | | | | Duplicates traffic to a shadow destination for validation |

@@ -1429,6 +1429,510 @@ PUBLISH_CONTROL_CONTRACTS = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# Trusted-base relevance contract for the required live-datapath gates
+# ---------------------------------------------------------------------------
+# `mesh-e2e-sidecar-live.yml` and `multicluster-federation-live.yml` publish
+# REQUIRED status checks that may skip their expensive live job when a pull
+# request touches nothing relevant. That skip is a security boundary: if the
+# relevance verdict is computed by a script the PULL REQUEST supplies, the pull
+# request can widen its own suite patterns, declare itself irrelevant, skip the
+# live job, and still turn the required gate green.
+#
+# The block below is therefore the ONLY accepted shape for that decision, and
+# it is frozen byte-for-byte so a later pull request cannot weaken, redirect,
+# or replace it with an equivalent-looking one. Its load-bearing properties:
+#
+#   * The relevance script is read from the base-branch tip of the BASE
+#     repository, never from the pull-request checkout. This holds for fork
+#     pull requests, because `github.base_ref` always names a branch in the
+#     base repository and `origin` is the base repository.
+#   * That tip is pinned once to a full 40-hex commit id, and every later read
+#     goes through that id and then through the blob's own object id, so a push
+#     to the base branch between validation and execution cannot swap the file.
+#   * `github.base_ref` is untrusted text and is charset- and shape-validated
+#     before it can reach a refspec, so no option, pathspec, or revision-syntax
+#     metacharacter can be smuggled into a git invocation.
+#   * The tree entry must be a regular blob (100644/100755) at the pinned path:
+#     a symlink (120000), gitlink (160000), tree, missing entry, multi-entry
+#     match, or oversized blob fails closed.
+#   * Every failure path exits non-zero, so a trusted-base acquisition or
+#     execution failure fails the gate instead of defaulting to "irrelevant",
+#     and the emitted verdict must literally be `true` or `false`.
+#   * The filter runs under `python3 -I`, so nothing the pull request committed
+#     can be imported into the trusted interpreter.
+#
+# The template is substituted only at three sentinels — display name, temp-file
+# slug, and suite selector — so every governed workflow runs identical logic.
+LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
+    name: @@DISPLAY@@
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+
+      # Relevance decides whether a REQUIRED live gate runs at all, so it must
+      # never be computed by code the pull request supplies: a PR that widens
+      # its own suite patterns could declare itself irrelevant, skip the live
+      # job, and still turn the required check green.
+      #
+      # Everything below reads ONE immutable trusted commit. The base-branch
+      # tip is fetched from the base repository, pinned once to a full object
+      # id, checked to hold the filter as a regular blob, and then read BY
+      # OBJECT ID rather than by path. A fork head, a rewritten head, or a push
+      # to the base branch mid-run therefore cannot swap the script between
+      # validation and execution, and every failure exits non-zero so the gate
+      # fails closed instead of quietly declaring itself irrelevant.
+      #
+      # This block is frozen by .github/scripts/verify_cross_build_policy.py
+      # (see live_suite_relevance_errors); it is byte-identical across every
+      # live-suite workflow apart from the suite, slug, and display name.
+      - name: Check for @@SLUG@@ changes
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          filter_path=.github/scripts/live_suite_path_filter.py
+          changed_files="$RUNNER_TEMP/@@SLUG@@-changed-files.txt"
+          trusted_filter="$RUNNER_TEMP/@@SLUG@@-trusted-filter.py"
+          rm -f -- "$changed_files" "$trusted_filter"
+          : > "$changed_files"
+
+          filter_args=(--suite @@SUITE@@ --changed-files "$changed_files")
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # `github.base_ref` names a branch in the BASE repository, so a fork
+            # cannot control its contents -- but it is still untrusted text.
+            # Reject anything outside a conservative branch charset before it
+            # reaches a refspec so no option, pathspec, or revision-syntax
+            # metacharacter can be smuggled into a git invocation.
+            if ! printf '%s' "$BASE_REF" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$'; then
+              echo "::error::refusing to resolve an unsafe base ref" >&2
+              exit 1
+            fi
+            case "$BASE_REF" in
+              *..*|*//*|*/|*.lock|*/.*)
+                echo "::error::refusing to resolve an unsafe base ref" >&2
+                exit 1
+                ;;
+            esac
+            fetched=false
+            for attempt in 1 2 3; do
+              if git fetch --no-tags --no-recurse-submodules origin \
+                "+refs/heads/${BASE_REF}:refs/ferrum/trusted-base"; then
+                fetched=true
+                break
+              fi
+              echo "git fetch of ${BASE_REF} failed (attempt ${attempt}/3); retrying" >&2
+              sleep $(( attempt * 10 ))
+            done
+            if [ "$fetched" != true ]; then
+              echo "::error::git fetch of ${BASE_REF} failed after 3 attempts" >&2
+              exit 1
+            fi
+            # Pin the moving tip exactly once; nothing below re-resolves a ref.
+            trusted_sha="$(git rev-parse --verify --quiet refs/ferrum/trusted-base^{commit} || true)"
+          else
+            # A push to the default branch and a manual dispatch already run
+            # trusted code, so the checked-out commit IS the trusted base.
+            trusted_sha="$(git rev-parse --verify --quiet 'HEAD^{commit}' || true)"
+            filter_args+=(--force-run)
+          fi
+
+          if ! printf '%s' "$trusted_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::trusted base did not resolve to a full commit id" >&2
+            exit 1
+          fi
+
+          # Reject anything that is not a regular blob at that exact commit: a
+          # symlink (mode 120000) would make a content read emit its target
+          # path, a gitlink (160000) or tree (040000) carries no script at all,
+          # and a missing entry must fail closed rather than fall back to the
+          # pull request's own copy.
+          entry="$(git ls-tree --full-tree "$trusted_sha" -- "$filter_path")"
+          if [ "$(printf '%s\n' "$entry" | grep -c . || true)" != "1" ]; then
+            echo "::error::${filter_path} is not a single tree entry at ${trusted_sha}" >&2
+            exit 1
+          fi
+          entry_mode="$(printf '%s\n' "$entry" | awk '{print $1}')"
+          entry_type="$(printf '%s\n' "$entry" | awk '{print $2}')"
+          entry_object="$(printf '%s\n' "$entry" | awk '{print $3}')"
+          entry_path="$(printf '%s\n' "$entry" | awk -F'\t' '{print $2}')"
+          if [ "$entry_type" != "blob" ] || [ "$entry_path" != "$filter_path" ]; then
+            echo "::error::${filter_path} is not a blob at ${trusted_sha}" >&2
+            exit 1
+          fi
+          case "$entry_mode" in
+            100644|100755) ;;
+            *)
+              echo "::error::${filter_path} has non-regular mode ${entry_mode}" >&2
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$entry_object" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::${filter_path} did not resolve to an object id" >&2
+            exit 1
+          fi
+          if [ "$(git cat-file -s "$entry_object")" -gt 262144 ]; then
+            echo "::error::${filter_path} exceeds the 256 KiB trusted-filter ceiling" >&2
+            exit 1
+          fi
+          git cat-file blob "$entry_object" > "$trusted_filter"
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            git diff --name-only --no-renames "${trusted_sha}...HEAD" \
+              | sort > "$changed_files"
+          fi
+
+          # Isolated interpreter: no user site directory, no PYTHON* overrides,
+          # and no implicit path entry, so nothing the pull request committed
+          # can be imported by the trusted filter.
+          python3 -I "$trusted_filter" --self-test
+          plan="$(python3 -I "$trusted_filter" "${filter_args[@]}")"
+          relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
+          case "$relevant" in
+            true|false) ;;
+            *)
+              echo "::error::trusted relevance filter produced no usable verdict" >&2
+              exit 1
+              ;;
+          esac
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "Relevance decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
+"""
+
+# workflow file -> (relevance job, live job, display name, temp slug, suite).
+LIVE_SUITE_RELEVANCE_CONTRACTS = {
+    "mesh-e2e-sidecar-live.yml": (
+        "changes",
+        "mesh-e2e-sidecar-live",
+        "Mesh e2e sidecar trigger",
+        "mesh-e2e-sidecar",
+        "mesh-e2e-sidecar",
+    ),
+    "multicluster-federation-live.yml": (
+        "changes",
+        "multicluster-federation-live",
+        "Multicluster federation trigger",
+        "multicluster-federation",
+        "mesh-federation",
+    ),
+}
+
+# Freezing the relevance job alone is not sufficient. A pull request that left
+# the frozen block untouched but rewrote the live job's `needs`/`if` would skip
+# the expensive job just as effectively, so the binding from the trusted
+# relevance output to the live job is part of the same contract.
+LIVE_SUITE_JOB_BINDING = {
+    "needs": "    needs: changes\n",
+    "if": "    if: needs.changes.outputs.relevant == 'true'\n",
+}
+
+# ---------------------------------------------------------------------------
+# Admitted fuzz/property lane (issue #2461)
+# ---------------------------------------------------------------------------
+# The trusted policy rejects any new Cross-readable executable surface in
+# `ci.yml` outside the protected ARM64 job, which is why the fuzz lane could
+# not be wired in. Rather than relaxing that rule — which would reopen
+# arbitrary pull-request-authored executable workflow injection — exactly one
+# additional `ci.yml` job is admitted, and only when its text is byte-identical
+# to the contract below. Its surfaces (and only its surfaces) are then withheld
+# from the `ci.yml` surface comparison.
+#
+# Consequences of freezing the whole job rather than a predicate about it:
+#   * every command, action pin, toolchain pin, tool version, target list, and
+#     libFuzzer bound is part of the contract;
+#   * the command surface cannot be redirected at a repository-supplied
+#     automation script; the explicit purpose of the read-only job is still to
+#     compile and execute pull-request-authored Rust tests and fuzz targets;
+#   * a repository that has not adopted the job may omit it, but once the
+#     trusted base carries it a pull request cannot remove it.
+CI_FUZZ_SMOKE_JOB_NAME = "fuzz-smoke"
+CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
+    # Byte-frozen by the trusted Cross build policy
+    # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
+    # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
+    # this is its entire permitted shape. Every command, action pin, toolchain
+    # pin, tool version, target name, and libFuzzer bound below is part of the
+    # contract, so a pull request cannot widen the budget, change the target
+    # list, add a step, or redirect this job at a repository-supplied script.
+    name: Fuzz Smoke
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    # The repository-root Cargo config selects sccache and host linker flags,
+    # but this isolated fuzz job installs neither sccache nor mold. Disable both
+    # Cargo wrapper inputs and inherited rustflags explicitly.
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install required build dependency
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2025-07-01
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-smoke
+
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.1
+
+      - name: Run deterministic property smoke tests
+        working-directory: fuzz
+        run: cargo test --locked
+
+      - name: Run bounded libFuzzer smoke budget
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+
+          for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
+            echo "Fuzz smoke target: ${fuzz_target}"
+            cargo fuzz run "$fuzz_target" -- \
+              -runs=512 \
+              -max_total_time=8 \
+              -max_len=4096 \
+              -timeout=2 \
+              -rss_limit_mb=512
+          done
+"""
+
+# Adopting the byte-frozen job above is only half of the gate: a lane nothing
+# observes is not a gate at all, so the first adoption must also make
+# `fuzz-smoke` a required input of the `test` aggregate. That aggregate is read
+# as Cross-sensitive by the pull-request scan, so its per-job digest surface
+# moves the moment those lines land, and `compare_pr_workflow_job` rejected the
+# complete adoption while accepting the useless half of it.
+#
+# Exactly three lines are admitted, each anchored to the trusted-base line it
+# must immediately follow. Anchoring is what keeps this from becoming a general
+# licence to edit the aggregate: the admission can only *insert* these three
+# byte-exact lines at these three positions, and the digest comparison that
+# follows still sees every other byte of the job. A missing line, a duplicated
+# line, a tampered result expression, a relocated line, or any unrelated
+# aggregate edit leaves a digest difference or raises an error of its own.
+CI_AGGREGATE_JOB_NAME = "test"
+CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS = (
+    (
+        "needs list",
+        "      - lint\n",
+        "      - fuzz-smoke\n",
+    ),
+    (
+        "result summary row",
+        '          add_row "Lint" "${{ needs.lint.result }}"\n',
+        '          add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"\n',
+    ),
+    (
+        "required-gate assertion",
+        '          require_success "Lint" "${{ needs.lint.result }}"\n',
+        '          require_success "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"\n',
+    ),
+)
+
+# The scheduled sanitizer lane is a whole-file contract rather than a job
+# contract: the file's triggers, permissions, and concurrency are as
+# security-relevant as its steps, and freezing the file is the only comparison
+# that cannot be sidestepped by moving a command between them.
+FUZZ_WORKFLOW_FILENAME = "fuzz.yml"
+FUZZ_WORKFLOW = r"""name: Fuzz
+
+# Scheduled/manual sanitizer-backed fuzz lane for issue #2461. This file is
+# byte-frozen by the trusted Cross build policy
+# (.github/scripts/verify_cross_build_policy.py, FUZZ_WORKFLOW): the filename,
+# triggers, permissions, action pins, toolchain and cargo-fuzz versions, target
+# matrix, libFuzzer budgets, and artifact bounds below are the whole contract.
+# A repository that has not adopted this file may omit it. Once the trusted
+# base carries it, a pull request may neither remove it nor change one byte.
+#
+# Deliberate constraints:
+#   * read-only `contents: read` permissions at both workflow and job level,
+#     and no reference to any repository secret anywhere;
+#   * no `pull_request` or `push` trigger, so an untrusted head can never
+#     schedule this lane;
+#   * `workflow_dispatch` takes NO inputs, so there is no caller-chosen target,
+#     tool, command, or time budget;
+#   * the matrix target reaches the shell only through an environment variable
+#     that is re-checked against the literal target list, so no untrusted text
+#     is interpolated into a command;
+#   * every libFuzzer run is bounded in wall time, input length, per-input
+#     timeout, and resident set size;
+#   * crash artifacts are rejected if any path is a symlink or other
+#     non-regular object, then size- and count-bounded BEFORE upload, uploaded
+#     from one fixed path, and expired quickly;
+#   * no Cross toolchain, aarch64 target, unpinned tool install, or release
+#     publication path is reachable from this file.
+
+on:
+  schedule:
+    - cron: '30 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz-sanitized:
+    name: Fuzz sanitizer lane
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    # The repository-root Cargo config selects sccache and host linker flags,
+    # but this isolated fuzz job installs neither sccache nor mold. Disable both
+    # Cargo wrapper inputs and inherited rustflags explicitly.
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+      RUSTFLAGS: ""
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        fuzz_target:
+          - traceparent
+          - config_decode
+          - proxy_protocol
+          - mesh_udp_frame
+          - k8s_crd
+          - plugin_config
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install required build dependency
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2025-07-01
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-sanitized
+
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.1
+
+      - name: Run sanitizer-backed fuzz target
+        working-directory: fuzz
+        env:
+          FUZZ_TARGET: ${{ matrix.fuzz_target }}
+          ASAN_OPTIONS: detect_odr_violation=0:allocator_may_return_null=1
+        run: |
+          set -euo pipefail
+
+          # The matrix is frozen above, so this can only fire if the workflow
+          # itself was tampered with; it costs nothing and keeps the command
+          # line free of any value this shell has not literally approved.
+          case "$FUZZ_TARGET" in
+            traceparent|config_decode|proxy_protocol|mesh_udp_frame|k8s_crd|plugin_config) ;;
+            *)
+              echo "::error::unknown fuzz target" >&2
+              exit 1
+              ;;
+          esac
+
+          mkdir -p "artifacts/$FUZZ_TARGET"
+          cargo fuzz run -s address "$FUZZ_TARGET" -- \
+            -max_total_time=300 \
+            -max_len=65536 \
+            -timeout=5 \
+            -rss_limit_mb=2048 \
+            -artifact_prefix="artifacts/$FUZZ_TARGET/"
+
+      # Bound the crash corpus BEFORE it can be published: an unbounded
+      # artifact path is an exfiltration surface, and a crash input large
+      # enough to carry unrelated process state must be triaged locally.
+      - name: Bound crash artifacts
+        id: bound
+        if: failure()
+        working-directory: fuzz
+        env:
+          FUZZ_TARGET: ${{ matrix.fuzz_target }}
+        run: |
+          set -euo pipefail
+
+          directory="artifacts/$FUZZ_TARGET"
+          if [ ! -d "$directory" ]; then
+            exit 0
+          fi
+          # upload-artifact follows symbolic links by default. Reject the root
+          # path and every descendant unless it is a directory or regular file,
+          # so the fixed upload path cannot escape into unrelated runner state.
+          if [ -L "$directory" ]; then
+            echo "::error::the crash artifact directory must not be a symbolic link" >&2
+            exit 1
+          fi
+          if find "$directory" \( -type l -o \( ! -type d ! -type f \) \) -print -quit | grep -q .; then
+            echo "::error::crash artifacts must contain only directories and regular files" >&2
+            exit 1
+          fi
+          if find "$directory" -type f -size +64k -print -quit | grep -q .; then
+            echo "::error::a crash artifact exceeds 64 KiB; triage and redact it locally" >&2
+            exit 1
+          fi
+          if [ "$(find "$directory" -type f | wc -l | tr -d ' ')" -gt 16 ]; then
+            echo "::error::more than 16 crash artifacts; triage locally before publishing" >&2
+            exit 1
+          fi
+
+      # Publication is gated on the bounding step having SUCCEEDED, not merely
+      # on job failure: a skipped or failed bound must never publish.
+      - name: Upload bounded crash artifacts
+        if: always() && steps.bound.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fuzz-crash-${{ matrix.fuzz_target }}
+          path: fuzz/artifacts/${{ matrix.fuzz_target }}
+          if-no-files-found: ignore
+          retention-days: 7
+"""
+
+# Only the repository-root Cargo configuration is validated by this policy
+# (`validate_cargo_tool_configuration`). A nested `.cargo/config.toml` would be
+# an unreviewed place to set a target linker, runner, or rustflags for any
+# cargo invocation started from that directory — including the admitted fuzz
+# lane, which runs with `working-directory: fuzz`.
+NESTED_CARGO_CONFIG_NAMES = frozenset({"config", "config.toml"})
+
 ATTACK_PAYLOADS = {
     "whitespace": "arm64 amd64",
     "leading option": "--help",
@@ -8485,15 +8989,362 @@ def flow_normalized_workflow_surfaces(
     ]
 
 
-def validate_workflow_collection(
+def live_suite_relevance_job(display: str, slug: str, suite: str) -> str:
+    """Render the frozen trusted-base relevance job for one live suite.
+
+    Substitution is by sentinel rather than by `str.format`, because the block
+    is GitHub Actions YAML and is full of `${{ ... }}` expressions that a format
+    string would misread as replacement fields.
+    """
+
+    return (
+        LIVE_SUITE_RELEVANCE_JOB_TEMPLATE.replace("@@DISPLAY@@", display)
+        .replace("@@SLUG@@", slug)
+        .replace("@@SUITE@@", suite)
+    )
+
+
+def live_suite_relevance_errors(
     workflows: dict[str, str],
     source: str,
 ) -> list[str]:
-    """Reject Cross inputs in every workflow except the two hashed contracts."""
+    """Hold every required live gate to the trusted-base relevance contract.
+
+    This is an ABSOLUTE check in both exact and pull-request mode, not a
+    comparison against the trusted base. A comparison would accept any shape
+    the base already carried, which is exactly the property a bootstrap of this
+    contract has to remove: the accepted shape is the one written here and
+    nothing else. Deleting a governed workflow is rejected too, because a
+    required check that never runs is indistinguishable from a passing one.
+    """
+
+    errors: list[str] = []
+    for name, (
+        relevance_job,
+        live_job,
+        display,
+        slug,
+        suite,
+    ) in sorted(LIVE_SUITE_RELEVANCE_CONTRACTS.items()):
+        contents = workflows.get(name)
+        if contents is None:
+            errors.append(
+                f"{source} is missing {name}; its required live gate must keep "
+                "deciding relevance from the trusted base"
+            )
+            continue
+        located = f"{source}/{name}"
+        block, failures = extract_job_block(
+            contents,
+            located,
+            relevance_job,
+            required=True,
+        )
+        errors.extend(failures)
+        if not failures:
+            assert block is not None
+            if block != live_suite_relevance_job(display, slug, suite):
+                errors.append(
+                    f"{located} job {relevance_job!r} must be exactly the trusted-base "
+                    "relevance contract; a required live gate may not decide its own "
+                    "relevance with pull-request-supplied code"
+                )
+        for field, expected_field in sorted(LIVE_SUITE_JOB_BINDING.items()):
+            actual, field_failures = extract_job_field_block(
+                contents,
+                located,
+                live_job,
+                field,
+                required=True,
+            )
+            errors.extend(field_failures)
+            if field_failures:
+                continue
+            if actual != expected_field:
+                errors.append(
+                    f"{located} job {live_job!r} must keep {field!r} bound to the "
+                    "trusted relevance output; rewriting it skips the live job just "
+                    "as effectively as tampering with the relevance decision"
+                )
+    return errors
+
+
+def admitted_fuzz_smoke_errors(contents: str, source: str) -> list[str]:
+    """Reject any `fuzz-smoke` job that is not the byte-frozen contract.
+
+    Absence is allowed: the fuzz lane is opt-in, and a repository that has not
+    adopted it must still validate. Presence is allowed only at exactly the
+    admitted text, so the admission can never be widened into a general licence
+    to add executable jobs to `ci.yml`.
+    """
+
+    block, failures = extract_job_block(
+        contents,
+        source,
+        CI_FUZZ_SMOKE_JOB_NAME,
+        required=False,
+    )
+    if failures:
+        return failures
+    if block is None or block == CI_FUZZ_SMOKE_JOB:
+        return []
+    return [
+        f"{source} job {CI_FUZZ_SMOKE_JOB_NAME!r} must be byte-identical to the "
+        "admitted fuzz-smoke contract in the trusted policy, or be absent"
+    ]
+
+
+def admitted_ci_job_names(contents: str, source: str) -> frozenset[str]:
+    """Return the admitted jobs this workflow carries verbatim.
+
+    Only a job whose text equals its contract is admitted, so a tampered job
+    keeps every surface it produced and is rejected by the surface comparison
+    in addition to `admitted_fuzz_smoke_errors`.
+    """
+
+    block, failures = extract_job_block(
+        contents,
+        source,
+        CI_FUZZ_SMOKE_JOB_NAME,
+        required=False,
+    )
+    if failures or block is None or block != CI_FUZZ_SMOKE_JOB:
+        return frozenset()
+    return frozenset({CI_FUZZ_SMOKE_JOB_NAME})
+
+
+def admitted_fuzz_smoke_removal_errors(
+    merge_base_contents: str,
+    proposed_contents: str,
+    source: str,
+) -> list[str]:
+    """Keep the admitted smoke gate once the trusted base has adopted it."""
+
+    baseline = admitted_ci_job_names(merge_base_contents, f"merge-base {source}")
+    proposed = admitted_ci_job_names(proposed_contents, f"proposed {source}")
+    if CI_FUZZ_SMOKE_JOB_NAME in baseline and CI_FUZZ_SMOKE_JOB_NAME not in proposed:
+        return [
+            f"{source} cannot remove or alter the admitted "
+            f"{CI_FUZZ_SMOKE_JOB_NAME!r} job after the trusted base adopts it"
+        ]
+    return []
+
+
+def without_admitted_job_surfaces(
+    surfaces: tuple[str, ...],
+    admitted: frozenset[str],
+) -> tuple[str, ...]:
+    """Drop the `job:<name>:<digest>` surfaces of admitted verbatim jobs.
+
+    Only per-job surfaces are withheld. A top-level surface, a remote-action
+    surface attributed outside a job, and every other job's surfaces are
+    untouched, so the admission cannot launder a Cross input that lives
+    anywhere but inside the frozen text.
+    """
+
+    if not admitted:
+        return surfaces
+    prefixes = tuple(f"job:{name}:" for name in sorted(admitted))
+    return tuple(
+        surface
+        for surface in surfaces
+        if not surface.startswith(prefixes)
+    )
+
+
+class FuzzAggregateWiring(NamedTuple):
+    """How one revision of `ci.yml` wires the admitted fuzz gate.
+
+    `state` is `"absent"` when the aggregate carries none of the admitted
+    references, `"present"` when it carries exactly all three at their anchored
+    positions, and `"invalid"` for anything between. `contents` is the workflow
+    with the admitted lines withheld, and is the *unmodified* input for every
+    state but `"present"`, so a partial or tampered wiring keeps the digest
+    difference it produced.
+    """
+
+    state: str
+    contents: str
+    errors: list[str]
+
+
+def ci_fuzz_smoke_aggregate_wiring(contents: str, source: str) -> FuzzAggregateWiring:
+    """Classify, and withhold, the admitted fuzz wiring in the `test` aggregate.
+
+    Absence is allowed for the same reason the job itself may be absent: the
+    lane is opt-in. Presence is allowed only as the three byte-exact lines in
+    `CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`, each immediately after its anchor, and
+    only when the `fuzz-smoke` job it requires is itself present and
+    byte-identical to the frozen contract. Nothing else about the aggregate is
+    exempted: the caller still compares the withheld rendering byte for byte
+    against the trusted base, so any other edit to the job is still rejected.
+    """
+
+    block, failures = extract_job_block(
+        contents,
+        source,
+        CI_AGGREGATE_JOB_NAME,
+        required=False,
+    )
+    if failures:
+        return FuzzAggregateWiring("invalid", contents, failures)
+    has_admitted_job = CI_FUZZ_SMOKE_JOB_NAME in admitted_ci_job_names(
+        contents, source
+    )
+    has_wiring = block is not None and any(
+        added in block for _, _, added in CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS
+    )
+    if not has_wiring and has_admitted_job:
+        return FuzzAggregateWiring(
+            "invalid",
+            contents,
+            [
+                f"{source} carries the admitted {CI_FUZZ_SMOKE_JOB_NAME!r} job, "
+                f"so the {CI_AGGREGATE_JOB_NAME!r} aggregate must carry all of "
+                "its admitted required-gate wiring"
+            ],
+        )
+    if not has_wiring:
+        return FuzzAggregateWiring("absent", contents, [])
+
+    errors: list[str] = []
+    withheld = block
+    for label, anchor, added in CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS:
+        occurrences = withheld.count(added)
+        if occurrences != 1:
+            errors.append(
+                f"{source} job {CI_AGGREGATE_JOB_NAME!r} must carry the admitted "
+                f"{CI_FUZZ_SMOKE_JOB_NAME!r} {label} exactly once "
+                f"({added.strip()!r} appears {occurrences} times)"
+            )
+            continue
+        if withheld.count(anchor + added) != 1:
+            errors.append(
+                f"{source} job {CI_AGGREGATE_JOB_NAME!r} must place the admitted "
+                f"{CI_FUZZ_SMOKE_JOB_NAME!r} {label} immediately after "
+                f"{anchor.strip()!r}"
+            )
+            continue
+        withheld = withheld.replace(anchor + added, anchor, 1)
+    if not has_admitted_job:
+        errors.append(
+            f"{source} job {CI_AGGREGATE_JOB_NAME!r} requires the "
+            f"{CI_FUZZ_SMOKE_JOB_NAME!r} gate, so that job must be present and "
+            "byte-identical to the admitted fuzz-smoke contract"
+        )
+    if errors:
+        return FuzzAggregateWiring("invalid", contents, errors)
+
+    start = contents.find(block)
+    if start < 0:
+        return FuzzAggregateWiring(
+            "invalid",
+            contents,
+            [f"{source} job {CI_AGGREGATE_JOB_NAME!r} cannot be isolated"],
+        )
+    return FuzzAggregateWiring(
+        "present",
+        contents[:start] + withheld + contents[start + len(block) :],
+        [],
+    )
+
+
+def ci_fuzz_smoke_aggregate_removal_errors(
+    baseline_state: str,
+    proposed_state: str,
+    source: str,
+) -> list[str]:
+    """Keep the admitted aggregate wiring once the trusted base has adopted it.
+
+    Withholding the three lines from both sides is symmetric, so a pull request
+    that simply deletes them would compare equal. This is the check that makes
+    the admission one-way.
+    """
+
+    if baseline_state == "present" and proposed_state != "present":
+        return [
+            f"{source} cannot remove or alter the admitted "
+            f"{CI_FUZZ_SMOKE_JOB_NAME!r} wiring in the "
+            f"{CI_AGGREGATE_JOB_NAME!r} aggregate after the trusted base adopts it"
+        ]
+    return []
+
+
+def frozen_fuzz_workflow_errors(contents: str, source: str) -> list[str]:
+    """Require `fuzz.yml`, when present, to be the frozen scheduled lane.
+
+    Whole-file equality is the contract: the triggers, permissions, and
+    concurrency of a scheduled sanitizer lane are as security-relevant as its
+    steps, and a per-job comparison could be sidestepped by moving a command
+    between them.
+    """
+
+    if contents == FUZZ_WORKFLOW:
+        return []
+    return [
+        f"{source} must be byte-identical to the admitted scheduled fuzz-lane "
+        "contract in the trusted policy, or be absent"
+    ]
+
+
+def validate_nested_cargo_configuration_tree(
+    tree_paths: tuple[str, ...],
+    label: str,
+) -> list[str]:
+    """Reject a committed `.cargo/config[.toml]` below the repository root.
+
+    `validate_cargo_tool_configuration` reviews exactly one Cargo configuration
+    file. A nested one is loaded by any cargo invocation started from its
+    directory — including the admitted fuzz lane, which runs with
+    `working-directory: fuzz` — and could set a target linker, runner, or
+    rustflags that nothing in this policy reads.
+    """
+
+    offenders = sorted(
+        path
+        for path in tree_paths
+        if (parts := PurePosixPath(path).parts)
+        and len(parts) > 2
+        and parts[-2] == ".cargo"
+        and parts[-1] in NESTED_CARGO_CONFIG_NAMES
+    )
+    return [
+        f"{label} commits {path!r}; only the repository-root Cargo "
+        "configuration is validated, so a nested one could set an unreviewed "
+        "target linker, runner, or rustflags"
+        for path in offenders
+    ]
+
+
+def scan_workflow_collection_cross_surfaces(
+    workflows: dict[str, str],
+    source: str,
+) -> list[str]:
+    """Reject Cross inputs in every workflow except the two hashed contracts.
+
+    This is the Cross-detection half of `validate_workflow_collection` and
+    nothing else: it says whether the workflows it is handed carry a Cross
+    executable or configuration input, not whether they are a complete
+    repository workflow collection. It exists so a scanner fixture can be one
+    synthetic workflow — the isolated shape every Cross-detection self-test
+    needs — without the completeness contract firing on the two governed live
+    workflows the fixture was never meant to contain. Production validation
+    goes through `validate_workflow_collection`, which is the only caller that
+    sees a real collection and which always enforces both halves; there is no
+    repository input, argument, or environment variable that reaches this
+    weaker entry point.
+    """
 
     errors: list[str] = []
     for name, contents in sorted(workflows.items()):
         if name in PROTECTED_WORKFLOW_FILENAMES:
+            continue
+        if name == FUZZ_WORKFLOW_FILENAME:
+            # Byte equality with a contract embedded in the trusted verifier is
+            # a stronger statement than the heuristic scan, so the frozen file
+            # is accepted on that basis alone and any other content is refused
+            # outright rather than scanned.
+            errors.extend(frozen_fuzz_workflow_errors(contents, f"{source}/{name}"))
             continue
         surface_reasons: dict[str, str] = {}
         # Exact validation runs with opaque *executable* checks off, but an
@@ -8542,12 +9393,37 @@ def validate_workflow_collection(
     return errors
 
 
-def compare_pr_workflow_collection(
+def validate_workflow_collection(
+    workflows: dict[str, str],
+    source: str,
+) -> list[str]:
+    """Validate a complete workflow collection: relevance contract plus Cross.
+
+    Both halves are mandatory here and neither is selectable. A workflow
+    directory that omits a governed live gate is rejected before its Cross
+    surfaces are even considered, because a required check that never runs is
+    indistinguishable from a passing one.
+    """
+
+    return [
+        *live_suite_relevance_errors(workflows, source),
+        *scan_workflow_collection_cross_surfaces(workflows, source),
+    ]
+
+
+def scan_pr_workflow_collection_cross_surfaces(
     merge_base_workflows: dict[str, str],
     proposed_workflows: dict[str, str],
     source: str,
 ) -> list[str]:
-    """Permit safe workflow edits while rejecting new or changed Cross inputs."""
+    """Permit safe workflow edits while rejecting new or changed Cross inputs.
+
+    The comparison half of `compare_pr_workflow_collection`, split for the same
+    reason `scan_workflow_collection_cross_surfaces` is: an isolated two-file
+    before/after fixture must be able to prove that a hostile edit changes the
+    Cross surface without also being asked to be a whole repository. The
+    production pull-request path calls `compare_pr_workflow_collection`.
+    """
 
     errors: list[str] = []
     names = sorted(
@@ -8557,6 +9433,32 @@ def compare_pr_workflow_collection(
     for name in names:
         baseline_contents = merge_base_workflows.get(name, "")
         proposed_contents = proposed_workflows.get(name, "")
+        if name == FUZZ_WORKFLOW_FILENAME:
+            # Adding the frozen file is allowed before adoption. Once the
+            # trusted base carries it, deletion is refused; anything other than
+            # the frozen content is always refused. A non-conforming file
+            # already present on the trusted base is reported too, so the
+            # contract cannot be inherited around.
+            if name in proposed_workflows:
+                errors.extend(
+                    frozen_fuzz_workflow_errors(
+                        proposed_contents,
+                        f"proposed {source}/{name}",
+                    )
+                )
+            if name in merge_base_workflows:
+                errors.extend(
+                    frozen_fuzz_workflow_errors(
+                        baseline_contents,
+                        f"merge-base {source}/{name}",
+                    )
+                )
+                if name not in proposed_workflows:
+                    errors.append(
+                        f"proposed {source}/{name} cannot remove the scheduled "
+                        "fuzz lane after the trusted base adopts it"
+                    )
+            continue
         baseline_surfaces, baseline_failures = generic_workflow_cross_surfaces(
             baseline_contents,
             f"merge-base {source}/{name}",
@@ -8590,6 +9492,28 @@ def compare_pr_workflow_collection(
                     "configuration surfaces"
                 )
     return errors
+
+
+def compare_pr_workflow_collection(
+    merge_base_workflows: dict[str, str],
+    proposed_workflows: dict[str, str],
+    source: str,
+) -> list[str]:
+    """Compare a complete proposed collection: relevance contract plus Cross.
+
+    The relevance half is absolute, not comparative: the trusted-base relevance
+    contract is what a required live gate must look like after the pull
+    request, regardless of what the base happened to carry.
+    """
+
+    return [
+        *live_suite_relevance_errors(proposed_workflows, f"proposed {source}"),
+        *scan_pr_workflow_collection_cross_surfaces(
+            merge_base_workflows,
+            proposed_workflows,
+            source,
+        ),
+    ]
 
 
 def generic_action_cross_surfaces(
@@ -12660,6 +13584,12 @@ def validate_workflow_contract(
         )
         surface_reasons.update(flow_reasons)
         surfaces = tuple(dict.fromkeys([*surfaces, *flow_surfaces]))
+    if source == "CI workflow":
+        errors.extend(admitted_fuzz_smoke_errors(contents, source))
+        surfaces = without_admitted_job_surfaces(
+            surfaces,
+            admitted_ci_job_names(contents, source),
+        )
     if surfaces:
         # Name what was matched: a bare rejection leaves the author to
         # rediscover which job and which line the scan read.
@@ -12798,18 +13728,67 @@ def compare_pr_workflow_job(
                 "because it schedules the protected ARM64 invocation"
             )
 
+    # The `test` aggregate is Cross-sensitive to the pull-request scan, so its
+    # digest surface moves when the mandatory `fuzz-smoke` gate wiring lands.
+    # Only the three anchored, byte-exact admitted lines are withheld, and they
+    # are withheld from both sides, so the digest comparison below still reads
+    # every other byte of the aggregate on both revisions.
+    baseline_wiring = FuzzAggregateWiring("absent", merge_base_contents, [])
+    proposed_wiring = FuzzAggregateWiring("absent", proposed_contents, [])
+    if source == "CI workflow":
+        baseline_wiring = ci_fuzz_smoke_aggregate_wiring(
+            merge_base_contents,
+            f"merge-base {source}",
+        )
+        proposed_wiring = ci_fuzz_smoke_aggregate_wiring(
+            proposed_contents,
+            f"proposed {source}",
+        )
+        errors.extend(baseline_wiring.errors)
+        errors.extend(proposed_wiring.errors)
+        errors.extend(
+            ci_fuzz_smoke_aggregate_removal_errors(
+                baseline_wiring.state,
+                proposed_wiring.state,
+                source,
+            )
+        )
+
     baseline_surfaces, baseline_surface_failures = pr_workflow_job_surfaces(
-        merge_base_contents,
+        baseline_wiring.contents,
         f"merge-base {source}",
         job_name,
     )
     proposed_surfaces, proposed_surface_failures = pr_workflow_job_surfaces(
-        proposed_contents,
+        proposed_wiring.contents,
         f"proposed {source}",
         job_name,
     )
     errors.extend(baseline_surface_failures)
     errors.extend(proposed_surface_failures)
+    if source == "CI workflow":
+        # The admitted fuzz-smoke job is the ONE executable surface a pull
+        # request may add to `ci.yml` outside the protected ARM64 job, and only
+        # by reproducing the frozen contract byte for byte. Its surfaces are
+        # withheld from both sides of the comparison; every other job's are not.
+        errors.extend(
+            admitted_fuzz_smoke_errors(proposed_contents, f"proposed {source}")
+        )
+        errors.extend(
+            admitted_fuzz_smoke_removal_errors(
+                merge_base_contents,
+                proposed_contents,
+                source,
+            )
+        )
+        baseline_surfaces = without_admitted_job_surfaces(
+            baseline_surfaces,
+            admitted_ci_job_names(merge_base_contents, f"merge-base {source}"),
+        )
+        proposed_surfaces = without_admitted_job_surfaces(
+            proposed_surfaces,
+            admitted_ci_job_names(proposed_contents, f"proposed {source}"),
+        )
     if not baseline_surface_failures and not proposed_surface_failures:
         if baseline_surfaces != proposed_surfaces:
             errors.append(
@@ -13835,7 +14814,7 @@ pre_build = []
         "      - run: echo safe\n"
     )
     benign_extra_edit = safe_extra_workflow.replace("echo safe", "echo still-safe")
-    if validate_workflow_collection(
+    if scan_workflow_collection_cross_surfaces(
         {"coverage.yml": safe_extra_workflow},
         "self-test workflow directory",
     ):
@@ -13845,7 +14824,7 @@ pre_build = []
         'echo "packaging $(grep -c x files) files '
         '($(grep -c y files) profraw)"',
     )
-    if validate_workflow_collection(
+    if scan_workflow_collection_cross_surfaces(
         {"coverage.yml": benign_embedded_substitutions},
         "self-test workflow directory",
     ):
@@ -13855,7 +14834,7 @@ pre_build = []
         "cmd=$(printf '\\143\\162\\157\\163\\163')\n"
         '          echo $("${cmd}" build --target aarch64-unknown-linux-gnu)',
     )
-    if not compare_pr_workflow_collection(
+    if not scan_pr_workflow_collection_cross_surfaces(
         {"coverage.yml": safe_extra_workflow},
         {
             "coverage.yml": safe_extra_workflow,
@@ -13864,7 +14843,7 @@ pre_build = []
         "self-test workflow directory",
     ):
         failures.append("opaque Cross executable in command substitution was not rejected")
-    if compare_pr_workflow_collection(
+    if scan_pr_workflow_collection_cross_surfaces(
         {"coverage.yml": safe_extra_workflow},
         {
             "coverage.yml": benign_extra_edit,
@@ -13878,7 +14857,7 @@ pre_build = []
         "echo safe",
         "cross build --target aarch64-unknown-linux-gnu",
     )
-    if not compare_pr_workflow_collection(
+    if not scan_pr_workflow_collection_cross_surfaces(
         {"coverage.yml": safe_extra_workflow},
         {"coverage.yml": safe_extra_workflow, "attacker.yml": added_cross_workflow},
         "self-test workflow directory",
@@ -13933,12 +14912,12 @@ pre_build = []
     }
     for label, command in inline_interpreter_bypasses.items():
         proposed = safe_extra_workflow.replace("echo safe", command)
-        if not validate_workflow_collection(
+        if not scan_workflow_collection_cross_surfaces(
             {"attacker.yml": proposed},
             "self-test workflow directory",
         ):
             failures.append(f"{label} was not rejected")
-        if not compare_pr_workflow_collection(
+        if not scan_pr_workflow_collection_cross_surfaces(
             {"coverage.yml": safe_extra_workflow},
             {"coverage.yml": proposed},
             "self-test workflow directory",
@@ -13958,7 +14937,7 @@ pre_build = []
     }
     for label, command in inline_interpreter_fail_closed.items():
         proposed = safe_extra_workflow.replace("echo safe", command)
-        if not compare_pr_workflow_collection(
+        if not scan_pr_workflow_collection_cross_surfaces(
             {"coverage.yml": safe_extra_workflow},
             {"coverage.yml": proposed},
             "self-test workflow directory",
@@ -13975,12 +14954,12 @@ pre_build = []
     }
     for label, command in benign_inline_interpreters.items():
         proposed = safe_extra_workflow.replace("echo safe", command)
-        if validate_workflow_collection(
+        if scan_workflow_collection_cross_surfaces(
             {"coverage.yml": proposed},
             "self-test workflow directory",
         ):
             failures.append(f"{label} was rejected")
-        if compare_pr_workflow_collection(
+        if scan_pr_workflow_collection_cross_surfaces(
             {"coverage.yml": proposed},
             {"coverage.yml": proposed.replace("name: Coverage", "name: Coverage 2")},
             "self-test workflow directory",
@@ -14020,12 +14999,12 @@ pre_build = []
     }
     for label, command in word_splitting_bypasses.items():
         proposed = safe_extra_workflow.replace("echo safe", command)
-        if not validate_workflow_collection(
+        if not scan_workflow_collection_cross_surfaces(
             {"attacker.yml": proposed},
             "self-test workflow directory",
         ):
             failures.append(f"{label} was not rejected")
-        if not compare_pr_workflow_collection(
+        if not scan_pr_workflow_collection_cross_surfaces(
             {"coverage.yml": safe_extra_workflow},
             {"coverage.yml": proposed},
             "self-test workflow directory",
@@ -14036,7 +15015,7 @@ pre_build = []
         "echo safe",
         'echo "cargo${SUFFIX} finished for ${MATRIX} targets"',
     )
-    if validate_workflow_collection(
+    if scan_workflow_collection_cross_surfaces(
         {"coverage.yml": benign_expansion_workflow},
         "self-test workflow directory",
     ):
@@ -14080,12 +15059,12 @@ pre_build = []
     }
     for label, command in shim_bypasses.items():
         proposed = safe_extra_workflow.replace("echo safe", command)
-        if not validate_workflow_collection(
+        if not scan_workflow_collection_cross_surfaces(
             {"attacker.yml": proposed},
             "self-test workflow directory",
         ):
             failures.append(f"{label} was not rejected")
-        if not compare_pr_workflow_collection(
+        if not scan_pr_workflow_collection_cross_surfaces(
             {"coverage.yml": safe_extra_workflow},
             {"coverage.yml": proposed},
             "self-test workflow directory",
@@ -14099,7 +15078,7 @@ pre_build = []
     }
     for label, command in benign_shim_lookalikes.items():
         proposed = safe_extra_workflow.replace("echo safe", command)
-        if validate_workflow_collection(
+        if scan_workflow_collection_cross_surfaces(
             {"coverage.yml": proposed},
             "self-test workflow directory",
         ):
@@ -14140,12 +15119,12 @@ pre_build = []
         ),
     }
     for label, proposed in remote_action_bypasses.items():
-        if not validate_workflow_collection(
+        if not scan_workflow_collection_cross_surfaces(
             {"attacker.yml": proposed},
             "self-test workflow directory",
         ):
             failures.append(f"{label} was not rejected")
-        if not compare_pr_workflow_collection(
+        if not scan_pr_workflow_collection_cross_surfaces(
             {"coverage.yml": safe_extra_workflow},
             {"coverage.yml": proposed},
             "self-test workflow directory",
@@ -14164,12 +15143,12 @@ pre_build = []
         "          name: report\n"
         "          path: results/\n",
     )
-    if validate_workflow_collection(
+    if scan_workflow_collection_cross_surfaces(
         {"coverage.yml": benign_remote_action_workflow},
         "self-test workflow directory",
     ):
         failures.append("benign pinned remote actions were rejected")
-    if compare_pr_workflow_collection(
+    if scan_pr_workflow_collection_cross_surfaces(
         {"coverage.yml": safe_extra_workflow},
         {"coverage.yml": benign_remote_action_workflow},
         "self-test workflow directory",
@@ -14198,7 +15177,7 @@ pre_build = []
         + "  duplicate:\n"
         + "    runs-on: ubuntu-latest\n"
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"malformed.yml": malformed_cross_workflow},
         "self-test workflow directory",
     ):
@@ -14533,7 +15512,7 @@ pre_build = []
         "          subprocess.run(['cross', 'build', '--target', "
         "'aarch64-unknown-linux-gnu'])\n",
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"python-shell.yml": python_shell_cross},
         "self-test workflow directory",
     ):
@@ -14553,7 +15532,7 @@ pre_build = []
         "          subprocess.run(['cross', 'build', '--target', "
         "'aarch64-unknown-linux-gnu'])\n"
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"default-python-shell.yml": default_python_shell_cross},
         "self-test workflow directory",
     ):
@@ -14568,7 +15547,7 @@ pre_build = []
         "'aarch64-unknown-linux-gnu'])\n"
         "          PY",
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"python-heredoc.yml": python_heredoc_cross},
         "self-test workflow directory",
     ):
@@ -15058,7 +16037,7 @@ pre_build = []
         "bash scripts/safe.sh",
         "bash -c \"$(printf '\\143\\162\\157\\163\\163 build')\"",
     )
-    if not compare_pr_workflow_collection(
+    if not scan_pr_workflow_collection_cross_surfaces(
         {"safe.yml": referenced_workflow},
         {"safe.yml": generated_shell_workflow},
         "self-test automation directory",
@@ -18488,7 +19467,7 @@ pre_build = []
         "          cross\n"
         f"          {arm_target}\n"
     )
-    if not compare_pr_workflow_collection(
+    if not scan_pr_workflow_collection_cross_surfaces(
         {"safe.yml": referenced_workflow},
         {"safe.yml": folded_workflow},
         "self-test automation directory",
@@ -18649,7 +19628,7 @@ pre_build = []
         "echo safe",
         "echo 'cargo install cross locally' # cross documentation",
     )
-    if validate_workflow_collection(
+    if scan_workflow_collection_cross_surfaces(
         {"prose.yml": benign_cross_prose_workflow},
         "self-test workflow directory",
     ):
@@ -18658,12 +19637,12 @@ pre_build = []
         "echo safe",
         'echo "cargo install cross locally"',
     ) + "# cross; cross build is documentation only\n"
-    if validate_workflow_collection(
+    if scan_workflow_collection_cross_surfaces(
         {"double-prose.yml": double_quoted_cross_prose},
         "self-test workflow directory",
     ):
         failures.append("double-quoted/commented workflow Cross prose was rejected")
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"hostile.yml": added_cross_workflow},
         "self-test workflow directory",
     ):
@@ -18672,7 +19651,7 @@ pre_build = []
         "    steps:\n",
         "    env:\n      CROSS_CONFIG: attacker.toml\n    steps:\n",
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"environment.yml": cross_environment_workflow},
         "self-test workflow directory",
     ):
@@ -18777,7 +19756,7 @@ pre_build = []
         "    steps:\n"
         f"      - run: {opaque_stdin_run}\n"
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"opaque_stdin.yml": opaque_stdin_workflow},
         "self-test workflow directory",
     ):
@@ -18861,7 +19840,7 @@ pre_build = []
         "python3 -c \"print('safe')\"",
         1,
     )
-    if not compare_pr_workflow_collection(
+    if not scan_pr_workflow_collection_cross_surfaces(
         {"inline-python.yml": benign_inline_python_workflow},
         {"inline-python.yml": opaque_inline_python_workflow},
         "self-test inline Python workflow",
@@ -18883,7 +19862,7 @@ pre_build = []
             "printf '%s\\n' 'echo safe' 'echo built' | bash",
         ),
     ):
-        benign_workflow_errors = validate_workflow_collection(
+        benign_workflow_errors = scan_workflow_collection_cross_surfaces(
             {
                 "benign_stdin.yml": opaque_stdin_workflow.replace(
                     opaque_stdin_run,
@@ -18954,7 +19933,7 @@ pre_build = []
         f"          $cmd build --target {TARGET}\n"
         "          TEMPLATE\n"
     )
-    if validate_workflow_collection(
+    if scan_workflow_collection_cross_surfaces(
         {"template.yml": template_workflow},
         "self-test workflow directory",
     ):
@@ -18962,7 +19941,7 @@ pre_build = []
             "a job that only writes a quoted heredoc template was reported as "
             "Cross-sensitive"
         )
-    if compare_pr_workflow_collection(
+    if scan_pr_workflow_collection_cross_surfaces(
         {"template.yml": template_workflow},
         {"template.yml": template_workflow.replace("render.sh", "rendered.sh", 1)},
         "self-test workflow directory",
@@ -18979,7 +19958,7 @@ pre_build = []
         "bash <<'TEMPLATE'",
         1,
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"executable_template.yml": executable_template_workflow},
         "self-test workflow directory",
     ):
@@ -18998,7 +19977,7 @@ pre_build = []
         f"          key: $($cmd build --target {TARGET})\n"
         "          TEMPLATE\n"
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"unquoted_template.yml": unquoted_template_workflow},
         "self-test workflow directory",
     ):
@@ -19449,14 +20428,14 @@ pre_build = []
         "./scripts/build",
         'eval "$(./scripts/build)"',
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"generated.yml": extensionless_eval_workflow},
         "self-test workflow directory",
     ):
         failures.append(
             "dynamic evaluation of extensionless Python output was accepted"
         )
-    if not compare_pr_workflow_collection(
+    if not scan_pr_workflow_collection_cross_surfaces(
         {"generated.yml": extensionless_workflow},
         {"generated.yml": extensionless_eval_workflow},
         "self-test workflow directory",
@@ -21100,6 +22079,815 @@ pre_build = []
     ):
         failures.append("a flow expression value was cut short by normalization")
 
+    # ------------------------------------------------------------------
+    # Trusted-base relevance contract for the required live-datapath gates
+    # ------------------------------------------------------------------
+    rendered_relevance = live_suite_relevance_job("Display", "slug", "suite")
+    for sentinel in ("@@DISPLAY@@", "@@SLUG@@", "@@SUITE@@"):
+        if sentinel in rendered_relevance:
+            failures.append(
+                f"{sentinel} survived trusted-base relevance contract rendering"
+            )
+    if live_suite_relevance_job("Display", "slug", "suite") == (
+        live_suite_relevance_job("Display", "slug", "other")
+    ):
+        failures.append("the trusted-base relevance contract ignores its suite")
+    if live_suite_relevance_job("Display", "slug", "suite") == (
+        live_suite_relevance_job("Display", "other", "suite")
+    ):
+        failures.append("the trusted-base relevance contract ignores its slug")
+    # Two governed suites sharing a temp-file slug would race on one runner.
+    relevance_slugs = [
+        contract[3] for contract in LIVE_SUITE_RELEVANCE_CONTRACTS.values()
+    ]
+    if len(relevance_slugs) != len(set(relevance_slugs)):
+        failures.append("two governed live suites share a trusted-filter slug")
+    # Each of these is a distinct fail-closed property of the contract. Losing
+    # any one of them silently restores the fail-open relevance decision.
+    for required_token in (
+        'git ls-tree --full-tree "$trusted_sha" -- "$filter_path"',
+        'git cat-file blob "$entry_object" > "$trusted_filter"',
+        "^[0-9a-f]{40}$",
+        "100644|100755",
+        'python3 -I "$trusted_filter" --self-test',
+        "+refs/heads/${BASE_REF}:refs/ferrum/trusted-base",
+        "^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$",
+        "            true|false) ;;",
+    ):
+        if required_token not in rendered_relevance:
+            failures.append(
+                "the trusted-base relevance contract no longer contains "
+                f"{required_token!r}"
+            )
+    if ".github/scripts/live_suite_path_filter.py --self-test" in rendered_relevance:
+        failures.append(
+            "the trusted-base relevance contract executes the pull request's own filter"
+        )
+
+    def relevance_workflow(display: str, live_job: str, body: str) -> str:
+        return (
+            "name: Self-test live suite\n"
+            "on:\n"
+            "  pull_request:\n"
+            "permissions:\n"
+            "  contents: read\n"
+            "jobs:\n"
+            + body
+            + "\n"
+            + f"  {live_job}:\n"
+            + f"    name: {display} live\n"
+            + "    needs: changes\n"
+            + "    if: needs.changes.outputs.relevant == 'true'\n"
+            + "    runs-on: ubuntu-latest\n"
+            + "    steps:\n"
+            + "      - run: echo live\n"
+        )
+
+    relevance_workflows = {
+        contract_name: relevance_workflow(
+            contract[2],
+            contract[1],
+            live_suite_relevance_job(contract[2], contract[3], contract[4]),
+        )
+        for contract_name, contract in LIVE_SUITE_RELEVANCE_CONTRACTS.items()
+    }
+    if live_suite_relevance_errors(relevance_workflows, "self-test workflows"):
+        failures.append("the trusted-base relevance contract was rejected")
+
+    relevance_mutations: dict[str, tuple[str, str]] = {
+        "pull-request-supplied filter": (
+            'python3 -I "$trusted_filter" --self-test',
+            "python3 .github/scripts/live_suite_path_filter.py --self-test",
+        ),
+        "re-resolved base ref": (
+            'git cat-file blob "$entry_object" > "$trusted_filter"',
+            'git show "origin/${BASE_REF}:$filter_path" > "$trusted_filter"',
+        ),
+        "dropped blob mode check": (
+            "            100644|100755) ;;\n",
+            "            *) ;;\n",
+        ),
+        "unvalidated base ref": (
+            "^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$",
+            ".*",
+        ),
+        "fail-open relevance verdict": (
+            "            true|false) ;;\n",
+            "            *) ;;\n",
+        ),
+        "unpinned trusted checkout": (
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6",
+            "actions/checkout@v6",
+        ),
+        "widened relevance-job permissions": (
+            "    permissions:\n      contents: read\n",
+            "    permissions:\n      contents: write\n",
+        ),
+    }
+    for mutation_name, (original, replacement) in relevance_mutations.items():
+        mutated = {
+            key: value.replace(original, replacement)
+            for key, value in relevance_workflows.items()
+        }
+        if mutated == relevance_workflows:
+            failures.append(
+                f"the {mutation_name} relevance self-test mutation is stale"
+            )
+            continue
+        if not live_suite_relevance_errors(mutated, "self-test workflows"):
+            failures.append(f"a {mutation_name} relevance job was not rejected")
+
+    severed_binding = {
+        key: value.replace(
+            "    if: needs.changes.outputs.relevant == 'true'\n",
+            "    if: false\n",
+        )
+        for key, value in relevance_workflows.items()
+    }
+    if not live_suite_relevance_errors(severed_binding, "self-test workflows"):
+        failures.append("a severed live-job relevance binding was not rejected")
+    unbound_needs = {
+        key: value.replace("    needs: changes\n", "    needs: []\n")
+        for key, value in relevance_workflows.items()
+    }
+    if not live_suite_relevance_errors(unbound_needs, "self-test workflows"):
+        failures.append("an unbound live job was not rejected")
+    if not live_suite_relevance_errors({}, "self-test workflows"):
+        failures.append("a deleted required live-gate workflow was not rejected")
+    renamed_relevance = {
+        key: value.replace("  changes:\n", "  relevance:\n", 1)
+        for key, value in relevance_workflows.items()
+    }
+    if not live_suite_relevance_errors(renamed_relevance, "self-test workflows"):
+        failures.append("a renamed relevance job was not rejected")
+
+    # The relevance contract has to be enforced by the *collection* entry
+    # points, not only by `live_suite_relevance_errors` in isolation. The
+    # Cross-detection halves are separately reachable so a scanner fixture can
+    # be one synthetic workflow, and the whole risk of that split is that the
+    # production wrappers quietly stop carrying the contract. Each check below
+    # is written as a difference between the two APIs on the same input, so it
+    # fails if either half is dropped from a wrapper.
+    relevance_selftest_source = "self-test workflow collection"
+    isolated_fixture = {"coverage.yml": safe_extra_workflow}
+    if scan_workflow_collection_cross_surfaces(
+        isolated_fixture,
+        relevance_selftest_source,
+    ):
+        failures.append("an isolated benign scanner fixture was rejected")
+    if scan_pr_workflow_collection_cross_surfaces(
+        isolated_fixture,
+        isolated_fixture,
+        relevance_selftest_source,
+    ):
+        failures.append("an isolated benign scanner comparison was rejected")
+    incomplete_validation = validate_workflow_collection(
+        isolated_fixture,
+        relevance_selftest_source,
+    )
+    incomplete_comparison = compare_pr_workflow_collection(
+        isolated_fixture,
+        isolated_fixture,
+        relevance_selftest_source,
+    )
+    for contract_name in sorted(LIVE_SUITE_RELEVANCE_CONTRACTS):
+        if not any(contract_name in error for error in incomplete_validation):
+            failures.append(
+                "full workflow-collection validation no longer requires "
+                f"{contract_name}"
+            )
+        if not any(contract_name in error for error in incomplete_comparison):
+            failures.append(
+                "full workflow-collection comparison no longer requires "
+                f"{contract_name}"
+            )
+
+    # A conforming complete collection must reach exactly the Cross verdict:
+    # the enforcing wrapper may add nothing of its own to a collection that
+    # already satisfies the contract, or the repair would have traded a false
+    # failure for a permanent one.
+    complete_collection = {**relevance_workflows, **isolated_fixture}
+    if validate_workflow_collection(
+        complete_collection,
+        relevance_selftest_source,
+    ) != scan_workflow_collection_cross_surfaces(
+        complete_collection,
+        relevance_selftest_source,
+    ):
+        failures.append(
+            "a complete conforming workflow collection was charged a "
+            "live-suite relevance error"
+        )
+    if compare_pr_workflow_collection(
+        complete_collection,
+        complete_collection,
+        relevance_selftest_source,
+    ) != scan_pr_workflow_collection_cross_surfaces(
+        complete_collection,
+        complete_collection,
+        relevance_selftest_source,
+    ):
+        failures.append(
+            "a complete conforming workflow collection comparison was charged "
+            "a live-suite relevance error"
+        )
+
+    # Tampering with the contract inside an otherwise complete collection, and
+    # deleting a governed live workflow outright, are both invisible to the
+    # Cross scan. Only the wrapper can reject them, so each is asserted as the
+    # wrapper's verdict *differing* from the scan's on the same input.
+    severed_collection = {**severed_binding, **isolated_fixture}
+    severed_validation = validate_workflow_collection(
+        severed_collection,
+        relevance_selftest_source,
+    )
+    if not severed_validation or severed_validation == (
+        scan_workflow_collection_cross_surfaces(
+            severed_collection,
+            relevance_selftest_source,
+        )
+    ):
+        failures.append(
+            "full workflow-collection validation accepted a severed live-gate "
+            "relevance binding"
+        )
+    severed_comparison = compare_pr_workflow_collection(
+        complete_collection,
+        severed_collection,
+        relevance_selftest_source,
+    )
+    if not severed_comparison or severed_comparison == (
+        scan_pr_workflow_collection_cross_surfaces(
+            complete_collection,
+            severed_collection,
+            relevance_selftest_source,
+        )
+    ):
+        failures.append(
+            "full workflow-collection comparison accepted a severed live-gate "
+            "relevance binding"
+        )
+    dropped_contract = sorted(LIVE_SUITE_RELEVANCE_CONTRACTS)[0]
+    deleted_live_gate = {
+        name: contents
+        for name, contents in complete_collection.items()
+        if name != dropped_contract
+    }
+    if not any(
+        f"is missing {dropped_contract}" in error
+        for error in compare_pr_workflow_collection(
+            complete_collection,
+            deleted_live_gate,
+            relevance_selftest_source,
+        )
+    ):
+        failures.append(
+            "full workflow-collection comparison accepted deletion of a "
+            "required live gate"
+        )
+    if not any(
+        f"is missing {dropped_contract}" in error
+        for error in validate_workflow_collection(
+            deleted_live_gate,
+            relevance_selftest_source,
+        )
+    ):
+        failures.append(
+            "full workflow-collection validation accepted deletion of a "
+            "required live gate"
+        )
+
+    # ------------------------------------------------------------------
+    # Admitted fuzz/property lane
+    # ------------------------------------------------------------------
+    for admitted_label, admitted_text in (
+        ("fuzz-smoke job", CI_FUZZ_SMOKE_JOB),
+        ("scheduled fuzz lane", FUZZ_WORKFLOW),
+    ):
+        if TARGET in admitted_text:
+            failures.append(
+                f"the admitted {admitted_label} names the protected ARM64 target"
+            )
+        if STANDALONE_CROSS.search(admitted_text):
+            failures.append(
+                f"the admitted {admitted_label} names the Cross executable"
+            )
+        if "secrets." in admitted_text:
+            failures.append(f"the admitted {admitted_label} references a secret")
+        if "contents: write" in admitted_text:
+            failures.append(
+                f"the admitted {admitted_label} requests write permission"
+            )
+        cargo_override_block = (
+            '    env:\n'
+            '      RUSTC_WRAPPER: ""\n'
+            '      CARGO_BUILD_RUSTC_WRAPPER: ""\n'
+            '      RUSTFLAGS: ""\n'
+        )
+        if cargo_override_block not in admitted_text:
+            failures.append(
+                f"the admitted {admitted_label} no longer disables repository "
+                "sccache wrapper inputs and inherited linker rustflags"
+            )
+    if (
+        "\non:\n  schedule:\n    - cron: '30 6 * * 1'\n  workflow_dispatch:\n"
+        "\npermissions:\n  contents: read\n"
+    ) not in FUZZ_WORKFLOW:
+        failures.append(
+            "the scheduled fuzz lane no longer carries exactly the "
+            "schedule/dispatch trigger and read-only permissions"
+        )
+
+    fuzz_ci_workflow = (
+        "name: Self-test CI\non:\n  pull_request:\njobs:\n" + CI_FUZZ_SMOKE_JOB
+    )
+    if admitted_fuzz_smoke_errors(fuzz_ci_workflow, "CI workflow"):
+        failures.append("the admitted fuzz-smoke contract was rejected")
+    if admitted_ci_job_names(fuzz_ci_workflow, "CI workflow") != frozenset(
+        {CI_FUZZ_SMOKE_JOB_NAME}
+    ):
+        failures.append("the admitted fuzz-smoke job was not recognized")
+    fuzz_absent_workflow = (
+        "name: Self-test CI\non:\n  pull_request:\njobs:\n"
+        "  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
+    )
+    if admitted_fuzz_smoke_errors(fuzz_absent_workflow, "CI workflow"):
+        failures.append("an absent fuzz-smoke job was rejected")
+    if admitted_ci_job_names(fuzz_absent_workflow, "CI workflow"):
+        failures.append("an absent fuzz-smoke job was reported as admitted")
+    if not admitted_fuzz_smoke_removal_errors(
+        fuzz_ci_workflow,
+        fuzz_absent_workflow,
+        "CI workflow",
+    ):
+        failures.append("removal of an adopted fuzz-smoke job was not rejected")
+    if admitted_fuzz_smoke_removal_errors(
+        fuzz_absent_workflow,
+        fuzz_ci_workflow,
+        "CI workflow",
+    ):
+        failures.append("initial adoption of the fuzz-smoke job was rejected")
+
+    fuzz_smoke_tampering: dict[str, tuple[str, str]] = {
+        "widened libFuzzer budget": ("-max_total_time=8", "-max_total_time=800"),
+        "unbounded input length": ("-max_len=4096", "-max_len=1048576"),
+        "unpinned cargo-fuzz": (
+            "cargo install cargo-fuzz --locked --version 0.13.1",
+            "cargo install cargo-fuzz",
+        ),
+        "missing protoc setup": (
+            "      - name: Install required build dependency\n"
+            "        run: |\n"
+            "          set -euo pipefail\n"
+            "          sudo apt-get update\n"
+            "          sudo apt-get install -y --no-install-recommends "
+            "protobuf-compiler\n\n",
+            "",
+        ),
+        "mutable toolchain pin": ("nightly-2025-07-01", "nightly"),
+        "repository-supplied script": (
+            'cargo fuzz run "$fuzz_target" -- \\',
+            'bash scripts/fuzz_smoke.sh "$fuzz_target" -- \\',
+        ),
+        "mutable action ref": (
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6",
+            "actions/checkout@v6",
+        ),
+        "local action substitution": (
+            "uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2",
+            "uses: ./.github/actions/fuzz-cache",
+        ),
+        "widened permissions": (
+            "      contents: read\n",
+            "      contents: write\n",
+        ),
+        "untrusted interpolation": (
+            "for fuzz_target in traceparent",
+            "for fuzz_target in ${{ github.event.pull_request.title }} traceparent",
+        ),
+        "failure-tolerant job": (
+            "    needs: ci-plan\n",
+            "    needs: ci-plan\n    continue-on-error: true\n",
+        ),
+    }
+    for tamper_name, (original, replacement) in fuzz_smoke_tampering.items():
+        tampered = fuzz_ci_workflow.replace(original, replacement)
+        if tampered == fuzz_ci_workflow:
+            failures.append(
+                f"the {tamper_name} fuzz-smoke self-test mutation is stale"
+            )
+            continue
+        if not admitted_fuzz_smoke_errors(tampered, "CI workflow"):
+            failures.append(f"a {tamper_name} fuzz-smoke job was not rejected")
+        if admitted_ci_job_names(tampered, "CI workflow"):
+            failures.append(f"a {tamper_name} fuzz-smoke job was still admitted")
+
+    # ------------------------------------------------------------------
+    # Initial adoption of the fuzz gate in the required `test` aggregate
+    # ------------------------------------------------------------------
+    # The shape of pull request #3448: the byte-frozen `fuzz-smoke` job plus the
+    # three aggregate lines that turn it into a required gate. The aggregate
+    # dispatches an opaque shell executable, exactly as the real one does, so it
+    # is Cross-sensitive and its per-job digest surface genuinely moves when the
+    # wiring lands. That premise is asserted rather than assumed: without it
+    # every case below would pass for the wrong reason.
+    aggregate_planner_job = (
+        "  ci-plan:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - name: Plan\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        "          planner=pr_ci_plan.py\n"
+        "          planner_dir=.github/scripts\n"
+        '          trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"\n'
+        '          planner_dir="$trusted_dir"\n'
+        f"          {ISOLATED_PLANNER_LAUNCHER} --self-test\n"
+        '          planner_dir=".github/scripts"\n'
+        '          trusted_dir="$RUNNER_TEMP/pr-ci-plan"\n'
+        '          planner_dir="$trusted_dir"\n'
+        f"          {ISOLATED_PLANNER_LAUNCHER} --event-name pull_request\n"
+    )
+    aggregate_lint_job = (
+        "  lint:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo lint\n"
+    )
+    aggregate_job = (
+        "  test:\n"
+        "    name: Tests\n"
+        "    needs:\n"
+        "      - ci-plan\n"
+        "      - lint\n"
+        "      - build-binaries\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - name: Verify required CI aggregate wiring\n"
+        "        run: python3 .github/scripts/verify_required_ci.py\n"
+        "\n"
+        "      - name: Summarize required CI results\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        "          summarize=$(printf '\\143\\162\\157\\163\\163')\n"
+        '          "$summarize" build --target aarch64-unknown-linux-gnu\n'
+        '          add_row "CI plan" "${{ needs.ci-plan.result }}"\n'
+        '          add_row "Lint" "${{ needs.lint.result }}"\n'
+        '          add_row "Native binaries" "${{ needs.build-binaries.result }}"\n'
+        '          require_success "CI plan" "${{ needs.ci-plan.result }}"\n'
+        '          require_success "Lint" "${{ needs.lint.result }}"\n'
+        '          require_success "Native binaries" "${{ needs.build-binaries.result }}"\n'
+    )
+    aggregate_wired_job = aggregate_job
+    for _, aggregate_anchor, aggregate_added in CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS:
+        if aggregate_anchor not in aggregate_wired_job:
+            failures.append(
+                "the aggregate self-test fixture no longer carries the anchor "
+                f"{aggregate_anchor.strip()!r} the fuzz wiring attaches to"
+            )
+            continue
+        aggregate_wired_job = aggregate_wired_job.replace(
+            aggregate_anchor,
+            aggregate_anchor + aggregate_added,
+            1,
+        )
+    aggregate_prologue = (
+        "name: CI\non:\n  pull_request:\nenv:\n  FIXED_INPUT: approved\njobs:\n"
+    )
+    aggregate_baseline = (
+        aggregate_prologue + aggregate_planner_job + aggregate_lint_job + aggregate_job
+    )
+    aggregate_adopted = (
+        aggregate_prologue
+        + aggregate_planner_job
+        + aggregate_lint_job
+        + CI_FUZZ_SMOKE_JOB
+        + aggregate_wired_job
+    )
+    aggregate_job_only = (
+        aggregate_prologue
+        + aggregate_planner_job
+        + aggregate_lint_job
+        + CI_FUZZ_SMOKE_JOB
+        + aggregate_job
+    )
+    aggregate_surfaces, aggregate_surface_failures = pr_workflow_job_surfaces(
+        aggregate_baseline,
+        "self-test CI workflow",
+        "build-arm64-cross",
+    )
+    if aggregate_surface_failures or not any(
+        surface.startswith(f"job:{CI_AGGREGATE_JOB_NAME}:")
+        for surface in aggregate_surfaces
+    ):
+        failures.append(
+            "the aggregate self-test fixture no longer produces the "
+            "Cross-sensitive digest surface the real comparison rejected"
+        )
+    if ci_fuzz_smoke_aggregate_wiring(
+        aggregate_baseline,
+        "self-test CI workflow",
+    ) != FuzzAggregateWiring("absent", aggregate_baseline, []):
+        failures.append("an unadopted aggregate was not read as absent wiring")
+    job_only_wiring = ci_fuzz_smoke_aggregate_wiring(
+        aggregate_job_only,
+        "self-test CI workflow",
+    )
+    if job_only_wiring.state != "invalid" or not job_only_wiring.errors:
+        failures.append(
+            "the admitted fuzz-smoke job was accepted without its required "
+            "aggregate wiring"
+        )
+    if not compare_pr_workflow_job(
+        aggregate_baseline,
+        aggregate_job_only,
+        "CI workflow",
+        "build-arm64-cross",
+    ):
+        failures.append(
+            "initial adoption of the byte-frozen fuzz job without its required "
+            "aggregate wiring was not rejected"
+        )
+    adopted_wiring = ci_fuzz_smoke_aggregate_wiring(
+        aggregate_adopted,
+        "self-test CI workflow",
+    )
+    if adopted_wiring.state != "present" or adopted_wiring.errors:
+        failures.append("the admitted aggregate fuzz wiring was rejected")
+    elif any(
+        added in adopted_wiring.contents
+        for _, _, added in CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS
+    ):
+        failures.append("withholding left an admitted aggregate reference behind")
+    if compare_pr_workflow_job(
+        aggregate_baseline,
+        aggregate_adopted,
+        "CI workflow",
+        "build-arm64-cross",
+    ):
+        failures.append(
+            "initial adoption of the byte-frozen fuzz job plus its required "
+            "aggregate wiring was rejected"
+        )
+    # Ordinary maintenance after adoption keeps working, and the admission does
+    # not travel to any other part of the aggregate.
+    aggregate_unrelated_job = aggregate_adopted.replace(
+        "  lint:\n",
+        "  extra-tests:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo extra\n"
+        "  lint:\n",
+        1,
+    )
+    if compare_pr_workflow_job(
+        aggregate_adopted,
+        aggregate_unrelated_job,
+        "CI workflow",
+        "build-arm64-cross",
+    ):
+        failures.append(
+            "an unrelated added job was rejected after the fuzz gate was adopted"
+        )
+
+    aggregate_rejections: dict[str, str] = {
+        "missing needs entry": aggregate_adopted.replace(
+            "      - fuzz-smoke\n",
+            "",
+            1,
+        ),
+        "missing summary row": aggregate_adopted.replace(
+            '          add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"\n',
+            "",
+            1,
+        ),
+        "missing required-gate assertion": aggregate_adopted.replace(
+            '          require_success "Fuzz Smoke" '
+            '"${{ needs.fuzz-smoke.result }}"\n',
+            "",
+            1,
+        ),
+        "tampered result expression": aggregate_adopted.replace(
+            '          require_success "Fuzz Smoke" '
+            '"${{ needs.fuzz-smoke.result }}"\n',
+            '          require_success "Fuzz Smoke" "${{ needs.lint.result }}"\n',
+            1,
+        ),
+        "advisory instead of required gate": aggregate_adopted.replace(
+            '          require_success "Fuzz Smoke" '
+            '"${{ needs.fuzz-smoke.result }}"\n',
+            '          add_row "Fuzz Smoke advisory" '
+            '"${{ needs.fuzz-smoke.result }}"\n',
+            1,
+        ),
+        "duplicated summary row": aggregate_adopted.replace(
+            '          add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"\n',
+            '          add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"\n'
+            '          add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"\n',
+            1,
+        ),
+        "relocated summary row": aggregate_adopted.replace(
+            '          add_row "Lint" "${{ needs.lint.result }}"\n'
+            '          add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"\n',
+            '          add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"\n'
+            '          add_row "Lint" "${{ needs.lint.result }}"\n',
+            1,
+        ),
+        "unrelated aggregate edit": aggregate_adopted.replace(
+            '          add_row "CI plan" "${{ needs.ci-plan.result }}"\n',
+            '          add_row "CI plan" "${{ needs.ci-plan.result }}"\n'
+            '          eval "${{ github.event.pull_request.title }}"\n',
+            1,
+        ),
+        "dropped aggregate anchor": aggregate_adopted.replace(
+            '          require_success "Lint" "${{ needs.lint.result }}"\n',
+            "",
+            1,
+        ),
+        "tampered fuzz job": aggregate_adopted.replace(
+            "-max_total_time=8",
+            "-max_total_time=800",
+            1,
+        ),
+        "wiring without the admitted job": (
+            aggregate_prologue
+            + aggregate_planner_job
+            + aggregate_lint_job
+            + aggregate_wired_job
+        ),
+    }
+    for aggregate_case, aggregate_proposed in aggregate_rejections.items():
+        if aggregate_proposed == aggregate_adopted:
+            failures.append(
+                f"the {aggregate_case} aggregate self-test mutation is stale"
+            )
+            continue
+        if not compare_pr_workflow_job(
+            aggregate_baseline,
+            aggregate_proposed,
+            "CI workflow",
+            "build-arm64-cross",
+        ):
+            failures.append(f"a {aggregate_case} fuzz-gate adoption was not rejected")
+    # Once the trusted base carries the wiring, no pull request may take it back
+    # out. Withholding is symmetric, so this is the check that makes the
+    # admission one-way rather than a two-way exemption.
+    for aggregate_case, aggregate_proposed in (
+        ("whole adoption", aggregate_baseline),
+        (
+            "needs edge",
+            aggregate_adopted.replace("      - fuzz-smoke\n", "", 1),
+        ),
+        (
+            "required-gate assertion",
+            aggregate_adopted.replace(
+                '          require_success "Fuzz Smoke" '
+                '"${{ needs.fuzz-smoke.result }}"\n',
+                "",
+                1,
+            ),
+        ),
+    ):
+        if not compare_pr_workflow_job(
+            aggregate_adopted,
+            aggregate_proposed,
+            "CI workflow",
+            "build-arm64-cross",
+        ):
+            failures.append(
+                f"removal of the adopted fuzz-gate {aggregate_case} was not rejected"
+            )
+    if not ci_fuzz_smoke_aggregate_removal_errors(
+        "present",
+        "absent",
+        "CI workflow",
+    ):
+        failures.append("adopted aggregate fuzz wiring could be removed")
+    if ci_fuzz_smoke_aggregate_removal_errors("absent", "present", "CI workflow"):
+        failures.append("initial adoption of the aggregate fuzz wiring was rejected")
+
+    # Withholding is scoped to the admitted job alone: a top-level surface and
+    # every other job's surface survive the admission untouched.
+    mixed_surfaces = (
+        "executable:cross build --target " + TARGET,
+        "job:other:0123456789abcdef",
+        f"job:{CI_FUZZ_SMOKE_JOB_NAME}:fedcba9876543210",
+    )
+    if without_admitted_job_surfaces(
+        mixed_surfaces,
+        frozenset({CI_FUZZ_SMOKE_JOB_NAME}),
+    ) != mixed_surfaces[:2]:
+        failures.append("admitted-job surface withholding is not scoped to that job")
+    if without_admitted_job_surfaces(mixed_surfaces, frozenset()) != mixed_surfaces:
+        failures.append("surfaces were withheld with no admitted job")
+
+    if frozen_fuzz_workflow_errors(FUZZ_WORKFLOW, "self-test/fuzz.yml"):
+        failures.append("the admitted scheduled fuzz-lane contract was rejected")
+    scheduled_removal = compare_pr_workflow_collection(
+        {"fuzz.yml": FUZZ_WORKFLOW, **relevance_workflows},
+        relevance_workflows,
+        "self-test workflows",
+    )
+    if not any("cannot remove the scheduled fuzz lane" in error for error in scheduled_removal):
+        failures.append("removal of an adopted scheduled fuzz lane was not rejected")
+    scheduled_adoption = compare_pr_workflow_collection(
+        relevance_workflows,
+        {"fuzz.yml": FUZZ_WORKFLOW, **relevance_workflows},
+        "self-test workflows",
+    )
+    if any("scheduled fuzz lane" in error for error in scheduled_adoption):
+        failures.append("initial adoption of the scheduled fuzz lane was rejected")
+    fuzz_workflow_tampering: dict[str, tuple[str, str]] = {
+        "untrusted trigger": (
+            "  workflow_dispatch:\n",
+            "  workflow_dispatch:\n  pull_request:\n",
+        ),
+        "caller-chosen budget": (
+            "  workflow_dispatch:\n",
+            "  workflow_dispatch:\n    inputs:\n      budget:\n        default: '1'\n",
+        ),
+        "write permission": (
+            "permissions:\n  contents: read\n",
+            "permissions:\n  contents: write\n",
+        ),
+        "secret exposure": (
+            "          ASAN_OPTIONS:",
+            "          TOKEN: ${{ secrets.GITHUB_TOKEN }}\n          ASAN_OPTIONS:",
+        ),
+        "unbounded run": ("-max_total_time=300", "-max_total_time=86400"),
+        "unbounded rss": ("-rss_limit_mb=2048", "-rss_limit_mb=0"),
+        "missing protoc setup": (
+            "      - name: Install required build dependency\n"
+            "        run: |\n"
+            "          set -euo pipefail\n"
+            "          sudo apt-get update\n"
+            "          sudo apt-get install -y --no-install-recommends "
+            "protobuf-compiler\n\n",
+            "",
+        ),
+        "widened artifact path": (
+            "          path: fuzz/artifacts/${{ matrix.fuzz_target }}\n",
+            "          path: .\n",
+        ),
+        "ungated artifact publication": (
+            "        if: always() && steps.bound.outcome == 'success'\n",
+            "        if: always()\n",
+        ),
+        "symlink-following artifact publication": (
+            '          if [ -L "$directory" ]; then\n',
+            '          if false; then\n',
+        ),
+        "local action substitution": (
+            "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7",
+            "uses: ./.github/actions/publish",
+        ),
+        "mutable action ref": (
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6",
+            "actions/checkout@v6",
+        ),
+        "shell indirection": (
+            'cargo fuzz run -s address "$FUZZ_TARGET" -- \\',
+            'bash -c "$FUZZ_TARGET" -- \\',
+        ),
+        "arbitrary target selection": (
+            "            traceparent|config_decode|proxy_protocol|mesh_udp_frame"
+            "|k8s_crd|plugin_config) ;;\n",
+            "            *) ;;\n",
+        ),
+    }
+    for tamper_name, (original, replacement) in fuzz_workflow_tampering.items():
+        tampered = FUZZ_WORKFLOW.replace(original, replacement)
+        if tampered == FUZZ_WORKFLOW:
+            failures.append(
+                f"the {tamper_name} fuzz-workflow self-test mutation is stale"
+            )
+            continue
+        if not frozen_fuzz_workflow_errors(tampered, "self-test/fuzz.yml"):
+            failures.append(
+                f"a {tamper_name} scheduled fuzz workflow was not rejected"
+            )
+
+    # ------------------------------------------------------------------
+    # Nested Cargo configuration
+    # ------------------------------------------------------------------
+    if validate_nested_cargo_configuration_tree(
+        (".cargo/config.toml", ".cargo/config", "Cargo.toml", "fuzz/Cargo.toml"),
+        "self-test tree",
+    ):
+        failures.append("the repository-root Cargo configuration was rejected")
+    for nested_config in (
+        "fuzz/.cargo/config.toml",
+        "fuzz/.cargo/config",
+        "tests/performance/multi_protocol/.cargo/config.toml",
+    ):
+        if not validate_nested_cargo_configuration_tree(
+            (nested_config,),
+            "self-test tree",
+        ):
+            failures.append(
+                f"nested Cargo configuration {nested_config!r} was not rejected"
+            )
+
     return failures
 
 
@@ -21510,6 +23298,12 @@ def main() -> int:
             if not listing_failures:
                 failures.extend(
                     validate_generated_command_tree(tree_paths, "proposed tree")
+                )
+                failures.extend(
+                    validate_nested_cargo_configuration_tree(
+                        tree_paths,
+                        "proposed tree",
+                    )
                 )
 
         comparisons = (

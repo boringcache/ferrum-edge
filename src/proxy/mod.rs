@@ -55,6 +55,7 @@ pub mod mesh_udp_capture;
 pub mod mesh_udp_frame;
 pub mod netns_capture;
 pub mod netns_udp_capture;
+pub(crate) mod node_waypoint_ingress_capture;
 pub mod proxy_protocol;
 pub mod sni;
 pub mod stream_error;
@@ -2118,6 +2119,203 @@ fn build_inbound_hbone_relay_proxy(
     Some(Arc::new(
         crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port),
     ))
+}
+
+/// A captured NodeWaypoint inbound connection resolved against the live slice:
+/// the relay entry to hand to `handle_mesh_tcp_inbound`, plus the
+/// PeerAuthentication posture of the **exact** destination workload.
+///
+/// The two are produced together on purpose. One NodeWaypoint capture listener
+/// serves every enrolled pod on the node, so neither the posture nor the policy
+/// scope may be read from anything listener-wide: both are properties of the
+/// single workload that owns the recovered original destination, and both are
+/// resolved from the SAME `RequestEpoch` load so a slice reload can never pair
+/// one workload's posture with another's scope.
+pub(crate) struct NodeWaypointCaptureDestination {
+    pub(crate) entry: Arc<crate::router_cache::MeshTcpInboundEntry>,
+    /// Effective inbound PeerAuthentication mode for the destination workload
+    /// on the captured app port. `Strict` means direct plaintext must be
+    /// refused even if some other workload on the same port is `Permissive`.
+    pub(crate) mtls_mode: crate::modes::mesh::config::MtlsMode,
+}
+
+/// Resolve a NodeWaypoint connection the eBPF tc ingress redirect steered into
+/// the transparent capture listener (issue #3287) against the live slice.
+///
+/// NodeWaypoint materializes no inbound routes (its inbound surface is the
+/// HBONE relay), so the relay target is synthesized per connection from the
+/// recovered original destination — the direct-plaintext counterpart of
+/// [`build_inbound_hbone_relay_proxy`].
+///
+/// This resolution is **destination-exact and fail-closed**, which the HBONE
+/// relay does not have to be: HBONE authenticates its peer and authorizes with
+/// the destination-scope machinery on the request path, whereas this listener
+/// admits unauthenticated direct plaintext and is therefore the only thing
+/// standing between a node-local peer and the workload. So:
+///
+/// * Resolution runs against the dedicated
+///   [`crate::modes::mesh::config::MeshConfig::node_waypoint_capture_destinations`]
+///   inventory — the CP-authorized set of workloads enrolled on THIS
+///   NodeWaypoint — not the subscription-namespace `workloads` view. Enrolled
+///   pods are routinely in other namespaces, so `workloads` cannot name them;
+///   and the inventory is narrower everywhere else, so it subsumes the HBONE
+///   open-relay guard rather than relaxing it.
+/// * The destination address must match **exactly one** inventory workload, and
+///   that workload must declare the captured port (a port-less workload does not
+///   constrain its address). No match (including the loopback case the HBONE
+///   open-relay guard tolerates), an EMPTY inventory, and divergent matches all
+///   return `None`: without the exact workload there is no PeerAuthentication
+///   posture and no policy scope to enforce, and evaluating another workload's
+///   policy — or defaulting PERMISSIVE because the required policy was filtered
+///   out at the CP — would be worse than refusing.
+/// * The returned [`NodeWaypointCaptureDestination::mtls_mode`] is resolved from
+///   that workload's own namespace/labels via the canonical PeerAuthentication
+///   resolver over the matching capture-policy inventory, never from the
+///   listener-wide per-port table — two pods can share an app port with opposite
+///   postures, and a `Permissive` neighbour must not admit plaintext to a
+///   `Strict` workload, including across namespaces.
+/// * The entry carries that workload's [`crate::modes::mesh::runtime::PolicyScopeCache`]
+///   so stream `mesh_authz` evaluates namespace/selector-scoped policies against
+///   the captured destination instead of failing every connection closed as
+///   `scope_missing`.
+///
+/// The dial is marked `NODE_WAYPOINT_INBOUND_AUTH_MARK` so the pod-veth
+/// `ferrum_tc_inbound` guard admits it as an authorized relay dial, and the
+/// ingress redirect bypasses it as already-relayed instead of steering it back
+/// into the capture listener.
+pub(crate) fn build_node_waypoint_capture_relay_entry(
+    orig_dst: SocketAddr,
+    epoch: &crate::request_epoch::RequestEpoch,
+) -> Option<NodeWaypointCaptureDestination> {
+    let mesh = epoch.config.mesh.as_deref()?;
+    // Stamp destination-authz readiness onto the synthesized entry so
+    // `handle_mesh_tcp_inbound` can fail closed before the backend dial. This
+    // is an O(1) read of a bit the plugin cache precomputed for this
+    // generation — NOT a config-vector or plugin-vector scan: the connect path
+    // must not walk `config.plugin_configs` or the built chain (hot-path
+    // invariant). The bit is true only when the mesh-managed reserved
+    // `__mesh_authz` row is enabled AND its runtime policy is provably in the
+    // prebuilt global TCP chain this relay resolves; an operator-authored
+    // global `mesh_authz` never satisfies it. See
+    // `PluginCacheInner::node_waypoint_destination_authz_ready`.
+    let has_destination_mesh_authz = epoch.plugin_cache.node_waypoint_destination_authz_ready();
+    resolve_node_waypoint_capture_destination(orig_dst, mesh, has_destination_mesh_authz)
+}
+
+/// Slice-only core of [`build_node_waypoint_capture_relay_entry`], split out so
+/// the destination-exactness and PeerAuthentication rules can be pinned without
+/// standing up a full `RequestEpoch`.
+pub(crate) fn resolve_node_waypoint_capture_destination(
+    orig_dst: SocketAddr,
+    mesh: &crate::modes::mesh::config::MeshConfig,
+    has_destination_mesh_authz: bool,
+) -> Option<NodeWaypointCaptureDestination> {
+    let host = orig_dst.ip().to_string();
+    // Resolution runs ONLY against the dedicated NodeWaypoint capture
+    // destination inventory (issue #3287), never `mesh.workloads`. A
+    // NodeWaypoint captures for every ENROLLED pod on its node, and those pods
+    // routinely live in namespaces other than the NodeWaypoint's own, so
+    // `mesh.workloads` — narrowed to the subscription namespace — cannot even
+    // name the destination. The inventory is CP-authorized (scope + bearer `ns`
+    // claim) and keyed on the trusted `Workload.node_waypoint.spiffe_id`, so it
+    // is both wider where it must be and strictly narrower everywhere else.
+    //
+    // This also subsumes the `inbound_hbone_relay_destination_allowed` open-relay
+    // guard the HBONE relay uses, and is strictly stronger: that guard admits any
+    // slice-declared workload address (and loopback), whereas here the address
+    // must belong to a workload THIS NodeWaypoint is enrolled for, and the port
+    // must be one that workload declares. An EMPTY inventory therefore matches
+    // nothing and fails closed — the caller refuses the connection — rather than
+    // resolving a workload with no policy and defaulting PERMISSIVE.
+    //
+    // A workload that declares ports admits only those ports; one that declares
+    // none does not constrain its address (the same rule the HBONE open-relay
+    // guard applies).
+    let owns_destination = |workload: &crate::modes::mesh::config::Workload| {
+        workload.addresses.iter().any(|addr| addr == &host)
+            && (workload.ports.is_empty()
+                || workload
+                    .ports
+                    .iter()
+                    .any(|workload_port| workload_port.port == orig_dst.port()))
+    };
+    // Exactly one workload identity may own the captured address. Duplicate
+    // records for one pod (several services backed by the same workload) are
+    // normal and agree on namespace/labels/SPIFFE, so they collapse to one
+    // scope; genuinely DIVERGENT records are an ambiguity we cannot resolve
+    // safely, and picking the first would silently choose whose policy applies.
+    let mut destination: Option<(
+        &crate::modes::mesh::config::Workload,
+        crate::modes::mesh::runtime::PolicyScopeCache,
+    )> = None;
+    for workload in mesh
+        .node_waypoint_capture_destinations
+        .iter()
+        .filter(|workload| owns_destination(workload))
+    {
+        let candidate = crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload);
+        if let Some((_, existing)) = destination.as_ref() {
+            if existing != &candidate {
+                return None;
+            }
+            continue;
+        }
+        destination = Some((workload, candidate));
+    }
+    let (workload, policy_scope) = destination?;
+    // Canonical PeerAuthentication resolution (WorkloadSelector > Namespace >
+    // MeshWide, port override inside the winner, fail-secure same-tier tie
+    // break) against the DESTINATION workload's authoritative namespace/labels
+    // as the slice declares them. The slice-level `labels_ambiguous` escalation
+    // does not apply here: that guards the DP's inference of its OWN identity,
+    // while these labels come straight off the workload record.
+    //
+    // The candidate set is the dedicated capture inventory, NOT
+    // `mesh.peer_authentications`: the latter is narrowed to this NodeWaypoint's
+    // OWN subscription namespace, so a STRICT PeerAuthentication declared in a
+    // CAPTURED pod's namespace would be absent and this resolver would fall back
+    // to Istio's PERMISSIVE default — admitting direct plaintext exactly where
+    // STRICT forbids it. The capture inventory carries the mesh-wide /
+    // root-namespace, namespace-scoped, and selector-scoped candidates
+    // applicable to the destinations, so precedence and port overrides resolve
+    // identically to how the destination's own sidecar would resolve them.
+    let mtls_mode = crate::modes::mesh::slice::resolve_effective_mtls_mode(
+        &mesh.node_waypoint_capture_peer_authentications,
+        &policy_scope.namespace,
+        &policy_scope.labels,
+        orig_dst.port(),
+    );
+    // Name the relay after the owning workload so the synthesized proxy id,
+    // authorization namespace, and logs identify the real service instead of a
+    // bare address.
+    let route = crate::modes::mesh::config::MeshInboundTcpRoute {
+        match_port: orig_dst.port(),
+        backend_addr: orig_dst,
+        namespace: workload.namespace.clone(),
+        service_name: workload.service_name.clone(),
+        service_fqdn: format!("{host}:{}", orig_dst.port()),
+        // The capture relay never peeks: it is protocol-agnostic by
+        // construction (the captured stream may be HTTP, a server-first binary
+        // protocol, or the application's own TLS), and a pre-dial peek on a
+        // server-first port would park the relay on the handshake clock.
+        tls_inspect: false,
+        first_bytes_inspect: false,
+    };
+    let relay_proxy = Arc::new(crate::modes::mesh::mesh_inbound_tcp_relay_proxy(&route));
+    Some(NodeWaypointCaptureDestination {
+        entry: Arc::new(crate::router_cache::MeshTcpInboundEntry {
+            relay_proxy,
+            backend_addr: orig_dst,
+            service_fqdn: route.service_fqdn,
+            tls_inspect: false,
+            first_bytes_inspect: false,
+            socket_mark: Some(crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK),
+            node_waypoint_policy_scope: Some(Arc::new(policy_scope)),
+            requires_destination_mesh_authz: true,
+            has_destination_mesh_authz,
+        }),
+        mtls_mode,
+    })
 }
 
 #[allow(dead_code)]
@@ -13959,6 +14157,7 @@ pub(crate) fn create_proxy_socket(
     backlog: i32,
     tcp_fastopen_queue_len: Option<u16>,
     reuse_port: bool,
+    transparent: bool,
 ) -> Result<TcpListener, anyhow::Error> {
     let socket = socket2::Socket::new(
         if addr.is_ipv6() {
@@ -13979,6 +14178,50 @@ pub(crate) fn create_proxy_socket(
     #[cfg(unix)]
     if reuse_port {
         socket.set_reuse_port(true)?;
+    }
+
+    // IP_TRANSPARENT / IPV6_TRANSPARENT for the NodeWaypoint transparent
+    // inbound CAPTURE listener (issue #3287). That listener is the only caller
+    // that passes `transparent = true`.
+    //
+    // The redirect never rewrites addresses: `bpf_sk_assign` hands the packet
+    // to the capture listener with the workload's real `podIP:appPort` intact.
+    // That is what preserves the original destination metadata, but it also
+    // means the accepted socket's local address is NOT configured on this host,
+    // so its replies can only be routed if the socket is transparent (the
+    // kernel needs `FLOWI_FLAG_ANYSRC` to accept a non-local source). Without
+    // this the redirect delivers inbound SYNs and then silently fails to send
+    // SYN-ACKs.
+    //
+    // Set BEFORE bind, and only for the one socket that opts in. A transparent
+    // socket may bind and source addresses this host does not own, so the
+    // capability is deliberately not conferred on a whole class of listeners
+    // (and never on the HBONE or admin listeners) by a process-wide switch.
+    #[cfg(target_os = "linux")]
+    if transparent {
+        use std::os::unix::io::AsRawFd;
+        let fd = socket.as_raw_fd();
+        let result = if addr.is_ipv6() {
+            crate::socket_opts::set_ipv6_transparent(fd)
+        } else {
+            crate::socket_opts::set_ip_transparent(fd)
+        };
+        // Fatal, not a warning: the caller only asks for a transparent bind
+        // when the tc ingress redirect is installed, and a non-transparent
+        // capture listener accepts connections it can never answer.
+        result.map_err(|e| {
+            anyhow::anyhow!(
+                "failed to enable IP_TRANSPARENT on the NodeWaypoint inbound capture listener \
+                 {addr}, which the eBPF tc ingress redirect requires in order to reply \
+                 from captured pod addresses: {e}"
+            )
+        })?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    if transparent {
+        anyhow::bail!(
+            "a transparent listener bind was requested for {addr}, but IP_TRANSPARENT is Linux-only"
+        );
     }
 
     socket.set_nonblocking(true)?;
@@ -14623,7 +14866,13 @@ async fn start_proxy_listener_with_tls_source_and_signal(
     };
 
     // Create the first listener — this one validates that the port is available.
-    let first_listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port)?;
+    //
+    // NEVER transparent here. `IP_TRANSPARENT` lets a socket bind and source
+    // addresses that are not configured on this host, so it is granted to
+    // exactly one listener — the NodeWaypoint inbound capture socket, which
+    // opts in explicitly in `proxy::node_waypoint_ingress_capture` — and never
+    // to a whole class of listeners on the strength of a process-wide env var.
+    let first_listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)?;
 
     // Optional connection limit. Shared across all accept threads so the global
     // max_connections limit is enforced regardless of which thread accepted.
@@ -14649,7 +14898,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
 
         // Spawn additional listeners (threads 1..N-1)
         for i in 1..accept_threads {
-            let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port)?;
+            let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)?;
             let state = Arc::clone(&state);
             let tls_source = tls_source.clone();
             let semaphore = conn_semaphore.clone();
@@ -16078,7 +16327,10 @@ pub(crate) async fn apply_plugin_rejection_response(
 /// validator explicitly requires zero-byte inspection) and the same
 /// response-body-buffering capability gate the normal response path uses is
 /// satisfied. Specifically we skip when:
-/// - the request is gRPC (synthetic gRPC bodies are handled as trailers-only),
+/// - the request is gRPC AND this is not the authorized `serverless_function`
+///   native-gRPC terminate representation (every other synthetic gRPC body is
+///   handled as trailers-only, so there is nothing for a body validator to
+///   inspect; see [`authorized_serverless_grpc_terminate_representation`]),
 /// - the status is neither 2xx nor a marked final serverless response,
 /// - the status is 204, 205, or 304 (a body-emitting transform there is
 ///   protocol-incorrect),
@@ -16103,7 +16355,7 @@ pub(crate) async fn apply_plugin_rejection_response(
 /// this body-hook gate.
 ///
 /// [`Plugin::should_buffer_response_body`]: crate::plugins::Plugin::should_buffer_response_body
-fn should_apply_synthetic_response_body_hooks(
+pub(crate) fn should_apply_synthetic_response_body_hooks(
     status_code: u16,
     is_grpc_request: bool,
     response_body: &[u8],
@@ -16112,7 +16364,9 @@ fn should_apply_synthetic_response_body_hooks(
 ) -> bool {
     let governed_synthetic_status = (200..300).contains(&status_code)
         || (ctx.serverless_terminate_response && (200..=599).contains(&status_code));
-    if is_grpc_request
+    let governed_grpc_representation = !is_grpc_request
+        || authorized_serverless_grpc_terminate_representation(status_code, response_body, ctx);
+    if !governed_grpc_representation
         || !governed_synthetic_status
         || crate::plugins::utils::synthetic_response::status_forbids_response_body(status_code)
     {
@@ -16128,6 +16382,44 @@ fn should_apply_synthetic_response_body_hooks(
         return false;
     }
     response_body_plugins_process_body(plugins, ctx)
+}
+
+/// Whether this synthetic response IS the validated `serverless_function`
+/// native-gRPC terminate representation for this request.
+///
+/// This is the sole gRPC short-circuit that puts a real body on the wire, so it
+/// is the sole gRPC short-circuit the shared response-body policy lifecycle can
+/// meaningfully govern. The predicate is deliberately the same request-scoped
+/// provenance the reject writers use, never body shape or reject headers:
+/// - the request must be the native-gRPC flavor the frontend stamped at intake,
+/// - the plugin must have marked a terminate response,
+/// - the status must be the one the contract authored, and
+/// - the bytes must still be the authored frame — which for the status-only
+///   contract shape is the empty frame it authored, so an empty body matches and
+///   a body that the contract never authored does not (that case still has to
+///   clear the explicit zero-byte inspection gate in
+///   [`should_apply_synthetic_response_body_hooks`]).
+///
+/// A body hook that rewrites or replaces these bytes invalidates the
+/// authorization, and the rejection then fails closed in
+/// [`normalize_reject_response_with_provenance`] rather than reaching the wire.
+fn authorized_serverless_grpc_terminate_representation(
+    status_code: u16,
+    response_body: &[u8],
+    ctx: &RequestContext,
+) -> bool {
+    if !ctx.serverless_terminate_response || !ctx.is_native_grpc_request() {
+        return false;
+    }
+    match ctx.serverless_grpc_terminate_frame.as_deref() {
+        Some(authored) => {
+            authored.http_status == status_code && authored.frame.as_ref() == response_body
+        }
+        // Every native-gRPC terminate contract — framed and status-only alike —
+        // stamps the authored representation. No provenance therefore means this
+        // is not the terminate representation at all, and the gate stays closed.
+        None => false,
+    }
 }
 
 /// Whether a response-body-capable plugin phase actually processes THIS
@@ -16515,8 +16807,17 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
             .any(|plugin| plugin.requires_response_committed_hook())
     {
         let status_code = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let normalized =
-            normalize_reject_response(status_code, body.clone(), headers, is_grpc_request);
+        // Committed observers must see the response that is actually emitted,
+        // including a serverless terminate framed unary body — otherwise the
+        // hook view and the wire diverge on exactly this path. The `Bytes` clone
+        // is a refcount bump, not a body copy.
+        let normalized = normalize_reject_response_with_provenance(
+            status_code,
+            body.clone(),
+            headers,
+            is_grpc_request,
+            FramedGrpcUnaryProvenance::from_context(ctx),
+        );
         for (index, plugin) in plugins.iter().enumerate() {
             if !plugin.requires_response_committed_hook() {
                 continue;
@@ -16731,6 +17032,11 @@ pub(crate) struct NormalizedRejectResponse {
     pub(crate) body: Bytes,
     pub(crate) grpc_status: Option<u32>,
     pub(crate) grpc_message: Option<String>,
+    /// When non-empty together with a non-empty `body`, these are emitted as
+    /// HTTP trailers after the unary DATA frame (serverless native-gRPC
+    /// terminate). Ordinary trailers-only rejects leave this empty and keep
+    /// terminal metadata in `headers`.
+    pub(crate) grpc_trailers: HashMap<String, String>,
 }
 
 /// Apply route policy to a gateway-generated plain HTTP response and then
@@ -16849,11 +17155,297 @@ pub(crate) fn map_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
     grpc_proxy::http_reject_status_to_grpc_status(status)
 }
 
+/// Provenance authorizing a native-gRPC rejection to keep a framed unary DATA
+/// body instead of collapsing to the trailers-only error contract.
+///
+/// The only holder of this authorization is a `serverless_function` terminate
+/// invocation whose function output already passed the plugin's fail-closed
+/// contract validation. Body shape and reject headers are deliberately NOT
+/// provenance: they are reachable by any plugin (including custom plugins) and
+/// partly derived from function/backend input, so trusting them would let an
+/// ordinary rejection reflect an untrusted body onto a native gRPC stream.
+///
+/// Authorization is byte-exact against the frame the plugin authored — and
+/// against the HTTP status it authored alongside it — so a replaceable
+/// `after_proxy` decorator that rewrites the reject body, a response-body
+/// transform that rewrites the frame, and any later unrelated rejection on the
+/// same request all fall back to trailers-only.
+///
+/// Falling back is not by itself safe: the authored reject headers still carry
+/// the contract's `grpc-status`, which is `0` on a successful unary response, so
+/// a plain fallback would emit an empty Trailers-Only *success*. Invalidated
+/// authorization therefore fails closed — see
+/// [`invalidated_grpc_terminate_fail_closed_signal`].
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FramedGrpcUnaryProvenance<'a> {
+    authored: Option<&'a crate::plugins::ServerlessGrpcTerminateFrame>,
+}
+
+impl<'a> FramedGrpcUnaryProvenance<'a> {
+    /// No authorization: framed unary DATA is never preserved.
+    pub(crate) const NONE: Self = Self { authored: None };
+
+    /// Read the request-scoped authorization stamped by `serverless_function`.
+    pub(crate) fn from_context(ctx: &'a RequestContext) -> Self {
+        Self::from_authored_frame(ctx.serverless_grpc_terminate_frame.as_deref())
+    }
+
+    /// Same authorization from a snapshot of the stamped frame, for call sites
+    /// that must release their `ctx` borrow before the write.
+    pub(crate) fn from_authored_frame(
+        authored: Option<&'a crate::plugins::ServerlessGrpcTerminateFrame>,
+    ) -> Self {
+        Self { authored }
+    }
+
+    /// Whether this request holds a terminate authorization at all — framed or
+    /// status-only.
+    ///
+    /// `true` + "the authorized representation was not emitted" is exactly the
+    /// invalidated case that must fail closed rather than fall back to the
+    /// authored (possibly successful) `grpc-status`. The one representation for
+    /// which trailers-only is *not* an invalidation is the unchanged status-only
+    /// contract; see [`Self::intact_status_only_signal`].
+    pub(crate) fn is_authorizing(&self) -> bool {
+        self.authored.is_some()
+    }
+
+    /// The terminal metadata this rejection may emit as trailers, or `None`
+    /// when this rejection is not the authored representation and must stay
+    /// trailers-only.
+    ///
+    /// Both the authored HTTP status and the authored frame bytes must match.
+    /// Requiring the status too is what keeps a *later* rejection from
+    /// inheriting the original successful trailers on a byte coincidence: a
+    /// replacement rejection selects its own status, and the authored status
+    /// (200) is the one the terminate contract itself produced.
+    fn authorized_trailers(
+        &self,
+        status: StatusCode,
+        body: &[u8],
+    ) -> Option<&'a HashMap<String, String>> {
+        let authored = self.authored?;
+        if authored.frame.is_empty() || authored.trailers.is_empty() {
+            return None;
+        }
+        if authored.http_status != status.as_u16() {
+            return None;
+        }
+        (authored.frame.as_ref() == body).then_some(&authored.trailers)
+    }
+
+    /// The COMPLETE authorized terminal metadata for the *status-only*
+    /// terminate contract — the shape that authored no frame and whose correct
+    /// client representation therefore IS trailers-only.
+    ///
+    /// `Some` only while the response is still exactly what the contract
+    /// authored: the authored HTTP status and a still-empty body. Every field
+    /// comes from the authored provenance rather than the reject header map,
+    /// which has been through `after_proxy` decorators, initial-header policy,
+    /// and — since the framed representation now runs it — the shared
+    /// response-body lifecycle. That covers `grpc-status`, an optional
+    /// `grpc-message`, `grpc-status-details-bin`, and the validated custom
+    /// trailers, so restoring this result is what makes the reply immune to
+    /// decorator mutation.
+    ///
+    /// `None` for a framed authorization (it authored DATA, so trailers-only is
+    /// not its representation), for a changed status or a body the contract
+    /// never authored, and for a status-only record whose own `grpc-status` no
+    /// longer parses. Each of those is an invalidation and falls through to
+    /// [`invalidated_grpc_terminate_fail_closed_signal`].
+    fn intact_status_only_signal(
+        &self,
+        status: StatusCode,
+        body: &[u8],
+    ) -> Option<StatusOnlyTerminalMetadata<'a>> {
+        let authored = self.authored?;
+        if !authored.frame.is_empty() || !body.is_empty() {
+            return None;
+        }
+        if authored.http_status != status.as_u16() {
+            return None;
+        }
+        let grpc_status = authored.trailers.get("grpc-status")?.parse::<u32>().ok()?;
+        // `grpc_message` is OPTIONAL in the contract, and omission is carried
+        // through as omission. Substituting a canonical reason here would invent
+        // "Gateway rejected request" for a status-only SUCCESS, and would
+        // override a nonzero contract's deliberate silence just as wrongly.
+        let grpc_message = authored
+            .trailers
+            .get("grpc-message")
+            .map(|message| sanitize_grpc_message(message))
+            .filter(|message| !message.is_empty());
+        // Everything else the contract authored — `grpc-status-details-bin` and
+        // the validated custom trailers — is restored alongside the status.
+        // Sorted so the emitted header block is deterministic regardless of map
+        // iteration order.
+        let mut additional: Vec<(&'a str, &'a str)> = authored
+            .trailers
+            .iter()
+            .filter(|(name, _)| !is_status_or_message_trailer(name.as_str()))
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        additional.sort_unstable();
+        Some(StatusOnlyTerminalMetadata {
+            grpc_status,
+            grpc_message,
+            additional,
+        })
+    }
+
+    /// Whether a trailers-only emitter must evict `name` from the mutable
+    /// reject header map because this request holds terminate authorization.
+    ///
+    /// Covers two things: every name the contract itself authored, and the
+    /// reserved gRPC terminal-metadata namespace whether the contract authored
+    /// it or not. So a decorator can neither replace what the contract
+    /// terminated with, nor inject a `grpc-status-details-bin` the contract
+    /// never authored onto the contract's own status.
+    ///
+    /// On the intact status-only path the authoritative copies are restored
+    /// from [`Self::intact_status_only_signal`] immediately afterwards. On any
+    /// invalidated path nothing is restored: pairing a replacement nonzero
+    /// `grpc-status` with the original contract's `grpc-status-details-bin` (or
+    /// its custom trailers) would describe the successful response the client
+    /// is not receiving.
+    ///
+    /// `grpc-status` and `grpc-message` are already dropped unconditionally by
+    /// every emitter; they are named here so the rule reads complete rather
+    /// than depending on that.
+    ///
+    /// Costs nothing when nothing is authorizing, which is every ordinary gRPC
+    /// rejection.
+    pub(crate) fn evicts_terminal_metadata(&self, name: &str) -> bool {
+        let Some(authored) = self.authored else {
+            return false;
+        };
+        if is_reserved_grpc_terminal_name(name) {
+            return true;
+        }
+        let mut authored_names = authored.trailers.keys();
+        authored_names.any(|authored_name| authored_name.eq_ignore_ascii_case(name))
+    }
+}
+
+/// Terminal names a [`StatusOnlyTerminalMetadata`] carries in its own
+/// `grpc_status` / `grpc_message` fields rather than in `additional`.
+fn is_status_or_message_trailer(name: &str) -> bool {
+    name.eq_ignore_ascii_case("grpc-status") || name.eq_ignore_ascii_case("grpc-message")
+}
+
+/// The reserved gRPC terminal-metadata namespace, matched case-insensitively
+/// because reject header maps are not normalized to lowercase.
+fn is_reserved_grpc_terminal_name(name: &str) -> bool {
+    is_status_or_message_trailer(name) || name.eq_ignore_ascii_case("grpc-status-details-bin")
+}
+
+/// The complete terminal metadata an UNCHANGED status-only
+/// `serverless_function` terminate contract must emit, taken from the validated
+/// authored provenance rather than the mutable reject header map.
+///
+/// This is the one representation shared by the H1/H2 normalizer and the
+/// direct-H3 writer, so a non-terminal response decorator can add initial
+/// response headers but can never alter, drop, or inject contract terminal
+/// metadata on either path.
+pub(crate) struct StatusOnlyTerminalMetadata<'a> {
+    pub(crate) grpc_status: u32,
+    /// `None` when the contract omitted `grpc_message`. Omission is emitted as
+    /// omission — never as an empty field and never as a synthesized reason.
+    pub(crate) grpc_message: Option<String>,
+    /// Authored terminal metadata other than `grpc-status`/`grpc-message`:
+    /// `grpc-status-details-bin` and the validated custom trailers, sorted by
+    /// name. Names are already lowercase.
+    pub(crate) additional: Vec<(&'a str, &'a str)>,
+}
+
+/// The authorized trailers-only signal for an unchanged status-only
+/// `serverless_function` terminate contract, shared by the H1/H2 normalizer and
+/// the direct-H3 writer (which derives its own signal and would otherwise read
+/// the mutable reject header map instead).
+///
+/// Every emitter must consult this BEFORE
+/// [`invalidated_grpc_terminate_fail_closed_signal`]: `Some` is the one case in
+/// which a terminate authorization legitimately produces no DATA, and `None`
+/// means the fail-closed correction applies. Ordering it this way keeps the
+/// carve-out at the call site, so an emitter that forgets it fails closed rather
+/// than silently emitting the contract's `grpc-status`.
+pub(crate) fn status_only_grpc_signal<'a>(
+    framed_unary_provenance: FramedGrpcUnaryProvenance<'a>,
+    status: StatusCode,
+    body: &[u8],
+) -> Option<StatusOnlyTerminalMetadata<'a>> {
+    framed_unary_provenance.intact_status_only_signal(status, body)
+}
+
+/// The `grpc-message` emitted when a framed serverless-terminate authorization
+/// was invalidated and the gateway had to fail closed.
+pub(crate) const INVALIDATED_GRPC_TERMINATE_MESSAGE: &str =
+    "gateway: authorized gRPC terminate response was invalidated";
+
+/// Fail-closed correction for a native-gRPC rejection that HELD framed
+/// serverless-terminate authorization but is not emitting the authorized
+/// representation (the frame was rewritten, the status changed, or the
+/// representation was replaced by a body-policy rejection).
+///
+/// The authored reject headers carry the contract's own `grpc-status`, which is
+/// `0` for a successful unary response. Falling back to the ordinary
+/// trailers-only derivation would therefore turn a rewritten/replaced success
+/// into an empty Trailers-Only **success** — the client would see
+/// `grpc-status: 0` with no message at all. A rejection that selected its own
+/// status keeps it (`derived_grpc_status` is already nonzero, or the HTTP status
+/// maps to a nonzero code); only a residual OK is replaced.
+///
+/// `http_status_fallback` is the caller's own HTTP→gRPC mapping so the H1/H2 and
+/// H3 emitters stay on their respective tables.
+///
+/// This deliberately knows nothing about the one authorization for which
+/// emitting no DATA is *correct* — the unchanged status-only contract. Callers
+/// resolve that first through [`status_only_grpc_signal`] and only reach
+/// here when it declined, so an emitter that forgets the carve-out fails closed
+/// instead of falling through to the contract's possibly-successful status.
+///
+/// Returns the replacement `(grpc-status, grpc-message)`, or `None` when no
+/// correction is required.
+pub(crate) fn invalidated_grpc_terminate_fail_closed_signal(
+    framed_unary_provenance: FramedGrpcUnaryProvenance<'_>,
+    derived_grpc_status: u32,
+    http_status_fallback: u32,
+) -> Option<(u32, &'static str)> {
+    if !framed_unary_provenance.is_authorizing() {
+        return None;
+    }
+    if derived_grpc_status != grpc_proxy::grpc_status::OK {
+        return None;
+    }
+    let replacement = if http_status_fallback == grpc_proxy::grpc_status::OK {
+        grpc_proxy::grpc_status::INTERNAL
+    } else {
+        http_status_fallback
+    };
+    Some((replacement, INVALIDATED_GRPC_TERMINATE_MESSAGE))
+}
+
 pub(crate) fn normalize_reject_response(
     status: StatusCode,
     body: Bytes,
     headers: &HashMap<String, String>,
     is_grpc_request: bool,
+) -> NormalizedRejectResponse {
+    normalize_reject_response_with_provenance(
+        status,
+        body,
+        headers,
+        is_grpc_request,
+        FramedGrpcUnaryProvenance::NONE,
+    )
+}
+
+pub(crate) fn normalize_reject_response_with_provenance(
+    status: StatusCode,
+    body: Bytes,
+    headers: &HashMap<String, String>,
+    is_grpc_request: bool,
+    framed_unary_provenance: FramedGrpcUnaryProvenance<'_>,
 ) -> NormalizedRejectResponse {
     let grpc_web_accept_rejected =
         crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers);
@@ -16872,34 +17464,103 @@ pub(crate) fn normalize_reject_response(
             body,
             grpc_status: None,
             grpc_message: None,
+            grpc_trailers: HashMap::new(),
         };
     }
 
-    let grpc_status = headers
-        .get("grpc-status")
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or_else(|| map_http_reject_status_to_grpc_status(status));
-    let grpc_message = headers
-        .get("grpc-message")
-        .cloned()
-        .or_else(|| extract_grpc_reject_message(body.as_ref()))
-        .unwrap_or_else(|| grpc_status_reason(grpc_status).to_string());
-    let grpc_message = sanitize_grpc_message(&grpc_message);
+    // Preserve uncompressed unary DATA + terminal metadata ONLY for the
+    // explicitly authorized `serverless_function` terminate result. Every other
+    // rejection — including one whose body happens to look like a gRPC frame and
+    // whose headers claim `application/grpc` + `grpc-status` — falls through to
+    // trailers-only, so an untrusted body is never reflected onto the wire.
+    // `body` is handed over as owned shared `Bytes`, so the authorized frame
+    // reaches the wire without a copy; the trailers-only fall-through below
+    // borrows it and then drops it. The predicates that decide intactness are
+    // shared with H3 reject logging via [`intact_framed_unary_terminate_signal`].
+    if let Some((grpc_status, grpc_message, trailers)) =
+        intact_framed_unary_terminate_signal(framed_unary_provenance, status, &body, headers)
+    {
+        return build_framed_grpc_unary_reject(body, headers, trailers, grpc_status, grpc_message);
+    }
 
+    // Past this point no DATA is emitted. That is correct for exactly one
+    // authorization — the status-only terminate contract, which authored no
+    // frame — and only while that reply is unchanged. For every other holder of
+    // terminate authorization, reaching here means the authored representation
+    // was invalidated (rewritten body, changed status, a body the status-only
+    // contract never authored, or a replacement rejection), and the contract's
+    // `grpc-status: 0` must not survive as an empty Trailers-Only success.
+    let mapped_status = map_http_reject_status_to_grpc_status(status);
+    let status_only = status_only_grpc_signal(framed_unary_provenance, status, &body);
+    let (grpc_status, grpc_message) = match status_only {
+        // The status-only terminate contract authored no frame, so trailers-only
+        // IS its authorized representation, and its own terminal metadata — not
+        // the decorated reject header map — is what the client must see. An
+        // omitted `grpc_message` stays omitted.
+        Some(ref authored) => (authored.grpc_status, authored.grpc_message.clone()),
+        None => {
+            let derived_grpc_status = headers
+                .get("grpc-status")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(mapped_status);
+            let fail_closed = invalidated_grpc_terminate_fail_closed_signal(
+                framed_unary_provenance,
+                derived_grpc_status,
+                mapped_status,
+            );
+            match fail_closed {
+                Some((status_code, message)) => (status_code, Some(message.to_string())),
+                None => {
+                    let message = headers
+                        .get("grpc-message")
+                        .cloned()
+                        .or_else(|| extract_grpc_reject_message(&body))
+                        .unwrap_or_else(|| grpc_status_reason(derived_grpc_status).to_string());
+                    (derived_grpc_status, Some(message))
+                }
+            }
+        }
+    };
+    let grpc_message = grpc_message
+        .map(|message| sanitize_grpc_message(&message))
+        .filter(|message| !message.is_empty());
+
+    // `content-length` is dropped with the terminal metadata: this branch emits
+    // an empty body, so any inbound value describes bytes that are not being
+    // sent. The framed terminate representation now runs the shared
+    // response-body lifecycle, whose transforms set `content-length` on the
+    // reject header map, so a stale value can reach here on the invalidated
+    // path.
     let mut normalized_headers = HashMap::with_capacity(headers.len() + 3);
     for (key, value) in headers {
         if key.eq_ignore_ascii_case("content-type")
             || key.eq_ignore_ascii_case("grpc-status")
             || key.eq_ignore_ascii_case("grpc-message")
+            || key.eq_ignore_ascii_case("content-length")
         {
+            continue;
+        }
+        // No terminal metadata is carried out of the reject header map while a
+        // terminate contract is authorizing — neither the keys it authored nor
+        // a `grpc-status-details-bin` a decorator injected. Intact status-only
+        // restores the authoritative copies from provenance just below; every
+        // invalidated path must emit none of them, so a replacement nonzero
+        // `grpc-status` can never ship beside the original contract's
+        // `grpc-status-details-bin` or its custom trailers.
+        if framed_unary_provenance.evicts_terminal_metadata(key) {
             continue;
         }
         normalized_headers.insert(key.clone(), value.clone());
     }
+    if let Some(ref authored) = status_only {
+        for (name, value) in &authored.additional {
+            normalized_headers.insert((*name).to_string(), (*value).to_string());
+        }
+    }
     normalized_headers.insert("content-type".to_string(), "application/grpc".to_string());
     normalized_headers.insert("grpc-status".to_string(), grpc_status.to_string());
-    if !grpc_message.is_empty() {
-        normalized_headers.insert("grpc-message".to_string(), grpc_message.clone());
+    if let Some(ref message) = grpc_message {
+        normalized_headers.insert("grpc-message".to_string(), message.clone());
     }
 
     NormalizedRejectResponse {
@@ -16907,8 +17568,152 @@ pub(crate) fn normalize_reject_response(
         headers: normalized_headers,
         body: Bytes::new(),
         grpc_status: Some(grpc_status),
-        grpc_message: Some(grpc_message),
+        grpc_message,
+        grpc_trailers: HashMap::new(),
     }
+}
+
+/// Build the client representation for a rejection that already carries the
+/// authorized `serverless_function` terminate frame: HTTP 200 +
+/// `application/grpc` HEADERS, one uncompressed unary DATA frame, and the
+/// plugin-authored terminal trailers.
+///
+/// `authored_trailers` is the ONLY source of client-visible trailers. Terminal
+/// metadata is deliberately not promoted out of `headers`: that map has been
+/// through `after_proxy` decorators and initial-response-header policy, so it
+/// can hold CORS fields, gateway-managed values, and internal bridge fields
+/// that belong in the HEADERS block (or nowhere) rather than in trailers. Those
+/// headers are preserved in the initial block minus terminal/hop-by-hop names.
+///
+/// Callers must have already obtained `(grpc_status, grpc_message, trailers)`
+/// from [`intact_framed_unary_terminate_signal`] so the owned normalizer and
+/// the borrowed H3 logging path cannot drift on the shared predicates.
+fn build_framed_grpc_unary_reject(
+    body: Bytes,
+    headers: &HashMap<String, String>,
+    authored_trailers: &HashMap<String, String>,
+    grpc_status: u32,
+    grpc_message: Option<String>,
+) -> NormalizedRejectResponse {
+    let mut initial_headers = HashMap::with_capacity(headers.len());
+    for (key, value) in headers {
+        let lower = key.to_ascii_lowercase();
+        // Terminal metadata belongs in the trailers block only; emitting it in
+        // HEADERS too would make the response look Trailers-Only to a client.
+        if lower == "content-type" || authored_trailers.contains_key(&lower) {
+            continue;
+        }
+        // The reserved gRPC terminal-metadata namespace is contract-owned even
+        // for names the contract did not author, so a decorator cannot inject
+        // `grpc-status-details-bin` alongside the contract's own trailers.
+        if grpc_proxy::is_reserved_grpc_terminal_metadata(&lower) {
+            continue;
+        }
+        // Ferrum-owned gRPC-Web bridge fields must never reach a client.
+        if crate::plugins::grpc_web::is_internal_grpc_web_bridge_header(&lower) {
+            continue;
+        }
+        if lower == "connection"
+            || lower == "keep-alive"
+            || lower == "proxy-connection"
+            || lower == "transfer-encoding"
+            || lower == "te"
+            || lower == "trailer"
+            || lower == "upgrade"
+            || lower == "content-length"
+        {
+            continue;
+        }
+        initial_headers.insert(lower, value.clone());
+    }
+    initial_headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    // Emit the same `grpc-message` shape every other gRPC error path emits, so
+    // the terminate contract cannot be the one place an unsanitized status
+    // message reaches the wire.
+    let mut trailers = authored_trailers.clone();
+    match grpc_message {
+        Some(ref message) => {
+            trailers.insert("grpc-message".to_string(), message.clone());
+        }
+        None => {
+            trailers.remove("grpc-message");
+        }
+    }
+
+    NormalizedRejectResponse {
+        http_status: StatusCode::OK,
+        headers: initial_headers,
+        // The authorized frame keeps the caller's allocation identity: the DATA
+        // frame every emitter writes is this same shared buffer, never a copy.
+        body,
+        grpc_status: Some(grpc_status),
+        grpc_message,
+        grpc_trailers: trailers,
+    }
+}
+
+/// Borrowed inspection of whether an authorizing terminate rejection is still
+/// the intact framed unary representation.
+///
+/// Shared by the owned normalizer and H3 reject logging so both agree on
+/// authored HTTP status, byte-exact frame equality, native `content-type`, a
+/// single uncompressed unary frame, terminal status parsing, and message
+/// sanitization — without requiring a full-body copy on the logging path.
+pub(crate) fn intact_framed_unary_terminate_signal<'a>(
+    framed_unary_provenance: FramedGrpcUnaryProvenance<'a>,
+    status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+) -> Option<(u32, Option<String>, &'a HashMap<String, String>)> {
+    let authored_trailers = framed_unary_provenance.authorized_trailers(status, body)?;
+    if body.is_empty() {
+        return None;
+    }
+    let content_type = headers.get("content-type")?;
+    if !backend_dispatch::is_native_grpc_content_type(content_type.as_bytes()) {
+        return None;
+    }
+    if !bytes_are_single_uncompressed_unary_grpc_frame(body) {
+        return None;
+    }
+    let grpc_status = authored_trailers.get("grpc-status")?.parse::<u32>().ok()?;
+    let grpc_message = authored_trailers
+        .get("grpc-message")
+        .map(|message| sanitize_grpc_message(message))
+        .filter(|message| !message.is_empty());
+    Some((grpc_status, grpc_message, authored_trailers))
+}
+
+/// Shared predicate for "this normalized rejection is a framed unary gRPC
+/// response rather than a trailers-only error", plus the terminal trailers that
+/// MUST accompany the DATA frame.
+///
+/// Every emitter (the H1/H2 body builder, the direct-H3 writer, and both H3
+/// cross-protocol writers) reads this one helper so no protocol path can emit
+/// DATA while dropping the mandatory terminal metadata.
+/// The `Bytes` handle is returned (rather than a slice) so an emitter clones the
+/// shared buffer instead of copying the frame out of it.
+pub(crate) fn framed_unary_reject_parts(
+    reject: &NormalizedRejectResponse,
+) -> Option<(&Bytes, &HashMap<String, String>)> {
+    (!reject.body.is_empty() && !reject.grpc_trailers.is_empty())
+        .then_some((&reject.body, &reject.grpc_trailers))
+}
+
+pub(crate) fn bytes_are_single_uncompressed_unary_grpc_frame(body: &[u8]) -> bool {
+    if body.len() < 5 {
+        return false;
+    }
+    // Compression is unsupported on the serverless terminate contract; only
+    // flag byte 0 (uncompressed DATA) is accepted.
+    if body[0] != 0 {
+        return false;
+    }
+    let msg_len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+    // `5 + msg_len` would overflow `usize` on a 32-bit target for a declared
+    // length near `u32::MAX`; a wrapped sum could then match a short body.
+    msg_len.checked_add(5) == Some(body.len())
 }
 
 fn normalized_grpc_deadline_exceeded() -> NormalizedRejectResponse {
@@ -16982,7 +17787,10 @@ fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Re
         &reject.headers,
     );
 
-    let body = if reject.body.is_empty() {
+    let body = if framed_unary_reject_parts(&reject).is_some() {
+        let trailers = grpc_proxy::buffered_grpc_trailers_to_header_map(&reject.grpc_trailers);
+        ProxyBody::buffered_grpc_with_trailers(reject.body, trailers)
+    } else if reject.body.is_empty() {
         // Status-aware empty body: 205 must not advertise Content-Length on H1
         // (Hyper would otherwise synthesize `Content-Length: 0` for ordinary
         // empty Full bodies; 204/304 are already special-cased upstream).
@@ -18113,7 +18921,13 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
         std::sync::atomic::Ordering::Relaxed,
     );
     let status = StatusCode::from_u16(response_status).unwrap_or(status);
-    normalize_reject_response(status, response_body, &headers, is_grpc_request)
+    normalize_reject_response_with_provenance(
+        status,
+        response_body,
+        &headers,
+        is_grpc_request,
+        FramedGrpcUnaryProvenance::from_context(ctx),
+    )
 }
 
 /// Finalize a terminal request-body read failure before any external operation
@@ -27888,10 +28702,10 @@ pub(crate) async fn proxy_to_backend_retry(
     let effective_proxy = resolve_effective_proxy_for_target(proxy, upstream_target);
     let proxy: &Proxy = effective_proxy.as_ref();
 
-    // All reqwest clients use our DnsCacheResolver, so DNS resolution is
-    // always served from the warmed cache — never hitting DNS on the hot path.
-    // For both single-backend and load-balanced proxies, the client transparently
-    // resolves hostnames through the DNS cache.
+    // All reqwest hostname resolution uses our DnsCacheResolver, so it is
+    // served from the warmed cache — never hitting DNS on the hot path.
+    // URL-literal hosts bypass reqwest's resolver and are screened below before
+    // this retry-only reqwest path can dial them.
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
@@ -27901,8 +28715,23 @@ pub(crate) async fn proxy_to_backend_retry(
     // rotation must be rejected here too, mirroring the first-attempt screen in
     // proxy_to_backend. (Hostname targets are screened by the resolver at
     // dispatch and classified via classify_reqwest_error.)
-    if denied_literal_backend_ip(effective_host, &state.env_config.backend_allow_ips).is_some() {
+    if let Some(reason) = denied_literal_backend_or_dns_override(
+        effective_host,
+        proxy,
+        &state.env_config.backend_allow_ips,
+    ) {
+        warn!(
+            proxy_id = %proxy.id,
+            backend = %effective_host,
+            reason,
+            "Backend egress policy denied literal-IP retry target; not dialing"
+        );
         return backend_egress_denied_response(effective_host);
+    }
+
+    if let Some(conflict) = reqwest_dns_override_literal_conflict(effective_host, proxy) {
+        warn_reqwest_dns_override_literal_conflict(proxy, effective_host, conflict);
+        return backend_dns_override_literal_conflict_response(conflict);
     }
 
     if proxy.resolved_tls.sni.is_some() {
@@ -28630,6 +29459,66 @@ pub(crate) fn denied_literal_backend_or_dns_override(
     })
 }
 
+/// A reqwest dispatch cannot apply a custom DNS resolver to a URL host that
+/// parses as an IP literal: hyper-util skips resolution and dials the literal
+/// directly. Keep that dependency behavior from silently defeating a proxy's
+/// `dns_override`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReqwestDnsOverrideLiteralConflict {
+    InvalidOverride {
+        target_ip: std::net::IpAddr,
+    },
+    Mismatch {
+        target_ip: std::net::IpAddr,
+        override_ip: std::net::IpAddr,
+    },
+}
+
+fn reqwest_dns_override_literal_conflict(
+    host: &str,
+    proxy: &Proxy,
+) -> Option<ReqwestDnsOverrideLiteralConflict> {
+    let dns_override = proxy.dns_override.as_deref()?;
+    let target_ip = crate::config::types::egress_literal_ip(host)?;
+    match dns_override.parse::<std::net::IpAddr>() {
+        Ok(override_ip) if override_ip == target_ip => None,
+        Ok(override_ip) => Some(ReqwestDnsOverrideLiteralConflict::Mismatch {
+            target_ip,
+            override_ip,
+        }),
+        Err(_) => Some(ReqwestDnsOverrideLiteralConflict::InvalidOverride { target_ip }),
+    }
+}
+
+fn warn_reqwest_dns_override_literal_conflict(
+    proxy: &Proxy,
+    host: &str,
+    conflict: ReqwestDnsOverrideLiteralConflict,
+) {
+    match conflict {
+        ReqwestDnsOverrideLiteralConflict::InvalidOverride { target_ip } => {
+            warn!(
+                proxy_id = %proxy.id,
+                backend = %host,
+                target_ip = %target_ip,
+                "Invalid dns_override cannot be applied to literal reqwest target; not dialing"
+            );
+        }
+        ReqwestDnsOverrideLiteralConflict::Mismatch {
+            target_ip,
+            override_ip,
+        } => {
+            warn!(
+                proxy_id = %proxy.id,
+                backend = %host,
+                target_ip = %target_ip,
+                dns_override_ip = %override_ip,
+                "dns_override differs from literal reqwest target; not dialing"
+            );
+        }
+    }
+}
+
 /// Canonical-literal-only counterpart of [`denied_literal_backend_ip`] for the
 /// **self-resolving** dispatch pools — gRPC (`GrpcConnectionPool`) and native H3
 /// (`Http3ConnectionPool`). Those pools do NOT hand the host to reqwest's URL
@@ -28682,6 +29571,30 @@ fn backend_egress_denied_response(host: &str) -> retry::BackendResponse {
         headers: HashMap::new(),
         connection_error: false,
         backend_resolved_ip: Some(host.to_string()),
+        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+    }
+}
+
+/// Fail closed when reqwest would bypass a configured DNS override for a
+/// literal URL target. No dial occurred, so this is neutral to retries,
+/// passive health, and circuit-breaker accounting.
+fn backend_dns_override_literal_conflict_response(
+    conflict: ReqwestDnsOverrideLiteralConflict,
+) -> retry::BackendResponse {
+    let resolved_ip = match conflict {
+        ReqwestDnsOverrideLiteralConflict::InvalidOverride { .. } => None,
+        ReqwestDnsOverrideLiteralConflict::Mismatch { override_ip, .. } => {
+            Some(override_ip.to_string())
+        }
+    };
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::buffered(
+            br#"{"error":"backend DNS override cannot be applied to literal target"}"#.to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
     }
 }
@@ -28805,10 +29718,10 @@ async fn proxy_to_backend(
     // call sites in `proxy_to_backend_inner` are unchanged.
     let mut retained_body: Option<Bytes> = None;
 
-    // All reqwest clients use our DnsCacheResolver, so DNS resolution is
-    // always served from the warmed cache — never hitting DNS on the hot path.
-    // For both single-backend and load-balanced proxies, the client transparently
-    // resolves hostnames through the DNS cache.
+    // All reqwest hostname resolution uses our DnsCacheResolver, so it is
+    // served from the warmed cache — never hitting DNS on the hot path.
+    // URL-literal hosts bypass reqwest's resolver; direct connectors can still
+    // honor their override, while the reqwest fallback is screened below.
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
@@ -28830,8 +29743,11 @@ async fn proxy_to_backend(
     }
 
     // Resolve backend IP from DNS cache (O(1) cached lookup, <1μs).
-    // This is the same cache reqwest will use internally via DnsCacheResolver,
-    // so the IP will match the actual connection target.
+    // When `dns_override` is set, this returns the override IP for the
+    // selected host — the same address the pooled reqwest client's
+    // `DnsCacheResolver::with_dns_override` will dial for that hostname
+    // (including load-balanced targets that differ from `backend_host`).
+    // Without an override, both paths consult the shared cache.
     let resolve_backend_ip = state.dns_cache.resolve(
         effective_host,
         proxy.dns_override.as_deref(),
@@ -29348,6 +30264,20 @@ async fn proxy_to_backend(
                 "H2 pool bypassed for request buffering support — using reqwest (ALPN HTTP/2)"
             );
         }
+    }
+
+    // hyper-util bypasses reqwest's custom resolver for URL-literal hosts. A
+    // differing (or invalid) dns_override would therefore be reported in
+    // telemetry but not used for the socket dial. Direct H2/H3/HBONE branches
+    // above resolve independently and may honor that combination; reject only
+    // now that dispatch has fallen through to reqwest.
+    if let Some(conflict) = reqwest_dns_override_literal_conflict(effective_host, proxy) {
+        warn_reqwest_dns_override_literal_conflict(proxy, effective_host, conflict);
+        return backend_dispatch_response(
+            backend_dns_override_literal_conflict_response(conflict),
+            None,
+            None,
+        );
     }
 
     // Get client from connection pool for HTTP/1.1 and HTTP/2.
@@ -35642,6 +36572,39 @@ mod tests {
         .expect("valid proxy")
     }
 
+    #[test]
+    fn reqwest_dns_override_literal_conflict_matches_url_host_semantics() {
+        let mut proxy = streaming_dispatch_test_proxy();
+        proxy.dns_override = Some("127.0.0.2".to_string());
+
+        assert_eq!(
+            reqwest_dns_override_literal_conflict("2130706433", &proxy),
+            Some(ReqwestDnsOverrideLiteralConflict::Mismatch {
+                target_ip: "127.0.0.1".parse().unwrap(),
+                override_ip: "127.0.0.2".parse().unwrap(),
+            }),
+            "non-canonical URL literals must be screened exactly as reqwest parses them"
+        );
+        assert_eq!(
+            reqwest_dns_override_literal_conflict("127.0.0.2", &proxy),
+            None,
+            "a literal already equal to the override is safe when reqwest bypasses DNS"
+        );
+        assert_eq!(
+            reqwest_dns_override_literal_conflict("backend.example.com", &proxy),
+            None,
+            "hostname targets still pass through the custom resolver"
+        );
+
+        proxy.dns_override = Some("not-an-ip".to_string());
+        assert_eq!(
+            reqwest_dns_override_literal_conflict("127.0.0.1", &proxy),
+            Some(ReqwestDnsOverrideLiteralConflict::InvalidOverride {
+                target_ip: "127.0.0.1".parse().unwrap(),
+            })
+        );
+    }
+
     /// The cross-cluster HBONE backend-URL authority rewrite swaps the
     /// (non-parseable) scoped synthetic host for the real pod addr in the
     /// AUTHORITY position only, leaving the path/query (and any host-like
@@ -38700,6 +39663,101 @@ mod tests {
             resp.headers.get("gateway-error-reason").map(String::as_str),
             Some(BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON)
         );
+    }
+
+    #[tokio::test]
+    async fn reqwest_retry_fails_closed_when_literal_target_differs_from_dns_override() {
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.backend_host = "127.0.0.1".to_string();
+        proxy.backend_port = 1;
+        proxy.dns_override = Some("127.0.0.2".to_string());
+        let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+
+        let resp = proxy_to_backend_retry(
+            &state,
+            &proxy,
+            "http://127.0.0.1:1/",
+            "GET",
+            &HashMap::new(),
+            None,
+            None,
+            true,
+            &[],
+            &ctx,
+            "127.0.0.1",
+            "127.0.0.1",
+            false,
+            hyper::Version::HTTP_11,
+        )
+        .await;
+
+        assert_eq!(resp.status_code, 502);
+        assert!(!resp.connection_error);
+        assert_eq!(
+            resp.error_class,
+            Some(retry::ErrorClass::DispatchPolicyRejected)
+        );
+        assert_eq!(resp.backend_resolved_ip.as_deref(), Some("127.0.0.2"));
+    }
+
+    #[tokio::test]
+    async fn reqwest_initial_dispatch_fails_closed_on_literal_dns_override_conflict() {
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.backend_host = "127.0.0.1".to_string();
+        proxy.backend_port = 1;
+        proxy.dns_override = Some("127.0.0.2".to_string());
+        let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+        let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut backend_start = std::time::Instant::now();
+
+        let dispatch = proxy_to_backend(
+            &state,
+            &proxy,
+            "http://127.0.0.1:1/",
+            "GET",
+            &HashMap::new(),
+            ClientRequestBody::Buffered(BufferedClientRequestBody {
+                method: hyper::Method::GET,
+                headers: hyper::HeaderMap::new(),
+                body: Vec::new(),
+            }),
+            None,
+            &[],
+            &[],
+            PreacquiredBackendAdmission::default(),
+            None,
+            &ctx,
+            true,
+            false,
+            true,
+            false,
+            false,
+            "127.0.0.1",
+            "127.0.0.1",
+            false,
+            false,
+            false,
+            false,
+            &bytes_sent,
+            hyper::Version::HTTP_11,
+            &mut backend_start,
+        )
+        .await;
+
+        let BackendDispatchResult::Response { response, .. } = dispatch else {
+            panic!("dns_override policy rejection must be a backend response");
+        };
+        assert_eq!(response.status_code, 502);
+        assert!(!response.connection_error);
+        assert_eq!(
+            response.error_class,
+            Some(retry::ErrorClass::DispatchPolicyRejected)
+        );
+        assert_eq!(response.backend_resolved_ip.as_deref(), Some("127.0.0.2"));
     }
 
     /// End-to-end wiring guard for the content-type-aware buffer->stream
