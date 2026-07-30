@@ -6,6 +6,7 @@
 //! boundary. It deliberately keeps the generic proxy/plugin chain unchanged so
 //! existing plugins work in mesh context.
 
+pub mod access_log_filter;
 pub mod config;
 pub mod config_consumer;
 pub mod dns_proxy;
@@ -22119,6 +22120,7 @@ mod tests {
                             status_code_max: None,
                             min_latency_ms: None,
                             errors_only: false,
+                            expression: None,
                         }),
                     }),
                     ..MeshTelemetryConfig::default()
