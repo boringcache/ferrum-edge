@@ -9816,6 +9816,11 @@ fn is_websocket_transport_managed_response_header(name: &str) -> bool {
 pub(crate) fn strip_websocket_transport_managed_response_header_map(
     response_headers: &mut HashMap<String, String>,
 ) {
+    // Parse and remove Connection-nominated extensions while the Connection
+    // value is still present. Removing the static WebSocket fields first would
+    // erase the only witness that an otherwise ordinary extension is
+    // hop-by-hop and let it cross the successful/reject handshake boundary.
+    headers_mod::strip_client_response_hop_by_hop_headers(response_headers);
     response_headers.retain(|name, _| !is_websocket_transport_managed_response_header(name));
 }
 
@@ -18028,6 +18033,12 @@ fn finalize_grpc_web_error_response_headers_with_policy_source(
         initial_response_header_policy_source.apply(&mut response.headers);
     }
 
+    // Consume Connection nominations before the fixed managed-field retain
+    // below removes `Connection` itself. Otherwise a policy could leave the
+    // nominated extension behind on this generated-error path even though
+    // ordinary responses run the shared final wire sanitizer.
+    headers_mod::strip_client_response_hop_by_hop_headers(&mut response.headers);
+
     let expose_headers = merge_grpc_web_expose_headers(
         Some(crate::plugins::grpc_web::BASE_EXPOSE_HEADERS_VALUE),
         &response.headers,
@@ -18068,9 +18079,12 @@ fn finalize_grpc_web_error_response_headers_with_policy_source(
             .headers
             .insert("access-control-expose-headers".to_string(), expose_headers);
     }
-    response.headers.insert(
-        "content-length".to_string(),
-        response.body.len().to_string(),
+    headers_mod::sanitize_client_response_headers_for_wire(
+        &mut response.headers,
+        headers_mod::ClientResponseFraming::ExactBody {
+            status: StatusCode::OK.as_u16(),
+            len: response.body.len() as u64,
+        },
     );
 }
 

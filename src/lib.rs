@@ -4178,6 +4178,12 @@ pub mod _test_support {
         );
     }
 
+    pub fn strip_websocket_transport_managed_response_headers(
+        headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::strip_websocket_transport_managed_response_header_map(headers);
+    }
+
     pub async fn run_h3_reject_response_committed_hooks(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,

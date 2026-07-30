@@ -4055,6 +4055,43 @@ fn test_ordinary_streaming_framing_strips_every_content_length_spelling() {
     assert_eq!(both.get("x-ok").map(String::as_str), Some("1"));
 }
 
+#[test]
+fn websocket_transport_boundary_strips_connection_nominated_extensions() {
+    use ferrum_edge::_test_support::strip_websocket_transport_managed_response_headers;
+
+    let mut headers = HashMap::from([
+        (
+            "Connection".to_string(),
+            "Upgrade, X-Handshake-Hop".to_string(),
+        ),
+        ("X-Handshake-Hop".to_string(), "must-not-leak".to_string()),
+        ("Sec-WebSocket-Protocol".to_string(), "fabricated".to_string()),
+        ("Content-Length".to_string(), "999".to_string()),
+        ("x-end-to-end".to_string(), "preserved".to_string()),
+    ]);
+
+    strip_websocket_transport_managed_response_headers(&mut headers);
+
+    for removed in [
+        "connection",
+        "upgrade",
+        "x-handshake-hop",
+        "sec-websocket-protocol",
+        "content-length",
+    ] {
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case(removed)),
+            "{removed} crossed the WebSocket handshake boundary"
+        );
+    }
+    assert_eq!(
+        headers.get("x-end-to-end").map(String::as_str),
+        Some("preserved")
+    );
+}
+
 /// `HEAD` is the one exemption, and it is narrow: exactly one valid
 /// representation length survives, while invalid values, duplicate case
 /// variants, and no-body statuses are still stripped.

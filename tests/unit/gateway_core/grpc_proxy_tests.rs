@@ -601,6 +601,48 @@ fn grpc_web_reject_finalizer_preserves_synthesized_status_without_terminal_overr
 }
 
 #[test]
+fn grpc_web_reject_finalizer_strips_connection_nominated_extensions() {
+    let mut response = ferrum_edge::plugins::grpc_web::error_response_for_content_type(
+        "application/grpc-web+proto",
+        14,
+        "backend unavailable",
+    );
+    let finalized_headers = HashMap::from([
+        (
+            "Connection".to_string(),
+            "keep-alive, X-Policy-Hop".to_string(),
+        ),
+        ("X-Policy-Hop".to_string(), "must-not-leak".to_string()),
+        ("x-end-to-end".to_string(), "preserved".to_string()),
+    ]);
+
+    ferrum_edge::_test_support::finalize_grpc_web_error_response_headers(
+        &mut response,
+        &[],
+        Some(&finalized_headers),
+    );
+
+    for removed in ["connection", "keep-alive", "x-policy-hop"] {
+        assert!(
+            !response
+                .headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case(removed)),
+            "{removed} crossed the generated gRPC-Web error boundary"
+        );
+    }
+    assert_eq!(
+        response.headers.get("x-end-to-end").map(String::as_str),
+        Some("preserved")
+    );
+    let expected_content_length = response.body.len().to_string();
+    assert_eq!(
+        response.headers.get("content-length"),
+        Some(&expected_content_length)
+    );
+}
+
+#[test]
 fn grpc_web_reject_finalizer_moves_rich_status_details_into_body_trailer() {
     for (response_content_type, is_text) in [
         ("application/grpc-web+proto", false),
