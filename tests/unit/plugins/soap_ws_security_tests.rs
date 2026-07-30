@@ -8,6 +8,7 @@ use ferrum_edge::_test_support::{
     soap_retire_same_cardinality_drift_scope_for_test,
     soap_shared_claim_retention_seconds_for_test, soap_username_token_created_outcome_for_test,
 };
+use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
@@ -56,6 +57,28 @@ fn make_ctx_with_soap_bytes(body: Vec<u8>, content_type: &str) -> RequestContext
         .insert("content-type".to_string(), content_type.to_string());
     ctx.request_body_bytes = Some(bytes::Bytes::from(body));
     ctx
+}
+
+/// Run the plugin's request-side policy in whichever phase its configuration
+/// selects.
+///
+/// GHSA-gfrx-43w6-jq3c moved identity-establishing SOAP policies
+/// (`username_token` / `x509_signature` / `saml`) into the `authenticate`
+/// phase so the SOAP principal exists before authorization; a timestamp-only
+/// policy establishes no principal and keeps validating in `before_proxy`. The
+/// two are mutually exclusive by configuration, so this helper mirrors the
+/// proxy's own dispatch.
+async fn run_soap_request_policy(
+    plugin: &SoapWsSecurity,
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) -> PluginResult {
+    if plugin.is_auth_plugin() {
+        let consumer_index = ConsumerIndex::new(&[]);
+        plugin.authenticate(ctx, &consumer_index).await
+    } else {
+        plugin.before_proxy(ctx, headers).await
+    }
 }
 
 fn soap_headers_with_content_type(content_type: &str) -> HashMap<String, String> {
@@ -506,6 +529,29 @@ fn test_x509_malformed_pem_error_withholds_configured_source() {
     );
 }
 
+#[test]
+fn test_x509_end_marker_before_begin_fails_without_panicking() {
+    let source = "-----END CERTIFICATE-----\n\
+                  -----BEGIN CERTIFICATE-----\n\
+                  U09BUA==\n";
+    let config = json!({
+        "timestamp": { "require": false },
+        "x509_signature": {
+            "enabled": true,
+            "trusted_certs": [source]
+        }
+    });
+
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("misordered PEM markers must fail admission");
+    assert!(err.contains("failed to decode PEM"), "got: {err}");
+    assert!(
+        !err.contains(source) && err.contains(INLINE_PEM_DISPLAY),
+        "misordered inline PEM must be rejected under a redacted source label: {err}"
+    );
+}
+
 /// The SAML `trusted_signing_certs` loop carries the same rule.
 #[test]
 fn test_saml_malformed_pem_error_withholds_configured_source() {
@@ -514,6 +560,8 @@ fn test_saml_malformed_pem_error_withholds_configured_source() {
         "saml": {
             "enabled": true,
             "trusted_issuers": ["urn:test:idp"],
+            "audience": "https://service.example.com",
+            "recipient": "https://service.example.com/ws",
             "trusted_signing_certs": [MALFORMED_INLINE_PEM],
             "allowed_signature_algorithms": ["rsa-sha256"]
         }
@@ -801,19 +849,41 @@ fn test_valid_username_token_config() {
     assert_eq!(plugin.name(), "soap_ws_security");
 }
 
-// ── Non-SOAP request passthrough tests ──────────────────────────────────────
+// ── Non-SOAP request handling ───────────────────────────────────────────────
+//
+// GHSA-435h-f785-wmm4: pass-through is no longer the consequence of a
+// client-chosen header value. On the default `strict` route every request is
+// governed; `mixed_route` is the explicit opt-out that restores pass-through.
+
+fn mixed_route_timestamp_only_config() -> serde_json::Value {
+    let mut config = timestamp_only_config();
+    config["content_type"] = json!({ "mode": "mixed_route" });
+    config
+}
 
 #[tokio::test]
-async fn test_non_soap_content_type_passes_through() {
+async fn test_non_soap_content_type_is_rejected_on_a_strict_route() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let mut ctx = make_ctx_non_soap();
     let mut headers = non_soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 415),
+        other => panic!("strict routes must govern every request, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_non_soap_content_type_passes_through_on_a_mixed_route() {
+    let plugin = SoapWsSecurity::new(&mixed_route_timestamp_only_config()).unwrap();
+    let mut ctx = make_ctx_non_soap();
+    let mut headers = non_soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
 
 #[tokio::test]
-async fn test_no_content_type_passes_through() {
+async fn test_no_content_type_is_rejected_on_a_strict_route() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -821,7 +891,23 @@ async fn test_no_content_type_passes_through() {
         "/ws".to_string(),
     );
     let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 415),
+        other => panic!("an absent Content-Type must not skip policy, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_no_content_type_passes_through_on_a_mixed_route() {
+    let plugin = SoapWsSecurity::new(&mixed_route_timestamp_only_config()).unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/ws".to_string(),
+    );
+    let mut headers = HashMap::new();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
 
@@ -840,7 +926,7 @@ async fn test_application_soap_xml_is_processed() {
         "content-type".to_string(),
         "application/soap+xml; charset=utf-8".to_string(),
     );
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
 
@@ -855,7 +941,7 @@ async fn test_missing_security_header_rejects() {
     </soap:Envelope>"#;
     let mut ctx = make_ctx_with_soap_body(body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert_eq!(reject_status(&result), 401);
     assert!(reject_body(&result).contains("Security header is missing"));
@@ -874,7 +960,7 @@ async fn test_missing_security_header_allowed_when_not_required() {
     </soap:Envelope>"#;
     let mut ctx = make_ctx_with_soap_body(body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
 
@@ -886,7 +972,7 @@ async fn test_valid_timestamp_passes() {
     let body = wrap_soap(&fresh_timestamp());
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
 
@@ -896,7 +982,7 @@ async fn test_missing_timestamp_rejects() {
     let body = wrap_soap("<!-- no timestamp -->");
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("missing Timestamp"));
 }
@@ -915,7 +1001,7 @@ async fn test_expired_timestamp_rejects() {
     let body = wrap_soap(&ts);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("too old"));
 }
@@ -943,7 +1029,7 @@ async fn test_future_timestamp_rejects() {
     let body = wrap_soap(&ts);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("in the future"));
 }
@@ -972,7 +1058,7 @@ async fn test_timestamp_expires_past_rejects() {
     let body = wrap_soap(&ts);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("expired"));
 }
@@ -998,7 +1084,7 @@ async fn test_timestamp_require_expires_missing_rejects() {
     let body = wrap_soap(&ts);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("missing required Expires"));
 }
@@ -1015,7 +1101,7 @@ async fn test_username_token_password_text_valid() {
     let body = wrap_soap(ut);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(ctx.metadata.get("soap_ws_username").unwrap(), "alice");
 }
@@ -1030,7 +1116,7 @@ async fn test_username_token_wrong_password_rejects() {
     let body = wrap_soap(ut);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert_username_token_invalid_credentials(&result, &["alice"]);
 }
 
@@ -1049,7 +1135,7 @@ async fn test_password_digest_config_rejects_passwordtext_type_downgrade() {
     let body = wrap_soap(ut);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert_eq!(reject_status(&result), 401);
     assert!(
@@ -1072,7 +1158,7 @@ async fn test_password_text_config_rejects_passworddigest_type() {
     let body = wrap_soap(ut);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert_eq!(reject_status(&result), 401);
     assert!(
@@ -1092,7 +1178,7 @@ async fn test_username_token_unknown_user_rejects() {
     let body = wrap_soap(ut);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert_username_token_invalid_credentials(&result, &["eve", "alice"]);
 }
 
@@ -1105,7 +1191,7 @@ async fn test_username_token_missing_password_rejects() {
     let body = wrap_soap(ut);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("missing Password"));
 }
@@ -1119,7 +1205,7 @@ async fn test_username_token_missing_username_rejects() {
     let body = wrap_soap(ut);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("missing Username"));
 }
@@ -1135,7 +1221,7 @@ async fn test_password_digest_valid() {
     let body = wrap_soap(&ut);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "Expected Continue, got {:?}",
@@ -1153,7 +1239,7 @@ async fn test_password_digest_valid_over_utf16le_wire_bytes() {
     let bytes = encode_utf16_le(&body);
     let mut ctx = make_ctx_with_soap_bytes(bytes, "application/soap+xml; charset=utf-16");
     let mut headers = soap_headers_with_content_type("application/soap+xml; charset=utf-16");
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "UTF-16LE PasswordDigest should validate after decode, got {:?}",
@@ -1169,7 +1255,7 @@ async fn test_password_digest_wrong_password_rejects() {
     let body = wrap_soap(&ut);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert_username_token_invalid_credentials(&result, &["alice"]);
 }
 
@@ -1203,7 +1289,7 @@ async fn test_username_token_credential_failures_are_indistinguishable() {
         let body = wrap_soap(&token);
         let mut ctx = make_ctx_with_soap_body(&body);
         let mut headers = soap_headers();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(plugin, &mut ctx, &mut headers).await;
         assert_username_token_invalid_credentials(&result, &["eve-candidate", "alice"]);
         outcomes.push((
             reject_status(&result),
@@ -1231,7 +1317,7 @@ async fn test_password_digest_missing_nonce_rejects() {
     let body = wrap_soap(ut);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("requires Nonce"));
 }
@@ -1244,7 +1330,7 @@ async fn test_username_token_missing_token_is_structural() {
     let body = wrap_soap("");
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert_username_token_structural(&result, "missing UsernameToken", &["alice", "eve"]);
 }
 
@@ -1260,7 +1346,7 @@ async fn test_username_token_empty_password_element_is_structural() {
     let body = wrap_soap(ut);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert_username_token_structural(&result, "Password element has no content", &["alice"]);
 }
 
@@ -1276,7 +1362,7 @@ async fn test_password_digest_invalid_nonce_base64_is_structural() {
     let body = wrap_soap(ut);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert_username_token_structural(&result, "invalid Nonce base64 encoding", &["alice"]);
 }
 
@@ -1298,7 +1384,7 @@ async fn test_password_digest_missing_created_is_structural_for_known_and_unknow
         let body = wrap_soap(&ut);
         let mut ctx = make_ctx_with_soap_body(&body);
         let mut headers = soap_headers();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
         assert_username_token_structural(
             &result,
             "PasswordDigest requires Created",
@@ -1324,13 +1410,13 @@ async fn test_nonce_replay_detected() {
     // First request succeeds
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 
     // Second request with same nonce is replay
     let mut ctx2 = make_ctx_with_soap_body(&body);
     let mut headers2 = soap_headers();
-    let result2 = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    let result2 = run_soap_request_policy(&plugin, &mut ctx2, &mut headers2).await;
     assert!(is_reject(&result2));
     assert!(reject_body(&result2).contains("nonce replay"));
 }
@@ -1358,9 +1444,7 @@ async fn failed_digest_attempts_do_not_poison_a_valid_principals_nonce() {
         let failed_body = wrap_soap(&failed_token);
         let mut failed_ctx = make_ctx_with_soap_body(&failed_body);
         let mut failed_headers = soap_headers();
-        let failed = plugin
-            .before_proxy(&mut failed_ctx, &mut failed_headers)
-            .await;
+        let failed = run_soap_request_policy(&plugin, &mut failed_ctx, &mut failed_headers).await;
         assert_username_token_invalid_credentials(
             &failed,
             &[attempt_username, "alice", "eve-candidate"],
@@ -1371,9 +1455,7 @@ async fn failed_digest_attempts_do_not_poison_a_valid_principals_nonce() {
         let valid_body = wrap_soap(&valid_token);
         let mut valid_ctx = make_ctx_with_soap_body(&valid_body);
         let mut valid_headers = soap_headers();
-        let valid = plugin
-            .before_proxy(&mut valid_ctx, &mut valid_headers)
-            .await;
+        let valid = run_soap_request_policy(&plugin, &mut valid_ctx, &mut valid_headers).await;
         assert!(
             matches!(valid, PluginResult::Continue),
             "failed attempt for {attempt_username} poisoned the legitimate nonce: {valid:?}"
@@ -1381,9 +1463,7 @@ async fn failed_digest_attempts_do_not_poison_a_valid_principals_nonce() {
 
         let mut replay_ctx = make_ctx_with_soap_body(&valid_body);
         let mut replay_headers = soap_headers();
-        let replay = plugin
-            .before_proxy(&mut replay_ctx, &mut replay_headers)
-            .await;
+        let replay = run_soap_request_policy(&plugin, &mut replay_ctx, &mut replay_headers).await;
         assert!(is_reject(&replay));
         assert!(reject_body(&replay).contains("nonce replay"));
     }
@@ -1428,6 +1508,11 @@ fn test_saml_enabled_without_trusted_signing_certs_is_error() {
         "saml": {
             "enabled": true,
             "trusted_issuers": ["https://idp.example.com"],
+            // Both bindings are mandatory when SAML is enabled and are checked
+            // ahead of the trust material, so they must be present for this
+            // test to reach the arm it is about.
+            "audience": "https://service.example.com",
+            "recipient": "https://service.example.com/ws",
             "trusted_signing_certs": []
         }
     });
@@ -1454,6 +1539,8 @@ fn test_saml_unreadable_signing_cert_is_error() {
         "saml": {
             "enabled": true,
             "trusted_issuers": ["https://idp.example.com"],
+            "audience": "https://service.example.com",
+            "recipient": "https://service.example.com/ws",
             "trusted_signing_certs": ["/nonexistent/path/to/cert.pem"]
         }
     });
@@ -1630,13 +1717,38 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
             .collect::<String>()
     }
 
+    pub const SAML_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
+    pub const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+    pub const TEST_AUDIENCE: &str = "https://service.example.com";
+    pub const TEST_RECIPIENT: &str = "https://service.example.com/ws";
+
+    /// A `Conditions` window that is inside policy for a fixture built now.
+    pub fn default_not_before() -> String {
+        (chrono::Utc::now() - chrono::Duration::seconds(60))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+
+    pub fn default_not_on_or_after() -> String {
+        (chrono::Utc::now() + chrono::Duration::seconds(120))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+
     pub struct AssertionBuilder<'a> {
         pub assertion_id: &'a str,
         pub issuer: &'a str,
         pub subject_name_id: &'a str,
-        pub not_before: Option<&'a str>,
-        pub not_on_or_after: Option<&'a str>,
-        pub audience: Option<&'a str>,
+        pub not_before: Option<String>,
+        pub not_on_or_after: Option<String>,
+        pub audience: Option<String>,
+        /// `SubjectConfirmationData/@Recipient`. `None` omits the whole
+        /// SubjectConfirmation, which GHSA-f44p-hfqr-cvcc requires be rejected.
+        pub recipient: Option<String>,
+        pub confirmation_method: &'a str,
+        pub confirmation_not_on_or_after: Option<String>,
+        pub confirmation_in_response_to: Option<String>,
+        pub one_time_use: bool,
         pub sign_with_untrusted_key: bool,
         pub use_sha1_digest: bool,
         /// Insert junk bytes into the assertion AFTER signing to simulate a
@@ -1645,21 +1757,44 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
         /// Mutate the SignatureValue bytes after signing to simulate a
         /// forged or randomly damaged signature.
         pub corrupt_signature_value: bool,
+        /// Replace the whole `<saml:NameID>…</saml:NameID>` fragment inside
+        /// `<saml:Subject>`, in both the emitted and the signed view, so a
+        /// Subject with no / blank / duplicate NameID still carries a fully
+        /// valid IdP signature. `""` removes the NameID entirely.
+        pub name_id_fragment: Option<String>,
+        /// `SignedInfo/Reference/@URI`, applied **before** the SignedInfo is
+        /// canonicalized and signed. Rewriting it after signing would only ever
+        /// reach the signature arm: trust and `SignatureValue`-over-`SignedInfo`
+        /// are settled before the first Reference is resolved
+        /// (GHSA-9g4v-h9hm-846r), so a Reference-scoping test has to sign the
+        /// URI it wants judged. `None` targets the enclosing assertion.
+        pub reference_uri_override: Option<String>,
     }
 
     impl<'a> AssertionBuilder<'a> {
+        /// A fixture that satisfies every binding the plugin now requires:
+        /// bounded Conditions, the service Audience, and a bearer
+        /// SubjectConfirmation naming the service Recipient. Negative tests
+        /// clear exactly the field they are about.
         pub fn new(assertion_id: &'a str, issuer: &'a str, subject_name_id: &'a str) -> Self {
             Self {
                 assertion_id,
                 issuer,
                 subject_name_id,
-                not_before: None,
-                not_on_or_after: None,
-                audience: None,
+                not_before: Some(default_not_before()),
+                not_on_or_after: Some(default_not_on_or_after()),
+                audience: Some(TEST_AUDIENCE.to_string()),
+                recipient: Some(TEST_RECIPIENT.to_string()),
+                confirmation_method: "urn:oasis:names:tc:SAML:2.0:cm:bearer",
+                confirmation_not_on_or_after: Some(default_not_on_or_after()),
+                confirmation_in_response_to: None,
+                one_time_use: false,
                 sign_with_untrusted_key: false,
                 use_sha1_digest: false,
                 corrupt_subject_after_signing: false,
                 corrupt_signature_value: false,
+                name_id_fragment: None,
+                reference_uri_override: None,
             }
         }
 
@@ -1671,22 +1806,45 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
             if self.not_before.is_some()
                 || self.not_on_or_after.is_some()
                 || self.audience.is_some()
+                || self.one_time_use
             {
-                conditions.push_str("<Conditions");
-                if let Some(nb) = self.not_before {
+                conditions.push_str("<saml:Conditions");
+                if let Some(nb) = self.not_before.as_deref() {
                     conditions.push_str(&format!(" NotBefore=\"{}\"", nb));
                 }
-                if let Some(noa) = self.not_on_or_after {
+                if let Some(noa) = self.not_on_or_after.as_deref() {
                     conditions.push_str(&format!(" NotOnOrAfter=\"{}\"", noa));
                 }
-                if let Some(aud) = self.audience {
-                    conditions.push_str(&format!(
-                        "><AudienceRestriction><Audience>{}</Audience></AudienceRestriction></Conditions>",
+                let mut inner = String::new();
+                if let Some(aud) = self.audience.as_deref() {
+                    inner.push_str(&format!(
+                        "<saml:AudienceRestriction><saml:Audience>{}</saml:Audience></saml:AudienceRestriction>",
                         aud
                     ));
-                } else {
-                    conditions.push_str("/>");
                 }
+                if self.one_time_use {
+                    inner.push_str("<saml:OneTimeUse/>");
+                }
+                if inner.is_empty() {
+                    conditions.push_str("/>");
+                } else {
+                    conditions.push_str(&format!(">{}</saml:Conditions>", inner));
+                }
+            }
+
+            let mut confirmation = String::new();
+            if let Some(recipient) = self.recipient.as_deref() {
+                confirmation.push_str(&format!(
+                    "<saml:SubjectConfirmation Method=\"{}\"><saml:SubjectConfirmationData Recipient=\"{}\"",
+                    self.confirmation_method, recipient
+                ));
+                if let Some(noa) = self.confirmation_not_on_or_after.as_deref() {
+                    confirmation.push_str(&format!(" NotOnOrAfter=\"{}\"", noa));
+                }
+                if let Some(in_response_to) = self.confirmation_in_response_to.as_deref() {
+                    confirmation.push_str(&format!(" InResponseTo=\"{}\"", in_response_to));
+                }
+                confirmation.push_str("/></saml:SubjectConfirmation>");
             }
 
             let subject_inner = if self.corrupt_subject_after_signing {
@@ -1697,22 +1855,32 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                 self.subject_name_id.to_string()
             };
 
+            let name_id = |value: &str| match self.name_id_fragment.as_deref() {
+                Some(fragment) => fragment.to_string(),
+                None => format!("<saml:NameID>{}</saml:NameID>", value),
+            };
             let body_after_issuer = format!(
-                "<Subject><NameID>{}</NameID></Subject>{}",
-                subject_inner, conditions
+                "<saml:Subject>{}{}</saml:Subject>{}",
+                name_id(&subject_inner),
+                confirmation,
+                conditions
             );
 
             // The bytes we actually sign use the ORIGINAL (untampered) subject.
             let signed_body_after_issuer = format!(
-                "<Subject><NameID>{}</NameID></Subject>{}",
-                self.subject_name_id, conditions
+                "<saml:Subject>{}{}</saml:Subject>{}",
+                name_id(self.subject_name_id),
+                confirmation,
+                conditions
             );
 
             // The assertion as it looks after enveloped-signature transform —
-            // this is what XMLDSIG digests for the Reference.
+            // this is what XMLDSIG digests for the Reference. Namespaces are
+            // declared on the Assertion element itself so the digested view and
+            // the in-envelope view canonicalize identically.
             let assertion_no_sig = format!(
-                "<Assertion ID=\"{}\"><Issuer>{}</Issuer>{}</Assertion>",
-                self.assertion_id, self.issuer, signed_body_after_issuer
+                "<saml:Assertion xmlns:saml=\"{}\" xmlns:ds=\"{}\" ID=\"{}\"><saml:Issuer>{}</saml:Issuer>{}</saml:Assertion>",
+                SAML_NS, DSIG_NS, self.assertion_id, self.issuer, signed_body_after_issuer
             );
             let canonical_assertion = super::soap_exclusive_canonicalize_element_for_test(
                 &assertion_no_sig,
@@ -1739,20 +1907,24 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
 
             // SignedInfo bytes — exactly these bytes are what
             // `<SignatureValue>` covers.
+            let reference_uri = self
+                .reference_uri_override
+                .as_deref()
+                .unwrap_or(self.assertion_id);
             let signed_info = format!(
-                "<SignedInfo>\
-<CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>\
-<SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>\
-<Reference URI=\"#{}\">\
-<Transforms>\
-<Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/>\
-<Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>\
-</Transforms>\
-<DigestMethod Algorithm=\"{}\"/>\
-<DigestValue>{}</DigestValue>\
-</Reference>\
-</SignedInfo>",
-                self.assertion_id, digest_method_uri, digest_b64
+                "<ds:SignedInfo xmlns:ds=\"{}\">\
+<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>\
+<ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>\
+<ds:Reference URI=\"#{}\">\
+<ds:Transforms>\
+<ds:Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/>\
+<ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>\
+</ds:Transforms>\
+<ds:DigestMethod Algorithm=\"{}\"/>\
+<ds:DigestValue>{}</ds:DigestValue>\
+</ds:Reference>\
+</ds:SignedInfo>",
+                DSIG_NS, reference_uri, digest_method_uri, digest_b64
             );
             let canonical_signed_info =
                 super::soap_exclusive_canonicalize_element_for_test(&signed_info, "SignedInfo", "")
@@ -1787,10 +1959,10 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
             let cert_b64 = pem_to_der_b64(cert_pem);
 
             let signature = format!(
-                "<Signature>{}<SignatureValue>{}</SignatureValue>\
-<KeyInfo><X509Data><X509Certificate>{}</X509Certificate></X509Data></KeyInfo>\
-</Signature>",
-                signed_info, sig_value_b64, cert_b64
+                "<ds:Signature xmlns:ds=\"{}\">{}<ds:SignatureValue>{}</ds:SignatureValue>\
+<ds:KeyInfo><ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>\
+</ds:Signature>",
+                DSIG_NS, signed_info, sig_value_b64, cert_b64
             );
 
             // Final assertion: Signature follows Issuer, then the body
@@ -1798,13 +1970,17 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
             // verification time removes the first <Signature> element, so
             // the digested view matches `assertion_no_sig`.
             format!(
-                "<Assertion ID=\"{}\"><Issuer>{}</Issuer>{}{}</Assertion>",
-                self.assertion_id, self.issuer, signature, body_after_issuer
+                "<saml:Assertion xmlns:saml=\"{}\" xmlns:ds=\"{}\" ID=\"{}\"><saml:Issuer>{}</saml:Issuer>{}{}</saml:Assertion>",
+                SAML_NS, DSIG_NS, self.assertion_id, self.issuer, signature, body_after_issuer
             )
         }
     }
 }
 
+/// SAML policy for the fixtures. `audience` overrides the default service
+/// audience so cross-audience tests can bind this proxy to a different service;
+/// `audience` and `recipient` are both mandatory now (GHSA-f44p-hfqr-cvcc), as
+/// is a declared replay scope for assertion single-use.
 fn saml_config(bundle: &saml_fixtures::IdpBundle, audience: Option<&str>) -> serde_json::Value {
     let mut saml = serde_json::Map::new();
     saml.insert("enabled".into(), json!(true));
@@ -1816,12 +1992,15 @@ fn saml_config(bundle: &saml_fixtures::IdpBundle, audience: Option<&str>) -> ser
         "trusted_signing_certs".into(),
         json!([bundle.trusted_cert_path.to_str().unwrap()]),
     );
-    if let Some(aud) = audience {
-        saml.insert("audience".into(), json!(aud));
-    }
+    saml.insert(
+        "audience".into(),
+        json!(audience.unwrap_or(saml_fixtures::TEST_AUDIENCE)),
+    );
+    saml.insert("recipient".into(), json!(saml_fixtures::TEST_RECIPIENT));
     json!({
         "timestamp": { "require": false },
         "saml": Value::Object(saml),
+        "nonce": { "replay_scope": "process" },
         "reject_missing_security_header": true
     })
 }
@@ -1832,12 +2011,6 @@ fn wrap_saml_assertion(assertion_xml: &str) -> String {
 
 fn far_future() -> String {
     (chrono::Utc::now() + chrono::Duration::days(7))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string()
-}
-
-fn long_past() -> String {
-    (chrono::Utc::now() - chrono::Duration::days(7))
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string()
 }
@@ -1857,7 +2030,7 @@ async fn test_saml_valid_signed_assertion_accepted() {
     let body = wrap_saml_assertion(&assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "valid signed SAML should pass, got {:?}",
@@ -1886,7 +2059,7 @@ async fn test_saml_valid_signed_assertion_accepted_over_utf16le() {
     let bytes = encode_utf16_le(&body);
     let mut ctx = make_ctx_with_soap_bytes(bytes, "application/soap+xml; charset=utf-16");
     let mut headers = soap_headers_with_content_type("application/soap+xml; charset=utf-16");
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "UTF-16LE signed SAML should validate after decode, got {:?}",
@@ -1914,7 +2087,7 @@ async fn test_saml_decodes_signed_authorization_fields_from_verified_dom() {
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
 
     assert!(
         matches!(result, PluginResult::Continue),
@@ -1931,13 +2104,18 @@ async fn test_saml_missing_signature_rejects() {
     let bundle = saml_fixtures::IdpBundle::new();
     let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
 
-    // Assertion with no Signature element — i.e. exactly the spoofable XML
-    // the previous behaviour silently accepted.
-    let unsigned = r#"<Assertion ID="_a"><Issuer>https://idp.example.com/metadata</Issuer><Subject><NameID>alice</NameID></Subject></Assertion>"#;
-    let body = wrap_saml_assertion(unsigned);
+    // Assertion with no Signature element — i.e. exactly the spoofable XML the
+    // previous behaviour silently accepted. It must be namespace-qualified:
+    // assertion selection is namespace-correct, so a bare `<Assertion>` is not
+    // a SAML assertion at all and would be reported as an absent one.
+    let unsigned = format!(
+        r#"<saml:Assertion xmlns:saml="{ns}" ID="_a"><saml:Issuer>https://idp.example.com/metadata</saml:Issuer><saml:Subject><saml:NameID>alice</saml:NameID></saml:Subject></saml:Assertion>"#,
+        ns = saml_fixtures::SAML_NS,
+    );
+    let body = wrap_saml_assertion(&unsigned);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(
         reject_body(&result).contains("missing Signature"),
@@ -1962,7 +2140,7 @@ async fn test_saml_tampered_assertion_rejects() {
     let body = wrap_saml_assertion(&assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(
         reject_body(&result).contains("digest mismatch"),
@@ -1987,7 +2165,7 @@ async fn test_saml_corrupted_signature_rejects() {
     let body = wrap_saml_assertion(&assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(
         reject_body(&result).contains("signature verification failed"),
@@ -2014,7 +2192,7 @@ async fn test_saml_untrusted_signing_cert_rejects() {
     let body = wrap_saml_assertion(&assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(
         reject_body(&result).contains("signing certificate is not trusted"),
@@ -2040,7 +2218,7 @@ async fn test_saml_untrusted_issuer_rejects() {
     let body = wrap_saml_assertion(&assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(
         reject_body(&result).contains("not trusted"),
@@ -2054,8 +2232,15 @@ async fn test_saml_expired_assertion_rejects() {
     let bundle = saml_fixtures::IdpBundle::new();
     let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
 
-    let nb = "2020-01-01T00:00:00Z";
-    let noa = "2020-01-02T00:00:00Z";
+    // The window must stay inside `saml.max_assertion_lifetime_seconds` (300 by
+    // default) or the lifetime cap — which is checked first, because it is what
+    // makes the fixed replay horizon sufficient — answers instead of the expiry
+    // arm this test is about. One hour in the past clears the 300s clock skew.
+    let expired_at = chrono::Utc::now() - chrono::Duration::seconds(3_600);
+    let nb = (expired_at - chrono::Duration::seconds(60))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let noa = expired_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let mut builder = saml_fixtures::AssertionBuilder::new(
         "_assertion-expired",
         "https://idp.example.com/metadata",
@@ -2068,10 +2253,10 @@ async fn test_saml_expired_assertion_rejects() {
     let body = wrap_saml_assertion(&assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(
-        reject_body(&result).contains("expired"),
+        reject_body(&result).contains("has expired"),
         "expected SAML expired rejection, got: {}",
         reject_body(&result)
     );
@@ -2089,18 +2274,23 @@ async fn test_saml_not_yet_valid_rejects() {
     let plugin = SoapWsSecurity::new(&cfg).unwrap();
 
     let nb = far_future();
+    let noa = (chrono::Utc::now() + chrono::Duration::days(7) + chrono::Duration::seconds(120))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
     let mut builder = saml_fixtures::AssertionBuilder::new(
         "_assertion-future",
         "https://idp.example.com/metadata",
         "alice@example.com",
     );
-    builder.not_before = Some(&nb);
+    builder.not_before = Some(nb.clone());
+    builder.not_on_or_after = Some(noa.clone());
+    builder.confirmation_not_on_or_after = Some(noa.clone());
     let assertion = builder.build();
 
     let body = wrap_saml_assertion(&assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(
         reject_body(&result).contains("not yet valid"),
@@ -2123,20 +2313,20 @@ async fn test_saml_wrong_audience_rejects() {
         "https://idp.example.com/metadata",
         "alice@example.com",
     );
-    let nb = long_past();
-    let noa = far_future();
-    builder.not_before = Some(&nb);
-    builder.not_on_or_after = Some(&noa);
-    builder.audience = Some("https://other-service.example.com");
+    let nb = saml_fixtures::default_not_before();
+    let noa = saml_fixtures::default_not_on_or_after();
+    builder.not_before = Some(nb.clone());
+    builder.not_on_or_after = Some(noa.clone());
+    builder.audience = Some("https://other-service.example.com".to_string());
     let assertion = builder.build();
 
     let body = wrap_saml_assertion(&assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(
-        reject_body(&result).contains("does not match expected"),
+        reject_body(&result).contains("does not admit this service"),
         "expected audience mismatch rejection, got: {}",
         reject_body(&result)
     );
@@ -2151,20 +2341,23 @@ async fn test_saml_configured_audience_requires_conditions() {
     ))
     .unwrap();
 
-    let assertion = saml_fixtures::AssertionBuilder::new(
+    let mut builder = saml_fixtures::AssertionBuilder::new(
         "_assertion-no-conditions",
         "https://idp.example.com/metadata",
         "alice@example.com",
-    )
-    .build();
+    );
+    builder.not_before = None;
+    builder.not_on_or_after = None;
+    builder.audience = None;
+    let assertion = builder.build();
 
     let body = wrap_saml_assertion(&assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(
-        reject_body(&result).contains("Conditions are required"),
+        reject_body(&result).contains("bounded validity window is required"),
         "expected missing Conditions rejection, got: {}",
         reject_body(&result)
     );
@@ -2179,24 +2372,21 @@ async fn test_saml_configured_audience_requires_audience_restriction() {
     ))
     .unwrap();
 
-    let nb = long_past();
-    let noa = far_future();
     let mut builder = saml_fixtures::AssertionBuilder::new(
         "_assertion-no-audience-restriction",
         "https://idp.example.com/metadata",
         "alice@example.com",
     );
-    builder.not_before = Some(&nb);
-    builder.not_on_or_after = Some(&noa);
+    builder.audience = None;
     let assertion = builder.build();
 
     let body = wrap_saml_assertion(&assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(
-        reject_body(&result).contains("AudienceRestriction is required"),
+        reject_body(&result).contains("must carry an AudienceRestriction"),
         "expected missing AudienceRestriction rejection, got: {}",
         reject_body(&result)
     );
@@ -2218,7 +2408,7 @@ async fn test_saml_sha1_digest_rejected_by_default() {
     let body = wrap_saml_assertion(&assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(
         reject_body(&result).contains("digest algorithm")
@@ -2236,22 +2426,26 @@ async fn test_saml_signature_must_cover_enclosing_assertion() {
     let bundle = saml_fixtures::IdpBundle::new();
     let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
 
-    // Build a valid assertion, then surgically rewrite its Reference URI.
-    let assertion = saml_fixtures::AssertionBuilder::new(
+    // The mis-targeted URI is *signed in*, not patched over afterwards: the IdP
+    // signature and the assertion digest are both authentic, so the only thing
+    // left to refuse the message is the Reference-scoping rule itself. Patching
+    // the URI after signing would invalidate SignedInfo and be caught one arm
+    // earlier, proving nothing about scoping.
+    let mut builder = saml_fixtures::AssertionBuilder::new(
         "_assertion-real-id",
         "https://idp.example.com/metadata",
         "alice@example.com",
-    )
-    .build();
-    let tampered = assertion.replace("URI=\"#_assertion-real-id\"", "URI=\"#somewhere-else\"");
+    );
+    builder.reference_uri_override = Some("somewhere-else".to_string());
+    let assertion = builder.build();
 
-    let body = wrap_saml_assertion(&tampered);
+    let body = wrap_saml_assertion(&assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(
-        reject_body(&result).contains("does not target Assertion ID"),
+        reject_body(&result).contains("does not target the enclosing Assertion"),
         "expected Reference URI mismatch, got: {}",
         reject_body(&result)
     );
@@ -2266,27 +2460,26 @@ async fn test_saml_signature_wrapping_values_inside_signature_are_ignored() {
     ))
     .unwrap();
 
-    let nb = long_past();
-    let noa = far_future();
     let mut builder = saml_fixtures::AssertionBuilder::new(
         "_assertion-wrapping",
         "https://idp.example.com/metadata",
         "alice@example.com",
     );
-    builder.not_before = Some(&nb);
-    builder.not_on_or_after = Some(&noa);
-    builder.audience = Some("https://my-service.example.com");
+    builder.audience = Some("https://my-service.example.com".to_string());
     let assertion = builder.build();
 
+    // Decoy Subject/Conditions injected INSIDE the Signature element, where
+    // the enveloped-signature transform excludes them from the digest and the
+    // namespace-qualified child resolvers never look.
     let wrapped = assertion.replace(
-        "<SignedInfo>",
-        "<Subject><NameID>admin@example.com</NameID></Subject><Conditions NotBefore=\"2099-01-01T00:00:00Z\"><AudienceRestriction><Audience>https://evil-service.example.com</Audience></AudienceRestriction></Conditions><SignedInfo>",
+        "<ds:SignedInfo",
+        "<saml:Subject><saml:NameID>admin@example.com</saml:NameID></saml:Subject><ds:SignedInfo",
     );
 
     let body = wrap_saml_assertion(&wrapped);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "wrapped values inside Signature must be ignored, got {:?}",
@@ -2327,7 +2520,7 @@ async fn test_saml_multiple_assertions_rejected() {
     let body = wrap_saml_assertion(&format!("{}{}", valid, second));
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(
         reject_body(&result).contains("multiple SAML Assertion elements"),
@@ -2348,14 +2541,20 @@ async fn test_saml_assertion_in_body_is_rejected() {
     )
     .build();
 
-    let body = wrap_saml_assertion(&valid).replace(
-        "<soap:Body>",
-        "<soap:Body><Assertion ID=\"body-assertion\"><Issuer>https://evil.example.com</Issuer>\
-         <Subject><NameID>mallory@example.com</NameID></Subject></Assertion>",
+    // The decoy must be a namespace-correct SAML Assertion: that is what a
+    // downstream consumer walking the Body would pick up, and it is what the
+    // envelope-wide single-assertion scan is defined over.
+    let decoy = format!(
+        "<saml:Assertion xmlns:saml=\"{ns}\" ID=\"body-assertion\">\
+         <saml:Issuer>https://evil.example.com</saml:Issuer>\
+         <saml:Subject><saml:NameID>mallory@example.com</saml:NameID></saml:Subject>\
+         </saml:Assertion>",
+        ns = saml_fixtures::SAML_NS,
     );
+    let body = wrap_saml_assertion(&valid).replace("<soap:Body>", &format!("<soap:Body>{decoy}"));
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
 
     assert!(is_reject(&result));
     assert!(
@@ -2557,14 +2756,20 @@ fn decode_rejects_duplicate_charset_parameters() {
 #[test]
 fn decode_rejects_unbalanced_charset_quotes() {
     let xml = wrap_soap(&fresh_timestamp());
-    for content_type in [
-        "text/xml; charset=\"utf-8",
-        "text/xml; charset=utf-8\"",
-        "text/xml; charset='utf-8",
-    ] {
+    for content_type in ["text/xml; charset=\"utf-8", "text/xml; charset=utf-8\""] {
         let err = soap_decode_xml_body_for_test(xml.as_bytes(), content_type)
             .expect_err("unbalanced charset quotes must fail closed");
         assert!(err.contains("conflicting or ambiguous"), "got: {err}");
+    }
+}
+
+#[test]
+fn decode_does_not_treat_single_quotes_as_parameter_delimiters() {
+    let xml = wrap_soap(&fresh_timestamp());
+    for content_type in ["text/xml; charset='utf-8'", "text/xml; charset='utf-8"] {
+        let err = soap_decode_xml_body_for_test(xml.as_bytes(), content_type)
+            .expect_err("a single quote is part of a token, not MIME quoted-string syntax");
+        assert!(err.contains("unsupported character encoding"), "got: {err}");
     }
 }
 
@@ -2712,7 +2917,7 @@ async fn utf16le_username_token_validates_over_decoded_text() {
     // Simulate H1/H2/H3 handoff: non-UTF-8 bytes must not populate request_body.
     assert!(!ctx.metadata.contains_key("request_body"));
     let mut headers = soap_headers_with_content_type("application/soap+xml; charset=utf-16");
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "UTF-16LE UsernameToken should validate, got {:?}",
@@ -2736,7 +2941,7 @@ async fn utf16be_timestamp_validates_over_decoded_text() {
     let bytes = encode_utf16_be(&body);
     let mut ctx = make_ctx_with_soap_bytes(bytes, "text/xml; charset=utf-16be");
     let mut headers = soap_headers_with_content_type("text/xml; charset=utf-16be");
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "UTF-16BE timestamp envelope should validate, got {:?}",
@@ -2753,7 +2958,7 @@ async fn utf16_missing_security_still_rejects_after_decode() {
     </soap:Envelope>"#;
     let mut ctx = make_ctx_with_soap_bytes(encode_utf16_le(body), "text/xml; charset=utf-16");
     let mut headers = soap_headers_with_content_type("text/xml; charset=utf-16");
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert_eq!(reject_status(&result), 401);
     assert!(reject_body(&result).contains("Security header is missing"));
@@ -2765,7 +2970,7 @@ async fn conflicting_charset_rejects_with_415_without_treating_as_empty() {
     let body = wrap_soap(&fresh_timestamp());
     let mut ctx = make_ctx_with_soap_bytes(encode_utf16_le(&body), "text/xml; charset=utf-8");
     let mut headers = soap_headers_with_content_type("text/xml; charset=utf-8");
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert_eq!(reject_status(&result), 415);
     let body = reject_body(&result);
@@ -2781,7 +2986,7 @@ async fn empty_request_body_bytes_still_reports_empty() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let mut ctx = make_ctx_with_soap_bytes(Vec::new(), "text/xml");
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert_eq!(reject_status(&result), 400);
     assert!(reject_body(&result).contains("SOAP request body is empty"));
@@ -2815,7 +3020,7 @@ async fn metadata_text_fallback_validates_utf8_xml_declaration() {
         "content-type".to_string(),
         "text/xml; charset=utf-8".to_string(),
     );
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert_eq!(reject_status(&result), 415);
     assert!(
@@ -2837,7 +3042,7 @@ async fn metadata_text_fallback_accepts_matching_utf8_declaration() {
     ctx.metadata.insert("request_body".to_string(), body);
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "text/xml".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "UTF-8 metadata fallback with a compatible declaration must still validate: {result:?}"
@@ -2851,9 +3056,13 @@ async fn test_non_envelope_soap_body_rejects() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let mut ctx = make_ctx_with_soap_body("<notasoap>hello</notasoap>");
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
-    assert!(reject_body(&result).contains("not a SOAP envelope"));
+    let body = reject_body(&result);
+    assert!(
+        body.contains("not a namespace-qualified SOAP Envelope"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -2870,7 +3079,7 @@ async fn test_doctype_entity_payload_rejected() {
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert_eq!(reject_status(&result), 400);
     assert!(reject_body(&result).contains("forbidden XML declaration"));
@@ -2931,7 +3140,7 @@ async fn test_handles_different_namespace_prefixes() {
     );
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
 
@@ -2940,7 +3149,7 @@ async fn test_empty_body_rejects() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let mut ctx = make_ctx_with_soap_body("");
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
 }
 
@@ -3126,6 +3335,21 @@ mod x509_roundtrip {
         file
     }
 
+    const WSU_NAMESPACE_URI_FOR_TESTS: &str =
+        "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd";
+
+    /// Open tag of the signed Body, used as the injection anchor by the XML
+    /// Signature Wrapping fixtures.
+    const SIGNED_BODY_OPEN_TAG: &str = r#"<soap:Body wsu:Id="Body-1">"#;
+
+    /// The signed, backend-visible SOAP Body used by every X.509 fixture. Its
+    /// `wsu:Id` is what the second `<Reference>` resolves to.
+    const SIGNED_BODY_XML: &str = concat!(
+        r#"<soap:Body wsu:Id="Body-1">"#,
+        r#"<GetPrice xmlns="http://example.com/prices"><Item>Widget</Item></GetPrice>"#,
+        r#"</soap:Body>"#,
+    );
+
     /// Construct a SOAP envelope whose `<wsse:Security>` block contains a
     /// `<Timestamp wsu:Id="TS-1">` and a `<Signature>` covering that Timestamp.
     /// The signed bytes are exclusive-canonicalized rather than copied from
@@ -3139,6 +3363,46 @@ mod x509_roundtrip {
     fn build_signed_soap_envelope_with_timestamp_prefix(
         cert: &TestRsaCert,
         timestamp_prefix: &str,
+    ) -> String {
+        build_signed_soap_envelope_full(cert, timestamp_prefix, SIGNED_BODY_XML, |signed_info| {
+            signed_info
+        })
+    }
+
+    /// Same fixture, but the `SignedInfo` is rewritten **before** it is
+    /// canonicalized and signed, so the emitted envelope carries an authentic
+    /// `SignatureValue` over exactly the `SignedInfo` on the wire.
+    ///
+    /// Trust and `SignatureValue`-over-`SignedInfo` are now settled before the
+    /// first attacker-selected `<Reference>` is resolved
+    /// (GHSA-9g4v-h9hm-846r). A fixture that edits `SignedInfo` after signing
+    /// can therefore only ever reach the signature arm; anything that must be
+    /// judged by a per-`Reference` rule has to be signed in.
+    fn build_signed_soap_envelope_with_signed_info(
+        cert: &TestRsaCert,
+        rewrite_signed_info: impl FnOnce(String) -> String,
+    ) -> String {
+        build_signed_soap_envelope_full(cert, "wsu", SIGNED_BODY_XML, rewrite_signed_info)
+    }
+
+    /// Same fixture with a caller-supplied signed Body.
+    ///
+    /// X.509 success now requires a Reference resolving uniquely to the
+    /// backend-visible Body (GHSA-3mwq-c8j6-9xhp), so a fixture that edits the
+    /// Body after signing is a digest mismatch by construction. A Body variant
+    /// that is meant to be *accepted* must be digested in.
+    fn build_signed_soap_envelope_with_signed_body(
+        cert: &TestRsaCert,
+        signed_body_xml: &str,
+    ) -> String {
+        build_signed_soap_envelope_full(cert, "wsu", signed_body_xml, |signed_info| signed_info)
+    }
+
+    fn build_signed_soap_envelope_full(
+        cert: &TestRsaCert,
+        timestamp_prefix: &str,
+        signed_body_xml: &str,
+        rewrite_signed_info: impl FnOnce(String) -> String,
     ) -> String {
         let now = chrono::Utc::now();
         let created = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
@@ -3168,10 +3432,25 @@ mod x509_roundtrip {
         let ts_digest = ring::digest::digest(&ring::digest::SHA256, canonical_timestamp.as_bytes());
         let ts_digest_b64 = B64.encode(ts_digest.as_ref());
 
-        let signed_info = format!(
-            r##"<SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"><ec:InclusiveNamespaces xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="soap"/></CanonicalizationMethod><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#TS-1"><Transforms><Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"><ec:InclusiveNamespaces xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="soap"/></Transform></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue>{}</DigestValue></Reference></SignedInfo>"##,
-            ts_digest_b64
+        // GHSA-3mwq-c8j6-9xhp: an accepted X.509 signature must cover the
+        // namespace-correct, backend-visible SOAP Body, not just a header
+        // fragment. The fixture therefore signs both.
+        let body_context = format!(
+            r#"<root xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:wsu="{wsu}">{body}</root>"#,
+            wsu = WSU_NAMESPACE_URI_FOR_TESTS,
+            body = signed_body_xml,
         );
+        let canonical_body =
+            soap_exclusive_canonicalize_element_for_test(&body_context, "Body", "soap")
+                .expect("test Body must canonicalize");
+        let body_digest = ring::digest::digest(&ring::digest::SHA256, canonical_body.as_bytes());
+        let body_digest_b64 = B64.encode(body_digest.as_ref());
+
+        let signed_info = format!(
+            r##"<SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"><ec:InclusiveNamespaces xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="soap"/></CanonicalizationMethod><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#TS-1"><Transforms><Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"><ec:InclusiveNamespaces xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="soap"/></Transform></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue>{}</DigestValue></Reference><Reference URI="#Body-1"><Transforms><Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"><ec:InclusiveNamespaces xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="soap"/></Transform></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue>{}</DigestValue></Reference></SignedInfo>"##,
+            ts_digest_b64, body_digest_b64
+        );
+        let signed_info = rewrite_signed_info(signed_info);
         let signed_info_context = format!(
             r#"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">{signed_info}</Signature>"#,
         );
@@ -3200,7 +3479,7 @@ mod x509_roundtrip {
         let signature_b64 = B64.encode(&signature);
 
         format!(
-            r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+            r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
   <soap:Header>
     <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
                    xmlns:{timestamp_prefix}="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
@@ -3212,14 +3491,31 @@ mod x509_roundtrip {
       </Signature>
     </wsse:Security>
   </soap:Header>
-  <soap:Body><GetPrice xmlns="http://example.com/prices"><Item>Widget</Item></GetPrice></soap:Body>
+  {signed_body}
 </soap:Envelope>"#,
+            signed_body = signed_body_xml,
             timestamp = timestamp_xml,
             timestamp_prefix = timestamp_prefix,
             cert_b64 = cert.cert_der_b64,
             signed_info = signed_info,
             sig_b64 = signature_b64,
         )
+    }
+
+    /// A trusted-store plugin plus a certificate the store does NOT contain,
+    /// shared with the advisory-regression module so the trust-before-work
+    /// ordering can be pinned against a real trust store.
+    pub(super) fn trusted_plugin_for_advisory_test() -> (SoapWsSecurity, tempfile::NamedTempFile) {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path()))
+            .expect("plugin should construct with a valid RSA trust store");
+        (plugin, cert_file)
+    }
+
+    /// Base64 DER of a certificate that is never in the trust store.
+    pub(super) fn untrusted_cert_der_b64() -> String {
+        mint_rsa_cert().cert_der_b64
     }
 
     fn x509_plugin_config(cert_path: &std::path::Path) -> serde_json::Value {
@@ -3235,6 +3531,118 @@ mod x509_roundtrip {
         })
     }
 
+    // ── X.509 integrity vs MTOM/XOP attachments ─────────────────────────
+    //
+    // An X.509 policy claims integrity over the message the backend executes.
+    // Ferrum implements no WS-Security attachment-signature transform, so for
+    // a XOP representation the digest it verifies covers the `xop:Include`
+    // element, not the attachment octets that element stands for: an
+    // attacker-selected attachment present during validation is never
+    // detected. Refusing the representation is the honest outcome.
+
+    /// MTOM/XOP `multipart/related` is refused before dispatch, and its body is
+    /// not even buffered.
+    #[tokio::test]
+    async fn mtom_is_refused_when_x509_claims_integrity() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+
+        let content_type = "multipart/related; type=\"application/xop+xml\"; \
+                            boundary=MIME_boundary; start=\"<root@example.com>\"";
+        let package = "--MIME_boundary\r\n\
+             Content-Type: application/xop+xml; charset=utf-8; type=\"text/xml\"\r\n\
+             Content-Transfer-Encoding: binary\r\n\
+             Content-ID: <root@example.com>\r\n\
+             \r\n\
+             <soap:Envelope/>\r\n\
+             --MIME_boundary--\r\n";
+
+        let mut ctx = make_ctx_with_soap_bytes(package.as_bytes().to_vec(), content_type);
+        assert!(
+            !plugin.should_buffer_request_body(&ctx),
+            "a refused representation must not be buffered"
+        );
+        let mut headers = soap_headers_with_content_type(content_type);
+        match run_soap_request_policy(&plugin, &mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 415);
+                assert!(body.contains("attachment octets"), "got: {body}");
+            }
+            other => panic!("MTOM under an X.509 policy must be refused, got {other:?}"),
+        }
+    }
+
+    /// A bare `application/xop+xml` infoset is the same claim without the
+    /// package, and is refused for the same reason.
+    #[tokio::test]
+    async fn bare_xop_infoset_is_refused_when_x509_claims_integrity() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+
+        let content_type = "application/xop+xml; charset=utf-8; type=\"text/xml\"";
+        let body = build_signed_soap_envelope(&cert);
+        let mut ctx = make_ctx_with_soap_bytes(body.into_bytes(), content_type);
+        let mut headers = soap_headers_with_content_type(content_type);
+        match run_soap_request_policy(&plugin, &mut ctx, &mut headers).await {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 415),
+            other => panic!("bare XOP under an X.509 policy must be refused, got {other:?}"),
+        }
+    }
+
+    /// The refusal is narrow: plain XML representations are unaffected, and a
+    /// policy that authenticates identity rather than asserting message
+    /// integrity keeps accepting XOP.
+    #[tokio::test]
+    async fn the_xop_refusal_is_narrow() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+        let body = build_signed_soap_envelope(&cert);
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        assert!(
+            matches!(
+                run_soap_request_policy(&plugin, &mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "text/xml under an X.509 policy is still governed and still accepted"
+        );
+
+        // UsernameToken authenticates the caller; it never claimed coverage of
+        // attachment octets, so MTOM/XOP stays available to it.
+        let ut = SoapWsSecurity::new(&username_token_config()).unwrap();
+        let xop_ctx = make_ctx_with_soap_bytes(b"x".to_vec(), "application/xop+xml");
+        assert!(ut.should_buffer_request_body(&xop_ctx));
+
+        let package = "multipart/related; type=\"application/xop+xml\"; boundary=b";
+        let mtom_ctx = make_ctx_with_soap_bytes(b"x".to_vec(), package);
+        assert!(ut.should_buffer_request_body(&mtom_ctx));
+    }
+
+    /// Asking for both in one configuration is asking for integrity Ferrum
+    /// cannot establish, so the explicit pairing is refused at admission.
+    #[test]
+    fn explicit_allow_mtom_with_x509_is_refused_at_admission() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+
+        let mut config = x509_plugin_config(cert_file.path());
+        config["content_type"] = json!({ "allow_mtom": true });
+        let err = SoapWsSecurity::new(&config)
+            .err()
+            .expect("allow_mtom alongside x509_signature must be refused");
+        assert!(err.contains("allow_mtom"), "got: {err}");
+
+        // The honest pairing constructs.
+        let mut config = x509_plugin_config(cert_file.path());
+        config["content_type"] = json!({ "allow_mtom": false });
+        assert!(SoapWsSecurity::new(&config).is_ok());
+    }
+
     #[tokio::test]
     async fn valid_rsa_signature_is_accepted() {
         let cert = mint_rsa_cert();
@@ -3245,7 +3653,7 @@ mod x509_roundtrip {
         let body = build_signed_soap_envelope(&cert);
         let mut ctx = make_ctx_with_soap_body(&body);
         let mut headers = soap_headers();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
 
         assert!(
             matches!(result, PluginResult::Continue),
@@ -3265,7 +3673,7 @@ mod x509_roundtrip {
         let bytes = encode_utf16_be(&body);
         let mut ctx = make_ctx_with_soap_bytes(bytes, "text/xml; charset=utf-16be");
         let mut headers = soap_headers_with_content_type("text/xml; charset=utf-16be");
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
 
         assert!(
             matches!(result, PluginResult::Continue),
@@ -3287,7 +3695,7 @@ mod x509_roundtrip {
 
         let mut ctx = make_ctx_with_soap_body(&body);
         let mut headers = soap_headers();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
 
         assert!(is_reject(&result));
         assert!(
@@ -3302,14 +3710,20 @@ mod x509_roundtrip {
         let cert = mint_rsa_cert();
         let cert_file = write_pem_to_tempfile(&cert.cert_pem);
         let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
-        let body = build_signed_soap_envelope(&cert).replace(
-            "<Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\">",
-            "<Transform Algorithm=\"urn:unsupported:transform\">",
-        );
+        // The Transform is inside SignedInfo, and SignedInfo is authenticated
+        // before any Reference is resolved, so the unsupported algorithm has to
+        // be signed in — otherwise this only ever proves the signature check
+        // works.
+        let body = build_signed_soap_envelope_with_signed_info(&cert, |signed_info| {
+            signed_info.replace(
+                "<Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\">",
+                "<Transform Algorithm=\"urn:unsupported:transform\">",
+            )
+        });
 
         let mut ctx = make_ctx_with_soap_body(&body);
         let mut headers = soap_headers();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
 
         assert!(is_reject(&result));
         assert!(
@@ -3336,7 +3750,7 @@ mod x509_roundtrip {
         let mut ctx = make_ctx_with_soap_body(&body);
         let mut headers = soap_headers();
 
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
 
         assert!(is_reject(&result));
         assert!(
@@ -3352,12 +3766,14 @@ mod x509_roundtrip {
         let cert_file = write_pem_to_tempfile(&cert.cert_pem);
         let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
         let many_nodes = "<N/>".repeat(66_000);
-        let body = build_signed_soap_envelope(&cert)
-            .replace("<soap:Body>", &format!("<soap:Body>{many_nodes}"));
+        let body = build_signed_soap_envelope(&cert).replace(
+            SIGNED_BODY_OPEN_TAG,
+            &format!("{SIGNED_BODY_OPEN_TAG}{many_nodes}"),
+        );
         let mut ctx = make_ctx_with_soap_body(&body);
         let mut headers = soap_headers();
 
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
 
         assert!(is_reject(&result));
         assert!(
@@ -3377,7 +3793,7 @@ mod x509_roundtrip {
         let body = build_signed_soap_envelope_with_timestamp_prefix(&cert, "u");
         let mut ctx = make_ctx_with_soap_body(&body);
         let mut headers = soap_headers();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
 
         assert!(
             matches!(result, PluginResult::Continue),
@@ -3400,7 +3816,7 @@ mod x509_roundtrip {
             );
         let mut ctx = make_ctx_with_soap_body(&body);
         let mut headers = soap_headers();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
 
         assert!(
             matches!(
@@ -3430,10 +3846,10 @@ mod x509_roundtrip {
         let valid = build_signed_soap_envelope(&cert);
         // Inject a duplicate wsu:Id="TS-1" element into the SOAP body.
         let wrapped = valid.replace(
-            "<soap:Body>",
-            "<soap:Body><Injected wsu:Id=\"TS-1\" \
+            SIGNED_BODY_OPEN_TAG,
+            &format!("{SIGNED_BODY_OPEN_TAG}<Injected wsu:Id=\"TS-1\" \
              xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\">\
-             attacker-controlled</Injected>",
+             attacker-controlled</Injected>"),
         );
         assert_ne!(
             valid, wrapped,
@@ -3442,7 +3858,7 @@ mod x509_roundtrip {
 
         let mut ctx = make_ctx_with_soap_body(&wrapped);
         let mut headers = soap_headers();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
 
         match result {
             PluginResult::Reject {
@@ -3468,7 +3884,7 @@ mod x509_roundtrip {
         let mut ctx = make_ctx_with_soap_body(&body);
         let mut headers = soap_headers();
 
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
 
         assert!(
             matches!(result, PluginResult::Continue),
@@ -3485,14 +3901,14 @@ mod x509_roundtrip {
         let entity_encoded =
             build_signed_soap_envelope(&cert).replace("wsu:Id=\"TS-1\"", "wsu:Id=\"TS&#x2D;1\"");
         let wrapped = entity_encoded.replace(
-            "<soap:Body>",
-            "<soap:Body><Injected wsu:Id=\"TS-1\" \
-             xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\">attacker</Injected>",
+            SIGNED_BODY_OPEN_TAG,
+            &format!("{SIGNED_BODY_OPEN_TAG}<Injected wsu:Id=\"TS-1\" \
+             xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\">attacker</Injected>"),
         );
         let mut ctx = make_ctx_with_soap_body(&wrapped);
         let mut headers = soap_headers();
 
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
 
         assert!(is_reject(&result));
         assert!(
@@ -3510,6 +3926,14 @@ mod x509_roundtrip {
         config["x509_signature"]["require_signed_timestamp"] = json!(false);
         let plugin = SoapWsSecurity::new(&config).unwrap();
 
+        // Two `wsse:Security` header blocks: the signed one is addressed to
+        // another intermediary (`soap:actor`), so it is not this receiver's to
+        // enforce and must not satisfy verification. The one this gateway
+        // selects — the unaddressed block — carries no Signature.
+        //
+        // The signed block stays a direct child of `soap:Header`. Parking it
+        // outside the Header (as a sibling of it, say) is refused structurally
+        // before selection ever runs, which would prove nothing about scoping.
         let valid = build_signed_soap_envelope(&cert);
         let security_start = valid.find("<wsse:Security").expect("Security start");
         let security_end = valid[security_start..]
@@ -3527,21 +3951,28 @@ mod x509_roundtrip {
         let mut unsigned_security = signed_security.to_string();
         unsigned_security.replace_range(signature_start..signature_end, "");
         unsigned_security = unsigned_security.replace("wsu:Id=\"TS-1\"", "wsu:Id=\"TS-actual\"");
+
+        // SOAP 1.1 addresses a header block with `soap:actor`.
+        let other_actor_security = signed_security.replacen(
+            "<wsse:Security",
+            "<wsse:Security soap:actor=\"urn:example:other-intermediary\"",
+            1,
+        );
         let header_unsigned = valid.replacen(signed_security, &unsigned_security, 1);
         let body = header_unsigned.replacen(
             "<soap:Header>",
-            &format!("{}<soap:Header>", signed_security),
+            &format!("<soap:Header>{other_actor_security}"),
             1,
         );
         let mut ctx = make_ctx_with_soap_body(&body);
         let mut headers = soap_headers();
 
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
 
         assert!(is_reject(&result));
         assert!(
             reject_body(&result).contains("missing Signature"),
-            "pre-header signed Security must not satisfy header verification: {}",
+            "a Security block addressed elsewhere must not satisfy header verification: {}",
             reject_body(&result)
         );
     }
@@ -3557,8 +3988,8 @@ mod x509_roundtrip {
 
         let valid = build_signed_soap_envelope(&cert);
         let wrapped = valid.replace(
-            "<soap:Body>",
-            "<soap:Body><Injected Id='TS-1'>attacker-controlled</Injected>",
+            SIGNED_BODY_OPEN_TAG,
+            &format!("{SIGNED_BODY_OPEN_TAG}<Injected Id='TS-1'>attacker-controlled</Injected>"),
         );
         assert_ne!(
             valid, wrapped,
@@ -3567,7 +3998,7 @@ mod x509_roundtrip {
 
         let mut ctx = make_ctx_with_soap_body(&wrapped);
         let mut headers = soap_headers();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
 
         match result {
             PluginResult::Reject {
@@ -3594,19 +4025,27 @@ mod x509_roundtrip {
         let cert_file = write_pem_to_tempfile(&cert.cert_pem);
         let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
 
-        let valid = build_signed_soap_envelope(&cert);
-        let with_business_attr = valid.replace(
+        // The attribute lives in the signed, backend-visible Body, so it has to
+        // be digested in: X.509 success now requires a Reference resolving to
+        // that Body, and adding the attribute afterwards would simply be a
+        // digest mismatch rather than a test of the uniqueness count.
+        let signed_body = SIGNED_BODY_XML.replace(
             "<GetPrice xmlns=\"http://example.com/prices\">",
             "<GetPrice xmlns=\"http://example.com/prices\" CorrelationId=\"TS-1\">",
         );
         assert_ne!(
-            valid, with_business_attr,
-            "business attribute injection must modify the envelope"
+            SIGNED_BODY_XML, signed_body,
+            "business attribute injection must modify the signed Body"
+        );
+        let with_business_attr = build_signed_soap_envelope_with_signed_body(&cert, &signed_body);
+        assert!(
+            with_business_attr.contains("CorrelationId=\"TS-1\""),
+            "the emitted envelope must carry the business attribute"
         );
 
         let mut ctx = make_ctx_with_soap_body(&with_business_attr);
         let mut headers = soap_headers();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
         assert!(
             matches!(result, PluginResult::Continue),
             "valid signature with an unrelated *Id business attribute must be accepted, got {:?}",
@@ -3638,7 +4077,7 @@ mod x509_roundtrip {
 
         let mut ctx = make_ctx_with_soap_body(&body);
         let mut headers = soap_headers();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
 
         match result {
             PluginResult::Reject {
@@ -3666,21 +4105,28 @@ mod x509_roundtrip {
         // must reject. We can't tamper with the Timestamp text itself here
         // because `validate_timestamp` runs first in the pipeline and would
         // fail on the parse before signature checks even run.
-        let original = build_signed_soap_envelope(&cert);
-        let dv_open = original
-            .find("<DigestValue>")
-            .expect("envelope must have <DigestValue>")
-            + "<DigestValue>".len();
-        let first_char = original.as_bytes()[dv_open];
-        let replacement = if first_char == b'A' { 'B' } else { 'A' };
-        let mut body = String::with_capacity(original.len());
-        body.push_str(&original[..dv_open]);
-        body.push(replacement);
-        body.push_str(&original[dv_open + 1..]);
+        //
+        // The flip is applied before signing. DigestValue lives inside
+        // SignedInfo, which is authenticated before any Reference is resolved,
+        // so flipping it on the wire would be caught as a signature failure and
+        // the digest arm would never run.
+        let body = build_signed_soap_envelope_with_signed_info(&cert, |signed_info| {
+            let dv_open = signed_info
+                .find("<DigestValue>")
+                .expect("SignedInfo must have <DigestValue>")
+                + "<DigestValue>".len();
+            let first_char = signed_info.as_bytes()[dv_open];
+            let replacement = if first_char == b'A' { 'B' } else { 'A' };
+            let mut tampered = String::with_capacity(signed_info.len());
+            tampered.push_str(&signed_info[..dv_open]);
+            tampered.push(replacement);
+            tampered.push_str(&signed_info[dv_open + 1..]);
+            tampered
+        });
 
         let mut ctx = make_ctx_with_soap_body(&body);
         let mut headers = soap_headers();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
 
         match result {
             PluginResult::Reject { body, .. } => assert!(
@@ -3806,7 +4252,7 @@ async fn run_compressed_soap_lifecycle(
         Some(plaintext.as_bytes()),
         "normalization must expose plaintext to soap_ws_security"
     );
-    let soap_result = soap.before_proxy(&mut ctx, &mut headers).await;
+    let soap_result = run_soap_request_policy(&soap, &mut ctx, &mut headers).await;
     assert!(
         matches!(soap_result, PluginResult::Continue),
         "soap_ws_security must accept decompressed SOAP, got {soap_result:?}"
@@ -3902,7 +4348,7 @@ async fn malformed_gzip_soap_is_rejected_before_ws_security() {
 
     // SOAP must not run after a failed normalize in production ordering; pin that
     // the still-compressed bytes would not validate as SOAP XML.
-    let soap_on_compressed = soap.before_proxy(&mut ctx, &mut headers).await;
+    let soap_on_compressed = run_soap_request_policy(&soap, &mut ctx, &mut headers).await;
     assert!(
         is_reject(&soap_on_compressed),
         "compressed bytes must not satisfy SOAP validation"
@@ -3973,7 +4419,7 @@ async fn compressed_soap_without_early_normalization_is_rejected_by_ws_security(
     headers.insert("content-encoding".to_string(), "gzip".to_string());
 
     let soap = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
-    let result = soap.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&soap, &mut ctx, &mut headers).await;
     assert!(
         is_reject(&result),
         "gzip bytes without early normalization must fail SOAP validation"
@@ -4085,7 +4531,7 @@ async fn test_out_of_range_expires_is_rejected_not_panicking() {
     );
     let mut ctx = make_ctx_with_soap_body(&wrap_soap(&security));
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert_eq!(reject_status(&result), 401);
 }
 
@@ -4415,7 +4861,7 @@ async fn test_oversized_wire_nonce_is_rejected_structurally() {
     let token = password_digest_token("alice", "wrong-password", &big_nonce);
     let mut ctx = make_ctx_with_soap_body(&wrap_soap(&token));
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert_eq!(reject_status(&result), 401);
     let body = reject_body(&result);
     assert_eq!(
@@ -5226,7 +5672,7 @@ fn offset_created(offset: chrono::Duration) -> String {
 async fn digest_outcome(plugin: &SoapWsSecurity, security_block: &str) -> PluginResult {
     let mut ctx = make_ctx_with_soap_body(&wrap_soap(security_block));
     let mut headers = soap_headers();
-    plugin.before_proxy(&mut ctx, &mut headers).await
+    run_soap_request_policy(plugin, &mut ctx, &mut headers).await
 }
 
 #[tokio::test]
@@ -5460,6 +5906,24 @@ fn password_digest_requires_an_explicit_replay_scope() {
 fn password_text_does_not_require_a_replay_scope() {
     // PasswordText carries no nonce, so there is no replay state to scope.
     assert!(SoapWsSecurity::new(&username_token_config()).is_ok());
+}
+
+#[tokio::test]
+async fn replay_inactive_policy_does_not_consume_a_registry_scope() {
+    let scope = "soap-replay-inactive";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    let plugin = SoapWsSecurity::new_with_http_client_and_config_id(
+        &timestamp_only_config(),
+        PluginHttpClient::default(),
+        Some(scope),
+    )
+    .expect("timestamp-only plugin must construct");
+
+    assert!(
+        !soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "a policy that cannot make replay claims must keep private state"
+    );
+    drop(plugin);
 }
 
 #[test]
@@ -5972,7 +6436,7 @@ async fn shared_backend_outage_rejects_before_it_can_be_treated_as_authenticated
     let token = password_digest_token("alice", "secret123", b"shared-outage-02");
     let mut ctx = make_ctx_with_soap_body(&wrap_soap(&token));
     let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(
         !ctx.metadata.contains_key("soap_ws_username"),
@@ -6398,4 +6862,995 @@ async fn the_shared_claim_ttl_is_the_fixed_future_safe_horizon() {
         .err()
         .expect("a declared keyspace retention must be refused");
     assert!(err.contains("cache_ttl_seconds"), "{err}");
+}
+
+// ── Advisory regression coverage ────────────────────────────────────────────
+//
+// GHSA-435h-f785-wmm4 — client-selected/misparsed media type bypasses SOAP
+//                       protection
+// GHSA-9g4v-h9hm-846r — reference×body XML work before signature authentication
+// GHSA-gfrx-43w6-jq3c — SOAP identity established after authorization
+// GHSA-f44p-hfqr-cvcc — SAML assertions lack recipient/freshness/replay binding
+// GHSA-3mwq-c8j6-9xhp — X.509 signatures need not protect the SOAP Body
+
+mod advisory_regressions {
+    use super::*;
+
+    fn strict_username_token_config() -> serde_json::Value {
+        json!({
+            "timestamp": { "require": false },
+            "username_token": {
+                "enabled": true,
+                "password_type": "PasswordText",
+                "credentials": [{"username": "alice", "password": "secret123"}]
+            },
+            "reject_missing_security_header": true
+        })
+    }
+
+    fn valid_username_token_body() -> String {
+        wrap_soap(
+            r#"<wsse:UsernameToken>
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">secret123</wsse:Password>
+    </wsse:UsernameToken>"#,
+        )
+    }
+
+    fn ctx_with(body: &str, content_type: Option<&str>) -> RequestContext {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/ws".to_string(),
+        );
+        if let Some(content_type) = content_type {
+            ctx.headers
+                .insert("content-type".to_string(), content_type.to_string());
+        }
+        ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body.as_bytes()));
+        ctx
+    }
+
+    // ── GHSA-435h-f785-wmm4 ─────────────────────────────────────────────
+
+    /// A SOAP envelope labelled with a non-SOAP media type used to skip the
+    /// whole policy. On a strict route it is now refused before dispatch, and
+    /// the body is not even buffered.
+    #[tokio::test]
+    async fn mislabelled_soap_is_rejected_on_a_strict_route() {
+        let plugin = SoapWsSecurity::new(&strict_username_token_config()).unwrap();
+        let body = wrap_soap("<wsse:UsernameToken/>");
+
+        for content_type in [
+            "application/octet-stream",
+            "text/plain",
+            "application/json",
+            "multipart/form-data; boundary=application/xml",
+        ] {
+            let mut ctx = ctx_with(&body, Some(content_type));
+            assert!(
+                !plugin.should_buffer_request_body(&ctx),
+                "{content_type} must not be buffered as SOAP"
+            );
+            let mut headers = soap_headers_with_content_type(content_type);
+            let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+            match result {
+                PluginResult::Reject { status_code, .. } => assert_eq!(
+                    status_code, 415,
+                    "{content_type} must be refused as an unsupported representation"
+                ),
+                other => panic!("{content_type} must be rejected on a strict route, got {other:?}"),
+            }
+        }
+    }
+
+    /// An absent Content-Type is the same bypass with no label at all.
+    #[tokio::test]
+    async fn absent_content_type_is_rejected_on_a_strict_route() {
+        let plugin = SoapWsSecurity::new(&strict_username_token_config()).unwrap();
+        let mut ctx = ctx_with(&wrap_soap("<wsse:UsernameToken/>"), None);
+        let mut headers = HashMap::new();
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+        match result {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 415);
+                assert!(body.contains("missing a Content-Type"), "got: {body}");
+            }
+            other => panic!("absent Content-Type must be rejected, got {other:?}"),
+        }
+    }
+
+    /// `mixed_route` is the explicit opt-out, and it is the only thing that
+    /// restores pass-through.
+    #[tokio::test]
+    async fn mixed_route_mode_restores_pass_through() {
+        let mut config = strict_username_token_config();
+        config["content_type"] = json!({ "mode": "mixed_route" });
+        let plugin = SoapWsSecurity::new(&config).unwrap();
+
+        let mut ctx = ctx_with("{\"not\":\"soap\"}", Some("application/json"));
+        let mut headers = non_soap_headers();
+        assert!(matches!(
+            run_soap_request_policy(&plugin, &mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+
+        // A governed representation is still governed in mixed mode.
+        let mut ctx = ctx_with(&wrap_soap("<wsse:UsernameToken/>"), Some("text/xml"));
+        let mut headers = soap_headers();
+        assert!(is_reject(
+            &run_soap_request_policy(&plugin, &mut ctx, &mut headers).await
+        ));
+    }
+
+    /// Parameter values that merely contain a SOAP essence never make a
+    /// request SOAP, and a charset parameter never stops one being SOAP.
+    #[test]
+    fn media_type_classification_is_not_substring_matching() {
+        let plugin = SoapWsSecurity::new(&strict_username_token_config()).unwrap();
+        assert!(plugin.should_buffer_request_body(&ctx_with("", Some("text/xml; charset=utf-8"))));
+        assert!(plugin.should_buffer_request_body(&ctx_with("", Some("APPLICATION/SOAP+XML"))));
+        assert!(!plugin.should_buffer_request_body(&ctx_with(
+            "",
+            Some("multipart/form-data; boundary=application/soap+xml")
+        )));
+        assert!(!plugin.should_buffer_request_body(&ctx_with("", Some("application/xmlish"))));
+    }
+
+    #[test]
+    fn multipart_boundary_must_not_end_in_space() {
+        use ferrum_edge::_test_support::soap_classify_request_for_test as classify;
+        let content_type =
+            "multipart/related; type=\"application/xop+xml\"; boundary=\"MIME boundary \"";
+
+        assert_eq!(
+            classify(&strict_username_token_config(), Some(content_type)),
+            Ok("reject:400:malformed_multipart".to_string())
+        );
+    }
+
+    #[test]
+    fn multipart_parameters_follow_http_quoted_string_rules() {
+        use ferrum_edge::_test_support::soap_classify_request_for_test as classify;
+        let config = strict_username_token_config();
+
+        assert_eq!(
+            classify(
+                &config,
+                Some("multipart/related; type='application/xop+xml'; boundary=MIME_boundary")
+            ),
+            Ok("reject:400:malformed_media_type".to_string()),
+            "single quotes are token bytes, but the slash remains invalid in an unquoted parameter value"
+        );
+        assert_eq!(
+            classify(
+                &config,
+                Some("multipart/related; type=\"application/xop+xml\"; boundary=MIME boundary")
+            ),
+            Ok("reject:400:malformed_media_type".to_string()),
+            "a boundary containing spaces must use a double-quoted parameter"
+        );
+    }
+
+    /// Classification names the representation. A bare `application/xop+xml`
+    /// infoset is distinguishable from plain XML even though both carry the
+    /// whole envelope in the body, because only the XOP forms may reference
+    /// octets that live outside the bytes Ferrum validates.
+    #[test]
+    fn governed_representations_are_named_by_class() {
+        use ferrum_edge::_test_support::soap_classify_request_for_test as classify;
+        let config = strict_username_token_config();
+
+        let xml = classify(&config, Some("text/xml"));
+        assert_eq!(xml, Ok("xml".to_string()));
+
+        let xop = classify(&config, Some("application/xop+xml"));
+        assert_eq!(xop, Ok("xop".to_string()));
+
+        let package = "multipart/related; type=\"application/xop+xml\"; boundary=b";
+        let mtom = classify(&config, Some(package));
+        assert_eq!(mtom, Ok("mtom".to_string()));
+
+        let other = classify(&config, Some("application/json"));
+        let refused = "reject:415:unsupported_media_type".to_string();
+        assert_eq!(other, Ok(refused));
+    }
+
+    /// MTOM/XOP: the envelope lives in the multipart root part and is
+    /// validated there; the packaging is not a way around the policy.
+    #[tokio::test]
+    async fn mtom_root_part_is_validated() {
+        let plugin = SoapWsSecurity::new(&strict_username_token_config()).unwrap();
+        let content_type = "multipart/related; type=\"application/xop+xml\"; \
+                            boundary=MIME_boundary; start=\"<root@example.com>\"";
+        let package = format!(
+            "--MIME_boundary\r\n\
+             Content-Type: application/xop+xml; charset=utf-8; type=\"text/xml\"\r\n\
+             Content-Transfer-Encoding: binary\r\n\
+             Content-ID: <root@example.com>\r\n\
+             \r\n\
+             {}\r\n\
+             --MIME_boundary--\r\n",
+            valid_username_token_body()
+        );
+
+        let mut ctx = ctx_with(&package, Some(content_type));
+        assert!(plugin.should_buffer_request_body(&ctx));
+        let mut headers = soap_headers_with_content_type(content_type);
+        assert!(
+            matches!(
+                run_soap_request_policy(&plugin, &mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "a valid MTOM root part must authenticate"
+        );
+
+        // Same packaging, unauthenticated envelope: refused, not forwarded.
+        let hostile = package.replace("secret123", "wrong-password");
+        let mut ctx = ctx_with(&hostile, Some(content_type));
+        let mut headers = soap_headers_with_content_type(content_type);
+        assert!(is_reject(
+            &run_soap_request_policy(&plugin, &mut ctx, &mut headers).await
+        ));
+    }
+
+    /// Declaring that a route does not accept MTOM must refuse SOAP-bearing
+    /// multipart rather than let it stream past.
+    #[tokio::test]
+    async fn mtom_can_be_refused_outright() {
+        let mut config = strict_username_token_config();
+        config["content_type"] = json!({ "allow_mtom": false });
+        let plugin = SoapWsSecurity::new(&config).unwrap();
+        let content_type =
+            "multipart/related; type=\"application/xop+xml\"; boundary=MIME_boundary";
+        let mut ctx = ctx_with("--MIME_boundary--\r\n", Some(content_type));
+        let mut headers = soap_headers_with_content_type(content_type);
+        match run_soap_request_policy(&plugin, &mut ctx, &mut headers).await {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 415),
+            other => panic!("MTOM must be refused when disallowed, got {other:?}"),
+        }
+    }
+
+    // ── GHSA-gfrx-43w6-jq3c ─────────────────────────────────────────────
+
+    /// A UsernameToken policy is an auth plugin, buffers before authenticate,
+    /// and publishes the SOAP principal as the request identity.
+    #[tokio::test]
+    async fn soap_identity_is_published_before_authorization() {
+        let plugin = SoapWsSecurity::new(&strict_username_token_config()).unwrap();
+        assert!(plugin.is_auth_plugin());
+        assert!(plugin.requires_request_body_before_authenticate());
+        assert!(!plugin.requires_request_body_before_before_proxy());
+
+        let mut ctx = ctx_with(&valid_username_token_body(), Some("text/xml"));
+        let consumer_index = ConsumerIndex::new(&[]);
+        let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(ctx.authenticated_identity.as_deref(), Some("alice"));
+        assert_eq!(ctx.auth_method, Some("soap_ws_security"));
+        assert_eq!(
+            ctx.metadata.get("soap_ws_username").map(String::as_str),
+            Some("alice")
+        );
+    }
+
+    /// The timestamp-only policy establishes no principal, so it must stay out
+    /// of the authentication chain (otherwise every request becomes
+    /// "Authentication required") and keep validating in `before_proxy`.
+    #[test]
+    fn timestamp_only_policy_is_not_an_auth_plugin() {
+        let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+        assert!(!plugin.is_auth_plugin());
+        assert!(!plugin.requires_request_body_before_authenticate());
+        assert!(plugin.requires_request_body_before_before_proxy());
+    }
+
+    /// The two phases are mutually exclusive: an identity-establishing policy
+    /// does nothing in `before_proxy`, so no message is validated twice.
+    #[tokio::test]
+    async fn identity_policy_does_not_double_run_in_before_proxy() {
+        let plugin = SoapWsSecurity::new(&strict_username_token_config()).unwrap();
+        let mut ctx = ctx_with("not a soap envelope at all", Some("text/xml"));
+        let mut headers = soap_headers();
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert!(ctx.authenticated_identity.is_none());
+    }
+
+    // ── GHSA-9g4v-h9hm-846r ─────────────────────────────────────────────
+
+    /// Reference resolution must be unreachable for an untrusted signer.
+    ///
+    /// The fixture declares 64 identical References — over the ceiling of 8 and
+    /// duplicated — so if References were processed first the rejection would
+    /// name the ceiling or the duplicate. Because trust is settled first, the
+    /// only reachable rejection is the trust failure, and none of the
+    /// `O(references x body)` canonicalization work is ever performed.
+    #[tokio::test]
+    async fn untrusted_signer_is_refused_before_any_reference_work() {
+        let large_body = "A".repeat(200_000);
+        let envelope = format!(
+            r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+  <soap:Header>
+    <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+      <wsu:Timestamp wsu:Id="TS-1"><wsu:Created>{created}</wsu:Created></wsu:Timestamp>
+      <wsse:BinarySecurityToken>{untrusted_cert}</wsse:BinarySecurityToken>
+      <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>{references}</ds:SignedInfo><ds:SignatureValue>AAAA</ds:SignatureValue></ds:Signature>
+    </wsse:Security>
+  </soap:Header>
+  <soap:Body wsu:Id="Body-1"><Payload>{large_body}</Payload></soap:Body>
+</soap:Envelope>"#,
+            created = fresh_created(),
+            untrusted_cert = super::x509_roundtrip::untrusted_cert_der_b64(),
+            references = std::iter::repeat_n(
+                r##"<ds:Reference URI="#Body-1"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>AAAA</ds:DigestValue></ds:Reference>"##,
+                64
+            )
+            .collect::<String>(),
+            large_body = large_body,
+        );
+
+        let (plugin, _cert_file) = super::x509_roundtrip::trusted_plugin_for_advisory_test();
+        let mut ctx = ctx_with(&envelope, Some("text/xml"));
+        let mut headers = soap_headers();
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+        assert!(is_reject(&result));
+        let body = reject_body(&result);
+        assert!(
+            body.contains("not trusted"),
+            "an untrusted signer must be refused on the trust check, got: {body}"
+        );
+        assert!(
+            !body.contains("too many Signature References")
+                && !body.contains("duplicate Signature Reference"),
+            "reference processing must be unreachable for an untrusted signer: {body}"
+        );
+    }
+
+    // ── GHSA-f44p-hfqr-cvcc ─────────────────────────────────────────────
+
+    /// SAML now requires a declared replay scope, a service audience, and a
+    /// service recipient. Each omission is a configuration error, not a weaker
+    /// runtime policy.
+    #[test]
+    fn saml_requires_binding_and_replay_configuration() {
+        // A real trust anchor on disk: `trusted_signing_certs` is loaded during
+        // construction, so a nonexistent path would fail admission before any
+        // of the bindings under test could be reached.
+        let bundle = super::saml_fixtures::IdpBundle::new();
+        let signing_cert = bundle.trusted_cert_path.to_str().unwrap();
+        let base = json!({
+            "timestamp": { "require": false },
+            "saml": {
+                "enabled": true,
+                "trusted_issuers": ["https://idp.example.com"],
+                "trusted_signing_certs": [signing_cert],
+                "audience": "https://service.example.com",
+                "recipient": "https://service.example.com/ws"
+            },
+            "nonce": { "replay_scope": "process" }
+        });
+
+        let mut without_audience = base.clone();
+        without_audience["saml"]
+            .as_object_mut()
+            .unwrap()
+            .remove("audience");
+        let err = SoapWsSecurity::new(&without_audience)
+            .err()
+            .expect("saml.audience must be required");
+        assert!(err.contains("config.saml.audience"), "got: {err}");
+
+        let mut without_recipient = base.clone();
+        without_recipient["saml"]
+            .as_object_mut()
+            .unwrap()
+            .remove("recipient");
+        let err = SoapWsSecurity::new(&without_recipient)
+            .err()
+            .expect("saml.recipient must be required");
+        assert!(err.contains("config.saml.recipient"), "got: {err}");
+
+        let mut without_scope = base.clone();
+        without_scope.as_object_mut().unwrap().remove("nonce");
+        let err = SoapWsSecurity::new(&without_scope)
+            .err()
+            .expect("saml must require a declared replay scope");
+        assert!(err.contains("replay_scope"), "got: {err}");
+
+        let mut holder_of_key = base.clone();
+        holder_of_key["saml"]["allowed_subject_confirmation_methods"] =
+            json!(["urn:oasis:names:tc:SAML:2.0:cm:holder-of-key"]);
+        let err = SoapWsSecurity::new(&holder_of_key)
+            .err()
+            .expect("holder-of-key must be refused");
+        assert!(err.contains("holder-of-key"), "got: {err}");
+    }
+
+    // ── GHSA-3mwq-c8j6-9xhp ─────────────────────────────────────────────
+
+    /// `require_signed_timestamp` alongside `timestamp.require: false` is the
+    /// vacuously-satisfiable pairing the advisory describes.
+    #[test]
+    fn contradictory_signed_timestamp_configuration_is_refused() {
+        // `trusted_certs` is loaded during construction, so the pairing under
+        // test is only reachable behind a trust anchor that actually exists.
+        let bundle = super::saml_fixtures::IdpBundle::new();
+        let err = SoapWsSecurity::new(&json!({
+            "timestamp": { "require": false },
+            "x509_signature": {
+                "enabled": true,
+                "trusted_certs": [bundle.trusted_cert_path.to_str().unwrap()],
+                "require_signed_timestamp": true
+            }
+        }))
+        .err()
+        .expect("contradictory timestamp policy must be refused");
+        assert!(err.contains("require_signed_timestamp"), "got: {err}");
+    }
+
+    // ── Requirement 6: the authenticated representation is what dispatches ──
+
+    /// A later request-body transform must not be able to substitute a
+    /// different message for the one that was authenticated.
+    #[tokio::test]
+    async fn a_mutated_body_is_refused_before_backend_dispatch() {
+        let plugin = SoapWsSecurity::new(&strict_username_token_config()).unwrap();
+        assert!(plugin.requires_final_request_body_before_backend_dispatch());
+
+        let body = valid_username_token_body();
+        let mut ctx = ctx_with(&body, Some("text/xml"));
+        let consumer_index = ConsumerIndex::new(&[]);
+        assert!(matches!(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            PluginResult::Continue
+        ));
+
+        let headers = soap_headers();
+        assert!(matches!(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+                .await,
+            PluginResult::Continue
+        ));
+
+        let tampered = body.replace("Widget", "Mainframe");
+        // Public metadata is deliberately untrusted. Before the private typed
+        // proof, a later/custom plugin could replace the digest with the
+        // transformed body's value and authorize bytes SOAP never validated.
+        let tampered_digest = ring::digest::digest(&ring::digest::SHA256, tampered.as_bytes());
+        let forged_public_digest = tampered_digest
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        ctx.metadata.insert(
+            "soap_ws_security.authenticated_body_sha256".to_string(),
+            forged_public_digest,
+        );
+        match plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, tampered.as_bytes())
+            .await
+        {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 500),
+            other => panic!("a mutated authenticated body must not dispatch, got {other:?}"),
+        }
+    }
+
+    /// The representation binding belongs to the identity-establishing form
+    /// only. A timestamp-only policy authenticates nobody and claims no
+    /// integrity over the Body, so it must not bind the representation: a
+    /// request-body transformer's rewrite lands immediately before the
+    /// final-body hooks, and binding here would fail every governed SOAP
+    /// request on such a proxy closed with `500` while protecting nothing.
+    #[tokio::test]
+    async fn a_timestamp_only_policy_does_not_bind_the_representation() {
+        let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+        assert!(!plugin.requires_final_request_body_before_backend_dispatch());
+        assert!(!plugin.needs_final_request_body_context());
+
+        let body = wrap_soap(&fresh_timestamp());
+        let mut ctx = ctx_with(&body, Some("text/xml"));
+        let mut headers = soap_headers();
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+
+        let transformed = body.replace("Widget", "Mainframe");
+        assert!(matches!(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+                .await,
+            PluginResult::Continue
+        ));
+    }
+}
+
+// ── Strict MTOM/XOP MIME framing (GHSA-435h-f785-wmm4 residual) ─────────────
+//
+// The package parser decides *which bytes are the SOAP envelope*. Any shape
+// where a conforming backend parser would frame the package differently is a
+// gateway/backend representation split — the exact bypass class the advisory
+// describes — so every one of them fails closed here.
+
+mod mtom_strict_framing {
+    use ferrum_edge::_test_support::soap_extract_mtom_root_part_for_test as extract;
+
+    const BOUNDARY: &str = "MIME_boundary";
+    const ROOT_ID: &str = "root@example.com";
+
+    /// A conforming two-part package: an XOP root selectable by `start`, plus
+    /// one opaque attachment.
+    fn package(root_body: &str, attachment_body: &str) -> String {
+        format!(
+            "--MIME_boundary\r\n\
+             Content-Type: application/xop+xml; charset=utf-8; type=\"text/xml\"\r\n\
+             Content-Transfer-Encoding: binary\r\n\
+             Content-ID: <root@example.com>\r\n\
+             \r\n\
+             {root_body}\r\n\
+             --MIME_boundary\r\n\
+             Content-Type: application/octet-stream\r\n\
+             Content-ID: <attachment@example.com>\r\n\
+             \r\n\
+             {attachment_body}\r\n\
+             --MIME_boundary--\r\n"
+        )
+    }
+
+    /// The resolved root part's body, as text.
+    fn root_of(package: &str, start: Option<&str>) -> String {
+        let resolved = extract(package.as_bytes(), BOUNDARY, start);
+        let (body, _) = resolved.expect("package must resolve");
+        String::from_utf8(body).expect("root part is UTF-8 here")
+    }
+
+    /// The package must fail closed with exactly `class`.
+    fn assert_closed(package: &str, start: Option<&str>, class: &str) {
+        let outcome = extract(package.as_bytes(), BOUNDARY, start);
+        let actual = outcome.err().unwrap_or("<accepted>");
+        assert_eq!(actual, class);
+    }
+
+    /// The conforming shapes still work: `start`-selected and first-part
+    /// selection both resolve the envelope, the root's own Content-Type (which
+    /// carries its charset) comes back with it, and an RFC 2046 preamble is
+    /// ignored rather than inspected.
+    #[test]
+    fn valid_packages_resolve_the_root_envelope() {
+        let package = package("<soap:Envelope/>", "opaque-bytes");
+        assert_eq!(root_of(&package, Some(ROOT_ID)), "<soap:Envelope/>");
+        assert_eq!(root_of(&package, None), "<soap:Envelope/>");
+
+        let resolved = extract(package.as_bytes(), BOUNDARY, Some(ROOT_ID));
+        let (_, content_type) = resolved.expect("package must resolve");
+        assert_eq!(
+            content_type,
+            "application/xop+xml; charset=utf-8; type=\"text/xml\""
+        );
+
+        let with_preamble = format!("this is a MIME preamble\r\n{package}");
+        assert_eq!(root_of(&with_preamble, Some(ROOT_ID)), "<soap:Envelope/>");
+    }
+
+    /// A `--boundary` that is not at the start of a line is payload, not
+    /// framing. The unanchored byte-substring search this replaced truncated
+    /// the envelope at the first such occurrence, so Ferrum validated a prefix
+    /// of the message the backend executed in full.
+    #[test]
+    fn an_embedded_boundary_substring_does_not_reframe_the_root() {
+        let root = "<soap:Envelope><!--MIME_boundary--></soap:Envelope>";
+        let package = package(root, "opaque-bytes");
+        assert_eq!(
+            root_of(&package, Some(ROOT_ID)),
+            root,
+            "a boundary substring inside the envelope is payload"
+        );
+    }
+
+    /// A fake part planted in the preamble must not become the root. With
+    /// first-part selection an unanchored search finds the planted delimiter
+    /// first and returns the attacker's envelope; anchored framing skips it and
+    /// selects the real first part.
+    #[test]
+    fn a_payload_fake_delimiter_cannot_become_the_root() {
+        let real = package("<soap:Envelope>real</soap:Envelope>", "opaque");
+        // The planted delimiter is mid-line, so it is not a delimiter line for
+        // any conforming parser.
+        let planted = format!(
+            "preamble --MIME_boundary\r\n\
+             Content-Type: text/xml\r\n\
+             \r\n\
+             <soap:Envelope>forged</soap:Envelope>\r\n\
+             {real}"
+        );
+        assert_eq!(
+            root_of(&planted, None),
+            "<soap:Envelope>real</soap:Envelope>",
+            "an unanchored delimiter must not select a root"
+        );
+        assert_eq!(
+            root_of(&planted, Some(ROOT_ID)),
+            "<soap:Envelope>real</soap:Envelope>"
+        );
+    }
+
+    /// LF-only framing is not MIME framing. A parser that tolerates it and one
+    /// that does not disagree about every part boundary in the package.
+    #[test]
+    fn lf_only_framing_fails_closed() {
+        let raw = package("<soap:Envelope/>", "opaque");
+        let package = raw.replace("\r\n", "\n");
+        assert_closed(&package, Some(ROOT_ID), "malformed_encoding");
+        assert_closed(&package, None, "malformed_encoding");
+    }
+
+    /// The close-delimiter is mandatory, and nothing boundary-shaped may
+    /// follow it.
+    #[test]
+    fn missing_or_ambiguous_closure_fails_closed() {
+        let complete = package("<soap:Envelope/>", "opaque");
+
+        let unterminated = complete.replace("--MIME_boundary--\r\n", "");
+        assert_closed(&unterminated, Some(ROOT_ID), "malformed_encoding");
+
+        // `--boundary-` is neither a part delimiter nor a close-delimiter.
+        let malformed = complete.replace("boundary--\r\n", "boundary-\r\n");
+        assert_closed(&malformed, Some(ROOT_ID), "malformed_encoding");
+
+        // A second package framed inside the epilogue: a parser that keeps
+        // reading past the close-delimiter frames a different root.
+        let with_epilogue = format!(
+            "{complete}--MIME_boundary\r\n\
+             Content-Type: text/xml\r\n\
+             Content-ID: <late@example.com>\r\n\
+             \r\n\
+             <soap:Envelope>late</soap:Envelope>\r\n\
+             --MIME_boundary--\r\n"
+        );
+        assert_closed(&with_epilogue, Some(ROOT_ID), "malformed_encoding");
+
+        // No parts at all.
+        assert_closed("--MIME_boundary--\r\n", None, "malformed_encoding");
+    }
+
+    /// Duplicated security-relevant part headers are ambiguous. A first-wins
+    /// rule here is a rule the backend need not share.
+    #[test]
+    fn duplicate_part_headers_fail_closed() {
+        let base = package("<soap:Envelope/>", "opaque");
+
+        let duplicate_type = base.replace(
+            "Content-Transfer-Encoding: binary\r\n",
+            "Content-Type: text/xml\r\nContent-Transfer-Encoding: binary\r\n",
+        );
+        assert_closed(&duplicate_type, Some(ROOT_ID), "malformed_encoding");
+
+        let duplicate_id = base.replace(
+            "Content-ID: <root@example.com>\r\n",
+            "Content-ID: <root@example.com>\r\nContent-ID: <b@example.com>\r\n",
+        );
+        assert_closed(&duplicate_id, Some(ROOT_ID), "malformed_encoding");
+
+        let duplicate_cte = base.replace(
+            "Content-Transfer-Encoding: binary\r\n",
+            "Content-Transfer-Encoding: binary\r\nContent-Transfer-Encoding: 8bit\r\n",
+        );
+        assert_closed(&duplicate_cte, Some(ROOT_ID), "malformed_encoding");
+    }
+
+    /// Two parts claiming one `Content-ID` let `start` resolve to either
+    /// envelope; RFC 2387 requires package-unique ids.
+    #[test]
+    fn duplicate_root_content_ids_fail_closed() {
+        let base = package("<soap:Envelope>real</soap:Envelope>", "opaque");
+        let package = base.replace("<attachment@example.com>", "<root@example.com>");
+        assert_closed(&package, Some(ROOT_ID), "malformed_encoding");
+        // Even first-part selection must not silently prefer one of them.
+        assert_closed(&package, None, "malformed_encoding");
+    }
+
+    /// Obsolete folded continuation lines unfold differently across parsers.
+    #[test]
+    fn folded_part_headers_fail_closed() {
+        let base = package("<soap:Envelope/>", "opaque");
+        let package = base.replace(
+            "application/xop+xml; charset=utf-8;",
+            "application/xop+xml;\r\n charset=utf-8;",
+        );
+        assert_closed(&package, Some(ROOT_ID), "malformed_encoding");
+    }
+
+    /// A header line with no colon, a non-ASCII header block, and a blank
+    /// `Content-ID` are all ambiguous syntax rather than readable metadata.
+    #[test]
+    fn malformed_part_headers_fail_closed() {
+        let base = package("<soap:Envelope/>", "opaque");
+
+        let no_colon = base.replace(
+            "Content-Transfer-Encoding: binary\r\n",
+            "Content-Transfer-Encoding: binary\r\nnot-a-header-line\r\n",
+        );
+        assert_closed(&no_colon, Some(ROOT_ID), "malformed_encoding");
+
+        let non_ascii = base.replace("<root@example.com>", "<r\u{00f6}ot>");
+        assert_closed(&non_ascii, Some(ROOT_ID), "malformed_encoding");
+
+        let blank_id = base.replace("<root@example.com>", "<>");
+        assert_closed(&blank_id, Some(ROOT_ID), "malformed_encoding");
+    }
+
+    /// `start` naming a part the package does not contain has no envelope to
+    /// validate.
+    #[test]
+    fn unknown_start_id_fails_closed() {
+        let package = package("<soap:Envelope/>", "opaque");
+        let absent = Some("absent@example.com");
+        assert_closed(&package, absent, "malformed_encoding");
+    }
+
+    /// The root part must itself be a SOAP/XOP infoset and must not declare a
+    /// re-encoding transfer encoding, or the bytes Ferrum validates are not the
+    /// bytes the backend decodes.
+    #[test]
+    fn a_mislabelled_or_re_encoded_root_fails_closed() {
+        let base = package("<soap:Envelope/>", "opaque");
+
+        let mislabelled = base.replace("application/xop+xml", "application/pdf");
+        assert_closed(&mislabelled, Some(ROOT_ID), "unsupported_charset");
+
+        let re_encoded = base.replace("binary\r\n", "base64\r\n");
+        assert_closed(&re_encoded, Some(ROOT_ID), "unsupported_charset");
+    }
+
+    /// Part-count and header-size ceilings stay fail-closed.
+    #[test]
+    fn part_and_header_bounds_fail_closed() {
+        // 65 parts: one over MAX_MULTIPART_PARTS.
+        let mut over_capacity = String::new();
+        for index in 0..65 {
+            over_capacity.push_str(&format!(
+                "--MIME_boundary\r\n\
+                 Content-Type: application/octet-stream\r\n\
+                 Content-ID: <part-{index}@example.com>\r\n\
+                 \r\n\
+                 payload\r\n"
+            ));
+        }
+        over_capacity.push_str("--MIME_boundary--\r\n");
+        assert_closed(&over_capacity, None, "malformed_encoding");
+
+        // A header block past MAX_MULTIPART_PART_HEADER_BYTES.
+        let padding = "X".repeat(9_000);
+        let base = package("<soap:Envelope/>", "opaque");
+        let oversized = base.replace(
+            "Content-Transfer-Encoding: binary\r\n",
+            &format!("Content-Transfer-Encoding: binary\r\nX-Pad: {padding}\r\n"),
+        );
+        assert_closed(&oversized, Some(ROOT_ID), "malformed_encoding");
+    }
+}
+
+// ── Governed representations always parse or reject ─────────────────────────
+//
+// `reject_missing_security_header: false` is the documented opt-out for a
+// governed message that genuinely carries no `wsse:Security` header. It is not
+// an opt-out from *parsing*: turning a gateway/backend parser disagreement into
+// pass-through skips authentication, integrity, freshness, and replay for a
+// message the backend still executes.
+
+mod governed_parse_failures_reject {
+    use super::*;
+
+    fn permissive_config() -> serde_json::Value {
+        json!({
+            "timestamp": { "require": false },
+            "username_token": {
+                "enabled": true,
+                "password_type": "PasswordText",
+                "credentials": [{"username": "alice", "password": "secret123"}]
+            },
+            "reject_missing_security_header": false
+        })
+    }
+
+    async fn run(body: &str) -> PluginResult {
+        let plugin = SoapWsSecurity::new(&permissive_config()).unwrap();
+        let mut ctx = make_ctx_with_soap_body(body);
+        let mut headers = soap_headers();
+        run_soap_request_policy(&plugin, &mut ctx, &mut headers).await
+    }
+
+    /// A SOAP 1.1 envelope wrapping exactly `inner`, so structural fixtures can
+    /// state only the shape they are about.
+    fn envelope(inner: &str) -> String {
+        let ns = "http://schemas.xmlsoap.org/soap/envelope/";
+        format!("<soap:Envelope xmlns:soap=\"{ns}\">{inner}</soap:Envelope>")
+    }
+
+    /// XML the gateway cannot parse is not proof that the backend cannot.
+    #[tokio::test]
+    async fn malformed_xml_rejects_even_with_the_missing_header_opt_out() {
+        let unclosed = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">"#;
+        let result = run(unclosed).await;
+        assert_eq!(reject_status(&result), 400);
+        assert!(
+            reject_body(&result).contains("malformed"),
+            "got: {}",
+            reject_body(&result)
+        );
+    }
+
+    /// A non-envelope root is unsupported structure, not an absent header.
+    #[tokio::test]
+    async fn unsupported_structure_rejects_even_with_the_opt_out() {
+        let result = run("<notasoap>hello</notasoap>").await;
+        assert_eq!(reject_status(&result), 400);
+        let body = reject_body(&result);
+        assert!(
+            body.contains("not a namespace-qualified SOAP Envelope"),
+            "{body}"
+        );
+    }
+
+    /// Two namespace-correct `soap:Body` elements are exactly the ambiguity
+    /// that lets a gateway and a backend read different messages.
+    #[tokio::test]
+    async fn duplicate_envelope_structure_rejects_even_with_the_opt_out() {
+        let two_bodies = "<soap:Header/><soap:Body><A/></soap:Body><soap:Body><B/></soap:Body>";
+        assert_eq!(reject_status(&run(&envelope(two_bodies)).await), 400);
+
+        let two_headers = "<soap:Header/><soap:Header/><soap:Body><A/></soap:Body>";
+        assert_eq!(reject_status(&run(&envelope(two_headers)).await), 400);
+    }
+
+    /// A parsing-budget failure is a refusal to read the message, so it cannot
+    /// become a decision to forward it unvalidated.
+    #[tokio::test]
+    async fn a_parsing_budget_failure_rejects_even_with_the_opt_out() {
+        let nodes = "<N/>".repeat(66_000);
+        let inner = format!("<soap:Header/><soap:Body>{nodes}</soap:Body>");
+        assert_eq!(reject_status(&run(&envelope(&inner)).await), 400);
+    }
+
+    /// The documented opt-out itself is preserved: a well-formed envelope whose
+    /// Header genuinely carries no `wsse:Security` still passes through.
+    #[tokio::test]
+    async fn a_genuinely_absent_security_header_still_passes_through() {
+        let inner = "<soap:Header/><soap:Body><GetPrice/></soap:Body>";
+        assert!(matches!(
+            run(&envelope(inner)).await,
+            PluginResult::Continue
+        ));
+    }
+}
+
+// ── SAML assertions must name a principal (GHSA-f44p-hfqr-cvcc residual) ────
+//
+// An enabled SAML policy makes this instance an authentication plugin whose
+// documented principal is the Subject `NameID`. An assertion that satisfies
+// every binding but names nobody authenticated nothing, so accepting it —
+// while burning its single-use replay id — silently degraded the request to
+// unauthenticated and let an attacker spend a legitimate assertion id.
+
+mod saml_name_id_is_required {
+    use super::*;
+
+    fn plugin_and_bundle() -> (SoapWsSecurity, saml_fixtures::IdpBundle) {
+        let bundle = saml_fixtures::IdpBundle::new();
+        let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+        (plugin, bundle)
+    }
+
+    fn assertion_with(assertion_id: &str, name_id_fragment: Option<&str>) -> String {
+        let mut builder = saml_fixtures::AssertionBuilder::new(
+            assertion_id,
+            "https://idp.example.com/metadata",
+            "alice@example.com",
+        );
+        builder.name_id_fragment = name_id_fragment.map(str::to_string);
+        builder.build()
+    }
+
+    async fn run(plugin: &SoapWsSecurity, assertion: &str) -> PluginResult {
+        let mut ctx = make_ctx_with_soap_body(&wrap_saml_assertion(assertion));
+        let mut headers = soap_headers();
+        run_soap_request_policy(plugin, &mut ctx, &mut headers).await
+    }
+
+    /// A fully signed, fully bound assertion whose Subject has no `NameID`
+    /// authenticates nobody.
+    #[tokio::test]
+    async fn an_absent_name_id_rejects() {
+        let (plugin, _bundle) = plugin_and_bundle();
+        let result = run(&plugin, &assertion_with("_no-name-id", Some(""))).await;
+        assert_eq!(reject_status(&result), 401);
+        assert!(
+            reject_body(&result).contains("NameID"),
+            "got: {}",
+            reject_body(&result)
+        );
+    }
+
+    /// Two `NameID` elements are two candidate principals; a downstream
+    /// consumer need not pick the one the gateway did.
+    #[tokio::test]
+    async fn a_duplicate_name_id_rejects() {
+        let (plugin, _bundle) = plugin_and_bundle();
+        let two_name_ids = concat!(
+            "<saml:NameID>alice@example.com</saml:NameID>",
+            "<saml:NameID>mallory@example.com</saml:NameID>"
+        );
+        let assertion = assertion_with("_duplicate-name-id", Some(two_name_ids));
+        let result = run(&plugin, &assertion).await;
+        assert_eq!(reject_status(&result), 401);
+    }
+
+    /// A whitespace-only `NameID` is not an identity.
+    #[tokio::test]
+    async fn a_blank_name_id_rejects() {
+        let (plugin, _bundle) = plugin_and_bundle();
+        let assertion = assertion_with("_blank-name-id", Some("<saml:NameID>   </saml:NameID>"));
+        let result = run(&plugin, &assertion).await;
+        assert_eq!(reject_status(&result), 401);
+        assert!(
+            reject_body(&result).contains("NameID"),
+            "got: {}",
+            reject_body(&result)
+        );
+    }
+
+    /// The positive case: one nonblank `NameID` becomes the request principal.
+    #[tokio::test]
+    async fn a_valid_name_id_becomes_the_principal() {
+        let (plugin, _bundle) = plugin_and_bundle();
+        let assertion = assertion_with("_valid-name-id", None);
+        let mut ctx = make_ctx_with_soap_body(&wrap_saml_assertion(&assertion));
+        let consumer_index = ConsumerIndex::new(&[]);
+        assert!(matches!(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            ctx.authenticated_identity.as_deref(),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            ctx.metadata.get("soap_ws_saml_subject").map(String::as_str),
+            Some("alice@example.com")
+        );
+    }
+
+    /// The semantic failure must consume no replay state: the very same
+    /// assertion id must still be spendable by a well-formed assertion.
+    #[tokio::test]
+    async fn a_principal_less_assertion_does_not_burn_the_replay_id() {
+        let (plugin, _bundle) = plugin_and_bundle();
+        let shared_id = "_shared-assertion-id";
+
+        let rejected = run(&plugin, &assertion_with(shared_id, Some(""))).await;
+        assert_eq!(reject_status(&rejected), 401);
+
+        let accepted = run(&plugin, &assertion_with(shared_id, None)).await;
+        assert!(
+            matches!(accepted, PluginResult::Continue),
+            "a rejected principal-less assertion must not claim the id: {accepted:?}"
+        );
+
+        // And the id is claimed exactly once by the assertion that was accepted.
+        let replayed = run(&plugin, &assertion_with(shared_id, None)).await;
+        assert_eq!(reject_status(&replayed), 401);
+        assert!(
+            reject_body(&replayed).contains("already been used"),
+            "got: {}",
+            reject_body(&replayed)
+        );
+    }
 }

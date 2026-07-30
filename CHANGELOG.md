@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- API-spec YAML ingestion now expands anchors and aliases through a bounded
+  libyaml event graph (node, depth, alias-reference, expanded-byte, and work
+  budgets) with cycle / undefined-alias / duplicate-anchor /
+  duplicate-mapping-key detection before JSON conversion (#3307). The expanded
+  byte budget is a fail-closed upper bound on the compact JSON representation,
+  including string/key escaping. Merge keys are applied when present. JSON and
+  YAML share the same expanded-node admission cap so autodetection cannot
+  weaken checks. Expansion also fails closed on non-core/local YAML tags,
+  non-finite numbers, and integers outside the exact JSON `i64`/`u64` range.
+  Scalar number and boolean mapping keys keep the stringified spelling the
+  previous `serde_json::to_value` conversion produced (`200:` → `"200"`), so
+  YAML that leaves status codes unquoted still ingests and already-stored specs
+  still restore.
 - Istio Telemetry `accessLogging.filter.expression` now supports bounded boolean
   expressions with `||`, `&&`, parentheses, and the existing `response.code`,
   `response.status`, and `response.duration` comparison atoms. `duration` is
@@ -71,6 +84,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a decoding or expanding transform cannot escape the route policy.
   This completes the advisory; [PR #3176](https://github.com/ferrum-edge/ferrum-edge/pull/3176)
   had previously closed only the direct-H2/SNI early-response timing window.
+- `soap_ws_security` no longer trusts client media-type selection
+  (GHSA-435h-f785-wmm4). Content types are parsed structurally (`type/subtype`
+  plus RFC 9110 parameters) and matched by exact essence instead of
+  case-insensitive substring search, and the new `content_type.mode` defaults to
+  `strict`: every request on a SOAP-protected proxy is governed, so a SOAP
+  envelope labelled `application/octet-stream`, `text/plain`, or with no
+  `Content-Type` at all is rejected (415) before backend dispatch rather than
+  streamed to a backend that routes by path or SOAPAction. `mixed_route` is the
+  explicit pass-through opt-out. SOAP 1.1/1.2, `application/xml`,
+  `application/xop+xml`, and MTOM/XOP `multipart/related` are supported;
+  MTOM validates the root part's envelope (selected by `start`, else the first
+  part) and refuses a root part that is mislabelled, re-encoded, or absent.
+  A `multipart/form-data; boundary=application/xml` request is no longer
+  raw-scanned as an envelope. MTOM package framing is now a strict MIME
+  contract, because the parser decides which bytes are the envelope: delimiter
+  *lines* are recognized only at the body start or immediately after a CRLF with
+  exact CRLF framing and no transport padding (so a `--boundary` sequence inside
+  a preamble, a header value, an attachment payload, or the envelope itself is
+  inert payload rather than framing); exactly one close-delimiter is required
+  and the epilogue after it must not contain the boundary token; part headers
+  must be US-ASCII, unfolded, well-formed `token: value` pairs carrying at most
+  one `Content-Type` / `Content-ID` / `Content-Transfer-Encoding` each;
+  `Content-ID` values must be package-unique and nonblank, and with `start`
+  supplied exactly one part may match; and the whole package is framed and every
+  part parsed before a root is selected, so no later ambiguity is missed by an
+  early return. Part, header, and boundary-candidate ceilings stay fail-closed.
+  Previously an unanchored byte-substring search let an attacker plant a
+  boundary-shaped sequence in a payload or preamble and have Ferrum validate a
+  fabricated envelope — or a truncated one — while the backend executed the real
+  root part.
+- `soap_ws_security` now authenticates the signer before performing
+  attacker-selected XML work (GHSA-9g4v-h9hm-846r). Both the X.509 and SAML
+  paths settle certificate trust and `SignatureValue`-over-`SignedInfo`
+  verification *before* the first `<Reference>` is resolved, canonicalized, or
+  digested, so an untrusted or forged signature costs constant work. Duplicate
+  Reference URIs are rejected, the X.509 Reference ceiling drops from 64 to 8,
+  SAML accepts exactly one Reference, one bounded id index is built per message
+  in place of a full-envelope scan per Reference, the raw-attribute uniqueness
+  guard is a single pass for the whole `SignedInfo`, and every canonicalization
+  is charged against an aggregate per-message byte budget derived from the body
+  length. Previously 64 References to one large element could force well over a
+  gigabyte of scanning and canonicalization per unauthenticated request.
+- `soap_ws_security` now establishes SOAP identity before authorization
+  (GHSA-gfrx-43w6-jq3c). A configuration that establishes a principal
+  (`username_token`, `x509_signature`, or `saml`) is an authentication plugin:
+  it buffers the body before the authenticate phase, validates there, and
+  publishes `authenticated_identity` plus a namespace-correct
+  `identified_consumer`, so `access_control`, consumer-scoped `rate_limiting`,
+  logging, retries, and chargeback all observe one authoritative SOAP identity
+  instead of running before it exists. A timestamp-only policy establishes no
+  principal, stays out of the authentication chain, and keeps validating in
+  `before_proxy`; the two phases are mutually exclusive by configuration, so no
+  message is validated twice. **Breaking:** an identity-establishing instance
+  must be the proxy's sole authentication mechanism in either auth mode, and
+  composing one with `compression`'s `decompress_request` is rejected at config
+  admission; for that identity-establishing form an `on_final_request_body`
+  guard additionally refuses to dispatch a message whose bytes changed after
+  validation. A timestamp-only instance authenticates nobody and claims no
+  integrity over the Body, so it does not bind the representation and stays
+  composable with request-body transformers. Also **breaking:** because an
+  identity-establishing instance is the proxy's sole authentication mechanism,
+  a request the SOAP policy passes through — a non-SOAP media type under
+  `content_type.mode: mixed_route`, or a governed envelope with no
+  `wsse:Security` header under `reject_missing_security_header: false` —
+  reaches the authentication chain with no identity and is answered `401`
+  rather than forwarded anonymously; pair those options with a timestamp-only
+  instance, or separate anonymous and SOAP-authenticated traffic onto different
+  proxies.
+- `soap_ws_security` X.509 signatures must now protect the backend-visible SOAP
+  Body (GHSA-3mwq-c8j6-9xhp). `Envelope`/`Header`/`Body`/`Security` selection is
+  namespace-qualified and positional rather than by local name, duplicate
+  namespace-correct envelope elements and misplaced `wsse:Security` headers are
+  rejected, and a successful X.509 verification now requires a Reference that
+  resolves uniquely to the actual Body. `require_signed_timestamp` rejects a
+  message with no Timestamp instead of passing vacuously, and pairing it with
+  `timestamp.require: false` is refused at admission. Previously a trusted
+  signature over only the Timestamp authorized an arbitrary rewritten operation,
+  and a signed lookalike `<Body>` under another namespace could be selected in
+  place of the real one. **Breaking:** because Ferrum implements no WS-Security
+  attachment-signature transform, an X.509 signature cannot cover the octets an
+  `xop:Include` stands for; an enabled `x509_signature` therefore now refuses
+  both MTOM/XOP `multipart/related` and bare `application/xop+xml` with `415`
+  before dispatch, and an explicit `content_type.allow_mtom: true` alongside it
+  is refused at config admission. `username_token` and `saml` keep accepting
+  MTOM/XOP — they authenticate who sent the message and never claimed integrity
+  over attachment octets. Separately, `reject_missing_security_header: false`
+  now governs an *absent header only*: on a governed representation, malformed
+  XML, unsupported or ambiguous envelope structure, and XML parsing-budget
+  failures reject with `400` regardless of that setting, so a gateway/backend
+  parser disagreement can no longer become a pass-through that skips
+  authentication, integrity, freshness, and replay for a message the backend
+  still executes.
+- `soap_ws_security` SAML assertions are now bound and single-use
+  (GHSA-f44p-hfqr-cvcc). **Breaking:** `saml.audience`, the new
+  `saml.recipient`, and `nonce.replay_scope` are required when SAML is enabled.
+  An accepted assertion must carry a mandatory `Conditions` window with both
+  `NotBefore` and `NotOnOrAfter` inside the new
+  `saml.max_assertion_lifetime_seconds` cap (default 300), must be admitted by
+  every `AudienceRestriction`, must carry one supported `SubjectConfirmation`
+  (bearer only; `holder-of-key` is refused at admission) whose
+  `SubjectConfirmationData` names `saml.recipient`, carries its own bounded
+  `NotOnOrAfter`, and omits `InResponseTo`, and its assertion id is claimed for
+  single use in the declared replay scope for the same fixed 93 601-second
+  horizon as PasswordDigest nonces. `OneTimeUse` needs no special case because
+  every accepted assertion is claimed exactly once. `process` scope is a
+  single-replica declaration and makes no cross-replica claim; multi-replica
+  SAML deployments must use `shared`. Previously a captured signed assertion
+  could be replayed indefinitely beside a freshly minted outer Timestamp, and in
+  the default configuration an assertion issued for another service by the same
+  trusted IdP was accepted. An accepted assertion must also resolve exactly one
+  namespace-correct, nonblank Subject `NameID` — the documented SAML principal —
+  and that resolution now happens *before* the single-use claim, so an assertion
+  that satisfies every binding but authenticates nobody fails closed with `401`
+  without consuming replay state. Previously such an assertion was accepted,
+  burned its replay id, and returned no principal, silently degrading the
+  request to unauthenticated while letting an attacker spend a legitimate
+  assertion id.
+
 - `mcp_gateway` aggregate-router mode now validates `tools/call` results against
   discovered tool `outputSchema` values when
   `validation.validate_tool_results` is enabled
