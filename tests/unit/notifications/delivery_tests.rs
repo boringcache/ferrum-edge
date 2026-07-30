@@ -100,10 +100,15 @@ async fn spawn_status_sequence_server(
 async fn wait_for_count(count: &AtomicUsize, notify: &Notify, expected: usize) {
     let wait = async {
         loop {
+            // Register before checking the counter so notify_waiters cannot
+            // land in the gap between the authoritative observation and the
+            // waiter registration. Unlike notify_one, notify_waiters does not
+            // retain a permit when no waiter is present.
+            let notified = notify.notified();
             if count.load(Ordering::SeqCst) >= expected {
                 break;
             }
-            notify.notified().await;
+            notified.await;
         }
     };
     timeout(Duration::from_secs(3), wait)
