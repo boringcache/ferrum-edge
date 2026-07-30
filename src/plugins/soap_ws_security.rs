@@ -6278,13 +6278,13 @@ fn load_rsa_public_key_from_cert(cert: &X509Certificate<'_>) -> Result<Vec<u8>, 
     // the key and reject every signature regardless of validity.
     let public_key_der = public_key_info.subject_public_key.data.to_vec();
 
-    // Structural regression guard: an `RSAPublicKey` DER is a top-level
-    // SEQUENCE whose declared length matches the buffer length. A future
-    // refactor that accidentally went back to `public_key().raw` (the full
-    // SPKI) would also start with 0x30 — so a tag-only check is
-    // insufficient — but its declared length would not agree with the
-    // buffer. Verifying both tag and length encoding here catches that
-    // class of mistake at load time rather than at request time.
+    // Structural framing guard: an `RSAPublicKey` DER is a top-level
+    // SEQUENCE whose declared length matches the buffer length. This rejects
+    // truncated data, trailing bytes, and invalid DER length encodings before
+    // the key reaches ring. It cannot distinguish a bare `RSAPublicKey` from
+    // a complete `SubjectPublicKeyInfo`, because both are independently
+    // well-formed SEQUENCE values; the extraction above and end-to-end
+    // signature tests enforce that distinction.
     validate_rsa_public_key_der_shape(&public_key_der)
         .map_err(|e| format!("has malformed RSA public key DER: {}", e))?;
 
@@ -6292,13 +6292,12 @@ fn load_rsa_public_key_from_cert(cert: &X509Certificate<'_>) -> Result<Vec<u8>, 
 }
 
 /// Structural sanity check: `der` must be a top-level DER `SEQUENCE` whose
-/// declared length matches the buffer length exactly. This is intentionally
-/// the narrow shape of an RFC 8017 `RSAPublicKey ::= SEQUENCE { modulus,
-/// publicExponent }`. It does NOT parse the inner integers — ring does that
-/// at verify time. The check exists specifically to catch a regression where
-/// the full `SubjectPublicKeyInfo` (which also starts with 0x30, but whose
-/// length header omits the wrapping `AlgorithmIdentifier` bytes that are
-/// still present in the buffer) is passed in place of the bare `RSAPublicKey`.
+/// declared length matches the buffer length exactly. This checks only the
+/// outer framing of an RFC 8017 `RSAPublicKey ::= SEQUENCE { modulus,
+/// publicExponent }`; ring parses the inner integers at verify time. This
+/// framing check rejects invalid DER length encodings, truncation, and
+/// trailing bytes. It does not by itself distinguish this sequence from
+/// another well-formed DER sequence such as a complete `SubjectPublicKeyInfo`.
 fn validate_rsa_public_key_der_shape(der: &[u8]) -> Result<(), String> {
     if der.is_empty() {
         return Err("public key DER is empty".to_string());
@@ -6345,8 +6344,7 @@ fn validate_rsa_public_key_der_shape(der: &[u8]) -> Result<(), String> {
     if expected_total != der.len() {
         return Err(format!(
             "length mismatch: header declares {declared_content_len} content bytes \
-             ({expected_total}-byte total), buffer is {} bytes \
-             (regression: looks like a full SubjectPublicKeyInfo, not a bare RSAPublicKey)",
+             ({expected_total}-byte total), buffer is {} bytes",
             der.len()
         ));
     }
@@ -7615,10 +7613,8 @@ mod tests {
 
     // ── RSA public-key DER shape validator ──────────────────────────────────
     //
-    // These tests pin the structural regression guard that catches a future
-    // refactor accidentally routing the full SubjectPublicKeyInfo (instead of
-    // the bare RSAPublicKey) into `ring::signature::UnparsedPublicKey::new` —
-    // the original PR #844 bug class.
+    // These tests pin the structural framing guard applied before the bare
+    // RSAPublicKey reaches `ring::signature::UnparsedPublicKey::new`.
 
     #[test]
     fn rsa_pk_shape_accepts_short_form_sequence_with_matching_length() {
@@ -7680,12 +7676,7 @@ mod tests {
     }
 
     #[test]
-    fn rsa_pk_shape_rejects_full_spki_shape_via_length_mismatch() {
-        // The exact regression: build a synthetic blob that resembles a
-        // SubjectPublicKeyInfo's outer wrapping. Its top-level SEQUENCE length
-        // header declares a content size that excludes the trailing bytes the
-        // buffer still carries — the length check must reject this.
-        //
+    fn rsa_pk_shape_rejects_trailing_bytes_after_sequence() {
         // Layout: 0x30 0x09 [9 content bytes] [4 extra trailing bytes].
         // 9 + 2 (header) = 11, but the buffer length is 15, so this rejects.
         let der = [
@@ -7695,9 +7686,6 @@ mod tests {
         ];
         let err = validate_rsa_public_key_der_shape(&der).unwrap_err();
         assert!(err.contains("length mismatch"), "got: {err}");
-        // The hint about the SPKI regression class is included so the
-        // failure mode is recognizable to future maintainers.
-        assert!(err.contains("SubjectPublicKeyInfo"), "got: {err}");
     }
 
     #[test]
