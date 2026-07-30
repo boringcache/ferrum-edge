@@ -108,6 +108,12 @@ Each proxy's effective plugin list is built by merging global, proxy-scoped, and
 3. Multiple scoped instances of the same `plugin_name` all coexist — only the global is replaced
 4. Sort by effective priority (built-in priority or `priority_override`)
 
+**Size-limit exception:** `request_size_limiting` and
+`response_size_limiting` policies are conjunctive security boundaries. Their
+same-name global and scoped instances all remain active and compose to the
+strictest (minimum) configured limit; a looser scoped instance cannot replace
+or relax a stricter global instance.
+
 **Chargeback exception:** `api_chargeback` follows the same merge steps above, but
 admission and reload then require the resulting effective list to contain **at
 most one** instance per proxy. The in-memory `/charges` registry is a
@@ -4064,6 +4070,26 @@ and `global_exemptions.consumers` available to request metadata rules.
 Request-body inspection runs on the final backend-visible body after request
 body transforms. It buffers only matching methods/content types. Response
 inspection is opt-in and can scan response headers and final response bodies.
+A configuration that can enforce response-header policy drops the backend
+trailer section on the trailer-forwarding paths (buffered and streaming HTTP/3,
+streaming HTTP/2, gRPC and gRPC-Web), because those fields arrive after
+inspection and cannot be proven safe. Native gRPC's reserved terminal fields
+(`grpc-status`, `grpc-message`, `grpc-status-details-bin`) always survive.
+Global monitor mode and monitor-action-only response header rules preserve
+trailers. Anomaly scoring counts as enforcing when it can block.
+
+That drop is decided **per request**, not per configuration. A request matched
+by `global_exemptions` (path, method, IP, or consumer) never reaches a WAF
+response-header scan, so it keeps its backend trailers exactly as it would with
+no WAF configured — the same request-level contract that governs body buffering
+and the buffered gRPC-Web trailer policy. Because a consumer exemption is only
+known after authentication, every trailer-forwarding response boundary resolves
+the decision from the finalized request context after the request-side phases.
+Exemption is per instance and never subtractive: with several WAF instances, or
+alongside another plugin whose own response policy is non-enumerable
+(`response_transformer`), the trailer section is still dropped whenever any one
+of them governs that request.
+
 WAF scans raw query pairs even after the proxy has materialized the parsed
 query map, so duplicate keys remain visible before the parsed `HashMap` can
 collapse them; synthetic contexts without a raw query string fall back to
@@ -4350,12 +4376,32 @@ Enforces per-proxy request body size limits. Rejects with HTTP 413.
 |---|---|---|---|
 | `max_bytes` | u64 | — (required, > 0) | Maximum allowed request body size in bytes. The plugin errors at construction if absent or zero. |
 
-Enforcement happens in three places:
+Enforcement happens in four places:
+- **The effective streaming/buffering ceiling.** The configured `max_bytes` is published to the proxy core and folded into the bound of every request path *before any byte is forwarded or retained* — H1/H2 (reqwest and direct-H2), native H3 and the H3 cross-protocol bridge, unary and streaming gRPC, retry replays, early prebuffering phases, mesh mTLS, and HBONE. A chunked or unknown-length upload is therefore bounded at the route limit, not merely at the global one.
 - `on_request_received` rejects oversized `Content-Length` headers without reading the body.
 - `before_proxy` checks the buffered raw body when another plugin already needed early body access.
 - `on_final_request_body` re-checks the final buffered body after request transforms, so body-rewriting plugins cannot expand the request past the configured limit before it reaches the backend.
 
-For chunked/streaming requests without `Content-Length` where no other plugin buffers the body, the global `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` limit applies at the proxy layer.
+**Interaction with the global limit.** The effective ceiling is the strictest
+*active* (nonzero) bound of `max_bytes` and `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`.
+A global limit of `0` means "unlimited" and **does not** disable an active route
+limit — the route limit stays authoritative. Multiple instances on one proxy (and
+a global instance composed with a proxy-scoped one) compose to their minimum; a
+looser sibling never relaxes the strictest active bound. A proxy with no
+`request_size_limiting` instance is unaffected: the global knob applies exactly as
+configured. The effective ceiling also bounds request decompression, so a small
+compressed body cannot inflate and retain plaintext above the matched route's
+limit before the final request-body hook runs.
+
+**Repeated `Content-Length`.** RFC 9110 §8.6 permits a `Content-Length` that
+appears more than once with identical values, and plugin-facing header maps fold
+those repeats with `", "`. Every folded member is parsed and must agree, so
+`Content-Length: 2048, 2048` is compared against `max_bytes` rather than failing
+to parse and skipping the check. A declared length that cannot be reduced to one
+agreed value (disagreeing members, a non-`1*DIGIT` member such as `+2048`, an
+empty member, or a value wider than `u64`) is refused **fail-closed** with HTTP
+400 and `{"error":"Request Content-Length is ambiguous"}` instead of being treated
+as an absent length.
 
 ### `response_size_limiting`
 
@@ -4368,13 +4414,35 @@ Configuration must be a top-level object. The only accepted keys are `max_bytes`
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `max_bytes` | u64 | — (required, > 0) | Maximum allowed response body size in bytes. The plugin errors at construction if absent or zero. |
-| `require_buffered_check` | bool | `false` | Force response body buffering to verify actual final size when `Content-Length` is absent. Adds memory overhead — only enable when needed. |
+| `require_buffered_check` | bool | `false` | Force route-bounded whole-body buffering so the complete final post-transform size is proven before response headers are committed. Unknown-length streams are already bounded frame by frame when this is false. Enabling it adds memory overhead and rejects indefinite SSE streams whose complete size cannot be proven. |
 
-Enforcement happens in two places:
+Enforcement happens in four places:
+- **The effective collection/streaming ceiling.** The configured `max_bytes` is published to the proxy core and folded into the bound of every response path across H1/H2, native H3 and the H3 cross-protocol bridge, buffered and streaming gRPC, retry replays, the response coalescers, mesh mTLS, and HBONE. Buffered collection **aborts at this ceiling** rather than retaining up to the generally larger global allowance and only then failing the final check, so concurrent requests cannot amplify retained gateway memory toward the global allowance each. Unknown-length streaming paths engage the size-limited (frame-by-frame) adapter at this ceiling; known-length paths reject an over-limit declaration before forwarding the body.
+- **Already-buffered synthetic responses.** A body produced by a gateway short-circuit (mock, serverless, cache, federation, dedup replay) is checked against the ceiling regardless of whether any plugin activated the response body-hook gate. Previously a default (non-buffering) instance had no hook on that path unless some *other* plugin independently elected response buffering. The check runs after any body transform, so a transform expansion cannot escape the ceiling either.
 - `after_proxy` rejects oversized `Content-Length` via the fast path when the response can transfer a body (no body buffering required). Bodyless semantics (`HEAD`, `1xx`, `204`/`205`/`304`) may advertise a representation `Content-Length` while transferring zero body bytes and are not rejected on that declaration alone; body-bearing responses (including `206`) keep exact-boundary enforcement (`Content-Length == max_bytes` passes).
 - `on_final_response_body` re-checks the final post-transform body when buffering is active (either via `require_buffered_check: true` or because another plugin requires response buffering).
 
-For streaming responses without `Content-Length` where buffering is disabled, the global `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` limit applies via the gateway's `SizeLimitedStreamingResponse` adapter (frame-by-frame enforcement, no buffering).
+**Interaction with the global limit.** The effective ceiling is the strictest
+*active* (nonzero) bound of `max_bytes` and
+`FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`. A global limit of `0` means "unlimited"
+and **does not** disable an active route limit. Multiple instances (including a
+global instance composed with a same-name proxy-scoped instance) compose to
+their minimum; a looser scoped instance cannot shadow or relax a stricter global
+one. A proxy with no `response_size_limiting` instance is unaffected.
+The effective ceiling also bounds the buffered-representation decode gate and
+compression admission, so a small compressed body cannot inflate past the route
+ceiling and be forwarded as a larger identity representation.
+
+**Repeated `Content-Length`.** Hyper accepts a backend response whose
+`Content-Length` repeats with identical values, and the shared response collector
+folds those repeats with `", "`. Every folded member is parsed and must agree, so
+a coalesced `Content-Length: 2048, 2048` is compared against `max_bytes` rather
+than failing to parse and skipping the check. A declared length that cannot be
+reduced to one agreed value is refused **fail-closed** with HTTP 502 and
+`{"error":"Response Content-Length is ambiguous"}` instead of being treated as an
+absent length. Bodyless semantics are exempt from both checks.
+
+For streaming responses without `Content-Length` where buffering is disabled, the effective limit applies via the gateway's `SizeLimitedStreamingResponse` adapter (frame-by-frame enforcement, no buffering).
 
 With `require_buffered_check: true`, the configured route ceiling is a strict
 whole-body policy. Request `Accept` and internal streaming markers cannot bypass

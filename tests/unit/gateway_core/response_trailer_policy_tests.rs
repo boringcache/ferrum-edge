@@ -1680,3 +1680,42 @@ fn the_grpc_web_adapter_wraps_the_governed_body_from_the_outside() {
         );
     }
 }
+
+#[test]
+fn every_trailer_boundary_resolves_the_unbounded_arm_against_the_request() {
+    // A plugin may govern trailers it cannot inspect for SOME requests only
+    // (`waf` skips a `global_exemptions` match entirely, and a consumer
+    // exemption is established by the authentication phase). Reading the
+    // config-time capability bit at a trailer boundary would drop trailers for
+    // requests the plugin never inspected, which is enforcement the operator
+    // disabled. Every boundary must therefore ask the request-aware resolver.
+    for src in [
+        include_str!("../../../src/proxy/mod.rs"),
+        include_str!("../../../src/http3/server.rs"),
+    ] {
+        assert!(
+            !src.contains("PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY"),
+            "no trailer boundary may read the config-time unbounded capability bit; \
+             it cannot see request-conditional contributors"
+        );
+        assert!(
+            src.contains("unbounded_response_trailer_policy_applies(&ctx)"),
+            "every trailer boundary must resolve the fail-closed unbounded arm \
+             against the finalized request context"
+        );
+    }
+
+    // Both HTTP/2-family boundaries — the direct native-gRPC pool streaming
+    // relay and the shared generic streaming arm (plain H2, mesh-mTLS
+    // translated gRPC-Web, and the native-H3 backend relay) — resolve it, not
+    // just one of them.
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    assert_eq!(
+        proxy_src
+            .matches("unbounded_response_trailer_policy_applies(&ctx)")
+            .count(),
+        2,
+        "both the native-gRPC streaming relay and the generic streaming arm must \
+         resolve the unbounded arm per request"
+    );
+}

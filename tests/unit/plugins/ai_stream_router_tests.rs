@@ -3846,11 +3846,11 @@ async fn test_anthropic_completed_modern_and_legacy_rounds_can_coexist() {
 }
 
 #[tokio::test]
-async fn test_anthropic_modern_tool_id_and_arguments_keep_existing_bounds() {
+async fn test_anthropic_modern_tool_id_and_arguments_are_bounded() {
     let long_id = format!("call_{}", "x".repeat(256));
     let large_arguments =
         serde_json::to_string(&json!({"payload": "x".repeat(256 * 1024)})).unwrap();
-    let body = json!({
+    let oversized_id = json!({
         "model": "claude-3-5-sonnet",
         "stream": true,
         "messages": [
@@ -3867,16 +3867,66 @@ async fn test_anthropic_modern_tool_id_and_arguments_keep_existing_bounds() {
             {"role": "tool", "tool_call_id": long_id, "content": "ok"}
         ]
     });
-
-    let parsed = translate_anthropic_body(&body)
-        .await
-        .expect("legacy support must not tighten the existing modern path");
-    assert_eq!(parsed["messages"][1]["content"][0]["id"], json!(long_id));
+    let mut ctx = post_ctx(&oversized_id);
+    let mut headers = json_headers();
     assert_eq!(
-        parsed["messages"][1]["content"][0]["input"]["payload"]
-            .as_str()
-            .map(str::len),
-        Some(256 * 1024)
+        reject_status(
+            &build(openai_and_anthropic_config())
+                .before_proxy(&mut ctx, &mut headers)
+                .await
+        ),
+        Some(400)
+    );
+
+    let oversized_arguments = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "alpha", "arguments": large_arguments}
+            }]
+        }]
+    });
+    let mut ctx = post_ctx(&oversized_arguments);
+    let mut headers = json_headers();
+    assert_eq!(
+        reject_status(
+            &build(openai_and_anthropic_config())
+                .before_proxy(&mut ctx, &mut headers)
+                .await
+        ),
+        Some(400)
+    );
+
+    let oversized_result_id = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "alpha", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": long_id, "content": "ok"}
+        ]
+    });
+    let mut ctx = post_ctx(&oversized_result_id);
+    let mut headers = json_headers();
+    assert_eq!(
+        reject_status(
+            &build(openai_and_anthropic_config())
+                .before_proxy(&mut ctx, &mut headers)
+                .await
+        ),
+        Some(400)
     );
 }
 
