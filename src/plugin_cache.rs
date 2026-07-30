@@ -269,6 +269,31 @@ fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), Stri
 /// cannot preserve the configured enforcement contract.
 fn validate_plugin_security_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
     for protocol in ALL_PROXY_PROTOCOLS {
+        let identity_soap_count = plugins
+            .iter()
+            .filter(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && plugin.name() == "soap_ws_security"
+                    && plugin.is_auth_plugin()
+            })
+            .count();
+        if identity_soap_count > 0 {
+            let auth_plugins: Vec<&str> = plugins
+                .iter()
+                .filter(|plugin| {
+                    plugin.supported_protocols().contains(&protocol) && plugin.is_auth_plugin()
+                })
+                .map(|plugin| plugin.name())
+                .collect();
+            if auth_plugins.len() != 1 {
+                return Err(format!(
+                    "identity-establishing soap_ws_security must be the sole authentication \
+                     mechanism for protocol {protocol:?} on its effective plugin chain; found: {}",
+                    auth_plugins.join(", ")
+                ));
+            }
+        }
+
         let has_hmac = plugins
             .iter()
             .filter(|plugin| plugin.supported_protocols().contains(&protocol))
@@ -2805,6 +2830,7 @@ const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "correlation_id",
     "hmac_auth",
     "request_deduplication",
+    "soap_ws_security",
     "serverless_function",
     "request_transformer",
     "compression",
@@ -2834,6 +2860,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
 ) -> Result<(), String> {
     validate_api_chargeback_ownership(config)?;
     validate_replay_provenance_composition(config)?;
+    validate_soap_ws_security_composition(config)?;
     let mut errors = Vec::new();
     let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
     let mut scoped_plugins: SecurityCompositionPluginMap<'_> = HashMap::new();
@@ -3265,6 +3292,81 @@ fn filter_for_protocol(
     )
 }
 
+/// Config-side state of global `mesh_authz` rows for one generation.
+///
+/// `managed` is `true` only for the exact reserved row the mesh runtime injects
+/// (`id == MESH_AUTHZ_PLUGIN_ID`, `plugin_name == "mesh_authz"`, enabled,
+/// global scope) — an operator-authored global `mesh_authz` never satisfies it.
+/// `enabled_global` counts every enabled global `mesh_authz` row, managed or
+/// operator-authored, which is what makes the presence proof below exact.
+fn mesh_authz_global_config_state(config: &GatewayConfig) -> (bool, usize) {
+    let mut managed = false;
+    let mut enabled_global = 0usize;
+    for plugin in &config.plugin_configs {
+        if !plugin.enabled
+            || plugin.scope != PluginScope::Global
+            || plugin.plugin_name != "mesh_authz"
+        {
+            continue;
+        }
+        enabled_global += 1;
+        if plugin.id == crate::modes::mesh::MESH_AUTHZ_PLUGIN_ID {
+            managed = true;
+        }
+    }
+    (managed, enabled_global)
+}
+
+/// Decide NodeWaypoint destination-authz readiness from the three generation
+/// counts, with no per-connection work.
+///
+/// The built plugin list holds trait objects, so an instance cannot be traced
+/// back to the config row that produced it. Counting closes that gap exactly:
+/// the global chain is built from enabled global rows at **most one instance
+/// per row** (plus the CORS / mesh-route-dispatch finalizers, neither of which
+/// is a `mesh_authz`). Requiring exact equality plus a managed row means the
+/// managed instance itself constructed AND survived the TCP protocol filter.
+/// Any construction failure, protocol-filter drop, or unexpected extra runtime
+/// instance fails closed rather than weakening this proof.
+///
+/// `pub(crate)` so `_test_support` can pin the "managed row configured but its
+/// runtime policy never reached the prebuilt TCP chain" arm directly, without
+/// forging a plugin construction failure. A dedicated `_for_test` wrapper would
+/// be dead code in the binary target, which does not compile `lib.rs`.
+pub(crate) fn node_waypoint_destination_authz_ready_from_counts(
+    managed_config_present: bool,
+    enabled_global_mesh_authz_configs: usize,
+    built_global_tcp_mesh_authz_plugins: usize,
+) -> bool {
+    managed_config_present
+        && enabled_global_mesh_authz_configs > 0
+        && built_global_tcp_mesh_authz_plugins == enabled_global_mesh_authz_configs
+}
+
+/// Precompute the generation-level NodeWaypoint destination-authz readiness
+/// bit against the *actual* prebuilt global TCP protocol entry — the exact
+/// entry `plugins_for_protocol` resolves for the dynamically synthesized
+/// capture relay proxy, which is never in `config.proxies` and therefore always
+/// falls back to the global chain.
+///
+/// Runs once per plugin-cache generation (build or reload), so the captured
+/// connection path only ever reads a `bool`.
+fn compute_node_waypoint_destination_authz_ready(
+    config: &GatewayConfig,
+    global: &HashMap<ProxyProtocol, ProtocolEntry>,
+) -> bool {
+    let (managed, enabled_global) = mesh_authz_global_config_state(config);
+    let built = match global.get(&ProxyProtocol::Tcp) {
+        Some(entry) => entry
+            .plugins
+            .iter()
+            .filter(|p| p.name() == "mesh_authz")
+            .count(),
+        None => 0,
+    };
+    node_waypoint_destination_authz_ready_from_counts(managed, enabled_global, built)
+}
+
 // ---------------------------------------------------------------------------
 // ProtocolSnapshot — bundles protocol-filtered plugins + phase data for
 // atomic swap via a single ArcSwap. Ensures a request always reads a
@@ -3290,6 +3392,16 @@ struct ProtocolSnapshot {
     grpc_web_proxy: HashMap<String, ProtocolEntry>,
     /// Global fallback for the composed H3 gRPC-Web view.
     grpc_web_global: ProtocolEntry,
+    /// Generation-level readiness bit for NodeWaypoint transparent-capture
+    /// destination authorization: the mesh-managed `__mesh_authz` reserved
+    /// global row is enabled AND its runtime policy is provably present in
+    /// `global[Tcp]` — the chain the synthesized capture relay resolves.
+    ///
+    /// Precomputed here so `build_node_waypoint_capture_relay_entry` and the
+    /// captured-connection handler are O(1) bool reads with no config-vector or
+    /// plugin-vector scan (hot-path invariant). See
+    /// [`compute_node_waypoint_destination_authz_ready`].
+    node_waypoint_destination_authz_ready: bool,
 }
 
 const ALL_PROXY_PROTOCOLS: [ProxyProtocol; 5] = [
@@ -3333,6 +3445,7 @@ fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
 
 /// Build the full protocol snapshot from the plugin map + global fallback.
 fn build_protocol_snapshot(
+    config: &GatewayConfig,
     proxy_map: &ProxyPluginMap,
     globals: &[Arc<dyn Plugin>],
 ) -> ProtocolSnapshot {
@@ -3354,11 +3467,15 @@ fn build_protocol_snapshot(
 
     let grpc_web_global = build_grpc_web_protocol_entry(globals);
 
+    let node_waypoint_destination_authz_ready =
+        compute_node_waypoint_destination_authz_ready(config, &global);
+
     ProtocolSnapshot {
         proxy,
         global,
         grpc_web_proxy,
         grpc_web_global,
+        node_waypoint_destination_authz_ready,
     }
 }
 
@@ -3414,14 +3531,25 @@ fn start_background_tasks(
 /// generation has been installed. Must stay infallible and idempotent.
 fn commit_background_tasks(proxy_map: &ProxyPluginMap, globals: &[Arc<dyn Plugin>]) {
     let mut committed = HashSet::new();
+    let mut saw_api_chargeback = false;
     for plugin in globals
         .iter()
         .chain(proxy_map.values().flat_map(|plugins| plugins.iter()))
     {
         let pointer = Arc::as_ptr(plugin) as *const () as usize;
         if committed.insert(pointer) {
+            if plugin.name() == "api_chargeback" {
+                saw_api_chargeback = true;
+            }
             plugin.commit_background_tasks();
         }
+    }
+    // Instance commit publishes the `/charges` projection while at least one
+    // enabled api_chargeback exists. A generation with zero instances has no
+    // plugin callback, so publish absence explicitly after atomic installation
+    // (never during candidate construction/validation).
+    if !saw_api_chargeback {
+        crate::plugins::api_chargeback::publish_render_schema_absence();
     }
 }
 
@@ -3729,6 +3857,17 @@ impl PluginCacheInner {
     /// [`Self::grpc_web_request_view`], or a namespace-taking accessor such as
     /// [`Self::initial_response_header_policy_plugins`] instead of passing
     /// `proxy.id` here.
+    /// Whether this generation can enforce NodeWaypoint transparent-capture
+    /// destination authorization.
+    ///
+    /// O(1) read of a bit precomputed at cache construction/reload — the
+    /// captured-connection path must never re-derive this by scanning
+    /// `config.plugin_configs` or the built plugin chain.
+    #[inline]
+    pub(crate) fn node_waypoint_destination_authz_ready(&self) -> bool {
+        self.protocol_snapshot.node_waypoint_destination_authz_ready
+    }
+
     fn protocol_entry(&self, proxy_key: &str, protocol: ProxyProtocol) -> Option<&ProtocolEntry> {
         self.protocol_snapshot
             .proxy
@@ -4321,6 +4460,15 @@ fn validate_replay_provenance_composition(config: &GatewayConfig) -> Result<(), 
         .map_err(|errors| errors.join("; "))
 }
 
+/// `soap_ws_security` establishes SOAP identity in the `authenticate` phase, so
+/// multi-auth composition would skip or override it and request decompression
+/// would run after the message was already validated. Reject both before
+/// constructing a generation whose ordering guarantees cannot hold.
+fn validate_soap_ws_security_composition(config: &GatewayConfig) -> Result<(), String> {
+    crate::plugins::soap_ws_security::validate_composition(config)
+        .map_err(|errors| errors.join("; "))
+}
+
 /// `__mesh_bpf_metrics` is a single scrape exporter per process. Require at
 /// most one enabled global instance so reload never registers duplicate
 /// collectors / double-emits series on authenticated `/metrics`.
@@ -4412,6 +4560,7 @@ impl PluginCache {
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
         validate_replay_provenance_composition(config)?;
+        validate_soap_ws_security_composition(config)?;
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let (
             proxy_map,
@@ -4433,7 +4582,7 @@ impl PluginCache {
             current_adaptive_states,
             current_tcp_throttle_states,
         )?;
-        let snapshot = build_protocol_snapshot(&proxy_map, &globals);
+        let snapshot = build_protocol_snapshot(config, &proxy_map, &globals);
         let (proxy_lifecycle_generations, proxy_lifecycle_generation_high_water) =
             build_proxy_lifecycle_generations(
                 previous_lifecycle_generations,
@@ -4818,6 +4967,7 @@ impl PluginCache {
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
         validate_replay_provenance_composition(config)?;
+        validate_soap_ws_security_composition(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         let restrict_country_mmdb_refresh_to_rebuild_scope =
             matches!(country_mmdb_load_mode, CountryMmdbLoadMode::PreloadedOnly);
@@ -4860,6 +5010,7 @@ impl PluginCache {
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
         validate_replay_provenance_composition(config)?;
+        validate_soap_ws_security_composition(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         if paths.is_empty() {
             return Ok(None);
@@ -5623,6 +5774,13 @@ impl PluginCache {
                 &lifecycle_advances,
             )?;
 
+        // Recomputed against the incoming config and the NEW global TCP entry
+        // on every delta, including the `global_plugins_changed == false` reuse
+        // path: a plugin-config row can be enabled or disabled without the
+        // built global chain being rebuilt, and this bit derives from both.
+        let node_waypoint_destination_authz_ready =
+            compute_node_waypoint_destination_authz_ready(config, &new_global_proto);
+
         Ok(Arc::new(PluginCacheInner::new(
             new_map,
             new_globals,
@@ -5631,6 +5789,7 @@ impl PluginCache {
             new_req_buffering,
             new_global_requires_request_buffering,
             ProtocolSnapshot {
+                node_waypoint_destination_authz_ready,
                 proxy: new_proxy_proto,
                 global: new_global_proto,
                 grpc_web_proxy: new_grpc_web_proxy,

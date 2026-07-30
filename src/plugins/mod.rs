@@ -1817,6 +1817,40 @@ impl std::fmt::Debug for PeerConnectionSignal {
     }
 }
 
+/// The complete native-gRPC unary representation a validated
+/// `serverless_function` terminate invocation authored.
+///
+/// `frame` is the exact uncompressed unary DATA frame and `trailers` is the
+/// terminal metadata the plugin's fail-closed contract validation produced
+/// (`grpc-status`, optional `grpc-message` / `grpc-status-details-bin`, and the
+/// operator's custom trailers). Terminal trailers are taken from here rather
+/// than promoted out of the reject header map, so gateway-managed response
+/// headers a decorator added — CORS, header policy, internal bridge fields —
+/// stay in the initial HEADERS block and can never surface as client-visible
+/// custom trailers.
+///
+/// `http_status` is the HTTP status the plugin authored alongside the frame
+/// (always 200 for a native gRPC terminate). Authorization checks it as well as
+/// the frame bytes so a *later, unrelated* rejection on the same request cannot
+/// inherit the original successful trailers just because its body happens to
+/// match: a replacement rejection carries its own status, and a rejection that
+/// matched on bytes alone would otherwise present as the original success.
+///
+/// An EMPTY `frame` is the status-only contract shape — the function asked for
+/// a trailers-only reply and authored no message at all. That representation can
+/// never authorize DATA (`FramedGrpcUnaryProvenance::authorized_trailers`
+/// refuses an empty frame), but recording it is what lets the normalizer tell an
+/// unchanged status-only reply from one a response-body policy rewrote or
+/// re-statused: unchanged keeps the contract's own terminal metadata, changed
+/// fails closed instead of falling back to a possibly-successful `grpc-status`
+/// read out of the mutable reject header map.
+#[derive(Debug, Clone)]
+pub(crate) struct ServerlessGrpcTerminateFrame {
+    pub(crate) http_status: u16,
+    pub(crate) frame: bytes::Bytes,
+    pub(crate) trailers: HashMap<String, String>,
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -1938,6 +1972,13 @@ pub struct RequestContext {
     /// `&'static str` because every `AuthMechanism::mechanism_name()` returns a
     /// compiled-in literal — zero allocation on the hot path.
     pub auth_method: Option<&'static str>,
+    /// SHA-256 of the exact SOAP representation accepted by an
+    /// identity-establishing `soap_ws_security` policy. The final request-body
+    /// hook compares this private proof with the bytes dispatched to the
+    /// backend, so a later/custom plugin cannot forge it through public
+    /// metadata. Keeping a credential/body-derived digest here also prevents
+    /// transaction-log serialization.
+    soap_ws_security_authenticated_body_digest: Option<[u8; 32]>,
     pub timestamp_received: DateTime<Utc>,
     /// Whether the request's gRPC deadline state has been initialized from the
     /// inbound `grpc-timeout` value. Initialization happens once, immediately
@@ -2178,6 +2219,19 @@ pub struct RequestContext {
     /// of public metadata so a custom plugin cannot opt an unrelated rejection
     /// into that contract.
     pub(crate) serverless_terminate_response: bool,
+    /// The framed unary DATA payload and terminal trailers a validated
+    /// `serverless_function` terminate invocation authored for this request.
+    ///
+    /// This is the ONLY provenance that authorizes native-gRPC reject
+    /// normalization to emit DATA + terminal trailers instead of the
+    /// trailers-only error contract. Reject body shape and reject
+    /// `content-type`/`grpc-status` headers are reachable by any plugin, so they
+    /// are never treated as provenance. Authorization is byte-exact
+    /// (`FramedGrpcUnaryProvenance`), which keeps an `after_proxy` decorator
+    /// that rewrites the reject body — and any later unrelated rejection on the
+    /// same request — on the trailers-only path. Kept out of public metadata so
+    /// a custom plugin cannot mint it.
+    pub(crate) serverless_grpc_terminate_frame: Option<Arc<ServerlessGrpcTerminateFrame>>,
     /// Deduplication instance currently publishing an owned terminal response
     /// from the observe-only committed hook. This transient private marker lets
     /// the ordinary publication path retain in-flight protection when no replay
@@ -2274,6 +2328,15 @@ pub struct RequestContext {
     /// under the public name only when the final wire name exactly matches
     /// this trusted upstream alias.
     pub(crate) mcp_trusted_tool_name_rewrite: Option<(String, String)>,
+    /// When set, `mcp_gateway` must validate the buffered `tools/call` result
+    /// against this exact compiled `outputSchema` validator before any
+    /// caller-visible response or audit publication. The `Arc` is pinned from
+    /// the routed catalog entry at dispatch so public
+    /// `mcp.response_rewrite.*` metadata cannot substitute or clear
+    /// enforcement, and a later catalog refresh cannot change the in-flight
+    /// snapshot. Kept out of public metadata so forgeable keys cannot opt a
+    /// response into or out of enforcement.
+    pub(crate) mcp_validate_tool_result: Option<Arc<jsonschema::Validator>>,
     /// Set while `mcp_gateway` dispatches a member of an aggregate JSON-RPC
     /// batch. Routed handlers then validate policy without dialing upstream or
     /// returning `Continue`, because executing a batch member from
@@ -2630,6 +2693,7 @@ impl RequestContext {
             authenticated_identity_header: None,
             backend_geo_country: None,
             auth_method: None,
+            soap_ws_security_authenticated_body_digest: None,
             timestamp_received: Utc::now(),
             grpc_deadline_initialized: false,
             grpc_deadline_had_valid_client_timeout: false,
@@ -2673,6 +2737,7 @@ impl RequestContext {
             serverless_pre_invocation_rejection_owners: HashSet::new(),
             serverless_external_side_effect_owners: HashSet::new(),
             serverless_terminate_response: false,
+            serverless_grpc_terminate_frame: None,
             serverless_owned_dedup_publication: None,
             ai_prompt_compressor_staged: HashMap::new(),
             ai_prompt_compressor_classification_path: None,
@@ -2694,6 +2759,7 @@ impl RequestContext {
             a2a_gateway_streaming: false,
             mcp_response_resource_binding: None,
             mcp_trusted_tool_name_rewrite: None,
+            mcp_validate_tool_result: None,
             mcp_batch_forbids_upstream: false,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
@@ -3434,6 +3500,8 @@ impl RequestContext {
             authenticated_identity_header: self.authenticated_identity_header.clone(),
             backend_geo_country: self.backend_geo_country,
             auth_method: self.auth_method,
+            soap_ws_security_authenticated_body_digest: self
+                .soap_ws_security_authenticated_body_digest,
             timestamp_received: self.timestamp_received,
             grpc_deadline_initialized: self.grpc_deadline_initialized,
             grpc_deadline_had_valid_client_timeout: self.grpc_deadline_had_valid_client_timeout,
@@ -3500,6 +3568,7 @@ impl RequestContext {
                 .serverless_external_side_effect_owners
                 .clone(),
             serverless_terminate_response: self.serverless_terminate_response,
+            serverless_grpc_terminate_frame: self.serverless_grpc_terminate_frame.clone(),
             serverless_owned_dedup_publication: self.serverless_owned_dedup_publication,
             // Transfer rather than clone the potentially body-sized compressor
             // stage. The final wire hook consumes it from this compatibility
@@ -3540,6 +3609,7 @@ impl RequestContext {
             a2a_gateway_streaming: self.a2a_gateway_streaming,
             mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             mcp_trusted_tool_name_rewrite: self.mcp_trusted_tool_name_rewrite.clone(),
+            mcp_validate_tool_result: self.mcp_validate_tool_result.clone(),
             mcp_batch_forbids_upstream: self.mcp_batch_forbids_upstream,
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),

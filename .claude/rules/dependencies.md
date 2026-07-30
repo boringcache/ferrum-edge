@@ -6,10 +6,17 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 
 - Ferrum carries vendored upstream crates under `vendor/**`, wired via
   `[patch.crates-io]` in `Cargo.toml`: `reqwest 0.13.3`, `h3 0.0.8` (three
-  patches), `tungstenite 0.29.0`, `tokio-tungstenite 0.29.0`.
+  patches), `tungstenite 0.29.0`, `tokio-tungstenite 0.29.0`, and
+  `dimpl 0.6.1`.
 - Each patch has a retirement plan under `docs/upstream-*-patches/` and a row in
-  the inventory table in `docs/dependency-policy.md`. Keep them, the
-  `[patch.crates-io]` block, and `scripts/check_vendored_patch_status.sh` in sync.
+  the inventory table in `docs/dependency-policy.md` plus a matching entry in
+  `docs/vendored-patch-lifecycle.json`. Keep them, the
+  `[patch.crates-io]` block, and `scripts/check_vendored_patch_lifecycle.py` in sync.
+  The parity gate lives in the `dependency-audit` job, which must stay behind
+  `mode == 'full'`, so `pr_ci_plan.py` keeps `docs/dependency-policy.md`,
+  `docs/vendored-patch-lifecycle.json`, and `docs/upstream-*-patches/` off the
+  lightweight docs path. A dated deliberate-fork reaffirmation belongs to an
+  unfiled fork only; CI rejects one on a `filed` patch.
 - Vendoring is a last resort: prefer a dependency bump, feature flag, or
   gateway-side workaround. A new vendored patch requires a written retirement
   plan and a behavioral regression test.
@@ -29,6 +36,25 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - The trusted-base `pr_ci_plan.py --self-test` rejects mutable or dynamic
   action refs, pipe-to-shell installers, and unverified tool downloads. The
   pull request's proposed policy is tested separately but never controls gates.
+- A required live gate must decide its own relevance from a pinned trusted-base
+  copy of `live_suite_path_filter.py`, never from the pull request's checkout.
+  `verify_cross_build_policy.py` freezes that block byte-for-byte
+  (`LIVE_SUITE_RELEVANCE_JOB_TEMPLATE`) for `mesh-e2e-sidecar-live.yml` and
+  `multicluster-federation-live.yml`, together with the live job's
+  `needs`/`if` binding. See `docs/ci_cd.md` → "Trusted-base relevance for
+  required live gates".
+- The fuzz/property lane is admitted only as two byte-frozen shapes:
+  `CI_FUZZ_SMOKE_JOB` (the whole `fuzz-smoke` job in `ci.yml`) and
+  `FUZZ_WORKFLOW` (the whole of `.github/workflows/fuzz.yml`). Either may be
+  absent before initial adoption; once present on the trusted base, pull
+  requests may neither remove nor alter it. Adoption additionally admits exactly
+  three byte-exact, anchored lines wiring `fuzz-smoke` into the required `test`
+  aggregate (`CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`: the `needs` entry, the
+  `add_row "Fuzz Smoke"` row, and the `require_success "Fuzz Smoke"` assertion,
+  each immediately after its `lint` counterpart); the rest of the aggregate is
+  still compared byte for byte, and the wiring cannot be removed once adopted. A
+  committed `.cargo/config[.toml]` below the repository root is rejected
+  outright.
 
 ## Drift Guard
 

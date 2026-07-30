@@ -11,16 +11,19 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     QuotaEvictionReport, SnapshotAccumulator, SpoolCompression, SpoolFinalOwnership, SpoolFsFault,
     SpoolManager, SpoolOwnerSpec, SpoolSettings, SpoolWriteHookPoint,
     classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
-    clickhouse_insert_url_for_tests, compact_recovery_probe_for_tests, decode_spool_file_for_tests,
-    encode_spool_bytes_for_tests, encode_spool_bytes_without_content_size_for_tests, new_ulid,
-    probe_charge_body_materialization_for_tests, probe_compact_recovery_retry_for_tests,
-    render_prometheus, render_status_json, replay_spool_once_for_tests,
-    replay_spool_once_with_batch_size_for_tests, replay_spool_once_with_ceiling_for_tests,
-    serialize_json_each_row, set_spool_write_hook_for_tests, spool_artifact_byte_limit_for_tests,
-    spool_claim_lease_secs_for_tests, spool_decompression_limit_for_tests,
-    spool_index_entry_bytes_for_tests, spool_replay_peak_bytes_for_tests,
-    spool_split_worklist_max_entries_for_tests, write_private_file_atomically_for_tests,
-    write_private_file_atomically_with_fault_for_tests,
+    clickhouse_insert_url_for_tests, compact_recovery_probe_for_tests,
+    compile_charge_event_projection, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
+    encode_spool_bytes_without_content_size_for_tests, new_ulid,
+    probe_charge_body_materialization_for_tests,
+    probe_charge_body_materialization_with_projection_for_tests,
+    probe_compact_recovery_retry_for_tests, render_prometheus, render_status_json,
+    replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
+    replay_spool_once_with_ceiling_for_tests, serialize_json_each_row,
+    serialize_json_each_row_projected, set_spool_write_hook_for_tests,
+    spool_artifact_byte_limit_for_tests, spool_claim_lease_secs_for_tests,
+    spool_decompression_limit_for_tests, spool_index_entry_bytes_for_tests,
+    spool_replay_peak_bytes_for_tests, spool_split_worklist_max_entries_for_tests,
+    write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
 use ferrum_edge::plugins::utils::byte_budget::RetainedByteCeiling;
@@ -1582,8 +1585,15 @@ fn quota_eviction_refreshes_inventory_when_a_candidate_disappears() {
     let calls_for_hook = Arc::clone(&calls);
     let vanishing = planted[0].clone();
     let peers_for_hook = peers.clone();
-    set_spool_write_hook_for_tests(Some(Arc::new(move |point| {
+    let hook_root = spool.namespace_root_for_tests().to_path_buf();
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point, namespace_root| {
         if point != SpoolWriteHookPoint::QuotaInventoryTaken {
+            return;
+        }
+        // The hook slot is process-global and the test binary runs in parallel:
+        // a concurrent test's eviction must not consume this test's one-shot
+        // mutation or inflate its pass accounting.
+        if namespace_root != hook_root.as_path() {
             return;
         }
         if calls_for_hook.fetch_add(1, Ordering::SeqCst) != 0 {
@@ -1672,8 +1682,15 @@ fn quota_eviction_fails_closed_when_the_inventory_never_stabilizes() {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_hook = Arc::clone(&calls);
     let day_for_hook = day.clone();
-    set_spool_write_hook_for_tests(Some(Arc::new(move |point| {
+    let hook_root = spool.namespace_root_for_tests().to_path_buf();
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point, namespace_root| {
         if point != SpoolWriteHookPoint::QuotaInventoryTaken {
+            return;
+        }
+        // The hook slot is process-global and the test binary runs in parallel:
+        // a concurrent test's eviction must not advance this test's generation
+        // counter, which is what bounds the asserted pass budget.
+        if namespace_root != hook_root.as_path() {
             return;
         }
         // Replace the whole observed generation on every pass. Deleting a
@@ -3500,12 +3517,19 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
     };
 
     let hook_gate = Arc::clone(&gate);
-    set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
-        SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
-        SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
-        // This test gates only the write boundary; quota-eviction snapshots are
-        // not part of the stall it asserts.
-        SpoolWriteHookPoint::QuotaInventoryTaken => {}
+    let hook_spool_dir = temp.path().to_path_buf();
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point, namespace_root| {
+        // The hook slot is process-global: only gate this test's own spool.
+        if !namespace_root.starts_with(&hook_spool_dir) {
+            return;
+        }
+        match point {
+            SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
+            SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
+            // This test gates only the write boundary; quota-eviction snapshots
+            // are not part of the stall it asserts.
+            SpoolWriteHookPoint::QuotaInventoryTaken => {}
+        }
     })));
 
     let (enqueued_baseline, written_baseline, lost_baseline) = spool_delivery_totals();
@@ -3842,12 +3866,19 @@ async fn saturated_spool_delivery_does_not_count_failed_high_water_diversion() {
         gate: Arc::clone(&gate),
     };
     let hook_gate = Arc::clone(&gate);
-    set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
-        SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
-        SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
-        // Quota inventory snapshots are unrelated to the delivery-channel
-        // saturation boundary this test intentionally stalls.
-        SpoolWriteHookPoint::QuotaInventoryTaken => {}
+    let hook_spool_dir = temp.path().to_path_buf();
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point, namespace_root| {
+        // The hook slot is process-global: only gate this test's own spool.
+        if !namespace_root.starts_with(&hook_spool_dir) {
+            return;
+        }
+        match point {
+            SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
+            SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
+            // Quota inventory snapshots are unrelated to the delivery-channel
+            // saturation boundary this test intentionally stalls.
+            SpoolWriteHookPoint::QuotaInventoryTaken => {}
+        }
     })));
 
     let (_, _, spool_lost_baseline) = spool_delivery_totals();
@@ -7234,10 +7265,17 @@ fn compact_snapshot_recovery_serializes_take_write_restore_attempts() {
         gate: Arc::clone(&gate),
     };
     let hook_gate = Arc::clone(&gate);
-    set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
-        SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
-        SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
-        SpoolWriteHookPoint::QuotaInventoryTaken => {}
+    let hook_spool_dir = temp.path().to_path_buf();
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point, namespace_root| {
+        // The hook slot is process-global: only gate this test's own spool.
+        if !namespace_root.starts_with(&hook_spool_dir) {
+            return;
+        }
+        match point {
+            SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
+            SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
+            SpoolWriteHookPoint::QuotaInventoryTaken => {}
+        }
     })));
 
     let first_recovery = Arc::clone(&recovery);
@@ -7371,4 +7409,248 @@ fn a_highly_compressible_zstd_artifact_this_build_writes_uses_its_declared_size(
     let decoded = decode_spool_file_for_tests(&path)
         .expect("a writer-owned frame with a safe declared size must decode");
     assert_eq!(decoded.len(), plain.len());
+}
+
+// ---------------------------------------------------------------------------
+// Charge-event schema projection (issue #3313)
+// ---------------------------------------------------------------------------
+
+fn sink_config_with(extra: Value) -> Value {
+    // Spool disabled so admission does not depend on creating the default
+    // on-disk spool directory in the unit-test environment.
+    let mut config = json!({
+        "mode": "per_event",
+        "clickhouse": { "url": "https://clickhouse.example:8443" },
+        "spool": { "enabled": false },
+        "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.01 }],
+        "pricing_version": "test-v1",
+        "currency": "USD"
+    });
+    if let Some(object) = extra.as_object() {
+        for (key, value) in object {
+            config[key.as_str()] = value.clone();
+        }
+    }
+    config
+}
+
+fn projected_row(schema: Value, event: &ChargeEvent) -> Value {
+    let projection =
+        compile_charge_event_projection(&sink_config_with(json!({ "schema": schema })))
+            .expect("schema compiles")
+            .expect("schema present");
+    let rendered =
+        serialize_json_each_row_projected(std::slice::from_ref(event), Some(&projection))
+            .expect("row serializes");
+    serde_json::from_str(&rendered).expect("row is valid JSON")
+}
+
+#[test]
+fn charge_event_default_wire_shape_is_unprojected() {
+    // No schema configured — the native JSONEachRow representation is
+    // byte-for-byte what it has always been.
+    let event = sample_event("evt-native");
+    let native = serialize_json_each_row(std::slice::from_ref(&event)).expect("native row");
+    assert_eq!(
+        native,
+        serde_json::to_string(&event).expect("serde round trip")
+    );
+    let value: Value = serde_json::from_str(&native).unwrap();
+    assert_eq!(value["proxy_id"], json!("proxy-a"));
+    assert_eq!(value["received_at"], json!(event.received_at));
+    // Absent optionals stay absent.
+    assert!(value.get("trace_id").is_none());
+    assert!(value.get("snapshot_id").is_none());
+}
+
+#[test]
+fn charge_event_projection_renames_omits_and_adds_fields() {
+    let event = sample_event("evt-projected");
+    let value = projected_row(
+        json!({
+            "rename": { "proxy_id": "route_key", "charge_total": "amount" },
+            "omit": ["node_id", "pricing_version"],
+            "static_fields": { "ledger": "prod", "shard": 3 },
+            "derived_fields": [
+                { "name": "status_group", "kind": "status_class" },
+                { "name": "record_kind", "kind": "summary_kind" },
+                { "name": "call_outcome", "kind": "outcome" }
+            ]
+        }),
+        &event,
+    );
+    assert_eq!(value["route_key"], json!("proxy-a"));
+    assert!(value.get("proxy_id").is_none());
+    assert_eq!(value["amount"], json!(event.charge_total));
+    assert!(value.get("node_id").is_none());
+    assert!(value.get("pricing_version").is_none());
+    assert_eq!(value["ledger"], json!("prod"));
+    assert_eq!(value["shard"], json!(3));
+    assert_eq!(value["status_group"], json!("2xx"));
+    assert_eq!(value["record_kind"], json!("charge_event"));
+    assert_eq!(value["call_outcome"], json!("ok"));
+    // Billing identity fields keep their values — only key naming moved.
+    assert_eq!(value["consumer_id"], json!("alice"));
+    assert_eq!(value["charge_call"], json!(event.charge_call));
+}
+
+#[test]
+fn charge_event_projection_preserves_optional_member_presence_and_orders_output() {
+    let mut event = sample_event("evt-optional");
+    event.trace_id = Some("trace-9".to_string());
+    let projection = compile_charge_event_projection(&sink_config_with(json!({
+        "schema": { "order": ["event_id", "charge_total", "*"] }
+    })))
+    .expect("schema compiles")
+    .expect("schema present");
+    let rendered =
+        serialize_json_each_row_projected(std::slice::from_ref(&event), Some(&projection))
+            .expect("row serializes");
+    let event_at = rendered.find("\"event_id\"").expect("event_id present");
+    let charge_at = rendered
+        .find("\"charge_total\"")
+        .expect("charge_total present");
+    let node_at = rendered.find("\"node_id\"").expect("node_id present");
+    assert!(event_at < charge_at && charge_at < node_at, "{rendered}");
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(value["trace_id"], json!("trace-9"));
+    // `snapshot_id` is still None and stays out of the row.
+    assert!(value.get("snapshot_id").is_none());
+}
+
+#[test]
+fn charge_event_projection_outcome_marks_grpc_and_server_errors() {
+    let mut event = sample_event("evt-grpc");
+    event.grpc_status = Some(13);
+    let schema = json!({ "derived_fields": [{ "name": "call_outcome", "kind": "outcome" }] });
+    assert_eq!(
+        projected_row(schema.clone(), &event)["call_outcome"],
+        json!("error")
+    );
+    let mut event = sample_event("evt-5xx");
+    event.status_code = 503;
+    event.grpc_status = None;
+    assert_eq!(
+        projected_row(schema, &event)["call_outcome"],
+        json!("error")
+    );
+}
+
+#[test]
+fn charge_event_projection_reservation_bound_still_covers_the_body() {
+    // The retained-byte reservation is taken before serialization, so it must
+    // account for the renamed keys and injected members up front.
+    let ceiling: &'static RetainedByteCeiling =
+        Box::leak(Box::new(RetainedByteCeiling::new(16 * 1024 * 1024)));
+    let events: Vec<ChargeEvent> = (0..8).map(|i| sample_event(&format!("evt-{i}"))).collect();
+    let projection = Arc::new(
+        compile_charge_event_projection(&sink_config_with(json!({
+            "schema": {
+                "rename": { "proxy_id": "a_much_longer_destination_column_name" },
+                "static_fields": { "ledger": "production-billing-ledger" },
+                "derived_fields": [{ "name": "status_group", "kind": "status_class" }]
+            }
+        })))
+        .expect("schema compiles")
+        .expect("schema present"),
+    );
+    let (bound, held, after) = probe_charge_body_materialization_with_projection_for_tests(
+        ceiling,
+        &events,
+        Some(Arc::clone(&projection)),
+    )
+    .expect("projected body materializes under the ceiling");
+    let rendered = serialize_json_each_row_projected(&events, Some(projection.as_ref())).unwrap();
+    assert!(
+        bound >= rendered.len(),
+        "reservation {bound} must cover the projected body {}",
+        rendered.len()
+    );
+    assert!(held >= rendered.len(), "body stays charged while held");
+    assert_eq!(after, 0, "reservation released on drop");
+    assert!(projection.row_overhead_bytes() > 0);
+}
+
+#[test]
+fn charge_event_schema_rejects_unrepresentable_shapes() {
+    for (schema, needle) in [
+        (
+            json!({ "summary_type": "http" }),
+            "'summary_type' is not supported",
+        ),
+        (
+            json!({ "timestamp_format": "epoch_ms" }),
+            "'timestamp_format' is not supported",
+        ),
+        (
+            json!({ "metadata": { "mode": "flatten" } }),
+            "'metadata' policy is not supported",
+        ),
+        (
+            json!({ "derived_fields": [{ "name": "host", "kind": "backend_host" }] }),
+            "not representable from a chargeback charge event",
+        ),
+        (
+            json!({ "omit": ["latency_total_ms"] }),
+            "schema omit references unknown field 'latency_total_ms'",
+        ),
+        (
+            json!({ "rename": { "consumer_id": "api_secret" } }),
+            "matches a sensitive-data substring",
+        ),
+        (
+            json!({ "rename": { "proxy_id": "namespace" } }),
+            "duplicate output key 'namespace'",
+        ),
+    ] {
+        let err = compile_charge_event_projection(&sink_config_with(json!({ "schema": schema })))
+            .err()
+            .unwrap_or_else(|| panic!("expected rejection for {schema}"));
+        assert!(err.contains(needle), "needle={needle}, got: {err}");
+    }
+}
+
+#[test]
+fn charge_event_schema_and_schema_ref_are_mutually_exclusive() {
+    let err = compile_charge_event_projection(&sink_config_with(json!({
+        "schema": {},
+        "schema_ref": "shared"
+    })))
+    .err()
+    .unwrap();
+    assert!(err.contains("mutually exclusive"), "got: {err}");
+}
+
+#[test]
+fn charge_event_dangling_schema_ref_fails_closed() {
+    let err = compile_charge_event_projection(&sink_config_with(json!({
+        "schema_ref": "definitely-not-defined"
+    })))
+    .err()
+    .unwrap();
+    assert!(
+        err.contains("references unknown schema 'definitely-not-defined'"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn sink_constructor_accepts_and_rejects_schemas_at_construction() {
+    ApiChargebackSink::new(
+        &sink_config_with(json!({ "schema": { "rename": { "proxy_id": "route_key" } } })),
+        PluginHttpClient::default(),
+        "ferrum",
+    )
+    .expect("valid schema is admitted at construction");
+    let err = ApiChargebackSink::new(
+        &sink_config_with(json!({ "schema": { "summary_type": "http" } })),
+        PluginHttpClient::default(),
+        "ferrum",
+    )
+    .err()
+    .expect("unrepresentable schema is rejected at construction");
+    assert!(
+        err.contains("'summary_type' is not supported"),
+        "got: {err}"
+    );
 }

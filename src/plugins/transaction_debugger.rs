@@ -77,13 +77,22 @@
 
 use async_trait::async_trait;
 use http::header::HeaderName;
+use serde::ser::SerializeMap;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use super::{
     Direction, DisconnectCause, Plugin, PluginResult, RequestContext, StreamTransactionSummary,
     TransactionSummary, WsDisconnectContext,
+};
+use crate::plugins::utils::log_schema::view::{
+    MetadataNested, emit_timestamp, extract_host_from_url, serialize_schema_metadata, status_class,
+};
+use crate::plugins::utils::log_schema::{
+    DerivedKind, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView, SummarySchema,
+    TimestampFormat, resolve_schema,
 };
 use crate::plugins::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
 use crate::proxy::tcp_proxy::StreamIoSide;
@@ -117,6 +126,8 @@ pub const TRANSACTION_DEBUGGER_CONFIG_KEYS: &[&str] = &[
     "max_response_body_bytes",
     "redacted_body_fields",
     "redacted_headers",
+    "schema",
+    "schema_ref",
 ];
 
 /// Default per-direction body capture budget in bytes.
@@ -271,6 +282,10 @@ pub struct TransactionDebugger {
     log_response_body: bool,
     max_request_body_bytes: usize,
     max_response_body_bytes: usize,
+    /// Compiled terminal-diagnostic projection, resolved once at construction
+    /// (inline `schema:` or global-first `schema_ref:`). `None` keeps the
+    /// pre-existing `tracing` field emission byte-for-byte and allocation-free.
+    schema: Option<Arc<SummarySchema>>,
 }
 
 impl TransactionDebugger {
@@ -278,14 +293,11 @@ impl TransactionDebugger {
         let object = config
             .as_object()
             .ok_or_else(|| "transaction_debugger: config must be an object".to_string())?;
-        if config.get("schema").is_some() || config.get("schema_ref").is_some() {
-            return Err(
-                "transaction_debugger: 'schema' / 'schema_ref' is not supported \
-                 (transaction-log schema customization applies only to log-shipping plugins; \
-                 see docs/plugins.md)"
-                    .to_string(),
-            );
-        }
+        let schema = resolve_schema(
+            config,
+            "transaction_debugger",
+            SchemaCapabilities::TRANSACTION_DEBUGGER,
+        )?;
         let mut unknown_keys: Vec<&str> = object
             .keys()
             .map(String::as_str)
@@ -326,7 +338,87 @@ impl TransactionDebugger {
             log_response_body,
             max_request_body_bytes,
             max_response_body_bytes,
+            schema,
         })
+    }
+
+    /// The compiled diagnostic projection, if one is configured.
+    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
+    pub fn schema(&self) -> Option<&Arc<SummarySchema>> {
+        self.schema.as_ref()
+    }
+
+    /// Project one HTTP terminal diagnostic exactly as `log` would.
+    ///
+    /// Test seam: the production path writes the result into a `tracing` event,
+    /// which external tests cannot inspect without a subscriber.
+    #[doc(hidden)]
+    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
+    pub fn project_http_for_tests(&self, summary: &TransactionSummary) -> Option<String> {
+        let schema = self.schema.as_ref().filter(|s| s.applies_to_http())?;
+        Self::render(
+            schema,
+            &DebugHttpRecord {
+                summary,
+                outcome: Self::classify_http_outcome(summary),
+            },
+        )
+    }
+
+    /// Project one stream terminal diagnostic exactly as `on_stream_disconnect`
+    /// would. Test seam; see [`Self::project_http_for_tests`].
+    #[doc(hidden)]
+    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
+    pub fn project_stream_for_tests(&self, summary: &StreamTransactionSummary) -> Option<String> {
+        let schema = self.schema.as_ref().filter(|s| s.applies_to_stream())?;
+        Self::render(
+            schema,
+            &DebugStreamRecord {
+                summary,
+                outcome: Self::classify_stream_outcome(summary),
+            },
+        )
+    }
+
+    /// Project one WebSocket terminal diagnostic exactly as `on_ws_disconnect`
+    /// would. Test seam; see [`Self::project_http_for_tests`].
+    #[doc(hidden)]
+    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
+    pub fn project_ws_for_tests(&self, summary: &WsDisconnectContext) -> Option<String> {
+        let schema = self
+            .schema
+            .as_ref()
+            .filter(|s| s.applies_to_websocket_disconnect())?;
+        Self::render(
+            schema,
+            &DebugWsRecord {
+                summary,
+                outcome: Self::classify_ws_outcome(summary),
+            },
+        )
+    }
+
+    /// Render `record` through the configured schema.
+    ///
+    /// Only reached when a schema is configured; serialization failure is
+    /// impossible for these record types (no map keys are non-strings, no
+    /// non-finite floats reach here — latency/duration values are already
+    /// finite), but the debugger is diagnostic-only so a failure degrades to a
+    /// one-line warning rather than dropping the record silently.
+    fn render<T: SchemaSerializable>(schema: &SummarySchema, record: &T) -> Option<String> {
+        match serde_json::to_string(&SchemaView {
+            summary: record,
+            schema,
+        }) {
+            Ok(rendered) => Some(rendered),
+            Err(error) => {
+                tracing::warn!(
+                    target: "transaction_debug",
+                    "transaction_debugger: schema projection failed: {error}"
+                );
+                None
+            }
+        }
     }
 
     /// Whether bounded request-body capture is enabled.
@@ -1029,6 +1121,26 @@ impl Plugin for TransactionDebugger {
         if !tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG) {
             return;
         }
+        // A schema whose `summary_type` excludes this entry kind falls back to
+        // the native diagnostic, matching every log-shipping plugin.
+        if let Some(schema) = self
+            .schema
+            .as_ref()
+            .filter(|schema| schema.applies_to_stream())
+        {
+            let record = DebugStreamRecord {
+                summary,
+                outcome: Self::classify_stream_outcome(summary),
+            };
+            if let Some(rendered) = Self::render(schema, &record) {
+                tracing::debug!(
+                    target: "transaction_debug",
+                    record = %rendered,
+                    "Stream terminal diagnostic",
+                );
+            }
+            return;
+        }
         let outcome = Self::classify_stream_outcome(summary);
         let error_class = summary.error_class.map(|class| class.as_str());
         let disconnect_direction = summary.disconnect_direction.map(direction_label);
@@ -1066,6 +1178,24 @@ impl Plugin for TransactionDebugger {
 
     async fn log(&self, summary: &TransactionSummary) {
         if !tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG) {
+            return;
+        }
+        if let Some(schema) = self
+            .schema
+            .as_ref()
+            .filter(|schema| schema.applies_to_http())
+        {
+            let record = DebugHttpRecord {
+                summary,
+                outcome: Self::classify_http_outcome(summary),
+            };
+            if let Some(rendered) = Self::render(schema, &record) {
+                tracing::debug!(
+                    target: "transaction_debug",
+                    record = %rendered,
+                    "Transaction terminal diagnostic",
+                );
+            }
             return;
         }
         let outcome = Self::classify_http_outcome(summary);
@@ -1118,6 +1248,24 @@ impl Plugin for TransactionDebugger {
         if !tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG) {
             return;
         }
+        if let Some(schema) = self
+            .schema
+            .as_ref()
+            .filter(|schema| schema.applies_to_websocket_disconnect())
+        {
+            let record = DebugWsRecord {
+                summary,
+                outcome: Self::classify_ws_outcome(summary),
+            };
+            if let Some(rendered) = Self::render(schema, &record) {
+                tracing::debug!(
+                    target: "transaction_debug",
+                    record = %rendered,
+                    "WebSocket terminal diagnostic",
+                );
+            }
+            return;
+        }
         let outcome = Self::classify_ws_outcome(summary);
         let direction = summary.direction.map(direction_label);
         let io_side = summary.io_side.map(stream_io_side_label);
@@ -1147,6 +1295,424 @@ impl Plugin for TransactionDebugger {
             trace_id = %trace_id.unwrap_or("-"),
             "WebSocket terminal diagnostic",
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Schema-projected terminal diagnostics
+// ---------------------------------------------------------------------------
+//
+// These record views exist ONLY when an operator configures `schema:` /
+// `schema_ref:`. They are faithful projections of the default diagnostic
+// records: the same field names, the same values, and the same `"-"`
+// placeholder for an absent optional. That keeps `omit` / `rename` / `order`
+// operating on exactly what the default record emits, so a schema is a
+// projection of the documented output rather than a second, subtly different
+// record shape.
+//
+// The one field the default records do not carry is `metadata`. The default
+// diagnostic hand-picks `request_id` / `trace_id` out of the summary metadata;
+// the projected record additionally exposes the full map as a native
+// `metadata` field so the shared `nested` / `omit` / `flatten` policy is
+// available here as on every log-shipping sink. Every path routes through
+// `serialize_redacted_metadata` / `flatten_metadata`, so sensitive keys are
+// redacted and `_dedup_*` lifecycle keys are stripped even when the outer field
+// is renamed or the map is flattened.
+
+/// Emit an optional string as the default diagnostic does: the value, or the
+/// `"-"` placeholder when absent.
+fn emit_optional<S: SerializeMap>(
+    out_key: &str,
+    value: Option<&str>,
+    map: &mut S,
+) -> Result<(), S::Error> {
+    map.serialize_entry(out_key, value.unwrap_or("-"))
+}
+
+/// HTTP / gRPC terminal diagnostic under a compiled schema.
+pub(crate) struct DebugHttpRecord<'a> {
+    pub(crate) summary: &'a TransactionSummary,
+    pub(crate) outcome: &'static str,
+}
+
+impl<'a> SchemaSerializable for DebugHttpRecord<'a> {
+    fn owns_native(&self, source: &str) -> bool {
+        crate::plugins::utils::log_schema::DEBUG_HTTP_FIELDS
+            .iter()
+            .any(|f| f.name == source)
+    }
+
+    fn serialize_native<S>(
+        &self,
+        source: &'static str,
+        out_key: &str,
+        ts_format: TimestampFormat,
+        map: &mut S,
+    ) -> Result<(), S::Error>
+    where
+        S: SerializeMap,
+    {
+        let summary = self.summary;
+        match source {
+            "outcome" => map.serialize_entry(out_key, self.outcome),
+            "namespace" => map.serialize_entry(out_key, &summary.namespace),
+            "timestamp_received" => {
+                emit_timestamp(out_key, &summary.timestamp_received, ts_format, map)
+            }
+            "client_ip" => map.serialize_entry(out_key, &summary.client_ip),
+            "method" => map.serialize_entry(out_key, &summary.http_method),
+            "path" => map.serialize_entry(out_key, &summary.request_path),
+            "status" => map.serialize_entry(out_key, &summary.response_status_code),
+            "proxy_id" => emit_optional(out_key, summary.proxy_id.as_deref(), map),
+            "proxy_name" => emit_optional(out_key, summary.proxy_name.as_deref(), map),
+            "backend_target" => emit_optional(out_key, summary.backend_target.as_deref(), map),
+            "backend_resolved_ip" => {
+                emit_optional(out_key, summary.backend_resolved_ip.as_deref(), map)
+            }
+            "consumer_username" => {
+                emit_optional(out_key, summary.consumer_username.as_deref(), map)
+            }
+            "auth_method" => emit_optional(out_key, summary.auth_method, map),
+            "error_class" => emit_optional(out_key, summary.error_class.map(|c| c.as_str()), map),
+            "body_error_class" => {
+                emit_optional(out_key, summary.body_error_class.map(|c| c.as_str()), map)
+            }
+            "response_streamed" => map.serialize_entry(out_key, &summary.response_streamed),
+            "body_completed" => map.serialize_entry(out_key, &summary.body_completed),
+            "client_disconnected" => map.serialize_entry(out_key, &summary.client_disconnected),
+            "bytes_sent" => map.serialize_entry(out_key, &summary.bytes_sent),
+            "bytes_received" => map.serialize_entry(out_key, &summary.bytes_received),
+            "rejection_phase" => emit_optional(
+                out_key,
+                selected_metadata_value(&summary.metadata, "rejection_phase"),
+                map,
+            ),
+            "grpc_status" => emit_optional(
+                out_key,
+                selected_metadata_value(&summary.metadata, "grpc_status"),
+                map,
+            ),
+            "request_id" => emit_optional(
+                out_key,
+                selected_metadata_value(&summary.metadata, "request_id"),
+                map,
+            ),
+            "trace_id" => emit_optional(
+                out_key,
+                selected_metadata_value(&summary.metadata, "trace_id"),
+                map,
+            ),
+            "latency_total_ms" => map.serialize_entry(out_key, &summary.latency_total_ms),
+            "latency_backend_ttfb_ms" => {
+                map.serialize_entry(out_key, &summary.latency_backend_ttfb_ms)
+            }
+            "latency_backend_total_ms" => {
+                map.serialize_entry(out_key, &summary.latency_backend_total_ms)
+            }
+            "latency_plugin_ms" => {
+                map.serialize_entry(out_key, &summary.latency_plugin_execution_ms)
+            }
+            "latency_gw_overhead_ms" => {
+                map.serialize_entry(out_key, &summary.latency_gateway_overhead_ms)
+            }
+            "metadata" => map.serialize_entry(out_key, &MetadataNested(&summary.metadata)),
+            // Fields owned by another entry kind in a `both`/ws schema.
+            _ => Ok(()),
+        }
+    }
+
+    fn serialize_derived<S>(
+        &self,
+        kind: DerivedKind,
+        out_key: &str,
+        map: &mut S,
+    ) -> Result<bool, S::Error>
+    where
+        S: SerializeMap,
+    {
+        match kind {
+            DerivedKind::StatusClass => {
+                map.serialize_entry(out_key, status_class(self.summary.response_status_code))?;
+                Ok(true)
+            }
+            DerivedKind::BackendHost => match self
+                .summary
+                .backend_target
+                .as_deref()
+                .and_then(extract_host_from_url)
+            {
+                Some(host) => {
+                    map.serialize_entry(out_key, host)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+            DerivedKind::SummaryKind => {
+                map.serialize_entry(out_key, "http")?;
+                Ok(true)
+            }
+            DerivedKind::Outcome => {
+                let is_error =
+                    self.summary.response_status_code >= 500 || self.summary.is_terminal_failure();
+                map.serialize_entry(out_key, if is_error { "error" } else { "ok" })?;
+                Ok(true)
+            }
+        }
+    }
+
+    fn serialize_metadata<S>(
+        &self,
+        policy: &MetadataPolicy,
+        emitted: &mut HashSet<String>,
+        map: &mut S,
+    ) -> Result<(), S::Error>
+    where
+        S: SerializeMap,
+    {
+        serialize_schema_metadata(&self.summary.metadata, policy, emitted, map)
+    }
+}
+
+/// Stream (TCP/UDP/DTLS) terminal diagnostic under a compiled schema.
+pub(crate) struct DebugStreamRecord<'a> {
+    pub(crate) summary: &'a StreamTransactionSummary,
+    pub(crate) outcome: &'static str,
+}
+
+impl<'a> SchemaSerializable for DebugStreamRecord<'a> {
+    fn owns_native(&self, source: &str) -> bool {
+        crate::plugins::utils::log_schema::DEBUG_STREAM_FIELDS
+            .iter()
+            .any(|f| f.name == source)
+    }
+
+    fn serialize_native<S>(
+        &self,
+        source: &'static str,
+        out_key: &str,
+        ts_format: TimestampFormat,
+        map: &mut S,
+    ) -> Result<(), S::Error>
+    where
+        S: SerializeMap,
+    {
+        let summary = self.summary;
+        match source {
+            "outcome" => map.serialize_entry(out_key, self.outcome),
+            "namespace" => map.serialize_entry(out_key, &summary.namespace),
+            "protocol" => map.serialize_entry(out_key, &summary.protocol),
+            "proxy_id" => map.serialize_entry(out_key, &summary.proxy_id),
+            "proxy_name" => emit_optional(out_key, summary.proxy_name.as_deref(), map),
+            "client_ip" => map.serialize_entry(out_key, &summary.client_ip),
+            "listen_port" => map.serialize_entry(out_key, &summary.listen_port),
+            "backend_target" => map.serialize_entry(out_key, &summary.backend_target),
+            "backend_resolved_ip" => {
+                emit_optional(out_key, summary.backend_resolved_ip.as_deref(), map)
+            }
+            "consumer_username" => {
+                emit_optional(out_key, summary.consumer_username.as_deref(), map)
+            }
+            "auth_method" => emit_optional(out_key, summary.auth_method, map),
+            "connection_error" => emit_optional(out_key, summary.connection_error.as_deref(), map),
+            "error_class" => emit_optional(out_key, summary.error_class.map(|c| c.as_str()), map),
+            "disconnect_direction" => emit_optional(
+                out_key,
+                summary.disconnect_direction.map(direction_label),
+                map,
+            ),
+            "disconnect_cause" => emit_optional(
+                out_key,
+                summary.disconnect_cause.map(disconnect_cause_label),
+                map,
+            ),
+            "duration_ms" => map.serialize_entry(out_key, &summary.duration_ms),
+            "bytes_sent" => map.serialize_entry(out_key, &summary.bytes_sent),
+            "bytes_received" => map.serialize_entry(out_key, &summary.bytes_received),
+            "timestamp_connected" => {
+                emit_timestamp(out_key, &summary.timestamp_connected, ts_format, map)
+            }
+            "timestamp_disconnected" => {
+                emit_timestamp(out_key, &summary.timestamp_disconnected, ts_format, map)
+            }
+            "sni_hostname" => emit_optional(out_key, summary.sni_hostname.as_deref(), map),
+            "request_id" => emit_optional(
+                out_key,
+                selected_metadata_value(&summary.metadata, "request_id"),
+                map,
+            ),
+            "trace_id" => emit_optional(
+                out_key,
+                selected_metadata_value(&summary.metadata, "trace_id"),
+                map,
+            ),
+            "metadata" => map.serialize_entry(out_key, &MetadataNested(&summary.metadata)),
+            _ => Ok(()),
+        }
+    }
+
+    fn serialize_derived<S>(
+        &self,
+        kind: DerivedKind,
+        out_key: &str,
+        map: &mut S,
+    ) -> Result<bool, S::Error>
+    where
+        S: SerializeMap,
+    {
+        match kind {
+            DerivedKind::StatusClass => {
+                map.serialize_entry(out_key, "none")?;
+                Ok(true)
+            }
+            DerivedKind::BackendHost => match extract_host_from_url(&self.summary.backend_target) {
+                Some(host) => {
+                    map.serialize_entry(out_key, host)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+            DerivedKind::SummaryKind => {
+                map.serialize_entry(out_key, "stream")?;
+                Ok(true)
+            }
+            DerivedKind::Outcome => {
+                let is_error = self.summary.connection_error.is_some()
+                    || self.summary.error_class.is_some()
+                    || matches!(
+                        self.summary.disconnect_cause,
+                        Some(DisconnectCause::BackendError)
+                    );
+                map.serialize_entry(out_key, if is_error { "error" } else { "ok" })?;
+                Ok(true)
+            }
+        }
+    }
+
+    fn serialize_metadata<S>(
+        &self,
+        policy: &MetadataPolicy,
+        emitted: &mut HashSet<String>,
+        map: &mut S,
+    ) -> Result<(), S::Error>
+    where
+        S: SerializeMap,
+    {
+        serialize_schema_metadata(&self.summary.metadata, policy, emitted, map)
+    }
+}
+
+/// WebSocket-disconnect terminal diagnostic under a compiled schema.
+pub(crate) struct DebugWsRecord<'a> {
+    pub(crate) summary: &'a WsDisconnectContext,
+    pub(crate) outcome: &'static str,
+}
+
+impl<'a> SchemaSerializable for DebugWsRecord<'a> {
+    fn owns_native(&self, source: &str) -> bool {
+        crate::plugins::utils::log_schema::DEBUG_WS_FIELDS
+            .iter()
+            .any(|f| f.name == source)
+    }
+
+    fn serialize_native<S>(
+        &self,
+        source: &'static str,
+        out_key: &str,
+        _ts_format: TimestampFormat,
+        map: &mut S,
+    ) -> Result<(), S::Error>
+    where
+        S: SerializeMap,
+    {
+        let summary = self.summary;
+        match source {
+            "outcome" => map.serialize_entry(out_key, self.outcome),
+            "namespace" => map.serialize_entry(out_key, &summary.namespace),
+            "proxy_id" => map.serialize_entry(out_key, &summary.proxy_id),
+            "proxy_name" => emit_optional(out_key, summary.proxy_name.as_deref(), map),
+            "client_ip" => map.serialize_entry(out_key, &summary.client_ip),
+            "listen_port" => map.serialize_entry(out_key, &summary.listen_port),
+            "backend_target" => map.serialize_entry(out_key, &summary.backend_target),
+            "consumer_username" => {
+                emit_optional(out_key, summary.consumer_username.as_deref(), map)
+            }
+            "auth_method" => emit_optional(out_key, summary.auth_method, map),
+            "duration_ms" => map.serialize_entry(out_key, &summary.duration_ms),
+            "frames_client_to_backend" => {
+                map.serialize_entry(out_key, &summary.frames_client_to_backend)
+            }
+            "frames_backend_to_client" => {
+                map.serialize_entry(out_key, &summary.frames_backend_to_client)
+            }
+            "bytes_client_to_backend" => {
+                map.serialize_entry(out_key, &summary.bytes_client_to_backend)
+            }
+            "bytes_backend_to_client" => {
+                map.serialize_entry(out_key, &summary.bytes_backend_to_client)
+            }
+            "disconnect_direction" => {
+                emit_optional(out_key, summary.direction.map(direction_label), map)
+            }
+            "io_side" => emit_optional(out_key, summary.io_side.map(stream_io_side_label), map),
+            "error_class" => emit_optional(out_key, summary.error_class.map(|c| c.as_str()), map),
+            "request_id" => emit_optional(
+                out_key,
+                selected_metadata_value(&summary.metadata, "request_id"),
+                map,
+            ),
+            "trace_id" => emit_optional(
+                out_key,
+                selected_metadata_value(&summary.metadata, "trace_id"),
+                map,
+            ),
+            "metadata" => map.serialize_entry(out_key, &MetadataNested(&summary.metadata)),
+            _ => Ok(()),
+        }
+    }
+
+    fn serialize_derived<S>(
+        &self,
+        kind: DerivedKind,
+        out_key: &str,
+        map: &mut S,
+    ) -> Result<bool, S::Error>
+    where
+        S: SerializeMap,
+    {
+        match kind {
+            DerivedKind::StatusClass => {
+                map.serialize_entry(out_key, "none")?;
+                Ok(true)
+            }
+            DerivedKind::BackendHost => match extract_host_from_url(&self.summary.backend_target) {
+                Some(host) => {
+                    map.serialize_entry(out_key, host)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+            DerivedKind::SummaryKind => {
+                map.serialize_entry(out_key, "websocket_disconnect")?;
+                Ok(true)
+            }
+            DerivedKind::Outcome => {
+                let is_error = self.summary.error_class.is_some();
+                map.serialize_entry(out_key, if is_error { "error" } else { "ok" })?;
+                Ok(true)
+            }
+        }
+    }
+
+    fn serialize_metadata<S>(
+        &self,
+        policy: &MetadataPolicy,
+        emitted: &mut HashSet<String>,
+        map: &mut S,
+    ) -> Result<(), S::Error>
+    where
+        S: SerializeMap,
+    {
+        serialize_schema_metadata(&self.summary.metadata, policy, emitted, map)
     }
 }
 

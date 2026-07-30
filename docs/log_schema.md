@@ -3,7 +3,9 @@
 Operators can shape the JSON / line-protocol output of every logging plugin
 (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_logging`,
 `ws_logging`, `kafka_logging`, `loki_logging`, `statsd_logging`) through a
-per-plugin `schema:` block. This lets you rename
+per-plugin `schema:` block. `api_chargeback`, `api_chargeback_sink`, and
+`transaction_debugger` accept the same contract against their own record
+families — see [Non-Summary Record Families](#non-summary-record-families). This lets you rename
 keys, drop fields, reorder output, add static stamping, and inject a few
 derived fields without forking the gateway.
 
@@ -338,7 +340,7 @@ compile time.
 
 | Plugin | Schema-aware output | Notes |
 |---|---|---|
-| `stdout_logging` | Full | Reserves bounded stdout queue capacity before serialization; independent of `FERRUM_LOG_LEVEL`. Optional filter (`status_code_min/max`, `min_latency_ms`, `errors_only`) runs before schema application. |
+| `stdout_logging` | Full | Reserves bounded stdout queue capacity before serialization; independent of `FERRUM_LOG_LEVEL`. Optional flat filter (`status_code_min/max`, `min_latency_ms`, `errors_only`) or compiled `expression` tree runs before schema application. |
 | `http_logging` | Full | Batched JSON array. |
 | `tcp_logging` | Full | NDJSON, one line per entry. |
 | `udp_logging` | Full | Batched JSON array per UDP datagram. Operators should keep per-summary size under MTU. |
@@ -347,18 +349,93 @@ compile time.
 | `loki_logging` | Full | Schema-customized JSON appears inside the Loki log line. Loki **labels** (`build_http_labels` / `build_stream_labels`) keep reading typed fields, so labels are NOT affected by `rename:`. |
 | `statsd_logging` | Tag rename / omit only | Static / derived / flatten / timestamp parts of a schema are no-ops here (statsd is line protocol, not JSON). When an inline `schema:` carries any of those keys, the plugin emits a `warn!` at construction time so operators don't ship a schema that silently throws fields away (per-referrer warnings would be noisy, so `schema_ref:` is not inspected — verify the shared schema's intent at the `transaction_log_schema` definition). The schema's `rename` and `omit` operate on the native field names backing the statsd tags. The supported mappings are: HTTP — `http_method`↔`method`, `response_status_code`↔`status`, `proxy_id`↔`proxy`. Stream — `protocol`↔`protocol`, `proxy_id`↔`proxy`, `disconnect_cause`↔`cause`, `disconnect_direction`↔`direction`. Computed statsd tags without native-field backing (`status_class`, `grpc_status`, `error`, `body_outcome`, `body_error`, `result`, `io_side`, `error_class`, and the authoritative `namespace`) are always emitted with their default names — `omit` and `rename` have no effect on them since they are derived at format time, not read from a summary field. `grpc_status` is emitted only for gRPC transactions and is bounded to `0`–`16` plus `OTHER`. Rename targets are fail-closed against a portable StatsD tag-key grammar (`[A-Za-z_][A-Za-z0-9_.-]*`) and cannot collide with reserved runtime tags; a schema that is valid for JSON loggers may still be rejected when attached to `statsd_logging` / `schema_ref`. |
 
-`prometheus_metrics`, `api_chargeback`, `transaction_debugger` reject
-`schema:` and `schema_ref:` at construction time. Prometheus exposes
-metrics with label names baked into the time-series store; chargeback is
-an in-memory accounting plugin; transaction_debugger emits debug-only
-traces. None of them serialize summaries for shipping, so customization
-doesn't apply. The transaction debugger's config is otherwise closed as well:
-only `redacted_headers`, `log_request_body`, `log_response_body`,
-`max_request_body_bytes`, `max_response_body_bytes`, and
-`redacted_body_fields` are accepted, and every other unsupported key is
+`prometheus_metrics` rejects `schema:` and `schema_ref:` at construction
+time: it exposes metrics with label names baked into the time-series store,
+so there is no serialization boundary to project.
+
+## Non-Summary Record Families
+
+`api_chargeback`, `api_chargeback_sink`, and `transaction_debugger` do not
+serialize `TransactionSummary` for shipping, but they each have an externally
+emitted representation of their own. They accept the same `schema:` /
+`schema_ref:` contract, compiled by the same resolver against their own field
+inventory (a **record family**). Everything a family cannot express is rejected
+at construction with a plugin- and field-specific diagnostic — never ignored.
+
+| Plugin | Projected surface | Field inventory | Rejected for this family |
+|---|---|---|---|
+| `api_chargeback` | The per-proxy billing row inside `GET /charges` (`consumers.<consumer>.proxies.<key>`) | `proxy_id`, `namespace`, `proxy_name`, `currency`, `protocol_family`, `total_calls`, `total_charges`, `by_status`, `bandwidth`, `stream` | `summary_type`, `timestamp_format`, `metadata`, `order`, every derived kind except `summary_kind` |
+| `api_chargeback_sink` | The exported charge event — the JSONEachRow row delivered to ClickHouse and the durable spool artifact that replays it | `event_id`, `received_at`, `node_id`, `namespace`, `consumer_id`, `consumer_name`, `proxy_id`, `proxy_name`, `route_id`, `status_code`, `http_status_code`, `grpc_status`, `protocol`, `call_count`, `charge_call`, `bytes_sent`, `bytes_received`, `charge_bytes_sent`, `charge_bytes_received`, `charge_total`, `currency`, `pricing_version`, `request_id`, `trace_id`, `snapshot_id` | `summary_type`, `timestamp_format`, `metadata`, the `backend_host` derived kind |
+| `transaction_debugger` | The terminal diagnostic records on the `transaction_debug` tracing target (HTTP, stream, WebSocket disconnect) | its own diagnostic names — `outcome`, `method`, `path`, `status`, `rejection_phase`, `latency_plugin_ms`, `latency_gw_overhead_ms`, `metadata`, … — **not** the transaction-summary names | — (full contract, including `summary_type` and `metadata`) |
+
+Shared rules for all three:
+
+- **Nothing but the emitted representation moves.** Projection never touches
+  billing identity, charge accounting, registry or accumulator keys, snapshot
+  keys, Prometheus label sets, or spool ownership. Renaming `proxy_id` renames
+  a JSON key, not the row it is accounted under.
+- **Compiled once, never on the emit path.** `schema` compiles and `schema_ref`
+  resolves at plugin construction / reload, exactly as for the log-shipping
+  plugins, and `schema_ref` keeps the global-first lifecycle and fails closed
+  for a missing definition.
+- **Default output is unchanged.** With no `schema` / `schema_ref` configured
+  every one of these surfaces emits its pre-existing bytes through its
+  pre-existing path, with no projection machinery and no added allocation.
+- **Named schemas are portable, so they are limited here.** A
+  `transaction_log_schema` definition is authored and registered against the
+  transaction-summary registry, so under another family it can only name the
+  fields that family happens to share with the summary registry. Only
+  `namespace`, `proxy_id`, and `proxy_name` are shared by all three families.
+  `protocol`, `bytes_sent`, and `bytes_received` reach the charge event and the
+  debugger diagnostics but **not** the chargeback billing row, which carries
+  `protocol_family` and a nested `bandwidth` object instead. Recompiling a
+  definition under a family that lacks one of its names fails closed on that
+  name — use an inline `schema:` for family-specific fields.
+
+Family-specific notes:
+
+- **`api_chargeback`** governs one process-global render cache, so — exactly
+  like `render_cache_ttl_seconds` and the registry budgets — every enabled
+  `api_chargeback` instance must resolve to the same `schema` / `schema_ref`.
+  A disagreement is rejected at admission. Changing the projection drops the
+  cached `/charges` document. `order` is rejected because the row is a member
+  of a `serde_json::Map`-backed document whose member order the projection does
+  not control.
+- **`api_chargeback_sink`** projects the ClickHouse INSERT row, so renaming a
+  field renames the column the row inserts into — the target table must agree.
+  Mind the sort key in particular: the reference `ferrum.charges_raw` is a
+  `ReplacingMergeTree` ordered by
+  `(namespace, consumer_id, received_at, event_id)`, and that ordering is what
+  makes at-least-once spool replay idempotent. Renaming or omitting one of
+  those four without matching the destination table leaves its column at the
+  default for every row, so distinct charges collapse onto one sort key and the
+  `FINAL` reads behind the hourly/daily/monthly rollup views keep only one of
+  them. Ferrum cannot inspect the remote table, so preserving the destination
+  sort key is the operator's responsibility.
+  `received_at` stays an epoch-nanosecond integer: its representation is fixed
+  by the column it inserts into, so `timestamp_format` is rejected rather than
+  silently changing a column's type. The durable spool artifact is a copy of the delivery body and is replayed
+  verbatim, so a spool file written before a schema change replays under the
+  schema in force when it was written. The retained-byte reservation for a
+  batch adds a precomputed worst-case per-row surcharge for the projection, so
+  the reservation still strictly precedes serialization.
+- **`transaction_debugger`** emits one `record` field carrying the projected
+  JSON document instead of the individual `tracing` fields when a schema is
+  configured. The projected record is a faithful projection of the default
+  one — same names, same values, same `"-"` placeholder for an absent optional
+  — plus a `metadata` native field exposing the (redacted, `_dedup_*`-stripped)
+  summary metadata map, so `nested` / `omit` / `flatten` work here as on any
+  shipping sink. A schema whose `summary_type` excludes an entry kind leaves
+  that record on its native diagnostic, matching every log-shipping plugin.
+
+The transaction debugger's config is otherwise closed as well: only
+`redacted_headers`, `log_request_body`, `log_response_body`,
+`max_request_body_bytes`, `max_response_body_bytes`, `redacted_body_fields`,
+`schema`, and `schema_ref` are accepted, and every other unsupported key is
 rejected rather than ignored. Bounded body samples are emitted only on the
 `transaction_debug` tracing target and are never projected into
-`TransactionSummary` metadata, so no shipping sink can observe them.
+`TransactionSummary` metadata, so no shipping sink can observe them — and they
+are not part of the diagnostic field inventory either.
 
 ## Validation
 

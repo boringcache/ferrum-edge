@@ -1,7 +1,8 @@
 name: Dependency Audit
 
 # Scheduled supply-chain governance for the dependency tree and the vendored,
-# patched crates (reqwest / h3 / tungstenite / tokio-tungstenite). The blocking
+# patched crates (reqwest / h3 / tungstenite / tokio-tungstenite / dimpl —
+# canonically docs/vendored-patch-lifecycle.json). The blocking
 # advisories gate also runs per-PR in ci.yml; this workflow re-checks against the
 # latest advisory database WITHOUT a PR (so a newly-published RUSTSEC advisory is
 # caught within a week even on a quiet repo) and adds two time-sensitive checks
@@ -76,10 +77,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
+      - name: Vendored-patch lifecycle parity
+        # Checker runs synthetic self-tests before repository parity.
+        run: python3 scripts/check_vendored_patch_lifecycle.py
+
       - name: Check upstream status of vendored patches
         # Reports each vendored patch's upstream PR state + latest crates.io
         # release. Fails (red scheduled run) when an upstream PR has merged, so
         # a retireable vendor copy can't be missed. See docs/dependency-policy.md.
+        # Wrapper path also self-tests, then parity, then network reporting.
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/check_vendored_patch_status.sh

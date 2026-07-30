@@ -4592,6 +4592,10 @@ impl GatewayConfig {
             errors.extend(dedup_errors);
         }
 
+        if let Err(soap_errors) = crate::plugins::soap_ws_security::validate_composition(self) {
+            errors.extend(soap_errors);
+        }
+
         for plugin in &self.plugin_configs {
             // `transaction_log_schema` is process-global by design (it
             // registers named schemas into a single registry); reject
