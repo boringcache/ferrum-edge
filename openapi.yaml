@@ -21480,6 +21480,8 @@ components:
                 type: string
                 enum:
                   - "$.messages[*].content"
+                  - "$.messages[*].function_call.name"
+                  - "$.messages[*].function_call.arguments"
                   - "$.messages[*].tool_calls[*].function.name"
                   - "$.messages[*].tool_calls[*].function.arguments"
                   - "$.prompt"
@@ -21494,6 +21496,8 @@ components:
                   - "$.tool_results[*].content"
               default:
                 - "$.messages[*].content"
+                - "$.messages[*].function_call.name"
+                - "$.messages[*].function_call.arguments"
                 - "$.messages[*].tool_calls[*].function.name"
                 - "$.messages[*].tool_calls[*].function.arguments"
                 - "$.prompt"
