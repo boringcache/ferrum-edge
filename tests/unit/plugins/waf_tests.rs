@@ -1,7 +1,8 @@
 use ferrum_edge::_test_support::clone_log_metadata;
 use ferrum_edge::plugins::waf::Waf;
 use ferrum_edge::plugins::{
-    Plugin, PluginFailurePolicy, PluginResult, RequestContext, plugin_failure_policy,
+    Plugin, PluginFailurePolicy, PluginResult, RequestContext, ResponseTrailerPolicy,
+    plugin_failure_policy,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -985,6 +986,20 @@ async fn response_header_rules_request_buffered_grpc_web_trailer_policy() {
     let ctx = ctx("POST", "/grpc.Service/Method");
 
     assert!(plugin.requires_buffered_grpc_web_trailer_policy(&ctx));
+    assert!(matches!(
+        plugin.response_trailer_policy(),
+        ResponseTrailerPolicy::Unbounded
+    ));
+}
+
+#[test]
+fn inactive_response_header_inspection_does_not_govern_native_h3_trailers() {
+    let plugin = Waf::new(&json!({})).unwrap();
+
+    assert!(matches!(
+        plugin.response_trailer_policy(),
+        ResponseTrailerPolicy::None
+    ));
 }
 
 #[tokio::test]

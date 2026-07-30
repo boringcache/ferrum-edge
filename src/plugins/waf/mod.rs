@@ -41,8 +41,8 @@ use self::stream::{
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::{
     ALL_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext,
-    StreamBytesKind, StreamConnectionContext, UdpDatagramContext, UdpDatagramDirection,
-    UdpDatagramVerdict,
+    ResponseTrailerPolicy, StreamBytesKind, StreamConnectionContext, UdpDatagramContext,
+    UdpDatagramDirection, UdpDatagramVerdict,
 };
 use crate::config::types::BackendScheme;
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -1191,6 +1191,20 @@ impl Plugin for Waf {
             return self.handle_unbounded_response_stream(ctx);
         }
         PluginResult::Continue
+    }
+
+    fn response_trailer_policy(&self) -> ResponseTrailerPolicy<'_> {
+        if self.active
+            && self.config.response_inspection
+            && self.compiled.response_header_rules_active
+        {
+            // Response-header rules can match any field name or value. Since
+            // `after_proxy` cannot inspect native H3 trailers, fail closed by
+            // preventing the buffered H3 path from forwarding that section.
+            ResponseTrailerPolicy::Unbounded
+        } else {
+            ResponseTrailerPolicy::None
+        }
     }
 
     fn requires_buffered_grpc_web_trailer_policy(&self, ctx: &RequestContext) -> bool {
