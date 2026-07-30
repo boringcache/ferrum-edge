@@ -1812,6 +1812,90 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_notification_delivery_abandoned_at_deadline_total",
+    "type": "counter",
+    "help": "Notification deliveries abandoned when reload retirement or the global shutdown drain deadline cancelled the task.",
+    "labels": [
+      "channel_type"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_notification_delivery_attempted_total",
+    "type": "counter",
+    "help": "Notification delivery attempts admitted past the dispatch semaphore (includes retries' parent task once).",
+    "labels": [
+      "channel_type"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_notification_delivery_backpressure_dropped_total",
+    "type": "counter",
+    "help": "Notification deliveries dropped because the bounded dispatch semaphore was exhausted.",
+    "labels": [
+      "channel_type"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_notification_delivery_failed_permanent_total",
+    "type": "counter",
+    "help": "Notification deliveries that failed with a permanent (non-retryable) outcome.",
+    "labels": [
+      "channel_type"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_notification_delivery_failed_transient_total",
+    "type": "counter",
+    "help": "Notification deliveries that exhausted retries on transient transport/HTTP failures.",
+    "labels": [
+      "channel_type"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_notification_delivery_in_flight",
+    "type": "gauge",
+    "help": "Notification deliveries currently executing (including bounded retry backoff).",
+    "labels": [
+      "channel_type"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_notification_delivery_succeeded_total",
+    "type": "counter",
+    "help": "Notification deliveries that completed successfully (after any bounded retries).",
+    "labels": [
+      "channel_type"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_observability_batch_materialization_fallbacks_total",
     "type": "counter",
     "help": "Batches delivered complete but in a degraded representation, such as uncompressed because the compressed copy could not be reserved. No record loss.",
