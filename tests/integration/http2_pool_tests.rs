@@ -815,7 +815,7 @@ async fn test_grpc_h2c_accepts_settings_with_zero_concurrent_streams() {
     let pool = GrpcConnectionPool::new(
         PoolConfig::default(),
         ferrum_edge::config::EnvConfig::default(),
-        Arc::new(DnsCache::new(DnsConfig::default())),
+        DnsCache::new(DnsConfig::default()),
         None,
         Arc::new(Vec::new()),
     );
