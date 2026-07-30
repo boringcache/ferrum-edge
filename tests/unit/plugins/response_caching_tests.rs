@@ -14,6 +14,7 @@ use ferrum_edge::_test_support::{
     response_caching_size_accounting_snapshot_for_test,
     response_caching_staging_metadata_key_for_test, response_caching_vary_index_snapshot_for_test,
     run_after_proxy_hooks_for_test, run_after_proxy_hooks_reject_for_test,
+    set_response_presentation_policy_digest_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::response_caching::{RESPONSE_CACHING_CONFIG_KEYS, ResponseCaching};
@@ -46,6 +47,7 @@ fn make_ctx(method: &str, path: &str) -> RequestContext {
         path.to_string(),
     );
     ctx.matched_proxy = Some(std::sync::Arc::new(create_test_proxy()));
+    set_response_presentation_policy_digest_for_test(&mut ctx, Some([0x51; 32]));
     ctx
 }
 
@@ -2728,7 +2730,7 @@ async fn test_max_total_size_exceeded() {
     }));
 
     // Cache a response that takes up most of the total size
-    // Each entry is ~200 bytes body + ~64 bytes overhead = ~264 bytes
+    // Each entry is ~200 bytes body + ~96 bytes overhead = ~296 bytes
     cache_response(&plugin, "GET", "/api/a", 200, &HashMap::new(), &[b'x'; 200]).await;
 
     // This should fail to cache (would exceed 300-byte total size)

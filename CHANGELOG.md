@@ -60,8 +60,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   published identity; `response_caching` therefore also binds each stored entry
   to its own generation's effective presentation-policy digest — which now
   covers the materialized gate — so an entry shaped by a superseded generation
-  is refetched instead of replayed. `request_deduplication` already bound both
-  halves.
+  is refetched instead of replayed. An unprovable digest retains nothing.
+  `request_deduplication` already bound both halves.
 
 - Plugin egress no longer inherits ambient proxy configuration
   (GHSA-c4pj-vq6x-53rw). Backend dispatch `reqwest` clients (via

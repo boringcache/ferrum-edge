@@ -55,9 +55,8 @@
 //! map is a no-op; every real policy transition receives a fresh, collision-free
 //! identity and retires entries from the preceding publication. A proxy whose
 //! effective presentation policy is *unprovable* (an enrolled plugin rewrites
-//! from live runtime state) records `None` on both sides, which compares equal
-//! and leaves the gate identity as the sole guard — the same behaviour it had
-//! before the digest was bound.
+//! from live runtime state) never stores or replays an entry. Unknown policy is
+//! not evidence that two requests shared one.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -429,9 +428,9 @@ struct CacheEntry {
     /// effective RTDS gate is materialized into its configuration, so this
     /// generation-local digest covers the gate as well as the static rules and
     /// is the exact witness of what produced these bytes. `None` means this
-    /// request's effective policy was unprovable; two `None`s compare equal, so
-    /// such proxies keep exactly their prior gate-identity-only behaviour.
-    response_presentation_digest: Option<[u8; 32]>,
+    /// Unknown policy is never stored: every replay consumer must fail closed
+    /// when the effective presentation policy cannot be established.
+    response_presentation_digest: [u8; 32],
 }
 
 impl CacheEntry {
@@ -454,7 +453,7 @@ impl CacheEntry {
                 .iter()
                 .map(|(k, v)| k.len() + v.len())
                 .sum::<usize>()
-            + 64 // struct overhead estimate
+            + 96 // struct overhead estimate, including the policy digest
     }
 }
 
@@ -2312,7 +2311,7 @@ impl Plugin for ResponseCaching {
             // generation's rules/gate (GHSA-83rc-23c9-3g9x). Either half
             // differing retires the entry.
             let stale_policy = entry.response_policy_stamp != policy_stamp
-                || entry.response_presentation_digest != presentation_digest;
+                || presentation_digest != Some(entry.response_presentation_digest);
             // Belt-and-braces companion to the store-side refusal: an entry
             // whose status has semantics this plugin does not implement is
             // never replayed, whatever produced it.
@@ -2487,7 +2486,13 @@ impl Plugin for ResponseCaching {
         // publication identity — the request kept its pinned plugin cache for
         // its whole lifetime, so this digest is exact even when the stamp above
         // belongs to a newer publication (GHSA-83rc-23c9-3g9x).
-        let presentation_digest = ctx.response_presentation_policy_digest;
+        let Some(presentation_digest) = ctx.response_presentation_policy_digest else {
+            debug!(
+                "response_caching: presentation policy is unprovable, \
+                 skipping store of an unattributable representation"
+            );
+            return PluginResult::Continue;
+        };
         // Use the variant-specific predict key (set during before_proxy) for
         // predictor marking so that uncacheability of one Vary variant does not
         // suppress cache lookups for other variants of the same route.

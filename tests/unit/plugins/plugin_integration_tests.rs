@@ -20,6 +20,10 @@ fn create_response_context(path: &str) -> RequestContext {
     let mut ctx = create_test_context();
     ctx.path = path.to_string();
     ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    ferrum_edge::_test_support::set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some([0x51; 32]),
+    );
     ctx
 }
 
@@ -1404,6 +1408,58 @@ async fn test_response_cache_retires_entry_from_a_superseded_plugin_generation()
             .is_none(),
         "an entry from a superseded plugin generation must not be replayed even \
          while the published gate identity is unchanged"
+    );
+
+    harness::reset_gates();
+}
+
+/// Unknown presentation policy must never match another unknown policy.
+///
+/// `ResponsePresentationPolicy::Dynamic` collapses the request digest to
+/// `None`. The shared response cache must fail closed exactly like
+/// `request_deduplication`: it cannot claim that two requests were shaped by
+/// the same policy merely because neither policy was provable.
+#[tokio::test]
+async fn test_response_cache_retains_nothing_under_unprovable_policy() {
+    use self::runtime_overlay_cache_provenance as harness;
+    use ferrum_edge::_test_support::set_response_presentation_policy_digest_for_test;
+
+    let _policy_guard = response_cache_replay_policy_guard();
+    harness::reset_gates();
+
+    let scope = "cache_provenance_unprovable";
+    let rules = json!([
+        {"target": "body", "operation": "update", "key": "secret", "value": "[redacted]"}
+    ]);
+    let plugins = harness::apply_gate_generation(
+        &harness::plugins_with_gated_transformer(scope, rules.clone()),
+        scope,
+        rules,
+        true,
+    );
+    let path = "/cache-provenance-unprovable";
+
+    let mut miss_ctx = create_response_context(path);
+    set_response_presentation_policy_digest_for_test(&mut miss_ctx, None);
+    let (status, headers, _) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut miss_ctx,
+        200,
+        harness::origin_headers(&[]),
+        br#"{"secret":"TOPSECRET"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("MISS")
+    );
+
+    let mut next_ctx = create_response_context(path);
+    set_response_presentation_policy_digest_for_test(&mut next_ctx, None);
+    assert!(
+        harness::lookup(&plugins, &mut next_ctx).await.is_none(),
+        "unknown presentation policy must not retain or replay a representation"
     );
 
     harness::reset_gates();
