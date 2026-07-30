@@ -16,7 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   co-retirement groups, compatible-release test status, and the shared retirement
   checklist for all eleven current `[patch.crates-io]` logical patches. Unfiled
   deliberate forks are flagged for upstream filing or dated owner reaffirmation
-  rather than tracked only in GitHub issue #3335.
+  rather than tracked only in GitHub issue #3335. Because the `dependency-audit`
+  job that runs the gate is required to stay on full CI, the PR planner now keeps
+  `docs/dependency-policy.md`, `docs/vendored-patch-lifecycle.json`, and
+  `docs/upstream-*-patches/` off the lightweight documentation path.
 
 ### Security
 

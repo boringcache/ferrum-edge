@@ -95,8 +95,12 @@ zeroization). They are not untracked TODOs; they are carried as
   without either a filed upstream issue/PR link recorded in the inventory table,
   or an explicit dated re-affirmation
   (`Deliberate fork — re-affirmed YYYY-MM-DD by <owner>: <reason>`) in the
-  patch's `README.md`. This keeps "not yet filed" from silently becoming
-  permanent in a released product.
+  patch's `README.md`, mirrored into the `reaffirmation` object of the matching
+  `docs/vendored-patch-lifecycle.json` entry. A reaffirmation is a
+  deliberate-fork record only: CI rejects one on a patch whose `upstream.filing`
+  is `filed`, so reaffirming a fork that shares a `README.md` with filed patches
+  (as `tungstenite-002-frame-limit-origin` does) does not drag them in. This
+  keeps "not yet filed" from silently becoming permanent in a released product.
 - **Retirement is unchanged.** Whether upstreamed via PR or carried as a fork,
   each patch retires per its `README.md` retirement plan and the co-vendoring
   rule (all three h3 patches retire together — see the inventory `Removal
@@ -170,16 +174,23 @@ demand:
 - **advisories** — re-runs the `cargo deny` gate against the freshly-fetched
   advisory DB (catches new advisories with no PR), runs the expiry check, and
   runs `cargo audit` as an independent second opinion.
-- **lifecycle-parity** — `scripts/check_vendored_patch_lifecycle.py --self-test`
-  then ordinary parity verifies that every patch in
-  `docs/vendored-patch-lifecycle.json` matches `Cargo.toml`, `vendor/`, the
-  inventory Lifecycle ID set here, the upstream-status wrapper delegation, and
-  per-patch READMEs. The per-PR `dependency-audit` job runs the same gates.
-- **upstream-patch-status** — `scripts/check_vendored_patch_status.sh` queries
-  each tracked upstream PR. The run goes **red when an upstream PR has merged**
-  (a retirement signal — run the compatible-release test before deleting vendor
-  copies) and reports each crate's latest crates.io release plus deliberate-fork
-  reaffirmation gaps.
+- **upstream-patch-status** — two steps. *Vendored-patch lifecycle parity* runs
+  `scripts/check_vendored_patch_lifecycle.py`, which self-tests its validators
+  and then verifies that every patch in `docs/vendored-patch-lifecycle.json`
+  matches `Cargo.toml`, `vendor/`, the inventory Lifecycle ID set and upstream
+  PR/issue numbers here, the upstream-status wrapper delegation, and per-patch
+  READMEs. *Check upstream status* then runs
+  `scripts/check_vendored_patch_status.sh`, which delegates to the same checker's
+  `--upstream-status` mode and queries each tracked upstream PR. The run goes
+  **red when an upstream PR has merged** (a retirement signal — run the
+  compatible-release test before deleting vendor copies) and reports each crate's
+  latest crates.io release plus deliberate-fork reaffirmation gaps.
+
+The per-PR `dependency-audit` job in `ci.yml` runs the same parity gate. Because
+that job is required to stay behind `mode == 'full'`,
+`.github/scripts/pr_ci_plan.py` keeps `docs/dependency-policy.md`,
+`docs/vendored-patch-lifecycle.json`, and `docs/upstream-*-patches/` on full CI —
+a governance-doc-only pull request cannot skip the gate that guards it.
 
 ### 5. Behavioral regression tests for the patched behaviors
 

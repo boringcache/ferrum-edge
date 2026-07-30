@@ -8,10 +8,16 @@ dependency-audit workflow runs --upstream-status after parity passes.
 Parity mode fails closed when the lifecycle contract drifts from:
   - root Cargo.toml [patch.crates-io]
   - tests/performance/mesh/Cargo.toml mirrored [patch.crates-io]
-  - vendor/*-ferrum-patched directories
+  - vendor/*-ferrum-patched directories (vendor_path is derived from crate and
+    vendored_version, so a version typo cannot hide behind an existing directory)
   - scripts/check_vendored_patch_status.sh safe wrapper delegation
-  - docs/dependency-policy.md inventory Lifecycle ID set
-  - per-patch README.md paths
+  - docs/dependency-policy.md inventory Lifecycle ID set, docs-path fragments,
+    and the upstream PR/issue numbers the weekly poll watches
+  - per-patch README.md paths and dated deliberate-fork reaffirmations
+
+Every governed surface lives on a path that .github/scripts/pr_ci_plan.py keeps
+on full CI, because the `dependency-audit` job that runs this checker is required
+to stay behind `mode == 'full'`.
 
 Upstream mode queries filed upstream PRs via the GitHub REST API and reports deliberate forks
 that still need filing or dated owner reaffirmation before the first stable
@@ -29,6 +35,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -65,6 +72,15 @@ INVENTORY_ROW_RE = re.compile(
     r"^\|\s*`([^`]+)`\s*\|\s*`[^`]+`\s*\|\s*[^|\n]+\|\s*[^|\n]+\|\s*[^|\n]+\|\s*[^|\n]+\|\s*[^|\n]+\|\s*[^|\n]+\|\s*\["
 )
 GITHUB_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+# Crate names and versions are interpolated into crates.io URLs and into the
+# expected vendor directory name, so keep them to the registry's own alphabet.
+CRATE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+CRATE_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]*$")
+# Upstream-reported strings are echoed into the Actions log, where a stray
+# `::error::` would forge a workflow command. Only print recognizable versions.
+CRATES_IO_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]{0,63}$")
+# api.github.com / crates.io responses are small; refuse to buffer more.
+MAX_RESPONSE_BYTES = 1 << 20
 WRAPPER_SET_LINES = frozenset({"set -uo pipefail", "set -euo pipefail"})
 WRAPPER_DIR_ASSIGN = 'SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"'
 WRAPPER_EXEC = (
@@ -80,8 +96,11 @@ def load_lifecycle() -> Any:
 
 
 def parse_patch_crates_io(cargo_path: Path) -> dict[str, str]:
+    return parse_patch_crates_io_text(cargo_path.read_text(encoding="utf-8"))
+
+
+def parse_patch_crates_io_text(text: str) -> dict[str, str]:
     """Return crate -> vendor path for each [patch.crates-io] entry."""
-    text = cargo_path.read_text(encoding="utf-8")
     in_block = False
     patches: dict[str, str] = {}
     for line in text.splitlines():
@@ -113,7 +132,13 @@ def find_readme(docs_path: str) -> Path | None:
 
 
 def parse_readme_reaffirmation(readme_path: Path) -> dict[str, str] | None:
-    text = readme_path.read_text(encoding="utf-8", errors="replace")
+    return find_reaffirmation(
+        readme_path.read_text(encoding="utf-8", errors="replace")
+    )
+
+
+def find_reaffirmation(text: str) -> dict[str, str] | None:
+    """Extract the first `re-affirmed YYYY-MM-DD by <owner>: <reason>` record."""
     match = REAFFIRMATION_RE.search(text)
     if not match:
         return None
@@ -122,6 +147,52 @@ def parse_readme_reaffirmation(readme_path: Path) -> dict[str, str] | None:
         "owner": match.group(2).strip(),
         "reason": match.group(3).strip(),
     }
+
+
+def reaffirmation_parity_errors(
+    pid: str,
+    filing: Any,
+    lifecycle_reaffirmation: Any,
+    readme_reaffirmation: dict[str, str] | None,
+) -> list[str]:
+    """Pair the lifecycle reaffirmation record with the per-patch README text.
+
+    A dated reaffirmation is a deliberate-fork record (docs/dependency-policy.md
+    "Deliberate fork policy and SLA"), so only an unfiled fork may carry one.
+    Patches deliberately share a README — the two lossless-takeover patches and
+    the frame-limit-origin fork all point at
+    docs/upstream-tungstenite-patches/README.md — so reaffirming the fork there
+    must not force a fabricated record onto the filed patches beside it.
+    """
+    errors: list[str] = []
+    unfiled = filing == "deliberate_fork_unfiled"
+    if lifecycle_reaffirmation is not None and not unfiled:
+        errors.append(
+            f"{pid}: reaffirmation is a deliberate-fork record; upstream.filing "
+            f"{filing!r} must not carry one"
+        )
+        return errors
+    if lifecycle_reaffirmation is None:
+        if unfiled and readme_reaffirmation is not None:
+            errors.append(
+                f"{pid}: README contains dated reaffirmation but "
+                "lifecycle.reaffirmation is null"
+            )
+        return errors
+    if readme_reaffirmation is None:
+        errors.append(
+            f"{pid}: lifecycle.reaffirmation set but README lacks matching dated "
+            "reaffirmation"
+        )
+        return errors
+    if isinstance(lifecycle_reaffirmation, dict):
+        for key in ("date", "owner", "reason"):
+            expected = str(lifecycle_reaffirmation.get(key, "")).strip()
+            if expected != readme_reaffirmation[key]:
+                errors.append(
+                    f"{pid}: lifecycle reaffirmation {key!r} does not match README"
+                )
+    return errors
 
 
 def vendor_patch_dirs() -> set[str]:
@@ -140,6 +211,13 @@ def _is_nonempty_str(value: Any) -> bool:
 
 def _is_positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _is_github_repo(value: Any) -> bool:
+    """owner/repo with no dot-only segment, so it cannot traverse the API path."""
+    if not _is_nonempty_str(value) or not GITHUB_REPO_RE.fullmatch(str(value)):
+        return False
+    return all(segment.strip(".") for segment in str(value).split("/"))
 
 
 def _require_nonempty_str(value: Any, path: str, errors: list[str]) -> None:
@@ -181,6 +259,25 @@ def validate_lifecycle_shape(data: Any) -> list[str]:
         for field in REQUIRED_PATCH_STRING_FIELDS:
             _require_nonempty_str(patch.get(field), f"{prefix}.{field}", errors)
 
+        crate = patch.get("crate")
+        version = patch.get("vendored_version")
+        vendor_path = patch.get("vendor_path")
+        if _is_nonempty_str(crate) and not CRATE_NAME_RE.fullmatch(str(crate)):
+            errors.append(f"{prefix}.crate: must be a registry crate name")
+            crate = None
+        if _is_nonempty_str(version) and not CRATE_VERSION_RE.fullmatch(str(version)):
+            errors.append(f"{prefix}.vendored_version: must be a registry version")
+            version = None
+        # vendor_path is a derived identity, so a version typo cannot hide behind
+        # a directory that happens to exist.
+        if all(_is_nonempty_str(value) for value in (crate, version, vendor_path)):
+            expected_vendor_path = f"vendor/{crate}-{version}-ferrum-patched"
+            if vendor_path != expected_vendor_path:
+                errors.append(
+                    f"{prefix}.vendor_path: must be {expected_vendor_path!r} for "
+                    f"crate {crate!r} at vendored version {version!r}"
+                )
+
         upstream = patch.get("upstream")
         if not isinstance(upstream, dict):
             errors.append(f"{prefix}.upstream: must be an object")
@@ -190,7 +287,7 @@ def validate_lifecycle_shape(data: Any) -> list[str]:
                 errors.append(f"{prefix}: unknown upstream.filing {filing!r}")
 
             repo = upstream.get("github_repo")
-            if not _is_nonempty_str(repo) or not GITHUB_REPO_RE.fullmatch(str(repo)):
+            if not _is_github_repo(repo):
                 errors.append(
                     f"{prefix}.upstream.github_repo: must match owner/repo form"
                 )
@@ -402,82 +499,55 @@ def policy_id_parity_errors(
     return errors
 
 
-def parity_errors(data: Any) -> list[str]:
+def policy_reference_errors(
+    policy_text: str, patches: list[dict[str, Any]]
+) -> list[str]:
+    """Require the policy inventory to name each patch's docs path and upstream refs."""
     errors: list[str] = []
-    shape_errors = validate_lifecycle_shape(data)
-    errors.extend(shape_errors)
-
-    # Synthetic malformed-input self-tests must fail closed before touching live
-    # repository files. Normal parity continues below only for a valid contract.
-    if shape_errors:
-        return errors
-
-    if PATCH_STATUS_SCRIPT.is_file():
-        errors.extend(
-            wrapper_delegation_errors(
-                PATCH_STATUS_SCRIPT.read_text(encoding="utf-8", errors="replace")
-            )
-        )
-    else:
-        errors.append("missing scripts/check_vendored_patch_status.sh wrapper")
-
-    patches_raw = data["patches"]
-    patches: list[dict[str, Any]] = patches_raw
-    patch_ids = [
-        patch["id"]
-        for patch in patches
-        if _is_nonempty_str(patch.get("id"))
-    ]
-    if len(patch_ids) != len(set(patch_ids)):
-        errors.append("duplicate patch id in lifecycle inventory")
-
-    if POLICY_PATH.is_file():
-        policy_text = POLICY_PATH.read_text(encoding="utf-8")
-        errors.extend(policy_id_parity_errors(policy_text, set(patch_ids)))
-        for patch in patches:
-            docs_path = patch.get("docs_path")
-            if not _is_nonempty_str(docs_path):
-                continue
+    for patch in patches:
+        pid = patch.get("id", "<unknown>")
+        docs_path = patch.get("docs_path")
+        if _is_nonempty_str(docs_path):
             docs_fragment = str(docs_path).removeprefix("docs/").rstrip("/")
             if docs_fragment not in policy_text:
-                pid = patch.get("id", "<unknown>")
                 errors.append(
-                    f"{pid}: docs path fragment {docs_fragment!r} missing from dependency-policy.md"
+                    f"{pid}: docs path fragment {docs_fragment!r} missing from "
+                    "dependency-policy.md"
                 )
-    else:
-        errors.append("missing docs/dependency-policy.md")
-
-    for patch in patches:
-        pid = patch["id"]
-        docs_path = patch["docs_path"]
-        if not find_readme(docs_path):
-            errors.append(f"{pid}: missing README under {docs_path}")
-
-        reaffirmation = patch.get("reaffirmation")
-        readme = find_readme(docs_path)
-        if readme is not None:
-            readme_reaffirm = parse_readme_reaffirmation(readme)
-            if reaffirmation is None and readme_reaffirm is not None:
+        upstream = patch.get("upstream")
+        if not isinstance(upstream, dict):
+            continue
+        repo = upstream.get("github_repo")
+        if not _is_github_repo(repo):
+            continue
+        # A stale PR/issue number would silently poll the wrong upstream thread,
+        # so the number the weekly run watches must be the documented one.
+        for label, number in (
+            ("pr", upstream.get("pr_number")),
+            ("issue", upstream.get("issue_number")),
+        ):
+            if not _is_positive_int(number):
+                continue
+            reference = f"{repo}#{number}"
+            if reference not in policy_text:
                 errors.append(
-                    f"{pid}: README contains dated reaffirmation but lifecycle.reaffirmation is null"
+                    f"{pid}: upstream {label} reference {reference!r} missing from "
+                    "dependency-policy.md inventory"
                 )
-            if reaffirmation is not None and readme_reaffirm is None:
-                errors.append(
-                    f"{pid}: lifecycle.reaffirmation set but README lacks matching dated reaffirmation"
-                )
-            if isinstance(reaffirmation, dict) and readme_reaffirm is not None:
-                for key in ("date", "owner", "reason"):
-                    if str(reaffirmation.get(key, "")).strip() != readme_reaffirm[key]:
-                        errors.append(
-                            f"{pid}: lifecycle reaffirmation {key!r} does not match README"
-                        )
+    return errors
 
-    declared_groups = data.get("co_retirement_groups", [])
+
+def co_retirement_parity_errors(
+    patches: list[dict[str, Any]], declared_groups: Any
+) -> list[str]:
+    """Cross-check co-retirement membership in both directions."""
+    errors: list[str] = []
     if not isinstance(declared_groups, list):
         declared_groups = []
-    known_ids = set(patch_ids)
+    known_ids = {patch["id"] for patch in patches if _is_nonempty_str(patch.get("id"))}
     patch_declared_group = {
-        patch["id"]: patch["retirement"].get("co_retirement_group") for patch in patches
+        patch["id"]: patch["retirement"].get("co_retirement_group")
+        for patch in patches
     }
     group_members: dict[str, list[str]] = {}
     patch_group_membership: dict[str, str] = {}
@@ -516,14 +586,71 @@ def parity_errors(data: Any) -> list[str]:
                     f"declares co_retirement_group {patch_declared_group.get(member)!r}"
                 )
 
+    for pid, group in patch_declared_group.items():
+        if group is None:
+            continue
+        if group not in group_members:
+            errors.append(f"{pid}: unknown co_retirement_group {group!r}")
+        elif pid not in group_members.get(group, []):
+            errors.append(f"{pid}: not listed in co_retirement_group {group!r}")
+    return errors
+
+
+def parity_errors(data: Any) -> list[str]:
+    errors: list[str] = []
+    shape_errors = validate_lifecycle_shape(data)
+    errors.extend(shape_errors)
+
+    # Synthetic malformed-input self-tests must fail closed before touching live
+    # repository files. Normal parity continues below only for a valid contract.
+    if shape_errors:
+        return errors
+
+    if PATCH_STATUS_SCRIPT.is_file():
+        errors.extend(
+            wrapper_delegation_errors(
+                PATCH_STATUS_SCRIPT.read_text(encoding="utf-8", errors="replace")
+            )
+        )
+    else:
+        errors.append("missing scripts/check_vendored_patch_status.sh wrapper")
+
+    patches_raw = data["patches"]
+    patches: list[dict[str, Any]] = patches_raw
+    patch_ids = [
+        patch["id"]
+        for patch in patches
+        if _is_nonempty_str(patch.get("id"))
+    ]
+    if len(patch_ids) != len(set(patch_ids)):
+        errors.append("duplicate patch id in lifecycle inventory")
+
+    if POLICY_PATH.is_file():
+        policy_text = POLICY_PATH.read_text(encoding="utf-8")
+        errors.extend(policy_id_parity_errors(policy_text, set(patch_ids)))
+        errors.extend(policy_reference_errors(policy_text, patches))
+    else:
+        errors.append("missing docs/dependency-policy.md")
+
     for patch in patches:
         pid = patch["id"]
-        group = patch_declared_group[pid]
-        if group is not None:
-            if group not in group_members:
-                errors.append(f"{pid}: unknown co_retirement_group {group!r}")
-            elif pid not in group_members.get(group, []):
-                errors.append(f"{pid}: not listed in co_retirement_group {group!r}")
+        docs_path = patch["docs_path"]
+        readme = find_readme(docs_path)
+        if readme is None:
+            errors.append(f"{pid}: missing README under {docs_path}")
+            continue
+        errors.extend(
+            reaffirmation_parity_errors(
+                pid,
+                patch["upstream"].get("filing"),
+                patch.get("reaffirmation"),
+                parse_readme_reaffirmation(readme),
+            )
+        )
+
+    errors.extend(
+        co_retirement_parity_errors(patches, data.get("co_retirement_groups", []))
+    )
 
     lifecycle_vendor_paths = {patch["vendor_path"] for patch in patches}
     on_disk_vendor_paths = vendor_patch_dirs()
@@ -584,40 +711,71 @@ def github_auth_headers() -> dict[str, str]:
     return headers
 
 
-def github_pr_state(repo: str, pr_number: int) -> str | None:
-    if not GITHUB_REPO_RE.fullmatch(repo) or pr_number <= 0:
-        return None
+def fetch_json(request: urllib.request.Request) -> tuple[Any, str | None]:
+    """Bounded JSON GET returning (payload, failure reason).
+
+    Reasons never echo request headers, so a token cannot reach the log. The
+    read is capped because an unbounded response would be buffered in memory.
+    """
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read(MAX_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        return None, f"HTTP {exc.code}"
+    except urllib.error.URLError as exc:
+        return None, f"transport failure ({type(exc).__name__})"
+    except Exception as exc:
+        return None, f"request failed ({type(exc).__name__})"
+    if len(raw) > MAX_RESPONSE_BYTES:
+        return None, f"response exceeded {MAX_RESPONSE_BYTES} bytes"
+    try:
+        return json.loads(raw.decode("utf-8")), None
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, "malformed JSON response"
+
+
+def github_pr_state(repo: str, pr_number: int) -> tuple[str | None, str | None]:
+    """Return (OPEN|CLOSED|MERGED, failure reason); both None-safe for callers."""
+    if not _is_github_repo(repo) or not _is_positive_int(pr_number):
+        return None, "invalid repository or pull-request number"
     request = urllib.request.Request(
         f"https://api.github.com/repos/{repo}/pulls/{pr_number}",
         headers=github_auth_headers(),
     )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            payload = json.load(response)
-    except Exception:
-        return None
+    payload, reason = fetch_json(request)
+    if reason is not None:
+        return None, reason
+    if not isinstance(payload, dict):
+        return None, "unexpected response shape"
     if payload.get("merged_at"):
-        return "MERGED"
+        return "MERGED", None
     state = payload.get("state")
     if state == "open":
-        return "OPEN"
+        return "OPEN", None
     if state == "closed":
-        return "CLOSED"
-    return None
+        return "CLOSED", None
+    # Never echo the raw field: an untrusted string in the log could forge a
+    # `::error::` workflow command.
+    return None, "unrecognized pull-request state"
 
 
 def crates_io_latest(crate: str) -> str | None:
+    if not CRATE_NAME_RE.fullmatch(crate):
+        return None
     request = urllib.request.Request(
         f"https://crates.io/api/v1/crates/{crate}",
         headers={"User-Agent": USER_AGENT},
     )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            payload = json.load(response)
-    except Exception:
+    payload, reason = fetch_json(request)
+    if reason is not None or not isinstance(payload, dict):
         return None
-    version = payload.get("crate", {}).get("max_stable_version")
-    return version if isinstance(version, str) and version else None
+    crate_payload = payload.get("crate")
+    if not isinstance(crate_payload, dict):
+        return None
+    version = crate_payload.get("max_stable_version")
+    if not isinstance(version, str) or not CRATES_IO_VERSION_RE.fullmatch(version):
+        return None
+    return version
 
 
 def run_upstream_status(data: dict[str, Any]) -> int:
@@ -672,11 +830,11 @@ def run_upstream_status(data: dict[str, Any]) -> int:
                     "dated reaffirmation in the lifecycle inventory."
                 )
         elif pr is not None:
-            state = github_pr_state(upstream["github_repo"], pr)
+            state, reason = github_pr_state(upstream["github_repo"], pr)
             if not state:
                 print(
                     f"  ::warning::could not query upstream PR "
-                    f"{upstream['github_repo']}#{pr} — failing closed."
+                    f"{upstream['github_repo']}#{pr} ({reason}) — failing closed."
                 )
                 query_failed = 1
             else:
@@ -1144,6 +1302,262 @@ true
         policy_id_parity_errors(duplicate_policy, {"example-001"}),
         "duplicate lifecycle id",
         "duplicate policy ID",
+    )
+
+    # --- derived vendor-path identity -------------------------------------
+    wrong_vendor_path = {
+        **base,
+        "patches": [_valid_patch(vendor_path="vendor/example-9.9.9-ferrum-patched")],
+    }
+    expect_contains(
+        validate_lifecycle_shape(wrong_vendor_path),
+        "vendor_path: must be 'vendor/example-1.0.0-ferrum-patched'",
+        "vendor_path not derived from crate and version",
+    )
+
+    bad_crate_name = {
+        **base,
+        "patches": [
+            _valid_patch(
+                crate="../evil", vendor_path="vendor/../evil-1.0.0-ferrum-patched"
+            )
+        ],
+    }
+    expect_contains(
+        validate_lifecycle_shape(bad_crate_name),
+        "crate: must be a registry crate name",
+        "crate name with path separator",
+    )
+
+    bad_version = {
+        **base,
+        "patches": [
+            _valid_patch(
+                vendored_version="1.0.0/../..",
+                vendor_path="vendor/example-1.0.0/../..-ferrum-patched",
+            )
+        ],
+    }
+    expect_contains(
+        validate_lifecycle_shape(bad_version),
+        "vendored_version: must be a registry version",
+        "vendored version with path separator",
+    )
+
+    dot_repo = {
+        **base,
+        "patches": [
+            _valid_patch(
+                upstream={
+                    "filing": "filed",
+                    "pr_number": 1,
+                    "github_repo": "../..",
+                }
+            )
+        ],
+    }
+    expect_contains(
+        validate_lifecycle_shape(dot_repo),
+        "github_repo",
+        "dot-only github_repo segments",
+    )
+
+    # --- reaffirmation pairing -------------------------------------------
+    readme_record = {"date": "2026-07-01", "owner": "@owner", "reason": "still right"}
+    expect_empty(
+        reaffirmation_parity_errors(
+            "p", "deliberate_fork_unfiled", dict(readme_record), dict(readme_record)
+        ),
+        "matching reaffirmation",
+    )
+    expect_contains(
+        reaffirmation_parity_errors("p", "deliberate_fork_unfiled", None, readme_record),
+        "README contains dated reaffirmation but lifecycle.reaffirmation is null",
+        "README reaffirmation without lifecycle record",
+    )
+    expect_contains(
+        reaffirmation_parity_errors("p", "deliberate_fork_unfiled", readme_record, None),
+        "README lacks matching dated reaffirmation",
+        "lifecycle reaffirmation without README record",
+    )
+    expect_contains(
+        reaffirmation_parity_errors(
+            "p",
+            "deliberate_fork_unfiled",
+            {**readme_record, "reason": "different"},
+            readme_record,
+        ),
+        "reaffirmation 'reason' does not match README",
+        "reaffirmation field mismatch",
+    )
+    # A filed patch may share a README with an unfiled fork (all three
+    # tungstenite/tokio-tungstenite takeover records point at one README), so the
+    # fork's reaffirmation must not force a fabricated record onto it.
+    expect_empty(
+        reaffirmation_parity_errors("p", "filed", None, readme_record),
+        "filed patch sharing a reaffirmed README",
+    )
+    expect_contains(
+        reaffirmation_parity_errors("p", "filed", readme_record, readme_record),
+        "reaffirmation is a deliberate-fork record",
+        "filed patch carrying a reaffirmation",
+    )
+    expect_empty(
+        reaffirmation_parity_errors("p", "deliberate_fork_unfiled", None, None),
+        "no reaffirmation on either side",
+    )
+
+    reaffirmed_readme = (
+        "## Status\n\nDeliberate fork — re-affirmed 2026-07-01 by @owner: still right\n"
+    )
+    if find_reaffirmation(reaffirmed_readme) != readme_record:
+        failures.append(
+            f"reaffirmation extraction: got {find_reaffirmation(reaffirmed_readme)!r}"
+        )
+    # The undated policy prose in docs/upstream-tungstenite-patches/README.md
+    # must not read as a dated record.
+    undated_readme = "must be upstreamed or explicitly re-affirmed before release\n"
+    if find_reaffirmation(undated_readme) is not None:
+        failures.append("undated re-affirmation prose must not parse as a record")
+
+    # --- co-retirement groups --------------------------------------------
+    grouped_patches = [
+        _valid_patch(id="a", retirement={"co_retirement_group": "g"}),
+        _valid_patch(id="b", retirement={"co_retirement_group": "g"}),
+    ]
+    expect_empty(
+        co_retirement_parity_errors(
+            grouped_patches, [{"id": "g", "patch_ids": ["a", "b"]}]
+        ),
+        "consistent co-retirement group",
+    )
+    expect_contains(
+        co_retirement_parity_errors(
+            grouped_patches, [{"id": "g", "patch_ids": ["a", "b", "ghost"]}]
+        ),
+        "unknown patch id 'ghost'",
+        "co-retirement group with unknown member",
+    )
+    expect_contains(
+        co_retirement_parity_errors(
+            grouped_patches, [{"id": "g", "patch_ids": ["a"]}]
+        ),
+        "b: not listed in co_retirement_group 'g'",
+        "member omitted from its declared group",
+    )
+    expect_contains(
+        co_retirement_parity_errors(
+            [
+                _valid_patch(id="a", retirement={"co_retirement_group": "g"}),
+                _valid_patch(id="b", retirement={"co_retirement_group": None}),
+            ],
+            [{"id": "g", "patch_ids": ["a", "b"]}],
+        ),
+        "member 'b' declares co_retirement_group None",
+        "group lists a patch that declares no group",
+    )
+    expect_contains(
+        co_retirement_parity_errors(
+            grouped_patches, [{"id": "other", "patch_ids": ["a", "b"]}]
+        ),
+        "unknown co_retirement_group 'g'",
+        "patch declares a group that does not exist",
+    )
+    expect_contains(
+        co_retirement_parity_errors(
+            grouped_patches,
+            [
+                {"id": "g", "patch_ids": ["a", "b"]},
+                {"id": "g2", "patch_ids": ["a"]},
+            ],
+        ),
+        "listed in multiple co_retirement_groups",
+        "member listed in two groups",
+    )
+
+    # --- [patch.crates-io] parsing ---------------------------------------
+    root_manifest = "\n".join(
+        [
+            "[package]",
+            'name = "ferrum-edge"',
+            "",
+            "# [patch.crates-io] in a comment must not open the block",
+            "[patch.crates-io]",
+            'reqwest = { path = "vendor/reqwest-0.13.3-ferrum-patched" }',
+            'tokio-tungstenite = { path = "vendor/tokio-tungstenite-0.29.0-ferrum-patched" }',
+            "",
+            "[profile.release]",
+            'ignored = { path = "vendor/ignored-ferrum-patched" }',
+        ]
+    )
+    parsed_root = parse_patch_crates_io_text(root_manifest)
+    if parsed_root != {
+        "reqwest": "vendor/reqwest-0.13.3-ferrum-patched",
+        "tokio-tungstenite": "vendor/tokio-tungstenite-0.29.0-ferrum-patched",
+    }:
+        failures.append(f"root [patch.crates-io] parse: got {parsed_root!r}")
+
+    registry_override = "\n".join(
+        [
+            "[patch.crates-io]",
+            'reqwest = { version = "0.13.3" }',
+        ]
+    )
+    if parse_patch_crates_io_text(registry_override) != {}:
+        failures.append("a non-path [patch.crates-io] entry must not parse as vendored")
+
+    mesh_manifest = "\n".join(
+        [
+            "[patch.crates-io]",
+            'reqwest = { path = "../../../vendor/reqwest-0.13.3-ferrum-patched" }',
+        ]
+    )
+    mesh_parsed = parse_patch_crates_io_text(mesh_manifest)
+    if Path(mesh_parsed["reqwest"]) != Path(
+        "../../../" + parsed_root["reqwest"]
+    ):
+        failures.append("mesh mirror path must resolve to the root vendor path")
+
+    # --- policy inventory references -------------------------------------
+    reference_policy = "\n".join(
+        [
+            _inventory_row("example-001"),
+            "docs path: upstream-example-patches/001",
+            "tracked as [example/example#7](https://github.com/example/example/pull/7)",
+            "issue [example/example#6](https://github.com/example/example/issues/6)",
+        ]
+    )
+    referenced_patch = _valid_patch(
+        upstream={"filing": "filed", "pr_number": 7, "issue_number": 6}
+    )
+    expect_empty(
+        policy_reference_errors(reference_policy, [referenced_patch]),
+        "documented upstream references",
+    )
+    expect_contains(
+        policy_reference_errors(
+            reference_policy,
+            [_valid_patch(upstream={"filing": "filed", "pr_number": 8})],
+        ),
+        "upstream pr reference 'example/example#8' missing",
+        "stale upstream PR number",
+    )
+    expect_contains(
+        policy_reference_errors(
+            reference_policy,
+            [
+                _valid_patch(
+                    upstream={"filing": "filed", "pr_number": 7, "issue_number": 99}
+                )
+            ],
+        ),
+        "upstream issue reference 'example/example#99' missing",
+        "stale upstream issue number",
+    )
+    expect_contains(
+        policy_reference_errors("| no rows here |", [referenced_patch]),
+        "docs path fragment 'upstream-example-patches/001' missing",
+        "docs path fragment absent from policy",
     )
 
     if failures:

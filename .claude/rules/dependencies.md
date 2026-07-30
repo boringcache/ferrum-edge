@@ -12,6 +12,11 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   the inventory table in `docs/dependency-policy.md` plus a matching entry in
   `docs/vendored-patch-lifecycle.json`. Keep them, the
   `[patch.crates-io]` block, and `scripts/check_vendored_patch_lifecycle.py` in sync.
+  The parity gate lives in the `dependency-audit` job, which must stay behind
+  `mode == 'full'`, so `pr_ci_plan.py` keeps `docs/dependency-policy.md`,
+  `docs/vendored-patch-lifecycle.json`, and `docs/upstream-*-patches/` off the
+  lightweight docs path. A dated deliberate-fork reaffirmation belongs to an
+  unfiled fork only; CI rejects one on a `filed` patch.
 - Vendoring is a last resort: prefer a dependency bump, feature flag, or
   gateway-side workaround. A new vendored patch requires a written retirement
   plan and a behavioral regression test.
