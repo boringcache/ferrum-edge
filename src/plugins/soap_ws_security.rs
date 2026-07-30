@@ -293,7 +293,7 @@ use std::time::Instant;
 use tracing::{debug, warn};
 use x509_parser::prelude::*;
 
-use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
+use crate::tls::source::{CertSource, MaterialKind, SecretString, load_material_blocking};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use crate::consumer_index::ConsumerIndex;
@@ -1675,7 +1675,7 @@ impl SoapWsSecurity {
 
         let mut trusted_certs = Vec::with_capacity(trusted_cert_paths.len());
         for path in &trusted_cert_paths {
-            let source = CertSource::parse(path, MaterialKind::Cert);
+            let source = parse_trusted_certificate_source(path);
             let material = load_material_blocking(&source, MaterialKind::Cert)
                 .map_err(|e| format!("soap_ws_security: failed to load trusted cert: {e}"))?;
 
@@ -1918,7 +1918,7 @@ impl SoapWsSecurity {
         let mut saml_trusted_signing_certs =
             Vec::with_capacity(saml_trusted_signing_cert_paths.len());
         for path in &saml_trusted_signing_cert_paths {
-            let source = CertSource::parse(path, MaterialKind::Cert);
+            let source = parse_trusted_certificate_source(path);
             let material = load_material_blocking(&source, MaterialKind::Cert).map_err(|e| {
                 format!("soap_ws_security: failed to load SAML trusted signing cert: {e}")
             })?;
@@ -6365,6 +6365,20 @@ fn extract_pem_der(pem: &str) -> Option<Vec<u8>> {
 
     let b64 = pem[start..end].replace(char::is_whitespace, "");
     BASE64.decode(b64.as_bytes()).ok()
+}
+
+/// Classify certificate-shaped input as inline material even when its PEM
+/// markers are malformed or out of order. Passing such hostile input through
+/// the generic path fallback would make the filesystem error echo the entire
+/// configured value before the redacted PEM parser can reject it.
+fn parse_trusted_certificate_source(raw: &str) -> CertSource {
+    if raw.contains("-----BEGIN CERTIFICATE-----")
+        || raw.contains("-----END CERTIFICATE-----")
+    {
+        CertSource::InlinePem(SecretString::new(raw.to_string()))
+    } else {
+        CertSource::parse(raw, MaterialKind::Cert)
+    }
 }
 
 fn contains_forbidden_xml_declaration(xml: &str) -> bool {

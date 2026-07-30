@@ -546,6 +546,10 @@ fn test_x509_end_marker_before_begin_fails_without_panicking() {
         .err()
         .expect("misordered PEM markers must fail admission");
     assert!(err.contains("failed to decode PEM"), "got: {err}");
+    assert!(
+        !err.contains(source) && err.contains(INLINE_PEM_DISPLAY),
+        "misordered inline PEM must be rejected under a redacted source label: {err}"
+    );
 }
 
 /// The SAML `trusted_signing_certs` loop carries the same rule.
@@ -7017,8 +7021,8 @@ mod advisory_regressions {
                 &config,
                 Some("multipart/related; type='application/xop+xml'; boundary=MIME_boundary")
             ),
-            Ok("reject:415:unsupported_media_type".to_string()),
-            "single quotes are token bytes and must not turn a non-matching type into XOP"
+            Ok("reject:400:malformed_media_type".to_string()),
+            "single quotes are token bytes, but the slash remains invalid in an unquoted parameter value"
         );
         assert_eq!(
             classify(
