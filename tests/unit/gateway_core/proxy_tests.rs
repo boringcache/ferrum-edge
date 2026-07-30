@@ -3536,10 +3536,9 @@ fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch
         .expect("terminal body preparation must remain present");
     assert!(
         mesh_fall_through < terminal
-            && handler[mesh_fall_through..terminal]
-                .contains(
-                    "grpc_uses_generic_dispatch\n            && requires_request_body_buffering",
-                ),
+            && handler[mesh_fall_through..terminal].contains(
+                "grpc_uses_generic_dispatch\n            && requires_request_body_buffering",
+            ),
         "every buffering gRPC request that will use generic dispatch must be pulled through \
          transforms, final policy, and finalized-request egress before dispatch"
     );
