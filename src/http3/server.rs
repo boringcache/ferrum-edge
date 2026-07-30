@@ -8480,6 +8480,7 @@ async fn proxy_to_backend_h3_refined_response(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn collect_h3_open_response_body(
     state: &ProxyState,
     proxy: &Proxy,
