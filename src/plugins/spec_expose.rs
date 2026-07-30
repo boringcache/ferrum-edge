@@ -137,6 +137,19 @@ struct CachedFailure {
     retry_at: Instant,
 }
 
+pub(crate) fn spec_expose_retry_after_seconds(remaining: Duration) -> u64 {
+    remaining
+        .as_secs()
+        .saturating_add(u64::from(remaining.subsec_nanos() != 0))
+}
+
+pub(crate) fn spec_expose_failure_backoff_seconds(previous_failures: u32) -> u64 {
+    let exponent = previous_failures.min(5);
+    FAILURE_BACKOFF_BASE_SECONDS
+        .saturating_mul(1_u64 << exponent)
+        .min(FAILURE_BACKOFF_MAX_SECONDS)
+}
+
 type FetchOutcome = Result<CachedSpec, FetchFailure>;
 
 /// A fetch generation whose completion is published by an independently owned
@@ -499,9 +512,7 @@ impl SpecExpose {
             return None;
         }
         let mut failure = entry.failure.clone();
-        failure.retry_after_seconds = remaining
-            .as_secs()
-            .saturating_add(u64::from(remaining.subsec_nanos() != 0));
+        failure.retry_after_seconds = spec_expose_retry_after_seconds(remaining);
         Some(failure)
     }
 
@@ -512,10 +523,7 @@ impl SpecExpose {
                 Some(value.saturating_add(1))
             })
             .unwrap_or_else(|value| value);
-        let exponent = previous.min(5);
-        let retry_after_seconds = FAILURE_BACKOFF_BASE_SECONDS
-            .saturating_mul(1_u64 << exponent)
-            .min(FAILURE_BACKOFF_MAX_SECONDS);
+        let retry_after_seconds = spec_expose_failure_backoff_seconds(previous);
         failure.retry_after_seconds = retry_after_seconds;
         self.failure_cache.store(Arc::new(Some(CachedFailure {
             failure: failure.clone(),

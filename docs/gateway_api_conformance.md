@@ -205,32 +205,16 @@ Same-kind behavior is unchanged: two HTTPRoutes (or two GRPCRoutes) sharing a
 `(hostname, listen path)` still collapse into one ordered dispatch-rule list,
 and only claim-for-claim collisions are resolved as conflicts.
 
-The prohibition is enforced where it applies — coexistence on one resolved
-listener — and not as a blanket ban on the route-proxy collapse. Two Routes that
-Gateway API requires be accepted *together* because they resolve to different
-listeners share Ferrum's single port-agnostic `(hosts, listen path)` slot, so
-they collapse into one ordered dispatch-rule list even across kinds. That is a
-representation detail, not spec-forbidden rule merging: the two kinds'
-predicates stay intact and disjoint inside that list, because every emitted
-GRPCRoute rule carries the native-gRPC `content-type` gate and can therefore
-only select gRPC calls, while everything else falls through to the HTTPRoute's
-own rules and default backend. The alternative — one proxy each — is not a
-choice the route table can express; it fails
-`validate_unique_listen_paths` and aborts the whole config reload. This matters
-in the ordinary "HTTP listener plus gRPC listener on one Gateway" topology,
-where a pathless GRPCRoute predicate always lands on `/` and so does an
-HTTPRoute `PathPrefix: /` rule.
-
 **Known limitation.** Ferrum materializes Gateway API HTTP-family routes as
 port-agnostic `(hosts, listen path)` proxies, so listeners of one Gateway are
 not distinguishable in the route table. Two consequences follow:
 
 - Two routes that legitimately survive on different listeners but claim the same
-  `(hostname, listen path)` share one route-table slot rather than being served
-  per listener port: their rules collapse into one ordered dispatch list, and a
-  request that matches the other listener's route is answered on both listener
-  ports. Give such routes distinct listen paths, distinct hostnames, or distinct
-  Gateways when per-listener isolation is required.
+  `(hostname, listen path)` collide at config validation
+  (`Overlapping host+listen_path`) rather than being served per listener port.
+  This fail-closed behavior prevents either route from becoming reachable on a
+  listener that admitted only the other kind. Give such routes distinct listen
+  paths, distinct hostnames, or distinct Gateways.
 - One Route cannot retain a second `(parentRef, hostname)` claim after a
   cross-kind loss elsewhere; the entire Route is withdrawn (above). Claims that
   need independent acceptance must be expressed as separate Route objects,

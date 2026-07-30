@@ -1194,6 +1194,20 @@ pub enum ResponseTrailerPolicy<'a> {
     /// published at request time. Trailer-forwarding paths fail closed and drop
     /// the whole backend trailer section.
     Unbounded,
+    /// Same non-enumerable governed field set as [`Self::Unbounded`], but the
+    /// plugin only *applies* it to some requests. The plugin cache keeps these
+    /// instances in a small per-proxy list instead of folding them into the
+    /// unconditional capability bit, and trailer-forwarding paths ask
+    /// [`Plugin::request_applies_unbounded_response_trailer_policy`] once the
+    /// request context is fully populated.
+    ///
+    /// The built-in example is `waf`: an enforcing response-header
+    /// configuration governs trailers it cannot inspect, but a request matched
+    /// by `global_exemptions` never reaches a WAF response-header scan at all,
+    /// so dropping its trailers would be enforcement the operator disabled.
+    /// Whether a request is exempt can depend on the authenticated consumer, so
+    /// this arm must never be resolved before authentication.
+    RequestConditionalUnbounded,
 }
 
 /// Shared one-element declaration for the plugins whose `after_proxy` echoes
@@ -2468,6 +2482,23 @@ pub struct RequestContext {
     /// H3 request handlers; a default-constructed context leaves it `0`, which
     /// falls back to the gate's own hard ceiling.
     pub max_response_body_size_bytes: usize,
+    /// Strictest active *route-scoped* request-body ceiling enforced by this
+    /// request's matched plugin set (`Plugin::enforced_request_body_limit`),
+    /// or `None` when no matched plugin enforces one.
+    ///
+    /// Deliberately stores the route ceiling alone rather than a pre-folded
+    /// effective value: `None` then means "no route policy", and every request
+    /// path folds it with the applicable global knob at the point of use via
+    /// [`crate::proxy::effective_request_body_limit`]. A default-constructed
+    /// context therefore behaves exactly like the pre-fix global-only path
+    /// instead of silently reading as "unlimited" and relaxing a real bound
+    /// (`GHSA-xrfj-852f-645j`).
+    pub route_request_body_limit_bytes: Option<u64>,
+    /// Strictest active *route-scoped* response-body ceiling enforced by this
+    /// request's matched plugin set (`Plugin::enforced_response_body_limit`),
+    /// or `None` when no matched plugin enforces one. Same fold-at-use contract
+    /// as [`Self::route_request_body_limit_bytes`].
+    pub route_response_body_limit_bytes: Option<u64>,
     /// Shared counter for request body bytes received from the client,
     /// populated by proxy body handlers and read by the summary builders.
     ///
@@ -2780,6 +2811,8 @@ impl RequestContext {
             request_body_sha256: None,
             request_body_sha512: None,
             max_response_body_size_bytes: 0,
+            route_request_body_limit_bytes: None,
+            route_response_body_limit_bytes: None,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             is_early_data: false,
             peer_connection: None,
@@ -3464,6 +3497,36 @@ impl RequestContext {
         }
     }
 
+    /// Route-scoped request-body ceiling as a `usize` for folding with the
+    /// global `usize` knobs. Saturates rather than wrapping or panicking on a
+    /// 32-bit target, where a ceiling above `usize::MAX` cannot be represented
+    /// and is unreachable anyway (the process could not buffer that much).
+    pub fn route_request_body_limit(&self) -> Option<usize> {
+        self.route_request_body_limit_bytes
+            .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX))
+    }
+
+    /// Route-scoped response-body ceiling as a `usize`. Saturates like
+    /// [`Self::route_request_body_limit`].
+    pub fn route_response_body_limit(&self) -> Option<usize> {
+        self.route_response_body_limit_bytes
+            .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX))
+    }
+
+    /// Effective response-body ceiling for this request: the strictest of the
+    /// operator's global `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` and any active
+    /// route ceiling, with `0` meaning unlimited.
+    ///
+    /// An unlimited global does not disable an active route ceiling, so a
+    /// decoding or expanding transform is bounded by the route policy the
+    /// client was admitted under (`GHSA-xrfj-852f-645j`).
+    pub fn effective_max_response_body_size_bytes(&self) -> usize {
+        crate::proxy::effective_request_body_limit(
+            self.max_response_body_size_bytes,
+            self.route_response_body_limit(),
+        )
+    }
+
     /// Build the lightweight compatibility context used by final request-body
     /// hooks when the active plugin needs request metadata after body
     /// transforms. The compressor's private staged representation and incoming
@@ -3637,6 +3700,12 @@ impl RequestContext {
             request_body_sha256: None,
             request_body_sha512: None,
             max_response_body_size_bytes: self.max_response_body_size_bytes,
+            // Route ceilings are request-scoped policy, not per-phase state:
+            // the final-body hooks must hold the same bound the streaming and
+            // buffering paths were admitted under, so a post-transform check
+            // cannot silently fall back to the global allowance.
+            route_request_body_limit_bytes: self.route_request_body_limit_bytes,
+            route_response_body_limit_bytes: self.route_response_body_limit_bytes,
             bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
             is_early_data: self.is_early_data,
             peer_connection: self.peer_connection.clone(),
@@ -6823,6 +6892,40 @@ pub trait Plugin: Send + Sync {
         None
     }
 
+    /// Route-scoped request-body ceiling this plugin *enforces* against the
+    /// client, in bytes. `None` means the plugin declares no client-facing
+    /// request ceiling.
+    ///
+    /// Distinct from [`Plugin::request_body_buffer_limit`], which only bounds
+    /// how much body the plugin itself retains for its own inspection (a
+    /// mirror's copy budget, an OPA input cap). Those caps are deliberately
+    /// fail-open for the primary request and must never shorten the bytes the
+    /// gateway is willing to forward. A value returned here is the opposite: it
+    /// is a policy the client is held to, so the proxy folds it into the
+    /// effective streaming/buffering ceiling of every request path *before*
+    /// bytes are forwarded or retained (`GHSA-xrfj-852f-645j`).
+    ///
+    /// The proxy takes the minimum of every active nonzero ceiling across the
+    /// matched plugin set and the global limit, and an unlimited global (`0`)
+    /// never disables an active route ceiling — see
+    /// `crate::proxy::effective_request_body_limit`.
+    fn enforced_request_body_limit(&self) -> Option<u64> {
+        None
+    }
+
+    /// Route-scoped response-body ceiling this plugin *enforces* against the
+    /// client, in bytes. `None` means the plugin declares no client-facing
+    /// response ceiling.
+    ///
+    /// Folded the same way as [`Plugin::enforced_request_body_limit`]: buffered
+    /// response collection aborts at this ceiling instead of retaining up to the
+    /// generally larger global allowance, and an already-buffered synthetic body
+    /// is checked against it without depending on another plugin to activate the
+    /// response body-hook gate (`GHSA-xrfj-852f-645j`).
+    fn enforced_response_body_limit(&self) -> Option<u64> {
+        None
+    }
+
     /// Returns `true` if this plugin may require the request body to be
     /// buffered instead of streamed for at least some requests.
     ///
@@ -7082,9 +7185,34 @@ pub trait Plugin: Send + Sync {
     /// it (CORS `access-control-*` plus `vary`); reserve
     /// [`ResponseTrailerPolicy::Unbounded`] when the governed set cannot be
     /// listed even that way — currently request-time route overrides from
-    /// `response_transformer`.
+    /// `response_transformer`. When that non-enumerable policy is also applied to
+    /// only some requests, declare
+    /// [`ResponseTrailerPolicy::RequestConditionalUnbounded`] and implement
+    /// [`Self::request_applies_unbounded_response_trailer_policy`] instead of
+    /// dropping trailers for requests the plugin never inspects (`waf` with
+    /// `global_exemptions`).
     fn response_trailer_policy(&self) -> ResponseTrailerPolicy<'_> {
         ResponseTrailerPolicy::None
+    }
+
+    /// Whether this instance's
+    /// [`ResponseTrailerPolicy::RequestConditionalUnbounded`] declaration
+    /// applies to THIS request.
+    ///
+    /// Only consulted for instances that declared that variant; every other
+    /// declaration is resolved at config time. Returning `true` keeps the
+    /// fail-closed arm active for the request (the safe default); returning
+    /// `false` means this instance governs nothing here, so the backend trailer
+    /// section is preserved exactly as an unconfigured chain would preserve it —
+    /// subject to the other plugins' own declarations and the ordinary
+    /// gateway/hop-by-hop trailer governance.
+    ///
+    /// Called at most once per response, after the request-side phases have run,
+    /// because request-level exemptions can key on identity that only
+    /// authentication establishes. It must not suppress any OTHER plugin's
+    /// declaration: the resolver ORs contributors together.
+    fn request_applies_unbounded_response_trailer_policy(&self, _ctx: &RequestContext) -> bool {
+        true
     }
 
     /// Returns `true` when this plugin may change the response `Content-Type`

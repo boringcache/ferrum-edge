@@ -917,7 +917,7 @@ async fn test_grpc_method_router_rate_limiting() {
     println!("test_grpc_method_router_rate_limiting PASSED");
 }
 
-/// Response-path plugin rejections are translated into gRPC trailers-only errors.
+/// Route response ceilings are translated into gRPC trailers-only errors.
 #[ignore]
 #[tokio::test]
 async fn test_grpc_response_size_limiting_returns_grpc_error() {
@@ -948,14 +948,14 @@ async fn test_grpc_response_size_limiting_returns_grpc_error() {
     );
     assert_eq!(
         headers.get("grpc-status").map(|s| s.as_str()),
-        Some("14"),
-        "Gateway-generated response rejection should map to grpc-status 14 (UNAVAILABLE)"
+        Some("8"),
+        "Gateway response-size rejection should map to grpc-status 8 (RESOURCE_EXHAUSTED)"
     );
     assert!(
         headers
             .get("grpc-message")
-            .is_some_and(|msg| msg.contains("Response body too large")),
-        "gRPC response rejection should preserve the plugin message"
+            .is_some_and(|msg| msg.contains("Resource exhausted")),
+        "gRPC response rejection should expose the bounded generic resource message"
     );
 
     let _ = gateway.kill();

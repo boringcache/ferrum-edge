@@ -45,6 +45,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Route-scoped request/response body ceilings are now enforced by the proxy core
+  on every path, not just in body hooks (GHSA-xrfj-852f-645j). The `max_bytes` of
+  `request_size_limiting` / `response_size_limiting` is published to the core
+  through the plugin cache (precomputed per proxy/protocol) and folded into the
+  effective bound of every H1/H2, direct-H2/SNI, native-H3 and H3
+  cross-protocol, unary/streaming gRPC, retry, buffering, coalescing, mesh-mTLS,
+  and HBONE path *before bytes are forwarded or retained*. Previously
+  `request_size_limiting` could not bound an unbuffered chunked, H2/H3
+  unknown-length, or streaming-gRPC upload at all — those streamed up to the
+  generally larger global ceiling, and to no bound whatsoever when the global
+  ceiling was disabled. Specific changes:
+  - The effective bound is the strictest *active* (nonzero) value of the route
+    ceiling and the applicable global knob, and a global limit of `0`
+    ("unlimited") no longer disables an active route ceiling. Multiple instances
+    (and a global composed with a proxy-scoped instance) compose to their
+    minimum; a looser sibling never relaxes the strictest active bound.
+  - Strict buffered response collection (`require_buffered_check: true`) now
+    aborts at the route ceiling instead of retaining up to the global allowance
+    and only then failing the lower final check, so concurrent requests can no
+    longer amplify retained gateway memory toward the global allowance each.
+  - Response-size policy now runs over every already-buffered synthetic body
+    (mock, `serverless_function`, response/semantic cache, `ai_federation`, dedup
+    replay) without depending on another plugin to activate the response
+    body-hook gate. A default non-buffering instance previously had no hook on
+    that path, so an oversized synthetic body crossed the client boundary.
+  - Standards-valid repeated identical `Content-Length` values (RFC 9110 §8.6)
+    are parsed per comma-folded member on both request and response fast paths
+    via a shared canonical parser, so `Content-Length: 2048, 2048` is compared
+    against the ceiling instead of failing a whole-list `parse()` and silently
+    skipping the bound. Members are validated as `1*DIGIT` (so `+2048` is not
+    honored as a length). A declared length that cannot be reduced to one agreed
+    value now fails closed — HTTP 400 on the request side, HTTP 502 on the
+    response side — rather than reading as an absent length. Bodyless semantics
+    (`HEAD`, `1xx`, `204`/`205`/`304`) remain exempt.
+  - Post-transform checks are preserved, and the effective ceiling additionally
+    bounds the buffered-representation decode gate and compression admission, so
+    a decoding or expanding transform cannot escape the route policy.
+  This completes the advisory; [PR #3176](https://github.com/ferrum-edge/ferrum-edge/pull/3176)
+  had previously closed only the direct-H2/SNI early-response timing window.
 - `soap_ws_security` no longer trusts client media-type selection
   (GHSA-435h-f785-wmm4). Content types are parsed structurally (`type/subtype`
   plus RFC 9110 parameters) and matched by exact essence instead of
@@ -371,8 +410,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend dispatch. A route-authored `content-type` match still replaces the
   gate, but it is validated against the same native contract first, so an
   operator header can only narrow the protocol boundary. GRPCRoutes share
-  HTTPRoute's same-`(hostname, listen path)` collapse, so rule/match ordering
-  and fall-through are preserved. Gateway API v1.5.1
+  HTTPRoute's same-`(hostname, listen path)` collapse **within their own kind**,
+  so rule/match ordering and fall-through are preserved. Gateway API v1.5.1
   forbids merging rules between GRPCRoutes and HTTPRoutes: an HTTPRoute and a
   GRPCRoute attached to the same resolved listener with any intersecting
   hostname now resolve to exactly one accepted Route on that listener and
@@ -391,18 +430,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entire Route is conservatively withdrawn across every claim as soon as it
   loses on **any** listener. Whole-Route arbitration runs in the same total
   Gateway API order, so a withdrawn Route cannot displace a later valid Route
-  elsewhere. Route status always echoes each parentRef the operator wrote. Two
-  Routes of different kinds that Gateway API
-  requires be accepted *together* — because `allowedRoutes.kinds`, a
-  `sectionName`/`port` pin, or separate Gateways send them to different
-  listeners — still share Ferrum's single port-agnostic `(hosts, listen path)`
-  slot and collapse into one ordered dispatch-rule list. Their predicates stay
-  intact and disjoint there (the gRPC rules are content-type gated), and the
-  alternative would emit two proxies with an identical `(hosts, listen path)`,
-  which `validate_unique_listen_paths` rejects — aborting the entire config
-  reload for the common "HTTP listener plus gRPC listener on one Gateway"
-  topology, where a pathless GRPCRoute and an HTTPRoute `PathPrefix: /` rule
-  both land on `/`. gRPC shapes Ferrum cannot represent exactly
+  elsewhere. Route status always echoes each parentRef the operator wrote.
+  Cross-kind routes never collapse, including when separate listeners admit
+  them: because the route table is port-agnostic, merging would make each
+  backend reachable through the other kind's listener. An identical
+  `(hosts, listen path)` therefore fails config validation closed.
+  gRPC shapes Ferrum cannot represent exactly
   — `method.type: RegularExpression` (Ferrum cannot constrain a regex operand
   to a single gRPC path segment, so the predicate is refused rather than
   compiled into a matcher that could widen across service/method boundaries)
