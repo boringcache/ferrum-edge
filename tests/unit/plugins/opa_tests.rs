@@ -435,9 +435,7 @@ async fn opa_delegate_mode_still_redacts_query_credentials() {
     mount_opa(&server, 200, json!({"result": true})).await;
     let plugin = plugin(&server, json!({"query_ambiguity_policy": "delegate"}));
     let mut ctx = make_ctx();
-    ctx.set_raw_query_string(
-        "api_key=first-secret&api_key=second-secret&scope=read".to_string(),
-    );
+    ctx.set_raw_query_string("api_key=first-secret&api_key=second-secret&scope=read".to_string());
 
     assert_continue(plugin.authorize(&mut ctx).await);
 
