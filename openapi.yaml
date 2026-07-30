@@ -15870,7 +15870,18 @@ components:
                     type: object
                     additionalProperties:
                       type: string
-                    description: Query parameter equality matches (all-of). Decoded after percent-decoding.
+                    description: >-
+                      Query parameter equality matches (all-of), compared after
+                      percent-decoding the effective backend-visible query — the
+                      same bytes the proxy forwards, including any
+                      request_transformer query mutation and
+                      authentication-owned credential strips — so a rule can
+                      never select a backend under a value the application does
+                      not execute. A request whose query cannot be decoded to
+                      one such value is rejected with 400 before any rule is
+                      evaluated: a repeated or percent-encoded duplicate name, a
+                      literal '+' (RFC 3986 plus vs form-urlencoded space),
+                      malformed percent-encoding, or a non-UTF-8 decoding.
                   uri:
                     description: |
                       Optional URI predicate (Istio `StringMatch` shape).
@@ -17442,17 +17453,25 @@ components:
         include_service:
           type: boolean
           default: true
-        reject_duplicate_query_keys:
-          type: boolean
-          default: true
+        query_ambiguity_policy:
+          type: string
+          enum:
+            - reject
+            - delegate
+          default: reject
           description: >-
-            When include_query is enabled, reject requests whose query string
-            contains duplicate keys with conflicting values (e.g. a=1&a=2) to
-            prevent OPA/backend authorization mismatch. Identical-value
-            duplicates (a=1&a=1) are allowed. Rejection uses the configured
-            deny_status and deny_body. Set to false for APIs that use
-            array-style repeated query keys, or disable include_query entirely
-            to skip the check.
+            When include_query is enabled, controls what happens to a request
+            whose query cannot be decoded to one value OPA and the backend are
+            guaranteed to read identically: a duplicate decoded parameter name
+            (including a percent-encoded alias such as a=1&%61=2 or a bare/valued
+            pair such as flag&flag=1), a literal '+' (RFC 3986 plus vs
+            form-urlencoded space), malformed percent-encoding, or a non-UTF-8
+            decoding. 'reject' denies the request with the configured deny_status
+            and deny_body before calling OPA. 'delegate' calls OPA anyway and
+            lets the policy decide from the lossless input.query_pairs array and
+            the input.query_ambiguity classifications; input.query is omitted in
+            that case so a rule written against the flat map cannot authorize a
+            value the backend does not execute.
         redact_headers:
           type: array
           items:

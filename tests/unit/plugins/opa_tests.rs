@@ -246,7 +246,7 @@ fn opa_rejects_unknown_security_sensitive_config_keys() {
         "include_bdy",
         "redact_heders",
         "redact_query_key",
-        "reject_duplicate_query_key",
+        "query_ambiguity_polcy",
     ] {
         let mut config = base_config("http://localhost:8181");
         config
@@ -295,7 +295,11 @@ async fn opa_rejects_duplicate_query_parameter_keys() {
 }
 
 #[tokio::test]
-async fn opa_allows_identical_value_duplicate_query_keys() {
+async fn opa_rejects_identical_value_duplicate_query_keys() {
+    // A repeated name is ambiguous even when the values agree: an
+    // all-values backend receives `["1","1"]` and a strict backend rejects
+    // outright, so `"1"` is not provably the value the backend executes.
+    // Matches the `serverless_function` duplicate contract exactly.
     let server = MockServer::start().await;
     mount_opa(&server, 200, json!({"result": true})).await;
     let plugin = plugin(&server, json!({}));
@@ -304,7 +308,135 @@ async fn opa_allows_identical_value_duplicate_query_keys() {
 
     let result = plugin.authorize(&mut ctx).await;
 
-    assert_continue(result);
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn opa_rejects_literal_plus_query_value() {
+    // GHSA-gr4p-3qw3-87r5 reproduction: OPA would see `delete+record` while a
+    // form-decoding backend executes `delete record`.
+    let server = MockServer::start().await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("action=delete+record".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_reject(result, Some(403));
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock request history should be available");
+    assert!(
+        requests.is_empty(),
+        "OPA must not be called with a literal-plus query"
+    );
+}
+
+#[tokio::test]
+async fn opa_rejects_literal_plus_query_name() {
+    let server = MockServer::start().await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("a+b=1".to_string());
+
+    assert_reject(plugin.authorize(&mut ctx).await, Some(403));
+}
+
+#[tokio::test]
+async fn opa_rejects_malformed_percent_encoding() {
+    let server = MockServer::start().await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("action=%zz".to_string());
+
+    assert_reject(plugin.authorize(&mut ctx).await, Some(403));
+}
+
+#[tokio::test]
+async fn opa_accepts_percent_encoded_space_and_plus() {
+    // `%20` and `%2B` are unambiguous: every decoder agrees they are a space
+    // and a `+`. Only a literal `+` byte is ambiguous, so the inverse policy
+    // the advisory describes must still be expressible.
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("action=delete%20record&sign=a%2Bb".to_string());
+
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    assert_eq!(payload["input"]["query"]["action"], json!("delete record"));
+    assert_eq!(payload["input"]["query"]["sign"], json!("a+b"));
+    assert_eq!(payload["input"]["query_ambiguity"], json!([]));
+}
+
+#[tokio::test]
+async fn opa_query_pairs_preserve_order_bare_and_empty_values() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    // `flag` (bare) and `empty=` (explicit empty) both decode to an empty
+    // value; only the `bare` bit keeps them distinguishable.
+    ctx.set_raw_query_string("z=last&flag&empty=".to_string());
+
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    assert_eq!(
+        payload["input"]["query_pairs"],
+        json!([
+            {"name": "z", "value": "last", "bare": false},
+            {"name": "flag", "value": "", "bare": true},
+            {"name": "empty", "value": "", "bare": false},
+        ]),
+        "wire order and the bare/empty distinction must survive to policy"
+    );
+}
+
+#[tokio::test]
+async fn opa_delegate_mode_omits_flat_query_and_reports_ambiguity() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({"query_ambiguity_policy": "delegate"}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("scope=denied&scope=allowed".to_string());
+
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    assert!(
+        payload["input"].get("query").is_none(),
+        "the flat map must be withheld for an ambiguous query so a rule \
+         written against it cannot authorize a value the backend skips"
+    );
+    assert_eq!(
+        payload["input"]["query_ambiguity"],
+        json!(["duplicate_name"])
+    );
+    assert_eq!(
+        payload["input"]["query_pairs"],
+        json!([
+            {"name": "scope", "value": "denied", "bare": false},
+            {"name": "scope", "value": "allowed", "bare": false},
+        ]),
+        "delegate mode must expose every occurrence, not just the last"
+    );
+}
+
+#[test]
+fn opa_rejects_unknown_query_ambiguity_policy() {
+    let mut config = base_config("http://localhost:8181");
+    config
+        .as_object_mut()
+        .expect("base config is an object")
+        .insert("query_ambiguity_policy".to_string(), json!("allow"));
+
+    let error = Opa::new(&config, default_client()).expect_err("unknown policy must be rejected");
+    assert!(error.contains("query_ambiguity_policy"), "got: {error}");
+    assert!(validate_plugin_config("opa", &config).is_err());
 }
 
 #[tokio::test]
@@ -347,7 +479,7 @@ async fn opa_rejects_conflicting_duplicate_with_empty_pairs() {
 async fn opa_allows_duplicate_query_keys_when_rejection_disabled() {
     let server = MockServer::start().await;
     mount_opa(&server, 200, json!({"result": true})).await;
-    let plugin = plugin(&server, json!({"reject_duplicate_query_keys": false}));
+    let plugin = plugin(&server, json!({"query_ambiguity_policy": "delegate"}));
     let mut ctx = make_ctx();
     ctx.set_raw_query_string("action=delete&action=view".to_string());
 
