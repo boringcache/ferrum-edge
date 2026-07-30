@@ -457,6 +457,30 @@ fn streaming_dispatch_acquires_sender_before_wrapping_frontend_upload() {
 }
 
 #[test]
+fn h2c_settings_observer_preserves_vectored_writes() {
+    let source = include_str!("../../../src/proxy/grpc_proxy.rs");
+    let start = source
+        .find("impl AsyncWrite for H2cSettingsIo")
+        .expect("H2cSettingsIo AsyncWrite implementation not found");
+    let implementation = &source[start..];
+    let end = implementation
+        .find("\n}\n\n/// Canonical terminal message")
+        .expect("H2cSettingsIo AsyncWrite implementation end not found");
+    let implementation = &implementation[..end];
+
+    assert!(
+        implementation.contains("fn poll_write_vectored(")
+            && implementation.contains(".poll_write_vectored(cx, bufs)"),
+        "the lifetime h2c wrapper must forward TcpStream scatter/gather writes"
+    );
+    assert!(
+        implementation.contains("fn is_write_vectored(&self)")
+            && implementation.contains("self.inner.is_write_vectored()"),
+        "the h2c wrapper must advertise the inner transport capability"
+    );
+}
+
+#[test]
 fn test_grpc_error_response_deadline_exceeded() {
     let resp = grpc_proxy::build_grpc_error_response(
         grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
