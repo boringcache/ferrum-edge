@@ -49,7 +49,7 @@ Current mesh HBONE/DNS perf status lives in
 | Mesh/HBONE/DNS perf baseline publication | [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) | Harnesses exist; `baseline.md` tables still `_TBD_` |
 | Live OIDC / OAuth2 introspection coverage | [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333) | |
 | NodeWaypoint observability + promotion gates | [#3334](https://github.com/ferrum-edge/ferrum-edge/issues/3334) | |
-| Vendored-patch upstream filing / retirement | [#3335](https://github.com/ferrum-edge/ferrum-edge/issues/3335) | |
+| Vendored-patch upstream filing / retirement | `docs/vendored-patch-lifecycle.json` + weekly `dependency-audit` | Replaces #3335 as the sole tracker |
 
 ## Documented deferrals without a dedicated issue (in-place docs)
 
