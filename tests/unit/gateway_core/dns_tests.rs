@@ -1493,3 +1493,103 @@ async fn test_per_proxy_vs_global_ttl_precedence_on_shared_hostname() {
         "per-proxy 1s policy must re-resolve after expiry"
     );
 }
+
+// ============================================================================
+// Reqwest DnsCacheResolver + per-proxy dns_override (issue #2414)
+// ============================================================================
+
+#[tokio::test]
+async fn reqwest_resolver_dns_override_pins_load_balanced_target_hostnames() {
+    use ferrum_edge::dns::DnsCacheResolver;
+    use reqwest::dns::Resolve;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    // Failure scenario from #2414: backend_host is a route template, selected
+    // targets differ, and dns_override must still determine the dial IP for
+    // every initial / retry hostname — not only the template host.
+    let cache = DnsCache::new(default_dns_config(HashMap::new()));
+    let override_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+    let resolver =
+        DnsCacheResolver::with_dns_override(cache, Some(override_ip.to_string()));
+
+    let base_host = "route-template.internal";
+    let initial_target = "target-a.internal";
+    let retry_target = "target-b.internal";
+    assert_ne!(base_host, initial_target);
+    assert_ne!(initial_target, retry_target);
+
+    for host in [base_host, initial_target, retry_target] {
+        let addrs: Vec<_> = resolver
+            .resolve(host.parse().expect("valid dns name"))
+            .await
+            .expect("override resolve")
+            .collect();
+        assert_eq!(
+            addrs,
+            vec![SocketAddr::new(override_ip, 0)],
+            "reqwest resolver must dial override for selected host {host}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reqwest_resolver_dns_override_matches_direct_connector_resolve() {
+    use ferrum_edge::dns::DnsCacheResolver;
+    use reqwest::dns::Resolve;
+    use std::net::SocketAddr;
+
+    // Parity: direct connectors call DnsCache::resolve_candidates(host, Some(ovr), …);
+    // the reqwest pool installs the same override on DnsCacheResolver.
+    let cache = DnsCache::new(default_dns_config(HashMap::new()));
+    let override_ip = "192.0.2.55";
+    let host = "lb-target.internal";
+
+    let direct = cache
+        .resolve_candidates(host, Some(override_ip), None)
+        .await
+        .expect("direct resolve_candidates");
+    let resolver =
+        DnsCacheResolver::with_dns_override(cache.clone(), Some(override_ip.to_string()));
+    let reqwest_addrs: Vec<_> = resolver
+        .resolve(host.parse().expect("valid dns name"))
+        .await
+        .expect("reqwest resolver")
+        .collect();
+
+    assert_eq!(direct.len(), 1);
+    let direct_ip = direct.first().expect("override answer");
+    assert_eq!(
+        reqwest_addrs,
+        vec![SocketAddr::new(direct_ip, 0)],
+        "reqwest dial destination must match direct-connector override resolution"
+    );
+    // Telemetry / backend_resolved_ip also uses DnsCache::resolve with the
+    // override; that first address must agree with the dial set.
+    let telemetry = cache
+        .resolve(host, Some(override_ip), None)
+        .await
+        .expect("telemetry resolve");
+    assert_eq!(telemetry, direct_ip);
+}
+
+#[tokio::test]
+async fn reqwest_resolver_without_override_uses_cached_answers() {
+    use ferrum_edge::dns::DnsCacheResolver;
+    use reqwest::dns::Resolve;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let cache = DnsCache::new(default_dns_config(HashMap::new()));
+    // Warm via a successful override resolve that does NOT populate the cache,
+    // then resolve localhost without override to prove the no-override path
+    // still hits the shared cache / system resolver.
+    let resolver = DnsCacheResolver::new(cache);
+    let addrs: Vec<_> = resolver
+        .resolve("127.0.0.1".parse().expect("literal name"))
+        .await
+        .expect("literal resolve")
+        .collect();
+    assert_eq!(
+        addrs,
+        vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0)]
+    );
+}

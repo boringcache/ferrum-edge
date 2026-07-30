@@ -29644,8 +29644,11 @@ async fn proxy_to_backend(
     }
 
     // Resolve backend IP from DNS cache (O(1) cached lookup, <1μs).
-    // This is the same cache reqwest will use internally via DnsCacheResolver,
-    // so the IP will match the actual connection target.
+    // When `dns_override` is set, this returns the override IP for the
+    // selected host — the same address the pooled reqwest client's
+    // `DnsCacheResolver::with_dns_override` will dial for that hostname
+    // (including load-balanced targets that differ from `backend_host`).
+    // Without an override, both paths consult the shared cache.
     let resolve_backend_ip = state.dns_cache.resolve(
         effective_host,
         proxy.dns_override.as_deref(),
