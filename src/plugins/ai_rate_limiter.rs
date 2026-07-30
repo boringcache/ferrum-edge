@@ -39,7 +39,8 @@ use std::time::Instant;
 use tracing::{debug, warn};
 
 use super::utils::ai_providers::{
-    AiProvider, AiTokenUsage, detect_response_provider, extract_response_usage, parse_ai_provider,
+    AiProvider, AiTokenUsage, BILLED_PROMPT_TEXT_FIELDS, detect_response_provider,
+    extract_response_usage, parse_ai_provider,
 };
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::rate_limit::{
@@ -1267,37 +1268,51 @@ fn estimate_prompt_tokens(json: &Value) -> u64 {
     if chars == 0 { 0 } else { chars.div_ceil(4) }
 }
 
+/// Pre-dispatch prompt character estimate for token reservation.
+///
+/// # Estimator contract
+///
+/// Sums string text under every applicable billed sibling in
+/// [`BILLED_PROMPT_TEXT_FIELDS`] (OpenAI Chat/`messages`, Responses
+/// `input`+`instructions`, Gemini `contents`+`systemInstruction`, Cohere
+/// `message`/`chat_history`/`preamble`/`documents`, TGI `inputs`, Titan
+/// `inputText`, Anthropic/Bedrock `system`, tool schemas, RAG fields, …)
+/// without short-circuiting once one recognized field contributes. A present
+/// `input` therefore still reserves `instructions`; a present `contents`
+/// still reserves `systemInstruction`. Alias pairs are counted independently
+/// when both appear (conservative over-reservation; never silent omission).
+///
+/// Azure "On Your Data" `role_information` is added on top when any billed
+/// field contributed text. When the enumerated subtotal is zero, the whole
+/// JSON body is walked once as a fail-closed fallback for unexpected
+/// provider-native shapes (or AI markers whose only text lives outside the
+/// list); that walk already includes Azure role text, so the targeted add is
+/// skipped to avoid double-counting.
+///
+/// Multimodal binary/base64 payloads under known keys and well-formed `data:`
+/// URLs remain excluded by [`string_value_character_count`]. Unknown top-level
+/// keys that coexist with a non-zero enumerated subtotal are not scanned —
+/// operators who need fail-closed rejection of unknown request shapes should
+/// use `ai_request_guard` `strict_schema`. The hot path is a bounded top-level
+/// field walk (no unbounded recursion beyond the request JSON the caller
+/// already parsed, no cloning, no locks).
 fn prompt_character_count(json: &Value) -> u64 {
     let mut chars = 0_u64;
 
-    if let Some(system) = json.get("system") {
-        chars = chars.saturating_add(string_value_character_count(system));
-    }
-    if let Some(messages) = json.get("messages") {
-        chars = chars.saturating_add(string_value_character_count(messages));
-    }
-    if let Some(prompt) = json.get("prompt") {
-        chars = chars.saturating_add(string_value_character_count(prompt));
-    }
-    if let Some(input) = json.get("input") {
-        chars = chars.saturating_add(string_value_character_count(input));
-    }
-    if let Some(contents) = json.get("contents") {
-        chars = chars.saturating_add(string_value_character_count(contents));
-    }
-    if let Some(tools) = json.get("tools") {
-        chars = chars.saturating_add(string_value_character_count(tools));
+    for field in BILLED_PROMPT_TEXT_FIELDS {
+        if let Some(value) = json.get(*field) {
+            chars = chars.saturating_add(string_value_character_count(value));
+        }
     }
 
     if chars == 0 {
-        // No recognized prompt field carried text. Fall back to counting the whole
-        // body — this is how AI markers that are NOT summed above (`inputs`,
-        // `inputText`, `chat_history`, `previous_response_id`) get their prompt
-        // text counted. That whole-body walk already includes any `data_sources` /
-        // `dataSources` role_information, so the targeted add below is gated behind
-        // this early return: counting it again would double it, and (worse) making
-        // `chars` nonzero here would skip the fallback and drop the real prompt,
-        // reserving only the instruction.
+        // No enumerated billed field carried text. Fall back to counting the
+        // whole body so unexpected provider-native shapes (or AI markers whose
+        // only text sits outside the list) still reserve. That walk already
+        // includes any `data_sources` / `dataSources` role_information, so the
+        // targeted add below is gated behind this early return: counting it
+        // again would double it, and making `chars` nonzero here would skip the
+        // fallback and drop the real prompt.
         return string_value_character_count(json);
     }
 
@@ -1305,7 +1320,7 @@ fn prompt_character_count(json: &Value) -> u64 {
     // `data_sources[].parameters.role_information` (current chat-completions data
     // plane) / `dataSources[].parameters.roleInformation` (the original
     // extensions-API camelCase). That text is sent to the model and billed as
-    // input, but it is not part of any recognized field above. A recognized field
+    // input, but it is not part of any enumerated field above. A billed field
     // DID contribute (we are past the zero-char fallback), so add the instruction
     // text explicitly — otherwise an On Your Data request (which always carries
     // `messages`) would never count it and the reservation would under-estimate
@@ -1345,7 +1360,7 @@ fn azure_role_information_values(item: &Value) -> impl Iterator<Item = &str> {
 
 /// Total characters of every Azure "On Your Data" `role_information` instruction
 /// in the request. This text is sent to the model and billed as input but is not
-/// part of any field `prompt_character_count` already recognizes, so it is counted
+/// part of any field in [`BILLED_PROMPT_TEXT_FIELDS`], so it is counted
 /// here. Only the instruction text is summed — the surrounding `endpoint`,
 /// `index_name`, and key/secret fields under `parameters` are intentionally left
 /// out (they are not prompt input, and counting them would inflate the estimate).

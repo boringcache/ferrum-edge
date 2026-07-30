@@ -2653,10 +2653,9 @@ async fn total_count_mode_sums_prompt_and_completion() {
 
 #[tokio::test]
 async fn prompt_estimate_covers_system_prompt_input_and_tools_fields() {
-    // `prompt_character_count` accumulates across system / messages / prompt /
-    // input / contents / tools fields. Use prompt_tokens mode and a body that
-    // exercises the `system`, `prompt`, `input`, `contents`, and `tools`
-    // branches together so their character counts sum into the reservation.
+    // `prompt_character_count` accumulates across the shared billed field set.
+    // Use prompt_tokens mode and a body that exercises system/prompt/input/
+    // contents/tools together so their character counts sum into the reservation.
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 100_000,
@@ -2697,12 +2696,11 @@ async fn prompt_estimate_covers_system_prompt_input_and_tools_fields() {
 }
 
 #[tokio::test]
-async fn prompt_estimate_falls_back_to_whole_body_when_no_known_fields() {
-    // When an LLM-shaped body uses none of the prompt fields
-    // `prompt_character_count` recognizes (system/messages/prompt/input/
-    // contents/tools), the estimate falls back to counting the whole JSON body's
-    // string values (minus the max_* keys). A TGI body (`inputs` — a strong
-    // AI-request marker, but not one of the itemized prompt fields) exercises that
+async fn prompt_estimate_falls_back_to_whole_body_when_no_billed_fields() {
+    // When an LLM-shaped body uses none of the enumerated billed prompt fields,
+    // the estimate falls back to counting the whole JSON body's string values
+    // (minus the max_* keys). A Responses continuation (`previous_response_id` —
+    // a strong AI-request marker, but not a billed prompt field) exercises that
     // fallback branch while still passing the LLM-shape gate.
     let plugin = AiRateLimiter::new(
         &json!({
@@ -2720,12 +2718,12 @@ async fn prompt_estimate_falls_back_to_whole_body_when_no_known_fields() {
     ctx.method = "POST".to_string();
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
-    // TGI `inputs` is a strong AI-request marker but is NOT among the fields
-    // `prompt_character_count` sums, so the estimate falls back to counting the
-    // whole body's string values (minus the max_* keys): 7 chars -> ceil(7/4) = 2.
+    // `previous_response_id` is a strong AI-request marker but is NOT among the
+    // billed prompt fields, so the estimate falls back to counting the whole
+    // body's string values (minus the max_* keys): 7 chars -> ceil(7/4) = 2.
     ctx.metadata.insert(
         "request_body".to_string(),
-        serde_json::to_string(&json!({"inputs": "yyyyyyy"})).unwrap(),
+        serde_json::to_string(&json!({"previous_response_id": "yyyyyyy"})).unwrap(),
     );
 
     let mut headers = HashMap::new();
@@ -2938,6 +2936,300 @@ async fn prose_starting_with_data_prefix_is_counted_not_treated_as_data_url() {
         0,
         "a real data:<mediatype>;base64,<payload> URL must still be excluded"
     );
+}
+
+// ─── Sibling-exhaustive prompt reservation (GHSA-2r5g-438w-85hr) ─────────────
+//
+// Pre-dispatch estimation must sum every applicable billed sibling even when
+// another recognized field already contributed text. These tests drive the
+// public `before_proxy` surface in `prompt_tokens` mode.
+
+/// Reserved prompt-token estimate for `body` under an isolated
+/// `prompt_tokens`-mode limiter with a budget far above any test request.
+async fn prompt_tokens_reserved(body: serde_json::Value) -> u64 {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1_000_000,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&body).unwrap(),
+    );
+
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    reserved_tokens(&ctx)
+}
+
+#[tokio::test]
+async fn prompt_estimate_sums_responses_instructions_with_input() {
+    // OpenAI Responses: a tiny `input` must not suppress a large `instructions`
+    // sibling — both are billed prompt text and both must reserve.
+    let input_only = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "input": "abcd"
+    }))
+    .await;
+    let with_instructions = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "input": "abcd",
+        "instructions": "0123456789abcdef0123456789abcdef" // 32 chars
+    }))
+    .await;
+
+    assert!(
+        with_instructions > input_only,
+        "Responses instructions must be reserved alongside input"
+    );
+    assert_eq!(
+        with_instructions - input_only,
+        8,
+        "instructions delta must be exactly ceil(32/4)=8 tokens"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_sums_gemini_system_instruction_with_contents() {
+    // Gemini: tiny `contents` must not suppress `systemInstruction`.
+    let contents_only = prompt_tokens_reserved(json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "abcd"}]}]
+    }))
+    .await;
+    let with_system = prompt_tokens_reserved(json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "abcd"}]}],
+        "systemInstruction": {"parts": [{"text": "0123456789abcdef0123456789abcdef"}]}
+    }))
+    .await;
+
+    assert!(with_system > contents_only);
+    assert_eq!(with_system - contents_only, 8);
+}
+
+#[tokio::test]
+async fn prompt_estimate_sums_gemini_system_instruction_snake_alias() {
+    // Both Gemini casings are billed siblings; snake_case must reserve too.
+    let contents_only = prompt_tokens_reserved(json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "abcd"}]}]
+    }))
+    .await;
+    let with_system = prompt_tokens_reserved(json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "abcd"}]}],
+        "system_instruction": {"parts": [{"text": "0123456789abcdef0123456789abcdef"}]}
+    }))
+    .await;
+
+    assert_eq!(with_system - contents_only, 8);
+}
+
+#[tokio::test]
+async fn prompt_estimate_sums_cohere_preamble_and_documents_with_message() {
+    // Cohere v1: `message` must not suppress `preamble` or `documents`.
+    let message_only = prompt_tokens_reserved(json!({
+        "model": "command-r",
+        "message": "abcd"
+    }))
+    .await;
+    let with_siblings = prompt_tokens_reserved(json!({
+        "model": "command-r",
+        "message": "abcd",
+        "preamble": "0123456789abcdef", // 16 chars
+        "documents": [{"text": "0123456789abcdef"}] // 16 chars
+    }))
+    .await;
+
+    assert_eq!(
+        with_siblings - message_only,
+        8,
+        "preamble+documents (32 chars) must add ceil(32/4)=8 tokens"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_titan_input_text_and_bedrock_system() {
+    // Titan `inputText` is a billed field in its own right (not whole-body-only).
+    assert_eq!(
+        prompt_tokens_reserved(json!({
+            "inputText": "0123456789abcdef0123456789abcdef" // 32 chars
+        }))
+        .await,
+        8
+    );
+
+    // TGI `inputs` likewise reserves from the enumerated set even when another
+    // billed sibling (`tools`) is present — it must not depend on the zero-sum
+    // whole-body fallback.
+    let tools_only = prompt_tokens_reserved(json!({
+        "tools": [{"name": "abcd"}]
+    }))
+    .await;
+    let with_inputs = prompt_tokens_reserved(json!({
+        "inputs": "0123456789abcdef0123456789abcdef",
+        "tools": [{"name": "abcd"}]
+    }))
+    .await;
+    assert_eq!(with_inputs - tools_only, 8);
+
+    // Bedrock Converse-style: top-level `system` alongside `messages`.
+    let messages_only = prompt_tokens_reserved(json!({
+        "model": "anthropic.claude-3-sonnet",
+        "messages": [{"role": "user", "content": [{"text": "abcd"}]}]
+    }))
+    .await;
+    let with_system = prompt_tokens_reserved(json!({
+        "model": "anthropic.claude-3-sonnet",
+        "system": [{"text": "0123456789abcdef0123456789abcdef"}],
+        "messages": [{"role": "user", "content": [{"text": "abcd"}]}]
+    }))
+    .await;
+    assert_eq!(with_system - messages_only, 8);
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_tools_alongside_messages_without_dropping_siblings() {
+    let messages_only = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}]
+    }))
+    .await;
+    let with_tools = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "0123456789abcdef0123456789abcdef"
+            }
+        }]
+    }))
+    .await;
+
+    assert!(
+        with_tools > messages_only,
+        "tool schema text must be reserved alongside messages"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_does_not_double_count_alias_pair_as_nested_duplicate() {
+    // When both Gemini casings carry DISTINCT text, both contribute (conservative).
+    // When only one casing is present, the other must not invent a second count.
+    let single = prompt_tokens_reserved(json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "abcd"}]}],
+        "systemInstruction": {"parts": [{"text": "0123456789abcdef0123456789abcdef"}]}
+    }))
+    .await;
+    let both_same = prompt_tokens_reserved(json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "abcd"}]}],
+        "systemInstruction": {"parts": [{"text": "0123456789abcdef0123456789abcdef"}]},
+        "system_instruction": {"parts": [{"text": "0123456789abcdef0123456789abcdef"}]}
+    }))
+    .await;
+
+    // Both aliases present ⇒ both counted (over-reserve), never under-count.
+    assert!(
+        both_same > single,
+        "distinct alias keys must each contribute when both are present"
+    );
+    assert_eq!(both_same - single, 8);
+}
+
+#[tokio::test]
+async fn prompt_estimate_excludes_multimodal_bytes_while_counting_text_siblings() {
+    // Vision request with Responses instructions: image bytes stay excluded,
+    // but instructions + input text still reserve.
+    let huge_b64 = "A".repeat(800_000);
+    let reserved = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "instructions": "0123456789abcdef0123456789abcdef",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "abcd"},
+                {"type": "input_image", "image_url": format!("data:image/jpeg;base64,{huge_b64}")}
+            ]
+        }]
+    }))
+    .await;
+
+    assert!(
+        reserved > 0 && reserved < 100,
+        "multimodal binary must be excluded while text siblings still reserve; got {reserved}"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_sibling_heavy_requests_cannot_oversubscribe_on_omitted_instructions() {
+    // Reproduction-shaped: tiny input + large instructions must reserve enough
+    // that a second concurrent twin cannot also fit in a tight budget.
+    let instructions = "X".repeat(400); // 400 chars -> 100 prompt tokens
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 120,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let body = json!({
+        "model": "gpt-4o",
+        "input": "hi",
+        "instructions": instructions
+    });
+
+    let make_ctx = || {
+        let mut ctx = create_test_context();
+        ctx.method = "POST".to_string();
+        ctx.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            serde_json::to_string(&body).unwrap(),
+        );
+        ctx
+    };
+
+    let mut ctx_a = make_ctx();
+    let mut ctx_b = make_ctx();
+    let mut headers_a = HashMap::new();
+    let mut headers_b = HashMap::new();
+
+    let (result_a, result_b) = tokio::join!(
+        plugin.before_proxy(&mut ctx_a, &mut headers_a),
+        plugin.before_proxy(&mut ctx_b, &mut headers_b)
+    );
+
+    let allowed = u8::from(matches!(&result_a, PluginResult::Continue))
+        + u8::from(matches!(&result_b, PluginResult::Continue));
+    let rejected = u8::from(matches!(&result_a, PluginResult::Reject { .. }))
+        + u8::from(matches!(&result_b, PluginResult::Reject { .. }));
+
+    // If instructions were omitted, each request would reserve ~1 token and both
+    // would fit. Exhaustive sibling counting makes only one fit.
+    assert_eq!(allowed, 1, "only one sibling-heavy reservation should fit");
+    assert_eq!(rejected, 1, "the second sibling-heavy request must be rejected");
 }
 
 #[tokio::test]

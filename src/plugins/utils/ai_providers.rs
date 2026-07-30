@@ -1,5 +1,49 @@
 use serde_json::Value;
 
+/// Top-level JSON fields that carry billed prompt text across the provider
+/// shapes Ferrum recognizes.
+///
+/// Shared by `ai_rate_limiter` pre-dispatch reservation so estimation stays
+/// aligned with the prompt-character coverage in `ai_request_guard` (chat
+/// containers, Responses `instructions`, Gemini `systemInstruction`, Cohere
+/// `preamble`/`documents`, TGI `inputs`, Titan `inputText`, tool schemas, and
+/// RAG fields) rather than maintaining a second partial walker. Alias pairs
+/// (`systemInstruction` / `system_instruction`) are listed independently: when
+/// both are present each contributes, which over-reserves rather than omitting
+/// billed text. Nested string values under each field are walked by the
+/// caller; multimodal binary payloads are excluded by that walker, not by
+/// omitting the parent field.
+pub const BILLED_PROMPT_TEXT_FIELDS: &[&str] = &[
+    // Chat / messages containers
+    "messages",
+    "contents",
+    "chat_history",
+    // Legacy completions + provider-native prompt containers
+    "prompt",
+    "input",
+    "inputs",
+    "inputText",
+    // System / instruction siblings — counted even when a prompt container
+    // already contributed text (Responses `instructions`, Gemini system
+    // instruction, Anthropic/Bedrock `system`, Cohere `preamble`, …)
+    "instructions",
+    "system",
+    "systemInstruction",
+    "system_instruction",
+    "developer",
+    "preamble",
+    // Cohere current turn + shared RAG / tool-result context
+    "message",
+    "context",
+    "documents",
+    "retrieved_context",
+    "tool_results",
+    "toolResults",
+    // Tool / function schemas (string values counted by the shared walker)
+    "tools",
+    "functions",
+];
+
 /// Shared AI provider identifiers for response parsing helpers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiProvider {
