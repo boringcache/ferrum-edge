@@ -1146,6 +1146,8 @@ shapes and nothing else:
   the read-only job necessarily compiles and executes pull-request-authored Rust
   tests and fuzz targets. The frozen job installs `protobuf-compiler` before
   invoking Cargo because the workspace build script requires `protoc`. Its
+  1024 MiB RSS cap leaves bounded headroom above the roughly 400 MiB baseline
+  of the fully linked, sanitizer-instrumented fuzz binaries. The job's
   environment clears both repository sccache wrapper inputs and `RUSTFLAGS`,
   because the isolated lane installs neither sccache nor the mold linker selected
   by the root Cargo configuration.

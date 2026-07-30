@@ -26,10 +26,12 @@ rejects crash artifacts larger than 64 KiB before upload.
 ## Hosted CI
 
 - **PR / `main` smoke** (`ci.yml` → `Fuzz Smoke`): locked `proptest` smoke tests
-  plus ~8 s libFuzzer budget per target (`-runs=512`, `-max_len=4096`).
+  plus ~8 s libFuzzer budget per target (`-runs=512`, `-max_len=4096`,
+  `-rss_limit_mb=1024`).
 - **Scheduled sanitizer lane** (`.github/workflows/fuzz.yml`): AddressSanitizer
   builds, 300 s per target, bounded crash artifacts uploaded after size/count
-  checks, 7-day retention, concurrency capped at two targets.
+  checks, a 2048 MiB RSS cap, 7-day retention, and concurrency capped at two
+  targets.
 
 The fuzz crate links the main Ferrum Edge crate, whose Kafka dependency builds
 `librdkafka` from source with OAuthBearer OIDC disabled. librdkafka 2.12.1
