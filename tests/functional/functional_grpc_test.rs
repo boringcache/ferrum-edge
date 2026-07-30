@@ -369,6 +369,11 @@ plugin_configs:
 }
 
 /// Write a YAML config with a gRPC proxy whose allowed_methods excludes POST.
+///
+/// Protocol-managed framing destinations are intentionally absent from
+/// `security_headers.set`: construction now rejects them, and that rejection is
+/// covered by the plugin unit tests. This fixture focuses on canonicalizing the
+/// remaining application headers into a trailers-only gRPC error.
 fn write_grpc_method_filter_config(config_path: &std::path::Path, backend_port: u16) {
     let config = format!(
         r#"
@@ -393,8 +398,6 @@ plugin_configs:
       set:
         X-Synthetic-Policy: "enforced"
         Content-Type: "text/plain"
-        Content-Length: "999"
-        Transfer-Encoding: "chunked"
         Grpc-Status: "0"
         Grpc-Message: "policy override"
       remove: []

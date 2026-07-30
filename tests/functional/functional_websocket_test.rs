@@ -444,7 +444,10 @@ fn start_gateway_with_extra_env(
     tls_key_path: Option<&str>,
     extra_env: &[(&str, &str)],
     observability_token: &str,
-) -> Result<(std::process::Child, u16), Box<dyn std::error::Error>> {
+) -> Result<
+    (std::process::Child, u16, std::path::PathBuf),
+    Box<dyn std::error::Error>,
+> {
     // Use a fresh admin HTTP port and disable admin HTTPS so parallel gateways
     // in the same functional shard never contend on the default admin ports
     // (9000/9443). Admin-listener bind failure aborts startup (fatal), which
@@ -457,6 +460,9 @@ fn start_gateway_with_extra_env(
     let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
         .map(|a| a.port())?;
+    let stderr_path = std::path::Path::new(config_path)
+        .with_extension(format!("gateway-{http_port}.stderr.log"));
+    let stderr_file = std::fs::File::create(&stderr_path)?;
     let mut cmd = std::process::Command::new(gateway_binary_path());
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
@@ -474,7 +480,7 @@ fn start_gateway_with_extra_env(
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::from(stderr_file));
 
     if let Some(port) = https_port {
         cmd.env("FERRUM_PROXY_HTTPS_PORT", port.to_string())
@@ -490,10 +496,48 @@ fn start_gateway_with_extra_env(
         cmd.env(name, value);
     }
 
-    Ok((cmd.spawn()?, admin_http_port))
+    Ok((cmd.spawn()?, admin_http_port, stderr_path))
+}
+
+/// Include the bounded tail of the child log in startup failures. The previous
+/// null stderr made deterministic config rejection look like a port-readiness
+/// flake and multiplied one root cause across every fixture consumer.
+fn gateway_startup_error(
+    error: &str,
+    stderr_path: &std::path::Path,
+    observability_token: &str,
+) -> String {
+    const MAX_LOG_CHARS: usize = 4_000;
+    let Ok(stderr) = std::fs::read_to_string(stderr_path) else {
+        return error.to_string();
+    };
+    let stderr = stderr.replace(observability_token, "[REDACTED]");
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        return error.to_string();
+    }
+    let tail = if stderr.chars().count() > MAX_LOG_CHARS {
+        stderr
+            .chars()
+            .rev()
+            .take(MAX_LOG_CHARS)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+    } else {
+        stderr.to_string()
+    };
+    format!("{error}; gateway stderr (tail): {tail}")
 }
 
 /// Write a YAML config file with a WebSocket proxy pointing to the given backend port.
+///
+/// Keep transport/framing destinations out of `security_headers.set`: the
+/// plugin now rejects those destinations during construction. Their rejection
+/// matrix is covered by the plugin unit tests, while hostile upstream fields
+/// and the final client-wire boundary are covered by the dedicated
+/// protocol-managed response-header functional tests.
 fn write_ws_config(config_path: &std::path::Path, backend_port: u16) {
     let config = format!(
         r#"
@@ -514,10 +558,6 @@ plugin_configs:
       hsts: true
       set:
         X-WS-Security: "gateway-enforced"
-        Upgrade: "policy-must-not-escape"
-        Connection: "policy-must-not-escape"
-        Sec-WebSocket-Accept: "policy-must-not-escape"
-        Sec-WebSocket-Protocol: "policy-must-not-escape"
       remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
@@ -588,10 +628,6 @@ plugin_configs:
       hsts: true
       set:
         X-WS-Security: "gateway-enforced"
-        Upgrade: "policy-must-not-escape"
-        Connection: "policy-must-not-escape"
-        Sec-WebSocket-Accept: "policy-must-not-escape"
-        Sec-WebSocket-Protocol: "policy-must-not-escape"
       remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
@@ -672,10 +708,6 @@ plugin_configs:
       set:
         X-WS-Security: "gateway-enforced"
         X-WS-Reject-Order: "security-policy"
-        Upgrade: "policy-must-not-escape"
-        Connection: "policy-must-not-escape"
-        Sec-WebSocket-Accept: "policy-must-not-escape"
-        Sec-WebSocket-Protocol: "policy-must-not-escape"
       remove: ["server", "x-powered-by", "content-type"]
     scope: global
     enabled: true
@@ -726,20 +758,6 @@ plugin_configs:
       hsts: true
       set:
         X-WS-Security: "gateway-enforced"
-        Upgrade: "policy-must-not-escape"
-        Connection: "policy-must-not-escape"
-        Keep-Alive: "policy-must-not-escape"
-        Proxy-Authenticate: "policy-must-not-escape"
-        Proxy-Connection: "policy-must-not-escape"
-        TE: "policy-must-not-escape"
-        Trailer: "policy-must-not-escape"
-        Transfer-Encoding: "policy-must-not-escape"
-        Content-Length: "1"
-        Sec-WebSocket-Accept: "policy-must-not-escape"
-        Sec-WebSocket-Key: "policy-must-not-escape"
-        Sec-WebSocket-Version: "policy-must-not-escape"
-        Sec-WebSocket-Protocol: "policy-must-not-escape"
-        Sec-WebSocket-Extensions: "policy-must-not-escape"
       remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
@@ -775,10 +793,6 @@ plugin_configs:
       hsts: true
       set:
         X-WS-Security: "gateway-enforced"
-        Upgrade: "policy-must-not-escape"
-        Connection: "policy-must-not-escape"
-        Sec-WebSocket-Accept: "policy-must-not-escape"
-        Sec-WebSocket-Protocol: "policy-must-not-escape"
       remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
@@ -828,10 +842,6 @@ plugin_configs:
       hsts: true
       set:
         X-WS-Security: "gateway-enforced"
-        Upgrade: "policy-must-not-escape"
-        Connection: "policy-must-not-escape"
-        Sec-WebSocket-Accept: "policy-must-not-escape"
-        Sec-WebSocket-Protocol: "policy-must-not-escape"
       remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
@@ -1117,7 +1127,7 @@ async fn start_gateway_with_retry_extra_env(
             extra_env,
             &observability_token,
         ) {
-            Ok((mut child, admin_port)) => {
+            Ok((mut child, admin_port, stderr_path)) => {
                 let owned = wait_for_owned_gateway(
                     &mut child,
                     admin_port,
@@ -1128,13 +1138,17 @@ async fn start_gateway_with_retry_extra_env(
                 match owned {
                     Ok(()) => return (child, gateway_port),
                     Err(e) => {
-                        last_err = e.to_string();
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        last_err = gateway_startup_error(
+                            &e.to_string(),
+                            &stderr_path,
+                            &observability_token,
+                        );
                         eprintln!(
                             "Gateway startup attempt {}/{} failed (port {}): {}",
                             attempt, MAX_ATTEMPTS, gateway_port, last_err
                         );
-                        let _ = child.kill();
-                        let _ = child.wait();
                     }
                 }
             }
@@ -1174,7 +1188,7 @@ async fn start_gateway_plain_with_retry_extra_env(
             extra_env,
             &observability_token,
         ) {
-            Ok((mut child, admin_port)) => {
+            Ok((mut child, admin_port, stderr_path)) => {
                 let owned = wait_for_owned_gateway(
                     &mut child,
                     admin_port,
@@ -1185,13 +1199,17 @@ async fn start_gateway_plain_with_retry_extra_env(
                 match owned {
                     Ok(()) => return (child, gateway_port),
                     Err(e) => {
-                        last_err = e.to_string();
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        last_err = gateway_startup_error(
+                            &e.to_string(),
+                            &stderr_path,
+                            &observability_token,
+                        );
                         eprintln!(
                             "Gateway startup attempt {}/{} failed (port {}): {}",
                             attempt, MAX_ATTEMPTS, gateway_port, last_err
                         );
-                        let _ = child.kill();
-                        let _ = child.wait();
                     }
                 }
             }
@@ -1245,7 +1263,7 @@ async fn start_gateway_tls_with_retry_extra_env(
             extra_env,
             &observability_token,
         ) {
-            Ok((mut child, admin_port)) => {
+            Ok((mut child, admin_port, stderr_path)) => {
                 let owned = wait_for_owned_gateway(
                     &mut child,
                     admin_port,
@@ -1256,13 +1274,17 @@ async fn start_gateway_tls_with_retry_extra_env(
                 match owned {
                     Ok(()) => return (child, gateway_http_port, gateway_https_port),
                     Err(e) => {
-                        last_err = e.to_string();
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        last_err = gateway_startup_error(
+                            &e.to_string(),
+                            &stderr_path,
+                            &observability_token,
+                        );
                         eprintln!(
                             "Gateway TLS startup attempt {}/{} failed (ports {}/{}): {}",
                             attempt, MAX_ATTEMPTS, gateway_http_port, gateway_https_port, last_err
                         );
-                        let _ = child.kill();
-                        let _ = child.wait();
                     }
                 }
             }
