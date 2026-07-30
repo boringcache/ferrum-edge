@@ -20,6 +20,10 @@ fn create_response_context(path: &str) -> RequestContext {
     let mut ctx = create_test_context();
     ctx.path = path.to_string();
     ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    ferrum_edge::_test_support::set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some([0x51; 32]),
+    );
     ctx
 }
 
@@ -671,6 +675,12 @@ mod runtime_overlay_cache_provenance {
 
     /// Publish one `response_transformer` scope gate through the real RTDS
     /// overlay entry point.
+    ///
+    /// Since GHSA-83rc-23c9-3g9x this publication is PROVENANCE ONLY: it moves
+    /// the response-side publication identity that `response_caching` binds its
+    /// stored entries to, but it does not (and must not) change what an
+    /// already-constructed `response_transformer` does. Use
+    /// [`apply_gate_generation`] to model a real accepted RTDS update.
     pub(super) fn publish_gate(scope: &str, enabled: bool) {
         let mut fields = HashMap::new();
         fields.insert(
@@ -684,6 +694,47 @@ mod runtime_overlay_cache_provenance {
         response_gate::reset_for_test();
     }
 
+    fn response_caching_plugin() -> Arc<dyn Plugin> {
+        create_plugin(
+            "response_caching",
+            &json!({
+                "ttl_seconds": 60,
+                "add_cache_status_header": true,
+                // Partitioning only: authenticated fixtures still need
+                // `Cache-Control: public` (see `origin_headers`) under
+                // RFC 9111 §3.5 / GHSA-7f28.
+                "cache_key_include_consumer": true,
+            }),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    /// One `response_transformer` instance as a mesh generation would build it:
+    /// the operator's static config plus the gate that generation resolved.
+    /// `resolved` of `None` models a generation whose overlay named no gate for
+    /// the scope, so `default_enabled: false` governs.
+    fn gated_transformer(
+        scope: &str,
+        rules: &serde_json::Value,
+        resolved: Option<bool>,
+    ) -> Arc<dyn Plugin> {
+        let mut config = json!({
+            "runtime_overlay_scope": scope,
+            "default_enabled": false,
+            "rules": rules.clone(),
+        });
+        if let Some(resolved) = resolved {
+            config.as_object_mut().expect("object").insert(
+                "runtime_overlay_resolved_enabled".to_string(),
+                json!(resolved),
+            );
+        }
+        create_plugin("response_transformer", &config)
+            .unwrap()
+            .unwrap()
+    }
+
     /// `response_caching` + one overlay-gated `response_transformer`, in
     /// priority order.
     pub(super) fn plugins_with_gated_transformer(
@@ -691,29 +742,40 @@ mod runtime_overlay_cache_provenance {
         rules: serde_json::Value,
     ) -> Vec<Arc<dyn Plugin>> {
         sort_plugins(vec![
-            create_plugin(
-                "response_caching",
-                &json!({
-                    "ttl_seconds": 60,
-                    "add_cache_status_header": true,
-                    // Partitioning only: authenticated fixtures still need
-                    // `Cache-Control: public` (see `origin_headers`) under
-                    // RFC 9111 §3.5 / GHSA-7f28.
-                    "cache_key_include_consumer": true,
-                }),
-            )
-            .unwrap()
-            .unwrap(),
-            create_plugin(
-                "response_transformer",
-                &json!({
-                    "runtime_overlay_scope": scope,
-                    "default_enabled": false,
-                    "rules": rules,
-                }),
-            )
-            .unwrap()
-            .unwrap(),
+            response_caching_plugin(),
+            gated_transformer(scope, &rules, None),
+        ])
+    }
+
+    /// Model a real accepted RTDS-only update.
+    ///
+    /// Production does exactly two things for an overlay-only gate change:
+    /// `reconcile_runtime_overlay_plugin_generations` stamps the transformer so
+    /// `ConfigDelta` rebuilds THAT instance from its newly materialized effective
+    /// config, while `response_caching` — whose own config did not change —
+    /// retains its instance and therefore its stored entries. The post-accept
+    /// consumer fanout then publishes the gate map, moving the provenance
+    /// identity those stored entries are bound to.
+    ///
+    /// This helper reproduces both halves: the same `response_caching` Arc is
+    /// carried over (so the cache under test still holds the entry stored by the
+    /// previous generation) while the transformer is replaced with a freshly
+    /// constructed instance carrying the new gate.
+    pub(super) fn apply_gate_generation(
+        previous: &[Arc<dyn Plugin>],
+        scope: &str,
+        rules: serde_json::Value,
+        enabled: bool,
+    ) -> Vec<Arc<dyn Plugin>> {
+        let caching = previous
+            .iter()
+            .find(|plugin| plugin.name() == "response_caching")
+            .cloned()
+            .expect("harness always configures response_caching");
+        publish_gate(scope, enabled);
+        sort_plugins(vec![
+            caching,
+            gated_transformer(scope, &rules, Some(enabled)),
         ])
     }
 
@@ -840,13 +902,11 @@ async fn test_response_cache_applies_response_transformer_enabled_after_store() 
     harness::reset_gates();
 
     let scope = "cache_provenance_enable";
-    let plugins = harness::plugins_with_gated_transformer(
-        scope,
-        json!([
-            {"target": "body", "operation": "update", "key": "secret", "value": "[redacted]"},
-            {"target": "header", "operation": "update", "key": "x-secret", "value": "[redacted]"}
-        ]),
-    );
+    let rules = json!([
+        {"target": "body", "operation": "update", "key": "secret", "value": "[redacted]"},
+        {"target": "header", "operation": "update", "key": "x-secret", "value": "[redacted]"}
+    ]);
+    let plugins = harness::plugins_with_gated_transformer(scope, rules.clone());
     let path = "/cache-provenance-enable";
 
     // 1. Gate disabled (no publication, `default_enabled: false`): the origin
@@ -874,8 +934,10 @@ async fn test_response_cache_applies_response_transformer_enabled_after_store() 
         r#"{"secret":"TOPSECRET"}"#
     );
 
-    // 2. Operator tightens policy at runtime.
-    harness::publish_gate(scope, true);
+    // 2. Operator tightens policy at runtime. A gate change is an accepted RTDS
+    //    generation: the transformer is rebuilt with the new gate while the
+    //    unchanged `response_caching` instance keeps the entry stored above.
+    let plugins = harness::apply_gate_generation(&plugins, scope, rules, true);
 
     // 3. The stored representation predates the live policy, so it is retired
     //    rather than replayed: a fresh origin fetch is redacted once.
@@ -937,18 +999,17 @@ async fn test_response_cache_hit_under_unchanged_gate_skips_non_idempotent_trans
     harness::reset_gates();
 
     let scope = "cache_provenance_stable";
-    let plugins = harness::plugins_with_gated_transformer(
-        scope,
-        json!([
-            {"target": "body", "operation": "rename", "key": "a", "new_key": "b"},
-            {"target": "body", "operation": "add", "key": "a", "value": "second"},
-            {"target": "header", "operation": "rename", "key": "x-a", "new_key": "x-b"},
-            {"target": "header", "operation": "add", "key": "x-a", "value": "second"}
-        ]),
-    );
+    let rules = json!([
+        {"target": "body", "operation": "rename", "key": "a", "new_key": "b"},
+        {"target": "body", "operation": "add", "key": "a", "value": "second"},
+        {"target": "header", "operation": "rename", "key": "x-a", "new_key": "x-b"},
+        {"target": "header", "operation": "add", "key": "x-a", "value": "second"}
+    ]);
+    let plugins = harness::plugins_with_gated_transformer(scope, rules.clone());
     let path = "/cache-provenance-stable";
 
-    harness::publish_gate(scope, true);
+    // The generation serving this test has the gate enabled.
+    let plugins = harness::apply_gate_generation(&plugins, scope, rules, true);
 
     let mut miss_ctx = create_response_context(path);
     let (status, headers, body) = run_buffered_response_lifecycle(
@@ -1003,9 +1064,16 @@ async fn test_response_cache_hit_under_unchanged_gate_skips_non_idempotent_trans
     harness::reset_gates();
 }
 
-/// A request that crosses a real gate publication can be transformed under a
-/// different policy than the one pinned at lookup. Those bytes have no stable
-/// replay provenance and must not be inserted into the cache.
+/// A request that crosses a real gate publication keeps the generation it pinned
+/// (GHSA-83rc-23c9-3g9x), and the bytes it produced still have no stable replay
+/// provenance — the identity `response_caching` pinned at lookup has moved — so
+/// they must not be inserted into the cache.
+///
+/// This test previously asserted the opposite for the body: that an in-flight
+/// response "should still obey the newly live gate". That WAS the vulnerability.
+/// A mid-flight gate change reaching an already-admitted request is exactly how a
+/// marker header and its paired body redaction came apart, so the in-flight
+/// request must now stay wholly on its own generation.
 #[tokio::test]
 async fn test_response_cache_drops_store_when_gate_changes_mid_request() {
     use self::runtime_overlay_cache_provenance as harness;
@@ -1014,12 +1082,10 @@ async fn test_response_cache_drops_store_when_gate_changes_mid_request() {
     harness::reset_gates();
 
     let scope = "cache_provenance_mid_request";
-    let plugins = harness::plugins_with_gated_transformer(
-        scope,
-        json!([
-            {"target": "body", "operation": "update", "key": "secret", "value": "[redacted]"}
-        ]),
-    );
+    let rules = json!([
+        {"target": "body", "operation": "update", "key": "secret", "value": "[redacted]"}
+    ]);
+    let plugins = harness::plugins_with_gated_transformer(scope, rules.clone());
     let path = "/cache-provenance-mid-request";
 
     let mut request_ctx = create_response_context(path);
@@ -1028,7 +1094,10 @@ async fn test_response_cache_drops_store_when_gate_changes_mid_request() {
         "initial request must miss and pin the disabled gate publication"
     );
 
-    harness::publish_gate(scope, true);
+    // A new accepted generation lands while the request above is mid-flight. It
+    // rebuilds the transformer and moves the provenance identity, but the
+    // in-flight request keeps running the plugin handles it already holds.
+    let next_generation = harness::apply_gate_generation(&plugins, scope, rules, true);
     let (_, body) = harness::finish_origin_after_lookup(
         &plugins,
         &mut request_ctx,
@@ -1039,14 +1108,34 @@ async fn test_response_cache_drops_store_when_gate_changes_mid_request() {
     .await;
     assert_eq!(
         String::from_utf8(body).unwrap(),
-        r#"{"secret":"[redacted]"}"#,
-        "the in-flight response should still obey the newly live gate"
+        r#"{"secret":"TOPSECRET"}"#,
+        "an in-flight response must stay on the generation it pinned, not adopt \
+         a gate published after it was admitted"
     );
 
+    // Still uncacheable: the pinned publication identity moved during the
+    // request, so those bytes have no stable replay provenance.
     let mut next_ctx = create_response_context(path);
     assert!(
         harness::lookup(&plugins, &mut next_ctx).await.is_none(),
         "a response that straddled a gate publication must not be cached"
+    );
+
+    // And the new generation does apply the redaction, so the tightened policy is
+    // genuinely live for requests admitted after it was published.
+    let mut after_ctx = create_response_context(path);
+    let (_, _, body) = run_buffered_response_lifecycle(
+        &next_generation,
+        &mut after_ctx,
+        200,
+        harness::origin_headers(&[]),
+        br#"{"secret":"TOPSECRET"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        r#"{"secret":"[redacted]"}"#,
+        "the newly published generation must apply the tightened policy"
     );
 
     harness::reset_gates();
@@ -1064,19 +1153,18 @@ async fn test_response_cache_provenance_survives_gate_cycles() {
     harness::reset_gates();
 
     let scope = "cache_provenance_cycle";
-    let plugins = harness::plugins_with_gated_transformer(
-        scope,
-        json!([
-            {"target": "body", "operation": "update", "key": "secret", "value": "[redacted]"},
-            {"target": "header", "operation": "update", "key": "x-secret", "value": "[redacted]"}
-        ]),
-    );
+    let rules = json!([
+        {"target": "body", "operation": "update", "key": "secret", "value": "[redacted]"},
+        {"target": "header", "operation": "update", "key": "x-secret", "value": "[redacted]"}
+    ]);
+    let plugins = harness::plugins_with_gated_transformer(scope, rules.clone());
     let path = "/cache-provenance-cycle";
 
     let origin_body = br#"{"secret":"TOPSECRET"}"#.to_vec();
 
-    // Enabled: store a redacted representation.
-    harness::publish_gate(scope, true);
+    // Enabled: store a redacted representation. Each cycle step is a full
+    // accepted generation (rebuilt transformer + republished provenance).
+    let plugins = harness::apply_gate_generation(&plugins, scope, rules.clone(), true);
     let mut ctx = create_response_context(path);
     let (_, headers, body) = run_buffered_response_lifecycle(
         &plugins,
@@ -1097,7 +1185,7 @@ async fn test_response_cache_provenance_survives_gate_cycles() {
 
     // Disabled: the redacted entry belongs to a policy that is no longer live,
     // so it is refetched instead of replayed.
-    harness::publish_gate(scope, false);
+    let plugins = harness::apply_gate_generation(&plugins, scope, rules.clone(), false);
     let mut ctx = create_response_context(path);
     let (_, headers, body) = run_buffered_response_lifecycle(
         &plugins,
@@ -1123,7 +1211,7 @@ async fn test_response_cache_provenance_survives_gate_cycles() {
 
     // Enabled again: the untransformed entry stored under the disabled gate is
     // retired in turn, and redaction applies once to the refetched response.
-    harness::publish_gate(scope, true);
+    let plugins = harness::apply_gate_generation(&plugins, scope, rules, true);
     let mut ctx = create_response_context(path);
     let (_, headers, body) = run_buffered_response_lifecycle(
         &plugins,
@@ -1162,12 +1250,10 @@ async fn test_response_cache_revalidation_respects_gate_change() {
     harness::reset_gates();
 
     let scope = "cache_provenance_revalidate";
-    let plugins = harness::plugins_with_gated_transformer(
-        scope,
-        json!([
-            {"target": "header", "operation": "update", "key": "x-secret", "value": "[redacted]"}
-        ]),
-    );
+    let rules = json!([
+        {"target": "header", "operation": "update", "key": "x-secret", "value": "[redacted]"}
+    ]);
+    let plugins = harness::plugins_with_gated_transformer(scope, rules.clone());
     let path = "/cache-provenance-revalidate";
 
     let mut miss_ctx = create_response_context(path);
@@ -1205,9 +1291,9 @@ async fn test_response_cache_revalidation_respects_gate_change() {
         Some("REVALIDATED")
     );
 
-    // Policy tightens: the same conditional request must not be answered from
-    // the superseded entry.
-    harness::publish_gate(scope, true);
+    // Policy tightens as a new accepted generation: the same conditional request
+    // must not be answered from the superseded entry.
+    let plugins = harness::apply_gate_generation(&plugins, scope, rules, true);
     let mut tightened_ctx = create_response_context(path);
     tightened_ctx
         .headers
@@ -1231,6 +1317,149 @@ async fn test_response_cache_revalidation_respects_gate_change() {
     assert_eq!(
         headers.get("x-secret").map(String::as_str),
         Some("[redacted]")
+    );
+
+    harness::reset_gates();
+}
+
+/// The published gate identity alone is not a sufficient provenance witness
+/// (GHSA-83rc-23c9-3g9x).
+///
+/// Mesh publishes the gate map from `record_applied_slice`, i.e. AFTER
+/// `ProxyState::update_config` has published the new `RequestEpoch`. A request
+/// that pinned the previous plugin generation can therefore still pin the NEW
+/// publication identity — its authenticate/authorize phase runs before
+/// `response_caching::before_proxy` and can span an entire mesh apply — and its
+/// response is shaped by the OLD generation's transformer instances, because a
+/// request now stays wholly on the generation it pinned. A `response_caching`
+/// instance that survives the apply (a global instance is not rebuilt when only
+/// a proxy-scoped transformer changes) would otherwise keep replaying those
+/// bytes as if the current policy had produced them.
+///
+/// The entry is therefore also bound to its own generation's effective
+/// presentation-policy digest, which since the gate is materialized into the
+/// transformer's configuration covers the gate as well as the static rules.
+/// This test holds the gate publication IDENTICAL throughout, so only the
+/// generation digest can retire the entry.
+#[tokio::test]
+async fn test_response_cache_retires_entry_from_a_superseded_plugin_generation() {
+    use self::runtime_overlay_cache_provenance as harness;
+    use ferrum_edge::_test_support::set_response_presentation_policy_digest_for_test;
+
+    let _policy_guard = response_cache_replay_policy_guard();
+    harness::reset_gates();
+
+    let scope = "cache_provenance_generation";
+    let rules = json!([
+        {"target": "body", "operation": "update", "key": "secret", "value": "[redacted]"}
+    ]);
+    // One accepted generation, published once. `apply_gate_generation` moves the
+    // publication identity exactly once here and is never called again, so every
+    // lookup below pins the same stamp.
+    let plugins = harness::apply_gate_generation(
+        &harness::plugins_with_gated_transformer(scope, rules.clone()),
+        scope,
+        rules,
+        true,
+    );
+    let path = "/cache-provenance-generation";
+
+    let generation_a = [0xA1u8; 32];
+    let generation_b = [0xB2u8; 32];
+
+    let mut miss_ctx = create_response_context(path);
+    set_response_presentation_policy_digest_for_test(&mut miss_ctx, Some(generation_a));
+    let (status, headers, _) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut miss_ctx,
+        200,
+        harness::origin_headers(&[]),
+        br#"{"secret":"TOPSECRET"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("MISS"),
+        "the first request must reach the origin and store under generation A"
+    );
+
+    // Same generation, same publication identity: the entry is replayable.
+    let mut same_generation_ctx = create_response_context(path);
+    set_response_presentation_policy_digest_for_test(&mut same_generation_ctx, Some(generation_a));
+    let hit = harness::lookup(&plugins, &mut same_generation_ctx)
+        .await
+        .expect("an entry from the live generation must still HIT");
+    let (status, _, headers) = reject_parts(hit).expect("expected a rejection");
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("HIT")
+    );
+
+    // A later generation whose effective presentation policy differs, with the
+    // gate publication identity unchanged. The stored representation was shaped
+    // by generation A's rules/gate, so it must be retired rather than replayed.
+    let mut next_generation_ctx = create_response_context(path);
+    set_response_presentation_policy_digest_for_test(&mut next_generation_ctx, Some(generation_b));
+    assert!(
+        harness::lookup(&plugins, &mut next_generation_ctx)
+            .await
+            .is_none(),
+        "an entry from a superseded plugin generation must not be replayed even \
+         while the published gate identity is unchanged"
+    );
+
+    harness::reset_gates();
+}
+
+/// Unknown presentation policy must never match another unknown policy.
+///
+/// `ResponsePresentationPolicy::Dynamic` collapses the request digest to
+/// `None`. The shared response cache must fail closed exactly like
+/// `request_deduplication`: it cannot claim that two requests were shaped by
+/// the same policy merely because neither policy was provable.
+#[tokio::test]
+async fn test_response_cache_retains_nothing_under_unprovable_policy() {
+    use self::runtime_overlay_cache_provenance as harness;
+    use ferrum_edge::_test_support::set_response_presentation_policy_digest_for_test;
+
+    let _policy_guard = response_cache_replay_policy_guard();
+    harness::reset_gates();
+
+    let scope = "cache_provenance_unprovable";
+    let rules = json!([
+        {"target": "body", "operation": "update", "key": "secret", "value": "[redacted]"}
+    ]);
+    let plugins = harness::apply_gate_generation(
+        &harness::plugins_with_gated_transformer(scope, rules.clone()),
+        scope,
+        rules,
+        true,
+    );
+    let path = "/cache-provenance-unprovable";
+
+    let mut miss_ctx = create_response_context(path);
+    set_response_presentation_policy_digest_for_test(&mut miss_ctx, None);
+    let (status, headers, _) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut miss_ctx,
+        200,
+        harness::origin_headers(&[]),
+        br#"{"secret":"TOPSECRET"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("MISS")
+    );
+
+    let mut next_ctx = create_response_context(path);
+    set_response_presentation_policy_digest_for_test(&mut next_ctx, None);
+    assert!(
+        harness::lookup(&plugins, &mut next_ctx).await.is_none(),
+        "unknown presentation policy must not retain or replay a representation"
     );
 
     harness::reset_gates();

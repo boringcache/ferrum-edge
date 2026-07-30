@@ -13,19 +13,38 @@
 //! `response_transformer` header/body `add` sequences cannot run a second time
 //! over an already-transformed entry.
 //!
-//! Static rules cannot change under a live instance — a config reload builds a
-//! new plugin instance with a new, empty cache — but RTDS runtime-overlay gates
-//! (`runtime_overlay_scope`) can flip at any moment without one. Without
-//! provenance, an entry stored while a redaction rule was disabled would keep
-//! being replayed unredacted after an operator enabled it.
+//! A `response_caching` instance can outlive the presentation policy that
+//! produced its entries. Its own config is untouched by a
+//! `response_transformer` edit, and a *global* instance is not even rebuilt when
+//! the proxy carrying that transformer is (`rebuild_globals` is only set by a
+//! global plugin change), so the same cache keeps serving across the change.
+//! Without provenance, an entry stored while a redaction rule was disabled would
+//! keep being replayed unredacted after an operator enabled it.
 //!
-//! Every entry therefore carries an opaque publication identity, pinned from
-//! the same atomically published state as the response-side gate map by
-//! `RequestContext::pin_response_policy_stamp`. Two rules keep it honest:
+//! Every entry therefore carries two independent provenance halves, and a
+//! difference in **either** retires it:
 //!
-//! - **Lookup**: an entry whose identity differs from the current request's
-//!   pinned identity is invalidated and refetched — checked before freshness,
-//!   for both HIT and REVALIDATED, so neither can serve a superseded policy.
+//! - The **published gate identity**, pinned by
+//!   `RequestContext::pin_response_policy_stamp` from the same atomically
+//!   published state as the response-side gate map.
+//! - The **generation's effective presentation policy digest**
+//!   (`RequestContext::response_presentation_policy_digest`), copied from this
+//!   request's own plugin-cache view before any plugin ran.
+//!
+//! Both are needed. The gate map is published *after*
+//! `ProxyState::update_config`, so the two are read from different generations
+//! whenever a mesh apply lands between a request pinning its plugin cache and
+//! that request reaching `before_proxy` (its authenticate/authorize phase can
+//! span a whole apply). Since GHSA-83rc-23c9-3g9x a transformer's effective gate
+//! is materialized into its configuration, so the digest — which covers the gate
+//! *and* the static rules, per instance — is the exact witness of the policy
+//! that shaped the stored bytes, while the gate identity remains the witness of
+//! what the rest of the process currently publishes. Two rules keep them honest:
+//!
+//! - **Lookup**: an entry whose gate identity or generation digest differs from
+//!   the current request's is invalidated and refetched — checked before
+//!   freshness, for both HIT and REVALIDATED, so neither can serve a superseded
+//!   policy.
 //! - **Store**: a response whose request straddled a gate publication is not
 //!   stored at all; its bytes belong to neither policy.
 //!
@@ -34,7 +53,10 @@
 //! product of the live policy, so transforms are neither skipped when policy
 //! tightened nor stacked when it did not change. Reapplying the identical live
 //! map is a no-op; every real policy transition receives a fresh, collision-free
-//! identity and retires entries from the preceding publication.
+//! identity and retires entries from the preceding publication. A proxy whose
+//! effective presentation policy is *unprovable* (an enrolled plugin rewrites
+//! from live runtime state) never stores or replays an entry. Unknown policy is
+//! not evidence that two requests shared one.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -394,6 +416,21 @@ struct CacheEntry {
     /// instead of replaying a representation from a superseded policy. It is
     /// opaque and carries no rule, header, or body content.
     response_policy_stamp: GatePolicyStamp,
+    /// Effective static response-presentation policy digest of the plugin-cache
+    /// generation that shaped this representation
+    /// (`RequestContext::response_presentation_policy_digest`).
+    ///
+    /// The stamp above is published *after* `ProxyState::update_config`, so a
+    /// request that pinned the previous plugin generation can still pin the new
+    /// publication identity — its authenticate/authorize phase can span an
+    /// entire mesh apply — and would otherwise store bytes shaped by the old
+    /// policy under the new identity. Since GHSA-83rc-23c9-3g9x a transformer's
+    /// effective RTDS gate is materialized into its configuration, so this
+    /// generation-local digest covers the gate as well as the static rules and
+    /// is the exact witness of what produced these bytes. `None` means this
+    /// Unknown policy is never stored: every replay consumer must fail closed
+    /// when the effective presentation policy cannot be established.
+    response_presentation_digest: [u8; 32],
 }
 
 impl CacheEntry {
@@ -416,7 +453,7 @@ impl CacheEntry {
                 .iter()
                 .map(|(k, v)| k.len() + v.len())
                 .sum::<usize>()
-            + 64 // struct overhead estimate
+            + 96 // struct overhead estimate, including the policy digest
     }
 }
 
@@ -2163,6 +2200,11 @@ impl Plugin for ResponseCaching {
         // refuses to store a representation produced across a publication.
         // One ArcSwap load, memoized on the context for sibling instances.
         let policy_stamp = ctx.pin_response_policy_stamp().clone();
+        // The other provenance half, and the only one that is generation-local:
+        // it was copied from this request's own plugin-cache view before any
+        // plugin ran, so unlike the stamp above it cannot describe a generation
+        // other than the one whose transformer instances shape this response.
+        let presentation_digest = ctx.response_presentation_policy_digest;
 
         // Method safety is independent of storage eligibility (RFC 9111 §4.4 /
         // RFC 9110 §9.2.1). An unsafe method listed in `cacheable_methods`
@@ -2262,7 +2304,14 @@ impl Plugin for ResponseCaching {
             // identity. Pointer identity cannot collide or wrap, so a
             // representation is either provably current or refetched, never
             // stacked with a second pass of non-idempotent rules.
-            let stale_policy = entry.response_policy_stamp != policy_stamp;
+            //
+            // The generation digest is checked alongside it because the two are
+            // published at different points: an entry can carry the current
+            // publication identity yet have been shaped by an older plugin
+            // generation's rules/gate (GHSA-83rc-23c9-3g9x). Either half
+            // differing retires the entry.
+            let stale_policy = entry.response_policy_stamp != policy_stamp
+                || presentation_digest != Some(entry.response_presentation_digest);
             // Belt-and-braces companion to the store-side refusal: an entry
             // whose status has semantics this plugin does not implement is
             // never replayed, whatever produced it.
@@ -2433,6 +2482,17 @@ impl Plugin for ResponseCaching {
             );
             return PluginResult::Continue;
         }
+        // Record the generation that actually shaped these bytes alongside the
+        // publication identity — the request kept its pinned plugin cache for
+        // its whole lifetime, so this digest is exact even when the stamp above
+        // belongs to a newer publication (GHSA-83rc-23c9-3g9x).
+        let Some(presentation_digest) = ctx.response_presentation_policy_digest else {
+            debug!(
+                "response_caching: presentation policy is unprovable, \
+                 skipping store of an unattributable representation"
+            );
+            return PluginResult::Continue;
+        };
         // Use the variant-specific predict key (set during before_proxy) for
         // predictor marking so that uncacheability of one Vary variant does not
         // suppress cache lookups for other variants of the same route.
@@ -2667,6 +2727,7 @@ impl Plugin for ResponseCaching {
                 // so `base_key.len()` recovers this entry's base key.
                 base_key_len: base_key.len(),
                 response_policy_stamp: policy_stamp,
+                response_presentation_digest: presentation_digest,
             };
             let entry_size = entry.approx_size();
             let mut old_size = self
@@ -2762,11 +2823,18 @@ mod tests {
     }
 
     fn make_ctx(method: &str, path: &str) -> RequestContext {
-        RequestContext::new(
+        let mut ctx = RequestContext::new(
             "127.0.0.1".to_string(),
             method.to_string(),
             path.to_string(),
-        )
+        );
+        // Protocol entry paths copy the selected plugin-cache generation's
+        // presentation digest before any plugin runs. These inline cache tests
+        // exercise ordinary provable generations, so give every shared fixture
+        // the same deterministic witness instead of accidentally testing the
+        // fail-closed `None` path.
+        ctx.set_response_presentation_policy_digest(Some([0x51; 32]));
+        ctx
     }
 
     #[tokio::test]
