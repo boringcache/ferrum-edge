@@ -1509,8 +1509,7 @@ async fn reqwest_resolver_dns_override_pins_load_balanced_target_hostnames() {
     // every initial / retry hostname — not only the template host.
     let cache = DnsCache::new(default_dns_config(HashMap::new()));
     let override_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
-    let resolver =
-        DnsCacheResolver::with_dns_override(cache, Some(override_ip.to_string()));
+    let resolver = DnsCacheResolver::with_dns_override(cache, Some(override_ip.to_string()));
 
     let base_host = "route-template.internal";
     let initial_target = "target-a.internal";
