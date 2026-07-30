@@ -18810,8 +18810,9 @@ components:
         collection/streaming ceiling across H1/H2, H3, gRPC, retries,
         coalescing, mesh mTLS, and HBONE: buffered collection aborts at this
         route ceiling rather than retaining up to the larger global allowance,
-        and streaming paths engage the frame-by-frame
-        `SizeLimitedStreamingResponse` adapter at this ceiling. Already-buffered
+        and unknown-length streaming paths engage the frame-by-frame
+        `SizeLimitedStreamingResponse` adapter at this ceiling (known-length
+        paths reject an over-limit declaration before forwarding). Already-buffered
         synthetic responses (mock, serverless, cache, federation, dedup replay)
         are checked against the ceiling even when no plugin activated the
         response body-hook gate, after any body transform. The effective bound
