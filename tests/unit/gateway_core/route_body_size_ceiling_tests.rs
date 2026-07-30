@@ -92,12 +92,12 @@ fn stricter_optional_limit_composes_to_the_minimum() {
 fn single_declared_length_parses_exactly() {
     assert_eq!(
         parse_content_length("2048"),
-        Some(ContentLength::Exact(2048))
+        ContentLength::Exact(2048)
     );
     // Surrounding OWS is legal field-value whitespace.
     assert_eq!(
         parse_content_length("  2048\t"),
-        Some(ContentLength::Exact(2048))
+        ContentLength::Exact(2048)
     );
 }
 
@@ -108,11 +108,11 @@ fn single_declared_length_parses_exactly() {
 fn repeated_identical_declared_lengths_fold_to_one_exact_value() {
     assert_eq!(
         parse_content_length("2048, 2048"),
-        Some(ContentLength::Exact(2048))
+        ContentLength::Exact(2048)
     );
     assert_eq!(
         parse_content_length("2048,2048,2048"),
-        Some(ContentLength::Exact(2048))
+        ContentLength::Exact(2048)
     );
 }
 
@@ -120,7 +120,7 @@ fn repeated_identical_declared_lengths_fold_to_one_exact_value() {
 fn disagreeing_declared_lengths_are_ambiguous_not_absent() {
     assert_eq!(
         parse_content_length("2048, 4096"),
-        Some(ContentLength::Ambiguous)
+        ContentLength::Ambiguous
     );
 }
 
@@ -143,7 +143,7 @@ fn non_digit_members_are_ambiguous() {
     ] {
         assert_eq!(
             parse_content_length(value),
-            Some(ContentLength::Ambiguous),
+            ContentLength::Ambiguous,
             "{value:?} must be refused as ambiguous, never treated as absent"
         );
     }
@@ -155,14 +155,14 @@ fn non_digit_members_are_ambiguous() {
 fn declared_length_above_u64_is_ambiguous() {
     assert_eq!(
         parse_content_length("184467440737095516160"),
-        Some(ContentLength::Ambiguous)
+        ContentLength::Ambiguous
     );
 }
 
 #[test]
-fn absent_or_empty_field_is_none() {
-    assert_eq!(parse_content_length(""), None);
-    assert_eq!(parse_content_length("   "), None);
+fn absent_field_is_none_but_present_empty_field_is_ambiguous() {
+    assert_eq!(parse_content_length(""), ContentLength::Ambiguous);
+    assert_eq!(parse_content_length("   "), ContentLength::Ambiguous);
     assert_eq!(declared_content_length(&HashMap::new()), None);
 }
 

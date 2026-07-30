@@ -43,42 +43,46 @@ pub enum ContentLength {
 /// Parse a possibly comma-folded `Content-Length` field value into a single
 /// authoritative length.
 ///
-/// Returns `None` only for a genuinely absent/empty field. A present field that
-/// cannot be reduced to one agreed value is [`ContentLength::Ambiguous`], never
-/// `None`, so a fold like `"2048, 4096"` can never be mistaken for "unknown
-/// length" and bypass a size bound.
+/// A present field that cannot be reduced to one agreed value is
+/// [`ContentLength::Ambiguous`], never `None`, so an empty value or a fold like
+/// `"2048, 4096"` can never be mistaken for "unknown length" and bypass a size
+/// bound. Absence is represented by [`declared_content_length`] returning
+/// `None` before this parser is called.
 ///
 /// Digits are validated explicitly as `1*DIGIT`: `str::parse::<u64>()` accepts a
 /// leading `+`, which is not a valid `Content-Length` and must not be honored as
 /// a length.
-pub fn parse_content_length(value: &str) -> Option<ContentLength> {
+pub fn parse_content_length(value: &str) -> ContentLength {
     let value = value.trim_matches(|c: char| c == ' ' || c == '\t');
     if value.is_empty() {
-        return None;
+        return ContentLength::Ambiguous;
     }
     let mut canonical: Option<u64> = None;
     for token in value.split(',') {
         let token = token.trim_matches(|c: char| c == ' ' || c == '\t');
         // An empty member (`"2048,"`, `"2048,,2048"`) is malformed framing.
         if token.is_empty() {
-            return Some(ContentLength::Ambiguous);
+            return ContentLength::Ambiguous;
         }
         // `1*DIGIT` only — no sign, decimal point, hex prefix, or whitespace
         // inside the token.
         if !token.bytes().all(|b| b.is_ascii_digit()) {
-            return Some(ContentLength::Ambiguous);
+            return ContentLength::Ambiguous;
         }
         let Ok(parsed) = token.parse::<u64>() else {
             // All-digits but wider than u64.
-            return Some(ContentLength::Ambiguous);
+            return ContentLength::Ambiguous;
         };
         match canonical {
             None => canonical = Some(parsed),
-            Some(previous) if previous != parsed => return Some(ContentLength::Ambiguous),
+            Some(previous) if previous != parsed => return ContentLength::Ambiguous,
             _ => {}
         }
     }
-    canonical.map(ContentLength::Exact)
+    match canonical {
+        Some(value) => ContentLength::Exact(value),
+        None => ContentLength::Ambiguous,
+    }
 }
 
 /// Canonical declared body length from a plugin-facing header map, or `None`
@@ -88,7 +92,7 @@ pub fn parse_content_length(value: &str) -> Option<ContentLength> {
 pub fn declared_content_length(
     headers: &std::collections::HashMap<String, String>,
 ) -> Option<ContentLength> {
-    parse_content_length(headers.get("content-length")?)
+    Some(parse_content_length(headers.get("content-length")?))
 }
 
 /// Returns `true` when `error` (or any error in its source chain) is a

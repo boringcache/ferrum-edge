@@ -29670,7 +29670,7 @@ pub(crate) fn canonical_header_content_length(headers: &http::HeaderMap) -> Opti
         // A non-UTF-8 field value is unusable, not absent-with-a-length: return
         // `None` so the caller falls back to a bound that does not trust it.
         let text = value.to_str().ok()?;
-        let len = match parse_content_length(text)? {
+        let len = match parse_content_length(text) {
             ContentLength::Exact(len) => len,
             ContentLength::Ambiguous => return None,
         };
@@ -33113,11 +33113,8 @@ async fn proxy_to_backend_hbone(
     };
 
     let status = response.status().as_u16();
-    let content_length = response
-        .headers()
-        .get("content-length")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok());
+    let content_length = canonical_header_content_length(response.headers())
+        .and_then(|len| usize::try_from(len).ok());
     if effective_max_response_body_size_bytes > 0
         && let Some(len) = content_length
         && len > effective_max_response_body_size_bytes
@@ -34089,11 +34086,8 @@ async fn proxy_to_backend_mesh_mtls(
     };
 
     let status = response.status().as_u16();
-    let content_length = response
-        .headers()
-        .get("content-length")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok());
+    let content_length = canonical_header_content_length(response.headers())
+        .and_then(|len| usize::try_from(len).ok());
     if effective_max_response_body_size_bytes > 0
         && let Some(len) = content_length
         && len > effective_max_response_body_size_bytes
@@ -35244,10 +35238,10 @@ async fn proxy_to_backend_http3(
                     "streaming HTTP/3 request body should not retain bytes for retries"
                 );
 
-                if effective_max_request_body_size_bytes > 0
-                    && let Some(content_length) = headers.get("content-length")
-                    && let Ok(len) = content_length.parse::<usize>()
-                    && len > effective_max_request_body_size_bytes
+                if declared_request_content_length_over_limit(
+                    headers,
+                    effective_max_request_body_size_bytes,
+                )
                 {
                     return (
                         retry::BackendResponse {
@@ -35481,10 +35475,10 @@ async fn proxy_to_backend_http3(
         ClientRequestBody::Streaming(original_req) => {
             let (_parts, body) = (*original_req).into_parts();
             if effective_max_request_body_size_bytes > 0 {
-                if let Some(content_length) = headers.get("content-length")
-                    && let Ok(len) = content_length.parse::<usize>()
-                    && len > effective_max_request_body_size_bytes
-                {
+                if declared_request_content_length_over_limit(
+                    headers,
+                    effective_max_request_body_size_bytes,
+                ) {
                     return (
                         retry::BackendResponse {
                             status_code: 413,
@@ -35966,9 +35960,7 @@ async fn drain_h3_streaming_response_to_buffered(
     let status = response.status;
     let response_headers = response.headers;
     let mut recv_stream = response.recv_stream;
-    let content_length: Option<u64> = response_headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok());
+    let content_length = canonical_header_content_length_from_map(&response_headers);
 
     match crate::http3::client::drain_h3_response_body(
         &mut recv_stream,

@@ -9606,12 +9606,10 @@ async fn dispatch_grpc_native_h3(
     // plain native-H3 streaming path and the cross-protocol streaming gRPC bridge
     // apply — NOT the request-side gRPC receive cap, so a large-but-valid gRPC
     // response is not spuriously rejected.
-    if effective_max_response_body_size_bytes > 0
-        && let Some(len) = response_headers
-            .get("content-length")
-            .and_then(|v| v.parse::<usize>().ok())
-        && len > effective_max_response_body_size_bytes
-    {
+    if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+        &response_headers,
+        effective_max_response_body_size_bytes,
+    ) {
         let error_sent = send_h3_grpc_error(
             stream,
             crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -10775,12 +10773,10 @@ async fn proxy_to_backend_h3_streaming(
     stamp_h3_original_response_metadata(ctx, response_status, &response_headers);
 
     // Enforce response body size limit via Content-Length fast path
-    if effective_max_response_body_size_bytes > 0
-        && let Some(len) = response_headers
-            .get("content-length")
-            .and_then(|v| v.parse::<usize>().ok())
-        && len > effective_max_response_body_size_bytes
-    {
+    if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
+        &response_headers,
+        effective_max_response_body_size_bytes,
+    ) {
         warn!(
             "Backend response body ({} bytes) exceeds limit ({} bytes)",
             len, effective_max_response_body_size_bytes
