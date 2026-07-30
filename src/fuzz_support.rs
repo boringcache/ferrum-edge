@@ -163,7 +163,7 @@ pub fn fuzz_validate_plugin_config(data: &[u8]) -> Result<(), String> {
     reject_excessive_json_depth(&value).map_err(|()| "json depth budget exceeded".to_string())?;
     let plugin_idx = selector as usize % FUZZ_PLUGIN_NAMES.len();
     let plugin_name = FUZZ_PLUGIN_NAMES[plugin_idx];
-    validate_plugin_config(plugin_name, &value).map_err(|error| error)
+    validate_plugin_config(plugin_name, &value)
 }
 
 /// Deterministic smoke helper used by hosted CI property checks.

@@ -532,27 +532,6 @@ impl SpecExpose {
         failure
     }
 
-    /// Record one synthetic upstream failure without performing network I/O.
-    ///
-    /// External tests use this seam to exercise the negative-cache clock and
-    /// exponential backoff deterministically. Mixing a paused Tokio clock with
-    /// a real TCP mock server makes the transport lifecycle scheduler-dependent
-    /// and does not test the backoff logic itself.
-    #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
-    pub fn record_failure_backoff_for_tests(&self) -> u64 {
-        self.record_failure(fetch_failure(502, "synthetic upstream failure"))
-            .retry_after_seconds
-    }
-
-    /// Return the currently advertised negative-cache delay, if it is live.
-    #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
-    pub fn cached_failure_backoff_for_tests(&self) -> Option<u64> {
-        self.cached_failure()
-            .map(|failure| failure.retry_after_seconds)
-    }
-
     fn record_success(&self, entry: &CachedSpec) {
         if !self.cache_ttl.is_zero() {
             self.cache.store(Arc::new(Some(entry.clone())));
