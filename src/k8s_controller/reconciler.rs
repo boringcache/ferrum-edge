@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -28,6 +29,7 @@ use crate::k8s_controller::watcher::namespaces_with_istio_root;
 
 const INITIAL_STORE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP: usize = 256;
+const STATUS_PATCH_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Last reconciler-accepted Kubernetes translation, held independently of the
 /// DB-authored `GatewayConfig` snapshot. CP full reloads re-merge this overlay
@@ -859,12 +861,27 @@ async fn patch_gateway_api_statuses(
         updates.truncate(GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP);
     }
     let updates_len = updates.len();
-    if let Err(error) = writer.patch_updates(updates).await {
-        warn!(
-            error = %error,
-            updates = updates_len,
-            "Failed to patch Gateway API status"
-        );
+    match await_status_patch_batch(
+        writer.patch_updates(updates),
+        STATUS_PATCH_BATCH_TIMEOUT,
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!(
+                error = %error,
+                updates = updates_len,
+                "Failed to patch Gateway API status"
+            );
+        }
+        Err(_) => {
+            warn!(
+                updates = updates_len,
+                timeout_secs = STATUS_PATCH_BATCH_TIMEOUT.as_secs(),
+                "Gateway API status patch batch timed out; unfinished updates will retry on a later reconcile"
+            );
+        }
     }
 }
 
@@ -903,13 +920,38 @@ async fn patch_istio_statuses(
         return;
     }
     let updates_len = updates.len();
-    if let Err(error) = writer.patch_updates(updates).await {
-        warn!(
-            error = %error,
-            updates = updates_len,
-            "Failed to patch Istio status (CRD may not have a status subresource)"
-        );
+    match await_status_patch_batch(
+        writer.patch_updates(updates),
+        STATUS_PATCH_BATCH_TIMEOUT,
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!(
+                error = %error,
+                updates = updates_len,
+                "Failed to patch Istio status (CRD may not have a status subresource)"
+            );
+        }
+        Err(_) => {
+            warn!(
+                updates = updates_len,
+                timeout_secs = STATUS_PATCH_BATCH_TIMEOUT.as_secs(),
+                "Istio status patch batch timed out; unfinished updates will retry on a later reconcile"
+            );
+        }
     }
+}
+
+async fn await_status_patch_batch<F, E>(
+    future: F,
+    timeout: Duration,
+) -> Result<Result<(), E>, tokio::time::error::Elapsed>
+where
+    F: Future<Output = Result<(), E>>,
+{
+    tokio::time::timeout(timeout, future).await
 }
 
 pub fn swap_merged_k8s_translation(
@@ -2209,6 +2251,17 @@ mod tests {
     fn full_sync_interval_zero_is_clamped_before_timer_creation() {
         assert_eq!(full_sync_interval_duration(0), Duration::from_secs(1));
         assert_eq!(full_sync_interval_duration(300), Duration::from_secs(300));
+    }
+
+    #[tokio::test]
+    async fn stalled_status_patch_batch_releases_the_reconcile_loop() {
+        let stalled = std::future::pending::<Result<(), ()>>();
+        let result = await_status_patch_batch(stalled, Duration::from_millis(1)).await;
+
+        assert!(
+            result.is_err(),
+            "a stalled Kubernetes status request must not retain the reconcile loop"
+        );
     }
 
     #[test]
