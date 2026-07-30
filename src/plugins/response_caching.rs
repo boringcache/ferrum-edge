@@ -2823,11 +2823,18 @@ mod tests {
     }
 
     fn make_ctx(method: &str, path: &str) -> RequestContext {
-        RequestContext::new(
+        let mut ctx = RequestContext::new(
             "127.0.0.1".to_string(),
             method.to_string(),
             path.to_string(),
-        )
+        );
+        // Protocol entry paths copy the selected plugin-cache generation's
+        // presentation digest before any plugin runs. These inline cache tests
+        // exercise ordinary provable generations, so give every shared fixture
+        // the same deterministic witness instead of accidentally testing the
+        // fail-closed `None` path.
+        ctx.set_response_presentation_policy_digest(Some([0x51; 32]));
+        ctx
     }
 
     #[tokio::test]
