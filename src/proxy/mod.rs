@@ -29796,8 +29796,7 @@ async fn proxy_to_backend(
     // Every ordinary host still fails closed here. Retry dispatch is always a
     // reqwest path and retains the unconditional preflight above.
     let resolved_ip = if dispatch_hbone
-        && effective_host
-            .starts_with(hbone_pool::HBONE_CROSS_CLUSTER_SYNTHETIC_HOST_PREFIX)
+        && effective_host.starts_with(hbone_pool::HBONE_CROSS_CLUSTER_SYNTHETIC_HOST_PREFIX)
     {
         None
     } else {
