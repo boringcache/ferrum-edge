@@ -649,8 +649,10 @@ pub fn load_config_from_file(
 
 /// Decode and validate a config document from in-memory bytes.
 ///
-/// Skips filesystem stability checks and namespace filtering. Intended for the
-/// adversarial fuzz lane and deterministic parser tests — not production load.
+/// Skips filesystem stability and plugin file-dependency checks, plus namespace
+/// filtering. Intended for the adversarial fuzz lane and deterministic parser
+/// tests — not production load. Keeping this entry point free of file reads
+/// prevents generated paths from turning a pure parser target into runner I/O.
 #[cfg(feature = "fuzzing")]
 pub fn decode_and_validate_config_document(
     content: &str,
@@ -809,9 +811,6 @@ pub fn decode_and_validate_config_document(
                 "Configuration validation failed: {} plugin config error(s) found",
             ),
         )
-        .validate_plugin_file_dependencies(ValidationAction::FatalCount(
-            "Configuration validation failed: {} plugin file dependency error(s) found",
-        ))
         .validate_stream_proxies(ValidationAction::FatalCount(
             "Configuration validation failed: {} stream proxy error(s) found",
         ))

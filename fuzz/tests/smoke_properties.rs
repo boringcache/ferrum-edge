@@ -48,6 +48,29 @@ fn config_decode_minimal_json() {
 }
 
 #[test]
+fn config_decode_does_not_materialize_runtime_file_dependencies() {
+    let doc = r#"{
+        "version":"1",
+        "proxies":[],
+        "consumers":[],
+        "upstreams":[],
+        "plugin_configs":[{
+            "id":"geo",
+            "plugin_name":"geo_restriction",
+            "config":{
+                "db_path":"/fuzz-target-must-not-read-this.mmdb",
+                "deny_countries":["SE"],
+                "on_lookup_failure":"deny"
+            },
+            "scope":"global",
+            "enabled":true
+        }]
+    }"#;
+    fuzz_decode_config_document(doc)
+        .expect("pure config fuzzing must not materialize runtime file dependencies");
+}
+
+#[test]
 fn k8s_minimal_virtual_service() {
     let json = br#"[{"apiVersion":"networking.istio.io/v1","kind":"VirtualService","metadata":{"name":"reviews","namespace":"default"},"spec":{"hosts":["reviews"],"http":[{"route":[{"destination":{"host":"reviews"}}]}]}}]"#;
     let _ = fuzz_translate_k8s_json(json);
