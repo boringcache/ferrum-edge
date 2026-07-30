@@ -1580,7 +1580,10 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
     );
     assert_eq!(status, 200);
     assert_eq!(rejected["error"]["code"], -32603);
-    assert_eq!(rejected["error"]["message"], "Invalid upstream MCP response");
+    assert_eq!(
+        rejected["error"]["message"],
+        "Invalid upstream MCP response"
+    );
     assert!(!rejected.to_string().contains("file:///project/README.md"));
 
     let mut response_headers = HashMap::from([
