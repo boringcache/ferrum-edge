@@ -944,3 +944,80 @@ fn non_summary_families_participate_in_the_prospective_graph() {
         "{errors:?}"
     );
 }
+
+/// Minimal `api_chargeback_sink` config the constructor admits: spool disabled
+/// so no on-disk tree is created, one pricing dimension, and a hostname
+/// ClickHouse endpoint that the literal-IP egress screen leaves alone.
+fn sink_config(extra: Value) -> Value {
+    let mut config = json!({
+        "mode": "per_event",
+        "clickhouse": { "url": "https://clickhouse.example:8443" },
+        "spool": { "enabled": false },
+        "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.01 }],
+        "pricing_version": "test-v1",
+        "currency": "USD"
+    });
+    if let Some(object) = extra.as_object() {
+        for (key, value) in object {
+            config[key.as_str()] = value.clone();
+        }
+    }
+    config
+}
+
+/// The charge-event family is the only one whose projected keys are remote
+/// ClickHouse column names, so its `schema_ref` lifecycle is asserted end to
+/// end: a shared definition recompiles under the family, a definition whose
+/// rename target collides with a real charge-event column is rejected instead
+/// of quietly redirecting a value into another column, and a reload that drops
+/// the definition leaves the referrer failing closed.
+///
+/// `summary_only_target` is the collision case: `route_id` is not a
+/// transaction-summary field, so the definition is perfectly valid where it is
+/// authored, but it IS a `ChargeEvent` member (and a ClickHouse column).
+#[test]
+fn charge_event_family_resolves_schema_ref_and_rejects_a_colliding_definition() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    registry::begin_reload().expect("reload bracket opens");
+    create_ok(
+        "transaction_log_schema",
+        json!({
+            "schemas": {
+                "sink_portable": { "rename": { "proxy_id": "gateway_route" } },
+                "summary_only_target": { "rename": { "proxy_id": "route_id" } }
+            }
+        }),
+    );
+    registry::commit_reload().expect("reload bracket commits");
+
+    create_ok(
+        "api_chargeback_sink",
+        sink_config(json!({ "schema_ref": "sink_portable" })),
+    );
+
+    let err = create_err(
+        "api_chargeback_sink",
+        sink_config(json!({ "schema_ref": "summary_only_target" })),
+    );
+    assert!(
+        err.contains("duplicate output key 'route_id' produced by native and native"),
+        "got: {err}"
+    );
+
+    registry::begin_reload().expect("second reload bracket opens");
+    create_ok(
+        "transaction_log_schema",
+        json!({ "schemas": { "other": {} } }),
+    );
+    registry::commit_reload().expect("second reload bracket commits");
+
+    let err = create_err(
+        "api_chargeback_sink",
+        sink_config(json!({ "schema_ref": "sink_portable" })),
+    );
+    assert!(
+        err.contains("references unknown schema 'sink_portable'"),
+        "got: {err}"
+    );
+}

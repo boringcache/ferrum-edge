@@ -1967,6 +1967,98 @@ fn test_debugger_projection_covers_stream_and_websocket_entry_kinds() {
     assert!(value.get("disconnect_cause").is_none());
 }
 
+/// The stream record carries the same silent-drop risk that
+/// `test_debugger_default_diagnostic_field_inventory_is_projected_verbatim`
+/// closes for the HTTP record: a name added to a family inventory without a
+/// matching `serialize_native` arm falls into the catch-all `_ => Ok(())` and
+/// vanishes from the projected record while the default `tracing` diagnostic
+/// still carries it. The registry drift guard in
+/// `tests/integration/log_schema_registry_tests.rs` cannot see that — these
+/// families have no serde struct to compare against.
+///
+/// The default (`both`) schema is used deliberately: its compiled spec list is
+/// the union of all three families, so an exact key count also proves that
+/// names owned by another entry kind never leak into this record.
+#[test]
+fn test_debugger_projected_stream_record_emits_its_whole_inventory() {
+    let config = json!({ "schema": {} });
+    let plugin = TransactionDebugger::new(&config).expect("schema compiles");
+    let rendered = plugin
+        .project_stream_for_tests(&stream_summary())
+        .expect("stream projected");
+    let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let object = value.as_object().expect("object");
+
+    for key in [
+        "outcome",
+        "namespace",
+        "protocol",
+        "proxy_id",
+        "proxy_name",
+        "client_ip",
+        "listen_port",
+        "backend_target",
+        "backend_resolved_ip",
+        "consumer_username",
+        "auth_method",
+        "connection_error",
+        "error_class",
+        "disconnect_direction",
+        "disconnect_cause",
+        "duration_ms",
+        "bytes_sent",
+        "bytes_received",
+        "timestamp_connected",
+        "timestamp_disconnected",
+        "sni_hostname",
+        "request_id",
+        "trace_id",
+        "metadata",
+    ] {
+        assert!(object.contains_key(key), "missing diagnostic field `{key}`");
+    }
+    assert_eq!(object.len(), 24, "unexpected diagnostic field: {object:?}");
+}
+
+/// WebSocket-disconnect counterpart of
+/// `test_debugger_projected_stream_record_emits_its_whole_inventory`.
+#[test]
+fn test_debugger_projected_ws_record_emits_its_whole_inventory() {
+    let config = json!({ "schema": {} });
+    let plugin = TransactionDebugger::new(&config).expect("schema compiles");
+    let rendered = plugin
+        .project_ws_for_tests(&websocket_summary())
+        .expect("ws projected");
+    let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let object = value.as_object().expect("object");
+
+    for key in [
+        "outcome",
+        "namespace",
+        "proxy_id",
+        "proxy_name",
+        "client_ip",
+        "listen_port",
+        "backend_target",
+        "consumer_username",
+        "auth_method",
+        "duration_ms",
+        "frames_client_to_backend",
+        "frames_backend_to_client",
+        "bytes_client_to_backend",
+        "bytes_backend_to_client",
+        "disconnect_direction",
+        "io_side",
+        "error_class",
+        "request_id",
+        "trace_id",
+        "metadata",
+    ] {
+        assert!(object.contains_key(key), "missing diagnostic field `{key}`");
+    }
+    assert_eq!(object.len(), 20, "unexpected diagnostic field: {object:?}");
+}
+
 #[test]
 fn test_debugger_schema_summary_type_scopes_entry_kinds() {
     // `summary_type: stream` leaves HTTP and WebSocket diagnostics on the
