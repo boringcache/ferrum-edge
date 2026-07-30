@@ -18,9 +18,11 @@
 //!    uses the effective route ceiling, and already-buffered gateway-generated
 //!    responses are checked independently of the body-hook scheduling gate.
 //!
-//! Set `require_buffered_check: true` to force response body buffering so that
-//! chunked/streaming responses without Content-Length are also checked. This adds
-//! memory overhead — only enable when needed.
+//! Unknown-length streaming responses are always bounded frame by frame by the
+//! core ceiling. Set `require_buffered_check: true` only when the policy must
+//! prove the complete final post-transform size before committing a response;
+//! this adds route-bounded buffering overhead and refuses indefinite SSE streams
+//! whose complete size cannot be proven.
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};

@@ -19063,7 +19063,12 @@ components:
         require_buffered_check:
           type: boolean
           default: false
-          description: Force response body buffering so this plugin can enforce the size limit on chunked/streaming responses without Content-Length.
+          description: >-
+            Force route-bounded whole-body buffering so the complete final
+            post-transform size is proven before response headers are committed.
+            Unknown-length streams are already bounded frame by frame when this
+            is false. Enabling it adds memory overhead and rejects indefinite
+            SSE streams whose complete size cannot be proven.
 
     FaultInjectionConfig:
       type: object

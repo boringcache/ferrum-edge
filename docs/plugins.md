@@ -4328,7 +4328,7 @@ Configuration must be a top-level object. The only accepted keys are `max_bytes`
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `max_bytes` | u64 | — (required, > 0) | Maximum allowed response body size in bytes. The plugin errors at construction if absent or zero. |
-| `require_buffered_check` | bool | `false` | Force response body buffering to verify actual final size when `Content-Length` is absent. Adds memory overhead — only enable when needed. |
+| `require_buffered_check` | bool | `false` | Force route-bounded whole-body buffering so the complete final post-transform size is proven before response headers are committed. Unknown-length streams are already bounded frame by frame when this is false. Enabling it adds memory overhead and rejects indefinite SSE streams whose complete size cannot be proven. |
 
 Enforcement happens in four places:
 - **The effective collection/streaming ceiling.** The configured `max_bytes` is published to the proxy core and folded into the bound of every response path across H1/H2, native H3 and the H3 cross-protocol bridge, buffered and streaming gRPC, retry replays, the response coalescers, mesh mTLS, and HBONE. Buffered collection **aborts at this ceiling** rather than retaining up to the generally larger global allowance and only then failing the final check, so concurrent requests cannot amplify retained gateway memory toward the global allowance each. Unknown-length streaming paths engage the size-limited (frame-by-frame) adapter at this ceiling; known-length paths reject an over-limit declaration before forwarding the body.
