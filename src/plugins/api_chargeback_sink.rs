@@ -7974,9 +7974,7 @@ fn encode_spool_bytes(bytes: &[u8], compression: SpoolCompression) -> Result<Vec
 /// size would exceed the replay ratio. Production must never call it.
 #[doc(hidden)]
 #[allow(dead_code)] // external unit tests only
-pub fn encode_spool_bytes_without_ratio_padding_for_tests(
-    bytes: &[u8],
-) -> Result<Vec<u8>, String> {
+pub fn encode_spool_bytes_without_ratio_padding_for_tests(bytes: &[u8]) -> Result<Vec<u8>, String> {
     zstd::bulk::compress(bytes, 0)
         .map_err(|error| format!("{PLUGIN_NAME}: zstd compression failed: {error}"))
 }
@@ -8396,9 +8394,9 @@ fn pad_zstd_to_replay_ratio(
     let payload_len = u32::try_from(payload_len)
         .map_err(|_| format!("{PLUGIN_NAME}: zstd ratio padding payload is too large"))?;
     {
-        let header = padding.get_mut(..SKIPPABLE_HEADER_BYTES).ok_or_else(|| {
-            format!("{PLUGIN_NAME}: zstd ratio padding header is incomplete")
-        })?;
+        let header = padding
+            .get_mut(..SKIPPABLE_HEADER_BYTES)
+            .ok_or_else(|| format!("{PLUGIN_NAME}: zstd ratio padding header is incomplete"))?;
         let magic = header
             .get_mut(..4)
             .ok_or_else(|| format!("{PLUGIN_NAME}: zstd ratio padding magic is incomplete"))?;
@@ -8408,9 +8406,9 @@ fn pad_zstd_to_replay_ratio(
             .ok_or_else(|| format!("{PLUGIN_NAME}: zstd ratio padding size is incomplete"))?;
         size.copy_from_slice(&payload_len.to_le_bytes());
     }
-    let payload = padding.get_mut(SKIPPABLE_HEADER_BYTES..).ok_or_else(|| {
-        format!("{PLUGIN_NAME}: zstd ratio padding payload is missing")
-    })?;
+    let payload = padding
+        .get_mut(SKIPPABLE_HEADER_BYTES..)
+        .ok_or_else(|| format!("{PLUGIN_NAME}: zstd ratio padding payload is missing"))?;
     payload.fill(0);
     let final_len_u64 = u64::try_from(final_len)
         .map_err(|_| format!("{PLUGIN_NAME}: padded zstd length exceeds u64"))?;
