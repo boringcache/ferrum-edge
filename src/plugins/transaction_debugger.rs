@@ -1962,10 +1962,31 @@ fn looks_like_credential(value: &str) -> bool {
         return true;
     }
     // JWT / JWS compact serialization: `eyJ…` header, at least two dots.
-    trimmed.match_indices("eyJ").any(|(start, _)| {
-        let candidate = &trimmed[start..];
-        candidate.len() >= 20 && candidate.bytes().filter(|byte| *byte == b'.').count() >= 2
-    })
+    //
+    // Scan each maximal base64url/compact-token run once. Re-scanning the full
+    // suffix for every `eyJ` occurrence would make an attacker-shaped captured
+    // value quadratic even though the total capture is byte-bounded.
+    trimmed
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+        .any(|token| {
+            let Some(start) = token.find("eyJ") else {
+                return false;
+            };
+            let candidate = &token[start..];
+            if candidate.len() < 20 {
+                return false;
+            }
+            let mut dots = 0u8;
+            for byte in candidate.bytes() {
+                if byte == b'.' {
+                    dots += 1;
+                    if dots == 2 {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
 }
 
 /// Decode one `application/x-www-form-urlencoded` component for sensitivity
