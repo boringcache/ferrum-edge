@@ -4481,11 +4481,6 @@ impl SoapRejection {
     }
 }
 
-/// Metadata key holding the SHA-256 of the exact backend-visible representation
-/// this plugin authenticated, so a later request-body transform that would
-/// invalidate the authenticated message can be caught before dispatch.
-const AUTHENTICATED_BODY_DIGEST_KEY: &str = "soap_ws_security.authenticated_body_sha256";
-
 impl SoapWsSecurity {
     /// Validate one SOAP message end to end.
     ///
@@ -4735,11 +4730,8 @@ impl SoapWsSecurity {
             let authenticated_digest = ctx
                 .request_body_bytes
                 .as_ref()
-                .map(|bytes| sha256_hex_lower(bytes));
-            if let Some(digest) = authenticated_digest {
-                ctx.metadata
-                    .insert(AUTHENTICATED_BODY_DIGEST_KEY.to_string(), digest);
-            }
+                .map(|bytes| sha256_array(bytes));
+            ctx.soap_ws_security_authenticated_body_digest = authenticated_digest;
         }
 
         if let Some(username) = principal.username.clone() {
@@ -5133,10 +5125,10 @@ impl Plugin for SoapWsSecurity {
         _headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        let Some(expected) = ctx.metadata.get(AUTHENTICATED_BODY_DIGEST_KEY) else {
+        let Some(expected) = ctx.soap_ws_security_authenticated_body_digest else {
             return PluginResult::Continue;
         };
-        if sha256_hex_lower(body) == *expected {
+        if sha256_array(body) == expected {
             return PluginResult::Continue;
         }
         warn!(
@@ -5699,9 +5691,11 @@ fn exclusive_canonicalize(
     }
 
     // Charge the subtree before walking it, so an over-budget request is
-    // refused without doing the work, then charge any expansion the canonical
-    // form adds. Both sides are needed: the source bounds the walk, the output
-    // bounds the allocation and the digest input.
+    // refused without doing the work, then charge the complete emitted
+    // canonical representation. Both sides are needed: the source bounds the
+    // walk, while the output bounds the allocation and digest input. Charging
+    // only output expansion would account for max(source, output), not the
+    // documented source + output work.
     let source_len = root.range().len();
     budget.charge(source_len)?;
     let mut output = String::with_capacity(source_len);
@@ -5719,7 +5713,7 @@ fn exclusive_canonicalize(
         &mut rendered_namespaces,
         &mut output,
     )?;
-    budget.charge(output.len().saturating_sub(source_len))?;
+    budget.charge(output.len())?;
     Ok(output.into_bytes())
 }
 
@@ -7588,14 +7582,19 @@ mod tests {
         assert!(error.contains("outside the SOAP Header"), "got: {error}");
     }
 
-    /// GHSA-9g4v-h9hm-846r: the aggregate budget is charged per
-    /// canonicalization, so an over-budget message is refused rather than
-    /// walked.
+    /// GHSA-9g4v-h9hm-846r: the aggregate budget charges both the source
+    /// subtree walk and the complete emitted canonical representation.
     #[test]
     fn canonicalization_budget_refuses_over_budget_work() {
-        let mut budget = WorkBudget { remaining: 4 };
-        assert!(budget.charge(4).is_ok());
-        let error = budget.charge(1).expect_err("budget must be finite");
+        let xml = "<root>value</root>";
+        let document = parse_bounded_xml(xml, "test fixture").expect("fixture parses");
+        let root = document.root_element();
+        let source_len = root.range().len();
+        let mut budget = WorkBudget {
+            remaining: source_len.saturating_mul(2).saturating_sub(1),
+        };
+        let error = exclusive_canonicalize(xml, root, &[], None, &mut budget)
+            .expect_err("source plus full canonical output must exceed the budget");
         assert!(
             error.contains("canonicalization work budget"),
             "got: {error}"

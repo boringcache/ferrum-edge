@@ -7321,6 +7321,19 @@ mod advisory_regressions {
         ));
 
         let tampered = body.replace("Widget", "Mainframe");
+        // Public metadata is deliberately untrusted. Before the private typed
+        // proof, a later/custom plugin could replace the digest with the
+        // transformed body's value and authorize bytes SOAP never validated.
+        let tampered_digest = ring::digest::digest(&ring::digest::SHA256, tampered.as_bytes());
+        let forged_public_digest = tampered_digest
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        ctx.metadata.insert(
+            "soap_ws_security.authenticated_body_sha256".to_string(),
+            forged_public_digest,
+        );
         match plugin
             .on_final_request_body_with_context(&mut ctx, &headers, tampered.as_bytes())
             .await
