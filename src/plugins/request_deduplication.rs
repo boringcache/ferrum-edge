@@ -1220,19 +1220,7 @@ impl RequestDeduplication {
         // path, where nothing else would have caught it.
         // 409 rather than a re-execution: the original backend side effect may
         // already have run under this idempotency key.
-        let live_policy = ctx.response_policy_provenance();
-        if !live_policy.admits_replay_of(&cached.response_policy) {
-            // Distinguish the two refusals for operators: a policy that moved
-            // is a transient, self-healing state, while an unestablished policy
-            // means this proxy composes deduplication with a presentation
-            // plugin whose rewrite cannot be witnessed and will never replay.
-            let body = if live_policy.complete().is_none()
-                || cached.response_policy.complete().is_none()
-            {
-                r#"{"error":"The response policy for this request could not be established, so a stored idempotent response cannot be replayed"}"#
-            } else {
-                r#"{"error":"The stored idempotent response was produced under a superseded response policy"}"#
-            };
+        if let Some(body) = self.replay_policy_refusal_body(ctx, cached) {
             return PluginResult::Reject {
                 status_code: 409,
                 body: body.to_string(),
@@ -1256,6 +1244,37 @@ impl RequestDeduplication {
             body: cached.body.clone(),
             headers: response_headers,
         }
+    }
+
+    /// Explain why `cached` cannot be replayed under the request's live
+    /// response-side policy.
+    ///
+    /// Kept separate from [`Self::replay_response`] so a gateway that
+    /// re-acquires missing Redis ownership while retaining a local completion
+    /// can publish either that compatible completion or a non-replayable
+    /// tombstone before answering. Publishing first closes the cross-instance
+    /// window without mutating the replay lifecycle prematurely.
+    fn replay_policy_refusal_body(
+        &self,
+        ctx: &RequestContext,
+        cached: &CachedResponse,
+    ) -> Option<&'static str> {
+        let live_policy = ctx.response_policy_provenance();
+        if live_policy.admits_replay_of(&cached.response_policy) {
+            return None;
+        }
+
+        // Distinguish the two refusals for operators: a policy that moved is a
+        // transient, self-healing state, while an unestablished policy means
+        // this proxy composes deduplication with a presentation plugin whose
+        // rewrite cannot be witnessed and will never replay.
+        let body =
+            if live_policy.complete().is_none() || cached.response_policy.complete().is_none() {
+                r#"{"error":"The response policy for this request could not be established, so a stored idempotent response cannot be replayed"}"#
+            } else {
+                r#"{"error":"The stored idempotent response was produced under a superseded response policy"}"#
+            };
+        Some(body)
     }
 
     fn build_request_fingerprint(
@@ -3281,7 +3300,55 @@ impl Plugin for RequestDeduplication {
         ) {
             LocalDeduplicationAction::Replay(cached) => {
                 if let Some(ownership) = redis_lock_token.as_ref() {
-                    self.redis_release_inflight(&key, ownership).await;
+                    // Redis had no record, so this request acquired fresh
+                    // distributed ownership before discovering a still-live
+                    // local completion. Releasing that ownership before
+                    // replaying creates a cross-instance split: this gateway
+                    // returns the completed response while a peer immediately
+                    // acquires the now-empty Redis key and executes the same
+                    // side effect again.
+                    //
+                    // Repair the missing distributed completion through the
+                    // same fenced transition used by the original publisher.
+                    // A response whose live presentation policy no longer
+                    // admits the local bytes publishes only a non-replayable
+                    // tombstone. An oversized Redis representation does the
+                    // same inside `redis_publish_completed`, while this gateway
+                    // may still return its richer authoritative local replay.
+                    let policy_refusal = self.replay_policy_refusal_body(ctx, &cached);
+                    match self
+                        .redis_publish_completed(
+                            &key,
+                            &fingerprint,
+                            ownership,
+                            policy_refusal.is_none().then_some(&cached),
+                            policy_refusal.is_some(),
+                        )
+                        .await
+                    {
+                        RedisPublication::Published { .. } => {}
+                        RedisPublication::NotOwner => {
+                            // Ownership changed after admission. The local
+                            // completion is no longer authoritative for the
+                            // deployment, so refuse rather than racing the new
+                            // owner or replaying a value Redis does not
+                            // recognize.
+                            return PluginResult::Reject {
+                                status_code: 409,
+                                body: NON_REPLAYABLE_COMPLETION_BODY.to_string(),
+                                headers: HashMap::new(),
+                            };
+                        }
+                        RedisPublication::Unavailable => {
+                            if self.on_redis_unavailable == RedisUnavailablePolicy::FailClosed {
+                                return PluginResult::Reject {
+                                    status_code: 503,
+                                    body: REDIS_UNAVAILABLE_BODY.to_string(),
+                                    headers: HashMap::new(),
+                                };
+                            }
+                        }
+                    }
                 }
                 debug!("request_deduplication: local cache hit, replaying response");
                 // Defense-in-depth: re-sanitize on replay even though insert
