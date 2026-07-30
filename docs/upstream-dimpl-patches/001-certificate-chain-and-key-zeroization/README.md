@@ -133,4 +133,4 @@ the Ferrum interoperability tests against the upstream release.
 
 `issue.md` and `pr-description.md` are ready-to-file drafts. When upstream work
 is filed, record its links here, in `docs/dependency-policy.md`, and in
-`scripts/check_vendored_patch_status.sh`.
+`docs/vendored-patch-lifecycle.json`.
