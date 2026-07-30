@@ -272,7 +272,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
     BuiltinPluginParityMeta {
         name: "request_deduplication",
         classification: BuiltinPluginClassification::Public,
-        priority: 2750,
+        priority: 3010,
         active_phases: "before_proxy, on_final_response_body, on_response_stream_terminated",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "HTTP-only request deduplication and response replay",
@@ -430,14 +430,6 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         protocol_rationale: "Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing",
     },
     BuiltinPluginParityMeta {
-        name: "ai_semantic_cache",
-        classification: BuiltinPluginClassification::Public,
-        priority: 2996,
-        active_phases: "before_proxy, after_proxy, on_final_response_body",
-        matrix_protocols: HTTP_ONLY_PROTOCOLS,
-        protocol_rationale: "HTTP-only exact/semantic cache for LLM JSON request and response bodies",
-    },
-    BuiltinPluginParityMeta {
         name: "request_transformer",
         classification: BuiltinPluginClassification::Public,
         priority: 3000,
@@ -524,6 +516,14 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         active_phases: "before_proxy, transform_request_body_with_context, on_final_request_body_with_context",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "HTTP-only JSON prompt compression; native gRPC wire frames are not rewritten",
+    },
+    BuiltinPluginParityMeta {
+        name: "ai_semantic_cache",
+        classification: BuiltinPluginClassification::Public,
+        priority: 4057,
+        active_phases: "on_final_request_body_with_context, after_proxy, on_final_response_body",
+        matrix_protocols: HTTP_ONLY_PROTOCOLS,
+        protocol_rationale: "HTTP-only exact/semantic cache for LLM JSON request and response bodies",
     },
     BuiltinPluginParityMeta {
         name: "ai_federation",

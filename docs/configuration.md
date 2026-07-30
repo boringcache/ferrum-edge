@@ -649,6 +649,24 @@ UDP capture (`FERRUM_MESH_CAPTURE_UDP_ENABLED`, default off) is read by both the
 
 See [size_limits.md](size_limits.md) for detailed sizing guidance.
 
+**Route-scoped ceilings compose with these globals.** The `request_size_limiting`
+and `response_size_limiting` plugins publish their configured `max_bytes` to the
+proxy core, and each request path enforces the strictest *active* (nonzero) bound
+of the plugin ceiling and the applicable global knob
+(`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`, `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`, or
+`FERRUM_MAX_GRPC_RECV_SIZE_BYTES` for native gRPC). Two consequences are worth
+calling out:
+
+- Setting a global limit to `0` ("unlimited") **does not** disable an active
+  route limit — the route limit remains authoritative for that proxy. Only a
+  proxy with no size-limiting instance is genuinely unbounded at `0`.
+- The bound applies before bytes are forwarded or retained, so a chunked or
+  unknown-length upload and a strict buffered response collection are both held
+  to the route ceiling rather than to the generally larger global one. A proxy
+  with no size-limiting plugin behaves exactly as configured by the globals.
+
+See [plugins.md](plugins.md) for the per-plugin enforcement points.
+
 ### DNS
 
 | Variable | Required | Default | Description |

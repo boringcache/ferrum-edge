@@ -4740,12 +4740,7 @@ async fn deadline_rebuild_keeps_an_exact_value_cache_status_telemetry_header() {
 
     let caching = create_plugin(
         "response_caching",
-        &json!({
-            "add_cache_status_header": true,
-            // gRPC / gRPC-Web requests are POST; enable caching so this instance
-            // stages a real MISS rather than the default-method BYPASS.
-            "cacheable_methods": ["POST"],
-        }),
+        &json!({"add_cache_status_header": true}),
     )
     .unwrap()
     .unwrap();
@@ -4753,6 +4748,12 @@ async fn deadline_rebuild_keeps_an_exact_value_cache_status_telemetry_header() {
     let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
 
     let mut ctx = create_grpc_context_with_timeout(None);
+    // A shared cache admits only the bodyless retrieval methods and only an
+    // upload the transport has proven empty, so drive this instance's MISS
+    // staging through a cacheable request shape. The provenance bookkeeping
+    // under test is protocol- and method-independent.
+    ctx.method = "GET".to_string();
+    ferrum_edge::_test_support::set_replay_request_body_empty_proven_for_test(&mut ctx, true);
     set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
 
     let mut request_headers =

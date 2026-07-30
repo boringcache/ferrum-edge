@@ -59,6 +59,225 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Retained-response replay now follows one fail-closed partition contract across
+  `response_caching`, `request_deduplication`, and `ai_semantic_cache`
+  (GHSA-w27g-65rf-h7xm, GHSA-v4g3-2r4f-f6pc, GHSA-37gg-v9m4-8445). A new shared
+  module, `plugins::utils::replay_partition`, defines it.
+  - **Caller authorization, not a display subject.** Every key binds the
+    authentication mechanism, resolved identity and consumer, peer SPIFFE
+    identity, and SHA-256 digests of every credential presented, so two
+    tokens that resolve to the same `sub` with different scopes, audiences, or
+    tenancy claims can no longer share a retained result. `scope_by_consumer`
+    and `cache_key_include_consumer` no longer gate caller isolation; they now
+    only add the display identity to the digest. `request_deduplication` also
+    stops excluding credential headers from the request fingerprint and binds
+    their digests instead, so a same-subject/different-scope credential is a
+    conflict rather than a replay. Both credential views are bound under separate
+    provenance labels — the pristine inbound wire headers and the live
+    backend-visible headers — because the post-routing caches run after
+    `ai_stream_router`, which strips the client credential and injects the
+    provider's; binding only the live view would collapse two distinct client
+    tokens onto one partition. The route's precomputed credential registry now
+    includes custom header locations configured by `key_auth`, `jwt_auth`,
+    `jwks_auth`, and `oauth2_introspection`. Present credential-bearing query
+    parameters are privately digested before authentication/transformer
+    stripping and remain mandatory caller dimensions independently of the
+    response cache's legacy `cache_key_include_query` setting.
+  - **Every caller binds canonical caller context.** A new
+    `anonymous_caller_scope` option (`caller_address` default, `shared` opt-out)
+    binds the gateway-resolved canonical peer address, which the origin observes
+    through Ferrum's regenerated `X-Forwarded-For`. Authenticated callers bind it
+    too — the backend receives their regenerated forwarding identity as well and
+    may vary policy or content by it — so the `shared` attestation applies to
+    anonymous callers only. A caller whose canonical address cannot be derived is
+    refused rather than keyed incompletely.
+  - **Effective destination is part of the key.** `response_caching` and
+    `ai_semantic_cache` run after every route-dispatch plugin and now bind the
+    post-routing upstream / host / port / scheme / authority and rewritten path,
+    so a header-selected tenant backend cannot replay another backend's result.
+    `ai_semantic_cache` now uses that shared contract instead of a plugin-local
+    encoding that omitted the proxy *namespace*, and additionally binds a
+    length-framed backend-visible request-context digest (original client
+    authority and `Host`, method, path, the effective outbound query, and every
+    non-credential request header, with credential values digested), so
+    cross-namespace and header/query-only tenant collisions are closed for both
+    exact and semantic lookup scopes.
+    `response_caching` now binds the same complete backend-visible request
+    *target* unconditionally: the effective outbound query is a key dimension
+    even when `cache_key_include_query` is `false`, which is retained only as a
+    legacy keyspace toggle. Its request-header dimension stays the complete
+    `Vary` tuple (backend-nominated dimensions, `vary_by_headers`, and the
+    mandatory credential/session auto-Vary) rather than the raw header view.
+    `Authorization`, `Proxy-Authorization`, and `Cookie` are now present as
+    dimensions on every retained response, including anonymous responses, so
+    the emitted `Vary` contract also protects downstream shared caches that
+    cannot see Ferrum's private caller partition. Authorization storage
+    admission checks both the pristine inbound and live backend-visible views,
+    so a request transformer cannot erase the origin opt-in requirement.
+    This tuple is used
+    because RFC 9111 §4.1 selection is target + `Vary` and a conditional
+    revalidation, a client `no-cache` refresh, and `Content-Length: 0` are
+    addressed to a stored entry rather than selecting a different one.
+  - **`ai_semantic_cache` lookup moved to the final-request-body stage**
+    (priority `2996` → `4057`). It previously looked up in `before_proxy`,
+    ahead of `request_transformer` (3000) and every `transform_request_body`
+    hook, so the headers, query, and prompt bytes it called "backend-visible"
+    were pre-transform, and a hit could bypass a fail-closed final-request-body
+    validator — notably `ai_prompt_compressor`, which stages a
+    marker-sanitization rejection in its transform and enforces it in its final
+    hook at 4055. Lookup now runs in `on_final_request_body_with_context`, after
+    that rejection boundary and after every request-body transform, and still
+    before `ai_federation` (4060) performs provider I/O. Every `before_proxy`
+    admission guardrail continues to run ahead of any hit, exact/semantic Redis
+    behavior is unchanged, and store remains in `on_final_response_body`.
+  - **Tracing and correlation request headers are bound, not excluded.** The
+    request-context partition previously excluded `traceparent`, `tracestate`,
+    `b3`, `X-B3-*`, `X-Request-Id`, `X-Correlation-Id` and related names by
+    reusing the response-cache sanitation classifier and asserting they are
+    fresh "by construction". That is not a valid request-side proof:
+    `correlation_id` preserves a valid client-supplied identifier, the plugin
+    may be absent entirely, and the value reaches the origin either way. They
+    are now bound like any other backend-visible header. The separate
+    response-header replay sanitation contract still strips trace identifiers
+    from retained responses and is unchanged.
+  - **A consumed credential no longer reads as an anonymous caller.** The
+    authenticated/anonymous classification now treats a candidate credential
+    present in *either* the pristine inbound wire headers or the live
+    backend-visible headers as authentication. A credential that an earlier
+    plugin removed was previously invisible to the classifier, so such a caller
+    was labelled anonymous and `anonymous_caller_scope: shared` could drop its
+    canonical-address binding — the one relaxation that is meant to apply only
+    to callers who presented nothing.
+  - **`request_deduplication` now witnesses routing and request shaping.** Its
+    lookup moved from priority `2750` to `3010`, after route dispatch and
+    request-transformer header/query rules but before terminate-mode serverless
+    execution. Its logical key now binds the effective destination and its
+    fingerprint binds the outbound query. Admission rejects every
+    same-protocol header/query mutator at or after deduplication (including
+    priority overrides), and rejects deferred request-body transformers whose
+    final wire bytes were not already established by pre-`before_proxy`
+    normalization.
+  - **Body-bearing response caching is refused.** `cacheable_methods` now
+    accepts only `GET` and `HEAD`; a body-bearing method is rejected at
+    admission. At runtime the H1/H2/H3 transport must observe the complete
+    upload and privately prove the final pre-`before_proxy` body is empty before
+    lookup. Header heuristics cannot prove this for H2/H3 DATA without
+    `Content-Length`. Non-empty or unproven bodies bypass lookup and storage,
+    and composition admission rejects deferred body transformers that could
+    synthesize bytes after lookup.
+  - **Canonical length-framed key serialization replaces raw delimiters.**
+    `ai_semantic_cache` no longer joins roles, content, and broader fields with
+    literal `:`, `|`, and newline bytes, and `response_caching` no longer
+    appends `name=value|name=value` Vary suffixes. Keys are digests over typed,
+    length-framed fields with explicit sequence counts and presence flags, so a
+    legal value containing a delimiter cannot reproduce another request's
+    preimage. `response_caching` hashes the *complete* Vary tuple — every name,
+    presence flag, and value — rather than only the subset classified as
+    sensitive.
+  - **Bounded cache maintenance.** `response_caching` overflow eviction now pops
+    an insertion-ordered queue in amortized O(1) instead of cloning and sorting
+    the entire cache under the accounting mutex for every admitted entry;
+    unsafe-method invalidation is an indexed exact lookup plus one ordered range
+    over the mutated path's descendants instead of a full-cache scan;
+    `vary_index` mappings are reclaimed exactly when their last variant leaves
+    instead of by a heuristic sweep; and the uncacheable predictor enforces its
+    bound with a FIFO queue instead of a full clone + sort at capacity. Byte-cap
+    pressure now evicts oldest-first rather than scanning for expiry.
+  - Replay keys, credentials, caller identities, and authorization fingerprints
+    are never logged; the remaining diagnostics carry only counts and static
+    reasons.
+  - **Breaking:** key derivation changed in all three plugins, so entries stored
+    by a previous build are unreachable — the intended fail-closed outcome for
+    anything keyed under the weaker partition. `response_caching` configs that
+    listed a body-bearing `cacheable_methods` entry now fail admission.
+    `request_deduplication` and `response_caching` priority overrides and
+    deferred body-transform compositions that hide final backend-visible
+    request state now fail admission; `mcp_gateway` remains incompatible
+    because its response rewrite is derived from mutable live discovery state.
+    `ai_semantic_cache` moves
+    from priority `2996` to `4057`: a `before_proxy`
+    short-circuit that previously lost to a cache hit (`serverless_function`,
+    `response_mock`) now wins, and a priority override placing the cache at or
+    before a co-located `ai_prompt_compressor` re-opens the bypass this change
+    closes.
+- Transformer RTDS gates are now bound to the mesh generation that supplied
+  their rules (GHSA-83rc-23c9-3g9x). `request_transformer` and
+  `response_transformer` read `ferrum.{request,response}_transformer.<scope>.enabled`
+  from process-global stores that mesh swapped *after* `ProxyState::update_config`
+  had already published the new `RequestEpoch`, and they re-read those stores at
+  every request phase. That opened two windows: a plugin built from the new slice
+  could read the previous gate during the publication gap, and an already-admitted
+  request could read a newly published gate for its whole lifetime — unbounded for
+  a slow upload or a slow backend. Scope, rules, defaults, and gate could combine
+  into states that existed in neither accepted slice, and one request could
+  observe different values at different phases: a request-side marker header
+  could be added while its paired body removal was skipped, and a response whose
+  buffering preflight answered `false` (selecting streaming) could then have
+  header rules applied by a `true` header phase, shipping a response marked as
+  sanitized whose body rules never ran.
+
+  The accepted overlay's gate is now materialized into each candidate instance's
+  own effective config on the mesh cold path — the same model `fault_injection`
+  already used for RTDS fault percentages — as the reserved
+  `runtime_overlay_resolved_enabled`. Gate and rules are therefore validated,
+  built, and published as one indivisible generation, and each instance resolves
+  one immutable decision at construction that every phase reads: buffering
+  preflight, request headers/query/body, response streaming/buffering selection,
+  response headers/body, retries, and synthetic responses, identically on
+  H1/H2/H3. An in-flight request stays wholly on the generation it pinned; a
+  rejected slice leaves the previous gate serving in full. Overlay-only changes
+  publish as coherent new generations because the affected instances are
+  re-stamped for rebuild. The request path no longer performs any overlay lookup,
+  removing a per-request `ArcSwap` load. The gate stores are still published
+  after acceptance as the provenance surface `response_caching` and
+  `request_deduplication` bind retained representations to, and
+  `GET /mesh/runtime-overlay` is unchanged. Because that publication lands
+  *after* the request epoch, a request whose authenticate/authorize phase spans
+  a slice apply keeps the plugin generation it pinned while pinning the newly
+  published identity; `response_caching` therefore also binds each stored entry
+  to its own generation's effective presentation-policy digest — which now
+  covers the materialized gate — so an entry shaped by a superseded generation
+  is refetched instead of replayed. An unprovable digest retains nothing.
+  `request_deduplication` already bound both halves.
+- Route-scoped request/response body ceilings are now enforced by the proxy core
+  on every path, not just in body hooks (GHSA-xrfj-852f-645j). The `max_bytes` of
+  `request_size_limiting` / `response_size_limiting` is published to the core
+  through the plugin cache (precomputed per proxy/protocol) and folded into the
+  effective bound of every H1/H2, direct-H2/SNI, native-H3 and H3
+  cross-protocol, unary/streaming gRPC, retry, buffering, coalescing, mesh-mTLS,
+  and HBONE path *before bytes are forwarded or retained*. Previously
+  `request_size_limiting` could not bound an unbuffered chunked, H2/H3
+  unknown-length, or streaming-gRPC upload at all — those streamed up to the
+  generally larger global ceiling, and to no bound whatsoever when the global
+  ceiling was disabled. Specific changes:
+  - The effective bound is the strictest *active* (nonzero) value of the route
+    ceiling and the applicable global knob, and a global limit of `0`
+    ("unlimited") no longer disables an active route ceiling. Multiple instances
+    (and a global composed with a proxy-scoped instance) compose to their
+    minimum; a looser sibling never relaxes the strictest active bound.
+  - Strict buffered response collection (`require_buffered_check: true`) now
+    aborts at the route ceiling instead of retaining up to the global allowance
+    and only then failing the lower final check, so concurrent requests can no
+    longer amplify retained gateway memory toward the global allowance each.
+  - Response-size policy now runs over every already-buffered synthetic body
+    (mock, `serverless_function`, response/semantic cache, `ai_federation`, dedup
+    replay) without depending on another plugin to activate the response
+    body-hook gate. A default non-buffering instance previously had no hook on
+    that path, so an oversized synthetic body crossed the client boundary.
+  - Standards-valid repeated identical `Content-Length` values (RFC 9110 §8.6)
+    are parsed per comma-folded member on both request and response fast paths
+    via a shared canonical parser, so `Content-Length: 2048, 2048` is compared
+    against the ceiling instead of failing a whole-list `parse()` and silently
+    skipping the bound. Members are validated as `1*DIGIT` (so `+2048` is not
+    honored as a length). A declared length that cannot be reduced to one agreed
+    value now fails closed — HTTP 400 on the request side, HTTP 502 on the
+    response side — rather than reading as an absent length. Bodyless semantics
+    (`HEAD`, `1xx`, `204`/`205`/`304`) remain exempt.
+  - Post-transform checks are preserved, and the effective ceiling additionally
+    bounds the buffered-representation decode gate and compression admission, so
+    a decoding or expanding transform cannot escape the route policy.
+  This completes the advisory; [PR #3176](https://github.com/ferrum-edge/ferrum-edge/pull/3176)
+  had previously closed only the direct-H2/SNI early-response timing window.
 - `soap_ws_security` no longer trusts client media-type selection
   (GHSA-435h-f785-wmm4). Content types are parsed structurally (`type/subtype`
   plus RFC 9110 parameters) and matched by exact essence instead of

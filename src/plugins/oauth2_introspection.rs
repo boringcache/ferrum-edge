@@ -84,6 +84,7 @@ pub struct Oauth2Introspection {
     consumer_header_claim: String,
     strip_authorization_on_success: bool,
     has_custom_query_token_locations: bool,
+    request_headers_to_redact: Vec<String>,
     allow_provider_fanout: bool,
     /// Complete gateway-owned `claim_headers` destination set across every
     /// provider. Precomputed so `before_proxy` can sanitize without walking the
@@ -396,6 +397,27 @@ impl Oauth2Introspection {
                 .iter()
                 .any(|location| matches!(location, TokenLocation::QueryParam(_)))
         });
+        let mut request_headers_to_redact = Vec::new();
+        for provider in &providers {
+            if provider.token_locations.is_empty()
+                && !request_headers_to_redact
+                    .iter()
+                    .any(|known: &String| known == "authorization")
+            {
+                request_headers_to_redact.push("authorization".to_string());
+            }
+            for location in &provider.token_locations {
+                let TokenLocation::Header(header) = location else {
+                    continue;
+                };
+                if !request_headers_to_redact
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&header.name))
+                {
+                    request_headers_to_redact.push(header.name.clone());
+                }
+            }
+        }
 
         let claim_header_destinations = ClaimHeaderDestinations::from_mapping_groups(
             providers
@@ -413,6 +435,7 @@ impl Oauth2Introspection {
             consumer_header_claim,
             strip_authorization_on_success,
             has_custom_query_token_locations,
+            request_headers_to_redact,
             allow_provider_fanout,
             claim_header_destinations,
             discovery_tasks: Mutex::new(None),
@@ -1183,6 +1206,10 @@ impl super::Plugin for Oauth2Introspection {
         for provider in &self.providers {
             mark_present_query_credential_locations(ctx, &provider.token_locations);
         }
+    }
+
+    fn request_headers_to_redact(&self) -> &[String] {
+        &self.request_headers_to_redact
     }
 
     fn modifies_request_headers(&self) -> bool {

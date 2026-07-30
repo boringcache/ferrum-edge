@@ -66,6 +66,7 @@ mod response_body_mode_tests;
 mod response_representation_tests;
 mod response_trailer_policy_tests;
 mod retry_tests;
+mod route_body_size_ceiling_tests;
 mod router_cache_tests;
 mod runtime_metrics_tests;
 mod secondary_request_headers_tests;

@@ -239,6 +239,24 @@ pub mod _test_support {
         ctx.clone_for_final_request_body_hooks()
     }
 
+    /// Install the route's precomputed credential-header registry so external
+    /// replay-partition tests can exercise stripped custom auth locations.
+    pub fn set_replay_credential_headers_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        headers: Vec<String>,
+    ) {
+        ctx.set_request_headers_to_redact(Arc::new(headers));
+    }
+
+    /// Model the transport-owned empty-body proof for direct plugin lifecycle
+    /// tests that do not enter through an HTTP proxy body-drain path.
+    pub fn set_replay_request_body_empty_proven_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        proven: bool,
+    ) {
+        ctx.set_replay_request_body_empty_proven(proven);
+    }
+
     pub fn gateway_response_compression_algorithm_for_test(
         ctx: &crate::plugins::RequestContext,
     ) -> Option<&'static str> {
@@ -465,11 +483,21 @@ pub mod _test_support {
 
     /// Exercise the mesh RTDS generation reconciliation boundary without
     /// widening its runtime API beyond the crate.
-    pub fn reconcile_fault_plugin_generations_for_test(
+    pub fn reconcile_runtime_overlay_plugin_generations_for_test(
         candidate: &mut crate::config::types::GatewayConfig,
         previous: &crate::config::types::GatewayConfig,
     ) {
-        crate::modes::mesh::reconcile_fault_plugin_generations(candidate, previous);
+        crate::modes::mesh::reconcile_runtime_overlay_plugin_generations(candidate, previous);
+    }
+
+    /// Bind transformer RTDS gates into a candidate config exactly as mesh slice
+    /// preparation does, so external tests exercise the production binding
+    /// rather than a reimplementation of it (GHSA-83rc-23c9-3g9x).
+    pub fn materialize_transformer_runtime_overlay_for_test(
+        config: &mut crate::config::types::GatewayConfig,
+        overlay: &crate::modes::mesh::config::MeshRuntimeOverlay,
+    ) {
+        crate::modes::mesh::materialize_transformer_runtime_overlay(config, overlay);
     }
 
     /// Return the exact proxy targets used by incremental plugin-cache staging.
@@ -690,6 +718,41 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
     ) {
         ctx.mark_gateway_deadline_response_selected();
+    }
+
+    /// Run the buffered request-body stage the way the proxy does: every
+    /// `transform_request_body` hook first, then every `on_final_request_body`
+    /// hook, over one shared `RequestContext`.
+    ///
+    /// This is the ordering that makes `ai_prompt_compressor`'s staged
+    /// marker-sanitization rejection (staged in the transform, enforced in the
+    /// final hook at 4055) fire ahead of `ai_semantic_cache` lookup (4057).
+    /// `plugins` must already be sorted by effective priority.
+    pub async fn run_request_body_stage_with_context_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> (Vec<u8>, crate::plugins::PluginResult) {
+        let deadline = ctx.grpc_deadline_at();
+        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            plugins,
+            Some(&mut *ctx),
+            deadline,
+            headers,
+            body.to_vec(),
+        )
+        .await;
+        let result = crate::proxy::run_final_request_body_hooks_with_provenance(
+            plugins,
+            Some(&mut *ctx),
+            deadline,
+            headers,
+            &transformed,
+        )
+        .await
+        .into_plugin_result(ctx);
+        (transformed, result)
     }
 
     pub async fn run_context_free_final_request_body_hooks_for_test(
@@ -5721,6 +5784,49 @@ pub mod _test_support {
             grpc_limit,
             plugin_limit,
         )
+    }
+
+    /// Fold a global body ceiling with a route/plugin ceiling exactly as every
+    /// request path does (`GHSA-xrfj-852f-645j`).
+    pub fn effective_request_body_limit_for_test(
+        global_limit: usize,
+        plugin_limit: Option<usize>,
+    ) -> usize {
+        crate::proxy::effective_request_body_limit(global_limit, plugin_limit)
+    }
+
+    /// Compose a phase's own buffering cap with the route ceiling.
+    pub fn stricter_optional_limit_for_test(a: Option<usize>, b: Option<usize>) -> Option<usize> {
+        crate::proxy::stricter_optional_limit(a, b)
+    }
+
+    /// Canonical declared `Content-Length` from a raw header map, honoring
+    /// standards-valid repeated identical values and refusing ambiguity.
+    pub fn canonical_header_content_length_for_test(headers: &http::HeaderMap) -> Option<u64> {
+        crate::proxy::canonical_header_content_length(headers)
+    }
+
+    /// Canonical declared `Content-Length` from a comma-folded header map.
+    pub fn canonical_header_content_length_from_map_for_test(
+        headers: &std::collections::HashMap<String, String>,
+    ) -> Option<u64> {
+        crate::proxy::canonical_header_content_length_from_map(headers)
+    }
+
+    /// Request-side declared-length reject predicate used by every dispatch path.
+    pub fn declared_request_content_length_over_limit_for_test(
+        headers: &std::collections::HashMap<String, String>,
+        max_bytes: usize,
+    ) -> bool {
+        crate::proxy::declared_request_content_length_over_limit(headers, max_bytes)
+    }
+
+    /// Response-side declared-length reject predicate used by every dispatch path.
+    pub fn declared_response_length_exceeds_limit_for_test(
+        headers: &std::collections::HashMap<String, String>,
+        max_response_body_size_bytes: usize,
+    ) -> Option<usize> {
+        crate::proxy::declared_response_length_exceeds_limit(headers, max_response_body_size_bytes)
     }
 
     pub async fn collect_h1h2_request_body_with_deadline_for_test<F, T, E>(

@@ -6,7 +6,7 @@ use ferrum_edge::_test_support::{
     initial_response_header_policy_plugins_by_bare_proxy_id_for_test,
     initial_response_header_policy_plugins_for_test, plugin_cache_with_real_ip_header_for_test,
     plugins_for_protocol_by_bare_proxy_id_for_test, plugins_for_protocol_for_test,
-    reconcile_fault_plugin_generations_for_test,
+    reconcile_runtime_overlay_plugin_generations_for_test,
     request_deduplication_logical_keys_from_context_for_test, run_after_proxy_hooks_for_test,
     set_grpc_deadline_budget_for_test, transform_buffered_response_body_with_deadline_for_test,
     validate_correlation_id_composition_with_real_ip_header_for_test,
@@ -3409,6 +3409,10 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
         candidate_names.contains("\"soap_ws_security\""),
         "candidate construction must include SOAP so custom auth capabilities cannot bypass its sole-auth gate"
     );
+    assert!(
+        candidate_names.contains("\"workload_metrics\""),
+        "candidate construction must include every built-in request-header mutator so replay plugins cannot pass admission ahead of workload tracing rewrites"
+    );
     let effective_chain_start = source
         .find("fn validate_plugin_security_composition(")
         .expect("effective-chain security validator must exist");
@@ -3460,7 +3464,7 @@ async fn transcript_audit_must_precede_every_request_deduplication_instance() {
         .expect("default audit priority must stage before deduplication");
     PluginCache::new(&valid).expect("runtime cache must accept the safe order");
 
-    for invalid_priority in [2750, 2800] {
+    for invalid_priority in [3010, 3020] {
         let mut audit = audit_config();
         audit.priority_override = Some(invalid_priority);
         let invalid = make_config(
@@ -3598,7 +3602,7 @@ fn candidate_serverless_pure_capabilities_still_reject_unsafe_order_and_body_egr
 
 #[test]
 fn terminate_serverless_must_run_after_every_request_deduplication_instance() {
-    for serverless_priority in [2700, 2750] {
+    for serverless_priority in [2700, 3010] {
         let mut serverless = make_plugin_config_with_json(
             "terminal-function",
             "serverless_function",
@@ -3631,6 +3635,277 @@ fn terminate_serverless_must_run_after_every_request_deduplication_instance() {
         assert!(error.contains("serverless_function"), "{error}");
         assert!(error.contains("request_deduplication"), "{error}");
     }
+}
+
+#[test]
+fn request_deduplication_rejects_unwitnessable_request_mutation_order_and_body() {
+    let dedup = || {
+        make_plugin_config(
+            "dedup",
+            "request_deduplication",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )
+    };
+
+    let mut late_headers = make_plugin_config_with_json(
+        "transform",
+        "request_transformer",
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "header",
+                "key": "x-operation",
+                "value": "v2"
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    late_headers.priority_override = Some(3010);
+    let late_headers_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "transform"])],
+        vec![dedup(), late_headers],
+    );
+    let late_headers_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &late_headers_config,
+        None,
+    )
+    .expect_err("deduplication must observe request-transformer header/query output");
+    assert!(
+        late_headers_error.contains("fingerprint headers/query"),
+        "{late_headers_error}"
+    );
+
+    let mut late_query = make_plugin_config_with_json(
+        "transform",
+        "request_transformer",
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "query",
+                "key": "operation",
+                "value": "v2"
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    late_query.priority_override = Some(3020);
+    let late_query_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "transform"])],
+        vec![dedup(), late_query],
+    );
+    let late_query_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &late_query_config,
+        None,
+    )
+    .expect_err("query-only mutation after deduplication must be rejected");
+    assert!(
+        late_query_error.contains("fingerprint headers/query"),
+        "{late_query_error}"
+    );
+
+    let safe_query = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "transform"])],
+        vec![
+            dedup(),
+            make_plugin_config_with_json(
+                "transform",
+                "request_transformer",
+                json!({
+                    "rules": [{
+                        "operation": "add",
+                        "target": "query",
+                        "key": "operation",
+                        "value": "v2"
+                    }]
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&safe_query, None)
+        .expect("the default transformer order runs before deduplication");
+    PluginCache::new(&safe_query)
+        .expect("runtime construction must accept the observable query-transform order");
+
+    let late_headers_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "compression"])],
+        vec![
+            dedup(),
+            make_plugin_config_with_json(
+                "compression",
+                "compression",
+                json!({}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let late_headers_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &late_headers_config,
+        None,
+    )
+    .expect_err("a later built-in header mutation must be rejected");
+    assert!(
+        late_headers_error.contains("compression")
+            && late_headers_error.contains("fingerprint headers/query"),
+        "{late_headers_error}"
+    );
+    let runtime_error = PluginCache::new(&late_headers_config)
+        .err()
+        .expect("runtime construction must repeat the later-header refusal");
+    assert!(
+        runtime_error.contains("compression")
+            && runtime_error.contains("fingerprint headers/query"),
+        "{runtime_error}"
+    );
+
+    let body_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "transform"])],
+        vec![
+            dedup(),
+            make_plugin_config_with_json(
+                "transform",
+                "request_transformer",
+                json!({
+                    "rules": [{
+                        "operation": "add",
+                        "target": "body",
+                        "key": "operation",
+                        "value": "rewritten"
+                    }]
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let candidate_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&body_config, None)
+            .expect_err("candidate admission must reject a post-lookup body policy");
+    assert!(
+        candidate_error.contains("backend-visible body policy"),
+        "{candidate_error}"
+    );
+    let runtime_error = PluginCache::new(&body_config)
+        .err()
+        .expect("runtime construction must repeat the body-policy refusal");
+    assert!(
+        runtime_error.contains("backend-visible body policy"),
+        "{runtime_error}"
+    );
+}
+
+#[test]
+fn response_caching_rejects_unwitnessable_request_mutation_order_and_body() {
+    let cache = || {
+        make_plugin_config(
+            "cache",
+            "response_caching",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )
+    };
+
+    let mut late_query = make_plugin_config_with_json(
+        "transform",
+        "request_transformer",
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "query",
+                "key": "tenant",
+                "value": "later"
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    late_query.priority_override = Some(3600);
+    let late_query_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["cache", "transform"])],
+        vec![cache(), late_query],
+    );
+    let candidate_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &late_query_config,
+        None,
+    )
+    .expect_err("cache lookup must run after the final query mutation");
+    assert!(
+        candidate_error.contains("before the final backend-visible headers/query"),
+        "{candidate_error}"
+    );
+    let runtime_error = PluginCache::new(&late_query_config)
+        .err()
+        .expect("runtime construction must repeat the mutation-order refusal");
+    assert!(
+        runtime_error.contains("before the final backend-visible headers/query"),
+        "{runtime_error}"
+    );
+
+    let safe_query = make_config(
+        vec![make_proxy("p1", "/api", vec!["cache", "transform"])],
+        vec![
+            cache(),
+            make_plugin_config_with_json(
+                "transform",
+                "request_transformer",
+                json!({
+                    "rules": [{
+                        "operation": "add",
+                        "target": "query",
+                        "key": "tenant",
+                        "value": "earlier"
+                    }]
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&safe_query, None)
+        .expect("default query transformation precedes cache lookup");
+    PluginCache::new(&safe_query).expect("runtime cache must accept the observable order");
+
+    let body_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["cache", "transform"])],
+        vec![
+            cache(),
+            make_plugin_config_with_json(
+                "transform",
+                "request_transformer",
+                json!({
+                    "rules": [{
+                        "operation": "add",
+                        "target": "body",
+                        "key": "tenant",
+                        "value": "synthesized"
+                    }]
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let candidate_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&body_config, None)
+            .expect_err("a post-lookup body transform must fail closed");
+    assert!(
+        candidate_error.contains("later transform could synthesize backend-visible bytes"),
+        "{candidate_error}"
+    );
+    let runtime_error = PluginCache::new(&body_config)
+        .err()
+        .expect("runtime cache must repeat the body-policy refusal");
+    assert!(
+        runtime_error.contains("later transform could synthesize backend-visible bytes"),
+        "{runtime_error}"
+    );
 }
 
 #[test]
@@ -5929,7 +6204,7 @@ fn fault_reconciliation_scope_move_advances_the_actual_generation() {
     let mut candidate = accepted.clone();
     candidate.plugin_configs[0].scope = PluginScope::Proxy;
     candidate.plugin_configs[0].proxy_id = Some("p1".to_string());
-    reconcile_fault_plugin_generations_for_test(&mut candidate, &accepted);
+    reconcile_runtime_overlay_plugin_generations_for_test(&mut candidate, &accepted);
 
     assert!(candidate.plugin_configs[0].updated_at > generation);
     let delta = ConfigDelta::compute(&accepted, &candidate);
@@ -5953,7 +6228,7 @@ fn fault_reconciliation_priority_change_advances_the_actual_generation() {
 
     let mut candidate = accepted.clone();
     candidate.plugin_configs[0].priority_override = Some(42);
-    reconcile_fault_plugin_generations_for_test(&mut candidate, &accepted);
+    reconcile_runtime_overlay_plugin_generations_for_test(&mut candidate, &accepted);
 
     assert!(candidate.plugin_configs[0].updated_at > generation);
     let delta = ConfigDelta::compute(&accepted, &candidate);
@@ -5975,12 +6250,12 @@ fn fault_reconciliation_comparison_is_schema_complete_and_normalizes_only_timest
 
     let mut persistence_only = accepted.clone();
     persistence_only.plugin_configs[0].created_at += chrono::Duration::seconds(1);
-    reconcile_fault_plugin_generations_for_test(&mut persistence_only, &accepted);
+    reconcile_runtime_overlay_plugin_generations_for_test(&mut persistence_only, &accepted);
     assert_eq!(persistence_only.plugin_configs[0].updated_at, generation);
 
     let mut metadata_changed = accepted.clone();
     metadata_changed.plugin_configs[0].api_spec_id = Some("spec-owner".to_string());
-    reconcile_fault_plugin_generations_for_test(&mut metadata_changed, &accepted);
+    reconcile_runtime_overlay_plugin_generations_for_test(&mut metadata_changed, &accepted);
     assert!(metadata_changed.plugin_configs[0].updated_at > generation);
     assert_eq!(
         ConfigDelta::compute(&accepted, &metadata_changed)
@@ -9075,6 +9350,10 @@ fn test_response_caching_requires_response_body_buffering() {
         cache.requires_response_body_buffering("ferrum", "p1"),
         "response_caching should require response body buffering"
     );
+    assert!(
+        cache.requires_request_body_buffering("ferrum", "p1"),
+        "response_caching must observe the complete GET/HEAD upload before lookup"
+    );
 }
 
 #[test]
@@ -9984,15 +10263,15 @@ fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_polici
         vec![make_proxy(
             "p1",
             "/api",
-            vec!["dedup", "grpc-web", "method-router", "deadline"],
+            vec!["cache", "grpc-web", "method-router", "deadline"],
         )],
         vec![
-            make_plugin_config(
-                "dedup",
-                "request_deduplication",
+            make_plugin_config_with_json(
+                "cache",
+                "response_caching",
+                json!({"ttl_seconds": 60}),
                 PluginScope::Proxy,
                 Some("p1"),
-                true,
             ),
             make_plugin_config("grpc-web", "grpc_web", PluginScope::Proxy, Some("p1"), true),
             make_plugin_config(
@@ -10014,11 +10293,7 @@ fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_polici
     let cache = PluginCache::new(&config).expect("plugin cache");
     let view = ferrum_edge::_test_support::grpc_web_request_view_for_test(&cache, "p1");
 
-    assert!(
-        view.plugins
-            .iter()
-            .any(|name| name == "request_deduplication")
-    );
+    assert!(view.plugins.iter().any(|name| name == "response_caching"));
     assert!(view.plugins.iter().any(|name| name == "grpc_web"));
     assert_eq!(
         view.plugins
@@ -10089,7 +10364,7 @@ fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_polici
         !reloaded_view
             .plugins
             .iter()
-            .any(|name| name == "request_deduplication")
+            .any(|name| name == "response_caching")
     );
     assert_eq!(
         reloaded_view
@@ -11280,4 +11555,258 @@ fn managed_config_without_its_runtime_policy_in_the_tcp_chain_is_not_ready() {
     // No managed row: an operator instance in the chain never satisfies it.
     assert!(!ready_from_counts(false, 1, 1));
     assert!(!ready_from_counts(true, 0, 0));
+}
+
+// === Route body-size ceiling fold (GHSA-xrfj-852f-645j) ===
+
+fn size_limit_plugin(
+    id: &str,
+    plugin_name: &str,
+    max_bytes: u64,
+    scope: PluginScope,
+    proxy_id: Option<&str>,
+) -> PluginConfig {
+    make_plugin_config_with_json(
+        id,
+        plugin_name,
+        json!({"max_bytes": max_bytes}),
+        scope,
+        proxy_id,
+    )
+}
+
+/// The precomputed ceiling is what every streaming adapter and buffered
+/// collector reads; without it the route limit only ever reached a body hook
+/// that an unbuffered upload never executes.
+#[test]
+fn request_view_publishes_the_configured_route_request_ceiling() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["rsl"])],
+        vec![size_limit_plugin(
+            "rsl",
+            "request_size_limiting",
+            1024,
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).expect("request size cache");
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert_eq!(view.enforced_request_body_limit(), Some(1024));
+    assert_eq!(view.enforced_response_body_limit(), None);
+}
+
+#[test]
+fn request_view_publishes_the_configured_route_response_ceiling() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["resl"])],
+        vec![size_limit_plugin(
+            "resl",
+            "response_size_limiting",
+            2048,
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).expect("response size cache");
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert_eq!(view.enforced_response_body_limit(), Some(2048));
+    assert_eq!(view.enforced_request_body_limit(), None);
+}
+
+/// Multiple instances on one proxy compose to their MINIMUM. A looser sibling
+/// must never relax the strictest active bound.
+#[test]
+fn multiple_size_limiting_instances_compose_to_the_minimum() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["loose", "strict"])],
+        vec![
+            size_limit_plugin(
+                "loose",
+                "request_size_limiting",
+                8192,
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            size_limit_plugin(
+                "strict",
+                "request_size_limiting",
+                512,
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("two-instance cache");
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert_eq!(view.enforced_request_body_limit(), Some(512));
+}
+
+/// A global instance and a proxy-scoped instance of DIFFERENT size plugins both
+/// contribute; the request and response ceilings are tracked independently.
+#[test]
+fn global_and_proxy_scoped_size_ceilings_are_tracked_per_direction() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["resl"])],
+        vec![
+            size_limit_plugin(
+                "global-rsl",
+                "request_size_limiting",
+                4096,
+                PluginScope::Global,
+                None,
+            ),
+            size_limit_plugin(
+                "resl",
+                "response_size_limiting",
+                256,
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("mixed-scope cache");
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert_eq!(view.enforced_request_body_limit(), Some(4096));
+    assert_eq!(view.enforced_response_body_limit(), Some(256));
+}
+
+/// Unlike ordinary replaceable plugin configuration, same-name global and
+/// scoped size policies are conjunctive. Both instances must survive the merge
+/// and the precomputed ceiling must keep the stricter bound in each direction.
+#[test]
+fn same_name_global_and_scoped_size_limiters_compose_to_the_minimum() {
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["scoped-request", "scoped-response"],
+        )],
+        vec![
+            size_limit_plugin(
+                "global-request",
+                "request_size_limiting",
+                512,
+                PluginScope::Global,
+                None,
+            ),
+            size_limit_plugin(
+                "scoped-request",
+                "request_size_limiting",
+                8192,
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            size_limit_plugin(
+                "global-response",
+                "response_size_limiting",
+                8192,
+                PluginScope::Global,
+                None,
+            ),
+            size_limit_plugin(
+                "scoped-response",
+                "response_size_limiting",
+                512,
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("same-name mixed-scope cache");
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert_eq!(view.enforced_request_body_limit(), Some(512));
+    assert_eq!(view.enforced_response_body_limit(), Some(512));
+    assert_eq!(
+        view.plugins()
+            .iter()
+            .filter(|plugin| plugin.name() == "request_size_limiting")
+            .count(),
+        2,
+        "global and scoped request limiters must both remain active"
+    );
+    assert_eq!(
+        view.plugins()
+            .iter()
+            .filter(|plugin| plugin.name() == "response_size_limiting")
+            .count(),
+        2,
+        "global and scoped response limiters must both remain active"
+    );
+}
+
+/// Both size plugins are `HTTP_GRPC_PROTOCOLS`, so the ceiling is published to
+/// the gRPC protocol view too — that view is what the native and streaming gRPC
+/// dispatch paths bound themselves with.
+#[test]
+fn size_ceilings_are_published_to_the_grpc_protocol_view() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["rsl", "resl"])],
+        vec![
+            size_limit_plugin(
+                "rsl",
+                "request_size_limiting",
+                1024,
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            size_limit_plugin(
+                "resl",
+                "response_size_limiting",
+                2048,
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("grpc view cache");
+
+    for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
+        let view = cache.request_view("ferrum", "p1", protocol);
+        assert_eq!(
+            view.enforced_request_body_limit(),
+            Some(1024),
+            "{protocol:?} must inherit the route request ceiling"
+        );
+        assert_eq!(
+            view.enforced_response_body_limit(),
+            Some(2048),
+            "{protocol:?} must inherit the route response ceiling"
+        );
+    }
+}
+
+/// A proxy with no size-limiting plugin publishes no ceiling, so every dispatch
+/// path keeps using the operator's global knob exactly as before the fix.
+#[test]
+fn proxy_without_size_limiting_publishes_no_ceiling() {
+    let config = make_config(vec![make_proxy("p1", "/api", vec![])], vec![]);
+    let cache = PluginCache::new(&config).expect("plain cache");
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert_eq!(view.enforced_request_body_limit(), None);
+    assert_eq!(view.enforced_response_body_limit(), None);
+}
+
+/// A disabled instance contributes nothing rather than publishing a ceiling.
+#[test]
+fn disabled_size_limiting_instance_publishes_no_ceiling() {
+    let mut plugin = size_limit_plugin(
+        "rsl",
+        "request_size_limiting",
+        1024,
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin.enabled = false;
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["rsl"])], vec![plugin]);
+    let cache = PluginCache::new(&config).expect("disabled-instance cache");
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert_eq!(view.enforced_request_body_limit(), None);
 }

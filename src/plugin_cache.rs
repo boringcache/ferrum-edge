@@ -83,6 +83,10 @@ impl Plugin for ServerlessSecurityCompositionPlugin {
         crate::plugins::HTTP_GRPC_PROTOCOLS
     }
 
+    fn modifies_request_headers(&self) -> bool {
+        !self.terminate
+    }
+
     fn egresses_request_body_before_finalization(&self) -> bool {
         self.forward_body
     }
@@ -328,6 +332,94 @@ fn validate_plugin_security_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(
             ));
         }
 
+        for deduplication in plugins.iter().filter(|plugin| {
+            plugin.supported_protocols().contains(&protocol)
+                && plugin.name() == "request_deduplication"
+        }) {
+            if let Some(transformer) = plugins.iter().find(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && plugin.name() != "request_deduplication"
+                    && plugin.modifies_request_body()
+                    && !plugin.final_request_body_matches_pre_before_proxy_normalization()
+            }) {
+                return Err(format!(
+                    "request_deduplication cannot be combined with deferred request-body \
+                     transformer '{}' for protocol {:?} on the same proxy; deduplication \
+                     fingerprints during before_proxy, before request-body transforms run, \
+                     so a retained operation cannot witness the backend-visible body policy",
+                    transformer.name(),
+                    protocol
+                ));
+            }
+
+            if let Some(later_mutator) = plugins.iter().find(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && plugin.name() != "request_deduplication"
+                    && plugin.priority() >= deduplication.priority()
+                    && (plugin.modifies_request_headers() || plugin.modifies_request_query())
+            }) {
+                return Err(format!(
+                    "request mutation plugin '{}' at effective priority {} must run before \
+                     every request_deduplication instance for protocol {:?}; \
+                     request_deduplication priority {} would fingerprint headers/query before \
+                     their backend-visible mutation",
+                    later_mutator.name(),
+                    later_mutator.priority(),
+                    protocol,
+                    deduplication.priority()
+                ));
+            }
+        }
+
+        for response_cache in plugins.iter().filter(|plugin| {
+            plugin.supported_protocols().contains(&protocol) && plugin.name() == "response_caching"
+        }) {
+            if let Some(transformer) = plugins.iter().find(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && plugin.name() != "response_caching"
+                    // gRPC-Web body translation is owned only for its
+                    // content-types (normally POST). Response caching admits
+                    // only GET/HEAD and additionally requires an observed empty
+                    // upload, so the two request-time populations are disjoint.
+                    && plugin.name() != "grpc_web"
+                    && plugin.modifies_request_body()
+                    && !plugin.final_request_body_matches_pre_before_proxy_normalization()
+            }) {
+                return Err(format!(
+                    "response_caching cannot be combined with deferred request-body \
+                     transformer '{}' for protocol {:?} on the same proxy; cache lookup runs \
+                     during before_proxy and only admits a transport-proven empty body, so a \
+                     later transform could synthesize backend-visible bytes after lookup",
+                    transformer.name(),
+                    protocol
+                ));
+            }
+
+            if let Some(later_mutator) = plugins.iter().find(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && plugin.name() != "response_caching"
+                    // Compression's later header projection is a deterministic
+                    // removal/normalization of fields already bound by the
+                    // cache key; it cannot introduce an unbound origin-visible
+                    // dimension. Response caching intentionally composes with
+                    // compression to retain final encoded representations.
+                    && plugin.name() != "compression"
+                    && plugin.priority() >= response_cache.priority()
+                    && (plugin.modifies_request_headers() || plugin.modifies_request_query())
+            }) {
+                return Err(format!(
+                    "request mutation plugin '{}' at effective priority {} must run before \
+                     every response_caching instance for protocol {:?}; response_caching \
+                     priority {} would select a retained response before the final \
+                     backend-visible headers/query exist",
+                    later_mutator.name(),
+                    later_mutator.priority(),
+                    protocol,
+                    response_cache.priority()
+                ));
+            }
+        }
+
         for side_effecting_plugin in plugins.iter().filter(|plugin| {
             plugin.supported_protocols().contains(&protocol)
                 && plugin.requires_prior_request_deduplication()
@@ -499,6 +591,9 @@ impl Plugin for PriorityOverridePlugin {
     fn modifies_request_headers(&self) -> bool {
         self.inner.modifies_request_headers()
     }
+    fn modifies_request_query(&self) -> bool {
+        self.inner.modifies_request_query()
+    }
     fn modifies_request_body(&self) -> bool {
         self.inner.modifies_request_body()
     }
@@ -514,6 +609,10 @@ impl Plugin for PriorityOverridePlugin {
     fn normalizes_buffered_request_body_before_before_proxy(&self) -> bool {
         self.inner
             .normalizes_buffered_request_body_before_before_proxy()
+    }
+    fn final_request_body_matches_pre_before_proxy_normalization(&self) -> bool {
+        self.inner
+            .final_request_body_matches_pre_before_proxy_normalization()
     }
     async fn normalize_buffered_request_body_before_before_proxy(
         &self,
@@ -553,6 +652,12 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn request_body_buffer_limit(&self) -> Option<usize> {
         self.inner.request_body_buffer_limit()
+    }
+    fn enforced_request_body_limit(&self) -> Option<u64> {
+        self.inner.enforced_request_body_limit()
+    }
+    fn enforced_response_body_limit(&self) -> Option<u64> {
+        self.inner.enforced_response_body_limit()
     }
     async fn before_proxy(
         &self,
@@ -2825,26 +2930,41 @@ struct ProxyGroupPluginInstance {
 
 /// Built-in plugin types whose constructed instance can participate in a
 /// security or cross-plugin composition invariant. Keep this list aligned with
-/// the relevant `Plugin` capabilities (`modifies_request_body()`,
+/// the relevant `Plugin` capabilities (`modifies_request_headers()`,
+/// `modifies_request_query()`, `modifies_request_body()`,
 /// `egresses_request_body_before_finalization()`, `requires_prior_request_deduplication()`,
 /// and `correlation_id_header_name()`). Registered custom plugins are also
 /// constructed because their capability is defined by their implementation
 /// rather than a core allowlist.
 const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
-    "correlation_id",
-    "hmac_auth",
-    "request_deduplication",
-    "soap_ws_security",
-    "serverless_function",
-    "request_transformer",
-    "compression",
-    "grpc_web",
-    "ai_transcript_audit",
-    "ai_prompt_shield",
-    "ai_stream_router",
-    "mcp_gateway",
+    "a2a_gateway",
     "ai_prompt_compressor",
+    "ai_prompt_shield",
+    "ai_rate_limiter",
     "ai_request_guard",
+    "ai_stream_router",
+    "ai_transcript_audit",
+    "compression",
+    "correlation_id",
+    "grpc_deadline",
+    "grpc_web",
+    "hmac_auth",
+    "jwks_auth",
+    "key_auth",
+    "load_testing",
+    "mcp_gateway",
+    "mesh_route_dispatch",
+    "oauth2_introspection",
+    "oidc_relying_party",
+    "otel_tracing",
+    "rate_limiting",
+    "request_deduplication",
+    "response_caching",
+    "request_transformer",
+    "serverless_function",
+    "soap_ws_security",
+    "sse",
+    "workload_metrics",
 ];
 
 fn is_security_composition_candidate_plugin(
@@ -2987,6 +3107,17 @@ fn remove_shadowed_global_plugin(
     global_ptrs: &HashSet<usize>,
     plugin_name: &str,
 ) {
+    // Size policy is conjunctive, not replaceable configuration. Retain a
+    // global limiter beside same-name scoped instances so every hook remains
+    // active and the precomputed route ceiling can fold all configured bounds
+    // to their minimum. Letting a looser scoped instance shadow a stricter
+    // global one would silently relax a security boundary.
+    if matches!(
+        plugin_name,
+        "request_size_limiting" | "response_size_limiting"
+    ) {
+        return;
+    }
     plugins.retain(|plugin| {
         plugin.name() != plugin_name
             || !global_ptrs.contains(&(Arc::as_ptr(plugin) as *const () as usize))
@@ -3070,6 +3201,22 @@ impl PluginCapabilities {
 /// Built at config reload time so the hot path does zero filtering or allocation.
 #[derive(Clone)]
 pub struct PluginPhaseData {
+    /// Strictest active client-facing request-body ceiling declared by this
+    /// proxy/protocol plugin set via `Plugin::enforced_request_body_limit`, or
+    /// `None` when no matched plugin enforces one.
+    ///
+    /// Precomputed per cache generation so the request path never scans the
+    /// plugin list to learn its own upload bound. Request paths fold this with
+    /// the global limit through `crate::proxy::effective_request_body_limit`,
+    /// which keeps an active route ceiling authoritative even when the global
+    /// limit is the unlimited `0` (`GHSA-xrfj-852f-645j`).
+    pub enforced_request_body_limit: Option<u64>,
+    /// Strictest active client-facing response-body ceiling declared by this
+    /// proxy/protocol plugin set via `Plugin::enforced_response_body_limit`, or
+    /// `None` when no matched plugin enforces one. Folded exactly like
+    /// `enforced_request_body_limit`; buffered collection aborts here instead of
+    /// at the generally larger global allowance.
+    pub enforced_response_body_limit: Option<u64>,
     /// gRPC deadline-policy plugins only, in configured priority order.
     pub grpc_deadline_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Auth plugins only (pre-filtered from the protocol plugin list).
@@ -3171,6 +3318,8 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     // omitted an undescribable member would keep matching while that member's
     // behavior changed underneath every retained representation.
     let mut presentation_policy_unprovable = false;
+    let mut enforced_request_body_limit: Option<u64> = None;
+    let mut enforced_response_body_limit: Option<u64> = None;
     for p in plugins {
         match p.response_presentation_policy() {
             Some(ResponsePresentationPolicy::Static(digest)) => {
@@ -3294,8 +3443,22 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         if p.requires_response_stream_hooks() {
             caps |= PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS;
         }
+        // Strictest active client-facing body ceiling across the matched set.
+        // Multiple instances (and a global plus a proxy-scoped instance) compose
+        // to their minimum; a zero/disabled instance contributes nothing rather
+        // than relaxing a sibling's active bound (`GHSA-xrfj-852f-645j`).
+        if let Some(limit) = p.enforced_request_body_limit().filter(|limit| *limit > 0) {
+            enforced_request_body_limit =
+                Some(enforced_request_body_limit.map_or(limit, |current: u64| current.min(limit)));
+        }
+        if let Some(limit) = p.enforced_response_body_limit().filter(|limit| *limit > 0) {
+            enforced_response_body_limit =
+                Some(enforced_response_body_limit.map_or(limit, |current: u64| current.min(limit)));
+        }
     }
     PluginPhaseData {
+        enforced_request_body_limit,
+        enforced_response_body_limit,
         grpc_deadline_plugins: Arc::new(grpc_deadline),
         auth_plugins: Arc::new(auth),
         authorize_plugins: Arc::new(authorize),
@@ -4154,6 +4317,32 @@ impl PluginCacheInner {
             .and_then(|entry| entry.phase.response_presentation_policy_digest)
     }
 
+    /// Strictest active client-facing request-body ceiling for a composed
+    /// `proxy_key` and protocol, or `None` when no matched plugin enforces one.
+    ///
+    /// A missing entry falls back to the global chain's value exactly like
+    /// [`Self::get_capabilities`], so a proxy served by global-only plugins still
+    /// inherits a global size-limiting instance's ceiling.
+    pub(crate) fn get_enforced_request_body_limit(
+        &self,
+        proxy_key: &str,
+        protocol: ProxyProtocol,
+    ) -> Option<u64> {
+        self.protocol_entry(proxy_key, protocol)
+            .and_then(|entry| entry.phase.enforced_request_body_limit)
+    }
+
+    /// Strictest active client-facing response-body ceiling for a composed
+    /// `proxy_key` and protocol, or `None` when no matched plugin enforces one.
+    pub(crate) fn get_enforced_response_body_limit(
+        &self,
+        proxy_key: &str,
+        protocol: ProxyProtocol,
+    ) -> Option<u64> {
+        self.protocol_entry(proxy_key, protocol)
+            .and_then(|entry| entry.phase.enforced_response_body_limit)
+    }
+
     /// Response-body buffering upper bound for a composed `proxy_key`.
     ///
     /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
@@ -4250,6 +4439,10 @@ impl PluginCacheInner {
                 requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
                 requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
                 requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
+                enforced_request_body_limit: self
+                    .get_enforced_request_body_limit(proxy_key, protocol),
+                enforced_response_body_limit: self
+                    .get_enforced_response_body_limit(proxy_key, protocol),
             }
         })
     }
@@ -4303,6 +4496,8 @@ impl PluginCacheInner {
                 requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
                 requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
                 requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
+                enforced_request_body_limit: entry.phase.enforced_request_body_limit,
+                enforced_response_body_limit: entry.phase.enforced_response_body_limit,
             }
         })
     }
@@ -4333,9 +4528,27 @@ pub struct PluginCacheRequestView {
     requires_response_body_buffering: bool,
     requires_request_body_buffering: bool,
     requires_ws_frame_hooks: bool,
+    enforced_request_body_limit: Option<u64>,
+    enforced_response_body_limit: Option<u64>,
 }
 
 impl PluginCacheRequestView {
+    /// Strictest active client-facing request-body ceiling for this
+    /// proxy/protocol pair, or `None` when no matched plugin enforces one.
+    ///
+    /// Request paths fold this with the global ceiling via
+    /// `crate::proxy::effective_request_body_limit` before forwarding or
+    /// retaining any bytes (`GHSA-xrfj-852f-645j`).
+    pub fn enforced_request_body_limit(&self) -> Option<u64> {
+        self.enforced_request_body_limit
+    }
+
+    /// Strictest active client-facing response-body ceiling for this
+    /// proxy/protocol pair, or `None` when no matched plugin enforces one.
+    pub fn enforced_response_body_limit(&self) -> Option<u64> {
+        self.enforced_response_body_limit
+    }
+
     /// Get pre-resolved protocol-filtered plugins from this request view.
     pub fn plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
         Arc::clone(&self.plugins)
@@ -4537,12 +4750,10 @@ fn validate_api_chargeback_ownership(config: &GatewayConfig) -> Result<(), Strin
     crate::plugins::api_chargeback::validate_composition(config).map_err(|errors| errors.join("; "))
 }
 
-/// A `request_deduplication` replay is a finalized representation served
-/// without re-running the response-body rewrites of higher-priority plugins.
-/// Reject composing it with a plugin whose rewrite is derived from live
-/// upstream discovery state (`mcp_gateway`), which no persisted digest can
-/// witness, before constructing a cache generation that would otherwise replay
-/// under an unprovable policy.
+/// A `request_deduplication` replay is a finalized representation. Reject
+/// composing it with a plugin whose skipped response rewrite is derived from
+/// live upstream discovery state (`mcp_gateway`) before constructing a cache
+/// generation that would otherwise replay under an unprovable policy.
 fn validate_replay_provenance_composition(config: &GatewayConfig) -> Result<(), String> {
     crate::plugins::request_deduplication::validate_composition(config)
         .map_err(|errors| errors.join("; "))
