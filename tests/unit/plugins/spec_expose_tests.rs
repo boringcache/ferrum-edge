@@ -1565,12 +1565,10 @@ async fn test_failed_fetch_burst_is_single_flight_with_bounded_waiters() {
 #[test]
 fn test_cached_failure_retry_after_reports_remaining_backoff() {
     use ferrum_edge::_test_support::{
-        spec_expose_failure_backoff_seconds_for_test,
-        spec_expose_retry_after_seconds_for_test,
+        spec_expose_failure_backoff_seconds_for_test, spec_expose_retry_after_seconds_for_test,
     };
 
-    for (previous_failures, expected) in
-        [(0, 1), (1, 2), (2, 4), (5, 30), (6, 30), (u32::MAX, 30)]
+    for (previous_failures, expected) in [(0, 1), (1, 2), (2, 4), (5, 30), (6, 30), (u32::MAX, 30)]
     {
         assert_eq!(
             spec_expose_failure_backoff_seconds_for_test(previous_failures),
