@@ -71,7 +71,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     even when `cache_key_include_query` is `false`, which is retained only as a
     legacy keyspace toggle. Its request-header dimension stays the complete
     `Vary` tuple (backend-nominated dimensions, `vary_by_headers`, and the
-    mandatory credential/session auto-Vary) rather than the raw header view,
+    mandatory credential/session auto-Vary) rather than the raw header view.
+    `Authorization`, `Proxy-Authorization`, and `Cookie` are now present as
+    dimensions on every retained response, including anonymous responses, so
+    the emitted `Vary` contract also protects downstream shared caches that
+    cannot see Ferrum's private caller partition. Authorization storage
+    admission checks both the pristine inbound and live backend-visible views,
+    so a request transformer cannot erase the origin opt-in requirement.
+    This tuple is used
     because RFC 9111 §4.1 selection is target + `Vary` and a conditional
     revalidation, a client `no-cache` refresh, and `Content-Length: 0` are
     addressed to a stored entry rather than selecting a different one.

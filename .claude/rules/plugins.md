@@ -70,7 +70,12 @@ paths:
   are addressed to an entry rather than selecting a different one — keying the
   raw view would put each of them in a partition the entry cannot be reached
   from and make the `Vary` index unreachable. Cross-caller isolation is the
-  mandatory caller partition.
+  mandatory caller partition. `Authorization`, `Proxy-Authorization`, and
+  `Cookie` remain mandatory Vary names even for anonymous entries because
+  downstream shared caches cannot observe Ferrum's private caller partition;
+  present values are hashed and absence is a distinct keyed state. The RFC
+  shared-cache authorization admission checks both pristine inbound and live
+  backend-visible `Authorization`, so request transforms cannot erase it.
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order

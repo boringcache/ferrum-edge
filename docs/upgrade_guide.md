@@ -331,7 +331,12 @@ one fail-closed replay-partition contract
   refresh, and `Content-Length: 0` are addressed to a stored entry rather than
   selecting a different one. Header/query priority overrides that run at or
   after `response_caching` and deferred request-body transformers now fail
-  configuration admission.
+  configuration admission. `Authorization`, `Proxy-Authorization`, and
+  `Cookie` are mandatory Vary dimensions even when absent, so anonymous cache
+  HITs now include those names in `Vary`; present values remain hashed.
+  Authorization storage admission also checks both the pristine inbound and
+  live backend-visible header views, so a transformer that removes or adds the
+  field cannot bypass the origin shared-cache opt-in requirement.
 - **GET/HEAD cache lookup now requires an observed empty upload.** Ferrum drains
   the complete H1/H2/H3 request body before cache lookup and bypasses when it is
   non-empty or cannot be proven empty. This closes H2/H3 GET-with-DATA replay

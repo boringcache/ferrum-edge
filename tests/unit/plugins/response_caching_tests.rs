@@ -3062,11 +3062,11 @@ async fn test_authorization_auto_vary_isolates_users() {
 }
 
 #[tokio::test]
-async fn test_no_authorization_no_auto_vary() {
-    // When the request has no Authorization header, the plugin must NOT
-    // auto-add `authorization` to the cached response's Vary list — the
-    // existing behavior (cache hit on identical anonymous request) is
-    // preserved.
+async fn test_anonymous_response_keeps_mandatory_sensitive_vary_boundary() {
+    // Ferrum's private caller partition is invisible to downstream shared
+    // caches. An anonymous response therefore keeps all mandatory sensitive
+    // Vary names so a downstream cache cannot replay it to a credentialed or
+    // session-bearing request.
     let plugin = default_plugin();
 
     cache_response(
@@ -3084,15 +3084,15 @@ async fn test_no_authorization_no_auto_vary() {
     let (_, body, response_headers) =
         expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(body, b"anon-data");
-    // No Vary header should have been auto-added (vary_headers list was empty
-    // and the request had no Authorization, so the auto-merge branch did not
-    // fire).
-    let vary_lower = response_headers.get("vary").map(|v| v.to_ascii_lowercase());
-    if let Some(vary) = vary_lower {
+    let vary = response_headers
+        .get("vary")
+        .expect("anonymous cached response must retain the sensitive Vary boundary");
+    for sensitive in ["authorization", "proxy-authorization", "cookie"] {
         assert!(
-            !vary.contains("authorization"),
-            "Vary must NOT include `authorization` when request had no Authorization header, got `{}`",
-            vary
+            vary.split(',')
+                .map(str::trim)
+                .any(|name| name.eq_ignore_ascii_case(sensitive)),
+            "Vary must include `{sensitive}` even for an anonymous request, got `{vary}`"
         );
     }
 }
@@ -3461,8 +3461,14 @@ async fn test_concurrent_stores_atomically_union_vary_dimensions_and_remove_narr
     assert_eq!(vary_index.len(), 1, "one base key should be indexed");
     assert_eq!(
         vary_index[0].1,
-        vec!["x-a".to_string(), "x-b".to_string()],
-        "concurrent stores must publish the full Vary union"
+        vec![
+            "authorization".to_string(),
+            "cookie".to_string(),
+            "proxy-authorization".to_string(),
+            "x-a".to_string(),
+            "x-b".to_string(),
+        ],
+        "concurrent stores must publish the full Vary union plus mandatory sensitive dimensions"
     );
 
     let cache_keys = response_caching_cache_keys_for_test(&plugin);

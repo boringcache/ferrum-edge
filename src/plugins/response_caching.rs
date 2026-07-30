@@ -179,12 +179,12 @@ fn sha256_hex(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
 
-/// Request headers whose presence makes a cacheable response automatically vary
-/// by that header.
+/// Credential/session headers that every cacheable response varies by.
 ///
-/// These are credentials or session identifiers, so they are auto-added to the
-/// keyed `Vary` set at storage time (see `on_final_response_body`) and
-/// SHA-256-hashed by [`cache_key_vary_value`] when they appear in a cache key.
+/// The name and presence bit are always keyed; present values are SHA-256-hashed
+/// by [`cache_key_vary_value`]. Keeping the names on anonymous retained
+/// responses also prevents a cache HIT from presenting an unvaried anonymous
+/// representation to a downstream shared cache.
 /// Additional operator-configured or backend-supplied Vary headers are also
 /// hashed when their header name matches the centralized log-redaction
 /// sensitivity rules.
@@ -1579,16 +1579,10 @@ impl ResponseCaching {
             .unwrap_or_else(|| self.config.vary_by_headers.clone())
     }
 
-    fn merge_present_sensitive_vary_headers(
-        &self,
-        vary_headers: &mut Vec<String>,
-        request_headers: &HashMap<String, String>,
-    ) -> bool {
+    fn merge_mandatory_sensitive_vary_headers(&self, vary_headers: &mut Vec<String>) -> bool {
         let mut added = false;
         for sensitive in SENSITIVE_VARY_HEADERS {
-            if request_headers.contains_key(sensitive) {
-                added |= merge_vary_header(vary_headers, sensitive);
-            }
+            added |= merge_vary_header(vary_headers, sensitive);
         }
         if added {
             vary_headers.sort();
@@ -1871,10 +1865,7 @@ impl ResponseCaching {
         match self.merged_vary_headers(response_headers) {
             Some(mut vary_headers) => {
                 self.merge_existing_vary_headers(base_key, &mut vary_headers);
-                self.merge_present_sensitive_vary_headers(
-                    &mut vary_headers,
-                    &lookup_headers.headers,
-                );
+                self.merge_mandatory_sensitive_vary_headers(&mut vary_headers);
                 let response_key = self.extend_base_key_with_vary(
                     base_key.to_string(),
                     &vary_headers,
@@ -2136,12 +2127,12 @@ impl ResponseCaching {
     /// the protected representation for the rest of its TTL even after the
     /// backend would revoke, expire, or narrow that token.
     ///
-    /// `request_headers` must be the same live/restored view the cache key was
-    /// derived from (`before_proxy`'s `headers` parameter as replayed by
-    /// [`Self::restore_request_headers_view`]), never the untransformed
-    /// `ctx.headers` alone — a request-side transformer can add or remove the
-    /// credential. The restored view is the union of both, so a credential
-    /// visible in either direction still refuses.
+    /// `request_headers` is the live/restored backend-visible view the cache key
+    /// was derived from (`before_proxy`'s `headers` parameter as replayed by
+    /// [`Self::restore_request_headers_view`]). Admission deliberately checks
+    /// both that view and the pristine inbound `ctx.headers`: a request-side
+    /// transformer may add or remove the credential, but visibility in either
+    /// provenance is sufficient to refuse storage without origin opt-in.
     ///
     /// `Proxy-Authorization` is deliberately not part of this predicate: it is
     /// an intermediary credential consumed at this hop and says nothing about
@@ -2154,8 +2145,9 @@ impl ResponseCaching {
         request_headers: &HashMap<String, String>,
         directives: &CacheControlDirectives,
     ) -> bool {
-        let authorized_request =
-            ctx.effective_identity().is_some() || request_headers.contains_key("authorization");
+        let authorized_request = ctx.effective_identity().is_some()
+            || header_value(&ctx.headers, "authorization").is_some()
+            || header_value(request_headers, "authorization").is_some();
         if !authorized_request {
             return true;
         }
@@ -2531,11 +2523,12 @@ impl Plugin for ResponseCaching {
         self.stash_request_headers_snapshot(ctx, headers);
 
         let mut vary_headers = self.cache_lookup_vary_headers(&base_key);
-        // A request that carries credentials/session headers must never probe
-        // the unvaried base key, even if this base key has only seen anonymous
-        // responses so far. Storage also merges these dimensions so the
-        // `vary_index` stays widened for future anonymous lookups.
-        self.merge_present_sensitive_vary_headers(&mut vary_headers, headers);
+        // Every internal key and every retained response uses the same fixed
+        // credential/session presence tuple. Ferrum's caller partition is not
+        // visible to downstream shared caches, so only adding a Vary name when
+        // the current request carries it would let an anonymous response omit
+        // `Vary` and be replayed downstream to a credentialed request.
+        self.merge_mandatory_sensitive_vary_headers(&mut vary_headers);
         let cache_key =
             self.extend_base_key_with_vary(base_key.clone(), &vary_headers, headers, None);
         // Store the full cache key (with Vary dimensions) so on_final_response_body
@@ -2871,14 +2864,18 @@ impl Plugin for ResponseCaching {
         // entry by the credential so two clients presenting different
         // credentials land on different cache entries.
         //
-        // Auto-merge every credential/session header the request carried
+        // Unconditionally merge every credential/session header name
         // (`authorization`, `proxy-authorization`, `cookie`) into the keyed
-        // Vary list. Operators don't need to remember to set
+        // Vary list. Presence remains a keyed bit, and present values remain
+        // hashed. Operators don't need to remember to set
         // `cache_key_include_consumer: true` or list these in
         // `vary_by_headers` — the safe default is to never share a cached
-        // response across distinct credentials or sessions. The merged list is
-        // sorted and re-stored in `vary_index` so the same dimension applies to
-        // every subsequent lookup at this base key.
+        // response across distinct credentials or sessions. Keeping the names
+        // on anonymous responses is also load-bearing: downstream shared caches
+        // cannot observe Ferrum's private caller partition and must receive the
+        // same `Vary` contract. The merged list is sorted and re-stored in
+        // `vary_index` so the same dimension applies to every subsequent lookup
+        // at this base key.
         //
         // This is complementary to the per-principal `consumer_part` in
         // `build_base_cache_key`: that isolates *authenticated* principals
@@ -2893,7 +2890,7 @@ impl Plugin for ResponseCaching {
         // / `host` / the sensitive headers and arbitrary response-added Vary
         // fields all reflect the complete backend-visible view staged during
         // lookup.
-        self.merge_present_sensitive_vary_headers(&mut vary_headers, &lookup_headers.headers);
+        self.merge_mandatory_sensitive_vary_headers(&mut vary_headers);
         // The base key is *read back* from this instance's staging, never
         // recomputed here. `stash_request_headers_snapshot` deliberately stores
         // credential/session values in their reduced `sha256-…` cache-key form
