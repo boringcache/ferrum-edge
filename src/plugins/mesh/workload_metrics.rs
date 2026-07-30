@@ -1569,9 +1569,11 @@ fn validate_env_var_name(tag: &str, env_var: &str) -> Result<(), String> {
 /// metadata redaction classifier's narrower `token` rules.
 ///
 /// Detection is fail-closed across delimiter, camelCase, and concatenated
-/// spellings via bounded token / known-compound matching — not open-ended
-/// substring search (so `ISTIO_META_CLUSTER_ID` / `FERRUM_REGION` stay allowed
-/// and incidental fragments inside unrelated words are not rejected).
+/// spellings. Most credential names use bounded token / known-compound
+/// matching; HTTP credential-state stems (`authorization`, `bearer`, `cookie`,
+/// and `csrf`) deliberately retain substring matching so concatenated names
+/// cannot bypass the telemetry boundary. Ordinary names such as
+/// `ISTIO_META_CLUSTER_ID` and `FERRUM_REGION` remain allowed.
 fn is_sensitive_environment_variable_name(name: &str) -> bool {
     if is_operator_sensitive_metadata_key(name) {
         return true;
