@@ -1319,10 +1319,10 @@ async fn test_plugin_response_size_limiting_fast_path() {
         "oversized backend response should be rejected"
     );
     let body = large.text().await.unwrap();
-    assert!(
-        body.contains("Response body too large"),
-        "response should explain the size rejection, got: {}",
-        body
+    assert_eq!(
+        body,
+        r#"{"error":"Backend response body exceeds maximum size"}"#,
+        "response should use the canonical backend-size rejection body"
     );
 }
 
