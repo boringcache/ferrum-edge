@@ -2237,7 +2237,8 @@ try_wait_for_node_waypoint_admission() {
   local label="$2"
   local url="$3"
   local family="${4:-4}"
-  local uid node pod identities_dir identities_file curl_out curl_err curl_status_file curl_status record
+  local uid node pod identities_dir identities_file curl_out curl_err curl_status_file
+  local curl_status curl_code record
   record="$(workload_pod_record_for_app "$from")"
   IFS=$'\t' read -r uid node pod <<<"$record"
   if [[ -z "${uid:-}" || -z "${node:-}" || -z "${pod:-}" ]]; then
@@ -2260,9 +2261,20 @@ try_wait_for_node_waypoint_admission() {
     curl_status=$?
     set -e
     echo "$curl_status" >"$curl_status_file"
+    curl_code="$(tail -n 1 "$curl_out" 2>/dev/null || true)"
 
+    # The in-netns identity registry can become visible before the newly
+    # received mesh slice has finished rebuilding the request router. Do not
+    # declare admission ready on that half-converged state: Ferrum returns its
+    # route-miss 404 there, and the immediately following traffic assertion
+    # would race the rebuild. Every caller of this readiness helper targets a
+    # fixture path whose converged outcome is either the allowed 200 or the
+    # AuthorizationPolicy 403, so require one of those live outcomes in
+    # addition to the exact pod UID.
     if fetch_node_waypoint_identities_for_node "$node" "$identities_file" &&
-      node_waypoint_identities_include_uid "$identities_file" "$uid"; then
+      node_waypoint_identities_include_uid "$identities_file" "$uid" &&
+      [[ "$curl_status" -eq 0 ]] &&
+      [[ "$curl_code" == "200" || "$curl_code" == "403" ]]; then
       return
     fi
     sleep 2
