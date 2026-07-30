@@ -226,12 +226,15 @@ async fn functional_protocol_managed_response_headers_h1_h2_h3() {
     );
     assert!(h1_resp.headers().get("x-backend-only").is_none());
     assert_no_protocol_managed(h1_resp.headers(), "H1 ordinary");
-    assert_eq!(
-        h1_resp
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok()),
-        Some("5")
+    assert!(
+        matches!(
+            h1_resp
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            None | Some("5")
+        ),
+        "H1 ordinary: exact framing may retain or derive only the real body length"
     );
     let corr = h1_resp
         .headers()
@@ -275,12 +278,15 @@ async fn functional_protocol_managed_response_headers_h1_h2_h3() {
     assert_eq!(h2_resp.version(), reqwest::Version::HTTP_2);
     assert_eq!(h2_resp.status(), StatusCode::OK);
     assert_no_protocol_managed(h2_resp.headers(), "H2 ordinary");
-    assert_eq!(
-        h2_resp
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok()),
-        Some("5")
+    assert!(
+        matches!(
+            h2_resp
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            None | Some("5")
+        ),
+        "H2 ordinary: streaming may omit length; exact framing may publish only the real length"
     );
     assert!(h2_resp.headers().get("x-request-id").is_some());
 
@@ -302,12 +308,15 @@ async fn functional_protocol_managed_response_headers_h1_h2_h3() {
     let h3_resp = h3_request_until_ready(&h3, &h3_echo, Method::GET).await;
     assert_eq!(h3_resp.status, StatusCode::OK);
     assert_no_protocol_managed(&h3_resp.headers, "H3 ordinary");
-    assert_eq!(
-        h3_resp
-            .headers
-            .get(header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok()),
-        Some("5")
+    assert!(
+        matches!(
+            h3_resp
+                .headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            None | Some("5")
+        ),
+        "H3 ordinary: streaming may omit length; exact framing may publish only the real length"
     );
     assert!(h3_resp.headers.get("x-request-id").is_some());
 
