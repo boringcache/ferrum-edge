@@ -219,14 +219,14 @@ installed on the context, matching the deferred-hook request view.
 reads the finalized mesh `route_override_path` without taking it from primary
 dispatch, then falls back to the backend-effective authorized path and finally
 the original client path.
-Within the transform band, `load_testing` (3070) runs before `request_mirror`
-(3075) so the reserved `X-Loadtesting-Key` is stripped on both matching and
-non-matching paths before mirror can copy it. As defense in depth,
-`request_mirror` also excludes both load-testing control headers if priority
-overrides reverse the order. `request_mirror` is also the security-sensitive
-path exception: when backend-path policy is active and `mirror_path` is unset,
-it mirrors the exact effective path that passed final authorization. An
-explicit operator-configured `mirror_path` still wins.
+The finalized-egress phase always follows `load_testing`'s `before_proxy` hook,
+so the reserved `X-Loadtesting-Key` is stripped on both matching and
+non-matching paths before the mirror can copy headers. As defense in depth,
+`request_mirror` also excludes both load-testing control headers regardless of
+priority configuration. `request_mirror` is also the security-sensitive path
+exception: when backend-path policy is active and `mirror_path` is unset, it
+mirrors the exact effective path that passed final authorization. An explicit
+operator-configured `mirror_path` still wins.
 Each configured mirror instance appends its own bounded result receiver; result
 logging is detached per instance, so later instances and mixed completion order
 cannot overwrite an earlier destination's outcome.
@@ -327,6 +327,8 @@ keeps the live generation): a registered custom plugin declaring
 `egresses_request_body_before_finalization()` may not share a protocol chain
 with a request-body transformer, nor with a plugin whose enforcement decision is
 taken in the final request-body phase (`enforces_finalized_request_policy()`),
+including protocol/integrity validation, WAF/OpenAPI/body/size policy, AI
+request guardrails, and mandatory audit admission,
 and it may not also declare `dispatches_finalized_request_egress()`.
 
 When a plugin returns a replacement body from `transform_response_body`, the core first removes representation metadata that can no longer describe the client-visible bytes: range fields, ETag/Last-Modified validators, content digests/checksums, and content-bound signatures. It then calls that plugin's `on_response_body_transformed` callback before the next transform, allowing the plugin to attach metadata it recomputed for the replacement representation. Neither step runs when the transform returns `None`, so unmodified responses retain their original semantics — with one exception: a body the representation gate **decoded** has already had its client-visible bytes changed (encoded in, identity out), so that same metadata invalidation is applied at the decode itself, whether or not a later rule matches. Otherwise a decoded body no rule happened to change would be served as identity bytes carrying the origin's validator for the encoded ones. `206 Partial Content` and `226 IM Used` responses that no configured body policy claims skip provider normalization and presentation transforms entirely: the buffered bytes are only a selected range or delta, so Ferrum cannot rewrite them into a truthful full representation merely by changing headers or status. When a configured body policy *does* claim such a response, skipping the transform would silently forward protected bytes, so the representation gate described below rejects it instead — see [Buffered response representation gate](#buffered-response-representation-gate). Transform-dependent header hooks also decline these statuses: compression does not attach `Content-Encoding`, gRPC-Web does not relabel native gRPC bytes or expose transformed trailers, and SSE does not force a non-SSE representation into event-stream headers when wrapping cannot run. Inspection hooks still run. If an enforcing policy detects content whose safe disposition requires redaction, it rejects the response instead of forwarding the original bytes with false redaction telemetry. This lifecycle rule is shared by buffered H1, H2, H3, gRPC, and synthetic/rejection response paths rather than delegated to individual transformer implementations.

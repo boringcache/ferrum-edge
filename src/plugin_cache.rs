@@ -2892,10 +2892,10 @@ struct ProxyGroupPluginInstance {
 ///
 /// `enforces_finalized_request_policy()` deliberately does NOT extend this list:
 /// its only rule fires against a plugin that still egresses before finalization,
-/// which after GHSA-4vr5-4wm3-x5xv can only be a registered custom plugin (already
-/// constructed here). Adding `waf` / `openapi_validator` / `body_validator` /
-/// `request_size_limiting` would make every admin write compile their rule sets
-/// for a check that runtime cache construction already performs fail-closed.
+/// which after GHSA-4vr5-4wm3-x5xv can only be a registered custom plugin
+/// (already constructed here). Adding every built-in final validator would make
+/// every admin write compile their rule sets for a check that runtime cache
+/// construction already performs fail-closed over the complete plugin chain.
 const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "correlation_id",
     "hmac_auth",

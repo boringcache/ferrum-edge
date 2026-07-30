@@ -3574,4 +3574,25 @@ fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch
     let cache = include_str!("../../../src/plugin_cache.rs");
     assert!(cache.contains("plugin.enforces_finalized_request_policy()"));
     assert!(cache.contains("plugin.dispatches_finalized_request_egress()"));
+
+    // Every built-in final request hook that can reject the backend-visible
+    // representation must advertise the composition marker. Otherwise a
+    // registered custom plugin could egress earlier and bypass that policy.
+    for policy_source in [
+        include_str!("../../../src/plugins/ai_prompt_compressor.rs"),
+        include_str!("../../../src/plugins/ai_prompt_shield.rs"),
+        include_str!("../../../src/plugins/ai_request_guard.rs"),
+        include_str!("../../../src/plugins/ai_semantic_firewall.rs"),
+        include_str!("../../../src/plugins/ai_stream_router.rs"),
+        include_str!("../../../src/plugins/ai_tool_governor.rs"),
+        include_str!("../../../src/plugins/ai_transcript_audit.rs"),
+        include_str!("../../../src/plugins/body_validator.rs"),
+        include_str!("../../../src/plugins/grpc_web.rs"),
+        include_str!("../../../src/plugins/openapi_validator.rs"),
+        include_str!("../../../src/plugins/request_size_limiting.rs"),
+        include_str!("../../../src/plugins/soap_ws_security.rs"),
+        include_str!("../../../src/plugins/waf/mod.rs"),
+    ] {
+        assert!(policy_source.contains("fn enforces_finalized_request_policy(&self) -> bool"));
+    }
 }

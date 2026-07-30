@@ -4469,8 +4469,9 @@ impl FinalizedRequestEgressOutcome {
 /// collection, after `apply_request_body_plugins_with_context`, and after
 /// `run_final_request_body_hooks` has returned `Continue` for the same
 /// `headers`/`body` pair — so the representation an egress plugin transmits is
-/// byte-identical to what the backend would receive, and every local policy
-/// that could still reject the request has already accepted it.
+/// byte-identical to what the backend would receive, and every applicable final
+/// request-body policy has already accepted it. Backend admission, circuit
+/// breaking, and transport checks still occur later.
 ///
 /// A request that finalizes nowhere — nothing required buffering, or it carries
 /// no body at all — has no transform and no final-body hook to run, so its

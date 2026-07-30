@@ -158,12 +158,14 @@ on a native-gRPC request.
   finalization to complete BEFORE backend dispatch (the `has_finalized_request_egress`
   term in `final_request_body_requirements`), because the ordinary ladder
   otherwise finalizes inside `proxy_to_backend`. On H1/H2 that term is gated to
-  non-gRPC; native gRPC reaches the egress boundary from its own branch after
-  its own transform/final-hook pass.
+  non-gRPC initially; once routing selects the transport, protocol-classified
+  gRPC that uses generic dispatch is also pulled through terminal preparation.
+  Native gRPC reaches the egress boundary from its own branch after its own
+  transform/final-hook pass.
 - Composition admission fails closed for anything that still egresses earlier:
   `egresses_request_body_before_finalization()` may not coexist with a
-  request-body transformer, with `enforces_finalized_request_policy()` (waf,
-  body_validator, openapi_validator, request_size_limiting), or with
+  request-body transformer, with any built-in final request hook that can reject
+  the backend-visible body (`enforces_finalized_request_policy()`), or with
   `dispatches_finalized_request_egress()` on the same plugin.
 - gRPC uses `GrpcBody::Streaming(Incoming)` when there are no body plugins and no retries; otherwise `Buffered(Full<Bytes>)`.
 - In `before_proxy(ctx, headers)`, read headers from the `headers` parameter, never `ctx.headers`. The handler may have moved headers out of `ctx.headers` when no plugin modifies request headers.

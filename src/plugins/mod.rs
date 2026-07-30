@@ -4424,10 +4424,9 @@ impl RequestContext {
     ///
     /// Read-only and idempotent: `should_buffer_request_body` is evaluated
     /// several times per request and must never advance the sampler or acquire
-    /// capacity itself. It also keeps answering `true` after `before_proxy`
-    /// consumed the lease, because the proxy re-evaluates that predicate after
-    /// `before_proxy` and must not conclude the already-buffered body was never
-    /// required.
+    /// capacity itself. It also keeps answering `true` after finalized request
+    /// egress consumed the lease, preserving the stable per-request admission
+    /// decision for any later observer.
     pub(crate) fn request_mirror_body_admitted(&self, instance_id: u64) -> bool {
         self.request_mirror_admissions.body_admitted(instance_id)
     }
@@ -4435,8 +4434,8 @@ impl RequestContext {
     /// Take one instance's staged admission, transferring ownership of its
     /// permit and retained-byte lease to the caller. Returns `None` when the
     /// `authorize` phase never ran for this instance (direct plugin invocation
-    /// in tests), which keeps `before_proxy` self-sufficient. A repeated take
-    /// yields the consumed marker, never a second lease.
+    /// in tests), which keeps finalized request egress self-sufficient. A
+    /// repeated take yields the consumed marker, never a second lease.
     pub(crate) fn take_request_mirror_admission(
         &mut self,
         instance_id: u64,
@@ -6717,9 +6716,9 @@ pub trait Plugin: Send + Sync {
 
     /// Returns `true` when this plugin's enforcement decision is taken in the
     /// final request-body phase (`on_final_request_body*`) over the exact
-    /// backend-visible representation: WAF body rules, OpenAPI request-schema
-    /// validation, request-body validation, and the post-transform request-size
-    /// ceiling.
+    /// backend-visible representation. This includes protocol framing and
+    /// integrity validation, WAF/OpenAPI/body/size policy, AI request
+    /// guardrails, and mandatory audit admission.
     ///
     /// Composition admission uses this to refuse a chain in which a plugin
     /// egresses BEFORE finalization (`egresses_request_body_before_finalization`)
