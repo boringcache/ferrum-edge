@@ -3431,3 +3431,39 @@ fn streaming_grpc_web_adapters_honor_preserved_response_statuses() {
         "generic preserved statuses must retain native headers and body framing"
     );
 }
+#[test]
+fn reqwest_dispatch_fails_closed_when_proxy_ttl_dns_preflight_fails() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    for (label, start_marker, end_marker, rejection) in [
+        (
+            "retry",
+            "pub(crate) async fn proxy_to_backend_retry(",
+            "pub(crate) async fn proxy_to_backend_with_body(",
+            "return backend_dns_resolution_failed_response(effective_host, &error);",
+        ),
+        (
+            "initial dispatch",
+            "async fn proxy_to_backend(",
+            "async fn proxy_to_backend_hbone(",
+            "return backend_dns_resolution_failed_dispatch_result(effective_host, &error);",
+        ),
+    ] {
+        let start = source
+            .find(start_marker)
+            .unwrap_or_else(|| panic!("{label}: missing start marker"));
+        let end = source[start..]
+            .find(end_marker)
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("{label}: missing end marker"));
+        let dispatch = &source[start..end];
+
+        assert!(
+            dispatch.contains(rejection),
+            "{label} must not continue to reqwest after the proxy-specific DNS lookup fails"
+        );
+        assert!(
+            !dispatch.contains("resolved_ip_result.ok()"),
+            "{label} must not discard the proxy-specific DNS error"
+        );
+    }
+}

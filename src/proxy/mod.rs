@@ -28748,7 +28748,12 @@ pub(crate) async fn proxy_to_backend_retry(
     } else {
         resolve_backend_ip.await
     };
-    let resolved_ip = resolved_ip_result.ok().map(|ip| ip.to_string());
+    let resolved_ip = match resolved_ip_result {
+        Ok(ip) => Some(ip.to_string()),
+        Err(error) => {
+            return backend_dns_resolution_failed_response(effective_host, &error);
+        }
+    };
 
     let client_result = crate::plugins::await_grpc_deadline(
         request_ctx.grpc_deadline_at(),
@@ -29506,6 +29511,45 @@ fn backend_egress_denied_dispatch_result(host: &str) -> BackendDispatchResult {
     backend_dispatch_response(backend_egress_denied_response(host), None, None)
 }
 
+/// Fail a reqwest dispatch before it can perform a second DNS lookup with the
+/// resolver's default TTL. The preflight lookup carries the proxy-specific TTL
+/// and egress policy, so proceeding after it fails could let reqwest reuse a
+/// shared address that is stale for this proxy.
+fn backend_dns_resolution_failed_response(
+    host: &str,
+    error: &anyhow::Error,
+) -> retry::BackendResponse {
+    let policy_rejected = error.to_string().contains("backend egress policy");
+    warn!(
+        backend = %host,
+        error = %error,
+        "Backend DNS preflight failed; not dialing"
+    );
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::buffered(br#"{"error":"Backend DNS resolution failed"}"#.to_vec()),
+        headers: HashMap::new(),
+        connection_error: !policy_rejected,
+        backend_resolved_ip: None,
+        error_class: Some(if policy_rejected {
+            retry::ErrorClass::DispatchPolicyRejected
+        } else {
+            retry::ErrorClass::DnsLookupError
+        }),
+    }
+}
+
+fn backend_dns_resolution_failed_dispatch_result(
+    host: &str,
+    error: &anyhow::Error,
+) -> BackendDispatchResult {
+    backend_dispatch_response(
+        backend_dns_resolution_failed_response(host, error),
+        None,
+        None,
+    )
+}
+
 /// deterministic gateway 413, masking a client/gateway policy violation as
 /// upstream pressure. The reqwest/direct-H2 paths already run their size checks
 /// before admitting; this restores the same ordering. Returns the 413 dispatch
@@ -29665,7 +29709,12 @@ async fn proxy_to_backend(
     } else {
         resolve_backend_ip.await
     };
-    let resolved_ip = resolved_ip_result.ok().map(|ip| ip.to_string());
+    let resolved_ip = match resolved_ip_result {
+        Ok(ip) => Some(ip.to_string()),
+        Err(error) => {
+            return backend_dns_resolution_failed_dispatch_result(effective_host, &error);
+        }
+    };
 
     if dispatch_hbone {
         // 413 on an oversized declared Content-Length BEFORE admission, so a
