@@ -1046,14 +1046,15 @@ async fn test_json_response_body_capture_covers_error_responses() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_credential_shaped_values_are_redacted_regardless_of_field_name() {
     let plugin = capture_plugin();
-    let headers = body_headers("application/json", 128);
-    let body = br#"{"note":"Bearer sk-live-abcdefghijklmnop","jot":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig"}"#;
+    let body = br#"{"note":"upstream said Authorization: Bearer sk-live-abcdefghijklmnop","basic":"prefix Basic dXNlcjpwYXNz","jot":"embedded eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig"}"#;
+    let headers = body_headers("application/json", body.len());
 
     let logs = capture_debug_logs(|| async {
         let _ = plugin.on_final_request_body(&headers, body).await;
     })
     .await;
     assert!(!logs.contains("sk-live-abcdefghijklmnop"), "got: {logs}");
+    assert!(!logs.contains("dXNlcjpwYXNz"), "got: {logs}");
     assert!(!logs.contains("eyJhbGciOiJIUzI1NiJ9"), "got: {logs}");
 }
 
@@ -1067,6 +1068,11 @@ fn test_form_and_text_body_redaction() {
     assert!(form.rendered.contains("user=alice"), "{}", form.rendered);
     assert!(!form.rendered.contains("shhh"), "{}", form.rendered);
     assert!(form.rendered.contains("note=fine"), "{}", form.rendered);
+
+    let embedded_credential = b"note=prefix+Bearer+secret-token&message=keep";
+    let form = plugin.render_captured_body(embedded_credential, BodyKind::Form, 512);
+    assert!(!form.rendered.contains("secret-token"), "{}", form.rendered);
+    assert!(form.rendered.contains("message=keep"), "{}", form.rendered);
 
     let text_body = b"line one is fine\nauthorization: Bearer abc\nline three is fine";
     let text = plugin.render_captured_body(text_body, BodyKind::Text, 512);
