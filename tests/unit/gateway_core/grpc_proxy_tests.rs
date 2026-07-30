@@ -113,10 +113,7 @@ impl Plugin for SyntheticInitialHeaderPolicy {
         true
     }
 
-    fn apply_initial_response_header_policy(
-        &self,
-        response_headers: &mut HashMap<String, String>,
-    ) {
+    fn apply_initial_response_header_policy(&self, response_headers: &mut HashMap<String, String>) {
         response_headers.extend(self.values.clone());
     }
 
