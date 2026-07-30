@@ -67,7 +67,7 @@ the batch and the message counts each wire frame exactly once.
 2. Push a fork branch with the patch applied and open a PR; open the matching
    `tokio-tungstenite` PR for the `WebSocketStream` delegator.
 3. Record the issue + PR numbers here, in `docs/dependency-policy.md`, and in
-   `scripts/check_vendored_patch_status.sh`.
+   `docs/vendored-patch-lifecycle.json`.
 
 ## Retirement
 
