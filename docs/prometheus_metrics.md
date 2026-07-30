@@ -1,6 +1,6 @@
 # Prometheus Metrics Contract (DOC-10)
 
-This page is the checked-in operator reference for Ferrum Edge Prometheus families exported on authenticated `GET /metrics`.
+This page is the checked-in operator reference for Ferrum Edge Prometheus families exported on authenticated `GET /metrics`, plus the `api_chargeback` billing families exported only by authenticated `GET /charges` in Prometheus format (see each row's `export_surface` in the inventory JSON).
 The canonical machine-readable inventory is [`docs/prometheus_metric_contract.json`](prometheus_metric_contract.json).
 Hosted CI and unit tests fail closed when exposition name/type/label drift is undocumented, when this reference diverges from the inventory, or when bundled PrometheusRule/Grafana queries reference unknown Ferrum families.
 
@@ -13,6 +13,7 @@ Hosted CI and unit tests fail closed when exposition name/type/label drift is un
 | `help` | HELP text emitted on scrape |
 | `labels` | Stable label keys the family may emit (optional `namespace` / `gateway_namespace` appear when the gateway namespace is configured) |
 | `subsystem` | Owning emitter / operational area |
+| `export_surface` | Admin endpoint that renders the family: `/metrics`, or `/charges` for the `api_chargeback` billing families, which are never folded into `/metrics` |
 | `bundled` | `alert`, `dashboard`, `alert_and_dashboard`, or `documented_only` (explicitly no bundled alert/dashboard yet) |
 | `emission` | `always`, `conditional`, `when_series_present`, `when_plugin_enabled`, or `when_process_initialized` |
 
@@ -155,7 +156,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_log_sink_accepted_records_total` | counter | `sink` | `logging` | `documented_only` | `when_process_initialized` | Records accepted by the bounded process log sink. |
 | `ferrum_log_sink_dropped_records_total` | counter | `sink`, `reason` | `logging` | `documented_only` | `when_process_initialized` | Log records dropped by bounded admission. |
 | `ferrum_log_sink_healthy` | gauge | `sink` | `logging` | `documented_only` | `when_process_initialized` | Whether the process log sink has recovered from its latest I/O or drain failure. |
-| `ferrum_log_sink_io_failures_total` | counter | `sink`, `reason` | `logging` | `documented_only` | `when_process_initialized` | Underlying writer and flush failures. |
+| `ferrum_log_sink_io_failures_total` | counter | `sink`, `operation` | `logging` | `documented_only` | `when_process_initialized` | Underlying writer and flush failures. |
 | `ferrum_log_sink_queued_bytes` | gauge | `sink` | `logging` | `documented_only` | `when_process_initialized` | Serialized bytes admitted but not yet completed. |
 | `ferrum_log_sink_queued_records` | gauge | `sink` | `logging` | `documented_only` | `when_process_initialized` | Records admitted but not yet completed. |
 | `ferrum_log_sink_reserved_bytes` | gauge | `sink` | `logging` | `documented_only` | `when_process_initialized` | Byte budget reserved by admitted records. |
@@ -174,8 +175,8 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_mesh_cert_rotation_failures_total` | counter | `spiffe_id`, `source`, `gateway_namespace` | `mesh` | `alert_and_dashboard` | `conditional` | Mesh certificate rotation failures. |
 | `ferrum_mesh_config_last_received_timestamp_seconds` | gauge | `namespace`, `gateway_namespace` | `mesh` | `alert_and_dashboard` | `conditional` | Unix timestamp of the last installed mesh config slice. |
 | `ferrum_mesh_config_revision_adoptions_total` | counter | `gateway_namespace` | `mesh` | `documented_only` | `always` | Foreign mesh config authorities adopted after the configured grace period. |
-| `ferrum_mesh_config_revision_rejections_total` | counter | `reason` | `mesh` | `documented_only` | `conditional` | Mesh slices quarantined by the config-revision freshness gate before replacing live state, by reason. |
-| `ferrum_mesh_config_update_rejections_total` | counter | `consumer`, `reason` | `mesh` | `documented_only` | `conditional` | MeshSubscribe responses refused before apply, by consumer and reason. |
+| `ferrum_mesh_config_revision_rejections_total` | counter | `reason`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Mesh slices quarantined by the config-revision freshness gate before replacing live state, by reason. |
+| `ferrum_mesh_config_update_rejections_total` | counter | `consumer`, `reason`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | MeshSubscribe responses refused before apply, by consumer and reason. |
 | `ferrum_mesh_dns_upstream_id_exhaustions_total` | counter | `namespace` | `mesh` | `documented_only` | `always` | Mesh DNS upstream transaction ID exhaustion events. |
 | `ferrum_mesh_federation_bundle_age_seconds` | gauge | `trust_domain`, `gateway_namespace` | `mesh_federation` | `alert_and_dashboard` | `conditional` | Age of the cached federated trust bundle, in seconds. |
 | `ferrum_mesh_federation_last_success_timestamp_seconds` | gauge | `trust_domain`, `gateway_namespace` | `mesh_federation` | `documented_only` | `conditional` | Unix timestamp of last successful SPIFFE federation poll. |
@@ -189,15 +190,15 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_mesh_node_waypoint_hbone_handshakes_total` | counter | `phase`, `result`, `gateway_namespace` | `mesh_node_waypoint` | `alert_and_dashboard` | `conditional` | NodeWaypoint HBONE handshake outcomes by phase. One failed session increments exactly one phase (inbound_tls XOR inbound_connect on the destination; outbound_dial is independent on the source). |
 | `ferrum_mesh_node_waypoint_missing_destination_metadata_total` | counter | `gateway_namespace` | `mesh_node_waypoint` | `dashboard` | `conditional` | Secured NodeWaypoint service targets skipped because Workload.node_waypoint metadata was absent. |
 | `ferrum_mesh_node_waypoint_plaintext_fallback_attempts_total` | counter | `gateway_namespace` | `mesh_node_waypoint` | `dashboard` | `conditional` | Prohibited plaintext fallback attempts blocked under identity-backed NodeWaypoint (fail-closed instead of retaining a plaintext backend). |
-| `ferrum_mesh_outbound_registry_decisions_total` | counter | `namespace`, `host_bucket`, `decision` | `mesh` | `dashboard` | `conditional` | Mesh outbound registry decisions with bounded host buckets (<admit_explicit>, <admit_wildcard>, <denied>). |
-| `ferrum_mesh_outbound_registry_stream_decisions_total` | counter | `namespace`, `protocol`, `decision` | `mesh` | `documented_only` | `conditional` | Mesh outbound registry decisions for stream-family egress (TCP/UDP/TCP+TLS/UDP+DTLS) by protocol. |
+| `ferrum_mesh_outbound_registry_decisions_total` | counter | `mesh_namespace`, `host`, `decision`, `namespace` | `mesh` | `dashboard` | `conditional` | Mesh outbound registry decisions with bounded host buckets (<admit_explicit>, <admit_wildcard>, <denied>). |
+| `ferrum_mesh_outbound_registry_stream_decisions_total` | counter | `mesh_namespace`, `protocol`, `decision`, `namespace` | `mesh` | `documented_only` | `conditional` | Mesh outbound registry decisions for stream-family egress (TCP/UDP/TCP+TLS/UDP+DTLS) by protocol. |
 | `ferrum_mesh_remote_discovery_endpoint_age_seconds` | gauge | `cluster`, `trust_domain`, `gateway_namespace` | `mesh_remote_discovery` | `documented_only` | `conditional` | Age of the cached remote-cluster endpoints, in seconds. |
 | `ferrum_mesh_remote_discovery_last_success_timestamp_seconds` | gauge | `cluster`, `trust_domain`, `gateway_namespace` | `mesh_remote_discovery` | `documented_only` | `conditional` | Unix timestamp of last successful remote-cluster endpoint discovery poll. |
 | `ferrum_mesh_remote_discovery_poll_failures_total` | counter | `cluster`, `trust_domain`, `control_plane`, `gateway_namespace` | `mesh_remote_discovery` | `documented_only` | `conditional` | Remote-cluster endpoint discovery poll failures. |
 | `ferrum_mesh_remote_discovery_poll_successes_total` | counter | `cluster`, `trust_domain`, `gateway_namespace` | `mesh_remote_discovery` | `documented_only` | `conditional` | Successful remote-cluster endpoint discovery polls. |
 | `ferrum_mesh_request_duration_ms` | histogram | `source_workload`, `source_namespace`, `source_principal`, `source_app`, `source_service`, `destination_workload`, `destination_namespace`, `destination_principal`, `destination_app`, `destination_service`, `request_protocol`, `response_code`, `response_flags`, `connection_security_policy`, `gateway_namespace`, `le` | `mesh` | `dashboard` | `conditional` | Mesh request duration in milliseconds. |
 | `ferrum_mesh_requests_total` | counter | `source_workload`, `source_namespace`, `source_principal`, `source_app`, `source_service`, `destination_workload`, `destination_namespace`, `destination_principal`, `destination_app`, `destination_service`, `request_protocol`, `response_code`, `response_flags`, `connection_security_policy`, `gateway_namespace` | `mesh` | `alert_and_dashboard` | `conditional` | Mesh requests by Istio/GAMMA identity labels. |
-| `ferrum_mesh_subscribe_audience_rejections_total` | counter | `subscription`, `reason` | `mesh` | `documented_only` | `conditional` | MeshSubscribe subscriptions refused by the control plane because the bearer JWT audience does not match the required subscription purpose, by subscription class and reason. |
+| `ferrum_mesh_subscribe_audience_rejections_total` | counter | `subscription`, `reason`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | MeshSubscribe subscriptions refused by the control plane because the bearer JWT audience does not match the required subscription purpose, by subscription class and reason. |
 | `ferrum_mesh_tcp_egress_connections_total` | counter | `transport`, `result`, `namespace` | `mesh` | `documented_only` | `conditional` | Raw-TCP mesh egress relay connections by transport and outcome. |
 | `ferrum_mesh_trust_bundle_version` | gauge | `trust_domain`, `source`, `gateway_namespace` | `mesh` | `dashboard` | `conditional` | Monotonic version of observed mesh trust bundles. |
 | `ferrum_node_agent_attach_errors_total` | counter | `namespace` | `node_agent` | `documented_only` | `conditional` | Node-agent BPF attachment or map update errors. |
@@ -240,8 +241,8 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_stream_connections_total` | counter | `proxy_id`, `protocol`, `namespace` | `stream` | `dashboard` | `conditional` | Total stream connections (TCP/UDP). |
 | `ferrum_stream_disconnects_total` | counter | `proxy_id`, `protocol`, `cause`, `direction`, `namespace` | `stream` | `dashboard` | `conditional` | Stream disconnects (TCP/UDP) by cause and direction. |
 | `ferrum_stream_duration_ms` | histogram | `proxy_id`, `le`, `namespace` | `stream` | `documented_only` | `conditional` | Stream connection duration in milliseconds. |
-| `ferrum_tls_cert_expiry_seconds` | gauge | `cert_id`, `source`, `namespace` | `tls` | `documented_only` | `conditional` | Seconds until the certificate leaf not_after timestamp. Negative means expired. |
-| `ferrum_tls_cert_not_before_seconds` | gauge | `cert_id`, `source`, `namespace` | `tls` | `documented_only` | `conditional` | Certificate leaf not_before timestamp as Unix seconds. |
+| `ferrum_tls_cert_expiry_seconds` | gauge | `cert_id`, `surface`, `source_kind`, `namespace` | `tls` | `documented_only` | `conditional` | Seconds until the certificate leaf not_after timestamp. Negative means expired. |
+| `ferrum_tls_cert_not_before_seconds` | gauge | `cert_id`, `surface`, `source_kind`, `namespace` | `tls` | `documented_only` | `conditional` | Certificate leaf not_before timestamp as Unix seconds. |
 | `ferrum_tls_cert_rotations_total` | counter | `cert_id`, `reason`, `outcome`, `namespace` | `tls` | `documented_only` | `conditional` | TLS certificate rotation outcomes by cert ID, reason, and outcome. |
 | `ferrum_tls_inventory_snapshot_max_age_seconds` | gauge | `namespace` | `tls` | `documented_only` | `conditional` | Configured maximum snapshot age (FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS) before a scrape schedules a background refresh. |
 | `ferrum_tls_inventory_snapshot_timestamp_seconds` | gauge | `namespace` | `tls` | `documented_only` | `conditional` | Unix timestamp of the cached, non-secret TLS inventory snapshot backing the certificate gauges. |
@@ -252,9 +253,9 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_websocket_frames_total` | counter | `proxy_id`, `direction`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket frames relayed by direction. |
 | `ferrum_websocket_session_duration_ms` | histogram | `proxy_id`, `result`, `direction`, `io_side`, `error_class`, `le`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket session duration in milliseconds. |
 | `ferrum_websocket_sessions_total` | counter | `proxy_id`, `result`, `direction`, `io_side`, `error_class`, `namespace` | `websocket` | `documented_only` | `conditional` | Completed WebSocket sessions by bounded terminal classification. |
-| `ferrum_xds_first_slice_nacks_total` | counter | `namespace`, `type_url` | `mesh` | `documented_only` | `conditional` | NACKs of a required mesh-slice type while the data plane is still waiting for its first slice. |
-| `ferrum_xds_streams_rejected_total` | counter | — | `mesh` | `documented_only` | `conditional` | ADS streams rejected for exceeding the per-node concurrent-stream ceiling. |
-| `ferrum_xds_warming_partial_applies_total` | counter | `namespace` | `mesh` | `documented_only` | `conditional` | Mesh slices applied while marked as xDS required-version skewed. Normal coherent xDS apply should not increment this. |
+| `ferrum_xds_first_slice_nacks_total` | counter | `namespace`, `type_url`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | NACKs of a required mesh-slice type while the data plane is still waiting for its first slice. |
+| `ferrum_xds_streams_rejected_total` | counter | `gateway_namespace` | `mesh` | `documented_only` | `conditional` | ADS streams rejected for exceeding the per-node concurrent-stream ceiling. |
+| `ferrum_xds_warming_partial_applies_total` | counter | `namespace`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Mesh slices applied while marked as xDS required-version skewed. Normal coherent xDS apply should not increment this. |
 
 ## Bundled observability surfaces
 

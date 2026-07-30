@@ -17,12 +17,16 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 VALID_TYPES = {"counter", "gauge", "histogram", "summary"}
+# `/metrics` is the general exposition surface. The `api_chargeback` billing
+# families are rendered only by the separate authenticated `GET /charges`
+# Prometheus format (`src/admin/mod.rs`), never folded into `/metrics`.
+VALID_EXPORT_SURFACES = {"/metrics", "/charges"}
+CHARGES_ONLY_SUBSYSTEM = "api_chargeback"
 VALID_BUNDLED = {"alert", "dashboard", "alert_and_dashboard", "documented_only"}
 VALID_EMISSION = {
     "always",
@@ -241,8 +245,19 @@ def load_contract(root: Path) -> list[dict]:
             fail("Invalid bundled classification", f"{name}: {item['bundled']}")
         if item["emission"] not in VALID_EMISSION:
             fail("Invalid emission classification", f"{name}: {item['emission']}")
-        if item["export_surface"] != "/metrics":
-            fail("Unexpected export surface", f"{name}: {item['export_surface']}")
+        surface = item["export_surface"]
+        if surface not in VALID_EXPORT_SURFACES:
+            fail("Unexpected export surface", f"{name}: {surface}")
+        # The two surfaces are not interchangeable: pin the mapping so a row
+        # cannot silently claim `/metrics` for a `/charges`-only family.
+        expected_surface = (
+            "/charges" if subsystem == CHARGES_ONLY_SUBSYSTEM else "/metrics"
+        )
+        if surface != expected_surface:
+            fail(
+                "Export surface does not match subsystem",
+                f"{name}: subsystem={subsystem} expects {expected_surface}, got {surface}",
+            )
         if "name_template" in item:
             template = item["name_template"]
             prefix = item["default_prefix"]

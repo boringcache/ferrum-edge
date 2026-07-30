@@ -482,7 +482,7 @@
       "namespace"
     ],
     "subsystem": "api_chargeback",
-    "export_surface": "/metrics",
+    "export_surface": "/charges",
     "bundled": "documented_only",
     "emission": "when_plugin_enabled"
   },
@@ -499,7 +499,7 @@
       "namespace"
     ],
     "subsystem": "api_chargeback",
-    "export_surface": "/metrics",
+    "export_surface": "/charges",
     "bundled": "documented_only",
     "emission": "when_plugin_enabled"
   },
@@ -516,7 +516,7 @@
       "namespace"
     ],
     "subsystem": "api_chargeback",
-    "export_surface": "/metrics",
+    "export_surface": "/charges",
     "bundled": "documented_only",
     "emission": "when_plugin_enabled"
   },
@@ -533,7 +533,7 @@
       "namespace"
     ],
     "subsystem": "api_chargeback",
-    "export_surface": "/metrics",
+    "export_surface": "/charges",
     "bundled": "documented_only",
     "emission": "when_plugin_enabled"
   },
@@ -543,7 +543,7 @@
     "help": "Charges lost because neither an ordinary billing row nor the aggregate row could be admitted.",
     "labels": [],
     "subsystem": "api_chargeback",
-    "export_surface": "/metrics",
+    "export_surface": "/charges",
     "bundled": "documented_only",
     "emission": "when_plugin_enabled"
   },
@@ -553,7 +553,7 @@
     "help": "Charges folded into the aggregate overflow row because a new billing row could not be admitted under max_entries (per-identity attribution lost).",
     "labels": [],
     "subsystem": "api_chargeback",
-    "export_surface": "/metrics",
+    "export_surface": "/charges",
     "bundled": "documented_only",
     "emission": "when_plugin_enabled"
   },
@@ -563,7 +563,7 @@
     "help": "Billing rows (complete registry entry keys) currently retained against max_entries.",
     "labels": [],
     "subsystem": "api_chargeback",
-    "export_surface": "/metrics",
+    "export_surface": "/charges",
     "bundled": "documented_only",
     "emission": "when_plugin_enabled"
   },
@@ -573,7 +573,7 @@
     "help": "Configured ceiling on retained billing rows (complete registry entry keys).",
     "labels": [],
     "subsystem": "api_chargeback",
-    "export_surface": "/metrics",
+    "export_surface": "/charges",
     "bundled": "documented_only",
     "emission": "when_plugin_enabled"
   },
@@ -583,7 +583,7 @@
     "help": "Configured ceiling on retained registry bytes.",
     "labels": [],
     "subsystem": "api_chargeback",
-    "export_surface": "/metrics",
+    "export_surface": "/charges",
     "bundled": "documented_only",
     "emission": "when_plugin_enabled"
   },
@@ -593,7 +593,7 @@
     "help": "Estimated bytes retained by the shared registry.",
     "labels": [],
     "subsystem": "api_chargeback",
-    "export_surface": "/metrics",
+    "export_surface": "/charges",
     "bundled": "documented_only",
     "emission": "when_plugin_enabled"
   },
@@ -610,7 +610,7 @@
       "namespace"
     ],
     "subsystem": "api_chargeback",
-    "export_surface": "/metrics",
+    "export_surface": "/charges",
     "bundled": "documented_only",
     "emission": "when_plugin_enabled"
   },
@@ -626,7 +626,7 @@
       "namespace"
     ],
     "subsystem": "api_chargeback",
-    "export_surface": "/metrics",
+    "export_surface": "/charges",
     "bundled": "documented_only",
     "emission": "when_plugin_enabled"
   },
@@ -642,7 +642,7 @@
       "namespace"
     ],
     "subsystem": "api_chargeback",
-    "export_surface": "/metrics",
+    "export_surface": "/charges",
     "bundled": "documented_only",
     "emission": "when_plugin_enabled"
   },
@@ -1107,7 +1107,7 @@
     "help": "Underlying writer and flush failures.",
     "labels": [
       "sink",
-      "reason"
+      "operation"
     ],
     "subsystem": "logging",
     "export_surface": "/metrics",
@@ -1351,7 +1351,8 @@
     "type": "counter",
     "help": "Mesh slices quarantined by the config-revision freshness gate before replacing live state, by reason.",
     "labels": [
-      "reason"
+      "reason",
+      "gateway_namespace"
     ],
     "subsystem": "mesh",
     "export_surface": "/metrics",
@@ -1364,7 +1365,8 @@
     "help": "MeshSubscribe responses refused before apply, by consumer and reason.",
     "labels": [
       "consumer",
-      "reason"
+      "reason",
+      "gateway_namespace"
     ],
     "subsystem": "mesh",
     "export_surface": "/metrics",
@@ -1546,9 +1548,10 @@
     "type": "counter",
     "help": "Mesh outbound registry decisions with bounded host buckets (<admit_explicit>, <admit_wildcard>, <denied>).",
     "labels": [
-      "namespace",
-      "host_bucket",
-      "decision"
+      "mesh_namespace",
+      "host",
+      "decision",
+      "namespace"
     ],
     "subsystem": "mesh",
     "export_surface": "/metrics",
@@ -1560,9 +1563,10 @@
     "type": "counter",
     "help": "Mesh outbound registry decisions for stream-family egress (TCP/UDP/TCP+TLS/UDP+DTLS) by protocol.",
     "labels": [
-      "namespace",
+      "mesh_namespace",
       "protocol",
-      "decision"
+      "decision",
+      "namespace"
     ],
     "subsystem": "mesh",
     "export_surface": "/metrics",
@@ -1685,7 +1689,8 @@
     "help": "MeshSubscribe subscriptions refused by the control plane because the bearer JWT audience does not match the required subscription purpose, by subscription class and reason.",
     "labels": [
       "subscription",
-      "reason"
+      "reason",
+      "gateway_namespace"
     ],
     "subsystem": "mesh",
     "export_surface": "/metrics",
@@ -2188,7 +2193,8 @@
     "help": "Seconds until the certificate leaf not_after timestamp. Negative means expired.",
     "labels": [
       "cert_id",
-      "source",
+      "surface",
+      "source_kind",
       "namespace"
     ],
     "subsystem": "tls",
@@ -2202,7 +2208,8 @@
     "help": "Certificate leaf not_before timestamp as Unix seconds.",
     "labels": [
       "cert_id",
-      "source",
+      "surface",
+      "source_kind",
       "namespace"
     ],
     "subsystem": "tls",
@@ -2364,7 +2371,8 @@
     "help": "NACKs of a required mesh-slice type while the data plane is still waiting for its first slice.",
     "labels": [
       "namespace",
-      "type_url"
+      "type_url",
+      "gateway_namespace"
     ],
     "subsystem": "mesh",
     "export_surface": "/metrics",
@@ -2375,7 +2383,9 @@
     "name": "ferrum_xds_streams_rejected_total",
     "type": "counter",
     "help": "ADS streams rejected for exceeding the per-node concurrent-stream ceiling.",
-    "labels": [],
+    "labels": [
+      "gateway_namespace"
+    ],
     "subsystem": "mesh",
     "export_surface": "/metrics",
     "bundled": "documented_only",
@@ -2386,7 +2396,8 @@
     "type": "counter",
     "help": "Mesh slices applied while marked as xDS required-version skewed. Normal coherent xDS apply should not increment this.",
     "labels": [
-      "namespace"
+      "namespace",
+      "gateway_namespace"
     ],
     "subsystem": "mesh",
     "export_surface": "/metrics",
