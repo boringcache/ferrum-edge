@@ -348,14 +348,7 @@ async fn proxy_alerts_failed_trigger_releases_cooldown_and_pending_state() {
     .expect("pending trigger should settle");
 
     assert!(
-        plugin.try_acquire_cooldown_for_test(
-            0,
-            "ferrum|p1",
-            0,
-            60_000,
-            monotonic_now_ms(),
-            0,
-        ),
+        plugin.try_acquire_cooldown_for_test(0, "ferrum|p1", 0, 60_000, monotonic_now_ms(), 0,),
         "failed trigger must release cooldown"
     );
     let _ = server;
@@ -403,14 +396,7 @@ async fn proxy_alerts_successful_trigger_commits_active_and_cooldown() {
     .expect("successful trigger should become Active");
 
     assert!(
-        !plugin.try_acquire_cooldown_for_test(
-            0,
-            "ferrum|p1",
-            0,
-            60_000,
-            monotonic_now_ms(),
-            0,
-        ),
+        !plugin.try_acquire_cooldown_for_test(0, "ferrum|p1", 0, 60_000, monotonic_now_ms(), 0,),
         "successful trigger must consume cooldown"
     );
 }
