@@ -269,6 +269,31 @@ fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), Stri
 /// cannot preserve the configured enforcement contract.
 fn validate_plugin_security_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
     for protocol in ALL_PROXY_PROTOCOLS {
+        let identity_soap_count = plugins
+            .iter()
+            .filter(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && plugin.name() == "soap_ws_security"
+                    && plugin.is_auth_plugin()
+            })
+            .count();
+        if identity_soap_count > 0 {
+            let auth_plugins: Vec<&str> = plugins
+                .iter()
+                .filter(|plugin| {
+                    plugin.supported_protocols().contains(&protocol) && plugin.is_auth_plugin()
+                })
+                .map(|plugin| plugin.name())
+                .collect();
+            if auth_plugins.len() != 1 {
+                return Err(format!(
+                    "identity-establishing soap_ws_security must be the sole authentication \
+                     mechanism for protocol {protocol:?} on its effective plugin chain; found: {}",
+                    auth_plugins.join(", ")
+                ));
+            }
+        }
+
         let has_hmac = plugins
             .iter()
             .filter(|plugin| plugin.supported_protocols().contains(&protocol))
@@ -2805,6 +2830,7 @@ const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "correlation_id",
     "hmac_auth",
     "request_deduplication",
+    "soap_ws_security",
     "serverless_function",
     "request_transformer",
     "compression",
@@ -2834,6 +2860,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
 ) -> Result<(), String> {
     validate_api_chargeback_ownership(config)?;
     validate_replay_provenance_composition(config)?;
+    validate_soap_ws_security_composition(config)?;
     let mut errors = Vec::new();
     let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
     let mut scoped_plugins: SecurityCompositionPluginMap<'_> = HashMap::new();
@@ -4433,6 +4460,15 @@ fn validate_replay_provenance_composition(config: &GatewayConfig) -> Result<(), 
         .map_err(|errors| errors.join("; "))
 }
 
+/// `soap_ws_security` establishes SOAP identity in the `authenticate` phase, so
+/// multi-auth composition would skip or override it and request decompression
+/// would run after the message was already validated. Reject both before
+/// constructing a generation whose ordering guarantees cannot hold.
+fn validate_soap_ws_security_composition(config: &GatewayConfig) -> Result<(), String> {
+    crate::plugins::soap_ws_security::validate_composition(config)
+        .map_err(|errors| errors.join("; "))
+}
+
 /// `__mesh_bpf_metrics` is a single scrape exporter per process. Require at
 /// most one enabled global instance so reload never registers duplicate
 /// collectors / double-emits series on authenticated `/metrics`.
@@ -4524,6 +4560,7 @@ impl PluginCache {
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
         validate_replay_provenance_composition(config)?;
+        validate_soap_ws_security_composition(config)?;
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let (
             proxy_map,
@@ -4930,6 +4967,7 @@ impl PluginCache {
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
         validate_replay_provenance_composition(config)?;
+        validate_soap_ws_security_composition(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         let restrict_country_mmdb_refresh_to_rebuild_scope =
             matches!(country_mmdb_load_mode, CountryMmdbLoadMode::PreloadedOnly);
@@ -4972,6 +5010,7 @@ impl PluginCache {
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
         validate_replay_provenance_composition(config)?;
+        validate_soap_ws_security_composition(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         if paths.is_empty() {
             return Ok(None);
