@@ -2,6 +2,7 @@
 //!
 //! v1 supports OpenAPI 2.0 (Swagger), 3.0.x, 3.1.x, 3.2.x in JSON or YAML.
 
+pub mod bounded_yaml;
 pub mod extractor;
 pub mod handlers;
 
