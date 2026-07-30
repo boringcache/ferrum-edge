@@ -273,8 +273,8 @@ pub(crate) fn validate_stored_api_spec_metadata(
 /// Parse `body` under a **declared** format using the same bounded document
 /// parser as ingestion and return the spec-language version it declares.
 ///
-/// This admits JSON/YAML syntax (plus the source-tree node cap and YAML
-/// anchor/alias rejection) and the same root `swagger`/`openapi` version
+/// This admits JSON/YAML syntax (plus the source-tree node cap and bounded
+/// YAML anchor/alias expansion) and the same root `swagger`/`openapi` version
 /// detection [`extract`] performs, so a document that declares no supported
 /// OpenAPI/Swagger version is rejected. It does **not** extract resources,
 /// re-resolve `$ref`s, or regenerate config — restore must keep historical
@@ -4568,46 +4568,57 @@ fn parse_root_document(
 ) -> Result<(serde_json::Value, SpecFormat), ExtractError> {
     let fmt = declared_format.unwrap_or_else(|| autodetect_format(body));
 
-    // Parse to serde_json::Value.  serde_yaml accepts JSON as a YAML subset, so
-    // a single serde_yaml parse covers both formats.  For JSON we still prefer
-    // serde_json so the error messages mention "JSON" rather than "YAML".
+    // JSON prefers serde_json so error messages mention "JSON". YAML always
+    // goes through the bounded event composer (`bounded_yaml`) so anchors and
+    // aliases expand under node/depth/alias-reference/byte/work budgets with
+    // cycle detection — never through serde_yaml's unbounded materialization.
     //
     // Fallback: YAML flow-style documents start with `{` and look like JSON to
     // autodetect_format, but they use unquoted keys which serde_json rejects.
     // When JSON parsing fails on autodetected (not declared) input, retry as
-    // YAML before surfacing the error.
+    // YAML before surfacing the error. The YAML path applies the same budgets
+    // as an explicitly declared YAML body (no autodetection differential).
     let (root, parsed_via_yaml, actual_format): (serde_json::Value, bool, SpecFormat) = match fmt {
         SpecFormat::Json => match serde_json::from_slice(body) {
             Ok(v) => (v, false, SpecFormat::Json),
             Err(e) if declared_format.is_none() => {
                 // Autodetected as JSON but failed — try YAML (covers flow-style).
-                reject_yaml_alias_or_anchor_syntax(body)?;
-                let yv: serde_yaml::Value = serde_yaml::from_slice(body)
-                    .map_err(|_| ExtractError::InvalidJson(e.to_string()))?;
-                let val = serde_json::to_value(yv)
-                    .map_err(|e2| ExtractError::InvalidYaml(e2.to_string()))?;
+                // Preserve every semantic fail-closed YAML diagnostic. Only a
+                // YAML syntax failure keeps the original JSON error, so adding
+                // a new bounded-composer error cannot silently weaken this
+                // classification through a brittle message allowlist.
+                let val = crate::admin::api_specs::bounded_yaml::parse_yaml_to_json(
+                    body,
+                    MAX_SOURCE_DOCUMENT_NODES,
+                )
+                .map_err(|yaml_err| {
+                    if matches!(
+                        &yaml_err,
+                        crate::admin::api_specs::bounded_yaml::BoundedYamlError::Parse(_)
+                            | crate::admin::api_specs::bounded_yaml::BoundedYamlError::EmptyDocument
+                    ) {
+                        ExtractError::InvalidJson(e.to_string())
+                    } else {
+                        ExtractError::InvalidYaml(yaml_err.message())
+                    }
+                })?;
                 (val, true, SpecFormat::Yaml)
             }
             Err(e) => return Err(ExtractError::InvalidJson(e.to_string())),
         },
         SpecFormat::Yaml => {
-            reject_yaml_alias_or_anchor_syntax(body)?;
-            let yv: serde_yaml::Value = serde_yaml::from_slice(body)
-                .map_err(|e| ExtractError::InvalidYaml(e.to_string()))?;
-            let val =
-                serde_json::to_value(yv).map_err(|e| ExtractError::InvalidYaml(e.to_string()))?;
+            let val = parse_yaml_document(body)?;
             (val, true, SpecFormat::Yaml)
         }
     };
 
     // Source-tree node cap, applied to **both** formats.
     //
-    // For YAML this is defence-in-depth: anchor/alias syntax is rejected before
-    // serde_yaml materializes the Value, so this post-parse walk is not the
-    // primary alias-bomb memory cap. For JSON it is the only structural bound
-    // besides the request-body byte ceiling; without it, a JSON document could
-    // present far more reference sites than an equivalently sized YAML one and
-    // face a strictly weaker admission check (GHSA-8jc7-c52g-85xr).
+    // For YAML this is defence-in-depth on top of budgeted expansion inside
+    // `bounded_yaml`. For JSON it is the only structural bound besides the
+    // request-body byte ceiling; without it, a JSON document could present far
+    // more reference sites than an equivalently sized YAML one and face a
+    // strictly weaker admission check (GHSA-8jc7-c52g-85xr).
     let mut budget = MAX_SOURCE_DOCUMENT_NODES;
     if !count_value_nodes(&root, &mut budget) {
         return Err(if parsed_via_yaml {
@@ -4624,230 +4635,22 @@ fn parse_root_document(
     Ok((root, actual_format))
 }
 
-// ---------------------------------------------------------------------------
-// YAML alias-bomb defence
-// ---------------------------------------------------------------------------
+fn parse_yaml_document(body: &[u8]) -> Result<serde_json::Value, ExtractError> {
+    crate::admin::api_specs::bounded_yaml::parse_yaml_to_json(body, MAX_SOURCE_DOCUMENT_NODES)
+        .map_err(|e| ExtractError::InvalidYaml(e.message()))
+}
 
-const YAML_ANCHORS_UNSUPPORTED_MESSAGE: &str =
-    "YAML anchors and aliases are not supported in API specs; inline repeated content instead";
+// ---------------------------------------------------------------------------
+// Source-document node budget (JSON + post-expansion YAML)
+// ---------------------------------------------------------------------------
 
 /// Maximum number of `serde_json::Value` nodes allowed in a parsed source
 /// document, and after a stored YAML → JSON representation conversion.
 ///
 /// 500k nodes is generous for any real OpenAPI spec (the largest public specs
-/// top out around 50k nodes). Anchors and aliases are rejected before parsing;
-/// this guard caps large literal documents in either source format.
+/// top out around 50k nodes). YAML anchors/aliases expand under the same cap
+/// (plus depth/alias-reference/byte/work budgets) before this post-check.
 pub(crate) const MAX_SOURCE_DOCUMENT_NODES: usize = 500_000;
-
-fn reject_yaml_alias_or_anchor_syntax(body: &[u8]) -> Result<(), ExtractError> {
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut escaped = false;
-    let mut flow_depth: usize = 0;
-    let mut expect_node_start = true;
-    let mut i = 0;
-    let mut block_scalar_min_indent: Option<usize> = None;
-
-    while i < body.len() {
-        let line_start = i;
-        let mut line_end = i;
-        while line_end < body.len() && body[line_end] != b'\n' && body[line_end] != b'\r' {
-            line_end += 1;
-        }
-
-        let mut next_line_start = line_end;
-        if next_line_start < body.len() {
-            if body[next_line_start] == b'\r'
-                && body.get(next_line_start + 1).copied() == Some(b'\n')
-            {
-                next_line_start += 2;
-            } else {
-                next_line_start += 1;
-            }
-        }
-
-        let line = &body[line_start..line_end];
-        let indent = line.iter().take_while(|&&b| b == b' ').count();
-        let line_blank = line.iter().all(|b| b.is_ascii_whitespace());
-
-        if let Some(min_indent) = block_scalar_min_indent {
-            if line_blank || indent >= min_indent {
-                i = next_line_start;
-                continue;
-            }
-            block_scalar_min_indent = None;
-        }
-
-        let mut j = line_start;
-        if flow_depth == 0 {
-            expect_node_start = true;
-        }
-        while j < line_end {
-            let byte = body[j];
-
-            if in_single_quote {
-                if byte == b'\'' {
-                    if body.get(j + 1) == Some(&b'\'') {
-                        j += 2;
-                        continue;
-                    }
-                    in_single_quote = false;
-                    expect_node_start = false;
-                }
-                j += 1;
-                continue;
-            }
-
-            if in_double_quote {
-                if escaped {
-                    escaped = false;
-                    j += 1;
-                    continue;
-                }
-                match byte {
-                    b'\\' => escaped = true,
-                    b'"' => {
-                        in_double_quote = false;
-                        expect_node_start = false;
-                    }
-                    _ => {}
-                }
-                j += 1;
-                continue;
-            }
-
-            match byte {
-                b'#' => {
-                    break;
-                }
-                b'\'' => {
-                    in_single_quote = true;
-                    expect_node_start = false;
-                }
-                b'"' => {
-                    in_double_quote = true;
-                    expect_node_start = false;
-                }
-                b'|' | b'>'
-                    if yaml_block_scalar_header_min_indent(line, j - line_start, indent)
-                        .is_some() =>
-                {
-                    block_scalar_min_indent =
-                        yaml_block_scalar_header_min_indent(line, j - line_start, indent);
-                    break;
-                }
-                b'&' | b'*'
-                    if expect_node_start
-                        && body
-                            .get(j + 1)
-                            .copied()
-                            .is_some_and(is_yaml_anchor_name_byte) =>
-                {
-                    return Err(ExtractError::InvalidYaml(format!(
-                        "{YAML_ANCHORS_UNSUPPORTED_MESSAGE} (found '{}' at byte {j})",
-                        char::from(byte)
-                    )));
-                }
-                b'[' | b'{' if expect_node_start => {
-                    flow_depth += 1;
-                    expect_node_start = true;
-                }
-                b']' | b'}' if flow_depth > 0 => {
-                    flow_depth -= 1;
-                    expect_node_start = false;
-                }
-                b',' if flow_depth > 0 => {
-                    expect_node_start = true;
-                }
-                b':' if yaml_colon_is_mapping_separator(line, j - line_start) => {
-                    expect_node_start = true;
-                }
-                b'-' if expect_node_start
-                    && line
-                        .get(j - line_start + 1)
-                        .copied()
-                        .is_none_or(|next| next.is_ascii_whitespace()) =>
-                {
-                    expect_node_start = true;
-                }
-                byte if byte.is_ascii_whitespace() => {}
-                _ => {
-                    expect_node_start = false;
-                }
-            }
-
-            j += 1;
-        }
-
-        i = next_line_start;
-    }
-
-    Ok(())
-}
-
-fn yaml_block_scalar_header_min_indent(
-    line: &[u8],
-    indicator_idx: usize,
-    line_indent: usize,
-) -> Option<usize> {
-    let prefix = line.get(..indicator_idx)?;
-    let prefix_trimmed_end = prefix
-        .iter()
-        .rposition(|b| !b.is_ascii_whitespace())
-        .map(|idx| idx + 1)
-        .unwrap_or(0);
-    let prefix_trimmed = &prefix[..prefix_trimmed_end];
-
-    if !prefix_trimmed.is_empty()
-        && !matches!(prefix_trimmed.last().copied(), Some(b':' | b'-' | b'?'))
-    {
-        return None;
-    }
-
-    let mut explicit_indent: Option<usize> = None;
-    let mut suffix_idx = indicator_idx + 1;
-    while let Some(byte) = line.get(suffix_idx).copied() {
-        match byte {
-            b'1'..=b'9' => {
-                explicit_indent = Some((byte - b'0') as usize);
-                suffix_idx += 1;
-            }
-            b'+' | b'-' => {
-                suffix_idx += 1;
-            }
-            b' ' | b'\t' => {
-                suffix_idx += 1;
-                break;
-            }
-            b'#' => break,
-            _ => return None,
-        }
-    }
-
-    while let Some(byte) = line.get(suffix_idx).copied() {
-        match byte {
-            b' ' | b'\t' => suffix_idx += 1,
-            b'#' => break,
-            _ => return None,
-        }
-    }
-
-    Some(line_indent + explicit_indent.unwrap_or(1))
-}
-
-fn yaml_colon_is_mapping_separator(line: &[u8], colon_idx: usize) -> bool {
-    line.get(colon_idx + 1)
-        .copied()
-        .is_none_or(|next| next.is_ascii_whitespace() || matches!(next, b'#' | b',' | b']' | b'}'))
-}
-
-fn is_yaml_anchor_name_byte(byte: u8) -> bool {
-    !byte.is_ascii_whitespace()
-        && !matches!(
-            byte,
-            b',' | b'[' | b']' | b'{' | b'}' | b':' | b'#' | b'\'' | b'"'
-        )
-}
 
 /// Walk a `serde_json::Value` tree, decrementing `budget` for each node
 /// visited.  Returns `false` (reject) when the budget hits zero.
@@ -6578,7 +6381,7 @@ x-ferrum-proxy:
     }
 
     // -----------------------------------------------------------------------
-    // YAML alias-bomb defence
+    // YAML bounded anchor/alias expansion
     // -----------------------------------------------------------------------
 
     #[test]
@@ -6598,40 +6401,51 @@ x-ferrum-proxy:
     }
 
     #[test]
-    fn yaml_anchor_syntax_rejected_before_parse() {
-        let yaml = b"openapi: '3.1.0'\n\
-                     info: &info\n\
-                       title: Anchored\n\
-                       version: '1.0'\n\
-                     x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}";
-        let err = extract(yaml, Some(SpecFormat::Yaml), "default").unwrap_err();
-        assert!(
-            matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("anchors and aliases")),
-            "expected YAML anchor preflight rejection, got {err:?}"
+    fn yaml_anchor_and_alias_expand_deterministically() {
+        let yaml = concat!(
+            "openapi: '3.1.0'\n",
+            "info: &info\n",
+            "  title: Anchored\n",
+            "  version: '1.0'\n",
+            "x-ferrum-proxy:\n",
+            "  id: test\n",
+            "  backend_host: x.com\n",
+            "  backend_port: 443\n",
+            "components:\n",
+            "  schemas:\n",
+            "    Reused: *info\n",
         );
+        let (bundle, meta) = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "default").unwrap();
+        assert_eq!(bundle.proxy.id, "test");
+        assert_eq!(meta.title.as_deref(), Some("Anchored"));
     }
 
     #[test]
-    fn yaml_alias_syntax_rejected_before_parse() {
-        let yaml = b"openapi: '3.1.0'\n\
-                     info: *common_info\n\
-                     x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}";
-        let err = extract(yaml, Some(SpecFormat::Yaml), "default").unwrap_err();
-        assert!(
-            matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("anchors and aliases")),
-            "expected YAML alias preflight rejection, got {err:?}"
+    fn yaml_alias_chain_expands() {
+        let yaml = concat!(
+            "openapi: '3.1.0'\n",
+            "info:\n",
+            "  title: Chain\n",
+            "  version: '1.0'\n",
+            "x-ferrum-proxy: &proxy\n",
+            "  id: test\n",
+            "  backend_host: x.com\n",
+            "  backend_port: 443\n",
+            "paths: {}\n",
+            "x-copy: *proxy\n",
         );
+        let (bundle, _) = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "default").unwrap();
+        assert_eq!(bundle.proxy.id, "test");
     }
 
     #[test]
-    fn flow_style_yaml_anchor_rejected_on_json_fallback() {
+    fn flow_style_yaml_anchor_expands_on_json_fallback() {
         let yaml = b"{openapi: '3.1.0', info: &info {title: flow, version: '1.0'}, \
-                     x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}}";
-        let err = extract(yaml, None, "default").unwrap_err();
-        assert!(
-            matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("anchors and aliases")),
-            "expected YAML fallback preflight rejection, got {err:?}"
-        );
+                     x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}, \
+                     reused: *info}";
+        let (bundle, meta) = extract(yaml, None, "default").unwrap();
+        assert_eq!(bundle.proxy.id, "test");
+        assert_eq!(meta.title.as_deref(), Some("flow"));
     }
 
     #[test]
@@ -6706,7 +6520,7 @@ x-ferrum-proxy:
     }
 
     #[test]
-    fn yaml_anchor_after_block_scalar_still_rejected() {
+    fn yaml_anchor_after_block_scalar_still_expands() {
         let yaml = concat!(
             "openapi: '3.1.0'\n",
             "info:\n",
@@ -6716,21 +6530,19 @@ x-ferrum-proxy:
             "    Folded *literal* text is fine.\n",
             "servers: &servers\n",
             "  - url: https://example.com\n",
-            "x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}",
+            "x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}\n",
+            "copied: *servers\n",
         )
         .as_bytes();
-        let err = extract(yaml, Some(SpecFormat::Yaml), "default").unwrap_err();
-        assert!(
-            matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("anchors and aliases")),
-            "expected YAML anchor preflight rejection after block scalar, got {err:?}"
-        );
+        let (bundle, meta) = extract(yaml, Some(SpecFormat::Yaml), "default").unwrap();
+        assert_eq!(bundle.proxy.id, "test");
+        assert_eq!(meta.server_urls, vec!["https://example.com".to_string()]);
     }
 
     #[test]
-    fn yaml_alias_bomb_rejected() {
-        // Build a YAML doc with deeply nested anchors that expands
-        // exponentially.  The preflight rejects anchors and aliases before
-        // serde_yaml can materialize the expanded tree.
+    fn yaml_alias_bomb_rejected_by_budget() {
+        // Deeply nested anchors that expand exponentially must fail closed
+        // under node/work budgets before unbounded allocation.
         let yaml = b"a: &a [1,2,3,4,5,6,7,8]\n\
                       b: &b [*a,*a,*a,*a,*a,*a,*a,*a]\n\
                       c: &c [*b,*b,*b,*b,*b,*b,*b,*b]\n\
@@ -6743,8 +6555,76 @@ x-ferrum-proxy:
                       x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}";
         let err = extract(yaml, Some(SpecFormat::Yaml), "default").unwrap_err();
         assert!(
-            matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("anchors and aliases")),
-            "alias bomb must be rejected before YAML parsing, got {err:?}"
+            matches!(
+                &err,
+                ExtractError::InvalidYaml(msg)
+                    if msg.contains("node limit")
+                        || msg.contains("work limit")
+                        || msg.contains("alias reference")
+                        || msg.contains("byte limit")
+            ),
+            "alias bomb must be rejected by expansion budgets, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn yaml_undefined_alias_rejected() {
+        let yaml = b"openapi: '3.1.0'\n\
+                     info: *missing\n\
+                     x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}";
+        let err = extract(yaml, Some(SpecFormat::Yaml), "default").unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("undefined YAML alias")),
+            "expected undefined alias rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn yaml_alias_cycle_rejected() {
+        // Use concat! (not `\` line continuations): Rust elides indentation after
+        // `\`-newline, which flattens the mapping and drops the self-ref cycle.
+        let yaml = concat!(
+            "openapi: '3.1.0'\n",
+            "info:\n",
+            "  title: Cycle\n",
+            "  version: '1.0'\n",
+            "loop: &a\n",
+            "  self: *a\n",
+            "x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}\n",
+        );
+        let err = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "default").unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("cycle")),
+            "expected alias cycle rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn yaml_anchored_scalar_title_preserved() {
+        let yaml = concat!(
+            "openapi: '3.1.0'\n",
+            "info:\n",
+            "  title: &title Alias Scalar\n",
+            "  version: '1.0'\n",
+            "components:\n",
+            "  schemas:\n",
+            "    Shared:\n",
+            "      type: string\n",
+            "      default: *title\n",
+            "x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}\n",
+        );
+        let (bundle, meta) = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "default").unwrap();
+        assert_eq!(bundle.proxy.id, "test");
+        assert_eq!(meta.title.as_deref(), Some("Alias Scalar"));
+    }
+
+    #[test]
+    fn autodetected_flow_yaml_duplicate_key_is_invalid_yaml() {
+        let yaml = br#"{openapi: '3.1.0', info: {title: Duplicate, version: '1.0'}, x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}, marker: one, marker: two}"#;
+        let err = extract(yaml, None, "default").unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("duplicate key")),
+            "semantic YAML failures must survive JSON-first autodetection, got {err:?}"
         );
     }
 
