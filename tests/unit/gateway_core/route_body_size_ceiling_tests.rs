@@ -90,15 +90,9 @@ fn stricter_optional_limit_composes_to_the_minimum() {
 
 #[test]
 fn single_declared_length_parses_exactly() {
-    assert_eq!(
-        parse_content_length("2048"),
-        ContentLength::Exact(2048)
-    );
+    assert_eq!(parse_content_length("2048"), ContentLength::Exact(2048));
     // Surrounding OWS is legal field-value whitespace.
-    assert_eq!(
-        parse_content_length("  2048\t"),
-        ContentLength::Exact(2048)
-    );
+    assert_eq!(parse_content_length("  2048\t"), ContentLength::Exact(2048));
 }
 
 /// The exact bypass the advisory describes: a standards-valid repeated identical
@@ -118,10 +112,7 @@ fn repeated_identical_declared_lengths_fold_to_one_exact_value() {
 
 #[test]
 fn disagreeing_declared_lengths_are_ambiguous_not_absent() {
-    assert_eq!(
-        parse_content_length("2048, 4096"),
-        ContentLength::Ambiguous
-    );
+    assert_eq!(parse_content_length("2048, 4096"), ContentLength::Ambiguous);
 }
 
 /// `str::parse::<u64>()` accepts a leading `+`, which is not a valid

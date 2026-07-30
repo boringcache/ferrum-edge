@@ -35241,8 +35241,7 @@ async fn proxy_to_backend_http3(
                 if declared_request_content_length_over_limit(
                     headers,
                     effective_max_request_body_size_bytes,
-                )
-                {
+                ) {
                     return (
                         retry::BackendResponse {
                             status_code: 413,
