@@ -1373,7 +1373,7 @@ impl AiSemanticCache {
         append_family_instruction_exact_key(family, body, &mut key_input, &mut has_part);
 
         if let Some(fingerprint) = multimodal_fingerprint {
-            start_key_part(&mut key_input, &mut has_part);
+            start_key_part(&key_input, &mut has_part);
             key_input.push_str("mm:");
             key_input.push_str(fingerprint);
         }
@@ -1408,7 +1408,7 @@ impl AiSemanticCache {
         append_family_instruction_scope(family, body, &mut key_input, &mut has_part);
 
         if let Some(fingerprint) = multimodal_fingerprint {
-            start_key_part(&mut key_input, &mut has_part);
+            start_key_part(&key_input, &mut has_part);
             key_input.push_str("mm:");
             key_input.push_str(fingerprint);
         }

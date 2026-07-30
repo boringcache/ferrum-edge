@@ -1941,12 +1941,9 @@ impl ResponseCaching {
         maintenance: &mut CacheMaintenance,
         now: Duration,
     ) {
-        loop {
-            let Some((expires_at, insert_seq, cache_key)) =
-                maintenance.expiry_index.iter().next().cloned()
-            else {
-                break;
-            };
+        while let Some((expires_at, insert_seq, cache_key)) =
+            maintenance.expiry_index.iter().next().cloned()
+        {
             if expires_at > now {
                 break;
             }
@@ -3636,7 +3633,7 @@ mod tests {
                     status_code: 200,
                     ref body,
                     ..
-                } if body.as_slice() == b"tenant-a-response"
+                } if body.as_ref() == b"tenant-a-response"
             ),
             "the same backend-visible value must select the stored representation"
         );

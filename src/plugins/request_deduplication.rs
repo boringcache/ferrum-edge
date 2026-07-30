@@ -1153,8 +1153,8 @@ impl RequestDeduplication {
     ///
     /// * the caller's *authorization context* (mechanism + identity + consumer
     ///   + peer SPIFFE identity + digests of the credential headers actually
-    ///    presented), not merely a display subject, so two tokens with equal
-    ///    `sub` and different scopes cannot claim one another's operation;
+    ///     presented), not merely a display subject, so two tokens with equal
+    ///     `sub` and different scopes cannot claim one another's operation;
     /// * every caller's canonical peer address, which the origin observes
     ///   through Ferrum's regenerated `X-Forwarded-For`; only an *anonymous*
     ///   caller's binding can be relaxed by operator attestation (see
