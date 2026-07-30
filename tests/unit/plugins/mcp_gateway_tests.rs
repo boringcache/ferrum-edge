@@ -8537,6 +8537,25 @@ fn ref_chain_output_schema(links: usize) -> Value {
     })
 }
 
+/// A flat local-reference chain whose definitions are traversed from the leaf
+/// toward the root before the longest path is reached. A single global
+/// `visited` set would incorrectly skip each already-seen target and admit the
+/// long path; depth-aware memoization must audit it again at the deeper depth.
+fn previsited_ref_chain_output_schema(links: usize) -> Value {
+    let mut defs = serde_json::Map::new();
+    defs.insert("d0000".to_string(), json!({ "type": "object" }));
+    for index in 1..=links {
+        defs.insert(
+            format!("d{index:04}"),
+            json!({ "$ref": format!("#/$defs/d{:04}", index - 1) }),
+        );
+    }
+    json!({
+        "$defs": Value::Object(defs),
+        "allOf": [{ "$ref": format!("#/$defs/d{links:04}") }]
+    })
+}
+
 fn recursive_local_ref_output_schema() -> Value {
     json!({
         "$defs": {
@@ -8642,6 +8661,10 @@ async fn validate_tool_results_skips_tools_for_output_schema_security_boundaries
         (
             "local $ref chain longer than the schema-walk budget",
             ref_chain_output_schema(512),
+        ),
+        (
+            "previsited local $ref chain longer than the schema-walk budget",
+            previsited_ref_chain_output_schema(512),
         ),
     ];
 

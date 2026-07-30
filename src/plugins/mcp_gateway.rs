@@ -5629,8 +5629,9 @@ fn compile_tool_output_schema(schema: &Value) -> Result<Arc<jsonschema::Validato
 fn audit_output_schema(schema: &Value) -> Result<(), String> {
     let mut nodes = 0usize;
     audit_output_schema_structure(schema, 0, &mut nodes)?;
-    let mut visited = HashSet::new();
-    audit_output_schema_node(schema, schema, 0, &mut visited)
+    let mut max_depth_seen = HashMap::new();
+    let mut active = HashSet::new();
+    audit_output_schema_node(schema, schema, 0, &mut max_depth_seen, &mut active)
 }
 
 fn audit_output_schema_structure(
@@ -5669,7 +5670,8 @@ fn audit_output_schema_node(
     node: &Value,
     document: &Value,
     depth: usize,
-    visited: &mut HashSet<usize>,
+    max_depth_seen: &mut HashMap<usize, usize>,
+    active: &mut HashSet<usize>,
 ) -> Result<(), String> {
     if depth > MAX_OUTPUT_SCHEMA_REF_DEPTH {
         return Err(format!(
@@ -5677,12 +5679,20 @@ fn audit_output_schema_node(
         ));
     }
     let identity = std::ptr::from_ref(node) as usize;
-    if !visited.insert(identity) {
+    if active.contains(&identity) {
         return Ok(());
     }
+    if max_depth_seen
+        .get(&identity)
+        .is_some_and(|seen_depth| *seen_depth >= depth)
+    {
+        return Ok(());
+    }
+    max_depth_seen.insert(identity, depth);
     let Value::Object(map) = node else {
         return Ok(());
     };
+    active.insert(identity);
     for key in ["$ref", "$dynamicRef"] {
         if let Some(value) = map.get(key) {
             let Some(reference) = value.as_str() else {
@@ -5694,7 +5704,13 @@ fn audit_output_schema_node(
                 ));
             }
             if let Some(target) = local_output_schema_pointer_target(document, reference, key)? {
-                audit_output_schema_node(target, document, depth + 1, visited)?;
+                audit_output_schema_node(
+                    target,
+                    document,
+                    depth + 1,
+                    max_depth_seen,
+                    active,
+                )?;
             }
         }
     }
@@ -5718,17 +5734,35 @@ fn audit_output_schema_node(
             "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas" => {
                 if let Some(object) = value.as_object() {
                     for child in object.values() {
-                        audit_output_schema_node(child, document, depth + 1, visited)?;
+                        audit_output_schema_node(
+                            child,
+                            document,
+                            depth + 1,
+                            max_depth_seen,
+                            active,
+                        )?;
                     }
                 }
             }
             "items" => match value {
                 Value::Array(items) => {
                     for child in items {
-                        audit_output_schema_node(child, document, depth + 1, visited)?;
+                        audit_output_schema_node(
+                            child,
+                            document,
+                            depth + 1,
+                            max_depth_seen,
+                            active,
+                        )?;
                     }
                 }
-                other => audit_output_schema_node(other, document, depth + 1, visited)?,
+                other => audit_output_schema_node(
+                    other,
+                    document,
+                    depth + 1,
+                    max_depth_seen,
+                    active,
+                )?,
             },
             "additionalProperties"
             | "unevaluatedProperties"
@@ -5740,18 +5774,31 @@ fn audit_output_schema_node(
             | "then"
             | "else"
             | "contentSchema" => {
-                audit_output_schema_node(value, document, depth + 1, visited)?;
+                audit_output_schema_node(
+                    value,
+                    document,
+                    depth + 1,
+                    max_depth_seen,
+                    active,
+                )?;
             }
             "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
                 if let Some(items) = value.as_array() {
                     for child in items {
-                        audit_output_schema_node(child, document, depth + 1, visited)?;
+                        audit_output_schema_node(
+                            child,
+                            document,
+                            depth + 1,
+                            max_depth_seen,
+                            active,
+                        )?;
                     }
                 }
             }
             _ => {}
         }
     }
+    active.remove(&identity);
     Ok(())
 }
 
