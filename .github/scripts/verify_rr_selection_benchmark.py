@@ -5,9 +5,10 @@ Criterion fixture contract (see tests/performance/mesh/benches/rr_selection.rs):
   - Each measured custom iteration runs ITERATIONS_PER_THREAD selections per
     worker thread (currently 50_000).
   - The gated comparison uses PARALLEL_THREADS workers for both:
-      * `sharded`: exact RoundRobin selection seam with one explicit
-        CachePadded shard per worker
-      * `shared`: the same seam with every worker pinned to shard zero
+      * `sharded`: RoundRobin selection seam using the production
+        thread-to-shard ticket selector
+      * `shared`: the same target-selection seam with every worker pinned to
+        shard zero
   - Multi-thread samples reuse a long-lived barrier-synchronized worker pool;
     Criterion's mean is the wall time from barrier release until every worker
     completes the selection loop, not thread spawn/join overhead.
@@ -21,8 +22,10 @@ Contended advantage (same Criterion invocation, equal element counts):
 
 A production path that has regressed to one shared counter line collapses this
 toward 1.0x (sharded ≈ shared). Healthy CachePadded sharding keeps the shared
-control slower while both sides perform the same ticket, modulo, target lookup,
-and Arc clone work, clearing the hosted floor.
+control slower while both sides perform the same atomic ticket, modulo, target
+lookup, and Arc clone work, clearing the hosted floor. The sharded side also
+executes the production thread-local shard lookup; only the control pins its
+shard choice.
 Absolute 1-thread vs N-thread speedup is intentionally not gated: hosted
 runners and 2-target Arc refcount concentration made that ratio swing from
 ~1.50x to 0.44x without an RR code change.

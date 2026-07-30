@@ -4,9 +4,9 @@
 //!
 //! Hosted CI runs `tests/performance/mesh/benches/rr_selection.rs` with
 //! `.github/scripts/verify_rr_selection_benchmark.py`: an equal-work 4-thread
-//! same-shard control versus distinct-shard RoundRobin on the 2-target fixture,
-//! using the exact same selection seam on both sides (absolute
-//! 1-thread/N-thread speedup is diagnostic-only).
+//! same-shard control versus the production thread-to-shard RoundRobin ticket
+//! selector on the 2-target fixture. Both use the same target-selection seam;
+//! absolute 1-thread/N-thread speedup is diagnostic-only.
 //! These unit tests guard layout, selection parity, and the hosted gate's
 //! measurement contract.
 
@@ -90,22 +90,39 @@ fn upstream_with_locality_lb(
 }
 
 #[test]
-fn rr_contention_bench_uses_exact_same_shard_control() {
-    // The hosted gate must compare distinct-shard RR against deliberately
-    // contended same-shard RR through the exact same selection seam — not
-    // absolute 1-thread vs N-thread speedup on a variable runner (observed
-    // 1.50x→0.44x).
+fn rr_contention_bench_uses_production_selector_and_fixed_shard_control() {
+    // The hosted gate must compare the actual production ticket selector
+    // against deliberately contended same-shard RR through the same target
+    // selection seam — not explicit test shards on both sides, and not absolute
+    // 1-thread vs N-thread speedup on a variable runner (observed 1.50x→0.44x).
     let bench = std::fs::read_to_string("tests/performance/mesh/benches/rr_selection.rs")
         .expect("rr_selection bench must be readable from crate root");
     let verifier = std::fs::read_to_string(".github/scripts/verify_rr_selection_benchmark.py")
         .expect("RR verifier must be readable from crate root");
+    let source = std::fs::read_to_string("src/load_balancer.rs")
+        .expect("load_balancer.rs must be readable from crate root");
+    let production_probe = source
+        .split_once("pub(crate) fn select_round_robin_for_test(")
+        .and_then(|(_, rest)| {
+            rest.split_once("/// One RoundRobin pick driven by an explicit counter shard.")
+        })
+        .map(|(body, _)| body)
+        .expect("production RR benchmark probe must remain present");
 
     assert!(
-        bench.contains("select_round_robin_from_shard_for_test")
-            && bench.contains("run_rr_selections")
-            && bench.contains("move |worker|")
-            && bench.contains("run_rr_selections(&lb, 0"),
-        "RR bench must compare distinct and shared shards through one exact selection seam"
+        bench.contains("select_round_robin_for_test")
+            && bench.contains("select_round_robin_from_shard_for_test")
+            && bench.contains("run_production_rr_selections")
+            && bench.contains("run_fixed_shard_rr_selections(&lb, 0"),
+        "RR bench must compare the production selector against a fixed-shard control"
+    );
+    assert!(
+        !bench.contains("move |worker|"),
+        "the sharded side must not assign explicit test shards per worker"
+    );
+    assert!(
+        production_probe.contains("selection_counter_ticket(&self.rr_counter)"),
+        "the sharded benchmark probe must use the production thread-to-shard ticket selector"
     );
     assert!(
         bench.contains("PARALLEL_THREADS: usize = 4")

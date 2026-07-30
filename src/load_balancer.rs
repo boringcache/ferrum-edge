@@ -2830,6 +2830,32 @@ impl LoadBalancer {
         std::array::from_fn(|i| self.rr_counter[i].load(Ordering::Relaxed))
     }
 
+    #[inline]
+    fn select_round_robin_target_from_ticket_for_test(
+        &self,
+        ticket: u64,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if self.targets.is_empty() {
+            return None;
+        }
+        Some(Arc::clone(
+            &self.targets[(ticket as usize) % self.targets.len()],
+        ))
+    }
+
+    /// One RoundRobin pick driven by the production thread-to-shard selector.
+    ///
+    /// The hosted contention benchmark compares this path against
+    /// [`Self::select_round_robin_from_shard_for_test`] pinned to shard zero.
+    /// Keeping the production [`selection_counter_ticket`] call here means a
+    /// regression in actual thread-to-shard assignment collapses the benchmark
+    /// ratio instead of being hidden by an explicitly assigned test shard.
+    #[allow(dead_code)]
+    pub(crate) fn select_round_robin_for_test(&self) -> Option<Arc<UpstreamTarget>> {
+        let ticket = selection_counter_ticket(&self.rr_counter);
+        self.select_round_robin_target_from_ticket_for_test(ticket)
+    }
+
     /// One RoundRobin pick driven by an explicit counter shard.
     ///
     /// Crate-private test seam (routed through `_test_support`): bypasses
@@ -2841,14 +2867,9 @@ impl LoadBalancer {
         &self,
         shard: usize,
     ) -> Option<Arc<UpstreamTarget>> {
-        if self.targets.is_empty() {
-            return None;
-        }
         let ticket =
             self.rr_counter[shard & (WRR_COUNTER_SHARDS - 1)].fetch_add(1, Ordering::Relaxed);
-        Some(Arc::clone(
-            &self.targets[(ticket as usize) % self.targets.len()],
-        ))
+        self.select_round_robin_target_from_ticket_for_test(ticket)
     }
 
     /// One Random pick driven by an explicit counter shard (same golden-ratio

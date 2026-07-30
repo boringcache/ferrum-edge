@@ -4,18 +4,19 @@
 //! **same Criterion invocation** under the same barrier-synchronized worker
 //! shape:
 //!
-//! - `sharded`: the exact RoundRobin selection seam with one explicit
-//!   CachePadded shard per worker
-//! - `shared`: the same selection seam with every worker deliberately pinned
-//!   to shard zero
+//! - `sharded`: the RoundRobin selection seam using the production
+//!   thread-to-shard ticket selector
+//! - `shared`: the same target-selection seam with every worker deliberately
+//!   pinned to shard zero
 //!
 //! The gate is `shared_wall_ns / sharded_wall_ns` (equal element counts), not
 //! absolute 1-thread vs N-thread speedup. Hosted runners vary in core count and
 //! scheduling; the old 1-vs-8 absolute speedup on a 2-target fixture also
 //! concentrated Arc refcount traffic onto two lines and was observed to swing
 //! from ~1.50x to 0.44x without an RR code change. Both sides of this comparison
-//! now execute the same ticket, modulo, target lookup, and Arc clone operations;
-//! only the selected counter shard differs.
+//! now execute the same atomic ticket, modulo, target lookup, and Arc clone
+//! operations. The sharded side additionally performs the production
+//! thread-local shard lookup; the control pins only its shard choice.
 //!
 //! Thread count matches the WRR contention bench (4) so the gate is calibrated
 //! to typical GitHub-hosted vCPU counts rather than oversubscribing an 8-wide
@@ -29,7 +30,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use ferrum_edge::_test_support::select_round_robin_from_shard_for_test;
+use ferrum_edge::_test_support::{
+    select_round_robin_for_test, select_round_robin_from_shard_for_test,
+};
 use ferrum_edge::config::types::{LoadBalancerAlgorithm, UpstreamTarget};
 use ferrum_edge::load_balancer::LoadBalancer;
 
@@ -55,7 +58,13 @@ fn make_targets(n: usize) -> Vec<UpstreamTarget> {
         .collect()
 }
 
-fn run_rr_selections(lb: &LoadBalancer, shard: usize, iterations: usize) {
+fn run_production_rr_selections(lb: &LoadBalancer, iterations: usize) {
+    for _ in 0..iterations {
+        black_box(select_round_robin_for_test(lb));
+    }
+}
+
+fn run_fixed_shard_rr_selections(lb: &LoadBalancer, shard: usize, iterations: usize) {
     for _ in 0..iterations {
         black_box(select_round_robin_from_shard_for_test(lb, shard));
     }
@@ -120,8 +129,9 @@ fn bench_rr_selection(c: &mut Criterion) {
         None,
     ));
     for shard in 0..PARALLEL_THREADS {
-        run_rr_selections(&lb, shard, 512);
+        run_fixed_shard_rr_selections(&lb, shard, 512);
     }
+    run_production_rr_selections(&lb, 2_048);
 
     let elements = (ITERATIONS_PER_THREAD * PARALLEL_THREADS) as u64;
     group.throughput(Throughput::Elements(elements));
@@ -132,9 +142,9 @@ fn bench_rr_selection(c: &mut Criterion) {
         |b| {
             b.iter_custom(|iters| {
                 let lb = Arc::clone(&lb);
-                measure_parallel_batches(PARALLEL_THREADS, iters, move |worker| {
+                measure_parallel_batches(PARALLEL_THREADS, iters, move |_| {
                     let lb = Arc::clone(&lb);
-                    move || run_rr_selections(&lb, worker, ITERATIONS_PER_THREAD)
+                    move || run_production_rr_selections(&lb, ITERATIONS_PER_THREAD)
                 })
             });
         },
@@ -148,7 +158,7 @@ fn bench_rr_selection(c: &mut Criterion) {
                 let lb = Arc::clone(&lb);
                 measure_parallel_batches(PARALLEL_THREADS, iters, move |_| {
                     let lb = Arc::clone(&lb);
-                    move || run_rr_selections(&lb, 0, ITERATIONS_PER_THREAD)
+                    move || run_fixed_shard_rr_selections(&lb, 0, ITERATIONS_PER_THREAD)
                 })
             });
         },
@@ -161,7 +171,7 @@ fn bench_rr_selection(c: &mut Criterion) {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
                 let started = Instant::now();
-                run_rr_selections(&lb, 0, ITERATIONS_PER_THREAD);
+                run_production_rr_selections(&lb, ITERATIONS_PER_THREAD);
                 total += started.elapsed();
             }
             total
