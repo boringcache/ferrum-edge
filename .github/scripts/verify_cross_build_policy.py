@@ -1715,7 +1715,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
 
           for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
             echo "Fuzz smoke target: ${fuzz_target}"
-            cargo fuzz run "$fuzz_target" -- \
+            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
               -runs=512 \
               -max_total_time=8 \
               -max_len=4096 \
@@ -22430,6 +22430,7 @@ pre_build = []
 
     fuzz_smoke_tampering: dict[str, tuple[str, str]] = {
         "altered outer deadline": ("timeout-minutes: 60", "timeout-minutes: 30"),
+        "reduced compilation parallelism": ("--codegen-units 16", "--codegen-units 1"),
         "widened libFuzzer budget": ("-max_total_time=8", "-max_total_time=800"),
         "unbounded input length": ("-max_len=4096", "-max_len=1048576"),
         "unpinned cargo-fuzz": (
@@ -22447,8 +22448,8 @@ pre_build = []
         ),
         "mutable toolchain pin": ("nightly-2025-07-01", "nightly"),
         "repository-supplied script": (
-            'cargo fuzz run "$fuzz_target" -- \\',
-            'bash scripts/fuzz_smoke.sh "$fuzz_target" -- \\',
+            'cargo fuzz run --codegen-units 16 "$fuzz_target" -- \\',
+            'bash scripts/fuzz_smoke.sh --codegen-units 16 "$fuzz_target" -- \\',
         ),
         "mutable action ref": (
             "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6",
