@@ -238,8 +238,9 @@ fn malformed_documents_are_not_reported_as_ambiguous() {
     }
 }
 
-/// Control characters and bad escapes inside strings are rejected the same way
-/// `serde_json` rejects them.
+/// Control characters and bad escapes inside strings are rejected without
+/// panicking. Ordinary malformed escapes retain the existing malformed-body
+/// handling, while surrogate parser differentials fail closed.
 #[test]
 fn rejects_invalid_string_content_without_panicking() {
     let backslash = '\\';
@@ -248,6 +249,19 @@ fn rejects_invalid_string_content_without_panicking() {
         format!("{{\"{backslash}q\":1}}"),
         format!("{{\"{backslash}u00\":1}}"),
         format!("{{\"{backslash}uZZZZ\":1}}"),
+    ] {
+        assert_eq!(
+            scan(body.as_bytes(), &GOVERNED_JSON_LIMITS),
+            Err(JsonScanReject::Malformed),
+            "scanner returned the wrong rejection for {body:?}"
+        );
+        assert!(
+            slice_ambiguity(body.as_bytes()).is_none(),
+            "{body:?} was reported as ambiguity rather than malformed"
+        );
+    }
+
+    for body in [
         // Lone high surrogate.
         format!("{{\"{backslash}ud83d\":1}}"),
         // Lone low surrogate.
@@ -255,13 +269,15 @@ fn rejects_invalid_string_content_without_panicking() {
         // High surrogate not followed by a low one.
         format!("{{\"{backslash}ud83d{backslash}u0061\":1}}"),
     ] {
-        assert!(
-            scan(body.as_bytes(), &GOVERNED_JSON_LIMITS).is_err(),
-            "scanner accepted {body:?}"
+        assert_eq!(
+            scan(body.as_bytes(), &GOVERNED_JSON_LIMITS),
+            Err(JsonScanReject::InvalidSurrogate),
+            "scanner returned the wrong rejection for {body:?}"
         );
-        assert!(
-            slice_ambiguity(body.as_bytes()).is_none(),
-            "{body:?} was reported as ambiguity rather than malformed"
+        assert_eq!(
+            slice_ambiguity(body.as_bytes()),
+            Some(JsonScanReject::InvalidSurrogate.reason()),
+            "{body:?} did not fail closed"
         );
     }
 }
