@@ -3531,7 +3531,7 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: read
     # The repository-root Cargo config selects sccache and host linker flags,
@@ -3576,7 +3576,7 @@ jobs:
 
           for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
             echo "Fuzz smoke target: ${fuzz_target}"
-            cargo fuzz run "$fuzz_target" -- \
+            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
               -runs=512 \
               -max_total_time=8 \
               -max_len=4096 \
