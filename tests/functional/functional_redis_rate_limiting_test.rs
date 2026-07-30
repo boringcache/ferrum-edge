@@ -2892,7 +2892,7 @@ plugin_configs:
 
     // Both instances should have published independent completed keys under the
     // shared default prefix (partitioned by plugin_config_id in the digest).
-    let completed_keys = redis_key_count_by_prefix(&format!("{default_prefix}:v4:")).await;
+    let completed_keys = redis_key_count_by_prefix(&format!("{default_prefix}:v6:")).await;
     assert!(
         completed_keys >= 2,
         "expected at least two completed Redis keys under the shared default prefix, got {completed_keys}"
@@ -3044,11 +3044,11 @@ plugin_configs:
         "no separate in-flight key may exist for instance B"
     );
     assert!(
-        redis_key_count_by_prefix(&format!("{prefix_a}:v4:")).await >= 1,
+        redis_key_count_by_prefix(&format!("{prefix_a}:v6:")).await >= 1,
         "instance A must publish a completed Redis value under its unique prefix"
     );
     assert!(
-        redis_key_count_by_prefix(&format!("{prefix_b}:v4:")).await >= 1,
+        redis_key_count_by_prefix(&format!("{prefix_b}:v6:")).await >= 1,
         "instance B must publish a completed Redis value under its unique prefix"
     );
 

@@ -5938,8 +5938,7 @@ fn admin_admitted_plugin_scope_implies_runtime_reference_admit() {
 
 // ── request_deduplication / mcp_gateway replay-provenance composition ────────
 //
-// A `request_deduplication` hit short-circuits `before_proxy` at priority 2750,
-// ahead of `mcp_gateway` at 2992, and serves a *finalized* representation whose
+// A `request_deduplication` hit serves a *finalized* representation whose
 // presentation transforms are deliberately skipped. `mcp_gateway`'s public
 // URI/name rewrite is resolved against a per-session catalog re-listed from
 // upstream on a discovery TTL, so nothing computed from configuration can prove

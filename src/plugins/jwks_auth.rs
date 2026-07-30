@@ -116,6 +116,7 @@ pub struct JwksAuth {
     claim_header_destinations: ClaimHeaderDestinations,
     strip_authorization_on_success: bool,
     has_custom_query_token_locations: bool,
+    request_headers_to_redact: Vec<String>,
     emit_mesh_request_principal_metadata: bool,
     http_client: PluginHttpClient,
     refresh_interval: Duration,
@@ -464,6 +465,27 @@ impl JwksAuth {
                 .iter()
                 .any(|location| matches!(location, TokenLocation::QueryParam(_)))
         });
+        let mut request_headers_to_redact = Vec::new();
+        for provider in &providers {
+            if provider.token_locations.is_empty()
+                && !request_headers_to_redact
+                    .iter()
+                    .any(|known: &String| known == "authorization")
+            {
+                request_headers_to_redact.push("authorization".to_string());
+            }
+            for location in &provider.token_locations {
+                let TokenLocation::Header(header) = location else {
+                    continue;
+                };
+                if !request_headers_to_redact
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&header.name))
+                {
+                    request_headers_to_redact.push(header.name.clone());
+                }
+            }
+        }
 
         let claim_header_destinations = ClaimHeaderDestinations::from_mapping_groups(
             std::iter::once(claim_headers.as_slice()).chain(
@@ -484,6 +506,7 @@ impl JwksAuth {
             claim_header_destinations,
             strip_authorization_on_success,
             has_custom_query_token_locations,
+            request_headers_to_redact,
             emit_mesh_request_principal_metadata,
             http_client,
             refresh_interval,
@@ -1035,6 +1058,10 @@ impl super::Plugin for JwksAuth {
         for provider in &self.providers {
             mark_present_query_credential_locations(ctx, &provider.token_locations);
         }
+    }
+
+    fn request_headers_to_redact(&self) -> &[String] {
+        &self.request_headers_to_redact
     }
 
     fn modifies_request_headers(&self) -> bool {

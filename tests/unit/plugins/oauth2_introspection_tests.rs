@@ -21,6 +21,23 @@ use super::plugin_utils::{assert_continue, create_test_consumer};
 struct InvalidSecondaryAuth;
 
 #[test]
+fn oauth2_custom_header_locations_are_registered_as_credentials() {
+    let plugin = Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": "http://127.0.0.1:8181/introspect",
+                "client_auth": {"method": "none"},
+                "from_headers": [{"name": "X-Opaque-Token"}]
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    assert_eq!(plugin.request_headers_to_redact(), &["x-opaque-token"]);
+}
+
+#[test]
 fn oauth2_marks_forwarded_custom_query_locations_for_opa_redaction() {
     let plugin = Oauth2Introspection::new(
         &json!({
