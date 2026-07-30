@@ -9610,6 +9610,12 @@ async fn dispatch_grpc_native_h3(
         &response_headers,
         effective_max_response_body_size_bytes,
     ) {
+        warn!(
+            proxy_id = %proxy.id,
+            response_body_bytes = len,
+            max_response_body_size_bytes = effective_max_response_body_size_bytes,
+            "HTTP/3 gRPC backend response body exceeds configured size limit"
+        );
         let error_sent = send_h3_grpc_error(
             stream,
             crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
