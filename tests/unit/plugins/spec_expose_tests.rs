@@ -1570,7 +1570,7 @@ fn test_cached_failure_retry_after_reports_remaining_backoff() {
     };
 
     for (previous_failures, expected) in
-        [(0, 1), (1, 2), (2, 4), (5, 32), (6, 32), (u32::MAX, 32)]
+        [(0, 1), (1, 2), (2, 4), (5, 30), (6, 30), (u32::MAX, 30)]
     {
         assert_eq!(
             spec_expose_failure_backoff_seconds_for_test(previous_failures),
