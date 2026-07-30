@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ============================================================================
 // Helpers
@@ -777,6 +777,61 @@ async fn test_grpc_h2c_pool_fails_over_after_tcp_success_but_h2_failure() {
         elapsed < Duration::from_millis(1_000),
         "failover must be driven by the h2c protocol rejection, not by the \
          candidate connect budget expiring (took {elapsed:?})"
+    );
+}
+
+#[tokio::test]
+async fn test_grpc_h2c_accepts_settings_with_zero_concurrent_streams() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind scripted h2c backend");
+    let port = listener
+        .local_addr()
+        .expect("scripted backend address")
+        .port();
+    let _backend = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept h2c client");
+        let mut client_preface = [0_u8; 24];
+        socket
+            .read_exact(&mut client_preface)
+            .await
+            .expect("read HTTP/2 client preface");
+        assert_eq!(&client_preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+
+        // A valid initial SETTINGS frame may temporarily prohibit all new
+        // streams. Establishment must recognize the frame independently of
+        // the resulting outbound stream capacity.
+        socket
+            .write_all(&[0, 0, 6, 4, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0])
+            .await
+            .expect("write SETTINGS_MAX_CONCURRENT_STREAMS=0");
+        // Keep the valid zero-capacity connection open well beyond both the
+        // pool's 500 ms connect bound and the test's outer hang guard. The old
+        // sentinel path therefore returns an error at the pool deadline rather
+        // than succeeding because the scripted peer happened to close.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    });
+
+    let pool = GrpcConnectionPool::new(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        None,
+        Arc::new(Vec::new()),
+    );
+    let mut proxy = create_test_proxy();
+    proxy.backend_scheme = Some(BackendScheme::Http);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Http);
+    proxy.backend_host = Ipv4Addr::LOCALHOST.to_string();
+    proxy.backend_port = port;
+    proxy.backend_connect_timeout_ms = 500;
+
+    let sender = tokio::time::timeout(Duration::from_secs(5), pool.get_sender(&proxy))
+        .await
+        .expect("valid peer SETTINGS should not hang h2c establishment");
+    assert!(
+        sender.is_ok(),
+        "zero-capacity SETTINGS is valid: {sender:?}"
     );
 }
 
