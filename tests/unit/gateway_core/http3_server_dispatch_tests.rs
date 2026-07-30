@@ -547,7 +547,7 @@ fn h3_cross_protocol_streaming_grpc_consumes_deadline_and_read_bounds() {
         .find("strip_content_length_for_streaming_grpc_deadline(")
         .expect("deadline-capable relay must strip Content-Length");
     let header_write = handler
-        .find("send_response_headers(")
+        .find("send_response_headers_with_framing(")
         .expect("streaming response header write");
     assert!(
         strip < header_write,
