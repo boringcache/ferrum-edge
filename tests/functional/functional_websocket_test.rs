@@ -444,10 +444,7 @@ fn start_gateway_with_extra_env(
     tls_key_path: Option<&str>,
     extra_env: &[(&str, &str)],
     observability_token: &str,
-) -> Result<
-    (std::process::Child, u16, std::path::PathBuf),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<(std::process::Child, u16, std::path::PathBuf), Box<dyn std::error::Error>> {
     // Use a fresh admin HTTP port and disable admin HTTPS so parallel gateways
     // in the same functional shard never contend on the default admin ports
     // (9000/9443). Admin-listener bind failure aborts startup (fatal), which
@@ -460,8 +457,8 @@ fn start_gateway_with_extra_env(
     let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
         .map(|a| a.port())?;
-    let stderr_path = std::path::Path::new(config_path)
-        .with_extension(format!("gateway-{http_port}.stderr.log"));
+    let stderr_path =
+        std::path::Path::new(config_path).with_extension(format!("gateway-{http_port}.stderr.log"));
     let stderr_file = std::fs::File::create(&stderr_path)?;
     let mut cmd = std::process::Command::new(gateway_binary_path());
     cmd.env("FERRUM_MODE", "file")
