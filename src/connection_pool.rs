@@ -23,7 +23,6 @@ use crate::tls::backend::{
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -51,7 +50,28 @@ impl ReqwestPoolManager {
     }
 
     async fn create_client(&self, proxy: &Proxy, config: &PoolConfig) -> Result<reqwest::Client> {
-        let dns_resolver = Arc::new(DnsCacheResolver::new(self.dns_cache.clone()));
+        // Install the per-proxy `dns_override` on the shared DnsCacheResolver so
+        // every hostname this client dials — including load-balanced targets
+        // whose host differs from `proxy.backend_host` — pins to the override
+        // IP. Do NOT use reqwest's hostname-specific `ClientBuilder::resolve()`
+        // map: an upstream-keyed pool entry is shared across targets, and a
+        // single-host resolve hint would leave other targets on normal DNS
+        // while telemetry still claimed the override (issue #2414).
+        if let Some(ref dns_override) = proxy.dns_override
+            && let Ok(ip) = dns_override.parse::<std::net::IpAddr>()
+            && let Some(reason) = self.global_env_config.backend_allow_ips.deny_reason(&ip)
+        {
+            anyhow::bail!(
+                "Proxy '{}': dns_override IP {} denied by backend egress policy: {}",
+                proxy.id,
+                ip,
+                reason
+            );
+        }
+        let dns_resolver = Arc::new(DnsCacheResolver::with_dns_override(
+            self.dns_cache.clone(),
+            proxy.dns_override.clone(),
+        ));
 
         let crls = self.crls.load_full();
         let tls_builder = BackendTlsConfigBuilder {
@@ -120,21 +140,6 @@ impl ReqwestPoolManager {
                 .http2_initial_connection_window_size(config.http2_initial_connection_window_size)
                 .http2_adaptive_window(config.http2_adaptive_window)
                 .http2_max_frame_size(config.http2_max_frame_size);
-        }
-
-        if let Some(ref dns_override) = proxy.dns_override
-            && let Ok(ip) = dns_override.parse::<std::net::IpAddr>()
-        {
-            if let Some(reason) = self.global_env_config.backend_allow_ips.deny_reason(&ip) {
-                anyhow::bail!(
-                    "Proxy '{}': dns_override IP {} denied by backend egress policy: {}",
-                    proxy.id,
-                    ip,
-                    reason
-                );
-            }
-            let socket_addr = SocketAddr::new(ip, proxy.backend_port);
-            client_builder = client_builder.resolve(&proxy.backend_host, socket_addr);
         }
 
         Ok(client_builder.build()?)

@@ -4937,6 +4937,23 @@ impl Plugin for McpGateway {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        // Rewrite-only responses have no outputSchema validator to reject the
+        // raw body after the transform hook declines to materialize ambiguous
+        // JSON. Fail closed here rather than forwarding upstream-native URIs.
+        if ctx.mcp_validate_tool_result.is_none()
+            && ctx
+                .metadata
+                .get(METADATA_RESPONSE_REWRITE_KEY)
+                .is_some_and(|value| value == "true")
+            && ctx.json_scan_memo.ambiguity(body).is_some()
+        {
+            if self.observability.emit_metadata {
+                ctx.metadata
+                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+            }
+            warn!("MCP gateway rejecting ambiguous response that requires public URI rewriting");
+            return json_rpc_error(None, -32603, "Invalid upstream MCP response", None);
+        }
         // Authoritative enforcement identity is the validator Arc pinned at
         // route time — never re-resolved through public rewrite metadata.
         let Some(validator) = ctx.mcp_validate_tool_result.clone() else {

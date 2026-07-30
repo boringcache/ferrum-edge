@@ -75,6 +75,11 @@ pub enum JsonScanReject {
     TooLarge,
     /// The bytes are not a well-formed JSON document.
     Malformed,
+    /// A string contains a lone or mispaired UTF-16 surrogate escape.
+    ///
+    /// Some downstream parsers, notably JavaScript's `JSON.parse`, accept
+    /// these escapes even though `serde_json::Value` rejects them.
+    InvalidSurrogate,
 }
 
 impl JsonScanReject {
@@ -91,6 +96,7 @@ impl JsonScanReject {
             Self::KeyTooLong => "JSON body exceeds the duplicate-key scan member-name budget",
             Self::TooLarge => "JSON body exceeds the duplicate-key scan size budget",
             Self::Malformed => "JSON body is not well-formed JSON",
+            Self::InvalidSurrogate => "JSON body contains an invalid Unicode surrogate escape",
         }
     }
 }
@@ -294,7 +300,8 @@ pub fn scan<'a>(bytes: &'a [u8], limits: &JsonScanLimits) -> Result<(), JsonScan
 /// a duplicate member, when any explicit scan budget is exhausted, or when
 /// `serde_json` accepts bytes whose grammar this scanner could not vouch for.
 /// Ordinary malformed bytes that both parsers reject return `None` so callers
-/// keep their existing malformed-body handling.
+/// keep their existing malformed-body handling. Invalid surrogate escapes are
+/// an exception because widely used downstream parsers accept them.
 ///
 /// The caller must pass exactly the bytes it will hand to `serde_json` (BOM
 /// already stripped, body already decoded), or the two verdicts describe
@@ -319,7 +326,8 @@ pub fn slice_ambiguity_with(bytes: &[u8], limits: &JsonScanLimits) -> Option<&'s
             | JsonScanReject::TokenBudgetExceeded
             | JsonScanReject::MemberBudgetExceeded
             | JsonScanReject::KeyTooLong
-            | JsonScanReject::TooLarge),
+            | JsonScanReject::TooLarge
+            | JsonScanReject::InvalidSurrogate),
         ) => Some(reject.reason()),
         Err(reject @ JsonScanReject::Malformed) => {
             // Confirmation parse, rejection path only. `SerdeJsonAccept` matches
@@ -580,16 +588,16 @@ fn read_string<'a>(bytes: &'a [u8], index: &mut usize) -> Result<(&'a str, bool)
                             if bytes.get(position) != Some(&b'\\')
                                 || bytes.get(position + 1) != Some(&b'u')
                             {
-                                return Err(JsonScanReject::Malformed);
+                                return Err(JsonScanReject::InvalidSurrogate);
                             }
                             let low = read_hex4(bytes, position + 2)?;
                             if !(0xDC00..0xE000).contains(&low) {
-                                return Err(JsonScanReject::Malformed);
+                                return Err(JsonScanReject::InvalidSurrogate);
                             }
                             position += 6;
                         } else if (0xDC00..0xE000).contains(&code) {
                             // Lone low surrogate.
-                            return Err(JsonScanReject::Malformed);
+                            return Err(JsonScanReject::InvalidSurrogate);
                         }
                     }
                     _ => return Err(JsonScanReject::Malformed),

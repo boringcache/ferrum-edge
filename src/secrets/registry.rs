@@ -22,7 +22,10 @@ use super::{env, file};
 /// Only scan environment variables with this prefix.
 const FERRUM_PREFIX: &str = "FERRUM_";
 
-const NON_SECRET_FILE_SUFFIX_KEYS: &[&str] = &["FERRUM_DNS_RESOLVER_HOSTS_FILE"];
+const NON_SECRET_FILE_SUFFIX_KEYS: &[&str] = &[
+    "FERRUM_DNS_RESOLVER_HOSTS_FILE",
+    "FERRUM_DP_CP_GRPC_TOKEN_FILE",
+];
 
 /// Substituted for a secret's source reference in an operator-facing error.
 const REDACTED_REFERENCE: &str = "<redacted source reference>";

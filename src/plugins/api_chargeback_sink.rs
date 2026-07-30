@@ -2891,7 +2891,7 @@ impl ApiChargebackSink {
             },
         );
 
-        let byte_budget = Arc::new(ByteBudget::new(
+        let byte_budget = Arc::new(ByteBudget::new_observability(
             PLUGIN_NAME,
             self.config
                 .batch
