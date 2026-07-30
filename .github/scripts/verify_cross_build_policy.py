@@ -1832,6 +1832,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install required build dependency
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
       - name: Install pinned nightly toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
@@ -22772,6 +22778,15 @@ pre_build = []
         ),
         "unbounded run": ("-max_total_time=300", "-max_total_time=86400"),
         "unbounded rss": ("-rss_limit_mb=2048", "-rss_limit_mb=0"),
+        "missing protoc setup": (
+            "      - name: Install required build dependency\n"
+            "        run: |\n"
+            "          set -euo pipefail\n"
+            "          sudo apt-get update\n"
+            "          sudo apt-get install -y --no-install-recommends "
+            "protobuf-compiler\n\n",
+            "",
+        ),
         "widened artifact path": (
             "          path: fuzz/artifacts/${{ matrix.fuzz_target }}\n",
             "          path: .\n",

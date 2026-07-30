@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Istio Telemetry `accessLogging.filter.expression` now supports bounded boolean
+  expressions with `||`, `&&`, parentheses, and the existing `response.code`,
+  `response.status`, and `response.duration` comparison atoms. `duration` is
+  accepted as the documented latency shorthand, and duration thresholds accept
+  integer milliseconds by default or explicit `ms` / `s` suffixes with checked
+  millisecond conversion. Pure conjunctions continue to compile into flat
+  `AccessLogFilter` fields; expressions containing `||` compile into a
+  pre-evaluated `expression` AST consumed by the injected `stdout_logging`
+  plugin.
 - Machine-readable vendored-patch lifecycle inventory at
   `docs/vendored-patch-lifecycle.json`, enforced on every PR and weekly
   `dependency-audit` run by `scripts/check_vendored_patch_lifecycle.py`. The
