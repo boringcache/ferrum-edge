@@ -413,9 +413,11 @@ fn test_new_default_config() {
     let plugin = make_plugin(config);
     assert_eq!(plugin.name(), "request_deduplication");
     assert_eq!(plugin.priority(), priority::REQUEST_DEDUPLICATION);
-    assert!(priority::MESH_ROUTE_DISPATCH < priority::REQUEST_TRANSFORMER);
-    assert!(priority::REQUEST_TRANSFORMER < priority::REQUEST_DEDUPLICATION);
-    assert!(priority::REQUEST_DEDUPLICATION < priority::SERVERLESS_FUNCTION);
+    const _: () = {
+        assert!(priority::MESH_ROUTE_DISPATCH < priority::REQUEST_TRANSFORMER);
+        assert!(priority::REQUEST_TRANSFORMER < priority::REQUEST_DEDUPLICATION);
+        assert!(priority::REQUEST_DEDUPLICATION < priority::SERVERLESS_FUNCTION);
+    };
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
     assert!(plugin.requires_response_body_buffering());
     assert!(!plugin.is_auth_plugin());

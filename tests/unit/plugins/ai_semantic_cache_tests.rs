@@ -5078,7 +5078,7 @@ async fn distinct_request_paths_do_not_collide_within_one_proxy() {
             .insert("request_body".to_string(), body_str.to_string());
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
-        let result = drive_cache_lookup(&plugin, &mut ctx, &headers).await;
+        let result = drive_cache_lookup(plugin, &mut ctx, &headers).await;
         (ctx, result)
     }
 
@@ -5530,7 +5530,7 @@ async fn route_rewrite_and_effective_upstream_isolate_cache_entries() {
             .insert("request_body".to_string(), body_str.to_string());
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
-        let result = drive_cache_lookup(&plugin, &mut ctx, &headers).await;
+        let result = drive_cache_lookup(plugin, &mut ctx, &headers).await;
         (ctx, result)
     }
 
