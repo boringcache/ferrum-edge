@@ -2226,12 +2226,7 @@ async fn mesh_tier3_mirror_vs_emits_working_request_mirror_plugin() {
     let headers = HashMap::new();
     let mut backend_header_overlay = HashMap::new();
     let res = plugin
-        .dispatch_finalized_request_egress(
-            &mut ctx,
-            &headers,
-            &[],
-            &mut backend_header_overlay,
-        )
+        .dispatch_finalized_request_egress(&mut ctx, &headers, &[], &mut backend_header_overlay)
         .await;
     assert!(matches!(res, PluginResult::Continue));
     assert!(backend_header_overlay.is_empty());
