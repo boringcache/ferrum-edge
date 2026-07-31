@@ -3797,14 +3797,14 @@ async fn prompt_estimate_counts_collision_shaped_binary_keys_outside_content_par
         "messages": [{"role": "user", "content": "abcd"}],
         "metadata": {
             "image_url": long_alnum.clone(),
-            "inline_data": PROMPT_DELTA_32
+            "inline_data": long_alnum
         }
     }))
     .await;
 
     assert_eq!(
         with - empty,
-        (64u64 + 32).div_ceil(4),
+        (64u64 * 2).div_ceil(4),
         "collision-shaped image_url/inline_data strings outside content parts must count"
     );
 
@@ -3935,13 +3935,13 @@ async fn prompt_estimate_counts_wrong_family_content_part_binary_collisions() {
         "messages": [{"role": "user", "content": [{
             "type": "text",
             "text": "abcd",
-            "inline_data": {"mime_type": "image/png", "data": PROMPT_DELTA_32}
+            "inline_data": {"mime_type": "image/png", "data": long_alnum.clone()}
         }]}]
     }))
     .await;
     assert_eq!(
         oa_inline - oa_inline_empty,
-        8,
+        16,
         "OpenAI message-part inline_data must count (Gemini contents.parts only)"
     );
 
