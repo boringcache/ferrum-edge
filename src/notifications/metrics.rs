@@ -241,7 +241,10 @@ impl DeliveryMetricsSnapshot {
 
     /// Only the true hard shutdown-deadline aborts.
     pub fn total_abandoned_at_deadline(&self) -> u64 {
-        self.by_channel.iter().map(|c| c.abandoned_at_deadline).sum()
+        self.by_channel
+            .iter()
+            .map(|c| c.abandoned_at_deadline)
+            .sum()
     }
 
     /// Every pre-attempt admission/registry rejection (excluding backpressure,

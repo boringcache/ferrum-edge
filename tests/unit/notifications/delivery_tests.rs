@@ -2,6 +2,7 @@
 //! proxy_alerts pending-state / generation retirement contracts (#2448).
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -86,6 +87,38 @@ async fn spawn_status_sequence_server(
 
     let handle = tokio::spawn(async move {
         for status in statuses {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request_headers(&mut socket).await;
+            server_count.fetch_add(1, Ordering::SeqCst);
+            server_notify.notify_waiters();
+            let body =
+                format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            socket.write_all(body.as_bytes()).await.unwrap();
+        }
+    });
+
+    (addr, count, notify, handle)
+}
+
+/// A live listener that keeps accepting and answering with the same status so
+/// a buggy retry is observable as an extra counted request.
+async fn spawn_persistent_status_server(
+    status: u16,
+) -> (
+    SocketAddr,
+    Arc<AtomicUsize>,
+    Arc<Notify>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(Notify::new());
+    let server_count = Arc::clone(&count);
+    let server_notify = Arc::clone(&notify);
+
+    let handle = tokio::spawn(async move {
+        loop {
             let (mut socket, _) = listener.accept().await.unwrap();
             read_request_headers(&mut socket).await;
             server_count.fetch_add(1, Ordering::SeqCst);
@@ -287,7 +320,8 @@ fn prometheus_contract_emits_fixed_channel_type_series() {
     assert!(!text.contains("reason=\"backpressure\""));
     // Exactly the fixed cardinality: 5 channel types x each reason set.
     assert_eq!(
-        text.matches("ferrum_notification_delivery_rejected_total{").count(),
+        text.matches("ferrum_notification_delivery_rejected_total{")
+            .count(),
         5 * REJECT_REASONS.len()
     );
     assert_eq!(
@@ -379,12 +413,10 @@ async fn semaphore_exhaustion_increments_backpressure_and_skips_send() {
         settles.snapshot(),
         vec![DispatchSettle::Abandoned(AbandonReason::Backpressure)]
     );
-    assert!(
-        timeout(Duration::from_millis(100), listener.accept())
-            .await
-            .is_err(),
-        "exhausted semaphore must not connect"
-    );
+    match listener.try_accept() {
+        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+        other => panic!("exhausted semaphore must not connect: {other:?}"),
+    }
 }
 
 /// A generation that already stopped admitting rejects *before* `begin_task()`.
@@ -442,12 +474,10 @@ async fn pre_task_generation_rejection_is_visible_without_inflating_attempted() 
         "the producer callback must still run exactly once, with a precise reason"
     );
     // Non-vacuous: prove nothing was ever sent.
-    assert!(
-        timeout(Duration::from_millis(100), listener.accept())
-            .await
-            .is_err(),
-        "a rejected dispatch must not reach the endpoint"
-    );
+    match listener.try_accept() {
+        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+        other => panic!("a rejected dispatch must not reach the endpoint: {other:?}"),
+    }
     assert_eq!(generation.in_flight(), 0);
     assert!(generation.wait_drain(Duration::from_secs(5)).await);
 }
@@ -502,7 +532,7 @@ async fn transient_retry_then_success() {
 async fn permanent_failure_does_not_retry() {
     let metrics = Arc::new(DeliveryMetrics::new());
     let generation = DispatchGeneration::with_metrics(8, Arc::clone(&metrics));
-    let (addr, count, notify, server) = spawn_status_sequence_server(vec![401]).await;
+    let (addr, count, notify, server) = spawn_persistent_status_server(401).await;
     let sem = Arc::new(Semaphore::new(1));
     let channel = webhook_channel_to(format!("http://{addr}/notify"));
 
@@ -523,27 +553,16 @@ async fn permanent_failure_does_not_retry() {
     ));
 
     wait_for_count(&count, &notify, 1).await;
-    // Give a moment; a buggy retry would produce a second accept.
     assert!(
-        timeout(Duration::from_millis(80), async {
-            loop {
-                if count.load(Ordering::SeqCst) > 1 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .is_err(),
+        generation.wait_drain(Duration::from_secs(5)).await,
+        "a settled permanent failure must drain"
+    );
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
         "permanent 401 must not be retried"
     );
-    drop(server);
-    timeout(
-        Duration::from_secs(2),
-        generation.wait_drain(Duration::from_secs(2)),
-    )
-    .await
-    .unwrap();
+    server.abort();
     let snap = metrics.channel_snapshot("webhook");
     assert_eq!(snap.attempted, 1);
     assert_eq!(snap.failed_permanent, 1);

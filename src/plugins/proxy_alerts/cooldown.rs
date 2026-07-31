@@ -588,7 +588,13 @@ impl RecoveryGate {
         ownership_generation: u64,
         reserved_at_ms: u64,
     ) {
-        self.settle_resolve(rule_id, proxy_id, ownership_generation, reserved_at_ms, None);
+        self.settle_resolve(
+            rule_id,
+            proxy_id,
+            ownership_generation,
+            reserved_at_ms,
+            None,
+        );
     }
 
     /// Roll back a failed/abandoned Resolve: PendingResolve → Recovering.
