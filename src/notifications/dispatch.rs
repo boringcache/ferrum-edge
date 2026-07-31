@@ -23,11 +23,14 @@
 //! settlement edge invoking the producer callback once with that outcome to
 //! roll back reserved/pending producer state.
 //!
-//! # Duplicate-delivery contract (at-least-once, not exactly-once)
+//! # Best-effort delivery can produce zero, one, or multiple copies
 //!
-//! Notification delivery is **at-least-once at the endpoint** and exactly-once
-//! only in Ferrum's own accounting. Three boundaries are genuinely
-//! indistinguishable from inside this process:
+//! Notification delivery is bounded and non-durable: backpressure, permanent
+//! failures, or an exhausted retry budget can produce zero endpoint copies,
+//! while uncertain transport/cancellation boundaries can produce duplicates.
+//! It therefore guarantees neither at-most-once nor at-least-once endpoint
+//! delivery. Settlement is exactly-once only in Ferrum's own accounting. Three
+//! boundaries are genuinely indistinguishable from inside this process:
 //!
 //! 1. **Transport timeout.** A request that times out may have been fully
 //!    received and acted on by the peer; the response was simply never read.
@@ -47,9 +50,13 @@
 //! peer already committed, so retrying would only duplicate.
 //!
 //! Operator expectation: **webhook and email consumers must be idempotent, or
-//! tolerant of duplicates.** Deduplicate on the stable notification identity
-//! (rule + proxy + `event_action` + `fired_at`) rather than on delivery count,
-//! and treat `abandoned_total{reason="shutdown_deadline"}` /
+//! tolerant of duplicates.** Retries inside one admitted task reuse the same
+//! notification (including `fired_at`), but a later re-admission after rollback
+//! creates a new timestamp and Ferrum does not emit a cross-admission
+//! idempotency key. Receivers that need incident-level deduplication must derive
+//! their own stable business key/window from rule + proxy + `event_action`;
+//! `fired_at` alone is not stable across re-admission. Treat
+//! `abandoned_total{reason="shutdown_deadline"}` /
 //! `{reason="generation_retired"}` as "delivery state unknown", not as
 //! "definitely not delivered". Setting `max_delivery_retries: 0` narrows
 //! duplicate windows 1 and 2 at the cost of dropping recoverable transient

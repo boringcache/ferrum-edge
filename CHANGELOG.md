@@ -78,11 +78,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CompensatingTrigger`, so the next breaching sample re-alerts through the
   ordinary cooldown gate. A rule that recovered again in the meantime returns
   to `Healthy` with no phantom alert (#2448).
-- Documented the at-least-once endpoint delivery contract: transport timeouts,
+- Documented the best-effort endpoint delivery contract: bounded
+  backpressure/failure paths can produce zero copies, while transport timeouts,
   connection errors after the request was written, and cancellation after bytes
-  left the process can all duplicate a delivery on retry or report an abandoned
-  outcome despite endpoint action. Webhook/email consumers must be idempotent
-  or duplicate-tolerant (#2448).
+  left the process can duplicate a delivery on retry or report an abandoned
+  outcome despite endpoint action. Retries preserve `fired_at`, but later
+  re-admission does not; Ferrum supplies no cross-admission idempotency key.
+  Webhook/email consumers must be idempotent or duplicate-tolerant (#2448).
 
 ### Security
 

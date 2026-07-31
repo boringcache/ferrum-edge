@@ -31,12 +31,13 @@
 //!   leave a genuinely breached incident silently suppressed. If the rule is no
 //!   longer breaching by then, the Resolve was accurate and the state returns
 //!   to `Healthy` with no phantom alert.
-//! - **At-least-once at the endpoint**: transport timeouts, post-write
-//!   connection errors, and cancellation after bytes left the process are all
-//!   reported as failure/abandonment even though the endpoint may have acted on
-//!   the send. Retries and compensating Triggers can therefore duplicate an
-//!   alert at the receiver. See the duplicate-delivery contract in
-//!   `src/notifications/dispatch.rs` and `docs/notifications.md`.
+//! - **Best-effort endpoint delivery**: bounded backpressure/failure paths can
+//!   produce zero copies, while transport timeouts, post-write connection
+//!   errors, and cancellation after bytes left the process are all reported as
+//!   failure/abandonment even though the endpoint may have acted on the send.
+//!   Retries and compensating Triggers can therefore duplicate an alert at the
+//!   receiver. See the delivery contract in `src/notifications/dispatch.rs`
+//!   and `docs/notifications.md`.
 //! - **Bounded-concurrency dispatch**: `tokio::Semaphore`. When exhausted,
 //!   alerts are dropped with a `warn!` rather than queued — alert storms
 //!   during a partial channel outage should be visible, not buffered.

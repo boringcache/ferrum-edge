@@ -217,9 +217,9 @@ attempted == succeeded + failed_transient + failed_permanent
 
 `backpressure_dropped_total` and `rejected_total` sit deliberately outside it: no transport attempt ran, so counting them as attempts would understate the delivery success ratio. Every one of those paths still invokes the producer's settle callback exactly once, so reserved cooldown / pending incident state is always rolled back.
 
-### Duplicate delivery is possible; consumers must be idempotent
+### Best-effort delivery can produce zero, one, or multiple copies
 
-Delivery is **at-least-once at the endpoint** and exactly-once only in Ferrum's own accounting. Three boundaries are indistinguishable from inside the process:
+Delivery is bounded and non-durable. Backpressure, permanent failure, or an exhausted retry budget can produce **zero** endpoint copies, while uncertain transport/cancellation boundaries can produce duplicates. Ferrum therefore guarantees neither at-most-once nor at-least-once endpoint delivery; settlement is exactly-once only in Ferrum's own accounting. Three boundaries are indistinguishable from inside the process:
 
 1. **Transport timeout** — the peer may have received and acted on the request; only the response was lost. Classified transient and retried.
 2. **Connection error after the request was written** — a reset or early EOF carries no proof the peer did not process the body. Classified transient and retried.
@@ -229,7 +229,7 @@ Conversely, a 2xx followed by a response-body drain failure is classified **perm
 
 Operator expectations for webhook and email consumers:
 
-- Make the receiver idempotent, or tolerant of duplicates. Deduplicate on the stable notification identity (rule + proxy + `event_action` + `fired_at`), not on delivery count.
+- Make the receiver idempotent, or tolerant of duplicates. Retries inside one admitted task reuse the same notification (including `fired_at`), but rollback followed by a later re-admission creates a new timestamp and Ferrum does not emit a cross-admission idempotency key. For incident-level deduplication, derive a receiver-owned stable business key/window from rule + proxy + `event_action`; do not rely on `fired_at` alone across re-admission.
 - Treat `abandoned_total{reason="shutdown_deadline"}` and `{reason="generation_retired"}` as **delivery state unknown**, not as "definitely not delivered".
 - Setting `max_delivery_retries: 0` narrows duplicate windows 1 and 2, at the cost of dropping recoverable transient failures. It cannot close window 3.
 
