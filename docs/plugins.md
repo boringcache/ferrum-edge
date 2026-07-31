@@ -3502,7 +3502,47 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 
 `function_url` and `aws_endpoint_url` reject URL userinfo (`user:password@host`). The AWS endpoint override must be an origin only, with no path, query, or fragment. Automatic redirects are disabled. In `pre_proxy` mode only a 2xx function response is approval; every other response uses `on_error` and `error_status_code`. In `terminate` mode only final 2xx-5xx statuses (`200..=599`) are returned intentionally; informational or out-of-range three-digit statuses use the configured error path.
 
-The function is invoked in the **finalized-request-egress** phase, after request-body transforms and after every final request-policy hook (WAF body rules, OpenAPI request schema, `body_validator`, the post-transform `request_size_limiting` ceiling) has accepted the representation — so none of those body policies can reject only after the function was contacted (advisory `GHSA-4vr5-4wm3-x5xv`). Backend admission, circuit-breaker, and transport checks still occur later where applicable. When `forward_body` is enabled, the plugin buffers for every HTTP method and fails closed without calling the function if no body was ever collected for a request that may carry one, or if the request carries a non-identity `Content-Encoding`. The forwarded bytes are the backend-visible body, so operator-configured `request_transformer` removals and redactions are applied before the function sees them. The encoding check consults the **original** request headers (captured at request intake) as well as the active header map: a header-only `request_transformer` that removes or renames `Content-Encoding` before this plugin cannot strip the label off still-compressed bytes and smuggle them past the boundary. The payload has one authoritative lossless body representation: Ferrum never parses JSON into a structured value, so duplicate object members, lexical number forms, whitespace, and every other byte remain identical to the backend-visible request. Valid UTF-8 is carried as an exact JSON string with `body_encoding: "utf8"`; arbitrary bytes use base64 with `body_encoding: "base64"`. `body_content_type` separately records the active hook `Content-Type` when present without changing the representation. Query forwarding starts from the same canonical effective query used for backend dispatch (transformer outbound query when present, otherwise the retained raw query, then auth credential strips), so credentials that an earlier auth plugin marked for hiding are removed before parsing and cannot be resurrected in external policy egress, and operator query transforms are reflected rather than ignored. Query/body representation ambiguity is governed input and remains fail-closed even with `on_error: "continue"`; that option applies to invocation/response failures, not to inputs the configured policy cannot inspect faithfully. A serverless body-egress instance may now share a protocol chain with a request-body transformer, because the function observes the post-transform representation. The fail-closed composition rule is retained, at plugin-cache construction, for anything that still egresses *earlier*: a registered custom plugin declaring `egresses_request_body_before_finalization()` may not share a protocol chain with a request-body transformer, nor with a plugin whose enforcement runs in the final request-body phase (`enforces_finalized_request_policy()` — `waf`, `body_validator`, `openapi_validator`, `request_size_limiting`), and may not simultaneously declare `dispatches_finalized_request_egress()`. This is capability-based rather than a built-in-name exception.
+The function is invoked in the **finalized-request-egress** phase, after
+request-body transforms and after every final request-policy hook has accepted
+the representation — including protocol and integrity validation,
+WAF/OpenAPI/body/size policy, AI request guardrails, and mandatory audit
+admission. None of those policies can reject only after the function was
+contacted (advisory `GHSA-4vr5-4wm3-x5xv`). Backend admission,
+circuit-breaker, and transport checks still occur later where applicable.
+When `forward_body` is enabled, the plugin buffers for every HTTP method and
+fails closed without calling the function if no body was ever collected for a
+request that may carry one, or if the request carries a non-identity
+`Content-Encoding`. The forwarded bytes are the backend-visible body, so
+operator-configured `request_transformer` removals and redactions are applied
+before the function sees them. The encoding check consults the **original**
+request headers (captured at request intake) as well as the active header map:
+a header-only `request_transformer` that removes or renames `Content-Encoding`
+before this plugin cannot strip the label off still-compressed bytes and
+smuggle them past the boundary. The payload has one authoritative lossless
+body representation: Ferrum never parses JSON into a structured value, so
+duplicate object members, lexical number forms, whitespace, and every other
+byte remain identical to the backend-visible request. Valid UTF-8 is carried as
+an exact JSON string with `body_encoding: "utf8"`; arbitrary bytes use base64
+with `body_encoding: "base64"`. `body_content_type` separately records the
+active hook `Content-Type` when present without changing the representation.
+Query forwarding starts from the same canonical effective query used for
+backend dispatch (transformer outbound query when present, otherwise the
+retained raw query, then auth credential strips), so credentials that an
+earlier auth plugin marked for hiding are removed before parsing and cannot be
+resurrected in external policy egress, and operator query transforms are
+reflected rather than ignored. Query/body representation ambiguity is governed
+input and remains fail-closed even with `on_error: "continue"`; that option
+applies to invocation/response failures, not to inputs the configured policy
+cannot inspect faithfully. A serverless body-egress instance may now share a
+protocol chain with a request-body transformer, because the function observes
+the post-transform representation. The fail-closed composition rule is
+retained, at plugin-cache construction, for anything that still egresses
+*earlier*: a registered custom plugin declaring
+`egresses_request_body_before_finalization()` may not share a protocol chain
+with a request-body transformer, nor with any plugin declaring
+`enforces_finalized_request_policy()`, and may not simultaneously declare
+`dispatches_finalized_request_egress()`. This is capability-based rather than a
+built-in-name exception.
 
 Candidate composition admission derives only the serverless protocol, effective priority, `mode`, and `forward_body` capabilities and does not construct the environment-bound HTTP/AWS client. CP/database admission therefore does not require AWS or externally resolved credentials that intentionally exist only on DPs; runtime cache construction still resolves and validates them fail closed.
 
