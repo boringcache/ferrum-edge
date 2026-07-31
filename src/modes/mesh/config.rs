@@ -2923,17 +2923,40 @@ impl MeshNamespacedObject for Workload {
         &self.namespace
     }
 
-    /// A workload has no `metadata.name` in the mesh model. Its identity is
-    /// the pod UID when Kubernetes supplied one, plus the SPIFFE id and
-    /// addresses, which is what distinguishes two `WorkloadEntry`-sourced
-    /// workloads that share a service account.
+    /// A workload has no `metadata.name` in the mesh model, so its identity is
+    /// TIERED.
+    ///
+    /// * **Pod-backed** (`pod_uid` present and non-empty): the pod UID ALONE.
+    ///   A Kubernetes Pod UID is the stable identity of that logical workload —
+    ///   its addresses, SPIFFE id, service account, locality and node-waypoint
+    ///   metadata all legitimately change while the same Pod object is
+    ///   reconciled. Folding any of those mutable fields into the key would stop
+    ///   the Kubernetes overlay from shadowing the base snapshot's copy of the
+    ///   same pod and leave two logical copies of it in the composed mesh.
+    /// * **Everything else** (WorkloadEntry / VM / native / xDS workloads, which
+    ///   carry no pod identity): the SPIFFE id plus addresses. `Workload` has no
+    ///   stable resource name to key on, so this composite is what keeps two
+    ///   distinct workloads sharing a service account — and therefore a SPIFFE
+    ///   id — from collapsing into one.
+    ///
+    /// An explicitly EMPTY `pod_uid` is treated as absent, not as a real pod
+    /// identity. The Kubernetes translator only ever stamps a non-empty UID,
+    /// but `pod_uid` is a plain deserialized field on the native / file / xDS
+    /// sources, so `Some("")` is reachable — and normalizing it into the pod
+    /// tier would collapse every such workload in a namespace onto one key.
+    ///
+    /// The two tiers live in disjoint key spaces (`uid|…` vs `id|…`) so no
+    /// `pod_uid` value, however malformed, can be made to collide with a
+    /// fallback key.
     fn object_key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!(
-            "{}|{}|{}",
-            self.pod_uid.as_deref().unwrap_or_default(),
-            self.spiffe_id,
-            self.addresses.join(",")
-        ))
+        match self.pod_uid.as_deref() {
+            Some(uid) if !uid.is_empty() => Cow::Owned(format!("uid|{uid}")),
+            _ => Cow::Owned(format!(
+                "id|{}|{}",
+                self.spiffe_id,
+                self.addresses.join(",")
+            )),
+        }
     }
 }
 

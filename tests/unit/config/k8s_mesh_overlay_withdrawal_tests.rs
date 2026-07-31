@@ -838,6 +838,261 @@ fn overlay_slot_full_reload_restores_a_db_object_the_overlay_shadowed() {
     assert_eq!(mesh_of(&withdrawn).services, vec![db_service]);
 }
 
+// ── Workload identity tiers ───────────────────────────────────────────────
+
+/// A `Workload` whose identity-bearing fields are all set independently.
+///
+/// `pod_uid` is passed through VERBATIM — including `Some("")`, which the
+/// native / file / xDS sources can deserialize — because an empty UID must
+/// reach the FALLBACK identity tier rather than becoming a real pod identity.
+fn workload(
+    namespace: &str,
+    service_account: &str,
+    addresses: &[&str],
+    pod_uid: Option<&str>,
+    service_name: &str,
+) -> Workload {
+    let uri = format!("spiffe://cluster.local/ns/{namespace}/sa/{service_account}");
+    Workload {
+        spiffe_id: SpiffeId::new(uri).expect("test spiffe id"),
+        selector: WorkloadSelector::default(),
+        service_name: service_name.to_string(),
+        addresses: addresses.iter().map(|addr| addr.to_string()).collect(),
+        ports: Vec::new(),
+        trust_domain: TrustDomain::new("cluster.local").expect("test trust domain"),
+        namespace: namespace.to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some(service_account.to_string()),
+        pod_uid: pod_uid.map(str::to_string),
+        node_waypoint: None,
+        remote_provenance: false,
+    }
+}
+
+fn mesh_with_workloads(workloads: Vec<Workload>) -> MeshConfig {
+    MeshConfig {
+        workloads,
+        ..MeshConfig::default()
+    }
+}
+
+/// Compose a non-Kubernetes base mesh with an authoritative Kubernetes overlay.
+fn compose_workloads(base: &MeshConfig, overlay: Option<MeshConfig>) -> GatewayConfig {
+    merge_k8s_translation(
+        &other_source_config(base.clone()),
+        &authoritative_overlay(overlay),
+        &managed(&["default"]),
+    )
+}
+
+fn workload_names(config: &GatewayConfig) -> Vec<&str> {
+    mesh_of(config)
+        .workloads
+        .iter()
+        .map(|workload| workload.service_name.as_str())
+        .collect()
+}
+
+const POD_A: &str = "11111111-1111-4111-8111-111111111111";
+const POD_B: &str = "22222222-2222-4222-8222-222222222222";
+
+/// A Kubernetes Pod UID is the STABLE identity of that logical workload: its
+/// addresses, SPIFFE id, service account and service name all legitimately
+/// change while the same Pod object is reconciled. Folding any of those into
+/// the identity key would stop the overlay from shadowing the base snapshot's
+/// copy of the pod, leaving two logical copies of it in the composed mesh.
+#[test]
+fn a_pod_backed_workload_is_identified_by_its_pod_uid_alone() {
+    let base_workload = workload(
+        "default",
+        "reviews",
+        &["10.0.0.1"],
+        Some(POD_A),
+        "reviews-base-v1",
+    );
+    let base = mesh_with_workloads(vec![base_workload]);
+    let k8s = workload(
+        "default",
+        "reviews-rotated",
+        &["10.0.0.9", "fd00::9"],
+        Some(POD_A),
+        "reviews-k8s-v2",
+    );
+    let overlay = mesh_with_workloads(vec![k8s.clone()]);
+
+    let composed = compose_workloads(&base, Some(overlay));
+
+    assert_eq!(
+        mesh_of(&composed).workloads,
+        vec![k8s],
+        "one pod UID is one logical workload: the Kubernetes copy must shadow \
+         the base copy even though every other field changed"
+    );
+}
+
+#[test]
+fn withdrawing_a_pod_backed_overlay_restores_the_exact_base_workload() {
+    let base_workload = workload(
+        "default",
+        "reviews",
+        &["10.0.0.1"],
+        Some(POD_A),
+        "reviews-base-v1",
+    );
+    let base = mesh_with_workloads(vec![base_workload.clone()]);
+    let k8s = workload(
+        "default",
+        "reviews-rotated",
+        &["10.0.0.9"],
+        Some(POD_A),
+        "reviews-k8s-v2",
+    );
+    let overlay = mesh_with_workloads(vec![k8s]);
+
+    let active = compose_workloads(&base, Some(overlay));
+    assert_eq!(mesh_of(&active).workloads.len(), 1);
+
+    let withdrawn = merge_k8s_translation(
+        &active,
+        &authoritative_overlay(None),
+        &managed(&["default"]),
+    );
+
+    assert_eq!(
+        mesh_of(&withdrawn).workloads,
+        vec![base_workload],
+        "withdrawal must restore the base workload the overlay had shadowed"
+    );
+}
+
+#[test]
+fn two_pod_backed_workloads_with_different_uids_coexist() {
+    // Identical in every field EXCEPT the pod UID.
+    let base_workload = workload(
+        "default",
+        "reviews",
+        &["10.0.0.1"],
+        Some(POD_A),
+        "reviews-same-fields",
+    );
+    let base = mesh_with_workloads(vec![base_workload]);
+    let k8s = workload(
+        "default",
+        "reviews",
+        &["10.0.0.1"],
+        Some(POD_B),
+        "reviews-same-fields",
+    );
+    let overlay = mesh_with_workloads(vec![k8s]);
+
+    let composed = compose_workloads(&base, Some(overlay));
+
+    assert_eq!(
+        mesh_of(&composed).workloads.len(),
+        2,
+        "two distinct pods must coexist even when every other field matches"
+    );
+}
+
+/// WorkloadEntry / VM / native / xDS workloads carry no pod identity, and
+/// `Workload` has no resource name to key on, so the fallback tier must keep
+/// two workloads that share a service account — and therefore a SPIFFE id —
+/// distinct.
+#[test]
+fn non_pod_workloads_sharing_a_spiffe_identity_coexist_when_addresses_differ() {
+    let base_workload = workload(
+        "default",
+        "vm-sa",
+        &["10.1.0.1"],
+        None,
+        "legacy-vm-alpha",
+    );
+    let base = mesh_with_workloads(vec![base_workload]);
+    let k8s = workload(
+        "default",
+        "vm-sa",
+        &["10.1.0.2"],
+        None,
+        "legacy-vm-beta",
+    );
+    let overlay = mesh_with_workloads(vec![k8s]);
+
+    let composed = compose_workloads(&base, Some(overlay));
+
+    assert_eq!(
+        mesh_of(&composed).workloads.len(),
+        2,
+        "a shared service account must not collapse two distinct non-pod workloads"
+    );
+}
+
+#[test]
+fn an_empty_pod_uid_falls_back_instead_of_becoming_a_pod_identity() {
+    // Two uid-less workloads differing only by address. Normalizing `Some("")`
+    // into the pod tier would give both the same key and silently drop one.
+    let empty_uid = workload(
+        "default",
+        "vm-sa",
+        &["10.1.0.1"],
+        Some(""),
+        "legacy-empty-uid",
+    );
+    let absent_uid = workload(
+        "default",
+        "vm-sa",
+        &["10.1.0.2"],
+        None,
+        "legacy-absent-uid",
+    );
+    let unrelated = mesh_with_workloads(vec![empty_uid, absent_uid]);
+    assert_eq!(
+        unrelated.object_identities().len(),
+        2,
+        "an empty pod UID must not collapse unrelated non-pod workloads"
+    );
+
+    let empty_base = mesh_with_workloads(Vec::new());
+    let composed = compose_workloads(&empty_base, Some(unrelated.clone()));
+    assert_eq!(mesh_of(&composed).workloads.len(), 2);
+
+    // An absent and an explicitly empty UID are the SAME (fallback) tier, so a
+    // matching SPIFFE id plus addresses still shadows.
+    let reauthoring = workload(
+        "default",
+        "vm-sa",
+        &["10.1.0.1"],
+        None,
+        "legacy-reauthored",
+    );
+    let shadowing = mesh_with_workloads(vec![reauthoring]);
+    let reauthored = compose_workloads(&unrelated, Some(shadowing));
+    assert_eq!(
+        workload_names(&reauthored),
+        vec!["legacy-absent-uid", "legacy-reauthored"],
+        "an absent and an explicitly empty pod UID share one identity tier"
+    );
+
+    // A fallback identity must never collide with a pod identity.
+    let twin = workload(
+        "default",
+        "vm-sa",
+        &["10.1.0.1"],
+        Some(POD_A),
+        "pod-backed-twin",
+    );
+    let pod_backed = mesh_with_workloads(vec![twin]);
+    let mixed = compose_workloads(&unrelated, Some(pod_backed));
+    assert_eq!(
+        mesh_of(&mixed).workloads.len(),
+        3,
+        "a pod-backed workload must never shadow a uid-less one that happens to \
+         share its SPIFFE id and addresses"
+    );
+}
+
 // ── Ownership-accounting coverage guard ───────────────────────────────────
 
 /// One object in EVERY namespaced [`MeshConfig`] collection.
