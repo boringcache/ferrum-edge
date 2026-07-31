@@ -14,10 +14,13 @@
 //! is raced against the owning generation's cancellation. Retirement therefore
 //! drops an in-flight send promptly instead of waiting out the transport
 //! timeout. Cancellation is a *commit* boundary, not an undo: bytes already
-//! written to the endpoint may still be delivered and acted on, but a retired
-//! generation never commits success/failure, never retries, and never runs a
-//! completion path after cancellation. The retired attempt settles exactly once
-//! as [`DispatchSettle::Abandoned`].
+//! written to the endpoint may still be delivered and acted on. A retired
+//! generation cannot commit [`DispatchSettle::Succeeded`],
+//! [`DispatchSettle::FailedTransient`], or [`DispatchSettle::FailedPermanent`];
+//! cannot schedule another retry or invoke a success/failure completion
+//! outcome; and settles exactly once as [`DispatchSettle::Abandoned`], with the
+//! exactly-once settlement edge invoking the producer callback once with
+//! `Abandoned` to roll back reserved/pending producer state.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -229,9 +232,12 @@ pub(crate) async fn run_with_retries(
         // Losing the race drops the in-flight transport future here. That
         // cannot unsend bytes already on the wire (the endpoint may still
         // observe, and act on, a delivery this generation will report as
-        // abandoned); it only guarantees the retired generation never commits
-        // success/failure into producer state, never schedules another retry,
-        // and never invokes a completion path after cancellation.
+        // abandoned). A retired generation cannot commit
+        // Succeeded/FailedTransient/FailedPermanent, cannot schedule another
+        // retry, or invoke a success/failure completion outcome; it settles
+        // exactly once as Abandoned, and the exactly-once settlement edge
+        // invokes the producer callback once with Abandoned to roll back
+        // reserved/pending producer state.
         let outcome = tokio::select! {
             biased;
             () = cancel_wait(generation) => return DispatchSettle::Abandoned,
