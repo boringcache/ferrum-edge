@@ -991,23 +991,19 @@ async fn admit_then_cancel_before_transport_counts_attempted_under_body_start_co
     let cancel_watch = Arc::clone(&generation);
 
     assert!(
-        generation.spawn(
-            "webhook",
-            Some(settles.callback()),
-            async move {
-                // Reaching this future proves the pre-future cancel check passed
-                // after `mark_attempt_started`, so `attempted` already advanced
-                // with no channel call yet.
-                body_entered_flag_set.store(1, Ordering::Release);
-                body_entered_signal.notify_waiters();
-                let _ = release_rx.await;
-                assert!(
-                    cancel_watch.is_cancelled(),
-                    "fixture must observe retirement before any channel call"
-                );
-                DispatchSettle::Abandoned(AbandonReason::GenerationRetired)
-            }
-        ),
+        generation.spawn("webhook", Some(settles.callback()), async move {
+            // Reaching this future proves the pre-future cancel check passed
+            // after `mark_attempt_started`, so `attempted` already advanced
+            // with no channel call yet.
+            body_entered_flag_set.store(1, Ordering::Release);
+            body_entered_signal.notify_waiters();
+            let _ = release_rx.await;
+            assert!(
+                cancel_watch.is_cancelled(),
+                "fixture must observe retirement before any channel call"
+            );
+            DispatchSettle::Abandoned(AbandonReason::GenerationRetired)
+        }),
         "open generation must admit the body"
     );
 
@@ -1106,7 +1102,10 @@ async fn hard_shutdown_deadline_aborts_admitted_notification_exactly_once() {
         .expect("server must observe the live transport before the deadline abort");
     assert_eq!(generation.in_flight(), 1);
     assert_eq!(metrics.channel_snapshot("webhook").in_flight, 1);
-    assert!(!generation.is_cancelled(), "reload retirement must stay disjoint");
+    assert!(
+        !generation.is_cancelled(),
+        "reload retirement must stay disjoint"
+    );
 
     // Comfortably long virtual budget: hard abort cannot fire until the test
     // advances paused time past this deadline.

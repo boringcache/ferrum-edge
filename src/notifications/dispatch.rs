@@ -295,9 +295,7 @@ fn dispatch_one_impl(
         .await
     };
     let spawned = match slot {
-        Some(slot) => {
-            generation.spawn_with_delivery_slot(channel_type, on_settle, slot, future)
-        }
+        Some(slot) => generation.spawn_with_delivery_slot(channel_type, on_settle, slot, future),
         None => generation.spawn(channel_type, on_settle, future),
     };
 
