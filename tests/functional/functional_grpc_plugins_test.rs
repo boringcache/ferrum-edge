@@ -311,7 +311,7 @@ async fn wait_for_owned_gateway(
         if std::time::Instant::now() >= deadline {
             return Err(format!(
                 "Gateway port {gateway_port} did not accept TCP connections within \
-                 {STARTUP_TIMEOUT_SECS} seconds"
+                 {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
             )
             .into());
         }
