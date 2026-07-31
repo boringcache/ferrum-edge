@@ -1038,6 +1038,19 @@ impl Plugin for PriorityOverridePlugin {
                 response_headers,
             )
     }
+    fn should_release_response_body_for_simulated_final_headers(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        final_response_headers: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        self.inner
+            .should_release_response_body_for_simulated_final_headers(
+                ctx,
+                response_status,
+                final_response_headers,
+            )
+    }
     fn should_release_response_body_for_later_strong_etag(
         &self,
         ctx: &RequestContext,

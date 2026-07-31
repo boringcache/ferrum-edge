@@ -1542,11 +1542,16 @@ impl ResponseCaching {
         //    here — not released quietly at the buffering vote — so the buffered
         //    path refuses the store too, even when an unrelated plugin keeps the
         //    body buffered for its own reasons.
-        if response_headers
-            .get("content-type")
-            .map(String::as_str)
-            .is_some_and(super::utils::sse::is_text_event_stream_media_type)
-        {
+        //
+        //    Read from the BACKEND-selected representation, not the live header
+        //    map: a later `after_proxy` hook may relabel an event stream, and a
+        //    relabel neither bounds those bytes nor makes them reusable by a
+        //    later request. Using the live map here would let adding a
+        //    content-type-rewriting plugin turn the refusal off — the same
+        //    silent reinstatement the release path guards against
+        //    (GHSA-pwcm-6rh8-f2gh). A synthetic response carries no backend
+        //    stamp, so the helper falls back to its live headers.
+        if super::utils::sse::original_response_is_event_stream(ctx, response_headers) {
             return FinalHeaderDecision::EventStreamNotStored;
         }
 
@@ -2929,6 +2934,36 @@ impl Plugin for ResponseCaching {
                 | FinalHeaderDecision::InvalidateZeroFreshness
                 | FinalHeaderDecision::EventStreamNotStored
         )
+    }
+
+    fn should_release_response_body_for_simulated_final_headers(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        final_response_headers: &HashMap<String, String>,
+    ) -> bool {
+        // The same predicate every other release here uses, evaluated over the
+        // SIMULATED final header view rather than the backend one. That is what
+        // lets a later built-in header rule which closes the store path —
+        // `no-store`, `private`, `no-cache`, `max-age=0` / zero freshness, an
+        // unusable `Vary` — release the body instead of collecting a response
+        // whose store path was already decided against it
+        // (GHSA-pwcm-6rh8-f2gh).
+        //
+        // Safe in exactly one direction, which is why this instance may
+        // implement a hook the trait warns is a projection rather than a proof:
+        // every effect the release skips belongs to the final response-header
+        // phase, which runs over the TRUE final headers on both the streaming and
+        // buffered paths. An over-optimistic simulation therefore costs a cache
+        // entry and can never skip an eviction or a predictor mark, nor store a
+        // representation the real headers refuse.
+        self.should_buffer_response_body(ctx)
+            && !self.final_response_body_is_required(
+                ctx,
+                response_status,
+                final_response_headers,
+                None,
+            )
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {

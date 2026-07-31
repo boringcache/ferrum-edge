@@ -9,13 +9,14 @@ use super::plugin_utils::create_test_proxy;
 use chrono::Utc;
 use ferrum_edge::_test_support::{
     advance_response_caching_clock_for_test, clone_log_metadata,
-    response_caching_cache_keys_for_test, response_caching_current_total_size_for_test,
-    response_caching_instance_id_for_test, response_caching_shard_amount_for_test,
-    response_caching_size_accounting_snapshot_for_test,
+    refine_stream_response_for_content_type_for_test, response_caching_cache_keys_for_test,
+    response_caching_current_total_size_for_test, response_caching_instance_id_for_test,
+    response_caching_shard_amount_for_test, response_caching_size_accounting_snapshot_for_test,
     response_caching_staging_metadata_key_for_test, response_caching_vary_index_snapshot_for_test,
-    run_after_proxy_hooks_for_test, run_after_proxy_hooks_reject_for_test,
-    set_replay_credential_headers_for_test, set_replay_request_body_empty_proven_for_test,
-    set_response_presentation_policy_digest_for_test,
+    retry_response_decision_context_for_test, run_after_proxy_hooks_for_test,
+    run_after_proxy_hooks_reject_for_test, set_replay_credential_headers_for_test,
+    set_replay_request_body_empty_proven_for_test, set_response_presentation_policy_digest_for_test,
+    stamp_original_response_metadata_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::response_caching::{RESPONSE_CACHING_CONFIG_KEYS, ResponseCaching};
@@ -7141,6 +7142,373 @@ async fn a_released_instance_does_not_open_the_retry_gate() {
             &plugins, &ctx
         )
     );
+}
+
+// ---------------------------------------------------------------------------
+// GHSA-pwcm-6rh8-f2gh — the retry-time refinement applies the content-type
+// relabel guard PER PLUGIN and projects the later chain's header effects, so a
+// supported `retries + response_caching + response_transformer` proxy no longer
+// buffers a backend-selected event stream for the life of the connection.
+// ---------------------------------------------------------------------------
+
+/// The retry-time refinement, driven exactly as every dispatch path drives it.
+fn retry_refinement_streams(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    response_status: u16,
+    response_headers: &HashMap<String, String>,
+) -> bool {
+    let proxy = create_test_proxy();
+    let retry_ctx = retry_response_decision_context_for_test(ctx);
+    refine_stream_response_for_content_type_for_test(
+        &proxy,
+        plugins,
+        &retry_ctx,
+        response_status,
+        response_headers,
+    )
+}
+
+/// A header-only `response_transformer` that may rewrite `Content-Type`. It runs
+/// at priority 4000, after `response_caching` at 3500, so it is exactly a
+/// "later hook" for the refinement.
+fn later_content_type_rewriter() -> Arc<dyn Plugin> {
+    let transformer = ferrum_edge::plugins::response_transformer::ResponseTransformer::new(&json!({
+        "rules": [{
+            "operation": "update",
+            "target": "header",
+            "key": "Content-Type",
+            "value": "application/json"
+        }]
+    }))
+    .expect("response_transformer config");
+    Arc::new(transformer)
+}
+
+fn later_header_transformer(key: &str, value: &str) -> Arc<dyn Plugin> {
+    let transformer = ferrum_edge::plugins::response_transformer::ResponseTransformer::new(&json!({
+        "rules": [{
+            "operation": "update",
+            "target": "header",
+            "key": key,
+            "value": value
+        }]
+    }))
+    .expect("response_transformer config");
+    Arc::new(transformer)
+}
+
+/// The root residual: with retries configured, a later `Content-Type`-rewriting
+/// transformer used to make the whole retry branch return "keep buffering" from
+/// one global early return, so a backend-selected event stream was collected for
+/// the entire life of the connection against the retained-response budget. The
+/// guard is now per plugin, and this instance proves its release independent of
+/// the final label — relabelling an unbounded stream does not bound it.
+#[tokio::test]
+async fn a_retried_event_stream_streams_past_a_later_content_type_rewriter() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin: Arc<ResponseCaching> = Arc::new(default_plugin());
+    let mut ctx = make_ctx("GET", "/api/events");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_status(&plugin, &ctx, "MISS");
+
+    let sse = response_headers_from(&[
+        ("content-type", "text/event-stream"),
+        ("cache-control", "public, max-age=60"),
+    ]);
+
+    let alone: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    assert!(
+        retry_refinement_streams(&alone, &ctx, 200, &sse),
+        "the cache alone already released this under retries"
+    );
+
+    let with_rewriter: Vec<Arc<dyn Plugin>> = vec![plugin.clone(), later_content_type_rewriter()];
+    assert!(
+        retry_refinement_streams(&with_rewriter, &ctx, 200, &sse),
+        "adding a Content-Type-rewriting transformer must not reinstate full buffering \
+         of a backend-selected event stream under retries"
+    );
+
+    // And the stream is still never STORED, including on the relabelled final
+    // headers a buffering plugin elsewhere might have collected. The backend
+    // representation is what decides that, so the pristine stamp every dispatch
+    // path records is what the header phase reads.
+    let mut final_headers = sse.clone();
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &final_headers);
+    let rejected =
+        run_after_proxy_hooks_for_test(&with_rewriter, &mut ctx, 200, &mut final_headers).await;
+    assert!(!rejected);
+    assert_eq!(
+        final_headers.get("content-type").map(String::as_str),
+        Some("application/json"),
+        "the later hook did relabel the response the header phase classified"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_final_header_decision"))
+            .map(String::as_str),
+        Some("event-stream-not-stored"),
+        "a relabel must not turn the event-stream refusal off"
+    );
+    plugin
+        .on_final_response_body(&mut ctx, 200, &final_headers, b"data: one\n\n")
+        .await;
+    assert!(
+        response_caching_cache_keys_for_test(&plugin).is_empty(),
+        "a relabelled event stream is still not a representation a later request can reuse"
+    );
+}
+
+/// The retry-time decision now sees the LATER chain's header rules, so a
+/// response the backend labelled cacheable but a later built-in hook makes
+/// unstorable is released rather than collected and discarded unread.
+#[tokio::test]
+async fn a_retried_response_a_later_hook_makes_unstorable_is_released() {
+    let plugin: Arc<ResponseCaching> = Arc::new(default_plugin());
+    let mut ctx = make_ctx("GET", "/api/widgets");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_status(&plugin, &ctx, "MISS");
+
+    // The backend response is storable by every header rule, so on the backend
+    // view alone only the completed body can decide — it stays buffered.
+    let storable = response_headers_from(&[
+        ("content-type", "application/json"),
+        ("cache-control", "public, max-age=60"),
+    ]);
+    let alone: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    assert!(
+        !retry_refinement_streams(&alone, &ctx, 200, &storable),
+        "a genuinely storable representation still needs its body"
+    );
+
+    for (key, value) in [
+        ("cache-control", "no-store"),
+        ("cache-control", "private, max-age=60"),
+        ("cache-control", "no-cache"),
+        ("cache-control", "max-age=0"),
+        ("vary", "*"),
+    ] {
+        let plugins: Vec<Arc<dyn Plugin>> =
+            vec![plugin.clone(), later_header_transformer(key, value)];
+        assert!(
+            retry_refinement_streams(&plugins, &ctx, 200, &storable),
+            "a later `{key}: {value}` rule closes the store path, so the body must stream"
+        );
+    }
+}
+
+/// A chain-level route response-header rule is part of the same projection: it
+/// is applied by `response_transformer`'s simulation, from the cloned context,
+/// so the live request keeps its one-shot override for the real hook.
+#[tokio::test]
+async fn a_route_level_response_header_rule_participates_in_the_retry_projection() {
+    use ferrum_edge::plugins::utils::route_header_transform::{
+        RouteHeaderTransformOp, RouteHeaderTransformRule,
+    };
+
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin: Arc<ResponseCaching> = Arc::new(default_plugin());
+    cache_response(&plugin, "GET", "/api/resource", 200, &HashMap::new(), b"old").await;
+    assert_eq!(response_caching_cache_keys_for_test(&plugin).len(), 1);
+
+    let mut ctx = refresh_ctx(&plugin, "/api/resource").await;
+    let route_rules = vec![RouteHeaderTransformRule {
+        operation: RouteHeaderTransformOp::Update,
+        key: "cache-control".to_string(),
+        value: Some("no-store".to_string()),
+    }];
+    ctx.route_override_response_transform = Some(Arc::new(route_rules));
+
+    let transformer = ferrum_edge::plugins::response_transformer::ResponseTransformer::new(&json!({
+        "apply_route_overrides": true
+    }))
+    .expect("route override response_transformer config");
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone(), Arc::new(transformer)];
+
+    let storable = response_headers_from(&[
+        ("content-type", "application/json"),
+        ("cache-control", "public, max-age=60"),
+    ]);
+    assert!(
+        retry_refinement_streams(&plugins, &ctx, 200, &storable),
+        "the route-level rule is part of the final header view the projection must reach"
+    );
+    assert!(
+        ctx.route_override_response_transform.is_some(),
+        "the projection runs on a cloned context, so the live one-shot override survives"
+    );
+
+    // The real chain then applies it, and the eviction happens exactly once,
+    // from the final response-header phase — not from any projection above.
+    let mut final_headers = storable.clone();
+    assert!(!run_after_proxy_hooks_for_test(&plugins, &mut ctx, 200, &mut final_headers).await);
+    assert_eq!(
+        final_headers.get("cache-control").map(String::as_str),
+        Some("no-store"),
+        "the route-level rule is what the real chain applied"
+    );
+    assert!(
+        response_caching_cache_keys_for_test(&plugin).is_empty(),
+        "the selected final response evicts what it supersedes"
+    );
+}
+
+/// The per-plugin guard must not widen anyone else's boundary: a plugin whose
+/// body need IS decided by `Content-Type` keeps buffering when a later hook may
+/// relabel the response.
+#[tokio::test]
+async fn a_content_type_dependent_plugin_still_buffers_behind_a_later_rewrite() {
+    let plugin: Arc<ResponseCaching> = Arc::new(default_plugin());
+    let mut ctx = make_ctx("GET", "/download");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let body_validator = ferrum_edge::plugins::body_validator::BodyValidator::new(&json!({
+        "response_required_fields": ["id"]
+    }))
+    .expect("body_validator config");
+    let validator: Arc<dyn Plugin> = Arc::new(body_validator);
+    // `no-store` closes the cache's store path, so the cache is not what decides
+    // this case — the validator is.
+    let png = response_headers_from(&[
+        ("content-type", "image/png"),
+        ("cache-control", "no-store"),
+    ]);
+
+    // Without a relabelling hook both instances release this representation.
+    let without_rewrite: Vec<Arc<dyn Plugin>> = vec![plugin.clone(), validator.clone()];
+    assert!(retry_refinement_streams(&without_rewrite, &ctx, 200, &png));
+
+    // With one, the validator's release was taken on a label the client never
+    // sees, so it must keep the buffered path — and the whole downgrade fails.
+    let with_rewrite: Vec<Arc<dyn Plugin>> =
+        vec![plugin.clone(), validator, later_content_type_rewriter()];
+    assert!(
+        !retry_refinement_streams(&with_rewrite, &ctx, 200, &png),
+        "a content-type-dependent body plugin must not release behind a later relabel"
+    );
+}
+
+/// Every active buffering plugin still has to agree. `response_caching` releasing
+/// a response can never stream a body another plugin genuinely needs.
+#[tokio::test]
+async fn retry_release_still_requires_every_active_buffering_plugin_to_agree() {
+    let plugin: Arc<ResponseCaching> = Arc::new(default_plugin());
+    let mut ctx = make_ctx("GET", "/api/widgets");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    // `no-store` closes this instance's store path outright...
+    let no_store_json = response_headers_from(&[
+        ("content-type", "application/json"),
+        ("cache-control", "no-store"),
+    ]);
+    let alone: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    assert!(retry_refinement_streams(&alone, &ctx, 200, &no_store_json));
+
+    // ...but a response body validator still has to read the JSON document.
+    let body_validator = ferrum_edge::plugins::body_validator::BodyValidator::new(&json!({
+        "response_required_fields": ["id"]
+    }))
+    .expect("body_validator config");
+    let with_validator: Vec<Arc<dyn Plugin>> = vec![plugin.clone(), Arc::new(body_validator)];
+    assert!(
+        !retry_refinement_streams(&with_validator, &ctx, 200, &no_store_json),
+        "one plugin's release must never stream a body another plugin enforces policy over"
+    );
+}
+
+/// A retry attempt the proxy discards takes no effect, however many times its
+/// transformed headers are classified. Only the selected response applies them,
+/// and it applies them exactly once.
+#[tokio::test]
+async fn a_discarded_transformed_retry_attempt_is_side_effect_free() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin: Arc<ResponseCaching> = Arc::new(default_plugin());
+    cache_response(&plugin, "GET", "/api/resource", 200, &HashMap::new(), b"old").await;
+    assert_eq!(response_caching_cache_keys_for_test(&plugin).len(), 1);
+
+    let mut ctx = refresh_ctx(&plugin, "/api/resource").await;
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        plugin.clone(),
+        later_header_transformer("cache-control", "no-store"),
+    ];
+
+    // The backend says nothing invalidating; the projected final view does.
+    let backend = response_headers_from(&[("content-type", "application/json")]);
+    for _ in 0..3 {
+        assert!(retry_refinement_streams(&plugins, &ctx, 200, &backend));
+    }
+    assert_eq!(
+        response_caching_cache_keys_for_test(&plugin).len(),
+        1,
+        "a discarded attempt must not evict, mark, or otherwise mutate cache state"
+    );
+
+    // The attempt the proxy selects is the only one that takes effects.
+    let mut final_headers = backend.clone();
+    assert!(!run_after_proxy_hooks_for_test(&plugins, &mut ctx, 200, &mut final_headers).await);
+    assert!(
+        response_caching_cache_keys_for_test(&plugin).is_empty(),
+        "the selected final response still evicts what it supersedes"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_final_header_decision"))
+            .map(String::as_str),
+        Some("invalidate-base-key"),
+        "and it staged that outcome once, so the buffered body hook cannot repeat it"
+    );
+}
+
+/// The projection is refused wholesale when the remaining chain contains a
+/// plugin whose header effects the gateway cannot reproduce, so an unknown or
+/// custom plugin keeps the conservative answer.
+#[tokio::test]
+async fn an_unreproducible_later_plugin_keeps_the_conservative_answer() {
+    let plugin: Arc<ResponseCaching> = Arc::new(default_plugin());
+    let mut ctx = make_ctx("GET", "/api/widgets");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let storable = response_headers_from(&[
+        ("content-type", "application/json"),
+        ("cache-control", "public, max-age=60"),
+    ]);
+
+    // A built-in later hook that makes it unstorable releases the body.
+    let reproducible: Vec<Arc<dyn Plugin>> = vec![
+        plugin.clone(),
+        later_header_transformer("cache-control", "no-store"),
+    ];
+    assert!(retry_refinement_streams(&reproducible, &ctx, 200, &storable));
+
+    // The SAME rule behind a plugin whose `after_proxy` the gateway cannot
+    // reproduce does not: the projection is not a proof there, so the
+    // conservative buffered answer stands.
+    let unreproducible: Vec<Arc<dyn Plugin>> = vec![
+        plugin.clone(),
+        Arc::new(OpaqueLaterPlugin),
+        later_header_transformer("cache-control", "no-store"),
+    ];
+    assert!(
+        !retry_refinement_streams(&unreproducible, &ctx, 200, &storable),
+        "an unreproducible later plugin must keep the conservative buffered answer"
+    );
+}
+
+/// A stand-in for an operator's custom plugin: it declares nothing the gateway
+/// can simulate, so nothing about the final header view is provable behind it.
+struct OpaqueLaterPlugin;
+
+#[async_trait::async_trait]
+impl Plugin for OpaqueLaterPlugin {
+    fn name(&self) -> &str {
+        "opaque_later_plugin"
+    }
 }
 
 /// Finding 1: the entry body is charged for its own lifetime, so an entry the

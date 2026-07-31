@@ -7889,6 +7889,38 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when this plugin can release its buffered response given
+    /// the SIMULATED final response headers — every later `after_proxy` header
+    /// hook in the configured chain applied cumulatively, in plugin order.
+    ///
+    /// Deliberately narrower than every other release hook. The simulation is
+    /// only as complete as the later plugins'
+    /// [`Self::simulate_after_proxy_response_headers`] implementations, so it is
+    /// a well-founded projection of the final header set, never a proof of it.
+    /// Implement this ONLY when an over-optimistic answer can cost nothing but a
+    /// missed optimization — never when the released body would otherwise have
+    /// been inspected, validated, or transformed by a policy this plugin
+    /// enforces.
+    ///
+    /// `response_caching` is the built-in implementer: every effect its release
+    /// skips is owned by [`Self::on_final_response_headers`], which runs over the
+    /// TRUE final headers on both the streaming and buffered paths, so a
+    /// mis-simulation can only cost a cache entry — never an eviction, a
+    /// predictor mark, or a stored representation (GHSA-pwcm-6rh8-f2gh).
+    ///
+    /// The proxy consults this only for the retry-time refinement, only once
+    /// every remaining plugin in the chain proved to be a built-in, and only in
+    /// addition to the other release hooks — it can never pin a response onto
+    /// the buffered path that would otherwise have been released.
+    fn should_release_response_body_for_simulated_final_headers(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _final_response_headers: &HashMap<String, String>,
+    ) -> bool {
+        false
+    }
+
     /// Content-type-aware refinement of [`should_buffer_response_body`].
     ///
     /// Evaluated once per response *after* the backend response headers arrive,

@@ -6137,6 +6137,34 @@ pub mod _test_support {
         crate::proxy::plugins_may_release_response_body_under_retries(plugins, ctx)
     }
 
+    /// The retry decision context every retry-enabled dispatch path builds before
+    /// consulting the shared header-time refinement.
+    pub fn retry_response_decision_context_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> crate::plugins::RequestContext {
+        crate::proxy::retry_response_decision_context(ctx)
+    }
+
+    /// The shared header-time buffer -> stream refinement, driven exactly as
+    /// every dispatch path drives it. Returns `true` when the response may
+    /// stream (`GHSA-pwcm-6rh8-f2gh`).
+    pub fn refine_stream_response_for_content_type_for_test(
+        proxy: &crate::config::types::Proxy,
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        crate::proxy::refine_stream_response_for_content_type(
+            false,
+            proxy,
+            plugins,
+            Some(ctx),
+            response_status,
+            response_headers,
+        )
+    }
+
     /// The prospective retained length a collector computes ONCE and reuses for
     /// its ceiling check, its budget charge, and its allocation. Saturating, so
     /// a hostile length cannot wrap past a finite ceiling or panic a debug

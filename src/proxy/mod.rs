@@ -1556,6 +1556,41 @@ fn simulate_later_after_proxy_headers(
     }
 }
 
+/// Project the remaining `after_proxy` chain's deterministic response-header
+/// effects, applied cumulatively in configured plugin order, onto the header set
+/// they would produce.
+///
+/// `None` means the projection cannot be trusted: the remaining chain contains a
+/// plugin whose header effects the gateway cannot reproduce (any non-built-in
+/// plugin, whose `simulate_after_proxy_response_headers` is the inert default
+/// while its real `after_proxy` may rewrite anything). Callers must fall back to
+/// the conservative answer rather than treating the unmodified map as final.
+///
+/// Pure with respect to the real request: the context is cloned, so one-shot
+/// state a simulation consumes — `response_transformer` taking
+/// `ctx.route_override_response_transform`, which is how a chain-level route
+/// response-header rule participates here — is taken from the clone and the live
+/// request keeps it for its real hook. That is what keeps a retry attempt the
+/// proxy later discards free of side effects (GHSA-pwcm-6rh8-f2gh).
+fn simulate_final_after_proxy_response_headers(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    response_headers: &HashMap<String, String>,
+) -> Option<HashMap<String, String>> {
+    if plugins
+        .iter()
+        .any(|plugin| !is_builtin_plugin_name(plugin.name()))
+    {
+        return None;
+    }
+    let mut simulated_ctx = ctx.clone();
+    let mut simulated_headers = response_headers.clone();
+    for plugin in plugins {
+        plugin.simulate_after_proxy_response_headers(&mut simulated_ctx, &mut simulated_headers);
+    }
+    Some(simulated_headers)
+}
+
 /// Refine the pre-flight `stream_response` decision once the backend response
 /// headers — including representation metadata such as `Content-Type` and
 /// `Content-Encoding` — are known.
@@ -1576,11 +1611,30 @@ fn simulate_later_after_proxy_headers(
 /// buffering plugin must explicitly opt an inherently streaming response out
 /// after headers arrive.
 ///
-/// If any plugin can mutate the response `Content-Type` in a later
-/// `after_proxy` hook, the helper keeps the original buffered decision. That
-/// preserves response-body inspection for the final client-visible headers
-/// rather than trusting a backend header value that may be relabeled before
-/// `on_final_response_body` runs.
+/// If a plugin can mutate the response `Content-Type` in a later `after_proxy`
+/// hook, an instance whose body need depends on that label keeps the original
+/// buffered decision. That preserves response-body inspection for the final
+/// client-visible headers rather than trusting a backend header value that may
+/// be relabeled before `on_final_response_body` runs. Both branches apply the
+/// guard PER PLUGIN over the plugins that still run after it, so an instance
+/// that can prove its release independent of the final label
+/// (`should_release_response_body_before_content_type_rewrite`) is not pinned to
+/// the buffered path by an unrelated relabeling plugin elsewhere in the chain.
+///
+/// Both branches also walk the chain in configured order and fold each releasing
+/// plugin's deterministic header effects into a simulated header map, so a later
+/// hook's rules are visible to the decisions that follow. The retry branch
+/// additionally offers each active buffering plugin the PROJECTED final header
+/// view (`should_release_response_body_for_simulated_final_headers`), which is
+/// what lets `response_caching` release a response a later built-in header rule
+/// has already made unstorable — but only while every remaining plugin is a
+/// built-in whose header effects the gateway can reproduce
+/// (GHSA-pwcm-6rh8-f2gh).
+///
+/// Neither branch mutates anything: every simulation runs on a cloned context,
+/// so a retry attempt the proxy later discards takes no cache, index, or
+/// predictor effect. Those belong to the final response-header phase, which runs
+/// once, over the response the proxy actually selected.
 pub(crate) fn refine_stream_response_for_content_type(
     stream_response: bool,
     proxy: &Proxy,
@@ -1608,31 +1662,83 @@ pub(crate) fn refine_stream_response_for_content_type(
         .metadata
         .contains_key(RETRY_RESPONSE_BUFFERING_METADATA_KEY)
     {
-        if plugins
-            .iter()
-            .any(|plugin| plugin.may_modify_response_content_type(ctx, content_type))
-        {
-            return false;
-        }
         let mut saw_retry_release_plugin = false;
-        let all_active_plugins_release = plugins.iter().all(|plugin| {
-            if !plugin.should_buffer_response_body(&simulated_ctx) {
+        let all_active_plugins_release = plugins.iter().enumerate().all(|(index, plugin)| {
+            let can_release = if !plugin.should_buffer_response_body(&simulated_ctx) {
                 true
-            } else if plugin.may_release_response_body_under_retries(&simulated_ctx) {
-                saw_retry_release_plugin = true;
-                plugin.should_release_response_body_under_retries(
-                    &simulated_ctx,
-                    response_status,
-                    response_headers,
-                )
             } else {
-                !plugin.should_buffer_response_body_for_content_type(
-                    &simulated_ctx,
-                    content_type,
-                    response_status,
-                    response_headers,
-                )
+                let later_plugins = &plugins[index + 1..];
+                let simulated_content_type = simulated_response_headers
+                    .get("content-type")
+                    .map(String::as_str);
+                // This plugin's own answer for the representation as it stands at
+                // its position in the chain: every earlier hook's header effects
+                // are already folded into `simulated_response_headers`.
+                let mut released =
+                    if plugin.may_release_response_body_under_retries(&simulated_ctx) {
+                        saw_retry_release_plugin = true;
+                        plugin.should_release_response_body_under_retries(
+                            &simulated_ctx,
+                            response_status,
+                            &simulated_response_headers,
+                        )
+                    } else {
+                        !plugin.should_buffer_response_body_for_content_type(
+                            &simulated_ctx,
+                            simulated_content_type,
+                            response_status,
+                            &simulated_response_headers,
+                        )
+                    };
+                // Otherwise: does the projected FINAL header view already close
+                // this plugin's remaining use for the body? Computed only when it
+                // can change the answer, and refused wholesale when a later
+                // plugin's header effects cannot be reproduced.
+                if !released {
+                    let projected = simulate_final_after_proxy_response_headers(
+                        later_plugins,
+                        &simulated_ctx,
+                        &simulated_response_headers,
+                    );
+                    if let Some(final_response_headers) = projected {
+                        released = plugin.should_release_response_body_for_simulated_final_headers(
+                            &simulated_ctx,
+                            response_status,
+                            &final_response_headers,
+                        );
+                    }
+                }
+                // The content-type relabel guard, applied PER PLUGIN over the
+                // plugins that actually still run rather than as one global early
+                // return. A later relabel invalidates a decision that was taken on
+                // a `Content-Type` the client never sees — but only for a plugin
+                // whose body need depends on that label. An instance that can
+                // prove its release independent of the final label
+                // (`response_caching`: relabelling an unbounded event stream does
+                // not bound it, and the store path it closed never reads
+                // `Content-Type`) keeps releasing, so adding a response
+                // transformer to a proxy no longer silently reinstates full
+                // buffering of a backend-selected event stream under retries
+                // (GHSA-pwcm-6rh8-f2gh).
+                let later_may_rewrite_content_type = later_plugins.iter().any(|later| {
+                    later.may_modify_response_content_type(&simulated_ctx, simulated_content_type)
+                });
+                if released && later_may_rewrite_content_type {
+                    released = plugin.should_release_response_body_before_content_type_rewrite(
+                        &simulated_ctx,
+                        response_status,
+                        &simulated_response_headers,
+                    );
+                }
+                released
+            };
+            if can_release {
+                plugin.simulate_after_proxy_response_headers(
+                    &mut simulated_ctx,
+                    &mut simulated_response_headers,
+                );
             }
+            can_release
         });
         return saw_retry_release_plugin && all_active_plugins_release;
     }
