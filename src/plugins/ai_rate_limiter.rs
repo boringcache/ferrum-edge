@@ -1180,12 +1180,13 @@ fn nested_token_cap_field_for_container(container: &str) -> Option<&'static str>
 /// Bedrock, or Titan request reserves 0 in `completion_tokens` mode, so a burst of
 /// capped completions can oversubscribe the budget until post-response
 /// reconciliation. Mirrors the token-field coverage in `ai_request_guard`.
-/// Field lists are shared with prompt-walk exclusion via
-/// [`TOP_LEVEL_TOKEN_CAP_FIELDS`] / [`NESTED_TOKEN_CAP_FIELDS`].
+/// Field lists and the unsigned acceptance contract are shared with prompt-walk
+/// exclusion via [`TOP_LEVEL_TOKEN_CAP_FIELDS`] / [`NESTED_TOKEN_CAP_FIELDS`] and
+/// [`token_cap_u64`].
 fn requested_completion_tokens(json: &Value) -> u64 {
     let top_level = TOP_LEVEL_TOKEN_CAP_FIELDS
         .iter()
-        .filter_map(|field| json.get(*field).and_then(Value::as_u64))
+        .filter_map(|field| json.get(*field).and_then(token_cap_u64))
         .max()
         .unwrap_or(0);
 
@@ -1194,12 +1195,18 @@ fn requested_completion_tokens(json: &Value) -> u64 {
         .filter_map(|(container, field)| {
             json.get(*container)
                 .and_then(|nested| nested.get(*field))
-                .and_then(Value::as_u64)
+                .and_then(token_cap_u64)
         })
         .max()
         .unwrap_or(0);
 
     top_level.max(nested)
+}
+
+/// Unsigned output-cap values accepted by [`requested_completion_tokens`].
+/// Negative and fractional JSON numbers are not recognized controls.
+fn token_cap_u64(value: &Value) -> Option<u64> {
+    value.as_u64()
 }
 
 /// Strong, LLM-idiomatic top-level fields — each marks an AI request on its own.
@@ -1307,14 +1314,19 @@ fn estimate_prompt_tokens(json: &Value) -> u64 {
 /// depth:
 /// - Numeric output caps are excluded only at the exact paths read by
 ///   [`requested_completion_tokens`] (root-level cap fields and the documented
-///   named provider containers). Nested schema/content numbers with the same
-///   spelling count fail-closed.
+///   named provider containers) and only when the value is an unsigned integer
+///   accepted by that helper (`as_u64`). Nested schema/content numbers with the
+///   same spelling, and negative/fractional numbers at cap paths, count
+///   fail-closed.
 /// - Multimodal binary URL/base64/file payloads are excluded only as **leaves**
-///   inside a recognized message content-block structure (OpenAI
-///   `messages`/`input` content parts, Gemini `contents` parts, Anthropic
-///   content-block `source`). Member names and every unrelated textual sibling
-///   still count. Ordinary strings — including well-formed `data:` URLs in
-///   `instructions`, `input`, schemas, or unknown fields — always count.
+///   inside a recognized provider content-part family **and** part `type` (OpenAI
+///   Chat `messages` + `image_url`/`input_audio`/`file`, Responses `input` +
+///   `input_image`/`input_audio`/`input_file`, Gemini `contents` parts +
+///   `inline_data`/`inlineData`, Anthropic `messages` + `image`/`document`
+///   `source`). Wrong-family / malformed / text parts count fail-closed. Member
+///   names and every unrelated textual sibling still count. Ordinary strings —
+///   including well-formed `data:` URLs in `instructions`, `input`, schemas, or
+///   unknown fields — always count.
 /// - Unknown, malformed, or collision-shaped objects outside those contexts
 ///   count fail-closed.
 ///
@@ -1347,6 +1359,21 @@ impl PromptWalkCtx {
     }
 }
 
+/// Provider / content-container family carried through
+/// ProviderMessages → MessageObject → ContentArray → ContentPart.
+/// Disambiguates which reserved binary keys may exclude leaves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContentFamily {
+    /// Root `messages` — OpenAI Chat or Anthropic (part `type` selects).
+    Messages,
+    /// Root `input` — OpenAI Responses API.
+    ResponsesInput,
+    /// Root `contents` — Gemini / Vertex `parts`.
+    GeminiContents,
+    /// Root `chat_history` — Cohere; no multimodal leaf exclusions.
+    ChatHistory,
+}
+
 /// Structural location for path-exact token-cap exclusion and multimodal
 /// leaf exclusion. Never stores paths or strings.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1360,13 +1387,13 @@ enum PromptLocation {
     /// excluded here.
     RootCapContainer { field: &'static str },
     /// Root-level `messages` / `contents` / `input` / `chat_history` value.
-    ProviderMessages,
+    ProviderMessages { family: ContentFamily },
     /// One element of a provider messages array (a message / content object).
-    MessageObject,
+    MessageObject { family: ContentFamily },
     /// A `content` / `parts` array under a message object.
-    ContentArray,
+    ContentArray { family: ContentFamily },
     /// One multimodal/text content-part object.
-    ContentPart,
+    ContentPart { family: ContentFamily },
     /// Recognized binary payload object under a content part.
     BinaryObject { kind: BinaryObjectKind },
     /// Everywhere else — count fail-closed; no binary/cap exclusions.
@@ -1391,10 +1418,10 @@ const BINARY_SOURCE_TYPES: &[&str] = &["base64", "url", "file"];
 const MIN_BASE64_PAYLOAD_LEN: usize = 48;
 
 /// Whether this object member is an output-cap control at a path also read by
-/// [`requested_completion_tokens`]. Shared so reservation exclusion and
-/// completion-budget estimation cannot silently drift.
+/// [`requested_completion_tokens`]. Uses the same unsigned (`as_u64`) acceptance
+/// contract so negative/fractional numbers count fail-closed.
 fn is_excluded_token_cap_member(ctx: PromptWalkCtx, key: &str, value: &Value) -> bool {
-    if !matches!(value, Value::Number(_)) {
+    if token_cap_u64(value).is_none() {
         return false;
     }
     match ctx.location {
@@ -1465,68 +1492,119 @@ fn json_number_literal_character_count(n: &serde_json::Number) -> u64 {
 }
 
 /// Child context when entering `key`'s value from `ctx`.
-fn child_context_for_member(ctx: PromptWalkCtx, key: &str, value: &Value) -> PromptWalkCtx {
+fn child_context_for_member(ctx: PromptWalkCtx, key: &str) -> PromptWalkCtx {
     match ctx.location {
         PromptLocation::RootObject => {
             if let Some(field) = nested_token_cap_field_for_container(key) {
                 return PromptWalkCtx::at(PromptLocation::RootCapContainer { field });
             }
-            match key {
-                "messages" | "contents" | "input" | "chat_history" => {
-                    PromptWalkCtx::at(PromptLocation::ProviderMessages)
+            let family = match key {
+                "messages" => Some(ContentFamily::Messages),
+                "contents" => Some(ContentFamily::GeminiContents),
+                "input" => Some(ContentFamily::ResponsesInput),
+                "chat_history" => Some(ContentFamily::ChatHistory),
+                _ => None,
+            };
+            match family {
+                Some(family) => {
+                    PromptWalkCtx::at(PromptLocation::ProviderMessages { family })
                 }
-                _ => PromptWalkCtx::at(PromptLocation::Nested),
+                None => PromptWalkCtx::at(PromptLocation::Nested),
             }
         }
-        PromptLocation::MessageObject => match key {
-            "content" | "parts" => PromptWalkCtx::at(PromptLocation::ContentArray),
+        PromptLocation::MessageObject { family } => match key {
+            "content" | "parts" => {
+                PromptWalkCtx::at(PromptLocation::ContentArray { family })
+            }
             _ => PromptWalkCtx::at(PromptLocation::Nested),
         },
-        PromptLocation::ContentPart => content_part_binary_child_ctx(key, value),
+        // Content-part binary children are handled by [`count_content_part_object`].
         _ => PromptWalkCtx::at(PromptLocation::Nested),
     }
 }
 
-fn content_part_binary_kind(key: &str, value: &Value) -> Option<BinaryObjectKind> {
-    match key {
-        "image_url" if value.is_object() => Some(BinaryObjectKind::ImageUrl),
-        "input_audio" if value.is_object() => Some(BinaryObjectKind::InputAudio),
-        "inline_data" | "inlineData" if value.is_object() => Some(BinaryObjectKind::InlineData),
-        "file" if value.is_object() => Some(BinaryObjectKind::File),
-        "source" if value.is_object() => Some(BinaryObjectKind::AnthropicSource),
-        _ => None,
+/// Recognized binary payload object under a content part for this family+type.
+/// Unknown / malformed / wrong-family parts return `None` (count fail-closed).
+fn content_part_binary_kind(
+    family: ContentFamily,
+    part_type: Option<&str>,
+    key: &str,
+    value: &Value,
+) -> Option<BinaryObjectKind> {
+    if !value.is_object() {
+        return None;
+    }
+    match family {
+        ContentFamily::Messages => match (part_type, key) {
+            (Some("image_url"), "image_url") => Some(BinaryObjectKind::ImageUrl),
+            (Some("input_audio"), "input_audio") => Some(BinaryObjectKind::InputAudio),
+            (Some("file"), "file") => Some(BinaryObjectKind::File),
+            (Some("image") | Some("document"), "source") => {
+                Some(BinaryObjectKind::AnthropicSource)
+            }
+            _ => None,
+        },
+        ContentFamily::ResponsesInput => match (part_type, key) {
+            (Some("input_image"), "image_url") => Some(BinaryObjectKind::ImageUrl),
+            (Some("input_audio"), "input_audio") => Some(BinaryObjectKind::InputAudio),
+            (Some("input_file"), "file") => Some(BinaryObjectKind::File),
+            _ => None,
+        },
+        ContentFamily::GeminiContents => match key {
+            // Gemini parts omit a discriminator `type`; inline data is the
+            // provider-native binary shape on `contents[].parts[]` only.
+            "inline_data" | "inlineData" => Some(BinaryObjectKind::InlineData),
+            _ => None,
+        },
+        ContentFamily::ChatHistory => None,
     }
 }
 
-fn content_part_binary_child_ctx(key: &str, value: &Value) -> PromptWalkCtx {
-    match content_part_binary_kind(key, value) {
-        Some(kind) => PromptWalkCtx::at(PromptLocation::BinaryObject { kind }),
-        None => PromptWalkCtx::at(PromptLocation::Nested),
+/// Whether a direct string member on a content part is a recognized binary leaf.
+fn content_part_string_leaf_excluded(
+    family: ContentFamily,
+    part_type: Option<&str>,
+    key: &str,
+    value: &str,
+) -> bool {
+    if !is_binary_payload_string(value) {
+        return false;
+    }
+    match family {
+        ContentFamily::Messages => matches!(
+            (part_type, key),
+            (Some("image_url"), "image_url") | (Some("file"), "file_data")
+        ),
+        ContentFamily::ResponsesInput => matches!(
+            (part_type, key),
+            (Some("input_image"), "image_url") | (Some("input_file"), "file_data")
+        ),
+        ContentFamily::GeminiContents | ContentFamily::ChatHistory => false,
     }
 }
 
 /// Array-element context when walking an array at `ctx`.
 fn child_context_for_array_element(ctx: PromptWalkCtx) -> PromptWalkCtx {
     match ctx.location {
-        PromptLocation::ProviderMessages => PromptWalkCtx::at(PromptLocation::MessageObject),
-        PromptLocation::ContentArray => PromptWalkCtx::at(PromptLocation::ContentPart),
+        PromptLocation::ProviderMessages { family } => {
+            PromptWalkCtx::at(PromptLocation::MessageObject { family })
+        }
+        PromptLocation::ContentArray { family } => {
+            PromptWalkCtx::at(PromptLocation::ContentPart { family })
+        }
         _ => PromptWalkCtx::at(PromptLocation::Nested),
     }
 }
 
-/// Exclude a recognized binary leaf string under a content-part key or inside a
-/// binary payload object. Member names are counted by the caller.
+/// Exclude a recognized binary leaf string inside a binary payload object.
+/// Member names are counted by the caller. Content-part string leaves are
+/// handled by [`count_content_part_object`].
 fn should_exclude_binary_leaf(ctx: PromptWalkCtx, key: &str, value: &Value) -> bool {
     let Some(s) = value.as_str() else {
         return false;
     };
 
     match ctx.location {
-        PromptLocation::ContentPart => match key {
-            // OpenAI / Responses image URL or file_data as a direct string on the part.
-            "image_url" | "file_data" => is_binary_payload_string(s),
-            _ => false,
-        },
         PromptLocation::BinaryObject { kind } => match kind {
             BinaryObjectKind::ImageUrl => {
                 key == "url" && (is_data_url(s) || is_remote_fetch_url(s))
@@ -1592,6 +1670,37 @@ fn count_binary_object_members(
     })
 }
 
+/// Count a provider content-part object: inspect part `type` (when the family
+/// defines one) and exclude only matching binary leaves; wrong-family /
+/// malformed reserved spellings count fail-closed.
+fn count_content_part_object(
+    family: ContentFamily,
+    part: &serde_json::Map<String, Value>,
+) -> u64 {
+    let part_type = part.get("type").and_then(Value::as_str);
+
+    part.iter().fold(0_u64, |acc, (key, value)| {
+        if let Some(s) = value.as_str() {
+            if content_part_string_leaf_excluded(family, part_type, key, s) {
+                return acc.saturating_add(member_name_character_count(key));
+            }
+        }
+
+        if let (Some(kind), Some(obj)) = (
+            content_part_binary_kind(family, part_type, key, value),
+            value.as_object(),
+        ) {
+            return count_binary_object_members(
+                acc.saturating_add(member_name_character_count(key)),
+                kind,
+                obj,
+            );
+        }
+
+        count_member_and_value(acc, key, value, PromptWalkCtx::at(PromptLocation::Nested))
+    })
+}
+
 /// Fail-closed prompt character walk with path/context-aware exclusions.
 fn prompt_json_character_count(value: &Value, ctx: PromptWalkCtx) -> u64 {
     match value {
@@ -1612,41 +1721,24 @@ fn prompt_json_character_count(value: &Value, ctx: PromptWalkCtx) -> u64 {
                 acc.saturating_add(prompt_json_character_count(value, elem_ctx))
             })
         }
-        Value::Object(values) => {
-            let member_ctx = match ctx.location {
-                PromptLocation::Root => PromptWalkCtx::at(PromptLocation::RootObject),
-                other => PromptWalkCtx::at(other),
-            };
-            values.iter().fold(0_u64, |acc, (key, value)| {
-                // Exact-path numeric caps (parity with requested_completion_tokens).
-                if is_excluded_token_cap_member(member_ctx, key, value) {
-                    return acc;
-                }
-
-                // Content-part string image_url / file_data leaf.
-                if member_ctx.location == PromptLocation::ContentPart
-                    && should_exclude_binary_leaf(member_ctx, key, value)
-                {
-                    return acc.saturating_add(member_name_character_count(key));
-                }
-
-                // Recognized multimodal payload objects: leaf-only exclusion.
-                if member_ctx.location == PromptLocation::ContentPart {
-                    if let (Some(kind), Some(obj)) =
-                        (content_part_binary_kind(key, value), value.as_object())
-                    {
-                        return count_binary_object_members(
-                            acc.saturating_add(member_name_character_count(key)),
-                            kind,
-                            obj,
-                        );
+        Value::Object(values) => match ctx.location {
+            PromptLocation::ContentPart { family } => count_content_part_object(family, values),
+            _ => {
+                let member_ctx = match ctx.location {
+                    PromptLocation::Root => PromptWalkCtx::at(PromptLocation::RootObject),
+                    other => PromptWalkCtx::at(other),
+                };
+                values.iter().fold(0_u64, |acc, (key, value)| {
+                    // Exact-path unsigned caps (parity with requested_completion_tokens).
+                    if is_excluded_token_cap_member(member_ctx, key, value) {
+                        return acc;
                     }
-                }
 
-                let child_ctx = child_context_for_member(member_ctx, key, value);
-                count_member_and_value(acc, key, value, child_ctx)
-            })
-        }
+                    let child_ctx = child_context_for_member(member_ctx, key);
+                    count_member_and_value(acc, key, value, child_ctx)
+                })
+            }
+        },
     }
 }
 

@@ -3702,27 +3702,21 @@ async fn prompt_estimate_counts_data_url_instructions_literal() {
 
 #[tokio::test]
 async fn prompt_estimate_counts_nested_numeric_caps_outside_exact_paths() {
-    // Numeric `max_tokens` / `maxOutputTokens` at unrelated nested schema paths
-    // are billed; recognized top-level / provider-container caps stay excluded.
-    // Path-independent TOKEN_CAP_KEYS (09514f4) yielded delta 0 for nested numbers.
+    // Direct numeric members with reserved spellings at an unrelated nested path
+    // are billed; recognized root / provider-container caps stay symmetrically
+    // present and excluded. Path-independent TOKEN_CAP_KEYS (09514f4) skipped
+    // any-depth Numbers under those names → delta 0. Changing a nested object
+    // property's `default` does not exercise the collision (09514f4 already
+    // counted object-shaped values under those keys).
     let empty_nested = prompt_tokens_reserved(json!({
         "model": "gpt-4o",
         "messages": [{"role": "user", "content": "abcd"}],
         "max_tokens": 999999,
         "generationConfig": {"maxOutputTokens": 999999},
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "f",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "max_tokens": {"type": "integer", "default": 0},
-                        "maxOutputTokens": {"type": "integer", "default": 0}
-                    }
-                }
-            }
-        }]
+        "metadata": {
+            "max_tokens": 0,
+            "maxOutputTokens": 0
+        }
     }))
     .await;
     let nested_caps = prompt_tokens_reserved(json!({
@@ -3730,28 +3724,19 @@ async fn prompt_estimate_counts_nested_numeric_caps_outside_exact_paths() {
         "messages": [{"role": "user", "content": "abcd"}],
         "max_tokens": 999999,
         "generationConfig": {"maxOutputTokens": 999999},
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "f",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "max_tokens": {"type": "integer", "default": 10000},
-                        "maxOutputTokens": {"type": "integer", "default": 10000}
-                    }
-                }
-            }
-        }]
+        "metadata": {
+            "max_tokens": 10000,
+            "maxOutputTokens": 10000
+        }
     }))
     .await;
 
-    // Two defaults: `0` (1 digit) → `10000` (5 digits) = +4 chars each → +8 chars
-    // → ceil(8/4)=2 tokens. Path-independent numeric skips yield delta 0.
+    // Two nested numbers: `0` (1 digit) → `10000` (5 digits) = +4 chars each →
+    // +8 chars → ceil(8/4)=2 tokens. Any-depth numeric skips yield delta 0.
     assert_eq!(
         nested_caps - empty_nested,
         2,
-        "nested schema numeric max_tokens/maxOutputTokens must contribute; \
+        "nested metadata numeric max_tokens/maxOutputTokens must contribute; \
          exact-path caps remain excluded"
     );
 }
@@ -3792,51 +3777,35 @@ async fn prompt_estimate_counts_collision_shaped_source_outside_content_block() 
 
 #[tokio::test]
 async fn prompt_estimate_counts_collision_shaped_binary_keys_outside_content_parts() {
-    // Reserved multimodal spellings outside recognized content parts — including
-    // a long alphanumeric string — must count. Real OpenAI/Gemini payloads stay
-    // bounded while textual siblings count.
+    // Long alphanumeric / prose values placed *directly* under reserved
+    // multimodal spellings outside content parts must count. Old any-depth
+    // BINARY_CONTENT_KEYS + base64 heuristic (09514f4) skipped those members
+    // entirely → delta 0. Nested schema `default` changes do not exercise the
+    // collision (09514f4 already counted object-shaped schema properties).
     let long_alnum = "A".repeat(64); // above MIN_BASE64_PAYLOAD_LEN, alphabet-only
     let empty = prompt_tokens_reserved(json!({
         "model": "gpt-4o",
         "messages": [{"role": "user", "content": "abcd"}],
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "f",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "image_url": {"type": "string", "default": ""},
-                        "inline_data": {"type": "string", "default": ""}
-                    }
-                }
-            }
-        }]
+        "metadata": {
+            "image_url": "",
+            "inline_data": ""
+        }
     }))
     .await;
     let with = prompt_tokens_reserved(json!({
         "model": "gpt-4o",
         "messages": [{"role": "user", "content": "abcd"}],
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "f",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "image_url": {"type": "string", "default": long_alnum.clone()},
-                        "inline_data": {"type": "string", "default": PROMPT_DELTA_32.to_string()}
-                    }
-                }
-            }
-        }]
+        "metadata": {
+            "image_url": long_alnum.clone(),
+            "inline_data": PROMPT_DELTA_32
+        }
     }))
     .await;
 
     assert_eq!(
         with - empty,
         (64u64 + 32).div_ceil(4),
-        "collision-shaped image_url/inline_data defaults outside content parts must count"
+        "collision-shaped image_url/inline_data strings outside content parts must count"
     );
 
     // Real Gemini inline_data leaf stays excluded; unexpected sibling counts.
@@ -3869,6 +3838,276 @@ async fn prompt_estimate_counts_collision_shaped_binary_keys_outside_content_par
         gemini_sibling - gemini_empty,
         8,
         "textual sibling under real Gemini inline_data must reserve ceil(32/4)=8"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_wrong_family_content_part_binary_collisions() {
+    // Provider-agnostic ContentPart exclusion (179d) skipped reserved binary
+    // keys without checking part `type` / family. Wrong-family collisions must
+    // count fail-closed; legitimate shapes stay leaf-only excluded.
+    let long_alnum = "A".repeat(64);
+    let huge = "B".repeat(100_000);
+
+    // OpenAI/Anthropic text part + image_url long alnum / URL must count.
+    let text_img_empty = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd", "image_url": ""}
+        ]}]
+    }))
+    .await;
+    let text_img = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd", "image_url": long_alnum.clone()}
+        ]}]
+    }))
+    .await;
+    assert_eq!(
+        text_img - text_img_empty,
+        16,
+        "text part image_url alphanumeric collision must reserve ceil(64/4)=16"
+    );
+
+    let text_url_empty = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd", "image_url": "https://example.com/"}
+        ]}]
+    }))
+    .await;
+    let text_url = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd",
+             "image_url": format!("https://example.com/{PROMPT_DELTA_32}")}
+        ]}]
+    }))
+    .await;
+    assert_eq!(
+        text_url - text_url_empty,
+        8,
+        "text part image_url URL collision must reserve ceil(32/4)=8"
+    );
+
+    // Text part with Anthropic-shaped binary source must count the data leaf.
+    let text_src_empty = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "text",
+            "text": "abcd",
+            "source": {"type": "base64", "media_type": "image/png", "data": ""}
+        }]}]
+    }))
+    .await;
+    let text_src = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "text",
+            "text": "abcd",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": PROMPT_DELTA_32
+            }
+        }]}]
+    }))
+    .await;
+    assert_eq!(
+        text_src - text_src_empty,
+        8,
+        "text part source.data must count; only image/document blocks exclude"
+    );
+
+    // inline_data on an OpenAI message part (wrong family) must count.
+    let oa_inline_empty = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [{
+            "type": "text",
+            "text": "abcd",
+            "inline_data": {"mime_type": "image/png", "data": ""}
+        }]}]
+    }))
+    .await;
+    let oa_inline = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [{
+            "type": "text",
+            "text": "abcd",
+            "inline_data": {"mime_type": "image/png", "data": PROMPT_DELTA_32}
+        }]}]
+    }))
+    .await;
+    assert_eq!(
+        oa_inline - oa_inline_empty,
+        8,
+        "OpenAI message-part inline_data must count (Gemini contents.parts only)"
+    );
+
+    // Legitimate OpenAI Chat image_url part stays bounded; sibling counts.
+    let real_img_empty = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd"},
+            {"type": "image_url", "image_url": {
+                "url": format!("data:image/png;base64,{huge}"),
+                "caption": ""
+            }}
+        ]}]
+    }))
+    .await;
+    let real_img = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd"},
+            {"type": "image_url", "image_url": {
+                "url": format!("data:image/png;base64,{huge}"),
+                "caption": PROMPT_DELTA_32
+            }}
+        ]}]
+    }))
+    .await;
+    assert!(
+        real_img_empty < 120,
+        "real OpenAI image_url payload must stay excluded; got {real_img_empty}"
+    );
+    assert_eq!(real_img - real_img_empty, 8);
+
+    // Legitimate Responses input_image stays bounded.
+    let resp_empty = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "abcd"},
+                {"type": "input_image", "image_url": format!("data:image/png;base64,{huge}"),
+                 "detail": ""}
+            ]
+        }]
+    }))
+    .await;
+    let resp = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "abcd"},
+                {"type": "input_image", "image_url": format!("data:image/png;base64,{huge}"),
+                 "detail": PROMPT_DELTA_32}
+            ]
+        }]
+    }))
+    .await;
+    assert!(
+        resp_empty < 120,
+        "real Responses input_image payload must stay excluded; got {resp_empty}"
+    );
+    assert_eq!(resp - resp_empty, 8);
+
+    // Legitimate Anthropic image source stays bounded; sibling counts.
+    let anth_empty = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": huge.clone(),
+                "note": ""
+            }
+        }]}]
+    }))
+    .await;
+    let anth = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": huge,
+                "note": PROMPT_DELTA_32
+            }
+        }]}]
+    }))
+    .await;
+    assert!(
+        anth_empty < 120,
+        "real Anthropic image source payload must stay excluded; got {anth_empty}"
+    );
+    assert_eq!(anth - anth_empty, 8);
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_non_u64_token_caps_at_exact_paths() {
+    // Exclusion shares requested_completion_tokens' as_u64 contract: negative and
+    // fractional numbers at exact cap paths are not recognized controls and must
+    // count fail-closed (name + literal). Unsigned caps remain excluded.
+    let short = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": -1,
+        "max_completion_tokens": -1
+    }))
+    .await;
+    let long = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": -10001,
+        "max_completion_tokens": -10001
+    }))
+    .await;
+    // Two literals: "-1" (2) → "-10001" (6) = +4 chars each → +8 → 2 tokens.
+    // Any-Number exclusion (179d) yielded delta 0.
+    assert_eq!(
+        long - short,
+        2,
+        "negative exact-path caps must count at literal width"
+    );
+
+    let frac_short = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "generationConfig": {"maxOutputTokens": -1.5},
+        "parameters": {"max_new_tokens": -1.5}
+    }))
+    .await;
+    let frac_long = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "generationConfig": {"maxOutputTokens": -10001.5},
+        "parameters": {"max_new_tokens": -10001.5}
+    }))
+    .await;
+    // "-1.5" (4) → "-10001.5" (8) = +4 chars each → +8 → 2 tokens.
+    assert_eq!(
+        frac_long - frac_short,
+        2,
+        "fractional exact-path caps must count at literal width"
+    );
+
+    // Unsigned controls at the same paths stay fully excluded (name + value).
+    let base = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "generationConfig": {"temperature": 0},
+        "parameters": {"temperature": 0}
+    }))
+    .await;
+    let with_u64 = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": 999999,
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 999999},
+        "parameters": {"temperature": 0, "max_new_tokens": 999999}
+    }))
+    .await;
+    assert_eq!(
+        with_u64, base,
+        "unsigned exact-path caps must remain excluded from the prompt estimate"
     );
 }
 
