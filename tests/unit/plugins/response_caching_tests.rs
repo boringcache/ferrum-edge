@@ -554,6 +554,30 @@ async fn base_cache_key_for_raw_query(plugin: &ResponseCaching, raw_query: &str)
 }
 
 #[tokio::test]
+async fn base_cache_key_partitions_unannounced_origin_visible_headers() {
+    let plugin = default_plugin();
+    let mut alpha = make_ctx("GET", "/tenant-data");
+    let alpha_headers = HashMap::from([("x-tenant-id".to_string(), "alpha".to_string())]);
+    assert!(matches!(
+        plugin.before_proxy(&mut alpha, &alpha_headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut beta = make_ctx("GET", "/tenant-data");
+    let beta_headers = HashMap::from([("x-tenant-id".to_string(), "beta".to_string())]);
+    assert!(matches!(
+        plugin.before_proxy(&mut beta, &beta_headers).await,
+        PluginResult::Continue
+    ));
+
+    assert_ne!(
+        alpha.metadata.get(&staging_key(&plugin, "cache_base_key")),
+        beta.metadata.get(&staging_key(&plugin, "cache_base_key")),
+        "an origin-visible header must partition the cache even without Vary"
+    );
+}
+
+#[tokio::test]
 async fn test_raw_query_cache_key_preserves_exact_semantics() {
     let plugin = default_plugin();
 

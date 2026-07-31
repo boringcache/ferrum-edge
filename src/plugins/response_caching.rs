@@ -1455,28 +1455,19 @@ impl ResponseCaching {
     ///   rewritten path. `response_caching` runs at
     ///   [`super::priority::RESPONSE_CACHING`], after every route-dispatch
     ///   plugin, so this is the destination that will actually serve a miss;
-    /// * **request target** — original authority, `Host`, method, path, and the
+    /// * **request context** — original authority, `Host`, method, path, the
     ///   *effective outbound* query, so a `request_transformer` query rewrite
     ///   that ran before this plugin is part of the partition. The request
-    ///   header dimension is deliberately **not** the raw header view: it is the
-    ///   complete `Vary` tuple appended by [`Self::extend_base_key_with_vary`]
-    ///   (backend-nominated dimensions, `vary_by_headers`, and the mandatory
-    ///   credential/session auto-Vary), plus the caller partition below.
+    ///   header dimension binds every backend-visible header except cache
+    ///   operation headers that address/control the selected entry. This
+    ///   prevents replay across unannounced tenant or policy headers even when
+    ///   an origin omits `Vary`. The complete `Vary` tuple is additionally
+    ///   appended by [`Self::extend_base_key_with_vary`].
     ///
-    ///   Binding the whole live header map here instead would be
-    ///   self-defeating rather than stricter. A shared cache selects a stored
-    ///   representation by target + `Vary` (RFC 9111 §4.1), and three of this
-    ///   plugin's own contracts are addressed *to the entry* rather than
-    ///   selecting it: an `If-None-Match` / `If-Modified-Since` revalidation
-    ///   (RFC 9110 §13), a client `Cache-Control: no-cache` refresh whose
-    ///   zero-freshness response must invalidate the entry (RFC 9111 §5.2),
-    ///   and `Content-Length: 0` framing. Each of those requests carries a
-    ///   header the stored request did not, so a raw-header partition would put
-    ///   it in a different partition from the entry it names — and the `Vary`
-    ///   index, variant union, and predictor would become unreachable because
-    ///   no two requests could ever share a base key. Origin-visible headers
-    ///   the backend does not nominate are covered by `vary_by_headers`, and
-    ///   cross-caller isolation by the mandatory caller partition;
+    ///   Conditional, request cache-control, range, and zero-length framing
+    ///   headers are excluded because they operate on an entry rather than
+    ///   select the origin representation. This keeps revalidation,
+    ///   invalidation, and range lookup able to reach the stored entry;
     /// * **complete `Vary` tuple** — appended to this base key by
     ///   [`Self::extend_base_key_with_vary`];
     /// * **caller authorization context** — see
@@ -1522,7 +1513,11 @@ impl ResponseCaching {
         // the digest so flipping it still produces a disjoint keyspace rather
         // than silently reusing entries minted under the other setting.
         hasher.bool_value("include_consumer", self.config.cache_key_include_consumer);
-        replay_partition::append_request_target_partition(&mut hasher, ctx, request_headers);
+        replay_partition::append_response_cache_request_partition(
+            &mut hasher,
+            ctx,
+            request_headers,
+        );
         replay_partition::append_caller_partition(
             &mut hasher,
             ctx,

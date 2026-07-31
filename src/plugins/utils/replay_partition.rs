@@ -34,9 +34,9 @@
 //!   plugins whose own key does not already bind an equivalent dimension
 //!   ([`append_request_context_partition`]). Only hop-by-hop/framing fields
 //!   Ferrum provably regenerates are excluded; tracing and correlation headers
-//!   reach the origin and are bound. A shared HTTP cache uses the narrower
-//!   target-only form instead, because its request-header dimension is the
-//!   complete `Vary` tuple (RFC 9111 §4.1).
+//!   reach the origin and are bound. The shared HTTP cache excludes only entry
+//!   operation headers while conservatively binding every representation and
+//!   policy dimension, including headers absent from `Vary`.
 //!
 //! Every component is serialized with typed, length-framed fields
 //! ([`PartitionHasher`]) so no attacker-controlled byte can impersonate a field
@@ -705,12 +705,50 @@ pub fn append_request_context_partition(
     ctx: &RequestContext,
     request_headers: &HashMap<String, String>,
 ) {
+    append_filtered_request_context_partition(hasher, ctx, request_headers, |_| false);
+}
+
+/// Append the request context used by `response_caching`.
+///
+/// Unlike an RFC cache's optional `Vary` optimization, this fail-closed
+/// partition binds every origin-visible header that could select tenant or
+/// policy state. Cache operation headers are excluded because they address or
+/// control an already selected entry rather than select its representation.
+pub fn append_response_cache_request_partition(
+    hasher: &mut PartitionHasher,
+    ctx: &RequestContext,
+    request_headers: &HashMap<String, String>,
+) {
+    const CACHE_OPERATION_HEADERS: &[&str] = &[
+        "cache-control",
+        "pragma",
+        "if-match",
+        "if-modified-since",
+        "if-none-match",
+        "if-range",
+        "if-unmodified-since",
+        "range",
+        "content-length",
+    ];
+    append_filtered_request_context_partition(hasher, ctx, request_headers, |name| {
+        CACHE_OPERATION_HEADERS
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    });
+}
+
+fn append_filtered_request_context_partition(
+    hasher: &mut PartitionHasher,
+    ctx: &RequestContext,
+    request_headers: &HashMap<String, String>,
+    excluded: impl Fn(&str) -> bool,
+) {
     append_request_target_partition(hasher, ctx, request_headers);
 
     let mut names: Vec<&str> = request_headers
         .keys()
         .map(String::as_str)
-        .filter(|name| !is_non_backend_visible_request_header(name))
+        .filter(|name| !is_non_backend_visible_request_header(name) && !excluded(name))
         .collect();
     names.sort_unstable();
     hasher.count("req.headers", names.len());

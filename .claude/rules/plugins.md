@@ -64,8 +64,9 @@ paths:
   rejects later header/query mutation, and rejects deferred body transforms that
   could synthesize bytes after lookup. Configured request decompression remains
   compatible because its exact final body is published during pre-`before_proxy`
-  normalization. Its request-header dimension is the complete `Vary` tuple, not
-  the raw header view: RFC 9111 §4.1 selection is target + `Vary`, and a
+  normalization. Its request-header dimension conservatively binds all
+  backend-visible headers, in addition to the complete `Vary` tuple, except
+  cache operation headers that address/control the selected entry. A
   conditional revalidation, a client `no-cache` refresh, and `Content-Length: 0`
   are addressed to an entry rather than selecting a different one — keying the
   raw view would put each of them in a partition the entry cannot be reached
