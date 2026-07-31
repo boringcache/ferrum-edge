@@ -126,8 +126,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The boundary now covers the rest of the provider-visible request as well,
   through one private typed claim on the request context (never metadata, never
   logged, holding the opaque owning-instance identity plus the exact committed
-  destination, resolved backend TLS, DNS decision, and backend-visible query):
+  model, destination, resolved backend TLS, DNS decision, and backend-visible
+  query):
 
+  - **Model.** The model that selected the provider is authorization state, not
+    observability: it is committed to the private claim, and final body
+    enforcement plus the claim-owned response normalizers read it from there.
+    `ai_stream_router.model` remains published for logs and other plugins, but
+    is never read back — otherwise a later in-process plugin could change the
+    final body's `model` *and* republish that key as the same value, satisfying
+    an equality check while bypassing the selection that chose the provider, the
+    price, and (for `{model}` endpoints) the backend URL. Whether the owning
+    instance's own transform produced the Anthropic representation, and whether
+    the claim forbids tool use for this generation (the response normalizer's
+    fail-closed `tool_use` guard), are claim state for the same reason. The one
+    metadata value a claim-owned hook still reads is
+    `ai_stream_router.provider_content_encoding`, which comes from the
+    provider's own response headers and only selects a bounded decoder.
   - **Query.** `request_transformer` can also add / update / rename / remove
     query pairs after the claim, appending a normal-backend static secret to the
     third-party provider target. The claim now freezes the exact safe

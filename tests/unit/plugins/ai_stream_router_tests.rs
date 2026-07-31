@@ -5334,3 +5334,421 @@ fn shared_lifecycle_captures_the_backend_query_through_one_funnel() {
         "the native HTTP/3 ladder must capture its backend query through the shared funnel"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The committed model is private claim state, not metadata
+// (GHSA-xhp5-hqj8-3mwg)
+//
+// `ai_stream_router.model` is published for observability and a later in-process
+// plugin can write it. Enforcement and claim-owned response normalization must
+// therefore read the model the CLAIM committed, never that key — otherwise a
+// plugin that rewrote both the final body's model and the metadata key to the
+// same new value would satisfy an equality check while bypassing the selection
+// that chose the provider, the price, and (for `{model}` endpoints) the backend
+// URL.
+// ---------------------------------------------------------------------------
+
+const MODEL_META_KEY: &str = "ai_stream_router.model";
+
+/// Claim through the composed chain, let a later in-process plugin overwrite the
+/// PUBLIC model metadata key, then run the shared buffered request-body stage
+/// (every transform, then every final hook) exactly as the proxy does.
+async fn forged_meta_body_stage(
+    plugins: &[Arc<dyn Plugin>],
+    model: &str,
+    forged: &str,
+) -> (Vec<u8>, PluginResult) {
+    let body = streaming_request(model);
+    let raw = serde_json::to_vec(&body).unwrap();
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        run_before_proxy_chain(plugins, &mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get(MODEL_META_KEY).map(String::as_str),
+        Some(model),
+        "fixture must start from the real committed model"
+    );
+    // A later plugin rewriting public metadata — exactly what the key being
+    // observability rather than policy state has to tolerate.
+    ctx.metadata.insert(MODEL_META_KEY.to_string(), forged.to_string());
+    final_header_policy(plugins, &ctx, &mut headers);
+    ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
+        plugins, &mut ctx, &headers, &raw,
+    )
+    .await
+}
+
+/// Same shape, but the later plugin DELETES the observability key instead.
+async fn dropped_meta_body_stage(
+    plugins: &[Arc<dyn Plugin>],
+    model: &str,
+) -> (Vec<u8>, PluginResult) {
+    let body = streaming_request(model);
+    let raw = serde_json::to_vec(&body).unwrap();
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        run_before_proxy_chain(plugins, &mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    ctx.metadata.remove(MODEL_META_KEY);
+    final_header_policy(plugins, &ctx, &mut headers);
+    ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
+        plugins, &mut ctx, &headers, &raw,
+    )
+    .await
+}
+
+fn safe_body_rule() -> Value {
+    json!([
+        {"operation": "add", "target": "body", "key": "user", "value": "tenant-a"}
+    ])
+}
+
+fn model_overwrite_rule(value: &str) -> Value {
+    json!([
+        {"operation": "update", "target": "body", "key": "model", "value": value}
+    ])
+}
+
+#[tokio::test]
+async fn final_body_ignores_a_metadata_only_model_rewrite() {
+    // Only the observability key moves; the backend-visible body still carries
+    // the committed model. Enforcement must not notice, because it never reads
+    // that key.
+    let plugins = router_then_transformer(safe_body_rule());
+    let (body, result) = forged_meta_body_stage(&plugins, "gpt-4o", "gpt-4o-x").await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a metadata-only rewrite must not change enforcement"
+    );
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["model"], json!("gpt-4o"));
+    assert_eq!(parsed["user"], json!("tenant-a"));
+}
+
+#[tokio::test]
+async fn final_body_rejects_a_model_swap_that_also_rewrites_the_metadata_key() {
+    // The advisory boundary: a later plugin changes the provider-visible model
+    // AND republishes `ai_stream_router.model` as the same new value. The two
+    // agree, both match `gpt-*`, and the request must still fail closed because
+    // neither is what selected the provider.
+    let plugins = router_then_transformer(model_overwrite_rule("gpt-4o-x"));
+    let (_body, result) = forged_meta_body_stage(&plugins, "gpt-4o", "gpt-4o-x").await;
+    assert_eq!(
+        reject_status(&result),
+        Some(400),
+        "a matched pair of forged body + forged metadata must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn final_body_rejects_an_anthropic_model_swap_that_rewrites_the_metadata_key() {
+    // The same attack against the translating provider, where the model is
+    // additionally baked into the translated provider body.
+    let plugins = router_then_transformer(model_overwrite_rule("claude-3-opus"));
+    let (_body, result) =
+        forged_meta_body_stage(&plugins, "claude-3-5-sonnet", "claude-3-opus").await;
+    assert_eq!(reject_status(&result), Some(400));
+}
+
+#[tokio::test]
+async fn a_dropped_model_metadata_key_is_neither_fail_open_nor_fail_broken() {
+    // Deleting the observability key must not open a hole...
+    let plugins = router_then_transformer(model_overwrite_rule("gpt-4o-x"));
+    let (_body, result) = dropped_meta_body_stage(&plugins, "gpt-4o").await;
+    assert_eq!(reject_status(&result), Some(400));
+
+    // ...and must not break an ordinary safe request either: the committed model
+    // lives in the claim, so the key's presence is irrelevant in both directions.
+    let plugins = router_then_transformer(safe_body_rule());
+    let (body, result) = dropped_meta_body_stage(&plugins, "gpt-4o").await;
+    assert!(matches!(result, PluginResult::Continue));
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["model"], json!("gpt-4o"));
+}
+
+#[tokio::test]
+async fn final_body_revalidation_echoes_neither_the_committed_nor_the_final_model() {
+    // Fixed cardinality in both directions: a rejection may leak neither the
+    // routed generation (a tenant's own model choice) nor the attacker-supplied
+    // value, which a transform could have relocated a secret into.
+    let plugin = build(openai_and_anthropic_config());
+    let body = streaming_request("gpt-4o-COMMITTEDMARK");
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            br#"{"model":"gpt-4o-FINALMARK","stream":true}"#,
+        )
+        .await;
+    let rendered = match &result {
+        PluginResult::Reject { body, .. } => body.clone(),
+        other => panic!("expected a reject, got {other:?}"),
+    };
+    assert!(
+        !rendered.contains("COMMITTEDMARK"),
+        "the rejection envelope must not echo the committed model"
+    );
+    assert!(
+        !rendered.contains("FINALMARK"),
+        "the rejection envelope must not echo the final body model"
+    );
+    assert!(rendered.contains("model_policy_violation"));
+}
+
+#[tokio::test]
+async fn the_private_claim_is_never_rendered_by_request_context_debug() {
+    // `RequestContext` derives `Debug`; the claim's own opaque implementation is
+    // what keeps the committed model, the committed query, and the ownership
+    // token out of any diagnostic that formats a context.
+    let plugin = build(openai_and_anthropic_config());
+    let body = streaming_request("gpt-4o-DEBUGMARK");
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    // Drop the two OBSERVABILITY copies so the only remaining source of the
+    // marker is the private claim.
+    assert!(ctx.metadata.remove("request_body").is_some());
+    assert!(ctx.metadata.remove(MODEL_META_KEY).is_some());
+
+    let rendered = format!("{ctx:?}");
+    assert!(
+        rendered.contains("AiStreamRouterClaim(<redacted>)"),
+        "the claim must format as an opaque placeholder: {rendered}"
+    );
+    assert!(
+        !rendered.contains("DEBUGMARK"),
+        "the committed model must not reach a formatted request context"
+    );
+}
+
+// --- Claim-owned response normalization --------------------------------------
+
+/// Claim a streaming Anthropic request, then let a later plugin overwrite the
+/// public model metadata key before any response hook runs.
+async fn forged_meta_anthropic_ctx(plugin: &AiStreamRouter) -> RequestContext {
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    ctx.metadata.insert(MODEL_META_KEY.to_string(), "forged-identity".to_string());
+    ctx
+}
+
+#[tokio::test]
+async fn streaming_normalizer_identity_comes_from_the_private_claim() {
+    let plugin = build(openai_and_anthropic_config());
+    let ctx = forged_meta_anthropic_ctx(&plugin).await;
+
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("the owning instance must still install its normalizer");
+    let mut collected = Vec::new();
+    let chunk = inspector.on_chunk(ANTHROPIC_SSE.as_bytes()).await;
+    collected.extend_from_slice(&forwarded(chunk));
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let out = String::from_utf8(collected).unwrap();
+
+    assert!(
+        out.contains("\"model\":\"claude-3-5-sonnet\""),
+        "client-visible chunks must carry the committed model: {out}"
+    );
+    assert!(
+        !out.contains("forged-identity"),
+        "a metadata rewrite must not change the generation identity: {out}"
+    );
+}
+
+#[tokio::test]
+async fn buffered_normalizer_identity_comes_from_the_private_claim() {
+    let plugin = build(openai_and_anthropic_config());
+    let mut ctx = forged_meta_anthropic_ctx(&plugin).await;
+
+    let buffered = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            ANTHROPIC_SSE.as_bytes(),
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("the owning instance must still normalize the buffered stream");
+    let out = String::from_utf8(buffered).unwrap();
+
+    assert!(out.contains("\"model\":\"claude-3-5-sonnet\""), "{out}");
+    assert!(!out.contains("forged-identity"), "{out}");
+}
+
+#[tokio::test]
+async fn the_tool_use_guard_cannot_be_disarmed_through_metadata() {
+    // `tool_choice: "none"` is committed at claim time, so deleting the mirrored
+    // observability key cannot re-enable normalization of provider `tool_use`
+    // into client-visible `tool_calls`.
+    let plugin = build(openai_and_anthropic_config());
+    let (mut ctx, _) = claim_and_translate_tool_choice_none(&plugin).await;
+    ctx.metadata.remove("ai_stream_router.tool_choice_none");
+
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let mut collected = Vec::new();
+    let chunk = inspector.on_chunk(ANTHROPIC_TOOL_USE_SSE.as_bytes()).await;
+    collected.extend_from_slice(&forwarded(chunk));
+    let streamed = String::from_utf8(collected).unwrap();
+    assert!(streamed.contains("upstream_error"), "{streamed}");
+    assert!(!streamed.contains("tool_calls"), "{streamed}");
+
+    let buffered = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            ANTHROPIC_TOOL_USE_SSE.as_bytes(),
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("the buffered path must still fail closed");
+    let buffered = String::from_utf8(buffered).unwrap();
+    assert!(buffered.contains("upstream_error"), "{buffered}");
+    assert!(!buffered.contains("tool_calls"), "{buffered}");
+}
+
+#[tokio::test]
+async fn the_anthropic_translation_witness_cannot_be_forged_through_metadata() {
+    // The final hook's translation gate is private claim state written by this
+    // instance's own transform on the same context. Publishing the mirrored
+    // metadata key without ever running the transform must not admit an
+    // untranslated OpenAI body to the Anthropic provider.
+    let plugin = build(openai_and_anthropic_config());
+    let body = streaming_request("claude-3-5-sonnet");
+    let raw = serde_json::to_vec(&body).unwrap();
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    ctx.metadata.insert(
+        "ai_stream_router.request_translated".to_string(),
+        "true".to_string(),
+    );
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &raw)
+        .await;
+    assert_eq!(
+        reject_status(&result),
+        Some(400),
+        "a forged translation marker must not admit an untranslated body"
+    );
+}
+
+// --- Ownership still decides, now with the committed model -------------------
+
+#[tokio::test]
+async fn only_the_owner_enforces_and_normalizes_under_a_forged_model_key() {
+    // Two same-named Anthropic instances with different endpoints and keys.
+    // Ownership still picks exactly one enforcer/normalizer, and that one uses
+    // ITS OWN committed model rather than the shared metadata key.
+    let first = build(json!({
+        "enabled": true,
+        "providers": [{
+            "name": "shared",
+            "provider_type": "anthropic",
+            "endpoint": "https://first.example.com/v1/messages",
+            "api_key": "sk-first-secret",
+            "model_patterns": ["claude-*"]
+        }]
+    }));
+    let second = build(json!({
+        "enabled": true,
+        "providers": [{
+            "name": "shared",
+            "provider_type": "anthropic",
+            "endpoint": "https://second.example.com/v1/messages",
+            "api_key": "sk-second-secret",
+            "model_patterns": ["claude-*"]
+        }]
+    }));
+
+    let body = streaming_request("claude-3-5-sonnet");
+    let raw = serde_json::to_vec(&body).unwrap();
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    for plugin in [&first, &second] {
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+    ctx.metadata.insert(MODEL_META_KEY.to_string(), "forged-identity".to_string());
+
+    assert!(
+        second
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .is_none(),
+        "a losing instance must not install a second normalizer"
+    );
+    let mut inspector = first
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("the owning instance normalizes");
+    let mut collected = Vec::new();
+    let chunk = inspector.on_chunk(ANTHROPIC_SSE.as_bytes()).await;
+    collected.extend_from_slice(&forwarded(chunk));
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let out = String::from_utf8(collected).unwrap();
+    assert!(out.contains("\"model\":\"claude-3-5-sonnet\""), "{out}");
+    assert!(!out.contains("forged-identity"), "{out}");
+
+    // The owner translates and accepts; the loser neither re-translates nor
+    // revalidates against its own provider policy.
+    let translated = first
+        .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+        .await
+        .expect("the owner translates");
+    assert!(
+        second
+            .transform_request_body_with_context(
+                &mut ctx,
+                &translated,
+                Some("application/json"),
+                &headers
+            )
+            .await
+            .is_none(),
+        "a losing instance must not re-translate an already-claimed body"
+    );
+    assert!(matches!(
+        second
+            .on_final_request_body_with_context(&mut ctx, &headers, &translated)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        first
+            .on_final_request_body_with_context(&mut ctx, &headers, &translated)
+            .await,
+        PluginResult::Continue
+    ));
+}

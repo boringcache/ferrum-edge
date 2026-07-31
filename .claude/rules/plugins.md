@@ -101,8 +101,8 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     (3000), so re-asserting here is what actually keeps a client or
     normal-backend credential off the third-party provider. Its matching
     fail-closed decision (final provider-visible `model` must still equal the
-    committed model AND match the selected provider's `model_patterns`; the
-    committed destination witness must be intact) lives in
+    PRIVATELY committed model AND match the selected provider's
+    `model_patterns`; the committed destination witness must be intact) lives in
     `on_final_request_body`, which has rejection plumbing on every dispatcher.
     A plugin declaring this capability may not be composed with
     `request_deduplication` (a before_proxy fingerprint cannot witness a later
@@ -111,8 +111,19 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     Headers are not the whole boundary. `ai_stream_router` records a PRIVATE
     typed claim (`RequestContext::ai_stream_router_claim`) — never metadata,
     never logged — carrying an opaque owning-instance identity plus the exact
-    committed destination, resolved backend TLS, DNS decision, and
-    backend-visible query. The committed query is replayed at
+    committed MODEL, destination, resolved backend TLS, DNS decision, and
+    backend-visible query. The committed model is the value that selected the
+    provider: final body enforcement compares against it and the claim-owned
+    response normalizers stamp the client-visible generation identity from it,
+    because a later plugin can rewrite the final body's `model` AND republish
+    `ai_stream_router.model` as the same value. Whether the owning transform
+    produced the Anthropic representation, and whether the claim forbids tool
+    use for this generation, are claim state for the same reason. Every
+    `ai_stream_router.*` metadata key is observability/coordination only and is
+    never read back for a decision; the sole exception a claim-owned hook still
+    reads is `ai_stream_router.provider_content_encoding`, which comes from the
+    provider's own response headers and only picks a bounded decoder. The
+    committed query is replayed at
     `crate::proxy::effective_backend_query_string*`, the single capture funnel
     for H1/H2, native H3, and retry replay, so later `request_transformer` query
     rules cannot append a normal-backend secret to a third-party URL. The

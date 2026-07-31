@@ -2727,12 +2727,15 @@ pub struct RequestContext {
     /// Private, typed provider claim published by the winning `ai_stream_router`
     /// instance (`GHSA-xhp5-hqj8-3mwg`).
     ///
-    /// Holds the opaque owner identity plus the exact destination, TLS, DNS, and
-    /// backend-visible query this request was committed to at claim time. It is
-    /// deliberately NOT metadata: it carries a query string (which can contain
-    /// client secrets a transform relocated) and an ownership token that must
-    /// never be forgeable from configuration, logs, or a response. Its lifetime
-    /// is exactly this request context.
+    /// Holds the opaque owner identity plus the exact model, destination, TLS,
+    /// DNS, and backend-visible query this request was committed to at claim
+    /// time. It is deliberately NOT metadata: it carries a query string (which
+    /// can contain client secrets a transform relocated), the model that
+    /// selected the provider, and an ownership token — none of which may be
+    /// forgeable from configuration, logs, or a response. The public
+    /// `ai_stream_router.*` metadata keys mirror some of it for observability
+    /// and are never read back for enforcement. Its lifetime is exactly this
+    /// request context.
     pub(crate) ai_stream_router_claim: Option<Box<ai_stream_router::AiStreamRouterClaim>>,
     /// In node-waypoint mesh topology, the Kubernetes pod UID resolved from
     /// the eBPF socket-cookie record at accept time. Set by the connection
@@ -3915,8 +3918,11 @@ impl RequestContext {
             route_override_dns_policy: self.route_override_dns_policy,
             // Carried, not dropped: `on_final_request_body` runs on this
             // compatibility context and is where the provider claim's
-            // destination/TLS/DNS/query witness is verified and where instance
-            // ownership is decided (`GHSA-xhp5-hqj8-3mwg`). A dropped claim
+            // model/destination/TLS/DNS/query witness is verified and where
+            // instance ownership is decided (`GHSA-xhp5-hqj8-3mwg`). The
+            // request-body transform hooks run on this SAME clone, so the
+            // claim's Anthropic-translation witness is recorded and read here
+            // without ever depending on a metadata write-back. A dropped claim
             // would silently skip the whole revalidation.
             ai_stream_router_claim: self.ai_stream_router_claim.clone(),
             node_waypoint_pod_uid: self.node_waypoint_pod_uid,

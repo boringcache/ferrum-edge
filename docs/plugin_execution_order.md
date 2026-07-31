@@ -316,9 +316,18 @@ JSON claim.
 
 Headers are only one of the things a later plugin can move. `ai_stream_router`
 therefore records a private, typed claim on the request context — never metadata
-— holding an opaque owning-instance identity plus the exact destination,
+— holding an opaque owning-instance identity plus the exact model, destination,
 resolved backend TLS, DNS decision, and backend-visible query it committed:
 
+- The committed **model** is the exact string that matched `model_patterns` and
+  selected the provider, the price, and (for `{model}` endpoints) the backend
+  URL. Final body enforcement compares the provider-visible `model` against that
+  private copy and re-checks it against the selected provider's patterns, and
+  the claim-owned response normalizers stamp the client-visible generation
+  identity from it. The `ai_stream_router.model` metadata key is observability
+  only and is never read back: a later plugin can change the final body's model
+  *and* republish that key as the same value, which would satisfy an equality
+  check against metadata while bypassing selection entirely.
 - The committed **query** is replayed at
   `crate::proxy::effective_backend_query_string*`, the single funnel every
   dispatcher and every retry attempt reads, so a later generic query transform
@@ -341,9 +350,24 @@ resolved backend TLS, DNS decision, and backend-visible query it committed:
   owns a claim. The first matching instance claims; later instances leave the
   route, credential, and body claim alone; and every claim-dependent request and
   response hook checks the private owner before acting.
+- Two **request-shape witnesses** are claim state for the same reason: whether
+  the owning instance's own transform actually produced the Anthropic
+  representation, and whether the claimed request forbids tool use for this
+  generation (the response normalizer's fail-closed `tool_use` guard). Both gate
+  fail-closed decisions, so neither may be forgeable through the mirrored
+  `ai_stream_router.request_translated` / `ai_stream_router.tool_choice_none`
+  observability keys.
+
+The `ai_stream_router.*` metadata keys stay published for logs and cross-plugin
+coordination, and a later plugin may write any of them — no enforcement point
+reads them back. The one metadata value a claim-owned hook still consults is
+`ai_stream_router.provider_content_encoding`, which is derived from the
+provider's own response headers, decides only how the owning instance decodes
+its own upstream bytes, and is bounded by that decoder's limits.
 
 `on_final_request_body` fails closed on any drift in that witness with a
-fixed-cardinality envelope that echoes no offending value.
+fixed-cardinality envelope that echoes no offending value — neither the
+committed model nor the final body's model.
 
 ## Finalized Request Egress
 

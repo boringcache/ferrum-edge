@@ -93,9 +93,13 @@
 //!   passes) and after an egress header overlay, on H1/H2 and H3 alike.
 //! - `on_final_request_body_with_context` re-parses the backend-visible body
 //!   after every `transform_request_body` hook and fails closed unless the
-//!   provider-visible `model` is still exactly the model that selected this
-//!   provider and still matches that provider's `model_patterns`. It also
-//!   re-checks the committed destination witness, so the credential and the
+//!   provider-visible `model` is still exactly the model recorded in the
+//!   PRIVATE claim — the value that actually selected this provider — and still
+//!   matches that provider's `model_patterns`. The public
+//!   `ai_stream_router.model` metadata key is never consulted: a later plugin
+//!   that rewrites both the final body's model and that key to the same value
+//!   would otherwise satisfy an equality check while bypassing selection. It
+//!   also re-checks the committed destination witness, so the credential and the
 //!   destination cannot drift apart.
 //!
 //! Both fail closed. Neither logs header values, credentials, or body bytes,
@@ -113,6 +117,11 @@
 //!   unknown custom header as a credential; an operator who routes a bespoke
 //!   secret header to a normal backend must not also configure that rule on a
 //!   proxy that routes to a third-party provider.
+//! - **Model** — the exact model string that matched `model_patterns` and chose
+//!   this provider, this price, and (for `{model}` endpoints) this backend URL.
+//!   Final body enforcement compares against THIS copy, and the claim-owned
+//!   response normalizers stamp the client-visible generation identity from it.
+//!   The `ai_stream_router.model` metadata key is observability only.
 //! - **Query** — the exact backend-visible query, frozen at claim time and
 //!   replayed from private request state at
 //!   `crate::proxy::effective_backend_query_string*`, the single funnel every
@@ -140,9 +149,23 @@
 //!   acting. Fail-on-missing-model / fail-on-no-matching-provider still decide an
 //!   UNCLAIMED request in normal plugin order; ownership begins only on a
 //!   successful claim.
+//! - **Request-shape witnesses** — whether this instance's own transform
+//!   actually produced the Anthropic representation, and whether the claimed
+//!   request forbids tool use for this generation. Both gate fail-closed
+//!   decisions, so both are claim state rather than the mirrored
+//!   `ai_stream_router.request_translated` / `ai_stream_router.tool_choice_none`
+//!   observability keys.
 //!
 //! None of the claim state is metadata, and none of it is logged, serialized, or
-//! exported: it holds a query string and an ownership token.
+//! exported: it holds a query string, the committed model, and an ownership
+//! token. The `ai_stream_router.*` metadata keys remain published for logs and
+//! cross-plugin coordination, and a later plugin may write any of them — no
+//! enforcement point reads them back. The one metadata value a claim-owned hook
+//! still consults is `ai_stream_router.provider_content_encoding`, which is
+//! derived from the PROVIDER's own response headers, decides only how this
+//! instance decodes its own upstream bytes, and is bounded by that decoder's
+//! `NORMALIZE_DECODE_LIMITS`; forging it can fail this instance's
+//! normalization but cannot move a credential, a destination, or a generation.
 //!
 //! A second provider needs a different endpoint/authority, different
 //! credentials, a different backend TLS resolution, a different translated
@@ -250,21 +273,43 @@ const META_CLAIMED_COORD: &str = "ai_stream_router_claimed";
 const META_PASSTHROUGH_COORD: &str = "ai_stream_router_pass_through";
 const META_PROVIDER: &str = "ai_stream_router.provider";
 const META_PROVIDER_TYPE: &str = "ai_stream_router.provider_type";
+/// OBSERVABILITY ONLY (`GHSA-xhp5-hqj8-3mwg`). The model that selected the
+/// provider is authorization state, so it is committed to the private claim
+/// (`AiStreamRouterClaim::model`) and read from there by final model
+/// enforcement and by every claim-owned response normalizer. This key is
+/// published for logs and for other plugins, and a later plugin may overwrite
+/// it: nothing reads it back for a policy decision.
 const META_MODEL: &str = "ai_stream_router.model";
 const META_NORMALIZED: &str = "ai_stream_router.normalized_response_stream";
-// NOTE (`GHSA-xhp5-hqj8-3mwg`): the committed destination, TLS, DNS decision,
-// backend-visible query, and owning instance are deliberately NOT metadata keys.
-// They live in the private, typed `RequestContext::ai_stream_router_claim`, so a
-// later plugin cannot forge them, and a query string (which may hold a relocated
-// credential) never reaches a transaction log.
+// NOTE (`GHSA-xhp5-hqj8-3mwg`): the committed model, destination, TLS, DNS
+// decision, backend-visible query, translation witness, and owning instance are
+// deliberately NOT metadata keys. They live in the private, typed
+// `RequestContext::ai_stream_router_claim`, so a later plugin cannot forge them,
+// and a query string (which may hold a relocated credential) never reaches a
+// transaction log.
+/// OBSERVABILITY ONLY. The decisive translation witness is
+/// `AiStreamRouterClaim::request_translated`, written by this instance's own
+/// transform hook on the same context the final body hook reads.
 const META_REQUEST_TRANSLATED: &str = "ai_stream_router.request_translated";
-/// Set when the translated Anthropic request carries `tool_choice: {"type":"none"}`.
-/// Request-local only: the response normalizer fails closed if the provider
-/// nevertheless emits `tool_use` for that generation.
+/// OBSERVABILITY ONLY. Set when the claimed Anthropic request carries
+/// `tool_choice: {"type":"none"}`. The decisive value is
+/// `AiStreamRouterClaim::tool_choice_none`, committed at claim time: the
+/// response normalizer fails closed if the provider nevertheless emits
+/// `tool_use` for that generation, so it must not be disarmable by a later
+/// metadata write.
 const META_TOOL_CHOICE_NONE: &str = "ai_stream_router.tool_choice_none";
 /// Provider `Content-Encoding` that must be decoded before Anthropic SSE
 /// normalization. Stamped in `after_proxy` before representation headers are
 /// repaired so both streaming and buffered normalizers see the same coding.
+///
+/// Deliberately left in metadata and deliberately NOT authorization state
+/// (`GHSA-xhp5-hqj8-3mwg`): it is derived from the PROVIDER's own response
+/// headers rather than from anything the claim committed, it decides only how
+/// this instance's own normalizer decodes its own upstream bytes, and every
+/// value it can take is bounded by [`NORMALIZE_DECODE_LIMITS`]. A forged value
+/// can only make the claim owner's normalization fail (a fixed-cardinality
+/// upstream error body); it cannot move a credential, a destination, or a
+/// generation.
 const META_PROVIDER_ENCODING: &str = "ai_stream_router.provider_content_encoding";
 /// Shared marker (same contract as `ai_prompt_shield` / `ai_semantic_firewall`)
 /// telling response plugins the request asked for a streaming response.
@@ -413,15 +458,16 @@ static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 /// The private, typed provider claim recorded on [`RequestContext`] by the
 /// winning `ai_stream_router` instance (`GHSA-xhp5-hqj8-3mwg`).
 ///
-/// This is the complete witness of what the credential was committed TO. The
-/// public `ai_stream_router.*` metadata keys stay what they always were —
+/// This is the complete witness of what the credential was committed TO,
+/// INCLUDING the generation it was committed FOR. The public
+/// `ai_stream_router.*` metadata keys stay what they always were —
 /// observability and cross-plugin coordination — and are deliberately not
 /// load-bearing here: a later plugin can write metadata, but it cannot reach
 /// this struct.
 ///
 /// Nothing in it is ever logged, serialized, echoed, or exported. It holds a
 /// backend-visible query string, which a transform could have moved a
-/// credential into.
+/// credential into, plus the committed model and the ownership token.
 #[derive(Clone)]
 pub(crate) struct AiStreamRouterClaim {
     /// Which instance won the claim. Compared against
@@ -431,6 +477,33 @@ pub(crate) struct AiStreamRouterClaim {
     /// a name so a later plugin rewriting `ai_stream_router.provider` metadata
     /// cannot redirect credential injection or revalidation.
     provider_index: usize,
+    /// The EXACT model string that selected `provider_index`, frozen at claim
+    /// time (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// Final request-body enforcement compares the provider-visible `model`
+    /// against this value and re-checks it against the selected provider's
+    /// `model_patterns`; the claim-owned response normalizers stamp the
+    /// client-visible generation identity from it. The public
+    /// `ai_stream_router.model` metadata key is NOT usable for either: a later
+    /// plugin can change the final body's model AND rewrite that key to the
+    /// same value, which would satisfy an equality check against metadata while
+    /// bypassing the selection that chose the provider, the price, and (for
+    /// `{model}` endpoints) the backend URL.
+    model: String,
+    /// Whether the claimed request forbids tool use for this generation
+    /// (`tool_choice: "none"` in the client body, translated to Anthropic
+    /// `tool_choice: {"type":"none"}`). Committed at claim time from the client
+    /// representation the claim selected on, so a later metadata write cannot
+    /// disarm the response normalizer's fail-closed `tool_use` guard. Always
+    /// `false` for providers whose responses this instance does not translate.
+    tool_choice_none: bool,
+    /// Set by this instance's own `transform_request_body` hook once the
+    /// Anthropic representation was produced. Read by
+    /// `on_final_request_body_with_context`, which runs on the SAME context
+    /// object the transform ran on (the proxy builds one hook context for both
+    /// phases), so the witness never has to survive a metadata write-back and
+    /// never has to be forgeable metadata.
+    request_translated: bool,
     /// Backend-visible destination committed at claim time.
     scheme: BackendScheme,
     host: String,
@@ -457,8 +530,10 @@ impl AiStreamRouterClaim {
 
 /// Deliberately opaque: `RequestContext` derives `Debug`, and a derived
 /// implementation here would print the committed backend-visible query (which a
-/// transform may have relocated a credential into) and the ownership token into
-/// any diagnostic that formats a request context.
+/// transform may have relocated a credential into), the committed model, and
+/// the ownership token into any diagnostic that formats a request context.
+/// Model enforcement is fixed-cardinality and never echoes a model, so the
+/// committed model must not reach a log through `Debug` either.
 impl std::fmt::Debug for AiStreamRouterClaim {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("AiStreamRouterClaim(<redacted>)")
@@ -2160,14 +2235,27 @@ impl Plugin for AiStreamRouter {
         // --- Private claim: the complete witness of what was committed. ---
         // Everything the credential boundary depends on lives here, in typed
         // request-private state, and nowhere in public metadata: the owning
-        // instance, the provider it selected, the destination identity, the
-        // resolved backend TLS, and the backend-visible query
-        // (`GHSA-xhp5-hqj8-3mwg`). `on_final_request_body_with_context` requires
-        // every one of them to be unchanged before the request is dispatched.
+        // instance, the provider it selected, the MODEL that selected it, the
+        // destination identity, the resolved backend TLS, and the
+        // backend-visible query (`GHSA-xhp5-hqj8-3mwg`).
+        // `on_final_request_body_with_context` requires every one of them to be
+        // unchanged before the request is dispatched.
         let committed_tls = ctx.route_override_resolved_tls.clone();
+        // Committed from the CLIENT representation this claim selected on, not
+        // from the later translated body: the response normalizer's fail-closed
+        // `tool_use` guard must be armed by what the request actually asked for
+        // and must not be disarmable afterwards. Only meaningful for the
+        // provider type whose SSE this instance translates.
+        let tool_choice_none = provider.provider_type == ProviderType::Anthropic
+            && openai_body.get("tool_choice").and_then(Value::as_str) == Some("none");
         ctx.ai_stream_router_claim = Some(Box::new(AiStreamRouterClaim {
             owner: self.owner_id,
             provider_index,
+            model: model.clone(),
+            tool_choice_none,
+            // The transform hook has not run yet; it sets this on the same
+            // context the final body hook reads.
+            request_translated: false,
             scheme: provider.scheme,
             host: provider.host.clone(),
             port: provider.port,
@@ -2177,7 +2265,10 @@ impl Plugin for AiStreamRouter {
             committed_query,
         }));
 
-        // --- Metadata (observability + downstream-hook coordination). ---
+        // --- Metadata (observability + downstream-hook coordination ONLY). ---
+        // Nothing below is read back for an authorization or policy decision:
+        // a later plugin can write any of these keys, so every enforcement
+        // point reads the private claim instead (`GHSA-xhp5-hqj8-3mwg`).
         ctx.metadata
             .insert(META_ENABLED.to_string(), "true".to_string());
         ctx.metadata
@@ -2205,6 +2296,7 @@ impl Plugin for AiStreamRouter {
             META_PROVIDER_TYPE.to_string(),
             provider.provider_type.as_str().to_string(),
         );
+        // Observability only: the decisive copy is `claim.model` above.
         ctx.metadata.insert(META_MODEL.to_string(), model);
         ctx.metadata
             .insert(META_NORMALIZED.to_string(), normalizes.to_string());
@@ -2232,14 +2324,24 @@ impl Plugin for AiStreamRouter {
         // Only the instance that won the claim transforms the body. A second
         // instance running this hook would translate an already-translated
         // representation, or re-inject usage options into another provider's
-        // body (`GHSA-xhp5-hqj8-3mwg`).
-        let provider_type = self.owned_claim(ctx)?.1.provider_type;
-        let model = ctx.metadata.get(META_MODEL)?.clone();
+        // body (`GHSA-xhp5-hqj8-3mwg`). The model comes from the private claim,
+        // never from `ai_stream_router.model`: this hook runs at 2984 but a
+        // later plugin's metadata write must not be able to decide which
+        // generation the provider request is translated for.
+        let (provider_type, model) = {
+            let (claim, provider) = self.owned_claim(ctx)?;
+            (provider.provider_type, claim.model.clone())
+        };
 
         match provider_type {
             ProviderType::Anthropic => {
                 let openai_body: Value = serde_json::from_slice(body).ok()?;
                 let translated = translate_to_anthropic(&openai_body, &model).ok()?;
+                // The decisive witness: private claim state on the very context
+                // `on_final_request_body_with_context` reads.
+                if let Some(claim) = ctx.ai_stream_router_claim.as_deref_mut() {
+                    claim.request_translated = true;
+                }
                 ctx.metadata
                     .insert(META_REQUEST_TRANSLATED.to_string(), "true".to_string());
                 if openai_body.get("tool_choice").and_then(Value::as_str) == Some("none") {
@@ -2309,7 +2411,13 @@ impl Plugin for AiStreamRouter {
         // Ownership and the destination witness both come from the private
         // claim. Read them in one scope so the shared duplicate-key memo below
         // can still take the context mutably.
-        let (provider_index, provider_is_anthropic, destination_intact) = {
+        let (
+            provider_index,
+            provider_is_anthropic,
+            destination_intact,
+            committed_model,
+            request_translated,
+        ) = {
             // Not this instance's claim — either the request was never claimed,
             // or a second effective `ai_stream_router` owns it and runs the
             // identical revalidation from this same phase.
@@ -2320,16 +2428,12 @@ impl Plugin for AiStreamRouter {
                 claim.provider_index,
                 provider.provider_type == ProviderType::Anthropic,
                 route_override_still_targets(ctx, claim),
+                claim.model.clone(),
+                claim.request_translated,
             )
         };
 
-        if provider_is_anthropic
-            && ctx
-                .metadata
-                .get(META_REQUEST_TRANSLATED)
-                .map(String::as_str)
-                != Some("true")
-        {
+        if provider_is_anthropic && !request_translated {
             return openai_error_response(
                 400,
                 "The Anthropic request body could not be translated safely",
@@ -2364,11 +2468,13 @@ impl Plugin for AiStreamRouter {
             );
         }
 
-        let Some(committed_model) = ctx.metadata.get(META_MODEL).cloned() else {
-            return provider_policy_violation(
-                "The routed AI model could not be revalidated before dispatch",
-            );
-        };
+        // `committed_model` is the private claim's copy, taken above. The public
+        // `ai_stream_router.model` key is deliberately NOT consulted here
+        // (`GHSA-xhp5-hqj8-3mwg`): a later plugin can rewrite the final body's
+        // model AND that key to the same new value, which would satisfy an
+        // equality check against metadata while bypassing the selection that
+        // chose this provider.
+        //
         // Recorded by this same instance at claim time, so the lookup cannot
         // miss; fail closed rather than indexing.
         let Some(provider) = self.providers.get(provider_index) else {
@@ -2427,9 +2533,20 @@ impl Plugin for AiStreamRouter {
         // type, and only the winner's decision may install a normalizer
         // (`GHSA-xhp5-hqj8-3mwg`). Double normalization would re-parse already
         // OpenAI-shaped SSE as if it were provider-native.
-        if !self.normalizes_owned_response(ctx) {
-            return None;
-        }
+        //
+        // The same lookup yields the generation identity this normalizer stamps
+        // into every client-visible chunk and the fail-closed `tool_use` guard,
+        // both from the private claim rather than from the forgeable
+        // `ai_stream_router.model` / `ai_stream_router.tool_choice_none` keys.
+        let (model, tools_forbidden) = {
+            let Some((claim, provider)) = self.owned_claim(ctx) else {
+                return None;
+            };
+            if !provider.normalizes_response(self.normalize_response_stream) {
+                return None;
+            }
+            (claim.model.clone(), claim.tool_choice_none)
+        };
         // Only normalize a successful event stream; a non-2xx/non-SSE body is an
         // error envelope that should reach the client untouched.
         if !(200..300).contains(&response_status) {
@@ -2438,14 +2555,7 @@ impl Plugin for AiStreamRouter {
         if !content_type.is_some_and(is_event_stream_content_type) {
             return None;
         }
-        let model = ctx
-            .metadata
-            .get(META_MODEL)
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
         let encoding = ctx.metadata.get(META_PROVIDER_ENCODING).cloned();
-        let tools_forbidden =
-            ctx.metadata.get(META_TOOL_CHOICE_NONE).map(String::as_str) == Some("true");
         Some(wrap_anthropic_normalizer(
             model,
             encoding.as_deref(),
@@ -2464,9 +2574,19 @@ impl Plugin for AiStreamRouter {
         if !self.response_stream_hooks {
             return None;
         }
-        if !self.normalizes_owned_response(ctx) {
-            return None;
-        }
+        // Same private-claim read as the streaming inspector: ownership plus the
+        // committed generation identity and tool-use guard
+        // (`GHSA-xhp5-hqj8-3mwg`). Scoped so the claim borrow ends before the
+        // buffered normalization await.
+        let (model, tools_forbidden) = {
+            let Some((claim, provider)) = self.owned_claim(ctx) else {
+                return None;
+            };
+            if !provider.normalizes_response(self.normalize_response_stream) {
+                return None;
+            }
+            (claim.model.clone(), claim.tool_choice_none)
+        };
         // Match the streaming normalizer: provider error envelopes reach the
         // client untouched even when a backend labels them as event streams.
         if !(200..300).contains(&response_status) {
@@ -2475,11 +2595,6 @@ impl Plugin for AiStreamRouter {
         if !content_type.is_some_and(is_event_stream_content_type) {
             return None;
         }
-        let model = ctx
-            .metadata
-            .get(META_MODEL)
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
         let header_encoding = match content_encoding_value(response_headers) {
             Ok(encoding) => encoding,
             Err(message) => return Some(upstream_sse_error_body(&message)),
@@ -2495,8 +2610,6 @@ impl Plugin for AiStreamRouter {
                 return Some(upstream_sse_error_body(&message));
             }
         };
-        let tools_forbidden =
-            ctx.metadata.get(META_TOOL_CHOICE_NONE).map(String::as_str) == Some("true");
         normalize_anthropic_sse_buffered(model, &plaintext, tools_forbidden).await
     }
 
