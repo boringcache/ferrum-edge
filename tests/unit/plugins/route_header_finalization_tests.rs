@@ -15,7 +15,7 @@ use ferrum_edge::config::types::{
     PluginConfig, PluginScope, Proxy, default_namespace,
 };
 use ferrum_edge::plugins::utils::route_header_transform::{
-    RawRouteHeaderTransformRule, parse_route_header_transforms,
+    RawRouteHeaderTransformRule, RouteHeaderTransformRule, parse_route_header_transforms,
 };
 use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
 use serde_json::json;
@@ -61,6 +61,7 @@ fn make_proxy(id: &str, plugin_ids: &[&str]) -> Proxy {
         pool_tcp_keepalive_seconds: None,
         pool_http2_keep_alive_interval_seconds: None,
         pool_http2_keep_alive_timeout_seconds: None,
+        pool_http2_initial_stream_window_size: None,
         pool_http2_initial_connection_window_size: None,
         pool_http2_adaptive_window: None,
         pool_http2_max_frame_size: None,
@@ -130,12 +131,12 @@ fn make_config(plugin_configs: Vec<PluginConfig>) -> GatewayConfig {
     }
 }
 
-fn route_request_rules(raw: serde_json::Value) -> Arc<Vec<_>> {
+fn route_request_rules(raw: serde_json::Value) -> Arc<Vec<RouteHeaderTransformRule>> {
     let raw: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(raw).unwrap();
     Arc::new(parse_route_header_transforms(&raw, "test.request_route").unwrap())
 }
 
-fn route_response_rules(raw: serde_json::Value) -> Arc<Vec<_>> {
+fn route_response_rules(raw: serde_json::Value) -> Arc<Vec<RouteHeaderTransformRule>> {
     let raw: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(raw).unwrap();
     Arc::new(parse_route_header_transforms(&raw, "test.response_route").unwrap())
 }
