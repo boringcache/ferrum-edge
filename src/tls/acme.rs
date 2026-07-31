@@ -1934,12 +1934,19 @@ fn has_active_renewal_order(
 ///
 /// Every stretch of external work — account registration, order creation, the
 /// DNS-01 provider hook, the propagation wait, authorization polling,
-/// finalization, and certificate download — runs inside the keeper's
-/// cancellation scope, so losing the claim abandons the renewal at the next
-/// await point rather than at some later checkpoint. Every synchronous store
-/// commit runs off the runtime and is fenced by an ownership check on both
-/// sides, so final certificate/order state is never published by an instance
-/// that has been superseded.
+/// finalization, certificate download, and the DNS-01 cleanup hook — runs
+/// inside the keeper's cancellation scope, so losing the claim abandons the
+/// renewal at the next await point rather than at some later checkpoint.
+///
+/// Every synchronous store commit runs off the runtime through
+/// `RenewalLeaseKeeper::commit_fenced`, which verifies ownership and then holds
+/// the *lease store's* exclusive lock for the whole account/order/certificate
+/// mutation. Acquisition and takeover block on that same lock, so a superseded
+/// instance cannot land a stale write beside the new owner's — the failure mode
+/// a before/after ownership check can detect but not undo. The ordinary
+/// ownership check still runs immediately after each commit, because the lock
+/// is released the moment the write completes and everything after it is fresh
+/// work.
 ///
 /// One residual is inherent to ACME: an order already created with the CA
 /// cannot be un-created if the claim is lost immediately afterwards. The check
@@ -1974,22 +1981,33 @@ async fn renew_certificate_once(
         AcmeError::InvalidId("ACME renewal order has no account credentials".to_string())
     })?;
 
-    if keeper.ensure_owned().await.is_err() {
-        return Ok(abandon_renewal(&certificate.id));
-    }
     let acct_id = prepared
         .account_id
         .clone()
         .unwrap_or_else(|| account_id.to_string());
     let dir_url = prepared.directory_url.clone();
     let accounts = Arc::clone(account_store);
-    commit_blocking(move || accounts.upsert_account(acct_id, dir_url, creds)).await?;
-
-    if keeper.ensure_owned().await.is_err() {
-        return Ok(abandon_renewal(&certificate.id));
+    let committed = keeper
+        .commit_fenced(move || accounts.upsert_account(acct_id, dir_url, creds))
+        .await;
+    match committed {
+        Ok(result) => {
+            result?;
+        }
+        Err(_) => return Ok(abandon_renewal(&certificate.id)),
     }
+
     let orders = Arc::clone(order_store);
-    let order = commit_blocking(move || orders.upsert_order(prepared, false)).await?;
+    let order = match keeper
+        .commit_fenced(move || orders.upsert_order(prepared, false))
+        .await
+    {
+        Ok(result) => result?,
+        Err(_) => return Ok(abandon_renewal(&certificate.id)),
+    };
+    // The order now exists with the CA, which cannot be un-created. The fence
+    // guaranteed the write itself did not race a takeover; this check is what
+    // stops the *next* stretch of external work if the claim has since gone.
     if keeper.ensure_owned().await.is_err() {
         return Ok(abandon_renewal(&certificate.id));
     }
@@ -2027,12 +2045,24 @@ async fn renew_certificate_once(
         // would break its validation.
         Err(_) => return Ok(abandon_renewal(&certificate.id)),
     };
+    // Cleanup is a side effect like any other and runs inside the cancellation
+    // scope for exactly the same reason: a claim lost right after completion
+    // must not let this instance retract `_acme-challenge` records the new
+    // owner still needs. A hook that merely *fails* is logged and processing
+    // continues, because the claim is still held.
     if config.challenge_type == AcmeRenewalChallengeType::Dns01
         && let Some(command) = config.dns01_hook_command.as_deref()
-        && let Err(error) =
-            cleanup_dns01_challenges_with_hook(command, &order.dns01_challenges).await
     {
-        tracing::warn!(error = %error, "ACME DNS-01 cleanup hook failed");
+        let cleanup = cleanup_dns01_challenges_with_hook(command, &order.dns01_challenges);
+        match keeper.guarded_cleanup(cleanup).await {
+            crate::tls::lease::GuardedCleanup::Completed(()) => {}
+            crate::tls::lease::GuardedCleanup::Failed(error) => {
+                tracing::warn!(error = %error, "ACME DNS-01 cleanup hook failed");
+            }
+            crate::tls::lease::GuardedCleanup::Lost => {
+                return Ok(abandon_renewal(&certificate.id));
+            }
+        }
     }
     let completed = completion_result?;
     validate_completed_certificate_pair(&completed.cert_pem, &completed.key_pem)?;
@@ -2048,21 +2078,32 @@ async fn renew_certificate_once(
     })?;
 
     // Final publication. A superseded instance must not overwrite the material
-    // the new owner is issuing.
-    if keeper.ensure_owned().await.is_err() {
-        return Ok(abandon_renewal(&certificate.id));
-    }
+    // the new owner is issuing, so the write happens under the lease lock: if
+    // the claim is gone the mutation is never run at all.
     let certs = Arc::clone(certificate_store);
-    commit_blocking(move || certs.upsert_certificate(issued, true)).await?;
-
-    if keeper.ensure_owned().await.is_err() {
-        return Ok(abandon_renewal(&certificate.id));
+    let committed = keeper
+        .commit_fenced(move || certs.upsert_certificate(issued, true))
+        .await;
+    match committed {
+        Ok(result) => {
+            result?;
+        }
+        Err(_) => return Ok(abandon_renewal(&certificate.id)),
     }
+
     let mut updated = order;
     updated.status = AcmeOrderStatus::Valid;
     updated.error = None;
     let orders = Arc::clone(order_store);
-    commit_blocking(move || orders.upsert_order(updated, true)).await?;
+    let committed = keeper
+        .commit_fenced(move || orders.upsert_order(updated, true))
+        .await;
+    match committed {
+        Ok(result) => {
+            result?;
+        }
+        Err(_) => return Ok(abandon_renewal(&certificate.id)),
+    }
     let _ = crate::tls::source::subscription::request_all_material_set_reloads();
     Ok(true)
 }
@@ -2078,25 +2119,6 @@ fn abandon_renewal(certificate_id: &str) -> bool {
         "ACME renewal claim lost; abandoning this renewal before further side effects"
     );
     false
-}
-
-/// Run a synchronous shared-store commit off the runtime.
-///
-/// Store commits are read-modify-writes under a cross-process advisory lock and
-/// can wait up to `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`, which must never
-/// occupy a Tokio worker.
-#[cfg(feature = "acme")]
-async fn commit_blocking<T, F>(commit: F) -> Result<T, AcmeError>
-where
-    F: FnOnce() -> Result<T, AcmeError> + Send + 'static,
-    T: Send + 'static,
-{
-    match tokio::task::spawn_blocking(commit).await {
-        Ok(result) => result,
-        Err(error) => Err(AcmeError::Write(format!(
-            "ACME store commit task failed: {error}"
-        ))),
-    }
 }
 
 #[cfg(feature = "acme")]

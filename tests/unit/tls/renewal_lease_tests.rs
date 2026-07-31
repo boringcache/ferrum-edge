@@ -12,18 +12,64 @@
 //! order/finalize cycle runs long; `RenewalLeaseKeeper` heartbeats the claim for
 //! the whole renewal and cancels the in-flight work the moment it is lost.
 
+//! Store commits are additionally *fenced*: the mutation runs while the lease
+//! table's own exclusive lock is held, so acquisition and takeover cannot cross
+//! it and a superseded owner can never land a stale write beside the new
+//! owner's.
+
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use ferrum_edge::tls::lease::{
-    RenewalLeaseKeeper, TlsLeaseError, TlsLeaseStore, acme_renewal_lease_name,
+    FencedCommit, GuardedCleanup, RenewalLeaseKeeper, TlsLeaseError, TlsLeaseStore,
+    acme_renewal_lease_name,
 };
 
 /// One replica's view of the shared lease table.
 fn instance(dir: &Path, holder: &str) -> Arc<TlsLeaseStore> {
     let opened = TlsLeaseStore::open_with_holder(dir, holder.to_string());
     Arc::new(opened.expect("open lease store"))
+}
+
+/// Poll the persisted record until a heartbeat has advanced `expires_at` past
+/// `beyond`, or give up after `timeout`.
+///
+/// Event driven rather than a blind sleep: a paused scheduler costs latency
+/// here instead of turning correct production behaviour into a red test, and
+/// the absence of any beat still fails (through the caller's diagnostic) rather
+/// than passing because a sleep happened to be long enough.
+async fn wait_for_extension(
+    store: &Arc<TlsLeaseStore>,
+    name: &str,
+    beyond: DateTime<Utc>,
+    timeout: Duration,
+) -> Option<DateTime<Utc>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(Some(record)) = store.peek(name)
+            && record.expires_at > beyond
+        {
+            return Some(record.expires_at);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Sleep until wall-clock time is past `moment`, in bounded steps, so the
+/// "operation" outlives a specific expiry rather than a guessed duration.
+async fn sleep_until_past(moment: DateTime<Utc>) {
+    loop {
+        let Ok(remaining) = (moment - Utc::now()).to_std() else {
+            return;
+        };
+        tokio::time::sleep(remaining.max(Duration::from_millis(25))).await;
+    }
 }
 
 #[test]
@@ -304,25 +350,50 @@ fn identities_that_a_sanitizer_would_collide_stay_distinct() {
 // what closes that window.
 // ---------------------------------------------------------------------------
 
-/// A renewal that takes far longer than the TTL still has exactly one owner,
-/// because the heartbeat keeps extending the claim while the work is in flight.
+/// A renewal that outlives the claim's *original* expiry still has exactly one
+/// owner, because the heartbeat keeps extending it while the work is in flight.
+///
+/// The proof is state driven, not timing driven. A persisted extension is
+/// observed first (so a missing heartbeat fails on the diagnostic timeout, not
+/// on a sleep that was merely long enough), then the operation is run until
+/// wall-clock time is genuinely past the original expiry, then exclusion is
+/// re-asserted. The TTL is deliberately generous — production clamps it to at
+/// least 60 seconds — so a scheduler pause on a shared runner cannot expire a
+/// claim the heartbeat is servicing correctly.
 #[tokio::test]
 async fn a_long_operation_retains_exactly_one_owner_via_the_heartbeat() {
     let dir = tempfile::tempdir().expect("tempdir");
     let instance_a = instance(dir.path(), "replica-a");
     let instance_b = instance(dir.path(), "replica-b");
     let name = acme_renewal_lease_name("edge-cert");
-    // Deliberately short: without a heartbeat this claim expires several times
-    // over during the "renewal" below.
-    let ttl = Duration::from_millis(1_000);
+    // Beats every 2s; tolerates a ~4s pause between beats.
+    let ttl = Duration::from_secs(6);
 
     let held = instance_a.try_acquire(&name, ttl).expect("A claims");
     let keeper = RenewalLeaseKeeper::start(held.expect("A wins"), ttl);
+    let original_expiry = instance_a.peek(&name).expect("read").expect("present").expires_at;
 
-    // Stand in for account registration, order creation, challenge publication,
-    // propagation, polling, and finalization.
-    let work = tokio::time::sleep(Duration::from_millis(2_500));
-    keeper.guarded(work).await.expect("the claim survives the work");
+    // Proof one: a beat actually reached the shared table. Without a heartbeat
+    // this never happens and the test fails here.
+    let extended = wait_for_extension(&instance_a, &name, original_expiry, Duration::from_secs(60))
+        .await
+        .expect("the heartbeat must persist an extension of the claim");
+    assert!(
+        extended > original_expiry,
+        "the persisted claim must have been extended past its original expiry"
+    );
+
+    // Proof two: stand in for account registration, order creation, challenge
+    // publication, propagation, polling, and finalization — work that runs
+    // until the original expiry is genuinely in the past.
+    keeper
+        .guarded(sleep_until_past(original_expiry))
+        .await
+        .expect("the claim survives work that outlives its original TTL");
+    assert!(
+        Utc::now() > original_expiry,
+        "the operation must have crossed the original expiry"
+    );
     keeper.ensure_owned().await.expect("still the owner");
 
     let denied = instance_b.try_acquire(&name, ttl).expect("B attempts");
@@ -453,5 +524,339 @@ async fn an_abandoned_keeper_stops_heartbeating() {
     assert!(
         taken.is_some(),
         "the certificate must become reclaimable again"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fenced commits.
+//
+// The lease table and the account/order/certificate stores are separate
+// documents behind separate locks, so an ownership check on each side of a
+// write bounds nothing: a claim that expires mid-write lets another replica
+// acquire and publish while the stale write still lands, and the after-check
+// detects a loss it cannot undo. The commit therefore runs while the lease
+// store's own exclusive lock is held.
+// ---------------------------------------------------------------------------
+
+/// A superseded owner's target-store mutation must never run at all — detecting
+/// the loss afterwards would be too late to unpublish a certificate.
+#[tokio::test]
+async fn a_target_store_mutation_cannot_run_after_ownership_is_lost() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let instance_a = instance(dir.path(), "replica-a");
+    let name = acme_renewal_lease_name("edge-cert");
+    let ttl = Duration::from_secs(60);
+
+    let held = instance_a.try_acquire(&name, ttl).expect("A claims");
+    let keeper = RenewalLeaseKeeper::start(held.expect("A wins"), ttl);
+
+    // Another instance took the claim over while this one was stalled.
+    std::fs::write(dir.path().join("tls-leases.json"), takeover_document(&name))
+        .expect("simulate a takeover by another instance");
+
+    let published = Arc::new(AtomicBool::new(false));
+    let publish = Arc::clone(&published);
+    let outcome = keeper
+        .commit_fenced(move || publish.store(true, Ordering::SeqCst))
+        .await;
+    assert!(
+        outcome.is_err(),
+        "a superseded owner must not be allowed to commit"
+    );
+    assert!(
+        !published.load(Ordering::SeqCst),
+        "the target-store mutation must not run once ownership is gone"
+    );
+    assert!(keeper.is_lost(), "the keeper records the loss");
+
+    // The new owner's claim is untouched: a refused commit writes nothing.
+    let record = instance_a.peek(&name).expect("read").expect("present");
+    assert_eq!(record.holder, "replica-b");
+    assert_eq!(record.fence, 9999);
+}
+
+/// An absent claim — the lease table was reset, or the record pruned — is the
+/// same fail-closed answer as a superseded one.
+#[tokio::test]
+async fn a_missing_claim_refuses_the_commit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let instance_a = instance(dir.path(), "replica-a");
+    let name = acme_renewal_lease_name("edge-cert");
+    let ttl = Duration::from_secs(60);
+
+    let held = instance_a.try_acquire(&name, ttl).expect("A claims");
+    let keeper = RenewalLeaseKeeper::start(held.expect("A wins"), ttl);
+
+    std::fs::write(
+        dir.path().join("tls-leases.json"),
+        br#"{"version":7,"leases":{}}"#,
+    )
+    .expect("reset the lease table");
+
+    let published = Arc::new(AtomicBool::new(false));
+    let publish = Arc::clone(&published);
+    let outcome = keeper
+        .commit_fenced(move || publish.store(true, Ordering::SeqCst))
+        .await;
+    assert!(outcome.is_err(), "an absent claim must refuse the commit");
+    assert!(
+        !published.load(Ordering::SeqCst),
+        "the target-store mutation must not run without a claim"
+    );
+    assert!(keeper.is_lost(), "the keeper records the loss");
+}
+
+/// A takeover cannot be granted while a fenced commit is in flight, even once
+/// the claim's nominal TTL has elapsed — the acquirer blocks on the same lease
+/// lock. Once the commit has finished, the newly expired claim is acquirable
+/// and the stale owner cannot commit a second time.
+#[test]
+fn a_takeover_cannot_cross_a_fenced_commit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let instance_a = instance(dir.path(), "replica-a");
+    let instance_b = instance(dir.path(), "replica-b");
+    let name = acme_renewal_lease_name("edge-cert");
+    // Short enough that the nominal TTL elapses during the commit below.
+    let ttl = Duration::from_millis(500);
+
+    let held = instance_a.try_acquire(&name, ttl).expect("A claims");
+    let lease = held.expect("A wins");
+    let fence = lease.fence();
+    // No heartbeat and no release: the owner is mid-write when its claim ages
+    // out. Leaking the guard reproduces that without racing the commit.
+    std::mem::forget(lease);
+
+    let finished = Arc::new(AtomicBool::new(false));
+    let commit_flag = Arc::clone(&finished);
+    let committing = Arc::clone(&instance_a);
+    let commit_name = name.clone();
+    let commit = std::thread::spawn(move || {
+        committing.commit_fenced(&commit_name, fence, move || {
+            // A slow account/order/certificate mutation.
+            std::thread::sleep(Duration::from_millis(1_500));
+            commit_flag.store(true, Ordering::SeqCst);
+            "published"
+        })
+    });
+
+    // Well past the nominal TTL, and well before the commit completes.
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(
+        !finished.load(Ordering::SeqCst),
+        "the commit must still be in flight"
+    );
+
+    let taken = instance_b.try_acquire(&name, ttl).expect("B attempts");
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "a takeover must not be granted while a fenced commit holds the lease lock"
+    );
+    assert!(
+        taken.is_some(),
+        "once the commit released the lock, the expired claim must be acquirable"
+    );
+
+    let outcome = commit
+        .join()
+        .expect("commit thread")
+        .expect("the commit is answered");
+    assert_eq!(
+        outcome,
+        FencedCommit::Committed("published"),
+        "a commit that started under a live claim finishes under it"
+    );
+
+    let second = Arc::new(AtomicBool::new(false));
+    let second_flag = Arc::clone(&second);
+    let refused = instance_a
+        .commit_fenced(&name, fence, move || {
+            second_flag.store(true, Ordering::SeqCst);
+        })
+        .expect("the second attempt is answered");
+    assert_eq!(
+        refused,
+        FencedCommit::NotOwner,
+        "the stale owner is superseded once the takeover landed"
+    );
+    assert!(
+        !second.load(Ordering::SeqCst),
+        "a superseded owner must not perform a second commit"
+    );
+}
+
+/// A target-store failure is not a lease failure: it propagates to the caller
+/// and leaves the claim exactly as it was, rather than rewriting or releasing
+/// the record another holder may be relying on.
+#[test]
+fn a_target_store_error_propagates_without_disturbing_the_claim() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let instance_a = instance(dir.path(), "replica-a");
+    let instance_b = instance(dir.path(), "replica-b");
+    let name = acme_renewal_lease_name("edge-cert");
+    let ttl = Duration::from_secs(60);
+
+    let held = instance_a.try_acquire(&name, ttl).expect("A claims");
+    let lease = held.expect("A wins");
+    let before = instance_a.peek(&name).expect("read").expect("present");
+
+    let outcome = instance_a
+        .commit_fenced(&name, lease.fence(), || {
+            Err::<(), String>("shared TLS store write failed".to_string())
+        })
+        .expect("the commit itself succeeds");
+    assert_eq!(
+        outcome,
+        FencedCommit::Committed(Err("shared TLS store write failed".to_string())),
+        "the target store's own error must be carried out to the caller"
+    );
+
+    let after = instance_a.peek(&name).expect("read").expect("present");
+    assert_eq!(
+        before, after,
+        "a failed target-store write must not rewrite or release the claim"
+    );
+
+    let denied = instance_b.try_acquire(&name, ttl).expect("B attempts");
+    assert!(denied.is_none(), "the claim is still exclusively A's");
+    assert!(
+        lease.renew(ttl).expect("A renews"),
+        "A must still be able to maintain the claim it never lost"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup is a side effect too.
+// ---------------------------------------------------------------------------
+
+/// Losing the claim cancels DNS-01 cleanup. The instance that took over
+/// republishes the same `_acme-challenge` names, so a superseded instance
+/// retracting them would break the new owner's validation — and nothing later
+/// in the renewal may publish either.
+#[tokio::test]
+async fn losing_the_claim_cancels_dns_cleanup() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let instance_a = instance(dir.path(), "replica-a");
+    let name = acme_renewal_lease_name("edge-cert");
+    let ttl = Duration::from_millis(600);
+
+    let held = instance_a.try_acquire(&name, ttl).expect("A claims");
+    let keeper = RenewalLeaseKeeper::start(held.expect("A wins"), ttl);
+
+    // The takeover lands as finalization completes, i.e. exactly when cleanup
+    // would otherwise run unguarded.
+    std::fs::write(dir.path().join("tls-leases.json"), takeover_document(&name))
+        .expect("simulate a takeover by another instance");
+
+    let retracted = Arc::new(AtomicBool::new(false));
+    let retract = Arc::clone(&retracted);
+    // Stands in for the DNS-01 cleanup hook: slow enough that the heartbeat
+    // observes the takeover while it is in flight.
+    let cleanup = async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        retract.store(true, Ordering::SeqCst);
+        Ok::<(), String>(())
+    };
+    assert_eq!(
+        keeper.guarded_cleanup(cleanup).await,
+        GuardedCleanup::Lost,
+        "cleanup must be cancelled when the claim is lost"
+    );
+    assert!(
+        !retracted.load(Ordering::SeqCst),
+        "a superseded instance must not retract the new owner's challenge records"
+    );
+
+    let published = Arc::new(AtomicBool::new(false));
+    let publish = Arc::clone(&published);
+    let commit = keeper
+        .commit_fenced(move || publish.store(true, Ordering::SeqCst))
+        .await;
+    assert!(
+        commit.is_err(),
+        "an abandoned renewal must not progress into final publication"
+    );
+    assert!(
+        !published.load(Ordering::SeqCst),
+        "no unguarded side effect may follow a cancelled cleanup"
+    );
+}
+
+/// An ordinary cleanup-hook failure is *not* loss: it is reported so the caller
+/// can log it, and the renewal keeps going under the claim it still holds.
+#[tokio::test]
+async fn an_ordinary_cleanup_failure_keeps_the_claim() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let instance_a = instance(dir.path(), "replica-a");
+    let name = acme_renewal_lease_name("edge-cert");
+    let ttl = Duration::from_secs(60);
+
+    let held = instance_a.try_acquire(&name, ttl).expect("A claims");
+    let keeper = RenewalLeaseKeeper::start(held.expect("A wins"), ttl);
+
+    let cleanup = async { Err::<(), String>("hook exited 1".to_string()) };
+    assert_eq!(
+        keeper.guarded_cleanup(cleanup).await,
+        GuardedCleanup::Failed("hook exited 1".to_string()),
+        "a hook failure must be reported rather than treated as loss"
+    );
+    assert!(!keeper.is_lost(), "the claim is still held");
+
+    let published = Arc::new(AtomicBool::new(false));
+    let publish = Arc::clone(&published);
+    keeper
+        .commit_fenced(move || publish.store(true, Ordering::SeqCst))
+        .await
+        .expect("certificate processing continues under the same claim");
+    assert!(published.load(Ordering::SeqCst));
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat shutdown.
+// ---------------------------------------------------------------------------
+
+/// `finish()` settles the heartbeat before releasing the claim.
+///
+/// Aborting the heartbeat task is not settlement: if it is parked on a
+/// `spawn_blocking` extension, dropping that join handle neither cancels nor
+/// joins the blocking work, so a beat can still land *after* the release and
+/// leave a claim alive that nobody is driving.
+#[tokio::test]
+async fn finish_settles_an_in_flight_heartbeat_before_release() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let instance_a = instance(dir.path(), "replica-a");
+    let instance_b = instance(dir.path(), "replica-b");
+    let name = acme_renewal_lease_name("edge-cert");
+    // Beats every 200ms, so the loop is demonstrably active before `finish()`.
+    let ttl = Duration::from_millis(600);
+
+    let held = instance_a.try_acquire(&name, ttl).expect("A claims");
+    let keeper = RenewalLeaseKeeper::start(held.expect("A wins"), ttl);
+    let acquired = instance_a.peek(&name).expect("read").expect("present").expires_at;
+
+    wait_for_extension(&instance_a, &name, acquired, Duration::from_secs(30))
+        .await
+        .expect("the heartbeat must be running before finish() is exercised");
+
+    keeper.finish().await.expect("release");
+
+    let released = instance_a.peek(&name).expect("read").expect("present");
+    assert!(
+        released.expires_at <= Utc::now(),
+        "finish() must leave the claim released"
+    );
+
+    // Nothing may land afterwards. An aborted-but-unjoined beat would have been
+    // free to extend the record here, resurrecting a released claim.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let later = instance_a.peek(&name).expect("read").expect("present");
+    assert_eq!(
+        released, later,
+        "no heartbeat may land after finish() returned"
+    );
+
+    let taken = instance_b.try_acquire(&name, ttl).expect("B claims");
+    assert!(
+        taken.is_some(),
+        "a settled, released claim hands over immediately"
     );
 }

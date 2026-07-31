@@ -39,6 +39,25 @@
 //! any store error, and publishes a loss signal that the long-running async
 //! ACME/hook/sleep/poll work selects against — so a lost claim cancels the
 //! renewal before the next side effect instead of at the next explicit check.
+//!
+//! # A commit needs a fence, not two checks
+//!
+//! The lease table and the account/order/certificate stores are separate
+//! documents behind separate advisory locks, so checking ownership before and
+//! after a synchronous target-store write bounds nothing: a claim that expires
+//! (or a heartbeat that fails) while a slow write is in flight lets another
+//! replica acquire and publish, and the after-check observes the loss it can no
+//! longer undo. [`TlsLeaseStore::commit_fenced`] therefore verifies
+//! holder/fence/liveness and then runs the target mutation **while still
+//! holding the lease store's exclusive lock**, so acquisition, renewal, and
+//! takeover cannot cross the commit.
+//!
+//! The lock order is always **lease store first, then target store**, and it is
+//! only ever taken across a narrow synchronous commit — never across an ACME
+//! network call, a provider hook, a propagation sleep, or an authorization
+//! poll, all of which use [`RenewalLeaseKeeper::guarded`] instead. No path
+//! holds a target-store lock and then waits for the lease lock, so the nesting
+//! cannot cycle.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -281,6 +300,56 @@ impl TlsLeaseStore {
         })
     }
 
+    /// Run `commit` under the lease store's exclusive lock, and only while this
+    /// instance still holds a live claim on `name` at `fence`.
+    ///
+    /// This is the fence for a synchronous target-store mutation. An ownership
+    /// check on each side of the write is not sufficient, because the lease
+    /// table and the account/order/certificate stores use different locks: if
+    /// the claim expires or a heartbeat fails while a slow mutation is in
+    /// flight, another replica can acquire and publish while the stale write
+    /// still lands, and the after-check detects the loss without being able to
+    /// undo it. Holding the lease lock for the whole mutation makes
+    /// acquisition, renewal, and takeover unable to cross the commit: another
+    /// replica's `try_acquire` blocks on the same lock until it has finished.
+    ///
+    /// The lease document is deliberately **never** rewritten here — the
+    /// mutation runs as a no-document-change lock scope — so a failing target
+    /// store cannot bump the lease store version or disturb any holder's
+    /// record. `commit`'s own result, error included, is carried out as the
+    /// outcome.
+    ///
+    /// # Lock order
+    ///
+    /// Lease store first, then the target store the closure touches. Nothing
+    /// takes them the other way round, so the nesting cannot cycle. Nothing
+    /// about the claim is exposed to `commit`, and no store contents are
+    /// logged.
+    ///
+    /// A commit that starts under a live claim may finish even if the nominal
+    /// TTL elapses mid-write, precisely because takeover is blocked on this
+    /// lock. The caller's next ownership check — immediately after the lock is
+    /// released — is what stops any further work.
+    pub fn commit_fenced<T>(
+        &self,
+        name: &str,
+        fence: u64,
+        commit: impl FnOnce() -> T,
+    ) -> Result<FencedCommit<T>, TlsLeaseError> {
+        let holder = self.holder.clone();
+        let name = name.to_string();
+        self.file.mutate_if::<_, TlsLeaseError>(move |document| {
+            let now = Utc::now();
+            let owned = document.leases.get(&name).is_some_and(|existing| {
+                existing.holder == holder && existing.fence == fence && existing.is_live_at(now)
+            });
+            if !owned {
+                return Ok((false, FencedCommit::NotOwner));
+            }
+            Ok((false, FencedCommit::Committed(commit())))
+        })
+    }
+
     fn release_claim(&self, name: &str, fence: u64) -> Result<bool, TlsLeaseError> {
         let holder = self.holder.clone();
         let name = name.to_string();
@@ -299,6 +368,17 @@ impl TlsLeaseStore {
             Ok((true, true))
         })
     }
+}
+
+/// Outcome of [`TlsLeaseStore::commit_fenced`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FencedCommit<T> {
+    /// The claim was live and still ours; the mutation ran under the lease
+    /// lock and produced this value.
+    Committed(T),
+    /// Ownership was absent, expired, or superseded. The mutation did **not**
+    /// run, so nothing was published on a claim this instance no longer holds.
+    NotOwner,
 }
 
 /// A held lease. Releases on drop so a completed or aborted renewal does not
@@ -368,9 +448,12 @@ pub struct RenewalLeaseLost;
 /// * loss is published on a `watch` channel that [`Self::guarded`] selects
 ///   against, so long-running async work is abandoned at its next await point
 ///   instead of at the next explicit check;
-/// * [`Self::ensure_owned`] is the synchronous-commit companion: it re-reads
-///   authoritative state without extending anything, for the checks either side
-///   of a store write and before publishing final certificate/order state.
+/// * [`Self::commit_fenced`] is the synchronous-commit companion: it verifies
+///   ownership and runs the target-store mutation under the *same* lease lock,
+///   so a superseded owner cannot publish certificate/order/account state;
+/// * [`Self::ensure_owned`] re-reads authoritative state without extending
+///   anything, for the check immediately after a fenced commit and before the
+///   next stretch of external work.
 ///
 /// A crashed process runs no heartbeat, so its claim expires and the
 /// certificate becomes reclaimable exactly as before.
@@ -382,6 +465,7 @@ pub struct RenewalLeaseKeeper {
     fence: u64,
     lost_tx: Arc<watch::Sender<bool>>,
     lost_rx: watch::Receiver<bool>,
+    stop_tx: watch::Sender<bool>,
     heartbeat: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -393,12 +477,14 @@ impl RenewalLeaseKeeper {
         let fence = guard.fence();
         let (lost_tx, lost_rx) = watch::channel(false);
         let lost_tx = Arc::new(lost_tx);
+        let (stop_tx, stop_rx) = watch::channel(false);
         let heartbeat = tokio::spawn(heartbeat_loop(
             Arc::clone(&store),
             name.clone(),
             fence,
             ttl,
             Arc::clone(&lost_tx),
+            stop_rx,
         ));
         Self {
             guard: Some(guard),
@@ -407,6 +493,7 @@ impl RenewalLeaseKeeper {
             fence,
             lost_tx,
             lost_rx,
+            stop_tx,
             heartbeat: Some(heartbeat),
         }
     }
@@ -441,6 +528,81 @@ impl RenewalLeaseKeeper {
             biased;
             _ = lost.wait_for(|lost| *lost) => Err(RenewalLeaseLost),
             output = future => Ok(output),
+        }
+    }
+
+    /// Run a best-effort cleanup step inside the claim's cancellation scope.
+    ///
+    /// Cleanup is a side effect like any other: a DNS-01 provider hook that
+    /// retracts `_acme-challenge` records must not run once the claim has moved
+    /// on, because the instance that took it over republishes those same names
+    /// and needs them to survive. An *ordinary* cleanup failure is not loss —
+    /// the caller logs it and may keep working under the claim it still holds.
+    pub async fn guarded_cleanup<F, T, E>(&self, cleanup: F) -> GuardedCleanup<T, E>
+    where
+        F: Future<Output = Result<T, E>>,
+    {
+        match self.guarded(cleanup).await {
+            Ok(Ok(value)) => GuardedCleanup::Completed(value),
+            Ok(Err(error)) => GuardedCleanup::Failed(error),
+            Err(RenewalLeaseLost) => GuardedCleanup::Lost,
+        }
+    }
+
+    /// Run a synchronous target-store mutation fenced by this claim.
+    ///
+    /// One `spawn_blocking` covers the ownership check *and* the mutation,
+    /// because [`TlsLeaseStore::commit_fenced`] holds the lease store's
+    /// exclusive advisory lock across both and that lock — like the target
+    /// store's own — is synchronous. Absent, expired, superseded, or unreadable
+    /// ownership, and a task that could not be joined, are all fail-closed
+    /// loss: the mutation never runs (or could not be driven to a conclusion),
+    /// the keeper is marked lost so concurrently [`guarded`](Self::guarded)
+    /// work is cancelled as well, and the caller abandons without publishing.
+    ///
+    /// A target-store *error* is not loss. It is carried inside `T` and
+    /// propagates to the caller normally.
+    pub async fn commit_fenced<T, F>(&self, commit: F) -> Result<T, RenewalLeaseLost>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        if self.is_lost() {
+            return Err(RenewalLeaseLost);
+        }
+        let store = Arc::clone(&self.store);
+        let name = self.name.clone();
+        let fence = self.fence;
+        let outcome =
+            tokio::task::spawn_blocking(move || store.commit_fenced(&name, fence, commit)).await;
+        match outcome {
+            Ok(Ok(FencedCommit::Committed(value))) => Ok(value),
+            Ok(Ok(FencedCommit::NotOwner)) => {
+                tracing::warn!(
+                    lease = %self.name,
+                    "the shared TLS renewal claim is no longer held by this instance; the store write was not performed"
+                );
+                self.mark_lost();
+                Err(RenewalLeaseLost)
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    lease = %self.name,
+                    error = %error,
+                    "could not fence a TLS store write against the shared renewal claim"
+                );
+                self.mark_lost();
+                Err(RenewalLeaseLost)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    lease = %self.name,
+                    error = %error,
+                    "fenced TLS store write could not be joined"
+                );
+                self.mark_lost();
+                Err(RenewalLeaseLost)
+            }
         }
     }
 
@@ -508,38 +670,90 @@ impl RenewalLeaseKeeper {
         }
     }
 
+    /// Settle the heartbeat: ask the loop to stop and wait for it, **without**
+    /// aborting.
+    ///
+    /// Aborting would only cancel the loop at its next await point. If that
+    /// await is the extension's `spawn_blocking` join handle, dropping the
+    /// handle neither cancels nor joins the blocking work, so the beat could
+    /// still land — after the release below — and leave a claim alive that
+    /// nobody is driving. Waiting for the loop to return is what makes
+    /// "settled" true, because the loop itself awaits its in-flight extension
+    /// before observing the stop signal.
     async fn stop_heartbeat(&mut self) {
+        let _ = self.stop_tx.send(true);
         let Some(handle) = self.heartbeat.take() else {
             return;
         };
-        handle.abort();
-        // Join so the heartbeat cannot still be mid-`spawn_blocking` extension
-        // while the release below removes the claim.
-        let _ = handle.await;
+        if let Err(error) = handle.await {
+            tracing::warn!(
+                lease = %self.name,
+                error = %error,
+                "TLS renewal claim heartbeat did not shut down cleanly"
+            );
+        }
     }
 }
 
 impl Drop for RenewalLeaseKeeper {
     fn drop(&mut self) {
-        // Without this an abandoned keeper would keep extending a claim nobody
-        // is acting on until the process exits.
+        // Emergency path only: `finish()` has already settled the heartbeat, so
+        // this runs for a keeper abandoned by an early return, a panic, or a
+        // cancelled scheduler. It is deliberately best effort — `drop` cannot
+        // await — but it must still be bounded, so the loop is both told to
+        // stop (it exits at the top of its next iteration, including after an
+        // in-flight extension returns) and aborted (so a loop parked in its
+        // sleep does not wait out the interval).
+        //
+        // A single detached in-flight beat cannot resurrect the claim. The
+        // guard's release — which runs immediately after this, when the
+        // keeper's fields drop — checks only holder and fence, while an
+        // extension additionally requires the record to be *live*. So a beat
+        // that lands first is overwritten by the release, and one that lands
+        // after it sees an already-elapsed `expires_at` and declines.
+        let _ = self.stop_tx.send(true);
         if let Some(handle) = self.heartbeat.take() {
             handle.abort();
         }
     }
 }
 
-/// Extend the claim until it is lost or the task is aborted.
+/// Outcome of [`RenewalLeaseKeeper::guarded_cleanup`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardedCleanup<T, E> {
+    /// The cleanup ran to completion under the claim.
+    Completed(T),
+    /// The cleanup ran and failed on its own terms. The claim is still held, so
+    /// the caller may log this and continue.
+    Failed(E),
+    /// The claim was lost before or during the cleanup, so it was cancelled and
+    /// the caller must abandon without publishing anything further.
+    Lost,
+}
+
+/// Extend the claim until it is lost or the keeper asks the loop to stop.
+///
+/// The stop signal is only ever observed at the top of an iteration, so an
+/// extension already in flight is awaited rather than left running detached.
+/// That is what lets [`RenewalLeaseKeeper::finish`] guarantee no beat lands
+/// after the release.
 async fn heartbeat_loop(
     store: Arc<TlsLeaseStore>,
     name: String,
     fence: u64,
     ttl: Duration,
     lost_tx: Arc<watch::Sender<bool>>,
+    mut stop_rx: watch::Receiver<bool>,
 ) {
     let interval = heartbeat_interval(ttl);
     loop {
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            biased;
+            // Resolves immediately when the stop signal is already set, so the
+            // iteration after an extension exits without another beat.
+            _ = stop_rx.wait_for(|stop| *stop) => return,
+            _ = tokio::time::sleep(interval) => {}
+        }
         let store = Arc::clone(&store);
         let beat_name = name.clone();
         let outcome =

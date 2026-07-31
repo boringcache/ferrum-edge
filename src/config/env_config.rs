@@ -1023,10 +1023,12 @@ pub struct EnvConfig {
     /// challenge ready.
     pub acme_dns01_propagation_seconds: u64,
     /// Lifetime of the shared per-certificate ACME renewal lease that makes one
-    /// instance the single renewer for a given certificate. A crashed holder's
-    /// claim expires after this long and another instance takes over, so the
-    /// value must comfortably exceed one full order/finalize cycle including
-    /// DNS-01 propagation. Default: 900.
+    /// instance the single renewer for a given certificate. The holder
+    /// heartbeats the claim every third of this value for as long as the
+    /// renewal runs, so it does **not** have to cover a whole order/finalize
+    /// cycle — only one heartbeat interval plus scheduling slack. What it does
+    /// set is how long a *crashed* holder's certificate stays unrenewable
+    /// before another instance takes over. Default: 900.
     pub acme_renewal_lease_ttl_seconds: u64,
     /// When true, streaming responses are wrapped with a lightweight tracker
     /// that records the final transfer time via a deferred task. Adds one
