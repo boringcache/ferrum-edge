@@ -1271,18 +1271,23 @@ fn estimate_prompt_tokens(json: &Value) -> u64 {
 ///
 /// # Estimator contract
 ///
-/// Walks every string value in the already-parsed request JSON once via
-/// [`string_value_character_count`]. That single pass covers known billed
-/// fields and unknown provider-native textual siblings alike — a present
-/// recognized field never suppresses an unknown sibling, and each JSON string
-/// value is counted at most once (distinct alias keys over-reserve rather than
-/// omit). Token-cap fields, multimodal binary/base64 subtrees, binary Anthropic
-/// `source` blocks, and well-formed `data:` URLs remain excluded by the walker.
+/// Walks the already-parsed request JSON once via [`prompt_json_character_count`],
+/// counting every billable string value **and** every visited object member name
+/// exactly once. Providers tokenize tool/function JSON Schema property names and
+/// nested schema keys as prompt input, so omitting member names under-reserves.
+/// The single pass covers known billed shapes and unknown provider-native
+/// textual siblings alike — a present recognized field never suppresses an
+/// unknown sibling, and distinct alias keys over-reserve rather than omit.
+/// Token-cap fields, multimodal binary/base64 subtrees, binary Anthropic
+/// `source` blocks, and well-formed `data:` URLs remain excluded (member names
+/// inside skipped subtrees are not counted). This is a conservative chars/4
+/// estimate, not provider tokenizer parity.
 ///
 /// The hot path is allocation-light: no cloning, locks, or per-request key sets;
-/// recursion is bounded by the request JSON the caller already parsed.
+/// recursion follows the `Value` tree the caller already parsed (bounded by the
+/// gateway's request-body limits).
 fn prompt_character_count(json: &Value) -> u64 {
-    string_value_character_count(json)
+    prompt_json_character_count(json)
 }
 
 /// Object keys whose values carry binary/non-text payloads (base64 image,
@@ -1292,8 +1297,9 @@ fn prompt_character_count(json: &Value) -> u64 {
 /// deny a vision request with a `429` *before* it is ever proxied, and a
 /// pre-proxy reject never reconciles, so the bogus estimate is never corrected.
 /// Image/audio inputs actually cost a small fixed number of tokens, not
-/// `bytes/4`, so we skip these subtrees entirely and rely on the text-bearing
-/// parts plus the requested output cap for the estimate.
+/// `bytes/4`, so we skip these subtrees entirely (including nested member names)
+/// and rely on the text-bearing parts plus the requested output cap for the
+/// estimate.
 ///
 /// Covered shapes:
 /// - OpenAI vision part: `{"type":"image_url","image_url":{"url":"data:..."}}`
@@ -1314,6 +1320,22 @@ const BINARY_CONTENT_KEYS: &[&str] = &[
     "file_data",
 ];
 
+/// Output-cap / token-control object keys excluded from the prompt walk at any
+/// depth. Their values are numeric control knobs (also used by
+/// [`requested_completion_tokens`]), not billed prompt prose; skipping the
+/// member entirely keeps the key name out of the estimate once member names are
+/// counted.
+const TOKEN_CAP_KEYS: &[&str] = &[
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "max_tokens_to_sample",
+    "max_new_tokens",
+    "maxOutputTokens",
+    "maxTokens",
+    "maxTokenCount",
+];
+
 /// Whether an Anthropic-style `source` block carries TEXT prose to count toward
 /// the estimate, rather than a binary blob to skip. Only an explicit
 /// `type:"text"` source (the Anthropic text-document shape
@@ -1331,7 +1353,13 @@ fn source_is_text_document(value: &Value) -> bool {
         == Some("text")
 }
 
-fn string_value_character_count(value: &Value) -> u64 {
+fn member_name_character_count(key: &str) -> u64 {
+    key.chars().count() as u64
+}
+
+/// Fail-closed prompt character walk: billable string values plus every visited
+/// object member name, excluding token-cap members and binary payload subtrees.
+fn prompt_json_character_count(value: &Value) -> u64 {
     match value {
         // A data URL (`data:<mime>;base64,<payload>`) is an inline binary blob,
         // not prose — count it as zero so a base64 image embedded directly in a
@@ -1345,30 +1373,32 @@ fn string_value_character_count(value: &Value) -> u64 {
             }
         }
         Value::Array(values) => values.iter().fold(0_u64, |acc, value| {
-            acc.saturating_add(string_value_character_count(value))
+            acc.saturating_add(prompt_json_character_count(value))
         }),
         Value::Object(values) => values.iter().fold(0_u64, |acc, (key, value)| {
-            if matches!(
-                key.as_str(),
-                "max_tokens" | "max_completion_tokens" | "max_output_tokens"
-            ) {
+            if TOKEN_CAP_KEYS.contains(&key.as_str()) {
                 return acc;
             }
-            // `source` is binary for image/PDF documents (skip) but prose for a
-            // text document (`source:{type:"text",...,data:"<prose>"}`) — that
-            // prose is sent to the model and billed as input, so count it. Only a
-            // genuinely binary source is skipped.
+            // `source` is binary for image/PDF documents (skip key + subtree) but
+            // prose for a text document (`source:{type:"text",...,data:"<prose>"}`)
+            // — that prose is sent to the model and billed as input, so count the
+            // member name and recurse. Only a genuinely binary source is skipped.
             if key == "source" {
                 return if source_is_text_document(value) {
-                    acc.saturating_add(string_value_character_count(value))
+                    acc.saturating_add(member_name_character_count(key))
+                        .saturating_add(prompt_json_character_count(value))
                 } else {
                     acc
                 };
             }
             if BINARY_CONTENT_KEYS.contains(&key.as_str()) {
+                // Skip the binary member name and its entire subtree so attacker-
+                // controlled keys nested under image/audio/file payloads cannot
+                // manufacture prompt overcharge.
                 acc
             } else {
-                acc.saturating_add(string_value_character_count(value))
+                acc.saturating_add(member_name_character_count(key))
+                    .saturating_add(prompt_json_character_count(value))
             }
         }),
         _ => 0,
