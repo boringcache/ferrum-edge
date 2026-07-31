@@ -11,10 +11,10 @@
 use crate::common::{TestGateway, TestGatewayBuilder};
 
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashSet;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::Frame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::{CloseCode, Data, OpCode};
@@ -185,6 +185,40 @@ async fn spawn_ws_plugins_gateway(
         .spawn()
         .await
         .expect("spawn ws plugins gateway")
+}
+
+fn ws_frame_log_connection_ids(output: &str) -> (HashSet<u64>, HashSet<u64>) {
+    let mut frame_ids = HashSet::new();
+    let mut disconnect_ids = HashSet::new();
+    for line in output.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("target").and_then(|target| target.as_str()) != Some("ws_frame_log") {
+            continue;
+        }
+        let fields = value.get("fields").unwrap_or(&value);
+        let Some(id) = fields.get("connection_id").and_then(|value| value.as_u64()) else {
+            continue;
+        };
+        let is_disconnect = fields.get("event").and_then(|event| event.as_str())
+            == Some("disconnect")
+            || fields
+                .get("message")
+                .and_then(|message| message.as_str())
+                .is_some_and(|message| message.contains("session ended"));
+        if is_disconnect {
+            disconnect_ids.insert(id);
+        } else if fields.get("frame_type").is_some()
+            || fields
+                .get("message")
+                .and_then(|message| message.as_str())
+                .is_some_and(|message| message.contains("WebSocket frame"))
+        {
+            frame_ids.insert(id);
+        }
+    }
+    (frame_ids, disconnect_ids)
 }
 
 // ============================================================================
@@ -587,15 +621,11 @@ async fn test_ws_frame_logging_connection_id_correlates_frame_and_disconnect() {
     ws_a.send(Message::Close(None)).await.unwrap();
     let _ = ws_a.next().await;
 
-    // Allow disconnect hooks to flush structured logs.
-    sleep(Duration::from_millis(500)).await;
-
     let captured = gateway
         .wait_for_captured_output(
             |output| {
-                output
-                    .lines()
-                    .any(|line| line.contains("ws_frame_log") || line.contains("connection_id"))
+                let (frame_ids, disconnect_ids) = ws_frame_log_connection_ids(output);
+                frame_ids.len() >= 2 && disconnect_ids == frame_ids
             },
             Duration::from_secs(5),
         )
@@ -613,37 +643,7 @@ async fn test_ws_frame_logging_connection_id_correlates_frame_and_disconnect() {
         "expected ws_frame_log output; got none (check FERRUM_LOG_LEVEL / RUST_LOG)"
     );
 
-    let mut frame_ids = std::collections::HashSet::new();
-    let mut disconnect_ids = std::collections::HashSet::new();
-    for line in &logs {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if value.get("target").and_then(|t| t.as_str()) != Some("ws_frame_log") {
-            continue;
-        }
-        // tracing-subscriber JSON nests event attributes under `fields` while
-        // leaving `target` at the envelope root.
-        let fields = value.get("fields").unwrap_or(&value);
-        let Some(id) = fields.get("connection_id").and_then(|v| v.as_u64()) else {
-            continue;
-        };
-        let is_disconnect = fields.get("event").and_then(|e| e.as_str()) == Some("disconnect")
-            || fields
-                .get("message")
-                .and_then(|m| m.as_str())
-                .is_some_and(|m| m.contains("session ended"));
-        if is_disconnect {
-            disconnect_ids.insert(id);
-        } else if fields.get("frame_type").is_some()
-            || fields
-                .get("message")
-                .and_then(|m| m.as_str())
-                .is_some_and(|m| m.contains("WebSocket frame"))
-        {
-            frame_ids.insert(id);
-        }
-    }
+    let (frame_ids, disconnect_ids) = ws_frame_log_connection_ids(&captured);
 
     assert!(
         frame_ids.len() >= 2,
@@ -714,12 +714,29 @@ async fn test_ws_frame_logging_peer_close_and_disconnect_fields() {
     })
     .await;
 
-    // Allow disconnect logging to flush.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
     let captured = gateway
         .wait_for_captured_output(
-            |output| output.lines().any(|line| line.contains("ws_frame_log")),
+            |output| {
+                let close_delivered = output.lines().any(|line| {
+                    line.contains("ws_frame_log")
+                        && line.contains("frame_type")
+                        && line.contains("close")
+                        && line.contains("outcome")
+                        && line.contains("delivered")
+                        && line.contains("close_code")
+                        && line.contains("1000")
+                });
+                let disconnect_complete = output.lines().any(|line| {
+                    line.contains("ws_frame_log")
+                        && line.contains("event")
+                        && line.contains("disconnect")
+                        && line.contains("bytes_c2b")
+                        && line.contains("bytes_b2c")
+                        && line.contains("io_side")
+                        && line.contains("frames_c2b")
+                });
+                close_delivered && disconnect_complete
+            },
             Duration::from_secs(5),
         )
         .await
