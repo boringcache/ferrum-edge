@@ -3523,6 +3523,45 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
     assert!(candidate.contains("validate_plugin_security_composition(plugins)"));
 }
 
+fn enforces_finalized_request_policy_override_returns_true(source: &str, fn_offset: usize) -> bool {
+    let after = &source[fn_offset..];
+    let open = match after.find('{') {
+        Some(idx) => idx,
+        None => return false,
+    };
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, ch) in after[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = match close {
+        Some(idx) => idx,
+        None => return false,
+    };
+    let body = &after[open + 1..close];
+    let mut expr = String::new();
+    for line in body.lines() {
+        let line = line.split("//").next().unwrap_or(line).trim();
+        if !line.is_empty() {
+            if !expr.is_empty() {
+                expr.push(' ');
+            }
+            expr.push_str(line);
+        }
+    }
+    expr == "true"
+}
+
 #[test]
 fn finalized_request_policy_candidate_inventory_covers_every_builtin_override() {
     // Mechanically pin candidate admission inventories against every production
@@ -3565,10 +3604,7 @@ fn finalized_request_policy_candidate_inventory_covers_every_builtin_override() 
     for source in &plugin_sources {
         let mut search = source.as_str();
         while let Some(offset) = search.find("fn enforces_finalized_request_policy") {
-            let after = &search[offset..];
-            let body_end = after.find("\n    fn ").unwrap_or(after.len().min(200));
-            let body = &after[..body_end];
-            if body.contains("true") {
+            if enforces_finalized_request_policy_override_returns_true(search, offset) {
                 // Walk backward to the nearest `fn name(&self)` return literal.
                 let before = &search[..offset];
                 let name_fn = before
