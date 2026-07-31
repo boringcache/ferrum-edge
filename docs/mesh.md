@@ -2840,6 +2840,25 @@ Ferrum merges its `FerrumAccepted` condition into the live `status.conditions[]`
 
 Istio status writing requires `get/list/watch` on the watched Istio CRDs plus `patch` on their `status` subresources; the standard Istio CRD manifests already declare `subresources: { status: {} }`.
 
+### Kubernetes Mesh Overlay Ownership And Withdrawal
+
+The Kubernetes controller publishes mesh state as an **overlay** that it owns independently of the DB-authored `GatewayConfig` (CP DB snapshots never carry `mesh`). Ownership is explicit rather than inferred from the presence of a mesh block:
+
+- **No mesh authority.** A controller that watches no mesh-contributing kind — no Istio CRDs (`FERRUM_K8S_WATCH_ISTIO_CRDS=false`), no Gateway API (`FERRUM_K8S_WATCH_GATEWAY_API_CRDS=false`), and no pod discovery (`FERRUM_K8S_POD_DISCOVERY_ENABLED=false`) — owns no mesh objects. It never withdraws mesh state published by another source, and a reconcile carries no mesh update at all.
+- **Mesh authority.** With any of those watches enabled, the controller authoritatively owns the mesh objects in its managed namespaces (`FERRUM_K8S_WATCH_NAMESPACES` plus every namespace it observed; empty means a cluster-wide watch, i.e. every namespace).
+
+Deleting the **last** mesh-contributing Kubernetes object therefore withdraws the overlay instead of leaving the previous snapshot live. An authoritative snapshot that translates to an empty mesh removes every Kubernetes-owned mesh object — `Service`/`Pod`-derived services and workloads, `AuthorizationPolicy`, `PeerAuthentication`, `RequestAuthentication`, `DestinationRule`, `ServiceEntry`, `WorkloadEntry`, `Sidecar`, `Telemetry`, `ProxyConfig`, and waypoint bindings — while mesh objects owned by native / file / xDS sources in other namespaces survive untouched. Mesh-global blocks (`trust_bundles`, `multi_cluster`, `outboundTrafficPolicy`, extension configs) are not produced by the Kubernetes translator and are never withdrawn by it.
+
+Operational properties:
+
+- **Atomic.** The withdrawal is one `ArcSwap` compare-and-swap of a complete `GatewayConfig` under the CP publication gate, followed by one full mesh broadcast. An in-flight request holds either the complete pre-withdrawal snapshot or the complete post-withdrawal one — never a half-withdrawn mesh.
+- **Idempotent.** A repeated empty snapshot produces no content change, so nothing is re-committed and nothing is re-broadcast.
+- **Fail-closed on translation failure.** A translation that cannot be produced (repeated failure on the same resource) publishes nothing at all, so a broken CRD can never be mistaken for a deletion. Only a *successful* translation withdraws.
+- **Survives CP full reload.** The accepted overlay slot stores the authoritative empty translation as translated, so a later DB full reload re-merges the withdrawal rather than resurrecting the deleted mesh.
+- **Visible.** The withdrawal is logged (`Kubernetes mesh overlay withdrawn…`, carrying no resource identifiers or policy contents), the published snapshot stops advertising mesh on the admin status surfaces, and mesh data planes receive a fresh slice whose resource counts and fingerprint reflect the removal on [`/mesh/config-drift`](#config-drift-introspection).
+
+Because withdrawal follows the Kubernetes source of truth, deleting every `AuthorizationPolicy` restores the Istio default (allow when no `ALLOW` rules exist) and deleting every `PeerAuthentication` restores the default mTLS mode — the same posture a fresh cluster starts in. Keep at least one mesh-wide policy in the Istio root namespace if you need a standing floor.
+
 ### Pod Auto-Discovery
 
 Control planes can opt into native Kubernetes service-registry discovery with `FERRUM_K8S_CONTROLLER_ENABLED=true` and `FERRUM_K8S_POD_DISCOVERY_ENABLED=true`. When enabled, the K8s controller watches `Pod`, `Service`, `EndpointSlice`, and `Node` resources in addition to the configured Istio/Gateway API watches. Ready Pods linked from EndpointSlices become mesh `Workload` entries, Services become mesh `MeshService` entries with their `spec.ports[]`, and Node `topology.kubernetes.io/region|zone` labels populate workload locality metadata consumed by locality-aware load balancing.

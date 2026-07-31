@@ -2536,6 +2536,68 @@ pub struct GatewayConfig {
     /// has already accepted a revisioned slice.
     #[serde(skip)]
     pub mesh_revision: Option<crate::modes::mesh::revision::MeshConfigRevision>,
+    /// Kubernetes mesh-overlay ownership marker (issue #2452).
+    ///
+    /// DERIVED, CP-in-memory only (`#[serde(skip)]`, same contract as
+    /// [`Self::mesh_revision`]): it never rides the ConfigSync `config_json`
+    /// wire, is never persisted, and defaults to
+    /// [`K8sMeshOverlay::NoAuthority`] for every snapshot that did not come
+    /// from a Kubernetes translation.
+    ///
+    /// On a Kubernetes **translation** it records whether that source is a
+    /// mesh authority and, if so, which namespaces its mesh objects occupy —
+    /// which is what lets `merge_k8s_translation` distinguish "Kubernetes has
+    /// no mesh authority, preserve whatever another source owns" from "the
+    /// managed Kubernetes snapshot is authoritatively empty, withdraw the
+    /// Kubernetes-owned mesh objects".
+    ///
+    /// On a **merged** snapshot it carries that same owned-namespace set
+    /// forward so the next merge can still withdraw objects whose namespace
+    /// has since dropped out of the managed set.
+    #[serde(skip)]
+    pub k8s_mesh_overlay: K8sMeshOverlay,
+}
+
+/// Whether a Kubernetes config source claims authority over mesh state.
+///
+/// The distinction this type encodes is load-bearing (issue #2452): before it
+/// existed, a managed-but-empty Kubernetes snapshot and "no Kubernetes mesh
+/// source at all" were both represented as `GatewayConfig.mesh == None`, so
+/// deleting the last mesh-contributing Kubernetes object left the previously
+/// published mesh live forever.
+///
+/// Authority is a property of the controller's **configuration** (which kinds
+/// it watches), never of the current snapshot's contents — otherwise deleting
+/// the last object would revoke the very authority needed to withdraw it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum K8sMeshOverlay {
+    /// This source supplies no mesh overlay and owns no mesh objects. A merge
+    /// leaves mesh state owned by other sources exactly as it found it.
+    #[default]
+    NoAuthority,
+    /// This source authoritatively supplies the mesh objects in
+    /// `owned_namespaces` — possibly the empty set, which is a withdrawal of
+    /// everything Kubernetes previously owned.
+    Authoritative {
+        /// Namespaces occupied by this source's mesh objects. Empty is
+        /// meaningful: it is an authoritative "Kubernetes owns nothing".
+        owned_namespaces: BTreeSet<String>,
+    },
+}
+
+impl K8sMeshOverlay {
+    /// `true` when this source owns mesh objects and may withdraw them.
+    pub fn is_authoritative(&self) -> bool {
+        matches!(self, Self::Authoritative { .. })
+    }
+
+    /// Namespaces this source claims, or `None` when it claims no authority.
+    pub fn owned_namespaces(&self) -> Option<&BTreeSet<String>> {
+        match self {
+            Self::NoAuthority => None,
+            Self::Authoritative { owned_namespaces } => Some(owned_namespaces),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

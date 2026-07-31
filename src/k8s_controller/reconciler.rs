@@ -8,7 +8,7 @@ use serde_json::Value;
 use tokio::sync::{broadcast, watch};
 use tracing::{debug, error, info, warn};
 
-use crate::config::types::GatewayConfig;
+use crate::config::types::{GatewayConfig, K8sMeshOverlay};
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
     translate_k8s_objects_with_filter,
@@ -101,18 +101,26 @@ impl CpPublicationGate {
 /// Only ever called after a translation SUCCEEDS, so a failed translate never
 /// overwrites the last accepted overlay with an empty one.
 ///
-/// Mesh retention matches [`merge_k8s_translation`]: a successful translate that
-/// omits `mesh` must not erase a previously accepted mesh block. The overlay
-/// slot is the sole mesh source on CP full-reload re-merge (DB snapshots clear
-/// `mesh`), so dropping it here would let the next DB poll wipe mesh from
-/// `config_arc` even though merging the same translate into the live snapshot
-/// would have kept it (#2982).
+/// Mesh retention matches [`merge_k8s_translation`] and is gated on the same
+/// ownership marker (#2982, then #2452):
+///
+/// * With no Kubernetes mesh authority, a translate that omits `mesh` carries
+///   no mesh update at all, so the previously accepted block is retained. The
+///   overlay slot is the sole mesh source on CP full-reload re-merge (DB
+///   snapshots clear `mesh`), so dropping it would let the next DB poll wipe
+///   mesh from `config_arc` even though merging the same translate into the
+///   live snapshot would have kept it.
+/// * With Kubernetes mesh authority, an omitted `mesh` is an authoritative
+///   empty set. Retaining the previous block here would resurrect withdrawn
+///   mesh objects on the next CP full reload, so the translation is stored
+///   exactly as translated.
 pub fn store_accepted_k8s_overlay(
     slot: &K8sOverlaySlot,
     mut translation: GatewayConfig,
     managed_namespaces: BTreeSet<String>,
 ) {
-    if translation.mesh.is_none()
+    if !translation.k8s_mesh_overlay.is_authoritative()
+        && translation.mesh.is_none()
         && let Some(previous) = slot.load_full().as_ref()
     {
         translation.mesh = previous.translation.mesh.clone();
@@ -155,6 +163,10 @@ pub struct ReconcilerConfig {
     /// passed to the Istio status writer so it reports `ingress_modeled` only
     /// when the data plane actually materializes the listeners (F6 §6.2).
     pub mesh_sidecar_ingress_enforced: bool,
+    /// Whether this controller is an authoritative owner of mesh state
+    /// (issue #2452). See
+    /// [`crate::config_sources::k8s::K8sTranslationOptions::mesh_overlay_authority`].
+    pub mesh_overlay_authority: bool,
 }
 
 pub struct ReconcileBroadcasters {
@@ -279,6 +291,7 @@ async fn run_reconcile_loop(
                 .clone(),
             gateway_api_status_address: reconciler_config.gateway_api_status_address.clone(),
             mesh_sidecar_ingress_enforced: reconciler_config.mesh_sidecar_ingress_enforced,
+            mesh_overlay_authority: reconciler_config.mesh_overlay_authority,
             gateway_status_writer: gateway_status_writer.clone(),
             istio_status_writer: istio_status_writer.clone(),
             metrics: Arc::clone(&metrics),
@@ -327,6 +340,7 @@ async fn run_reconcile_loop(
                             .clone(),
                         mesh_sidecar_ingress_enforced: reconciler_config
                             .mesh_sidecar_ingress_enforced,
+                        mesh_overlay_authority: reconciler_config.mesh_overlay_authority,
                         gateway_status_writer: gateway_status_writer.clone(),
                         istio_status_writer: istio_status_writer.clone(),
                         metrics: Arc::clone(&metrics),
@@ -369,6 +383,7 @@ async fn run_reconcile_loop(
                             .clone(),
                         mesh_sidecar_ingress_enforced: reconciler_config
                             .mesh_sidecar_ingress_enforced,
+                        mesh_overlay_authority: reconciler_config.mesh_overlay_authority,
                         gateway_status_writer: gateway_status_writer.clone(),
                         istio_status_writer: istio_status_writer.clone(),
                         metrics: Arc::clone(&metrics),
@@ -554,6 +569,8 @@ struct ReconcileContext {
     gateway_api_data_plane_service_name: Option<String>,
     gateway_api_status_address: Option<String>,
     mesh_sidecar_ingress_enforced: bool,
+    /// Kubernetes mesh-overlay ownership gate (issue #2452).
+    mesh_overlay_authority: bool,
     gateway_status_writer: Option<GatewayApiStatusWriter>,
     /// T2-B: Istio CRD status sub-resource patcher. `None` when the
     /// controller couldn't be built (no Istio CRD watching, or the
@@ -697,7 +714,8 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         .with_source_namespaces(source_namespaces)
         .with_pod_source_namespaces(ctx.watch_namespaces.clone())
         .with_pod_discovery_enabled(ctx.pod_discovery_enabled)
-        .with_mesh_sidecar_ingress_enforced(ctx.mesh_sidecar_ingress_enforced);
+        .with_mesh_sidecar_ingress_enforced(ctx.mesh_sidecar_ingress_enforced)
+        .with_mesh_overlay_authority(ctx.mesh_overlay_authority);
     let Some(translation) = translate_with_skip_retries(&objects, options.clone(), &ctx.metrics)
     else {
         return;
@@ -946,6 +964,13 @@ where
     tokio::time::timeout(timeout, future).await
 }
 
+/// Commit one Kubernetes translation into `config_arc`.
+///
+/// The merge is recomputed on every CAS retry, so the mesh overlay is always
+/// withdrawn from — and layered onto — the snapshot that actually loses the
+/// race, and the winning store publishes ONE complete snapshot. A consumer
+/// holding an older `Arc` keeps a consistent pre-withdrawal view for the life
+/// of its request; the next load sees the complete post-withdrawal view.
 pub fn swap_merged_k8s_translation(
     config_arc: &ArcSwap<GatewayConfig>,
     k8s_config: &GatewayConfig,
@@ -965,6 +990,7 @@ pub fn swap_merged_k8s_translation(
 
         let previous = config_arc.compare_and_swap(&*old_config, new_config.clone());
         if Arc::ptr_eq(&*old_config, &*previous) {
+            log_mesh_overlay_transition(old_config.as_ref(), &new_config, k8s_config);
             return Some(new_config);
         }
 
@@ -974,6 +1000,39 @@ pub fn swap_merged_k8s_translation(
 
 fn gateway_config_content_changed(new_config: &GatewayConfig, old_config: &GatewayConfig) -> bool {
     stable_config_value(new_config) != stable_config_value(old_config)
+}
+
+/// Report a Kubernetes mesh-overlay transition on the winning publication so
+/// operators can correlate "the last mesh resource was deleted" with the exact
+/// snapshot that withdrew it (issue #2452).
+///
+/// The message carries no resource identifiers, selectors, or policy contents,
+/// so a mesh withdrawal cannot become a configuration-disclosure surface in
+/// logs.
+fn log_mesh_overlay_transition(
+    old_config: &GatewayConfig,
+    new_config: &GatewayConfig,
+    k8s_config: &GatewayConfig,
+) {
+    if !k8s_config.k8s_mesh_overlay.is_authoritative() {
+        return;
+    }
+    let owned_namespaces = k8s_config
+        .k8s_mesh_overlay
+        .owned_namespaces()
+        .map(|namespaces| namespaces.len())
+        .unwrap_or(0);
+    if owned_namespaces > 0 {
+        return;
+    }
+    if old_config.mesh.is_some() && new_config.mesh.is_none() {
+        info!(
+            "Kubernetes mesh overlay withdrawn: the managed Kubernetes snapshot supplies no \
+             mesh resources and no other source owns any"
+        );
+    } else if old_config.mesh.is_some() {
+        info!("Kubernetes mesh overlay withdrawn; other sources' mesh state retained");
+    }
 }
 
 const K8S_MANAGED_PROXY_ID_PREFIXES: &[&str] = &["gwapi-route-", "gwapi-l4-", "istio-vs-"];
@@ -1009,6 +1068,24 @@ fn namespace_is_managed(namespace: &str, managed_namespaces: &BTreeSet<String>) 
     managed_namespaces.is_empty() || managed_namespaces.contains(namespace)
 }
 
+/// Compose the active snapshot with one Kubernetes translation.
+///
+/// Mesh state follows `k8s_config.k8s_mesh_overlay` (issue #2452):
+///
+/// * [`K8sMeshOverlay::NoAuthority`] — Kubernetes is not a mesh source. Mesh
+///   state owned by another source is left exactly as found, and a mesh block
+///   the caller did supply still replaces the active one (the pre-#2452
+///   contract for hand-composed overlays).
+/// * [`K8sMeshOverlay::Authoritative`] — Kubernetes owns the mesh objects in
+///   the managed namespaces. Those are withdrawn first and the translation's
+///   own objects layered back on, so an authoritatively EMPTY translation
+///   withdraws every Kubernetes-owned mesh object while objects owned by
+///   native/file/xDS sources in other namespaces survive.
+///
+/// The result is a whole new `GatewayConfig`; the caller publishes it through
+/// a single `ArcSwap` compare-and-swap, so an in-flight consumer observes
+/// either the complete old snapshot or the complete new one — never a
+/// half-withdrawn mesh.
 pub fn merge_k8s_translation(
     active: &GatewayConfig,
     k8s_config: &GatewayConfig,
@@ -1040,12 +1117,68 @@ pub fn merge_k8s_translation(
     namespaces.extend(k8s_config.known_namespaces.iter().cloned());
     merged.known_namespaces = namespaces.into_iter().collect();
 
-    if k8s_config.mesh.is_some() {
-        merged.mesh = k8s_config.mesh.clone();
-    }
+    merge_k8s_mesh_overlay(&mut merged, k8s_config, managed_namespaces);
 
     merged.normalize_fields();
     merged
+}
+
+/// Apply the Kubernetes mesh overlay to `merged` under explicit ownership.
+///
+/// The withdrawal set is the union of
+///
+/// * the managed namespaces (empty means a cluster-wide watch, i.e. every
+///   namespace is Kubernetes-managed — the same rule the proxy/upstream/plugin
+///   retains above use),
+/// * the namespaces the PREVIOUS Kubernetes overlay occupied, carried on
+///   `active.k8s_mesh_overlay`, so an object whose namespace has since dropped
+///   out of the managed set is still withdrawn instead of stranded, and
+/// * the namespaces this translation occupies, so a re-published object is
+///   replaced rather than duplicated.
+///
+/// Mesh-global blocks (`trust_bundles`, `multi_cluster`,
+/// `outbound_traffic_policy`, `extension_configs`) are never withdrawn here:
+/// the Kubernetes translator does not produce them, so it does not own them.
+/// `istio_root_namespace` is adopted from the translation only when the
+/// translation actually carries mesh objects.
+fn merge_k8s_mesh_overlay(
+    merged: &mut GatewayConfig,
+    k8s_config: &GatewayConfig,
+    managed_namespaces: &BTreeSet<String>,
+) {
+    let Some(owned_namespaces) = k8s_config.k8s_mesh_overlay.owned_namespaces() else {
+        // No Kubernetes mesh authority: never withdraw another source's mesh.
+        if k8s_config.mesh.is_some() {
+            merged.mesh = k8s_config.mesh.clone();
+        }
+        return;
+    };
+
+    let mut previously_owned: BTreeSet<String> = merged
+        .k8s_mesh_overlay
+        .owned_namespaces()
+        .cloned()
+        .unwrap_or_default();
+    previously_owned.extend(owned_namespaces.iter().cloned());
+
+    let mut mesh = merged.mesh.take().unwrap_or_default();
+    mesh.retain_object_namespaces(|namespace| {
+        let managed = namespace_is_managed(namespace, managed_namespaces);
+        !managed && !previously_owned.contains(namespace)
+    });
+    if let Some(k8s_mesh) = k8s_config.mesh.as_deref() {
+        mesh.istio_root_namespace = k8s_mesh.istio_root_namespace.clone();
+        mesh.extend_objects_from(k8s_mesh);
+    }
+
+    if mesh.is_empty_overlay() {
+        merged.mesh = None;
+    } else {
+        merged.mesh = Some(mesh);
+    }
+    merged.k8s_mesh_overlay = K8sMeshOverlay::Authoritative {
+        owned_namespaces: owned_namespaces.clone(),
+    };
 }
 
 fn merge_k8s_frontend_tls(merged: &mut GatewayConfig, k8s_config: &GatewayConfig) {
@@ -2017,8 +2150,12 @@ mod tests {
         );
     }
 
+    /// A source with NO mesh authority carries no mesh update at all, so the
+    /// active mesh survives. Issue #2452 changed only the authoritative case:
+    /// see `tests/unit/config/k8s_mesh_overlay_withdrawal_tests.rs` for the
+    /// withdrawal coverage.
     #[test]
-    fn merge_k8s_translation_preserves_existing_mesh_when_k8s_has_none() {
+    fn merge_k8s_translation_preserves_existing_mesh_when_k8s_has_no_authority() {
         let mut active = GatewayConfig {
             mesh: Some(Box::new(MeshConfig::default())),
             ..GatewayConfig::default()

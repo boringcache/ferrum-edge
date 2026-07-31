@@ -14,7 +14,7 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
 
@@ -2728,6 +2728,209 @@ impl MeshConfig {
             &mut self.virtual_service_cors_policies,
             self.multi_cluster.as_mut(),
         );
+    }
+
+    /// Every namespace that owns at least one namespaced mesh object here.
+    ///
+    /// This is the ownership footprint a config source publishes: the
+    /// Kubernetes overlay records it on
+    /// [`crate::config::types::GatewayConfig::k8s_mesh_overlay`] so a later
+    /// merge can still withdraw objects whose namespace has since stopped
+    /// appearing in the managed set (issue #2452).
+    ///
+    /// The `serde(skip)` runtime-only back-projections
+    /// (`node_waypoint_capture_*`, `local_*`) are deliberately excluded: they
+    /// are per-slice derivations, never source-owned configuration, and are
+    /// always default on a control-plane snapshot.
+    pub fn object_namespaces(&self) -> BTreeSet<String> {
+        let mut namespaces = BTreeSet::new();
+        collect_ns(&self.workloads, &mut namespaces);
+        collect_ns(&self.services, &mut namespaces);
+        collect_ns(&self.mesh_policies, &mut namespaces);
+        collect_ns(&self.peer_authentications, &mut namespaces);
+        collect_ns(&self.service_entries, &mut namespaces);
+        collect_ns(&self.request_authentications, &mut namespaces);
+        collect_ns(&self.telemetry_resources, &mut namespaces);
+        collect_ns(&self.destination_rules, &mut namespaces);
+        collect_ns(&self.virtual_service_cors_policies, &mut namespaces);
+        collect_ns(&self.proxy_configs, &mut namespaces);
+        collect_ns(&self.sidecars, &mut namespaces);
+        collect_ns(&self.waypoint_bindings, &mut namespaces);
+        namespaces
+    }
+
+    /// Drop every namespaced mesh object whose namespace fails `keep`.
+    ///
+    /// Used to withdraw one source's mesh objects while leaving objects owned
+    /// by other sources in place. Mesh-global blocks (`trust_bundles`,
+    /// `multi_cluster`, `outbound_traffic_policy`, `extension_configs`,
+    /// `istio_root_namespace`) are NOT namespaced and are never withdrawn
+    /// here — the caller decides whether its source owns them.
+    pub fn retain_object_namespaces(&mut self, keep: impl Fn(&str) -> bool) {
+        retain_ns(&mut self.workloads, &keep);
+        retain_ns(&mut self.services, &keep);
+        retain_ns(&mut self.mesh_policies, &keep);
+        retain_ns(&mut self.peer_authentications, &keep);
+        retain_ns(&mut self.service_entries, &keep);
+        retain_ns(&mut self.request_authentications, &keep);
+        retain_ns(&mut self.telemetry_resources, &keep);
+        retain_ns(&mut self.destination_rules, &keep);
+        retain_ns(&mut self.virtual_service_cors_policies, &keep);
+        retain_ns(&mut self.proxy_configs, &keep);
+        retain_ns(&mut self.sidecars, &keep);
+        retain_ns(&mut self.waypoint_bindings, &keep);
+    }
+
+    /// Append every namespaced mesh object from `other`, leaving this config's
+    /// own objects and every mesh-global block untouched.
+    ///
+    /// Ordering is append-only so a source that emits its objects in a
+    /// deterministic order keeps that order inside the merged view.
+    pub fn extend_objects_from(&mut self, other: &MeshConfig) {
+        for item in &other.workloads {
+            self.workloads.push(item.clone());
+        }
+        for item in &other.services {
+            self.services.push(item.clone());
+        }
+        for item in &other.mesh_policies {
+            self.mesh_policies.push(item.clone());
+        }
+        for item in &other.peer_authentications {
+            self.peer_authentications.push(item.clone());
+        }
+        for item in &other.service_entries {
+            self.service_entries.push(item.clone());
+        }
+        for item in &other.request_authentications {
+            self.request_authentications.push(item.clone());
+        }
+        for item in &other.telemetry_resources {
+            self.telemetry_resources.push(item.clone());
+        }
+        for item in &other.destination_rules {
+            self.destination_rules.push(item.clone());
+        }
+        for item in &other.virtual_service_cors_policies {
+            self.virtual_service_cors_policies.push(item.clone());
+        }
+        for item in &other.proxy_configs {
+            self.proxy_configs.push(item.clone());
+        }
+        for item in &other.sidecars {
+            self.sidecars.push(item.clone());
+        }
+        for item in &other.waypoint_bindings {
+            self.waypoint_bindings.push(item.clone());
+        }
+    }
+
+    /// `true` when this config carries nothing beyond its root namespace.
+    ///
+    /// Structural equality against a default config with the same
+    /// `istio_root_namespace`, so a field added to [`MeshConfig`] later is
+    /// covered without touching this predicate. `GatewayConfig.mesh` is
+    /// normalized back to `None` when this holds, which keeps `mesh.is_some()`
+    /// meaning "this deployment has mesh state" everywhere it is read.
+    pub fn is_empty_overlay(&self) -> bool {
+        let empty = MeshConfig {
+            istio_root_namespace: self.istio_root_namespace.clone(),
+            ..MeshConfig::default()
+        };
+        *self == empty
+    }
+}
+
+/// One namespaced mesh object.
+///
+/// Implemented by every [`MeshConfig`] collection element a config source can
+/// own, so Kubernetes overlay ownership accounting ([`MeshConfig::object_namespaces`],
+/// [`MeshConfig::retain_object_namespaces`], [`MeshConfig::extend_objects_from`])
+/// cannot silently miss a collection (issue #2452).
+pub trait MeshNamespacedObject {
+    /// The namespace that owns this object.
+    fn object_namespace(&self) -> &str;
+}
+
+fn collect_ns<T: MeshNamespacedObject>(items: &[T], out: &mut BTreeSet<String>) {
+    for item in items {
+        out.insert(item.object_namespace().to_string());
+    }
+}
+
+fn retain_ns<T: MeshNamespacedObject>(items: &mut Vec<T>, keep: &dyn Fn(&str) -> bool) {
+    items.retain(|item| keep(item.object_namespace()));
+}
+
+impl MeshNamespacedObject for Workload {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+}
+
+impl MeshNamespacedObject for MeshService {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+}
+
+impl MeshNamespacedObject for MeshPolicy {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+}
+
+impl MeshNamespacedObject for PeerAuthentication {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+}
+
+impl MeshNamespacedObject for ServiceEntry {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+}
+
+impl MeshNamespacedObject for MeshRequestAuthentication {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+}
+
+impl MeshNamespacedObject for MeshTelemetryResource {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+}
+
+impl MeshNamespacedObject for MeshDestinationRule {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+}
+
+impl MeshNamespacedObject for MeshVirtualServiceCorsPolicy {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+}
+
+impl MeshNamespacedObject for MeshProxyConfig {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+}
+
+impl MeshNamespacedObject for MeshSidecar {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+}
+
+impl MeshNamespacedObject for MeshWaypointBinding {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
     }
 }
 
