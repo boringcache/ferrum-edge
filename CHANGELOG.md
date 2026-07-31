@@ -92,6 +92,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Updated the transitive `event-listener` dependency from 5.4.1 to 5.4.2,
+  removing the `StackSlot` cross-thread unsoundness reported as
+  RUSTSEC-2026-0221.
+
 - `ai_rate_limiter` pre-dispatch prompt reservation no longer under-counts billed
   prompt text when a recognized field is present (GHSA-2r5g-438w-85hr). The
   estimator walks the already-parsed request JSON once and sums billable string
