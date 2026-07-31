@@ -8437,12 +8437,7 @@ async fn transform_injected_field_cannot_satisfy_the_client_contract() {
     // The client omitted `client_attestation`; the transform would add it.
     let client_body = br#"{"id":"a"}"#.to_vec();
     assert_reject(
-        apply_client_request_contract_validation_for_test(
-            &plugins,
-            &mut ctx,
-            &client_body,
-        )
-        .await,
+        apply_client_request_contract_validation_for_test(&plugins, &mut ctx, &client_body).await,
         Some(400),
     );
     assert_eq!(contract_phase(&ctx), Some("client"));
@@ -8601,7 +8596,11 @@ async fn response_only_sibling_keeps_its_backend_final_fallback_after_route_rewr
     // fallback must enforce that new match.
     ctx.path = "/rewritten".to_string();
     let mut rewritten_headers = headers.clone();
-    assert_continue(fallback.before_proxy(&mut ctx, &mut rewritten_headers).await);
+    assert_continue(
+        fallback
+            .before_proxy(&mut ctx, &mut rewritten_headers)
+            .await,
+    );
     assert_reject(
         fallback
             .on_final_request_body_with_context(

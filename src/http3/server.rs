@@ -2899,9 +2899,7 @@ async fn handle_h3_request(
         }
         if rejected.is_none() && before_proxy_body_requirements.validates_client_contract {
             let contract_result = crate::proxy::apply_client_request_contract_validation(
-                &plugins,
-                &mut ctx,
-                body_data,
+                &plugins, &mut ctx, body_data,
             )
             .await;
             if !matches!(contract_result, PluginResult::Continue) {
