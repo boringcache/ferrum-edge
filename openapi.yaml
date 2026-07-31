@@ -3788,6 +3788,10 @@ paths:
             Comma-separated list of resource types to include.
             Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`.
             When omitted, all resource types are included.
+            Unknown tokens are rejected with `400` and a static error message
+            that does not echo the rejected token; they are never persisted in
+            audit events (unknown filters are recorded as the fixed `invalid`
+            sentinel only).
             Including `api_specs` also requires `proxies`, `upstreams`, and
             `plugin_configs` so the export stays directly restorable (owning
             proxy plus generated upstream/plugin relationships). Otherwise the
@@ -6832,8 +6836,8 @@ components:
           type: string
           description: >-
             Fixed-cardinality result for security-sensitive events:
-            `success`, `denied`, `validation_failed`, `unavailable`, or
-            `audit_admit_failed`. Omitted when empty (legacy mutation events).
+            `success`, `denied`, `validation_failed`, or `unavailable`.
+            Omitted when empty (legacy mutation events).
         diff:
           type: object
           additionalProperties: true
@@ -6842,7 +6846,11 @@ components:
             backup audit payload. Backup success diffs carry only
             `data_source`, `resources`, `counts`, and `bytes` — never backup
             body bytes or secrets. Backup failure diffs carry only
-            `failure_category` and `resources`. Basic credential
+            `failure_category` and `resources`. `resources` is either the
+            sentinel `all`, a sorted allow-listed name array
+            (`proxies`/`consumers`/`plugin_configs`/`upstreams`/`api_specs`),
+            or the fixed sentinel `invalid` when the request filter contained
+            unknown tokens (raw tokens are never stored). Basic credential
             changes expose only the credential type, action, and a stable
             `[REDACTED]` marker, never values, entry fields, shape, or count.
             Unknown/custom credential types are omitted from audit payloads so

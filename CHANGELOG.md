@@ -17,7 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FERRUM_ADMIN_AUDIT_FALLBACK_PATH`, failing closed with `503` if neither
   sink admits the event. Authenticated denied/failed backup attempts are
   audited with fixed failure categories only; backup payload bytes and
-  secrets never enter audit events or logs (#2422).
+  secrets never enter audit events or logs. Backup `resources=` filters are
+  a closed allow-list; unknown tokens are rejected with static client text
+  and never persisted raw in audit metadata (#2422).
 - API-spec YAML ingestion now expands anchors and aliases through a bounded
   libyaml event graph (node, depth, alias-reference, expanded-byte, and work
   budgets) with cycle / undefined-alias / duplicate-anchor /

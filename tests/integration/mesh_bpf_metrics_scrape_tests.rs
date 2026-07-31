@@ -108,6 +108,7 @@ fn admin_state_with_proxy(proxy_state: ProxyState) -> AdminState {
         mode: "test".to_string(),
         read_only: true,
         admin_audit_enabled: false,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: false,
         startup_ready: Some(Arc::new(AtomicBool::new(true))),
         serving_degraded: None,

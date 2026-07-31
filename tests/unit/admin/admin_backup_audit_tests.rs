@@ -2,8 +2,9 @@
 
 use ferrum_edge::admin::audit::{
     self, AuditActor, AuditAdmitSink, AuditEvent, AuditRequestContext, AUDIT_REQUEST_ID_MAX_LEN,
-    append_local_fallback_event, backup_failure_diff, backup_resources_audit_value,
-    backup_success_diff, extract_or_generate_request_id, list_local_fallback_events,
+    BACKUP_RESOURCES_INVALID_SENTINEL, append_local_fallback_event, backup_failure_diff,
+    backup_resources_audit_value, backup_success_diff, extract_or_generate_request_id,
+    list_local_fallback_events,
 };
 use ferrum_edge::admin::jwt_auth::AdminRole;
 use hyper::HeaderMap;
@@ -68,6 +69,19 @@ fn backup_resources_audit_value_sorts_and_uses_all_sentinel() {
         backup_resources_audit_value(Some(&filter)),
         json!(["consumers", "proxies"])
     );
+}
+
+#[test]
+fn backup_resources_audit_value_never_persists_unknown_raw_token() {
+    let canary = "canary-token-credential-value-should-never-persist";
+    let mut filter = HashSet::new();
+    filter.insert("proxies");
+    filter.insert(canary);
+    let value = backup_resources_audit_value(Some(&filter));
+    assert_eq!(value, json!(BACKUP_RESOURCES_INVALID_SENTINEL));
+    let rendered = serde_json::to_string(&value).unwrap();
+    assert!(!rendered.contains(canary));
+    assert!(!rendered.contains("credential"));
 }
 
 #[test]
@@ -153,6 +167,76 @@ fn local_fallback_persists_event_without_secret_canaries() {
     assert!(!raw.contains(secret));
     assert!(!raw.contains("Bearer "));
     assert!(!raw.contains("basicauth"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        let file_mode = std::fs::metadata(dir.path().join("admin-audit-fallback.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn local_fallback_rejects_symlink_directory() {
+    let parent = TempDir::new().expect("tempdir");
+    let real = parent.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = parent.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let event = AuditEvent::new(
+        &admin_actor(),
+        "backup",
+        "gateway_config",
+        "ferrum",
+        "ferrum",
+        json!({}),
+    );
+    let err = append_local_fallback_event(&link, &event).expect_err("symlink dir");
+    assert!(err.to_string().contains("symlink"));
+}
+
+#[cfg(unix)]
+#[test]
+fn local_fallback_rejects_symlink_data_file() {
+    let dir = TempDir::new().expect("tempdir");
+    let outside = dir.path().join("outside.json");
+    std::fs::write(&outside, b"[]").unwrap();
+    let data = dir.path().join("admin-audit-fallback.json");
+    std::os::unix::fs::symlink(&outside, &data).unwrap();
+    let event = AuditEvent::new(
+        &admin_actor(),
+        "backup",
+        "gateway_config",
+        "ferrum",
+        "ferrum",
+        json!({}),
+    );
+    let err = append_local_fallback_event(dir.path(), &event).expect_err("symlink data");
+    assert!(err.to_string().contains("symlink"));
+}
+
+#[cfg(unix)]
+#[test]
+fn local_fallback_rejects_non_regular_data_target() {
+    let dir = TempDir::new().expect("tempdir");
+    let data = dir.path().join("admin-audit-fallback.json");
+    std::fs::create_dir(&data).unwrap();
+    let event = AuditEvent::new(
+        &admin_actor(),
+        "backup",
+        "gateway_config",
+        "ferrum",
+        "ferrum",
+        json!({}),
+    );
+    let err = append_local_fallback_event(dir.path(), &event).expect_err("non-regular");
+    assert!(err.to_string().contains("regular file"));
 }
 
 #[tokio::test]

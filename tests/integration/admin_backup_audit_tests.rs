@@ -86,6 +86,7 @@ fn base_admin_state(audit_enabled: bool) -> AdminState {
         mode: "database".to_string(),
         read_only: false,
         admin_audit_enabled: audit_enabled,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
@@ -357,17 +358,39 @@ async fn backup_role_denial_is_audited() {
 }
 
 #[tokio::test]
+async fn backup_unknown_resources_token_is_rejected_without_persisting_canary() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await, true);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("backup-admin", Some("admin"));
+    let canary = "canary-secret-token-never-in-audit-or-logs";
+
+    let (status, body, _) =
+        get_backup(&base, &format!("/backup?resources=proxies,{canary}"), &admin, None).await;
+    assert_eq!(status, 400, "unknown resources body: {body:?}");
+    assert_eq!(body["error"], "Unsupported backup resource filter");
+    assert!(!body.to_string().contains(canary));
+
+    let (audit_status, audit_body) = get_audit(&base, &admin).await;
+    assert_eq!(audit_status, 200);
+    assert_eq!(audit_body["total"], 1);
+    let event = &audit_body["items"][0];
+    assert_eq!(event["outcome"], "validation_failed");
+    assert_eq!(event["diff"]["failure_category"], "validation_failed");
+    assert_eq!(event["diff"]["resources"], "invalid");
+    let rendered = serde_json::to_string(&audit_body).unwrap();
+    assert!(!rendered.contains(canary));
+    assert_no_secret_canaries(&audit_body);
+}
+
+#[tokio::test]
 async fn cached_backup_without_db_uses_local_fallback_audit_sink() {
     let fallback = TempDir::new().unwrap();
-    // Isolate the process-local fallback path for this test.
-    unsafe {
-        std::env::set_var(
-            "FERRUM_ADMIN_AUDIT_FALLBACK_PATH",
-            fallback.path().to_string_lossy().as_ref(),
-        );
-    }
+    let mut state = cached_only_state(sample_cached_config(), true);
+    // Inject an isolated fallback path through AdminState — never mutate
+    // process-global environment (which races parallel tests / panics).
+    state.admin_audit_fallback_dir = Some(fallback.path().to_path_buf());
 
-    let state = cached_only_state(sample_cached_config(), true);
     let (base, _shutdown) = start_admin(state).await;
     let admin = token("backup-admin", Some("admin"));
 
@@ -382,14 +405,10 @@ async fn cached_backup_without_db_uses_local_fallback_audit_sink() {
 
     let events = list_local_fallback_events(fallback.path()).expect("list fallback");
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].outcome, audit::outcome::SUCCESS);
+    assert_eq!(events[0].outcome, audit::outcome::SUCCESS.as_str());
     assert_eq!(events[0].request_id, "cached-backup-1");
     assert_eq!(events[0].diff["data_source"], "cached");
     assert!(events[0].diff["bytes"].as_u64().unwrap() > 0);
     let rendered = serde_json::to_string(&events[0]).unwrap();
     assert!(!rendered.contains(JWT_CANARY));
-
-    unsafe {
-        std::env::remove_var("FERRUM_ADMIN_AUDIT_FALLBACK_PATH");
-    }
 }

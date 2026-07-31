@@ -109,6 +109,7 @@ fn make_admin_state(db: DatabaseStore, max_spec_mib: usize) -> AdminState {
         mode: "database".to_string(),
         read_only: false,
         admin_audit_enabled: false,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,

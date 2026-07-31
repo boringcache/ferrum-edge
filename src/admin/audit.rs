@@ -22,7 +22,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -40,24 +40,79 @@ pub const AUDIT_REQUEST_ID_MAX_LEN: usize = 128;
 /// Bound on local fallback events retained on disk (newest kept).
 pub const AUDIT_LOCAL_FALLBACK_CAPACITY: usize = 4_096;
 const AUDIT_LOCAL_FALLBACK_FILE_NAME: &str = "admin-audit-fallback.json";
+const AUDIT_LOCAL_FALLBACK_LOCK_FILE_NAME: &str = "admin-audit-fallback.lock";
 const AUDIT_LOCAL_FALLBACK_DEFAULT_DIR: &str = "./ferrum-admin-audit";
 
+/// Closed allow-list of backup resource filter names persisted in audit events.
+pub const BACKUP_AUDIT_RESOURCE_NAMES: &[&str] = &[
+    "proxies",
+    "consumers",
+    "plugin_configs",
+    "upstreams",
+    "api_specs",
+];
+/// Fixed non-sensitive sentinel when a filter contained unknown tokens.
+pub const BACKUP_RESOURCES_INVALID_SENTINEL: &str = "invalid";
+
 /// Fixed-cardinality outcomes stored on [`AuditEvent::outcome`].
-pub mod outcome {
-    pub const SUCCESS: &str = "success";
-    pub const DENIED: &str = "denied";
-    pub const VALIDATION_FAILED: &str = "validation_failed";
-    pub const UNAVAILABLE: &str = "unavailable";
-    pub const AUDIT_ADMIT_FAILED: &str = "audit_admit_failed";
+///
+/// Typed so callers cannot persist arbitrary outcome strings through the
+/// security-sensitive builder API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditOutcome {
+    Success,
+    Denied,
+    ValidationFailed,
+    Unavailable,
+}
+
+impl AuditOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Denied => "denied",
+            Self::ValidationFailed => "validation_failed",
+            Self::Unavailable => "unavailable",
+        }
+    }
 }
 
 /// Fixed-cardinality failure categories for backup audit `diff` payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupFailureCategory {
+    Forbidden,
+    NamespaceDenied,
+    ValidationFailed,
+    Unavailable,
+}
+
+impl BackupFailureCategory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Forbidden => "forbidden",
+            Self::NamespaceDenied => "namespace_denied",
+            Self::ValidationFailed => "validation_failed",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Convenience aliases for closed backup audit outcomes.
+pub mod outcome {
+    use super::AuditOutcome;
+    pub const SUCCESS: AuditOutcome = AuditOutcome::Success;
+    pub const DENIED: AuditOutcome = AuditOutcome::Denied;
+    pub const VALIDATION_FAILED: AuditOutcome = AuditOutcome::ValidationFailed;
+    pub const UNAVAILABLE: AuditOutcome = AuditOutcome::Unavailable;
+}
+
+/// Convenience aliases for closed backup failure categories.
 pub mod failure_category {
-    pub const FORBIDDEN: &str = "forbidden";
-    pub const NAMESPACE_DENIED: &str = "namespace_denied";
-    pub const VALIDATION_FAILED: &str = "validation_failed";
-    pub const UNAVAILABLE: &str = "unavailable";
-    pub const AUDIT_ADMIT_FAILED: &str = "audit_admit_failed";
+    use super::BackupFailureCategory;
+    pub const FORBIDDEN: BackupFailureCategory = BackupFailureCategory::Forbidden;
+    pub const NAMESPACE_DENIED: BackupFailureCategory = BackupFailureCategory::NamespaceDenied;
+    pub const VALIDATION_FAILED: BackupFailureCategory = BackupFailureCategory::ValidationFailed;
+    pub const UNAVAILABLE: BackupFailureCategory = BackupFailureCategory::Unavailable;
 }
 
 /// Upper bound for `FERRUM_AUDIT_RETENTION_DAYS` (100 years).
@@ -270,8 +325,8 @@ pub struct AuditEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub request_id: String,
     /// Fixed-cardinality outcome (`success`, `denied`, `validation_failed`,
-    /// `unavailable`, `audit_admit_failed`). Empty for legacy mutation events
-    /// that only recorded successful commits.
+    /// `unavailable`). Empty for legacy mutation events that only recorded
+    /// successful commits. Set only through [`AuditEvent::with_outcome`].
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub outcome: String,
     pub diff: Value,
@@ -325,8 +380,8 @@ impl AuditEvent {
         self
     }
 
-    pub fn with_outcome(mut self, outcome: impl Into<String>) -> Self {
-        self.outcome = outcome.into();
+    pub fn with_outcome(mut self, outcome: AuditOutcome) -> Self {
+        self.outcome = outcome.as_str().to_string();
         self
     }
 }
@@ -597,20 +652,36 @@ pub fn backup_success_diff(
 }
 
 /// Fixed-shape backup failure/denied diff. Categories are closed enums only.
-pub fn backup_failure_diff(category: &str, resources: Value) -> Value {
+pub fn backup_failure_diff(category: BackupFailureCategory, resources: Value) -> Value {
     json!({
-        "failure_category": category,
+        "failure_category": category.as_str(),
         "resources": resources,
     })
 }
 
-/// Canonical resource-filter representation for audit events (sorted names, or
-/// the sentinel `"all"` when unfiltered).
+/// Whether `name` is a canonical backup resource filter token.
+pub fn is_canonical_backup_resource(name: &str) -> bool {
+    BACKUP_AUDIT_RESOURCE_NAMES.contains(&name)
+}
+
+/// Canonical resource-filter representation for audit events.
+///
+/// - Unfiltered → `"all"`
+/// - Only allow-listed names → sorted JSON array of those names
+/// - Any unknown token → fixed `"invalid"` sentinel (never the raw token)
 pub fn backup_resources_audit_value(filter: Option<&std::collections::HashSet<&str>>) -> Value {
     match filter {
         None => json!("all"),
         Some(set) => {
-            let mut names: Vec<&str> = set.iter().copied().collect();
+            let mut names: Vec<&str> = Vec::with_capacity(set.len());
+            for name in set.iter().copied() {
+                if is_canonical_backup_resource(name) {
+                    names.push(name);
+                } else {
+                    // Never persist or log the unknown raw token.
+                    return json!(BACKUP_RESOURCES_INVALID_SENTINEL);
+                }
+            }
             names.sort_unstable();
             json!(names)
         }
@@ -622,7 +693,8 @@ pub fn backup_resources_audit_value(filter: Option<&std::collections::HashSet<&s
 /// When auditing is disabled this is a no-op success. Otherwise:
 /// 1. Prefer a synchronous `insert_audit_event` on the provided backend.
 /// 2. If no backend is present or the insert fails, append to the bounded local
-///    fallback file under `fallback_dir` (or the configured default).
+///    fallback file under `fallback_dir` (or the configured default) on a
+///    blocking worker so admin Tokio tasks are not stalled on disk I/O.
 /// 3. If neither sink admits the event, return an error so the caller can fail
 ///    closed without emitting the sensitive response body.
 ///
@@ -657,16 +729,21 @@ pub async fn admit_security_sensitive_event(
     let dir = fallback_dir
         .map(Path::to_path_buf)
         .unwrap_or_else(audit_local_fallback_dir);
-    append_local_fallback_event(&dir, event).map_err(|_error| {
-        error!(
-            audit_event_id = %event.id,
-            surface = "audit_security_admit_local_fallback",
-            detail_withheld = true,
-            "Failed to admit security-sensitive audit event to local fallback"
-        );
-        anyhow!("security-sensitive audit event could not be admitted")
-    })?;
-    Ok(AuditAdmitSink::LocalFallback)
+    let event_id = event.id.clone();
+    let event = event.clone();
+    let join = tokio::task::spawn_blocking(move || append_local_fallback_event(&dir, &event)).await;
+    match join {
+        Ok(Ok(())) => Ok(AuditAdmitSink::LocalFallback),
+        Ok(Err(_error)) | Err(_) => {
+            error!(
+                audit_event_id = %event_id,
+                surface = "audit_security_admit_local_fallback",
+                detail_withheld = true,
+                "Failed to admit security-sensitive audit event to local fallback"
+            );
+            Err(anyhow!("security-sensitive audit event could not be admitted"))
+        }
+    }
 }
 
 /// Best-effort admit for authenticated backup denials/validation failures.
@@ -690,67 +767,265 @@ pub async fn record_backup_attempt_best_effort(
 
 static LOCAL_FALLBACK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-/// Append one event to the bounded local fallback store. Creates the directory
-/// with owner-only permissions when possible. Never logs event contents.
+/// Cross-process exclusive lock held for the fallback read/modify/write window.
+struct FallbackFileLock {
+    _file: File,
+}
+
+/// Append one event to the bounded local fallback store.
+///
+/// Enforces a non-symlink directory/data/lock target, owner-only Unix
+/// permissions, collision-resistant temp publication with directory sync, and
+/// cross-process exclusion where the platform supports it. Never logs event
+/// contents.
 pub fn append_local_fallback_event(dir: &Path, event: &AuditEvent) -> Result<(), anyhow::Error> {
-    let _guard = LOCAL_FALLBACK_LOCK
+    let _process_guard = LOCAL_FALLBACK_LOCK
         .lock()
         .map_err(|_| anyhow!("audit local fallback lock poisoned"))?;
-    fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
-    }
+    prepare_fallback_directory(dir)?;
+    let lock_path = dir.join(AUDIT_LOCAL_FALLBACK_LOCK_FILE_NAME);
+    let _cross_process = acquire_fallback_file_lock(&lock_path)?;
     let path = audit_local_fallback_file(dir);
+    reject_symlink_or_non_regular_file(&path, "audit local fallback data file")?;
     let mut events = read_local_fallback_events_unlocked(&path)?;
     events.push(event.clone());
     if events.len() > AUDIT_LOCAL_FALLBACK_CAPACITY {
         let overflow = events.len() - AUDIT_LOCAL_FALLBACK_CAPACITY;
         events.drain(0..overflow);
     }
-    write_local_fallback_events_unlocked(&path, &events)
+    write_local_fallback_events_unlocked(dir, &path, &events)
 }
 
 /// Read all events currently retained in the local fallback store.
 pub fn list_local_fallback_events(dir: &Path) -> Result<Vec<AuditEvent>, anyhow::Error> {
-    let _guard = LOCAL_FALLBACK_LOCK
+    let _process_guard = LOCAL_FALLBACK_LOCK
         .lock()
         .map_err(|_| anyhow!("audit local fallback lock poisoned"))?;
-    read_local_fallback_events_unlocked(&audit_local_fallback_file(dir))
+    prepare_existing_fallback_directory(dir)?;
+    let lock_path = dir.join(AUDIT_LOCAL_FALLBACK_LOCK_FILE_NAME);
+    let _cross_process = acquire_fallback_file_lock(&lock_path)?;
+    let path = audit_local_fallback_file(dir);
+    reject_symlink_or_non_regular_file(&path, "audit local fallback data file")?;
+    read_local_fallback_events_unlocked(&path)
 }
 
-fn read_local_fallback_events_unlocked(path: &Path) -> Result<Vec<AuditEvent>, anyhow::Error> {
-    if !path.exists() {
-        return Ok(Vec::new());
+fn prepare_fallback_directory(dir: &Path) -> Result<(), anyhow::Error> {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(anyhow!("audit local fallback path must not be a symlink"));
+            }
+            if !meta.is_dir() {
+                return Err(anyhow!("audit local fallback path must be a directory"));
+            }
+            enforce_owner_only_dir_permissions(dir)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(dir)?;
+            // Re-validate after create so a raced symlink/non-dir fails closed.
+            prepare_existing_fallback_directory(dir)
+        }
+        Err(error) => Err(error.into()),
     }
-    let raw = fs::read_to_string(path)?;
-    if raw.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    serde_json::from_str(&raw).map_err(|e| anyhow!("corrupt audit local fallback store: {e}"))
 }
 
-fn write_local_fallback_events_unlocked(
-    path: &Path,
-    events: &[AuditEvent],
-) -> Result<(), anyhow::Error> {
-    let tmp = path.with_extension("json.tmp");
-    let body = serde_json::to_vec_pretty(events)?;
-    {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)?;
-        file.write_all(&body)?;
-        file.sync_all()?;
+fn prepare_existing_fallback_directory(dir: &Path) -> Result<(), anyhow::Error> {
+    let meta = fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() {
+        return Err(anyhow!("audit local fallback path must not be a symlink"));
     }
+    if !meta.is_dir() {
+        return Err(anyhow!("audit local fallback path must be a directory"));
+    }
+    enforce_owner_only_dir_permissions(dir)
+}
+
+fn enforce_owner_only_dir_permissions(dir: &Path) -> Result<(), anyhow::Error> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
-    fs::rename(&tmp, path)?;
+    let _ = dir;
+    Ok(())
+}
+
+fn reject_symlink_or_non_regular_file(
+    path: &Path,
+    label: &'static str,
+) -> Result<(), anyhow::Error> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(anyhow!("{label} must not be a symlink"));
+            }
+            if !meta.file_type().is_file() {
+                return Err(anyhow!("{label} must be a regular file"));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn acquire_fallback_file_lock(lock_path: &Path) -> Result<FallbackFileLock, anyhow::Error> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::io::AsRawFd;
+
+    reject_symlink_or_non_regular_file(lock_path, "audit local fallback lock file")?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(lock_path)
+        .map_err(|error| anyhow!("failed to open audit local fallback lock: {error}"))?;
+    let lock_metadata = file.metadata()?;
+    if !lock_metadata.file_type().is_file() {
+        return Err(anyhow!("audit local fallback lock file must be a regular file"));
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+
+    // SAFETY: `file` owns a valid descriptor for the lifetime of this guard.
+    // `flock` does not access Rust-managed memory.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result != 0 {
+        return Err(anyhow!(
+            "failed to acquire audit local fallback cross-process lock: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let path_metadata = fs::symlink_metadata(lock_path)?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.file_type().is_file()
+        || path_metadata.dev() != lock_metadata.dev()
+        || path_metadata.ino() != lock_metadata.ino()
+    {
+        return Err(anyhow!(
+            "audit local fallback lock file changed identity during acquisition"
+        ));
+    }
+
+    Ok(FallbackFileLock { _file: file })
+}
+
+#[cfg(windows)]
+fn acquire_fallback_file_lock(lock_path: &Path) -> Result<FallbackFileLock, anyhow::Error> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    reject_symlink_or_non_regular_file(lock_path, "audit local fallback lock file")?;
+    // `share_mode(0)` denies all share access for as long as this handle is
+    // held — a std-only cross-process exclusive critical section.
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(lock_path)
+        .map_err(|error| anyhow!("failed to open audit local fallback lock: {error}"))?;
+    let lock_metadata = file.metadata()?;
+    if !lock_metadata.file_type().is_file() {
+        return Err(anyhow!("audit local fallback lock file must be a regular file"));
+    }
+    Ok(FallbackFileLock { _file: file })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn acquire_fallback_file_lock(_lock_path: &Path) -> Result<FallbackFileLock, anyhow::Error> {
+    Err(anyhow!(
+        "audit local fallback cross-process exclusion is unavailable on this platform"
+    ))
+}
+
+fn read_local_fallback_events_unlocked(path: &Path) -> Result<Vec<AuditEvent>, anyhow::Error> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(anyhow!("audit local fallback data file must not be a symlink"));
+            }
+            if !meta.file_type().is_file() {
+                return Err(anyhow!("audit local fallback data file must be a regular file"));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    }
+    let raw = fs::read(path)?;
+    if raw.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Vec::new());
+    }
+    serde_json::from_slice(&raw).map_err(|_| anyhow!("corrupt audit local fallback store"))
+}
+
+fn write_local_fallback_events_unlocked(
+    dir: &Path,
+    path: &Path,
+    events: &[AuditEvent],
+) -> Result<(), anyhow::Error> {
+    let body = serde_json::to_vec_pretty(events)?;
+    let tmp_name = format!(
+        "{}.{}.tmp",
+        AUDIT_LOCAL_FALLBACK_FILE_NAME,
+        Uuid::new_v4()
+    );
+    let tmp = dir.join(tmp_name);
+    let write_result = write_temp_fallback_file(&tmp, &body);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error.into());
+    }
+    sync_directory(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn write_temp_fallback_file(tmp: &Path, body: &[u8]) -> Result<(), anyhow::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(tmp)?;
+        file.write_all(body)?;
+        file.sync_all()?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(tmp)?;
+        file.write_all(body)?;
+        file.sync_all()?;
+        Ok(())
+    }
+}
+
+fn sync_directory(dir: &Path) -> Result<(), anyhow::Error> {
+    #[cfg(unix)]
+    {
+        let dir_file = OpenOptions::new().read(true).open(dir)?;
+        dir_file.sync_all()?;
+    }
+    let _ = dir;
     Ok(())
 }

@@ -99,6 +99,7 @@ async fn build_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDir) {
         mode: "database".to_string(),
         read_only: false,
         admin_audit_enabled: false,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,

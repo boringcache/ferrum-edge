@@ -14,6 +14,11 @@ use crate::config::types::{
 /// remain restorable via the explicit deletion-confirmation preflight.
 pub(crate) const API_SPECS_BACKUP_SECTION_VERSION: &str = "1";
 
+/// Stable client text when `resources=` contains an unsupported token.
+/// Never echoes the rejected token.
+pub(crate) const BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR: &str =
+    "Unsupported backup resource filter";
+
 pub(crate) fn parse_backup_resources(query: Option<&str>) -> Option<HashSet<&str>> {
     let query = query?;
     for pair in query.split('&') {
@@ -30,6 +35,27 @@ pub(crate) fn parse_backup_resources(query: Option<&str>) -> Option<HashSet<&str
         }
     }
     None
+}
+
+/// Fail closed when any `resources=` token is outside the closed allow-list.
+///
+/// Client text is static and never echoes the rejected token. Unknown tokens
+/// must also never reach audit persistence (see
+/// [`crate::admin::audit::backup_resources_audit_value`]).
+pub(crate) fn validate_backup_resources_allowlist(
+    filter: Option<&HashSet<&str>>,
+) -> Result<(), &'static str> {
+    let Some(filter) = filter else {
+        return Ok(());
+    };
+    if filter
+        .iter()
+        .copied()
+        .any(|name| !crate::admin::audit::is_canonical_backup_resource(name))
+    {
+        return Err(BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR);
+    }
+    Ok(())
 }
 
 /// Stable error when a filtered backup requests `api_specs` without the
@@ -801,6 +827,24 @@ mod tests {
         assert!(resources.contains("proxies"));
         assert!(resources.contains("upstreams"));
         assert_eq!(resources.len(), 2);
+    }
+
+    #[test]
+    fn validate_backup_resources_allowlist_rejects_unknown_without_echoing() {
+        assert!(validate_backup_resources_allowlist(None).is_ok());
+        let known =
+            parse_backup_resources(Some("resources=proxies,consumers")).expect("parse known");
+        assert!(validate_backup_resources_allowlist(Some(&known)).is_ok());
+
+        let unknown = parse_backup_resources(Some(
+            "resources=proxies,canary-secret-token-never-echoed",
+        ))
+        .expect("parse unknown");
+        assert_eq!(
+            validate_backup_resources_allowlist(Some(&unknown)),
+            Err(BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR)
+        );
+        assert!(!BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR.contains("canary"));
     }
 
     #[test]

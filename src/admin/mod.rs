@@ -32,10 +32,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::admin::audit::AuditActor;
 use crate::admin::backup::{
-    ApiSpecsBackupSection, BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR, BackupCounts, BackupPayload,
-    RestorePayload, clear_api_spec_ownership_tags, filter_config_by_namespace,
-    parse_backup_resources, parse_confirm_api_spec_deletion, parse_restore_confirm,
-    validate_backup_api_specs_resource_filter, validate_restore_api_specs_section_with_total_limit,
+    ApiSpecsBackupSection, BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR,
+    BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR, BackupCounts, BackupPayload, RestorePayload,
+    clear_api_spec_ownership_tags, filter_config_by_namespace, parse_backup_resources,
+    parse_confirm_api_spec_deletion, parse_restore_confirm, validate_backup_api_specs_resource_filter,
+    validate_backup_resources_allowlist, validate_restore_api_specs_section_with_total_limit,
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
@@ -299,6 +300,11 @@ pub struct AdminState {
     pub read_only: bool,
     /// Enables database-backed audit events for successful admin mutations.
     pub admin_audit_enabled: bool,
+    /// Optional override for the local security-audit fallback directory.
+    /// When `None`, uses [`audit::audit_local_fallback_dir`] (env/config).
+    /// Tests inject an isolated path here so they do not mutate process-global
+    /// environment state.
+    pub admin_audit_fallback_dir: Option<std::path::PathBuf>,
     /// When `true` (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`), namespace-scoped
     /// admin routes require the admin JWT to carry an `ns` claim authorizing
     /// the `X-Ferrum-Namespace` value (mirrors the CP↔DP gRPC plane's
@@ -2251,7 +2257,7 @@ pub async fn handle_admin_request(
                 state.admin_audit_enabled,
                 state.db.as_ref(),
                 &event,
-                None,
+                state.admin_audit_fallback_dir.as_deref(),
             )
             .await;
         }
@@ -2642,7 +2648,7 @@ pub async fn handle_admin_request(
                     state.admin_audit_enabled,
                     state.db.as_ref(),
                     &event,
-                    None,
+                    state.admin_audit_fallback_dir.as_deref(),
                 )
                 .await;
                 return Ok(resp);
@@ -6802,7 +6808,7 @@ async fn finalize_backup_export(
         state.admin_audit_enabled,
         state.db.as_ref(),
         &event,
-        None,
+        state.admin_audit_fallback_dir.as_deref(),
     )
     .await
     {
@@ -6828,8 +6834,8 @@ async fn audit_backup_failure(
     namespace: &str,
     request_ctx: &audit::AuditRequestContext,
     resource_filter: Option<&HashSet<&str>>,
-    category: &str,
-    outcome: &str,
+    category: audit::BackupFailureCategory,
+    outcome: audit::AuditOutcome,
 ) {
     let event = audit::AuditEvent::new(
         actor,
@@ -6848,7 +6854,7 @@ async fn audit_backup_failure(
         state.admin_audit_enabled,
         state.db.as_ref(),
         &event,
-        None,
+        state.admin_audit_fallback_dir.as_deref(),
     )
     .await;
 }
@@ -7068,6 +7074,24 @@ async fn handle_backup(
     request_ctx: &audit::AuditRequestContext,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let resource_filter = parse_backup_resources(query);
+    // Reject unknown resources= tokens fail-closed with static client text
+    // that never echoes the rejected token.
+    if let Err(_error) = validate_backup_resources_allowlist(resource_filter.as_ref()) {
+        audit_backup_failure(
+            state,
+            actor,
+            namespace,
+            request_ctx,
+            resource_filter.as_ref(),
+            audit::failure_category::VALIDATION_FAILED,
+            audit::outcome::VALIDATION_FAILED,
+        )
+        .await;
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR}),
+        ));
+    }
     // Fail closed before database/spec loading when a filtered export would
     // emit api_specs without the owning/generated resource classes required
     // for a directly restorable payload.

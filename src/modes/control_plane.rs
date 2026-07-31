@@ -2166,6 +2166,7 @@ pub async fn run(
         mode: "cp".into(),
         read_only: env_config.admin_read_only,
         admin_audit_enabled: env_config.admin_audit_enabled,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: env_config.admin_require_namespace_claim,
         startup_ready: Some(startup_ready.clone()),
         serving_degraded: Some(serving_degraded.clone()),
