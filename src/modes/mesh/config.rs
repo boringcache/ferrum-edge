@@ -2805,7 +2805,7 @@ impl MeshConfig {
     /// Nothing else in `self` is touched. A base object that the overlay does
     /// not name survives even when it sits in the same namespace — or is of
     /// the same kind — as an overlay object, which is what keeps
-    /// native/file/xDS/DB-authored mesh state alive through a Kubernetes
+    /// native/file/xDS-authored mesh state alive through a Kubernetes
     /// publish. Withdrawal is not modeled here at all: the caller recomposes
     /// from the retained base layer, so an empty overlay simply yields the
     /// base again and the shadowed base object is restored.

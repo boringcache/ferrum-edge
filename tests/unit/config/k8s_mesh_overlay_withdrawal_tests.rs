@@ -245,7 +245,7 @@ fn authoritative_overlay(mesh: Option<MeshConfig>) -> GatewayConfig {
 }
 
 /// An active snapshot whose mesh is owned entirely by a non-Kubernetes source
-/// (native / file / xDS / DB).
+/// (native / file / xDS).
 fn other_source_config(mesh: MeshConfig) -> GatewayConfig {
     GatewayConfig {
         mesh: Some(Box::new(mesh)),
@@ -770,14 +770,14 @@ fn overlay_slot_does_not_resurrect_an_authoritatively_withdrawn_mesh() {
 }
 
 #[test]
-fn overlay_slot_full_reload_preserves_same_namespace_mesh_from_the_db_snapshot() {
-    // On a CP full reload the freshly loaded DB snapshot IS the base layer.
-    // Composing the accepted overlay through the slot must layer onto it, and
-    // an authoritative withdrawal must leave it whole.
+fn overlay_slot_compose_preserves_same_namespace_mesh_from_a_non_kubernetes_base() {
+    // Production CP DB full loads clear `mesh` before overlay re-merge; this
+    // exercises `compose_db_with_k8s_overlay` with a synthetic non-Kubernetes
+    // mesh base to pin the helper's retained-base contract.
     let overlay_slot = empty_k8s_overlay_slot();
     let managed = managed(&["default"]);
-    let db_snapshot = other_source_config(MeshConfig {
-        services: vec![native_mesh_service("default", "db-svc")],
+    let non_kubernetes_base = other_source_config(MeshConfig {
+        services: vec![native_mesh_service("default", "native-svc")],
         ..MeshConfig::default()
     });
     let objects = [service(), service_entry("default", "api", "api.example.com")];
@@ -787,30 +787,30 @@ fn overlay_slot_full_reload_preserves_same_namespace_mesh_from_the_db_snapshot()
         authoritative_translation(&objects),
         managed.clone(),
     );
-    let composed = compose_db_with_k8s_overlay(&db_snapshot, &overlay_slot);
+    let composed = compose_db_with_k8s_overlay(&non_kubernetes_base, &overlay_slot);
     assert_eq!(
         service_names(mesh_of(&composed), "default"),
-        vec!["db-svc".to_string(), "reviews".to_string()],
-        "the overlay must layer onto the DB-authored mesh, not replace it"
+        vec!["native-svc".to_string(), "reviews".to_string()],
+        "the overlay must layer onto the non-Kubernetes mesh base, not replace it"
     );
 
     store_accepted_k8s_overlay(&overlay_slot, authoritative_empty_translation(), managed);
-    let withdrawn = compose_db_with_k8s_overlay(&db_snapshot, &overlay_slot);
+    let withdrawn = compose_db_with_k8s_overlay(&non_kubernetes_base, &overlay_slot);
 
     let mesh = mesh_of(&withdrawn);
     assert_eq!(
         service_names(mesh, "default"),
-        vec!["db-svc".to_string()],
-        "a full reload after a withdrawal must keep the DB-authored mesh in that namespace"
+        vec!["native-svc".to_string()],
+        "a withdrawal after compose must keep the non-Kubernetes mesh base in that namespace"
     );
     assert!(mesh.service_entries.is_empty());
 }
 
 #[test]
-fn overlay_slot_full_reload_restores_a_db_object_the_overlay_shadowed() {
+fn overlay_slot_compose_restores_a_non_kubernetes_object_the_overlay_shadowed() {
     let overlay_slot = empty_k8s_overlay_slot();
     let managed = managed(&["default"]);
-    let db_service = MeshService {
+    let base_service = MeshService {
         cluster_ips: vec!["10.96.0.7".to_string()],
         name: "reviews".to_string(),
         namespace: "default".to_string(),
@@ -818,8 +818,8 @@ fn overlay_slot_full_reload_restores_a_db_object_the_overlay_shadowed() {
         workloads: Vec::new(),
         protocol_overrides: HashMap::new(),
     };
-    let db_snapshot = other_source_config(MeshConfig {
-        services: vec![db_service.clone()],
+    let non_kubernetes_base = other_source_config(MeshConfig {
+        services: vec![base_service.clone()],
         ..MeshConfig::default()
     });
 
@@ -828,14 +828,14 @@ fn overlay_slot_full_reload_restores_a_db_object_the_overlay_shadowed() {
         authoritative_translation(&[service()]),
         managed.clone(),
     );
-    let composed = compose_db_with_k8s_overlay(&db_snapshot, &overlay_slot);
+    let composed = compose_db_with_k8s_overlay(&non_kubernetes_base, &overlay_slot);
     assert_eq!(mesh_of(&composed).services.len(), 1);
     assert!(mesh_of(&composed).services[0].cluster_ips.is_empty());
 
     store_accepted_k8s_overlay(&overlay_slot, authoritative_empty_translation(), managed);
-    let withdrawn = compose_db_with_k8s_overlay(&db_snapshot, &overlay_slot);
+    let withdrawn = compose_db_with_k8s_overlay(&non_kubernetes_base, &overlay_slot);
 
-    assert_eq!(mesh_of(&withdrawn).services, vec![db_service]);
+    assert_eq!(mesh_of(&withdrawn).services, vec![base_service]);
 }
 
 // ── Workload identity tiers ───────────────────────────────────────────────
