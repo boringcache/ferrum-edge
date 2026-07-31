@@ -10584,11 +10584,40 @@ async fn handle_websocket_request_authenticated(
             .and_then(|uri| uri.path_and_query().map(|pq| pq.as_str().to_string()))
             .map(std::borrow::Cow::Owned)
             .unwrap_or(std::borrow::Cow::Borrowed("/"));
+        // Per-attempt target-effective backend policy (issue #2416). Every H1/H2
+        // WebSocket attempt — the initial one and each retry-rotated one — dials
+        // under the DestinationRule policy projected for its OWN `current_target`
+        // (per-port `connectTimeout`, `tls` CA / client identity / verification /
+        // SAN allow-list, and the DNS override / TTL the dial reads). The base
+        // proxy is never used for dial configuration, so a rotation from port
+        // 8443 to 9443 can no longer carry the first target's trust roots or
+        // timeout forward.
+        //
+        // POLICY PORT vs TRANSPORT DIAL PORT. Target selection chooses the
+        // POLICY port: `UpstreamTarget::dispatch_policy_port()` (the declared
+        // Service port when a Kubernetes `targetPort` remap made the workload
+        // port differ), which is the projection key here and the key the
+        // `maxConnections` gate above uses. The TRANSPORT dial port is a
+        // separate, transport-owned decision: the direct path dials the target's
+        // own `port` (carried in `current_backend_url`), while a mesh egress
+        // target dials its sidecar `:15006` mesh-mTLS listener or its Ambient
+        // `:15008` HBONE listener and reaches the app port THROUGH that tunnel.
+        // Both mesh pools receive the app/policy ports explicitly, so this
+        // projection never redirects a tunnel dial — it only decides which
+        // port's policy configures it.
+        //
+        // Uses the same `resolve_backend_connection_proxy_for_target` helper as
+        // the H3 WebSocket bridge (`src/http3/websocket.rs`) so the two protocol
+        // paths cannot drift. Borrowed (zero-alloc) when the selected target has
+        // no per-port override; cloned only when a projected field differs.
+        let ws_connection_proxy =
+            resolve_backend_connection_proxy_for_target(&proxy, current_target.as_deref());
+        let ws_dial_proxy: &Proxy = ws_connection_proxy.as_ref();
         let ws_dial_result: Result<WsBackendHandshake, Box<dyn std::error::Error + Send + Sync>> =
             match (&ws_mesh_egress, current_target.as_deref()) {
                 (Some(egress), Some(target)) => connect_mesh_websocket_backend(
                     &state,
-                    &proxy,
+                    ws_dial_proxy,
                     target,
                     egress,
                     ws_client_host.as_deref(),
@@ -10611,7 +10640,7 @@ async fn handle_websocket_request_authenticated(
                 .map(|handshake| WsBackendHandshake::Mesh(Box::new(handshake))),
                 _ => connect_websocket_backend(
                     &current_backend_url,
-                    &proxy,
+                    ws_dial_proxy,
                     &env_config,
                     &client_headers,
                     state.tls_policy.as_deref(),
@@ -11885,6 +11914,22 @@ pub(crate) fn build_websocket_backend_url_with_target(
     url
 }
 
+/// Whether `proxy`'s resolved backend TLS carries an SNI override the WebSocket
+/// transport cannot apply (issue #2416).
+///
+/// `client_async_tls_with_config` derives the TLS server name from the request
+/// URI, so an SNI override would be silently dropped and the handshake would
+/// verify the URI host instead. Callers must fail the dial closed rather than
+/// verify the wrong server name.
+///
+/// Takes the TARGET-EFFECTIVE proxy, so a DestinationRule port-level `tls.sni`
+/// that applies only to the selected target's policy port is caught for that
+/// target and not for its siblings. Plaintext `ws://` backends carry no server
+/// name to verify, so they are unaffected.
+pub(crate) fn websocket_backend_tls_sni_unsupported(proxy: &Proxy) -> bool {
+    matches!(proxy.backend_scheme, Some(BackendScheme::Https)) && proxy.resolved_tls.sni.is_some()
+}
+
 /// Build a rustls TLS connector for WebSocket backends that respects
 /// proxy-level and global TLS settings (CA bundles, client certs, cert verification).
 /// When `tls_policy` is provided, outbound connections use the same cipher suites,
@@ -12039,6 +12084,30 @@ pub(crate) async fn connect_websocket_backend(
             )
             .into());
         }
+    }
+
+    // Fail closed on a backend TLS SNI override this transport cannot carry
+    // (issue #2416). The WebSocket dial derives both the `Host` header and the
+    // TLS server name from the request URI, so a `resolved_tls.sni` value —
+    // whether it came from the proxy/upstream or from the selected target's
+    // DestinationRule port-level `tls` projection — would be silently dropped
+    // and the handshake would verify the URI host instead of the configured
+    // server name. Refuse the dial rather than trust the wrong name; this
+    // mirrors the reqwest retry path, which also 502s on an unreplayable SNI
+    // override instead of dialing without it. Gateway-side and pre-dial, so the
+    // shared `retry::WS_BACKEND_TLS_SNI_UNSUPPORTED` anchor classifies it as
+    // `DispatchPolicyRejected`: non-retryable and neutral to the circuit
+    // breaker / passive health, exactly like the literal-IP denial above. The
+    // configured SNI value itself is never logged or echoed. Shared by the H1/H2
+    // and H3 WebSocket bridges, which both dial through this function.
+    if websocket_backend_tls_sni_unsupported(proxy) {
+        warn!(
+            proxy_id = %proxy.id,
+            "Refusing WebSocket backend dial: backend TLS SNI override cannot be applied to a \
+             WebSocket transport (server name is derived from the request URI); failing closed \
+             rather than verifying the wrong server name"
+        );
+        return Err(retry::WS_BACKEND_TLS_SNI_UNSUPPORTED.into());
     }
 
     let connector = build_websocket_tls_connector(proxy, env_config, tls_policy, crls)?;
