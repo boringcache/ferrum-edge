@@ -255,18 +255,13 @@ impl DispatchGeneration {
         body_entered_tx: tokio::sync::oneshot::Sender<()>,
         pending_body_dropped_tx: tokio::sync::oneshot::Sender<()>,
     ) -> bool {
-        self.spawn_with_delivery_slot(
-            channel_type,
-            on_settle,
-            slot,
-            async move {
-                let _drop_witness = PendingDeliveryBodyDropWitness {
-                    tx: Some(pending_body_dropped_tx),
-                };
-                let _ = body_entered_tx.send(());
-                std::future::pending::<DispatchSettle>().await
-            },
-        )
+        self.spawn_with_delivery_slot(channel_type, on_settle, slot, async move {
+            let _drop_witness = PendingDeliveryBodyDropWitness {
+                tx: Some(pending_body_dropped_tx),
+            };
+            let _ = body_entered_tx.send(());
+            std::future::pending::<DispatchSettle>().await
+        })
     }
 
     fn spawn_impl<F>(
