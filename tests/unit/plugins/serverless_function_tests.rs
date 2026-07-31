@@ -881,7 +881,10 @@ fn test_terminate_mode() {
     .unwrap();
 
     // terminate mode doesn't modify headers — it short-circuits via RejectBinary
-    assert!(!plugin.modifies_request_headers());
+    assert!(
+        plugin.modifies_request_headers(),
+        "pre_proxy must advertise its finalized backend-header overlay to replay/cache ordering"
+    );
 }
 
 #[test]
@@ -970,7 +973,10 @@ fn test_default_mode_is_pre_proxy() {
     .unwrap();
 
     // Default mode is pre_proxy, dispatched through finalized request egress.
-    assert!(!plugin.modifies_request_headers());
+    assert!(
+        plugin.modifies_request_headers(),
+        "the default pre_proxy mode must publish its backend-visible header mutation capability"
+    );
     assert!(plugin.dispatches_finalized_request_egress());
 }
 
