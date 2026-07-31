@@ -19,12 +19,15 @@ use std::sync::Arc;
 
 use ferrum_edge::HttpFlavor;
 use ferrum_edge::_test_support::{
-    BufferedRepresentationOutcome, RESPONSE_BUFFER_OVERLOAD_BODY,
-    RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS, RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
-    RESPONSE_BUFFER_OVERLOAD_STATUS, RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT,
-    ResponseBufferBudgetProbe, error_class_is_backend_failure_for_test,
-    error_class_is_health_neutral_for_test, install_response_buffer_capacity_refusal_for_test,
-    set_request_http_flavor_for_test, stamp_original_response_metadata_for_test,
+    BufferedRepresentationOutcome, MAX_DECODED_RESPONSE_INSPECTION_BYTES,
+    RESPONSE_BUFFER_OVERLOAD_BODY, RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS,
+    RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS, RESPONSE_BUFFER_OVERLOAD_STATUS,
+    RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT, RESPONSE_DECODE_BROTLI_SCRATCH_BYTES,
+    RESPONSE_DECODE_GZIP_SCRATCH_BYTES, ResponseBufferBudgetProbe,
+    error_class_is_backend_failure_for_test, error_class_is_health_neutral_for_test,
+    install_response_buffer_capacity_refusal_for_test,
+    projected_decode_output_capacity_for_test, set_request_http_flavor_for_test,
+    stamp_original_response_metadata_for_test,
 };
 use ferrum_edge::plugins::{Plugin, RequestContext, response_transformer::ResponseTransformer};
 use ferrum_edge::retry::ErrorClass;
@@ -958,6 +961,54 @@ fn gzip(data: &[u8]) -> Vec<u8> {
     encoder.finish().expect("gzip finish must succeed")
 }
 
+/// Default `br`, i.e. the 22-bit window a real encoder picks — well inside the
+/// 24-bit ceiling `Content-Encoding: br` permits.
+fn brotli(data: &[u8]) -> Vec<u8> {
+    let params = brotli::enc::BrotliEncoderParams::default();
+    let mut compressed = Vec::new();
+    brotli::BrotliCompress(&mut &data[..], &mut compressed, &params)
+        .expect("brotli compress must succeed");
+    compressed
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic budget brackets.
+//
+// A decode's peak is arithmetic, not folklore: it is the ACTIVE codec's scratch
+// ceiling plus the reservation covering the previous pass's buffer and this
+// pass's output capacity, all rounded to whole 64 KiB blocks. Every bracket
+// below is derived from the ACTUAL encoded/intermediate lengths through the
+// PRODUCTION growth rule (`projected_decode_output_capacity_for_test`), so a
+// change to a codec's output size, to the growth rule, or to a scratch ceiling
+// fails with a precise arithmetic mismatch instead of looking like a flaky
+// admission assertion.
+// ---------------------------------------------------------------------------
+
+fn blocks(bytes: usize) -> usize {
+    bytes.div_ceil(UNIT)
+}
+
+/// The output-buffer capacity the decode ends up holding for `decoded_len`
+/// bytes. The gate's ceiling is 10 MiB here, and every payload in this file is
+/// far below it, so the ceiling never clamps the growth.
+fn decode_capacity(decoded_len: usize) -> usize {
+    projected_decode_output_capacity_for_test(decoded_len, MAX_DECODED_RESPONSE_INSPECTION_BYTES)
+}
+
+/// Blocks held at the peak of ONE decode pass: the codec's scratch reservation
+/// (a separate permit, so it adds rather than overlaps) plus the output
+/// reservation covering `concurrent_bytes` of still-resident input alongside
+/// this pass's output capacity.
+fn pass_peak_blocks(scratch_bytes: usize, concurrent_bytes: usize, decoded_len: usize) -> usize {
+    blocks(scratch_bytes) + blocks(concurrent_bytes + decode_capacity(decoded_len))
+}
+
+/// Bytes the budget reports as spent for an allocation of `capacity` bytes —
+/// whole blocks, since that is the granularity the semaphore is charged in.
+fn charged_for_capacity(capacity: usize) -> usize {
+    blocks(capacity) * UNIT
+}
+
 /// A JSON document of exactly `payload_bytes` of high-entropy payload.
 ///
 /// The point is not that gzip achieves nothing on it — a 64-symbol alphabet
@@ -1113,26 +1164,51 @@ fn a_decode_no_later_transform_rewrites_is_still_charged_and_reheadered() {
 ///
 /// The pair is self-calibrating: the SAME plaintext under the SAME budget is
 /// admitted when it arrives under one coding and refused when it arrives under
-/// two, so the refusal can only come from the concurrent working set.
+/// two, so the refusal can only come from the concurrent working set. Both
+/// brackets are derived, not guessed — see [`pass_peak_blocks`].
 #[test]
 fn a_stacked_decode_charges_its_input_and_output_concurrently() {
-    // 300 KiB of payload: the decoded buffer lands in the (256 KiB, 512 KiB]
-    // growth step (8 blocks) and the intermediate in (128 KiB, 256 KiB]
-    // (4 blocks), with room on both sides for the compressor's exact ratio.
     let plain = incompressible_json(300 * 1024);
     let once = gzip(&plain);
     let twice = gzip(&once);
+
+    // Single coding: one pass, nothing else resident.
+    let single_peak = pass_peak_blocks(RESPONSE_DECODE_GZIP_SCRATCH_BYTES, 0, plain.len());
+    // Stacked: pass 1 produces the intermediate, then pass 2 decodes it while
+    // that intermediate buffer is still held. Its capacity — not its length — is
+    // what stays resident.
+    let intermediate_capacity = decode_capacity(once.len());
+    let stacked_peak = pass_peak_blocks(
+        RESPONSE_DECODE_GZIP_SCRATCH_BYTES,
+        intermediate_capacity,
+        plain.len(),
+    );
+    assert!(
+        single_peak < stacked_peak,
+        "this payload must separate the two peaks or the pair proves nothing: \
+         single {single_peak} blocks, stacked {stacked_peak} blocks \
+         (plaintext {}, once-gzipped {}, intermediate capacity {intermediate_capacity})",
+        plain.len(),
+        once.len()
+    );
+
+    // Sized to admit the single-coding peak and to refuse the stacked one, which
+    // is the only difference between the two halves below.
+    let budget = probe(stacked_peak - 1);
+    let total = budget.available_bytes();
+    assert!(
+        blocks(total) >= single_peak,
+        "the budget must still admit the single-coding decode: {single_peak} \
+         blocks needed, {} available",
+        blocks(total)
+    );
+
     let headers = || {
         HashMap::from([
             ("content-type".to_string(), "application/json".to_string()),
             ("content-encoding".to_string(), "gzip, gzip".to_string()),
         ])
     };
-
-    // Sized between "one decoded copy fits" (8 blocks for this plaintext) and
-    // "the intermediate and the final buffer fit at once" (12).
-    let budget = probe(10);
-    let total = budget.available_bytes();
 
     let mut single_headers = headers();
     single_headers.insert("content-encoding".to_string(), "gzip".to_string());
@@ -1141,6 +1217,14 @@ fn a_stacked_decode_charges_its_input_and_output_concurrently() {
         admit_backend_representation(&budget, &mut single_headers, &mut single_body),
         BufferedRepresentationOutcome::Decoded,
         "one decoded copy of this plaintext fits in the budget"
+    );
+    assert_eq!(
+        total - budget.available_bytes(),
+        charged_for_capacity(decode_capacity(plain.len())),
+        "after publication the surviving charge is exactly the decoded \
+         allocation's capacity: the codec scratch and the peak surplus are back. \
+         A mismatch here means the allocator returned more capacity than \
+         `reserve_exact` was asked for, or the growth rule moved"
     );
     drop(single_body);
     assert_eq!(budget.available_bytes(), total);
@@ -1160,6 +1244,93 @@ fn a_stacked_decode_charges_its_input_and_output_concurrently() {
     );
 }
 
+/// The codec's OWN heap is not represented by the output buffer and is allocated
+/// from the attacker-supplied stream header before any output exists, so it is
+/// reserved before the decoder is constructed. A `br` response whose decoded
+/// output would fit easily must still be refused when that working set cannot be
+/// admitted — and refused as gateway capacity, with the encoded representation
+/// left exactly as the backend sent it until the caller replaces it.
+#[test]
+fn a_brotli_decode_whose_codec_working_set_is_unaffordable_is_refused() {
+    let plain = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+    let output_blocks = blocks(decode_capacity(plain.len()));
+    let scratch_blocks = blocks(RESPONSE_DECODE_BROTLI_SCRATCH_BYTES);
+
+    // Room for many copies of the decoded output, and nowhere near the Brotli
+    // ring buffer's ceiling — so the refusal can only be the codec scratch.
+    let budget = probe(scratch_blocks - 1);
+    assert!(
+        blocks(budget.available_bytes()) > output_blocks * 8,
+        "the payload must be trivially affordable on its own: {output_blocks} \
+         output blocks against {} available",
+        blocks(budget.available_bytes())
+    );
+    let total = budget.available_bytes();
+
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-encoding".to_string(), "br".to_string()),
+    ]);
+    let encoded = bytes::Bytes::from(brotli(&plain));
+    let mut body = encoded.clone();
+
+    assert_eq!(
+        admit_backend_representation(&budget, &mut headers, &mut body),
+        BufferedRepresentationOutcome::CapacityRefused,
+        "the decoder's own heap is charged before it is constructed, so a \
+         decode the gateway has no room to run is a capacity refusal"
+    );
+    assert_eq!(
+        body, encoded,
+        "nothing is installed on the refusal path; the encoded bytes stay \
+         untouched until the caller replaces the response"
+    );
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("br"),
+        "the representation the refusal describes is still the encoded one"
+    );
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "every permit the refused decode took is released"
+    );
+}
+
+/// The `br` scratch ceiling must be a bound, not a blanket rejection: the same
+/// response decodes and installs normally once the budget can hold the working
+/// set, and the working set is returned as soon as the pass ends — only the
+/// decoded allocation stays charged.
+#[test]
+fn a_brotli_decode_that_can_afford_its_working_set_is_admitted_and_gives_it_back() {
+    let plain = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+    let peak = pass_peak_blocks(RESPONSE_DECODE_BROTLI_SCRATCH_BYTES, 0, plain.len());
+    let budget = probe(peak);
+    let total = budget.available_bytes();
+
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-encoding".to_string(), "br".to_string()),
+    ]);
+    let mut body = bytes::Bytes::from(brotli(&plain));
+
+    assert_eq!(
+        admit_backend_representation(&budget, &mut headers, &mut body),
+        BufferedRepresentationOutcome::Decoded,
+        "a budget sized for the derived peak must admit the decode"
+    );
+    assert_eq!(body.as_ref(), plain.as_slice());
+    assert_eq!(
+        total - budget.available_bytes(),
+        charged_for_capacity(decode_capacity(plain.len())),
+        "the codec working set is released when its pass ends; only the \
+         decoded allocation stays charged"
+    );
+
+    drop(body);
+    assert_eq!(budget.available_bytes(), total);
+}
+
 /// Refusal is a statement about the GATEWAY, not the representation, so it takes
 /// the transient-capacity terminal: `503` with the fixed redaction-safe body,
 /// `RESOURCE_EXHAUSTED` for gRPC, health-neutral and never retried. A `502`
@@ -1167,9 +1338,19 @@ fn a_stacked_decode_charges_its_input_and_output_concurrently() {
 /// poison breaker/passive-health accounting.
 #[test]
 fn a_refused_decode_fails_closed_as_gateway_capacity_not_a_backend_error() {
-    let budget = probe(2);
+    // Deliberately sized to afford the gzip working set and NOT the decoded
+    // output, so this covers the output-growth refusal specifically; the codec
+    // scratch refusal has its own coverage above.
+    let (plain, mut headers, mut body) = gzip_json_response(1024 * 1024);
+    let scratch_blocks = blocks(RESPONSE_DECODE_GZIP_SCRATCH_BYTES);
+    let peak = pass_peak_blocks(RESPONSE_DECODE_GZIP_SCRATCH_BYTES, 0, plain.len());
+    assert!(
+        peak > scratch_blocks + 1,
+        "this payload must need more than its codec scratch: peak {peak} \
+         blocks, scratch {scratch_blocks}"
+    );
+    let budget = probe(scratch_blocks + 1);
     let total = budget.available_bytes();
-    let (_, mut headers, mut body) = gzip_json_response(1024 * 1024);
     let encoded = body.clone();
 
     let outcome = admit_backend_representation(&budget, &mut headers, &mut body);
@@ -1310,8 +1491,7 @@ fn a_rejection_after_the_decode_releases_its_capacity() {
 fn the_decoded_body_is_published_through_the_charged_owner() {
     let representation = include_str!("../../../src/plugins/response_representation.rs");
     assert!(
-        representation.contains("*response_body = decoded.into_charged_bytes();")
-            && representation.contains("charged_bytes(self.data, self.reservation)"),
+        representation.contains("charged_bytes(self.data, self.reservation)"),
         "the decoded allocation must be published together with the permit that \
          paid for it (GHSA-pwcm-6rh8-f2gh)"
     );
@@ -1324,5 +1504,79 @@ fn the_decoded_body_is_published_through_the_charged_owner() {
         !representation.contains("let mut current = body.to_vec();"),
         "the first decode pass must read the collector-charged wire bytes \
          directly rather than making an uncharged copy of them"
+    );
+}
+
+/// The handoff that publishes the decoded body must be CHECKED, not merely
+/// narrowed. `narrow_to_covered` can only release permits, so describing it as
+/// preventing an under-charge is only true while something proves the charge
+/// already covers the surviving capacity — which is why it reports failure and
+/// why the install is fallible.
+#[test]
+fn the_final_decode_handoff_is_checked_rather_than_only_narrowed() {
+    let representation = include_str!("../../../src/plugins/response_representation.rs");
+    let budget = include_str!("../../../src/proxy/response_buffer_budget.rs");
+
+    assert!(
+        budget.contains("pub(crate) fn narrow_to_covered(&mut self, retained_bytes: usize) -> bool")
+            && budget.contains("if wanted > self.blocks {\n            return false;"),
+        "narrowing must refuse when the charge does not cover the allocation, \
+         rather than silently publishing under-charged bytes"
+    );
+    assert!(
+        !budget.contains("fn release_above("),
+        "the unconditional shrink must not come back: it cannot repair an \
+         under-charge and reads as though it could"
+    );
+    assert!(
+        representation.contains("if !self.reservation.narrow_to_covered(self.data.capacity())")
+            && representation.contains("fn into_charged_bytes(mut self) -> Option<Bytes>"),
+        "publication must be gated on the charge covering the ACTUAL capacity"
+    );
+    assert!(
+        representation.contains("out.reserve_exact(grown - out.len());")
+            && representation.contains(
+                "let allocated = prospective_retained_len(concurrent_bytes, out.capacity());"
+            ),
+        "`reserve_exact` guarantees at least the requested capacity, so the \
+         reservation must be topped up to the capacity that was actually \
+         allocated"
+    );
+}
+
+/// The codec's own heap is reserved BEFORE the decoder exists, and the `br`
+/// decoder is the strict one — the crate's default reader admits Large Window
+/// Brotli, whose ring buffer is bounded by 1 GiB rather than 16 MiB, which no
+/// fixed scratch ceiling could honestly cover.
+#[test]
+fn the_decoder_working_set_is_reserved_before_the_decoder_is_constructed() {
+    let representation = include_str!("../../../src/plugins/response_representation.rs");
+
+    let scratch = representation
+        .find("if !scratch.reserve_in(budget, coding.scratch_bytes())")
+        .expect("the codec working set must be reserved against the aggregate budget");
+    for decoder in [
+        "flate2::read::MultiGzDecoder::new(data)",
+        "StrictBrotliReader::new(data)",
+    ] {
+        let constructed = representation
+            .find(decoder)
+            .unwrap_or_else(|| panic!("`{decoder}` must be the decoder that is constructed"));
+        assert!(
+            scratch < constructed,
+            "`{decoder}` is constructed before its working set is reserved; the \
+             first read can allocate that heap before any output-growth \
+             reservation happens (GHSA-pwcm-6rh8-f2gh)"
+        );
+    }
+    assert!(
+        representation.contains("brotli::BrotliState::new_strict("),
+        "the `br` decoder must pin `large_window = false`, or its ring buffer is \
+         bounded by 1 GiB and the scratch ceiling is fiction"
+    );
+    assert!(
+        !representation.contains("brotli::Decompressor::new("),
+        "`brotli::Decompressor` builds its state with `large_window = true`, so \
+         a handful of header bits can ask it for a 1 GiB ring buffer"
     );
 }

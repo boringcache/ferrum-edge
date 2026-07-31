@@ -19122,7 +19122,25 @@ pub(crate) async fn admit_buffered_response_body_transforms(
         ResponseBodyPolicyPosture::Enforce { decoded } => {
             let representation_rewritten = decoded.is_some();
             if let Some(decoded) = decoded {
-                install_decoded_response_body(ctx, response_headers, response_body, decoded);
+                // The install is fallible for exactly one reason: the decode's
+                // charge must cover the allocation's real capacity before those
+                // bytes become client-visible. A refusal installs nothing, so it
+                // takes the same gateway-local capacity terminal the refused
+                // decode above does — never a forward of the claimed encoded
+                // bytes (GHSA-pwcm-6rh8-f2gh).
+                if !install_decoded_response_body(ctx, response_headers, response_body, decoded) {
+                    warn!(
+                        "Response representation decode refused: retained-response budget exhausted"
+                    );
+                    replace_buffered_response_with_capacity_refusal_with_policy_source(
+                        ctx,
+                        response_status,
+                        response_headers,
+                        response_body,
+                        initial_response_header_policy_source,
+                    );
+                    return BufferedTransformAdmission::Rejected;
+                }
             }
             // A claimed response is never a fragment here: the gate rejects
             // partial and delta representations rather than admitting them, so

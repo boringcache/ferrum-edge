@@ -5986,6 +5986,37 @@ pub mod _test_support {
     pub const RESPONSE_BUFFER_RESERVATION_UNIT_BYTES: usize =
         crate::proxy::response_buffer_budget::RESERVATION_UNIT_BYTES;
 
+    /// Conservative heap ceiling the representation gate reserves for one
+    /// `gzip`/`x-gzip` decode pass before it constructs the decoder.
+    pub const RESPONSE_DECODE_GZIP_SCRATCH_BYTES: usize =
+        crate::plugins::response_representation::GZIP_DECODER_SCRATCH_BYTES;
+
+    /// Conservative heap ceiling the representation gate reserves for one `br`
+    /// decode pass before it constructs the decoder.
+    pub const RESPONSE_DECODE_BROTLI_SCRATCH_BYTES: usize =
+        crate::plugins::response_representation::BROTLI_DECODER_SCRATCH_BYTES;
+
+    /// The output-buffer capacity the production decode ends up holding for a
+    /// decoded body of `decoded_len` bytes under `limit`, computed with the
+    /// production growth rule.
+    ///
+    /// External budget tests derive their brackets from this rather than from
+    /// hardcoded block counts, so a change to the growth rule or to a codec's
+    /// output size surfaces as a precise arithmetic mismatch instead of a
+    /// seemingly flaky admission assertion.
+    pub fn projected_decode_output_capacity_for_test(decoded_len: usize, limit: usize) -> usize {
+        crate::plugins::response_representation::projected_decode_output_capacity(
+            decoded_len,
+            limit,
+        )
+    }
+
+    /// The decode ceiling the gate applies when no smaller response-body limit
+    /// is configured — the `limit` argument of
+    /// [`projected_decode_output_capacity_for_test`] on a default deployment.
+    pub const MAX_DECODED_RESPONSE_INSPECTION_BYTES: usize =
+        crate::plugins::response_representation::MAX_DECODED_RESPONSE_INSPECTION_BYTES;
+
     /// Client-visible HTTP status for an aggregate-capacity refusal.
     pub const RESPONSE_BUFFER_OVERLOAD_STATUS: u16 =
         crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS;
@@ -6145,8 +6176,19 @@ pub mod _test_support {
                 ResponseBodyPolicyPosture::Enforce { decoded } => match decoded {
                     None => BufferedRepresentationOutcome::EnforcedWithoutDecode,
                     Some(bytes) => {
-                        install_decoded_response_body(ctx, response_headers, response_body, bytes);
-                        BufferedRepresentationOutcome::Decoded
+                        // Same two outcomes the proxy distinguishes: an install
+                        // whose charge does not cover the allocation installs
+                        // nothing and becomes the capacity terminal.
+                        if install_decoded_response_body(
+                            ctx,
+                            response_headers,
+                            response_body,
+                            bytes,
+                        ) {
+                            BufferedRepresentationOutcome::Decoded
+                        } else {
+                            BufferedRepresentationOutcome::CapacityRefused
+                        }
                     }
                 },
             }

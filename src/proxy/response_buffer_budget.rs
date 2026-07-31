@@ -92,13 +92,36 @@
 //! * a stacked `Content-Encoding` holds one pass's input and the next pass's
 //!   output at the same time, so the reservation tracks the PEAK of
 //!   input + output across passes. A reservation only ever grows, so holding
-//!   the peak is automatic; [`ResponseBufferReservation::release_above`] then
-//!   hands the surplus back when the surviving allocation is published.
+//!   the peak is automatic;
+//!   [`ResponseBufferReservation::narrow_to_covered`] then hands the surplus
+//!   back when the surviving allocation is published;
+//! * the CODEC's own heap — a `brotli` ring buffer and Huffman/context tables,
+//!   a `miniz_oxide` inflate state — is not represented by the output buffer at
+//!   all, and the first read into a freshly constructed decoder can allocate it
+//!   before any output exists. So the representation gate reserves a
+//!   conservative per-codec ceiling on that working set *before it constructs
+//!   the decoder*, as a SEPARATE reservation held for exactly the length of one
+//!   pass. Being separate is what stops a large output from hiding behind an
+//!   earlier scratch charge: the semaphore sees the sum, not the maximum. The
+//!   ceilings and their derivation live beside the decoder in
+//!   [`crate::plugins::response_representation`].
 //!
 //! The first pass decodes straight from the collector-charged wire bytes, so no
-//! copy of them is made or charged. The bound is on the gateway's own decode
-//! allocations; it is not a claim that the allocator returns exactly the
-//! requested capacity.
+//! copy of them is made or charged.
+//!
+//! ## Allocator slop, stated exactly
+//!
+//! `Vec` guarantees *at least* the capacity that was requested, not exactly it.
+//! The decode therefore reserves its computed growth target, allocates, and then
+//! immediately tops the reservation up to the resulting `Vec::capacity()`,
+//! failing closed (and dropping the buffer) if the top-up is refused. The window
+//! in which capacity exceeds the reservation is the single statement between the
+//! allocation and the top-up, on one thread, with no await in it. Nothing is
+//! published out of that window:
+//! [`ResponseBufferReservation::narrow_to_covered`] gates the handoff and
+//! REFUSES rather than narrowing when the charge is smaller than the surviving
+//! capacity, so an allocation whose real capacity outran its charge is dropped
+//! rather than installed.
 //!
 //! # Admission
 //!
@@ -162,6 +185,15 @@ pub(crate) const RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE: &str =
 /// upstream would hit the same process-global budget).
 pub(crate) const RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS: ErrorClass =
     ErrorClass::GatewayBufferCapacity;
+
+/// Whole blocks needed to cover `retained_bytes`.
+///
+/// Saturating at `u32::MAX` rather than wrapping: a saturated block count is
+/// unsatisfiable by any real semaphore, so an absurd byte count is refused
+/// instead of wrapping down into an affordable one.
+fn blocks_for(retained_bytes: usize) -> u32 {
+    u32::try_from(retained_bytes.div_ceil(RESERVATION_UNIT_BYTES)).unwrap_or(u32::MAX)
+}
 
 struct Budget {
     fallback_per_response_bytes: usize,
@@ -299,8 +331,7 @@ impl ResponseBufferReservation {
         if retained_bytes == 0 {
             return true;
         }
-        let wanted = u32::try_from(retained_bytes.div_ceil(RESERVATION_UNIT_BYTES))
-            .unwrap_or(u32::MAX);
+        let wanted = blocks_for(retained_bytes);
         if wanted <= self.blocks {
             return true;
         }
@@ -326,30 +357,39 @@ impl ResponseBufferReservation {
         self.reserve_against(budget.resolve(), retained_bytes)
     }
 
-    /// Return every block beyond what `retained_bytes` needs, keeping the rest
-    /// of the charge — and its identity — intact.
+    /// Narrow the charge to exactly what `retained_bytes` needs, returning every
+    /// surplus block — but only when the charge already COVERS those bytes.
     ///
     /// This exists for one shape: a working reservation that had to cover a
     /// transient PEAK (a stacked decode holds its input and its output at once)
     /// and is then handed to [`charged_bytes`] together with only the surviving
-    /// allocation. Without it the peak would stay charged for the whole response
-    /// lifetime, which is safe but needlessly shrinks the budget other responses
-    /// can use.
+    /// allocation. Without narrowing, the peak would stay charged for the whole
+    /// response lifetime, which is safe but needlessly shrinks the budget other
+    /// responses can use.
     ///
-    /// Shrinking only ever RELEASES permits, so it cannot fail and cannot
-    /// under-charge: the retained blocks still cover `retained_bytes` rounded up.
-    pub(crate) fn release_above(&mut self, retained_bytes: usize) {
-        let wanted =
-            u32::try_from(retained_bytes.div_ceil(RESERVATION_UNIT_BYTES)).unwrap_or(u32::MAX);
-        if wanted >= self.blocks {
-            return;
+    /// Narrowing only ever RELEASES permits, so it can never itself acquire.
+    /// That is exactly why it must not be described as *preventing* an
+    /// under-charge: if the surviving allocation is larger than what was
+    /// reserved — an allocator that returned more capacity than requested and a
+    /// caller that did not top the reservation up — narrowing would silently
+    /// publish under-charged bytes. So this returns `false` in that case and the
+    /// caller must not publish; dropping the reservation and the buffer together
+    /// is the fail-closed answer.
+    #[must_use]
+    pub(crate) fn narrow_to_covered(&mut self, retained_bytes: usize) -> bool {
+        let wanted = blocks_for(retained_bytes);
+        if wanted > self.blocks {
+            return false;
+        }
+        if wanted == self.blocks {
+            return true;
         }
         if wanted == 0 {
             // Dropping the whole permit is the same release, without
             // constructing a zero-permit handle.
             self.permit = None;
             self.blocks = 0;
-            return;
+            return true;
         }
         let surplus = self.blocks - wanted;
         if let Some(held) = self.permit.as_mut() {
@@ -362,6 +402,7 @@ impl ResponseBufferReservation {
                 self.blocks = wanted;
             }
         }
+        true
     }
 
     /// Bytes currently reserved (whole blocks). Diagnostics only.
@@ -497,7 +538,15 @@ fn charge_retained_copy_against(budget: &Budget, data: &[u8]) -> Option<Bytes> {
     if !reservation.reserve_against(budget, data.len()) {
         return None;
     }
-    Some(charged_bytes(data.to_vec(), reservation))
+    let copy = data.to_vec();
+    // `to_vec` guarantees at least `data.len()` capacity, not exactly it, and
+    // what is resident is the capacity. Top up before publishing so the permit
+    // cannot be smaller than the allocation it is supposed to bound; a refused
+    // top-up drops `copy` here rather than storing under-charged bytes.
+    if !reservation.reserve_against(budget, copy.capacity()) {
+        return None;
+    }
+    Some(charged_bytes(copy, reservation))
 }
 
 /// Charge a retained body that was produced without a collector reservation —
@@ -516,7 +565,9 @@ fn charge_replacement_body_against(budget: &Budget, data: Vec<u8>) -> Option<Byt
         return Some(Bytes::new());
     }
     let mut reservation = ResponseBufferReservation::new();
-    if !reservation.reserve_against(budget, data.len()) {
+    // The allocation's CAPACITY is what is resident, and a plugin-authored
+    // buffer routinely carries capacity beyond its length.
+    if !reservation.reserve_against(budget, data.capacity()) {
         return None;
     }
     Some(charged_bytes(data, reservation))
