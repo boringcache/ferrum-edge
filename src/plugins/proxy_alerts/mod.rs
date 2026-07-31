@@ -327,6 +327,8 @@ impl ProxyAlerts {
         self.recovery
             .settle_trigger_success(0, proxy_id, generation, 1, 1);
     }
+
+    /// Run the ownership portion of the background lifecycle sweep without
     /// waiting for its one-minute cadence.
     #[doc(hidden)]
     #[allow(dead_code)]
