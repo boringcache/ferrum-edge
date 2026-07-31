@@ -3029,8 +3029,7 @@ async fn handle_h3_request(
         .await
         {
             PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. }
-            | reject @ PluginResult::RejectBinary { .. } => {
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     tracing::error!("Plugin result could not be converted to rejection parts");
                     run_h3_reject_response_committed_hooks(
@@ -3146,8 +3145,7 @@ async fn handle_h3_request(
         .await
         {
             PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. }
-            | reject @ PluginResult::RejectBinary { .. } => {
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     tracing::error!("Plugin result could not be converted to rejection parts");
                     ctx.headers = tmp_headers;

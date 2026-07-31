@@ -16447,11 +16447,7 @@ async fn run_after_proxy_hooks_on_rejection(
                 None => {
                     // Commit route policy before detaching remaining hooks so a
                     // mid-chain deadline cannot drop matched response transforms.
-                    maybe_finalize_route_override_response_headers(
-                        plugins,
-                        ctx,
-                        response_headers,
-                    );
+                    maybe_finalize_route_override_response_headers(plugins, ctx, response_headers);
                     spawn_detached_rejection_cleanup(
                         future,
                         plugins[index + 1..]
@@ -16533,8 +16529,7 @@ async fn run_after_proxy_hooks_on_rejection(
         if matches!(&result, PluginResult::Continue) || !plugin.may_replace_rejection_response() {
             ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
         }
-        if matches!(&result, PluginResult::Continue)
-            && last_route_response_finalizer == Some(index)
+        if matches!(&result, PluginResult::Continue) && last_route_response_finalizer == Some(index)
         {
             crate::plugins::utils::route_header_transform::finalize_route_override_response_headers(
                 ctx,

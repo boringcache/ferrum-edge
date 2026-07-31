@@ -9,15 +9,15 @@ use ferrum_edge::_test_support::{
     apply_replaceable_after_proxy_hooks_to_rejection_for_test, plugins_for_protocol_for_test,
     run_after_proxy_hooks_for_test, run_before_proxy_hooks_for_test,
 };
+use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, DispatchKind, GatewayConfig, PluginAssociation, PluginConfig,
-    PluginScope, Proxy, DEFAULT_NAMESPACE, default_namespace,
+    AuthMode, BackendScheme, DEFAULT_NAMESPACE, DispatchKind, GatewayConfig, PluginAssociation,
+    PluginConfig, PluginScope, Proxy, default_namespace,
 };
 use ferrum_edge::plugins::utils::route_header_transform::{
     RawRouteHeaderTransformRule, parse_route_header_transforms,
 };
 use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
-use ferrum_edge::PluginCache;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -141,7 +141,11 @@ fn route_response_rules(raw: serde_json::Value) -> Arc<Vec<_>> {
 }
 
 fn make_ctx() -> RequestContext {
-    RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/api".to_string())
+    RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    )
 }
 
 async fn run_request_chain(
@@ -189,7 +193,8 @@ async fn cache_backed_stable_order_route_remove_survives_later_request_rename() 
         ),
     ]);
     let cache = PluginCache::new(&config).expect("cache");
-    let plugins = plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
     assert_eq!(
         plugins
             .iter()
@@ -254,7 +259,8 @@ async fn cache_backed_priority_override_order_route_set_survives_later_static_up
         ),
     ]);
     let cache = PluginCache::new(&config).expect("cache");
-    let plugins = plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
     let names: Vec<&str> = plugins
         .iter()
         .filter(|p| p.name() == "request_transformer")
@@ -315,7 +321,8 @@ async fn cache_backed_auto_emit_consumer_then_operator_keeps_route_final() {
         ),
     ]);
     let cache = PluginCache::new(&config).expect("cache");
-    let plugins = plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
 
     let mut ctx = make_ctx();
     ctx.route_override_request_transform = Some(route_request_rules(json!([
@@ -371,7 +378,8 @@ async fn cache_backed_disabled_rtds_instance_does_not_suppress_route_final() {
         ),
     ]);
     let cache = PluginCache::new(&config).expect("cache");
-    let plugins = plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
     assert!(
         plugins
             .iter()
@@ -432,7 +440,8 @@ async fn cache_backed_response_route_remove_survives_later_backend_rename() {
         ),
     ]);
     let cache = PluginCache::new(&config).expect("cache");
-    let plugins = plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
     assert_eq!(
         plugins
             .iter()
@@ -490,7 +499,8 @@ async fn cache_backed_response_route_set_and_add_apply_exactly_once() {
         ),
     ]);
     let cache = PluginCache::new(&config).expect("cache");
-    let plugins = plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
 
     let mut ctx = make_ctx();
     ctx.route_override_response_transform = Some(route_response_rules(json!([
@@ -539,7 +549,8 @@ async fn cache_backed_synthetic_rejection_path_applies_response_route_final() {
         ),
     ]);
     let cache = PluginCache::new(&config).expect("cache");
-    let plugins = plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
 
     let mut ctx = make_ctx();
     ctx.route_override_response_transform = Some(route_response_rules(json!([
@@ -590,7 +601,8 @@ async fn no_eligible_consumer_leaves_route_override_unused() {
         None,
     )]);
     let cache = PluginCache::new(&config).expect("cache");
-    let plugins = plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
     assert!(
         !plugins
             .iter()
