@@ -96,7 +96,9 @@ paths:
   because everything else is either bound into the logical key or enforced per
   operation. In-flight operations, completions, and execution barriers retain
   their admission-time protection windows across reloads; never evaluate an
-  existing lease with a replacement generation's shorter timeout. Do not
+  existing lease with a replacement generation's shorter timeout. Weak
+  registries keep every still-live semantic generation for an identity, not
+  just the last one, so A → B → A recovers A's active protection state. Do not
   reintroduce per-instance ownership for any of these.
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 

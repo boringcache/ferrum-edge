@@ -768,10 +768,12 @@ static NEXT_REQUEST_DEDUPLICATION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 ///
 /// Values are `Weak`, so an entry only survives while a live plugin instance or
 /// an in-flight request still owns the state. Every insert prunes dead entries,
-/// which bounds the map at the number of currently configured deduplication
-/// policies rather than letting reload churn accumulate.
-static SHARED_LOCAL_STATES: OnceLock<Mutex<HashMap<String, Weak<RequestDeduplicationLocalState>>>> =
-    OnceLock::new();
+/// which bounds the registry to currently configured policies plus retired
+/// semantic generations that still protect in-flight work rather than letting
+/// reload churn accumulate.
+static SHARED_LOCAL_STATES: OnceLock<
+    Mutex<HashMap<String, Vec<Weak<RequestDeduplicationLocalState>>>>,
+> = OnceLock::new();
 
 /// Effective policy fields whose change makes already-retained local
 /// deduplication state unsafe to inherit.
@@ -878,16 +880,27 @@ fn retain_shared_local_state(
     let mut guard = registry
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(existing) = guard.get(identity).and_then(|weak| weak.upgrade())
-        && existing.compatibility == compatibility
-    {
+    // Keep every still-live semantic generation for an identity. A single
+    // last-writer slot is insufficient: A -> B -> A while an A operation is
+    // still in flight must recover A's protection state instead of creating a
+    // third empty domain.
+    guard.retain(|_, states| {
+        states.retain(|weak| weak.strong_count() > 0);
+        !states.is_empty()
+    });
+    if let Some(existing) = guard.get(identity).and_then(|states| {
+        states
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|state| state.compatibility == compatibility)
+    }) {
         return existing;
     }
     let state = RequestDeduplicationLocalState::new(compatibility, shard_amount);
-    guard.insert(identity.to_string(), Arc::downgrade(&state));
-    // Opportunistically prune dead weak entries so removed or superseded
-    // policies cannot accumulate across reload churn.
-    guard.retain(|_, weak| weak.strong_count() > 0);
+    guard
+        .entry(identity.to_string())
+        .or_default()
+        .push(Arc::downgrade(&state));
     state
 }
 

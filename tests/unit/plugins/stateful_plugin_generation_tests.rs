@@ -608,6 +608,35 @@ async fn dedup_header_name_change_isolates_instead_of_reusing_retained_keys() {
 }
 
 #[tokio::test]
+async fn dedup_policy_revert_recovers_a_still_live_semantic_generation() {
+    let first = dedup_generation("ns-dedup-aba", "dedup-aba", json!({}));
+    let (leased, _ctx) = dedup_lookup(&first, DEDUP_HEADER, "aba-key").await;
+    assert!(matches!(leased, PluginResult::Continue));
+
+    let changed = dedup_generation(
+        "ns-dedup-aba",
+        "dedup-aba",
+        json!({"header_name": "X-Request-Id"}),
+    );
+    assert!(
+        !changed.shares_local_state_with(&first),
+        "the incompatible middle generation must stay isolated"
+    );
+
+    let reverted = dedup_generation("ns-dedup-aba", "dedup-aba", json!({}));
+    assert!(
+        reverted.shares_local_state_with(&first),
+        "A -> B -> A must recover A while its operation is still live"
+    );
+    let (duplicate, _) = dedup_lookup(&reverted, DEDUP_HEADER, "aba-key").await;
+    assert_eq!(
+        reject_status(&duplicate),
+        Some(409),
+        "the reverted generation must not re-execute A's in-flight operation"
+    );
+}
+
+#[tokio::test]
 async fn dedup_distinct_policies_tenants_and_identityless_instances_never_share() {
     let base = dedup_generation("ns-dedup-iso", "dedup-iso-a", json!({}));
     let (leased, _ctx) = dedup_lookup(&base, DEDUP_HEADER, "iso-key").await;
@@ -799,6 +828,29 @@ async fn load_testing_active_run_blocks_a_replacement_generation_trigger() {
         !first.is_running(),
         "both generations observe the same completion"
     );
+}
+
+#[tokio::test]
+async fn load_testing_policy_revert_recovers_a_still_live_semantic_generation() {
+    let original_config = load_testing_config(1);
+    let first = load_testing_generation("ns-lt-aba", "lt-aba", &original_config);
+    trigger_load_test(&first).await;
+    assert!(first.is_running(), "the A cohort must be active");
+
+    let mut changed_config = original_config.clone();
+    changed_config["max_response_body_bytes"] = json!(2048);
+    let changed = load_testing_generation("ns-lt-aba", "lt-aba", &changed_config);
+    assert!(
+        !changed.is_running(),
+        "the incompatible B generation has an isolated admission domain"
+    );
+
+    let reverted = load_testing_generation("ns-lt-aba", "lt-aba", &original_config);
+    assert!(
+        reverted.is_running(),
+        "A -> B -> A must recover A's still-active cohort guard"
+    );
+    wait_until_idle(&reverted).await;
 }
 
 #[tokio::test]

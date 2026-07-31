@@ -64,7 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes are compatible without resetting the protection domain. Each
   admitted operation, completion, and execution barrier retains its original
   protection window, so a reload cannot shorten an in-flight lease; new
-  operations use the replacement settings.
+  operations use the replacement settings. Every still-live semantic
+  generation remains discoverable, so a rapid A → B → A policy sequence
+  recovers A's active protection domain instead of admitting against a third
+  empty state.
   Retention is bounded to currently configured policies plus whatever in-flight
   work still holds a reference.
 - `load_testing` now admits at most **one** effective instance per proxy after
@@ -74,6 +77,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gateway with no reload at all, multiplying thousands of loopback requests per
   instance. Cross-generation admission for one policy identity was already
   shared; this closes the duplicate-instance half.
+  Compatible-state lookup also retains every still-live semantic generation,
+  so an A → B → A reload cannot lose A's active cohort admission flag.
 - Irreversible request egress no longer precedes request-body transformation or
   final request policy (GHSA-4vr5-4wm3-x5xv). `request_mirror` and
   `serverless_function` previously ran their external dispatch in
