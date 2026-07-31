@@ -436,13 +436,16 @@ async fn test_harness_identity_distinguishes_two_real_gateways() {
 fn harness_capture_diagnostics_scrub_secrets_and_bound_output() {
     let jwt_secret = "harness-jwt-secret-value-0123456789";
     let observability = "harness-obs-token-value-ABCDEFGH";
+    let short_hmac = "xy";
 
     let sensitive = format!(
         "startup failed redis_url=redis://user:s3cret@127.0.0.1:6379/0 \
-         jwt={jwt_secret} token={observability}"
+         jwt={jwt_secret} token={observability} hmac={short_hmac}"
     );
-    let scrubbed_sensitive =
-        scrub_gateway_capture_for_diagnostics(&sensitive, &[jwt_secret, observability, "short"]);
+    let scrubbed_sensitive = scrub_gateway_capture_for_diagnostics(
+        &sensitive,
+        &[jwt_secret, observability, short_hmac],
+    );
 
     assert!(
         !scrubbed_sensitive.contains(jwt_secret),
@@ -451,6 +454,10 @@ fn harness_capture_diagnostics_scrub_secrets_and_bound_output() {
     assert!(
         !scrubbed_sensitive.contains(observability),
         "observability token must not appear in diagnostics: {scrubbed_sensitive}"
+    );
+    assert!(
+        !scrubbed_sensitive.contains(short_hmac),
+        "short caller-provided secret must not appear in diagnostics: {scrubbed_sensitive}"
     );
     assert!(
         !scrubbed_sensitive.contains("user:s3cret@"),
@@ -462,8 +469,10 @@ fn harness_capture_diagnostics_scrub_secrets_and_bound_output() {
     );
 
     let oversized = format!("{}{}", "x".repeat(20_000), sensitive);
-    let scrubbed_oversized =
-        scrub_gateway_capture_for_diagnostics(&oversized, &[jwt_secret, observability]);
+    let scrubbed_oversized = scrub_gateway_capture_for_diagnostics(
+        &oversized,
+        &[jwt_secret, observability, short_hmac],
+    );
     assert!(
         scrubbed_oversized.starts_with("…[truncated]…\n"),
         "oversized capture must be truncated from the front: {}",
@@ -479,7 +488,9 @@ fn harness_capture_diagnostics_scrub_secrets_and_bound_output() {
         "trailing diagnostic content must survive truncation: {scrubbed_oversized}"
     );
     assert!(
-        !scrubbed_oversized.contains(jwt_secret) && !scrubbed_oversized.contains("user:s3cret@"),
+        !scrubbed_oversized.contains(jwt_secret)
+            && !scrubbed_oversized.contains(short_hmac)
+            && !scrubbed_oversized.contains("user:s3cret@"),
         "truncated diagnostics must still scrub secrets: {scrubbed_oversized}"
     );
 }

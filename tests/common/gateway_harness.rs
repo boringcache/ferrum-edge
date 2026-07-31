@@ -1543,14 +1543,15 @@ const GATEWAY_CAPTURE_DIAGNOSTIC_MAX_BYTES: usize = 16 * 1024;
 
 /// Scrub secrets and bound captured gateway logs for harness failure diagnostics.
 ///
-/// Replaces each provided secret (≥8 chars, to avoid scrubbing trivial noise),
-/// redacts URL userinfo (`scheme://user:pass@host`), and keeps only the trailing
+/// Replaces every provided non-empty secret (empty strings are skipped because
+/// replacing them would corrupt the entire capture), redacts URL userinfo
+/// (`scheme://user:pass@host`), and keeps only the trailing
 /// `GATEWAY_CAPTURE_DIAGNOSTIC_MAX_BYTES` so hosted CI stays actionable without
 /// dumping unbounded child output.
 pub fn scrub_gateway_capture_for_diagnostics(raw: &str, secrets: &[&str]) -> String {
     let mut text = raw.to_string();
     for secret in secrets {
-        if secret.len() >= 8 {
+        if !secret.is_empty() {
             text = text.replace(secret, "***");
         }
     }
