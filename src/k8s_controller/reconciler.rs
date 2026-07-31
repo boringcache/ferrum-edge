@@ -26,6 +26,7 @@ use crate::k8s_controller::status::{
     plan_gateway_api_status_updates_with_context,
 };
 use crate::k8s_controller::watcher::namespaces_with_istio_root;
+use crate::modes::mesh::config::MeshConfig;
 
 const INITIAL_STORE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP: usize = 256;
@@ -1014,15 +1015,7 @@ fn log_mesh_overlay_transition(
     new_config: &GatewayConfig,
     k8s_config: &GatewayConfig,
 ) {
-    if !k8s_config.k8s_mesh_overlay.is_authoritative() {
-        return;
-    }
-    let owned_namespaces = k8s_config
-        .k8s_mesh_overlay
-        .owned_namespaces()
-        .map(|namespaces| namespaces.len())
-        .unwrap_or(0);
-    if owned_namespaces > 0 {
+    if !k8s_config.k8s_mesh_overlay.is_authoritative() || k8s_config.mesh.is_some() {
         return;
     }
     if old_config.mesh.is_some() && new_config.mesh.is_none() {
@@ -1076,11 +1069,12 @@ fn namespace_is_managed(namespace: &str, managed_namespaces: &BTreeSet<String>) 
 ///   state owned by another source is left exactly as found, and a mesh block
 ///   the caller did supply still replaces the active one (the pre-#2452
 ///   contract for hand-composed overlays).
-/// * [`K8sMeshOverlay::Authoritative`] — Kubernetes owns the mesh objects in
-///   the managed namespaces. Those are withdrawn first and the translation's
-///   own objects layered back on, so an authoritatively EMPTY translation
-///   withdraws every Kubernetes-owned mesh object while objects owned by
-///   native/file/xDS sources in other namespaces survive.
+/// * [`K8sMeshOverlay::Authoritative`] — Kubernetes owns an overlay layered on
+///   a retained non-Kubernetes base. The composed mesh is rebuilt from that
+///   base plus this translation's objects, so an authoritatively EMPTY
+///   translation withdraws every Kubernetes-owned mesh object and leaves the
+///   base exactly as another source authored it — same namespace, same kind,
+///   or same name included.
 ///
 /// The result is a whole new `GatewayConfig`; the caller publishes it through
 /// a single `ArcSwap` compare-and-swap, so an in-flight consumer observes
@@ -1117,68 +1111,74 @@ pub fn merge_k8s_translation(
     namespaces.extend(k8s_config.known_namespaces.iter().cloned());
     merged.known_namespaces = namespaces.into_iter().collect();
 
-    merge_k8s_mesh_overlay(&mut merged, k8s_config, managed_namespaces);
+    merge_k8s_mesh_overlay(&mut merged, k8s_config);
 
     merged.normalize_fields();
     merged
 }
 
-/// Apply the Kubernetes mesh overlay to `merged` under explicit ownership.
+/// Recompose `merged.mesh` from its non-Kubernetes base layer plus the
+/// Kubernetes overlay this translation carries (issue #2452).
 ///
-/// The withdrawal set is the union of
+/// Ownership is by OBJECT IDENTITY, never by namespace. A namespace routinely
+/// holds objects from several sources at once — a `Service`-derived
+/// `MeshService` next to a natively authored one, an Istio `AuthorizationPolicy`
+/// next to a file-authored `MeshPolicy` — so withdrawing a namespace would
+/// erase mesh state Kubernetes never published. Instead:
 ///
-/// * the managed namespaces (empty means a cluster-wide watch, i.e. every
-///   namespace is Kubernetes-managed — the same rule the proxy/upstream/plugin
-///   retains above use),
-/// * the namespaces the PREVIOUS Kubernetes overlay occupied, carried on
-///   `active.k8s_mesh_overlay`, so an object whose namespace has since dropped
-///   out of the managed set is still withdrawn instead of stranded, and
-/// * the namespaces this translation occupies, so a re-published object is
-///   replaced rather than duplicated.
+/// 1. The base layer is recovered. When the active snapshot already carries a
+///    Kubernetes overlay, its retained `base_mesh` IS the base; otherwise the
+///    active `mesh` is entirely non-Kubernetes and becomes the base.
+/// 2. The translation's objects are layered onto a copy of that base
+///    ([`MeshConfig::overlay_objects_from`]), shadowing a base object only on
+///    an exact same-collection `(namespace, key)` collision.
+/// 3. The base is retained on the result, so the NEXT publish recomposes from
+///    it. An authoritatively empty translation therefore yields the base
+///    verbatim — every Kubernetes object gone, every other source's object
+///    intact, and any base object the overlay had shadowed restored.
+///
+/// Because step 2 rebuilds from the base rather than editing the composed
+/// view, a Kubernetes object is withdrawn purely by being absent from the new
+/// translation. Nothing depends on the watch scope, so shrinking
+/// `FERRUM_K8S_WATCH_NAMESPACES` cannot strand an object — including a
+/// waypoint binding or policy whose own namespace differs from the namespace
+/// of the services it governs.
 ///
 /// Mesh-global blocks (`trust_bundles`, `multi_cluster`,
-/// `outbound_traffic_policy`, `extension_configs`) are never withdrawn here:
+/// `outbound_traffic_policy`, `extension_configs`) ride the base untouched:
 /// the Kubernetes translator does not produce them, so it does not own them.
 /// `istio_root_namespace` is adopted from the translation only when the
-/// translation actually carries mesh objects.
-fn merge_k8s_mesh_overlay(
-    merged: &mut GatewayConfig,
-    k8s_config: &GatewayConfig,
-    managed_namespaces: &BTreeSet<String>,
-) {
-    let Some(owned_namespaces) = k8s_config.k8s_mesh_overlay.owned_namespaces() else {
-        // No Kubernetes mesh authority: never withdraw another source's mesh.
+/// translation actually carries a mesh block.
+fn merge_k8s_mesh_overlay(merged: &mut GatewayConfig, k8s_config: &GatewayConfig) {
+    if !k8s_config.k8s_mesh_overlay.is_authoritative() {
+        // No Kubernetes mesh authority: this source may not withdraw anything.
+        // A mesh block it did supply still replaces the active one (the
+        // pre-#2452 contract for hand-composed overlays), and that replacement
+        // is wholly non-Kubernetes-owned.
         if k8s_config.mesh.is_some() {
             merged.mesh = k8s_config.mesh.clone();
+            merged.k8s_mesh_overlay = K8sMeshOverlay::NoAuthority;
         }
         return;
+    }
+
+    let base_mesh: Option<Box<MeshConfig>> = match &merged.k8s_mesh_overlay {
+        K8sMeshOverlay::Authoritative { base_mesh } => base_mesh.clone(),
+        K8sMeshOverlay::NoAuthority => merged.mesh.clone(),
     };
 
-    let mut previously_owned: BTreeSet<String> = merged
-        .k8s_mesh_overlay
-        .owned_namespaces()
-        .cloned()
-        .unwrap_or_default();
-    previously_owned.extend(owned_namespaces.iter().cloned());
-
-    let mut mesh = merged.mesh.take().unwrap_or_default();
-    mesh.retain_object_namespaces(|namespace| {
-        let managed = namespace_is_managed(namespace, managed_namespaces);
-        !managed && !previously_owned.contains(namespace)
-    });
+    let mut composed = base_mesh.as_deref().cloned().unwrap_or_default();
     if let Some(k8s_mesh) = k8s_config.mesh.as_deref() {
-        mesh.istio_root_namespace = k8s_mesh.istio_root_namespace.clone();
-        mesh.extend_objects_from(k8s_mesh);
+        composed.istio_root_namespace = k8s_mesh.istio_root_namespace.clone();
+        composed.overlay_objects_from(k8s_mesh);
     }
 
-    if mesh.is_empty_overlay() {
-        merged.mesh = None;
+    merged.mesh = if composed.is_empty_overlay() {
+        None
     } else {
-        merged.mesh = Some(mesh);
-    }
-    merged.k8s_mesh_overlay = K8sMeshOverlay::Authoritative {
-        owned_namespaces: owned_namespaces.clone(),
+        Some(Box::new(composed))
     };
+    merged.k8s_mesh_overlay = K8sMeshOverlay::Authoritative { base_mesh };
 }
 
 fn merge_k8s_frontend_tls(merged: &mut GatewayConfig, k8s_config: &GatewayConfig) {

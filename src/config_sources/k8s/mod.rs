@@ -758,16 +758,15 @@ impl K8sAccumulator {
         self.mesh.proxy_configs.sort_by(|left, right| {
             (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
         });
-        // Record the mesh ownership footprint BEFORE the mesh is moved onto the
-        // config. `Authoritative` with an EMPTY namespace set is the load-bearing
-        // state (issue #2452): it says "this managed Kubernetes snapshot supplies
-        // no mesh objects", which the merge withdraws, as distinct from
-        // `NoAuthority`, which says "Kubernetes is not a mesh source at all;
-        // leave whatever another source owns alone".
+        // Claim mesh ownership of this translation. `Authoritative` with an
+        // EMPTY `mesh` is the load-bearing state (issue #2452): it says "this
+        // managed Kubernetes snapshot supplies no mesh objects", which the
+        // merge withdraws, as distinct from `NoAuthority`, which says
+        // "Kubernetes is not a mesh source at all; leave whatever another
+        // source owns alone". A translation has no base layer underneath it —
+        // every object in its `mesh` is Kubernetes-owned by construction.
         self.config.k8s_mesh_overlay = if self.options.mesh_overlay_authority {
-            crate::config::types::K8sMeshOverlay::Authoritative {
-                owned_namespaces: self.mesh.object_namespaces(),
-            }
+            crate::config::types::K8sMeshOverlay::authoritative_translation()
         } else {
             crate::config::types::K8sMeshOverlay::NoAuthority
         };

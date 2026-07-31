@@ -8,13 +8,20 @@
 //!
 //!   * `NoAuthority`   — this source is not a mesh owner; leave other sources'
 //!                       mesh state alone.
-//!   * `Authoritative` — this source owns the mesh objects in the listed
-//!                       namespaces, and an EMPTY list is a withdrawal.
+//!   * `Authoritative` — the published mesh is a retained non-Kubernetes
+//!                       `base_mesh` plus a Kubernetes overlay layered on top,
+//!                       and an EMPTY overlay is a withdrawal.
+//!
+//! Ownership is keyed by OBJECT IDENTITY (collection + namespace + the
+//! resource's own key), never by namespace: a namespace routinely holds
+//! objects from several sources at once, so withdrawing a namespace would
+//! erase mesh state Kubernetes never published.
 //!
 //! These tests cover both states end to end: real translations for Service /
 //! Workload, AuthorizationPolicy / PeerAuthentication / RequestAuthentication,
-//! ServiceEntry / WorkloadEntry, mixed-source ownership, drift (re-publication
-//! without duplication), namespaces that leave the managed set, publication
+//! ServiceEntry / WorkloadEntry, same-namespace mixed-source ownership,
+//! same-name collisions, mesh-global blocks, drift (re-publication without
+//! duplication), watch-scope shrink, CP full-reload composition, publication
 //! atomicity, and repeated-empty idempotence.
 
 use std::collections::{BTreeSet, HashMap};
@@ -28,8 +35,14 @@ use ferrum_edge::config::types::{GatewayConfig, K8sMeshOverlay};
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
-use ferrum_edge::identity::spiffe::TrustDomain;
-use ferrum_edge::modes::mesh::config::{MeshConfig, MeshService};
+use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
+use ferrum_edge::modes::mesh::config::{
+    MeshConfig, MeshCorsOriginMatch, MeshCorsPolicy, MeshDestinationRule, MeshPolicy,
+    MeshProxyConfig, MeshRequestAuthentication, MeshService, MeshSidecar, MeshTelemetryConfig,
+    MeshTelemetryResource, MeshVirtualServiceCorsPolicy, MeshWaypointBinding, MtlsMode,
+    OutboundTrafficPolicy, PeerAuthentication, PolicyScope, ServiceEntry, Workload,
+    WorkloadSelector,
+};
 use serde_json::{Value, json};
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
@@ -221,19 +234,50 @@ fn authoritative_empty_translation() -> GatewayConfig {
     authoritative_translation(&[])
 }
 
+/// A hand-built authoritative Kubernetes overlay, for coverage a real
+/// translation cannot reach conveniently (every mesh collection at once).
+fn authoritative_overlay(mesh: Option<MeshConfig>) -> GatewayConfig {
+    GatewayConfig {
+        mesh: mesh.map(Box::new),
+        k8s_mesh_overlay: K8sMeshOverlay::authoritative_translation(),
+        ..GatewayConfig::default()
+    }
+}
+
+/// An active snapshot whose mesh is owned entirely by a non-Kubernetes source
+/// (native / file / xDS / DB).
+fn other_source_config(mesh: MeshConfig) -> GatewayConfig {
+    GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    }
+}
+
 fn managed(namespaces: &[&str]) -> BTreeSet<String> {
     namespaces.iter().map(|ns| ns.to_string()).collect()
 }
 
 fn native_mesh_service(namespace: &str, name: &str) -> MeshService {
     MeshService {
-        cluster_ips: Vec::new(),
+        cluster_ips: vec!["10.96.0.7".to_string()],
         name: name.to_string(),
         namespace: namespace.to_string(),
         ports: Vec::new(),
         workloads: Vec::new(),
         protocol_overrides: HashMap::new(),
     }
+}
+
+fn mesh_of(config: &GatewayConfig) -> &MeshConfig {
+    config.mesh.as_deref().expect("mesh must be published")
+}
+
+fn service_names(mesh: &MeshConfig, namespace: &str) -> Vec<String> {
+    mesh.services
+        .iter()
+        .filter(|svc| svc.namespace == namespace)
+        .map(|svc| svc.name.clone())
+        .collect()
 }
 
 // ── Translator: authority marking ─────────────────────────────────────────
@@ -248,15 +292,13 @@ fn authoritative_translator_marks_an_empty_snapshot_as_authoritative() {
     );
     assert_eq!(
         empty.k8s_mesh_overlay,
-        K8sMeshOverlay::Authoritative {
-            owned_namespaces: BTreeSet::new(),
-        },
+        K8sMeshOverlay::Authoritative { base_mesh: None },
         "an empty managed snapshot is an authoritative withdrawal, not a missing update"
     );
 }
 
 #[test]
-fn authoritative_translator_records_the_namespaces_it_owns() {
+fn a_translation_owns_its_whole_mesh_and_nothing_underneath_it() {
     let translation = authoritative_translation(&[
         service_entry("alpha", "api", "api.example.com"),
         service_entry("beta", "cdn", "cdn.example.com"),
@@ -264,10 +306,10 @@ fn authoritative_translator_records_the_namespaces_it_owns() {
 
     assert_eq!(
         translation.k8s_mesh_overlay,
-        K8sMeshOverlay::Authoritative {
-            owned_namespaces: managed(&["alpha", "beta"]),
-        }
+        K8sMeshOverlay::Authoritative { base_mesh: None },
+        "a raw translation has no base layer: its whole mesh is Kubernetes-owned"
     );
+    assert_eq!(mesh_of(&translation).service_entries.len(), 2);
 }
 
 #[test]
@@ -285,15 +327,16 @@ fn non_authoritative_translator_never_claims_mesh_ownership() {
 #[test]
 fn deleting_the_last_service_and_workload_withdraws_the_mesh_overlay() {
     let populated = authoritative_translation(&[service(), ready_pod(), endpoint_slice()]);
-    let mesh = populated.mesh.as_deref().expect("mesh translated");
+    let mesh = mesh_of(&populated);
     assert_eq!(mesh.services.len(), 1);
     assert_eq!(mesh.workloads.len(), 1);
 
     let managed = managed(&["default"]);
+    let empty = authoritative_empty_translation();
     let active = merge_k8s_translation(&GatewayConfig::default(), &populated, &managed);
     assert!(active.mesh.is_some(), "the K8s mesh must publish first");
 
-    let withdrawn = merge_k8s_translation(&active, &authoritative_empty_translation(), &managed);
+    let withdrawn = merge_k8s_translation(&active, &empty, &managed);
 
     assert!(
         withdrawn.mesh.is_none(),
@@ -308,16 +351,17 @@ fn deleting_the_last_policies_withdraws_the_mesh_overlay() {
         peer_authentication("default"),
         request_authentication("default"),
     ]);
-    let mesh = populated.mesh.as_deref().expect("mesh translated");
+    let mesh = mesh_of(&populated);
     assert_eq!(mesh.mesh_policies.len(), 1);
     assert_eq!(mesh.peer_authentications.len(), 1);
     assert_eq!(mesh.request_authentications.len(), 1);
 
     let managed = managed(&["default"]);
+    let empty = authoritative_empty_translation();
     let active = merge_k8s_translation(&GatewayConfig::default(), &populated, &managed);
     assert!(active.mesh.is_some());
 
-    let withdrawn = merge_k8s_translation(&active, &authoritative_empty_translation(), &managed);
+    let withdrawn = merge_k8s_translation(&active, &empty, &managed);
 
     assert!(
         withdrawn.mesh.is_none(),
@@ -332,15 +376,16 @@ fn deleting_the_last_service_entry_and_workload_entry_withdraws_the_mesh_overlay
         service_entry("default", "api", "api.example.com"),
         workload_entry("default"),
     ]);
-    let mesh = populated.mesh.as_deref().expect("mesh translated");
+    let mesh = mesh_of(&populated);
     assert_eq!(mesh.service_entries.len(), 1);
     assert_eq!(mesh.workloads.len(), 1);
 
     let managed = managed(&["default"]);
+    let empty = authoritative_empty_translation();
     let active = merge_k8s_translation(&GatewayConfig::default(), &populated, &managed);
     assert!(active.mesh.is_some());
 
-    let withdrawn = merge_k8s_translation(&active, &authoritative_empty_translation(), &managed);
+    let withdrawn = merge_k8s_translation(&active, &empty, &managed);
 
     assert!(
         withdrawn.mesh.is_none(),
@@ -355,24 +400,22 @@ fn withdrawal_preserves_mesh_state_owned_by_another_source() {
     // A native/file/xDS source owns `native/native-svc`; Kubernetes owns
     // `default/*`. Kubernetes withdrawing everything it owns must not touch
     // the other source's object.
-    let mut active = GatewayConfig {
-        mesh: Some(Box::new(MeshConfig {
-            services: vec![native_mesh_service("native", "native-svc")],
-            ..MeshConfig::default()
-        })),
-        ..GatewayConfig::default()
-    };
+    let mut active = other_source_config(MeshConfig {
+        services: vec![native_mesh_service("native", "native-svc")],
+        ..MeshConfig::default()
+    });
     let managed = managed(&["default"]);
+    let empty = authoritative_empty_translation();
     active = merge_k8s_translation(
         &active,
         &authoritative_translation(&[service_entry("default", "api", "api.example.com")]),
         &managed,
     );
-    let active_mesh = active.mesh.as_deref().expect("mesh after first publish");
+    let active_mesh = mesh_of(&active);
     assert_eq!(active_mesh.services.len(), 1);
     assert_eq!(active_mesh.service_entries.len(), 1);
 
-    let withdrawn = merge_k8s_translation(&active, &authoritative_empty_translation(), &managed);
+    let withdrawn = merge_k8s_translation(&active, &empty, &managed);
 
     let mesh = withdrawn
         .mesh
@@ -391,21 +434,110 @@ fn withdrawal_preserves_mesh_state_owned_by_another_source() {
 }
 
 #[test]
-fn a_source_without_mesh_authority_never_withdraws_another_sources_mesh() {
-    let active = GatewayConfig {
-        mesh: Some(Box::new(MeshConfig {
-            services: vec![native_mesh_service("default", "native-svc")],
-            ..MeshConfig::default()
-        })),
-        ..GatewayConfig::default()
+fn withdrawal_preserves_another_sources_mesh_state_in_the_same_namespace() {
+    // The root-review case: the other source's object lives in the SAME
+    // namespace Kubernetes owns objects in, and is of the same kind as one of
+    // them. Namespace-scoped withdrawal would delete it; identity-scoped
+    // withdrawal must not.
+    let base = other_source_config(MeshConfig {
+        services: vec![native_mesh_service("default", "native-svc")],
+        ..MeshConfig::default()
+    });
+    let managed = managed(&["default"]);
+    let empty = authoritative_empty_translation();
+    let objects = [
+        service(),
+        ready_pod(),
+        endpoint_slice(),
+        service_entry("default", "api", "api.example.com"),
+    ];
+    let overlay = authoritative_translation(&objects);
+
+    let published = merge_k8s_translation(&base, &overlay, &managed);
+
+    let published_mesh = mesh_of(&published);
+    assert_eq!(
+        service_names(published_mesh, "default"),
+        vec!["native-svc".to_string(), "reviews".to_string()],
+        "a non-empty Kubernetes publish must add to, not replace, a shared namespace"
+    );
+    assert_eq!(published_mesh.service_entries.len(), 1);
+    assert_eq!(published_mesh.workloads.len(), 1);
+
+    let withdrawn = merge_k8s_translation(&published, &empty, &managed);
+
+    let mesh = withdrawn
+        .mesh
+        .as_deref()
+        .expect("the other source's same-namespace mesh state must survive the withdrawal");
+    assert_eq!(
+        service_names(mesh, "default"),
+        vec!["native-svc".to_string()],
+        "only the Kubernetes-owned service may be withdrawn"
+    );
+    assert_eq!(mesh.services[0].cluster_ips, vec!["10.96.0.7".to_string()]);
+    assert!(mesh.service_entries.is_empty());
+    assert!(mesh.workloads.is_empty());
+}
+
+#[test]
+fn a_same_name_collision_gives_kubernetes_precedence_then_restores_the_base() {
+    // Both sources author `default/reviews`. Kubernetes must win
+    // deterministically while its overlay is present — ONE object, the
+    // Kubernetes one — and the base object must come back when it withdraws.
+    // Neither "keep both" nor "lose both" is acceptable.
+    let base_service = MeshService {
+        cluster_ips: vec!["10.96.0.7".to_string()],
+        name: "reviews".to_string(),
+        namespace: "default".to_string(),
+        ports: Vec::new(),
+        workloads: Vec::new(),
+        protocol_overrides: HashMap::new(),
     };
+    let base = other_source_config(MeshConfig {
+        services: vec![base_service.clone()],
+        ..MeshConfig::default()
+    });
+    let managed = managed(&["default"]);
+    let empty = authoritative_empty_translation();
+    let overlay = authoritative_translation(&[service()]);
+
+    let published = merge_k8s_translation(&base, &overlay, &managed);
+
+    let published_mesh = mesh_of(&published);
+    assert_eq!(
+        published_mesh.services.len(),
+        1,
+        "a same-key collision must resolve, not leave two ambiguous duplicates"
+    );
+    let winner = &published_mesh.services[0];
+    assert!(
+        winner.cluster_ips.is_empty() && !winner.ports.is_empty(),
+        "Kubernetes must win the collision while its overlay is present, got {winner:?}"
+    );
+
+    let withdrawn = merge_k8s_translation(&published, &empty, &managed);
+
+    let mesh = withdrawn
+        .mesh
+        .as_deref()
+        .expect("the shadowed base object must be restored, not withdrawn with the overlay");
+    assert_eq!(mesh.services, vec![base_service]);
+}
+
+#[test]
+fn a_source_without_mesh_authority_never_withdraws_another_sources_mesh() {
+    let active = other_source_config(MeshConfig {
+        services: vec![native_mesh_service("default", "native-svc")],
+        ..MeshConfig::default()
+    });
     let no_authority = translate_k8s_objects(&[], non_authoritative_options())
         .expect("translation succeeds")
         .config;
 
     let merged = merge_k8s_translation(&active, &no_authority, &managed(&["default"]));
 
-    let mesh = merged.mesh.as_deref().expect("mesh must be preserved");
+    let mesh = mesh_of(&merged);
     assert_eq!(
         mesh.services.len(),
         1,
@@ -414,28 +546,52 @@ fn a_source_without_mesh_authority_never_withdraws_another_sources_mesh() {
 }
 
 #[test]
-fn withdrawal_covers_a_namespace_that_left_the_managed_set() {
+fn mesh_global_blocks_owned_by_another_source_survive_the_overlay_lifecycle() {
+    let base = other_source_config(MeshConfig {
+        outbound_traffic_policy: Some(OutboundTrafficPolicy::RegistryOnly),
+        ..MeshConfig::default()
+    });
+    let managed = managed(&["default"]);
+    let empty = authoritative_empty_translation();
+    let overlay = authoritative_translation(&[service_entry("default", "api", "api.example.com")]);
+
+    let published = merge_k8s_translation(&base, &overlay, &managed);
+
+    assert_eq!(
+        mesh_of(&published).outbound_traffic_policy,
+        Some(OutboundTrafficPolicy::RegistryOnly),
+        "Kubernetes does not translate mesh-global blocks, so it must not own them"
+    );
+
+    let withdrawn = merge_k8s_translation(&published, &empty, &managed);
+
+    assert_eq!(
+        mesh_of(&withdrawn).outbound_traffic_policy,
+        Some(OutboundTrafficPolicy::RegistryOnly),
+        "a Kubernetes withdrawal must not clear another source's mesh-global policy"
+    );
+    assert!(mesh_of(&withdrawn).service_entries.is_empty());
+}
+
+// ── Watch-scope shrink ────────────────────────────────────────────────────
+
+#[test]
+fn watch_scope_shrink_withdraws_kubernetes_objects_and_keeps_other_sources() {
     // `beta` is dropped from the watch scope between rounds. Its previously
     // published Kubernetes objects must still be withdrawn rather than
-    // stranded, which is what the carried-forward owned-namespace set is for.
+    // stranded — and the other source's object in the STILL-managed `alpha`
+    // namespace must survive, because withdrawal keys on object identity, not
+    // on whether a namespace is managed.
+    let base = other_source_config(MeshConfig {
+        services: vec![native_mesh_service("alpha", "native-svc")],
+        ..MeshConfig::default()
+    });
     let populated = authoritative_translation(&[
         service_entry("alpha", "api", "api.example.com"),
         service_entry("beta", "cdn", "cdn.example.com"),
     ]);
-    let active = merge_k8s_translation(
-        &GatewayConfig::default(),
-        &populated,
-        &managed(&["alpha", "beta"]),
-    );
-    assert_eq!(
-        active
-            .mesh
-            .as_deref()
-            .expect("mesh translated")
-            .service_entries
-            .len(),
-        2
-    );
+    let active = merge_k8s_translation(&base, &populated, &managed(&["alpha", "beta"]));
+    assert_eq!(mesh_of(&active).service_entries.len(), 2);
 
     let withdrawn = merge_k8s_translation(
         &active,
@@ -443,9 +599,49 @@ fn withdrawal_covers_a_namespace_that_left_the_managed_set() {
         &managed(&["alpha"]),
     );
 
+    let mesh = mesh_of(&withdrawn);
+    assert!(
+        mesh.service_entries.is_empty(),
+        "objects in a namespace that left the managed set must still be withdrawn"
+    );
+    assert_eq!(
+        service_names(mesh, "alpha"),
+        vec!["native-svc".to_string()],
+        "shrinking the watch scope must not disturb another source's object"
+    );
+}
+
+#[test]
+fn watch_scope_shrink_withdraws_objects_outside_every_service_namespace() {
+    // Waypoint bindings and root-namespace resources sit in a namespace of
+    // their own. Withdrawal must not depend on that namespace still being
+    // watched.
+    let overlay = MeshConfig {
+        waypoint_bindings: vec![MeshWaypointBinding {
+            name: "shared-waypoint".to_string(),
+            namespace: "mesh-system".to_string(),
+            waypoint_for: "service".to_string(),
+            services: Vec::new(),
+        }],
+        services: vec![native_mesh_service("payments", "checkout")],
+        ..MeshConfig::default()
+    };
+    let active = merge_k8s_translation(
+        &GatewayConfig::default(),
+        &authoritative_overlay(Some(overlay)),
+        &managed(&["payments", "mesh-system"]),
+    );
+    assert_eq!(mesh_of(&active).waypoint_bindings.len(), 1);
+
+    let withdrawn = merge_k8s_translation(
+        &active,
+        &authoritative_overlay(None),
+        &managed(&["payments"]),
+    );
+
     assert!(
         withdrawn.mesh.is_none(),
-        "objects in a namespace that left the managed set must still be withdrawn"
+        "a Kubernetes waypoint binding outside every service namespace must not be stranded"
     );
 }
 
@@ -453,18 +649,33 @@ fn withdrawal_covers_a_namespace_that_left_the_managed_set() {
 
 #[test]
 fn republishing_the_same_snapshot_replaces_rather_than_duplicates() {
+    let base = other_source_config(MeshConfig {
+        services: vec![native_mesh_service("default", "native-svc")],
+        ..MeshConfig::default()
+    });
     let populated =
         authoritative_translation(&[service_entry("default", "api", "api.example.com")]);
     let managed = managed(&["default"]);
 
-    let first = merge_k8s_translation(&GatewayConfig::default(), &populated, &managed);
+    let first = merge_k8s_translation(&base, &populated, &managed);
     let second = merge_k8s_translation(&first, &populated, &managed);
+    let third = merge_k8s_translation(&second, &populated, &managed);
 
-    let mesh = second.mesh.as_deref().expect("mesh stays published");
+    let mesh = mesh_of(&third);
     assert_eq!(
         mesh.service_entries.len(),
         1,
         "a re-published Kubernetes object must replace its predecessor, not stack on it"
+    );
+    assert_eq!(
+        service_names(mesh, "default"),
+        vec!["native-svc".to_string()],
+        "repeated publishes must not duplicate or drop the other source's object"
+    );
+    assert_eq!(
+        mesh_of(&first).services,
+        mesh.services,
+        "idempotent publishes must converge on one composed view"
     );
 }
 
@@ -496,25 +707,36 @@ fn repeated_empty_snapshots_are_idempotent_and_publish_once() {
 fn withdrawal_publishes_one_complete_snapshot() {
     let populated =
         authoritative_translation(&[service_entry("default", "api", "api.example.com")]);
+    let empty = authoritative_empty_translation();
     let managed = managed(&["default"]);
+    let base = other_source_config(MeshConfig {
+        services: vec![native_mesh_service("default", "native-svc")],
+        ..MeshConfig::default()
+    });
 
-    let config_arc = ArcSwap::from_pointee(GatewayConfig::default());
+    let config_arc = ArcSwap::from_pointee(base);
     swap_merged_k8s_translation(&config_arc, &populated, &managed).expect("initial publication");
 
     // An in-flight consumer holding the pre-withdrawal snapshot.
     let in_flight = config_arc.load_full();
-    assert!(in_flight.mesh.is_some());
+    assert_eq!(mesh_of(&in_flight).service_entries.len(), 1);
 
-    swap_merged_k8s_translation(&config_arc, &authoritative_empty_translation(), &managed)
-        .expect("withdrawal publication");
+    swap_merged_k8s_translation(&config_arc, &empty, &managed).expect("withdrawal publication");
 
-    assert!(
-        in_flight.mesh.is_some(),
+    assert_eq!(
+        mesh_of(&in_flight).service_entries.len(),
+        1,
         "the in-flight snapshot must stay complete — never partially withdrawn"
     );
+    let published = config_arc.load_full();
     assert!(
-        config_arc.load().mesh.is_none(),
+        mesh_of(&published).service_entries.is_empty(),
         "the next load must see the complete post-withdrawal snapshot"
+    );
+    assert_eq!(
+        service_names(mesh_of(&published), "default"),
+        vec!["native-svc".to_string()],
+        "the same-namespace object owned by another source must survive publication"
     );
 }
 
@@ -547,16 +769,232 @@ fn overlay_slot_does_not_resurrect_an_authoritatively_withdrawn_mesh() {
     );
 }
 
+#[test]
+fn overlay_slot_full_reload_preserves_same_namespace_mesh_from_the_db_snapshot() {
+    // On a CP full reload the freshly loaded DB snapshot IS the base layer.
+    // Composing the accepted overlay through the slot must layer onto it, and
+    // an authoritative withdrawal must leave it whole.
+    let overlay_slot = empty_k8s_overlay_slot();
+    let managed = managed(&["default"]);
+    let db_snapshot = other_source_config(MeshConfig {
+        services: vec![native_mesh_service("default", "db-svc")],
+        ..MeshConfig::default()
+    });
+    let objects = [service(), service_entry("default", "api", "api.example.com")];
+
+    store_accepted_k8s_overlay(
+        &overlay_slot,
+        authoritative_translation(&objects),
+        managed.clone(),
+    );
+    let composed = compose_db_with_k8s_overlay(&db_snapshot, &overlay_slot);
+    assert_eq!(
+        service_names(mesh_of(&composed), "default"),
+        vec!["db-svc".to_string(), "reviews".to_string()],
+        "the overlay must layer onto the DB-authored mesh, not replace it"
+    );
+
+    store_accepted_k8s_overlay(&overlay_slot, authoritative_empty_translation(), managed);
+    let withdrawn = compose_db_with_k8s_overlay(&db_snapshot, &overlay_slot);
+
+    let mesh = mesh_of(&withdrawn);
+    assert_eq!(
+        service_names(mesh, "default"),
+        vec!["db-svc".to_string()],
+        "a full reload after a withdrawal must keep the DB-authored mesh in that namespace"
+    );
+    assert!(mesh.service_entries.is_empty());
+}
+
+#[test]
+fn overlay_slot_full_reload_restores_a_db_object_the_overlay_shadowed() {
+    let overlay_slot = empty_k8s_overlay_slot();
+    let managed = managed(&["default"]);
+    let db_service = MeshService {
+        cluster_ips: vec!["10.96.0.7".to_string()],
+        name: "reviews".to_string(),
+        namespace: "default".to_string(),
+        ports: Vec::new(),
+        workloads: Vec::new(),
+        protocol_overrides: HashMap::new(),
+    };
+    let db_snapshot = other_source_config(MeshConfig {
+        services: vec![db_service.clone()],
+        ..MeshConfig::default()
+    });
+
+    store_accepted_k8s_overlay(
+        &overlay_slot,
+        authoritative_translation(&[service()]),
+        managed.clone(),
+    );
+    let composed = compose_db_with_k8s_overlay(&db_snapshot, &overlay_slot);
+    assert_eq!(mesh_of(&composed).services.len(), 1);
+    assert!(mesh_of(&composed).services[0].cluster_ips.is_empty());
+
+    store_accepted_k8s_overlay(&overlay_slot, authoritative_empty_translation(), managed);
+    let withdrawn = compose_db_with_k8s_overlay(&db_snapshot, &overlay_slot);
+
+    assert_eq!(mesh_of(&withdrawn).services, vec![db_service]);
+}
+
 // ── Ownership-accounting coverage guard ───────────────────────────────────
 
-/// Exhaustively destructures [`MeshConfig`] so a new field cannot be added
-/// without deciding whether it participates in Kubernetes overlay ownership.
+/// One object in EVERY namespaced [`MeshConfig`] collection.
 ///
-/// A new NAMESPACED collection must be added to all three of
-/// `MeshConfig::object_namespaces`, `MeshConfig::retain_object_namespaces`, and
-/// `MeshConfig::extend_objects_from`, or it will silently survive a Kubernetes
-/// withdrawal. A new mesh-GLOBAL block is deliberately left alone by the merge
-/// (the Kubernetes translator does not produce any).
+/// `key_suffix` varies the objects' IDENTITY (so base and overlay objects can
+/// be made distinct or made to collide) while `marker` varies a NON-identity
+/// field (so a collision's winner is observable). `waypoint_bindings` is
+/// deliberately placed in a different namespace from everything else: a
+/// waypoint binding's own namespace routinely differs from the namespaces of
+/// the services it governs.
+fn all_collections(key_suffix: &str, marker: &str) -> MeshConfig {
+    let name = |kind: &str| format!("{kind}-{key_suffix}");
+    let uri = format!("spiffe://cluster.local/ns/shared/sa/{key_suffix}");
+    let spiffe_id = SpiffeId::new(uri).expect("test spiffe id");
+    let trust_domain = TrustDomain::new("cluster.local").expect("test trust domain");
+    let scope = PolicyScope::Namespace {
+        namespace: marker.to_string(),
+    };
+    let origin = MeshCorsOriginMatch::Exact(format!("https://{marker}.example.com"));
+    MeshConfig {
+        workloads: vec![Workload {
+            spiffe_id,
+            selector: WorkloadSelector::default(),
+            service_name: marker.to_string(),
+            addresses: Vec::new(),
+            ports: Vec::new(),
+            trust_domain,
+            namespace: "shared".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
+            pod_uid: None,
+            node_waypoint: None,
+            remote_provenance: false,
+        }],
+        services: vec![MeshService {
+            cluster_ips: vec![marker.to_string()],
+            name: name("service"),
+            namespace: "shared".to_string(),
+            ports: Vec::new(),
+            workloads: Vec::new(),
+            protocol_overrides: HashMap::new(),
+        }],
+        mesh_policies: vec![MeshPolicy {
+            name: name("policy"),
+            namespace: "shared".to_string(),
+            scope: scope.clone(),
+            rules: Vec::new(),
+        }],
+        peer_authentications: vec![PeerAuthentication {
+            name: name("peer-auth"),
+            namespace: "shared".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::default(),
+            port_overrides: HashMap::new(),
+        }],
+        service_entries: vec![ServiceEntry {
+            name: name("service-entry"),
+            namespace: "shared".to_string(),
+            hosts: vec![format!("{marker}.example.com")],
+            endpoints: Vec::new(),
+            resolution: Default::default(),
+            location: Default::default(),
+            ports: Vec::new(),
+            export_to: Vec::new(),
+            workload_selector: None,
+        }],
+        request_authentications: vec![MeshRequestAuthentication {
+            name: name("request-auth"),
+            namespace: "shared".to_string(),
+            scope: scope.clone(),
+            jwt_rules: Vec::new(),
+        }],
+        telemetry_resources: vec![MeshTelemetryResource {
+            name: name("telemetry"),
+            namespace: "shared".to_string(),
+            scope,
+            config: MeshTelemetryConfig::default(),
+        }],
+        destination_rules: vec![MeshDestinationRule {
+            name: name("destination-rule"),
+            namespace: "shared".to_string(),
+            host: "shared.example.com".to_string(),
+            traffic_policy: None,
+            port_level_settings: HashMap::new(),
+            subsets: Vec::new(),
+        }],
+        virtual_service_cors_policies: vec![MeshVirtualServiceCorsPolicy {
+            name: name("cors"),
+            namespace: "shared".to_string(),
+            host: "shared.example.com".to_string(),
+            export_to: Vec::new(),
+            cors: MeshCorsPolicy {
+                allowed_origins: vec![origin],
+                allowed_methods: Vec::new(),
+                allowed_headers: Vec::new(),
+                exposed_headers: Vec::new(),
+                max_age_seconds: None,
+                allow_credentials: None,
+                unmatched_preflights: None,
+            },
+        }],
+        proxy_configs: vec![MeshProxyConfig {
+            name: name("proxy-config"),
+            namespace: "shared".to_string(),
+            image: Some(marker.to_string()),
+            ..MeshProxyConfig::default()
+        }],
+        sidecars: vec![MeshSidecar {
+            name: name("sidecar"),
+            namespace: "shared".to_string(),
+            workload_selector: None,
+            egress_inherits_defaults: marker == "k8s",
+            egress: Vec::new(),
+            ingress_declared: false,
+            ingress: Vec::new(),
+        }],
+        waypoint_bindings: vec![MeshWaypointBinding {
+            name: name("waypoint"),
+            namespace: "mesh-system".to_string(),
+            waypoint_for: marker.to_string(),
+            services: Vec::new(),
+        }],
+        ..MeshConfig::default()
+    }
+}
+
+/// Per-collection object counts, in the order [`MeshConfig`] declares them.
+fn collection_counts(mesh: &MeshConfig) -> [usize; 12] {
+    [
+        mesh.workloads.len(),
+        mesh.services.len(),
+        mesh.mesh_policies.len(),
+        mesh.peer_authentications.len(),
+        mesh.service_entries.len(),
+        mesh.request_authentications.len(),
+        mesh.telemetry_resources.len(),
+        mesh.destination_rules.len(),
+        mesh.virtual_service_cors_policies.len(),
+        mesh.proxy_configs.len(),
+        mesh.sidecars.len(),
+        mesh.waypoint_bindings.len(),
+    ]
+}
+
+/// Exhaustively destructures [`MeshConfig`] so a new field cannot be added
+/// without deciding whether it participates in Kubernetes overlay ownership,
+/// then proves every namespaced collection is actually wired in.
+///
+/// A new NAMESPACED collection must reach `MeshConfig::object_namespaces`,
+/// `MeshConfig::object_identities`, and `MeshConfig::overlay_objects_from`, or
+/// it will silently survive a Kubernetes withdrawal. A new mesh-GLOBAL block is
+/// deliberately left alone by the merge (the Kubernetes translator produces
+/// none).
 #[test]
 fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
     let MeshConfig {
@@ -591,11 +1029,61 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
         local_inbound_tcp_routes: _,
     } = MeshConfig::default();
 
-    let mut mesh = MeshConfig {
-        services: vec![native_mesh_service("owned", "svc")],
-        ..MeshConfig::default()
-    };
-    assert_eq!(mesh.object_namespaces(), managed(&["owned"]));
-    mesh.retain_object_namespaces(|namespace| namespace != "owned");
-    assert!(mesh.is_empty_overlay());
+    // Every namespaced collection is visible to the ownership accounting.
+    let base = all_collections("base", "base");
+    assert_eq!(
+        base.object_identities().len(),
+        12,
+        "every namespaced collection must contribute exactly one identity"
+    );
+    assert_eq!(
+        base.object_namespaces(),
+        managed(&["mesh-system", "shared"]),
+        "an object outside the service namespaces must still be accounted for"
+    );
+
+    // Distinct identities: the overlay ADDS to every collection. A collection
+    // missing from `overlay_objects_from` would keep only its base object.
+    let mut composed = base.clone();
+    composed.overlay_objects_from(&all_collections("k8s", "k8s"));
+    assert_eq!(
+        collection_counts(&composed),
+        [2; 12],
+        "every namespaced collection must be layered, not skipped"
+    );
+
+    // Colliding identities: the overlay WINS in every collection.
+    let overlay = all_collections("base", "k8s");
+    let mut collided = base.clone();
+    collided.overlay_objects_from(&overlay);
+    assert_eq!(
+        collection_counts(&collided),
+        [1; 12],
+        "a same-key collision must resolve to one object per collection"
+    );
+    assert_eq!(
+        collided,
+        overlay,
+        "Kubernetes must deterministically win every same-key collision"
+    );
+}
+
+#[test]
+fn every_namespaced_collection_is_withdrawn_and_restores_its_base() {
+    let base = all_collections("base", "base");
+    let managed = managed(&["shared", "mesh-system"]);
+    let active = merge_k8s_translation(
+        &other_source_config(base.clone()),
+        &authoritative_overlay(Some(all_collections("k8s", "k8s"))),
+        &managed,
+    );
+    assert_eq!(collection_counts(mesh_of(&active)), [2; 12]);
+
+    let withdrawn = merge_k8s_translation(&active, &authoritative_overlay(None), &managed);
+
+    assert_eq!(
+        mesh_of(&withdrawn),
+        &base,
+        "a Kubernetes withdrawal must restore every collection's base layer exactly"
+    );
 }
