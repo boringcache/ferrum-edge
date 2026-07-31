@@ -3,20 +3,32 @@
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
 //! `normalize_buffered_request_body_before_before_proxy` →
+//! `validate_client_request_body_contract` →
 //! `before_proxy` → backend-path policy enforcement →
 //! deferred routing-header hooks → remaining deferred `before_proxy` hooks →
 //! `transform_request_body` →
-//! `on_final_request_body` → `backend_admission` → `after_proxy` →
+//! `on_final_request_body` → `dispatch_finalized_request_egress` →
+//! `backend_admission` → `after_proxy` →
 //! `normalize_response_body` → `on_response_body` →
 //! `transform_response_body` → `on_final_response_body` →
 //! `on_response_committed` (buffered responses only) →
 //! `on_response_stream_terminated` (streamed responses only) → `log` →
 //! `on_ws_frame`.
 //!
-//! `backend_admission` runs last on the request side — after request-body
-//! transforms and `on_final_request_body`, immediately before the backend
-//! dispatch — so a rejected admission still skips the actual upstream call but
-//! not the body hooks that precede it.
+//! `dispatch_finalized_request_egress` is irreversible outbound request egress
+//! (`request_mirror`, `serverless_function`, `ai_federation`) after every
+//! `on_final_request_body` hook accepted the request (`GHSA-4vr5-4wm3-x5xv`).
+//! `backend_admission` runs last on the request side — after that egress phase,
+//! immediately before the backend dispatch — so a rejected admission still skips
+//! the actual upstream call but not the body or egress hooks that precede it.
+//!
+//! `validate_client_request_body_contract` is the CLIENT-contract phase and is
+//! deliberately distinct from `on_final_request_body`, which is the
+//! backend-contract phase. It observes the original client representation after
+//! gateway-owned normalization (bounded `Content-Encoding` decoding) but before
+//! any `before_proxy` or `transform_request_body` hook can add, remove, rename,
+//! coerce, or replace fields, so a declared client contract cannot be satisfied
+//! by gateway-synthesized data (`GHSA-896v-jx23-9g6p`).
 //!
 //! Each plugin declares which protocols it supports via `supported_protocols()`.
 //! The `PluginCache` pre-filters plugins per protocol at config reload time
@@ -2156,6 +2168,17 @@ pub struct RequestContext {
     /// final body hooks. Kept out of public metadata so per-instance state does
     /// not leak into transaction logs.
     pub(crate) openapi_validator_matches: HashMap<usize, (String, String)>,
+    /// OpenAPI validator instances whose CLIENT-contract decision has already
+    /// been made on the original client representation in
+    /// `validate_client_request_body_contract`.
+    ///
+    /// Keyed by process-unique validator instance ID so sibling instances on one
+    /// proxy can never consume each other's decision, and so the backend-side
+    /// `on_final_request_body` hook of an instance that already decided does not
+    /// validate, reject, or log the same request a second time over transformed
+    /// bytes (`GHSA-896v-jx23-9g6p`). Kept out of public metadata: it is
+    /// per-instance lifecycle bookkeeping, not observability.
+    pub(crate) openapi_validator_client_contract_enforced: HashSet<usize>,
     /// Per-`ai_tool_governor`-instance internal correlation markers staged between
     /// `on_response_body` / `transform_response_body` and the
     /// `on_final_response_body` re-check. Kept out of public `metadata` so this
@@ -2800,6 +2823,7 @@ impl RequestContext {
             ai_semantic_cache_embeddings: HashMap::new(),
             ai_semantic_cache_scope_keys: HashMap::new(),
             openapi_validator_matches: HashMap::new(),
+            openapi_validator_client_contract_enforced: HashSet::new(),
             ai_tool_governor_response_hashes: HashMap::new(),
             ai_response_guard_replay_redactions: HashSet::new(),
             ai_tool_governor_replay_redactions: HashSet::new(),
@@ -3717,6 +3741,9 @@ impl RequestContext {
             ai_semantic_cache_embeddings: self.ai_semantic_cache_embeddings.clone(),
             ai_semantic_cache_scope_keys: self.ai_semantic_cache_scope_keys.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
+            openapi_validator_client_contract_enforced: self
+                .openapi_validator_client_contract_enforced
+                .clone(),
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
             ai_response_guard_replay_redactions: self.ai_response_guard_replay_redactions.clone(),
             ai_tool_governor_replay_redactions: self.ai_tool_governor_replay_redactions.clone(),
@@ -7094,6 +7121,46 @@ pub trait Plugin: Send + Sync {
         _ctx: &mut RequestContext,
         _headers: &mut HashMap<String, String>,
         _body: &mut Vec<u8>,
+    ) -> PluginResult {
+        PluginResult::Continue
+    }
+
+    /// Returns `true` when this plugin enforces a CLIENT-facing request-body
+    /// contract that must be decided over the original client representation.
+    ///
+    /// A plugin that opts in also has to declare
+    /// [`Plugin::requires_request_body_before_before_proxy`] so the pre-
+    /// `before_proxy` buffer actually exists. That is not documentation-only:
+    /// `plugin_cache::validate_plugin_security_composition` rejects a plugin
+    /// that declares this capability without it at admission and at every cache
+    /// construction, because the phase runs only over that buffer and the
+    /// declared contract would otherwise be silently inert. The plugin must also
+    /// select buffering in
+    /// [`Plugin::should_buffer_request_body`] from request properties it
+    /// controls — never from an attacker-supplied representation hint such as a
+    /// `Content-Type` it may simply omit (`GHSA-6p78-6x8c-9g9x`).
+    fn validates_client_request_body_contract(&self) -> bool {
+        false
+    }
+
+    /// Decide the client-facing request contract over the ORIGINAL client body.
+    ///
+    /// The proxy invokes this only for plugins that return `true` from
+    /// [`Plugin::validates_client_request_body_contract`], after the pre-
+    /// `before_proxy` buffer and its gateway-owned normalization
+    /// (bounded `Content-Encoding` decoding) and before any `before_proxy` or
+    /// `transform_request_body` hook can reshape the body. `headers` and `body`
+    /// are read-only here: this is an admission decision, not a rewrite point.
+    ///
+    /// This phase is deliberately distinct from `on_final_request_body`, which
+    /// sees the final backend-visible representation. A plugin that decides here
+    /// must not also decide, reject, or log the same request in the final hook
+    /// (`GHSA-896v-jx23-9g6p`).
+    async fn validate_client_request_body_contract(
+        &self,
+        _ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
     ) -> PluginResult {
         PluginResult::Continue
     }

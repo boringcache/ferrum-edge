@@ -279,6 +279,16 @@ pub mod _test_support {
         )
     }
 
+    /// The exact effective-chain security-composition validator every plugin
+    /// cache construction and every admin candidate admission runs. Exposed so
+    /// tests can drive it with a synthetic capability plugin that no built-in
+    /// can express.
+    pub fn validate_plugin_security_composition_for_test(
+        plugins: &[Arc<dyn Plugin>],
+    ) -> Result<(), String> {
+        crate::plugin_cache::validate_plugin_security_composition(plugins)
+    }
+
     pub fn validate_correlation_id_composition_for_test(
         plugins: &[Arc<dyn Plugin>],
     ) -> Result<(), String> {
@@ -5011,6 +5021,27 @@ pub mod _test_support {
             needs_body_bytes,
         )
         .await
+    }
+
+    /// Drive the client-request-contract phase exactly as both protocol
+    /// handlers do, so external tests can compose it with real transformers
+    /// instead of re-deriving the ordering.
+    pub async fn apply_client_request_contract_validation_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        body: &[u8],
+    ) -> crate::plugins::PluginResult {
+        crate::proxy::apply_client_request_contract_validation(plugins, ctx, body).await
+    }
+
+    /// `true` when the pre-`before_proxy` requirements this request computes
+    /// include a client-contract decision.
+    pub fn client_request_contract_phase_selected_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        crate::proxy::request_body_requirements_before_before_proxy(plugins, ctx)
+            .validates_client_contract
     }
 
     pub fn extract_grpc_reject_message(body: &[u8]) -> Option<String> {

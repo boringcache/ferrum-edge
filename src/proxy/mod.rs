@@ -3262,6 +3262,80 @@ pub(crate) async fn apply_buffered_request_body_normalization_before_before_prox
     PluginResult::Continue
 }
 
+/// Reject-log phase label for the client-request-contract phase. Distinct from
+/// `normalize_buffered_request_body` so a contract rejection is never attributed
+/// to gateway-owned body normalization.
+pub(crate) const CLIENT_REQUEST_CONTRACT_PHASE: &str = "validate_client_request_contract";
+
+/// Run client-facing request-contract validators over the ORIGINAL client
+/// representation, after the pre-`before_proxy` buffer (and its gateway-owned
+/// normalization) and before any `before_proxy` or `transform_request_body` hook
+/// can add, remove, rename, coerce, or replace fields.
+///
+/// This is the explicit client-contract phase of the request lifecycle. It is
+/// deliberately NOT the backend-contract phase: `on_final_request_body` still
+/// sees the final backend-visible bytes, and a plugin that decided here must
+/// not decide again there (`GHSA-896v-jx23-9g6p`).
+///
+/// `headers`/`body` are passed immutably: this phase admits or rejects, it never
+/// rewrites. Callers pass either an owned prebuffered body or explicit `&[]`
+/// after transport end-of-stream plus method/framing proof; arbitrary unread
+/// streaming bodies still never enter this phase or pay collection cost.
+pub(crate) async fn apply_client_request_contract_validation(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    body: &[u8],
+) -> PluginResult {
+    for plugin in plugins {
+        // The phase is scheduled once when any instance selects it, but each
+        // instance keeps its own request-time applicability. Recheck the same
+        // predicate with the effective post-normalization headers restored on
+        // the live context; otherwise an unrelated sibling could be invoked and
+        // incorrectly record that it decided a contract for this request.
+        if !plugin.validates_client_request_body_contract()
+            || !plugin.should_buffer_request_body(ctx)
+        {
+            continue;
+        }
+        let headers = std::mem::take(&mut ctx.headers);
+        let deadline = ctx.grpc_deadline_at();
+        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
+            deadline,
+            plugin.validate_client_request_body_contract(ctx, &headers, body),
+        )
+        .await
+        .into_plugin_result(ctx);
+        ctx.headers = headers;
+        match result {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                return reject;
+            }
+        }
+    }
+    PluginResult::Continue
+}
+
+/// `true` only when the request representation itself proves the client sent no
+/// body at all.
+///
+/// For a buffered request that is the collected byte count. For a streaming
+/// request it is hyper's own end-of-stream proof, which
+/// `buffer_request_body_for_before_proxy` establishes before it declines to
+/// collect: the method/header classification says no body is possible AND the
+/// protocol stream is already ended. That zero-copy representation is kept on
+/// purpose so an empty `GET`/`HEAD`/`OPTIONS` pays nothing on H1/H2.
+///
+/// This is deliberately NOT a general "a streaming body might be empty" test.
+/// An arbitrary streaming body has not been read yet, is not end-of-stream, and
+/// must never be treated as empty here.
+fn client_request_body_proven_empty(client_request_body: &ClientRequestBody) -> bool {
+    match client_request_body {
+        ClientRequestBody::Streaming(request) => hyper::body::Body::is_end_stream(request.body()),
+        ClientRequestBody::Buffered(buffered) => buffered.body.is_empty(),
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RequestBodyPhaseRequirements {
     pub required: bool,
@@ -3269,6 +3343,11 @@ pub(crate) struct RequestBodyPhaseRequirements {
     pub needs_bytes: bool,
     pub needs_digests: bool,
     pub plugin_limit: Option<usize>,
+    /// At least one plugin buffering for this phase also decides a client-facing
+    /// request contract, so the distinct client-contract phase must run over the
+    /// prebuffered original representation before `before_proxy`. Only ever set
+    /// by `request_body_requirements_before_before_proxy`.
+    pub validates_client_contract: bool,
 }
 
 pub(crate) fn request_body_requirements_before_authorize(
@@ -3312,6 +3391,7 @@ pub(crate) fn request_body_requirements_before_before_proxy(
         requirements.needs_text |= plugin.needs_request_body_text();
         requirements.needs_bytes |= plugin.needs_request_body_bytes();
         requirements.needs_digests |= plugin.needs_request_body_digests();
+        requirements.validates_client_contract |= plugin.validates_client_request_body_contract();
         if let Some(limit) = plugin.request_body_buffer_limit() {
             requirements.plugin_limit = Some(
                 requirements
@@ -22115,70 +22195,118 @@ async fn handle_proxy_request_inner(
         };
     }
 
-    // Opt-in buffered-body normalization (configured request decompression)
-    // runs after the pre-`before_proxy` buffer is stored and before any
-    // `before_proxy` hook, so earlier body consumers see validated plaintext.
-    if capabilities.has(PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY)
-        && let ClientRequestBody::Buffered(buffered) = &mut client_request_body
-    {
+    // Pre-`before_proxy` buffered-body phases, in fixed order:
+    //   1. opt-in gateway-owned normalization (configured request decompression)
+    //      so earlier body consumers see validated plaintext;
+    //   2. the distinct client-request-contract decision, taken over the
+    //      ORIGINAL client representation before any `before_proxy` or
+    //      `transform_request_body` hook can reshape it (`GHSA-896v-jx23-9g6p`).
+    // Normalization needs an owned buffer and therefore only runs on a buffered
+    // body. The client-contract decision additionally covers the zero-copy
+    // transport-proven-empty representation that `buffer_request_body_for_
+    // before_proxy` leaves as `Streaming`: a declared-required client body must
+    // be rejected on an empty H1/H2 `GET`/`HEAD`/`OPTIONS` exactly as it already
+    // is on H3, which collects the same request into an empty buffer.
+    let runs_pre_before_proxy_body_phase = capabilities
+        .has(PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY)
+        || before_proxy_body_requirements.validates_client_contract;
+    // Computed before the buffered branch takes its mutable borrow: the streaming
+    // representation reaches the client-contract phase only when the transport
+    // itself already proved the request carries no body.
+    let streaming_body_proven_empty = before_proxy_body_requirements.validates_client_contract
+        && before_proxy_body_requirements.required
+        && matches!(client_request_body, ClientRequestBody::Streaming(_))
+        && client_request_body_proven_empty(&client_request_body);
+    if runs_pre_before_proxy_body_phase {
         let phase_start = Instant::now();
-        let mut tmp_headers = std::mem::take(&mut ctx.headers);
-        let normalize_result = apply_buffered_request_body_normalization_before_before_proxy(
-            &plugins,
-            &mut ctx,
-            &mut tmp_headers,
-            &mut buffered.body,
-            before_proxy_body_requirements.needs_text,
-            before_proxy_body_requirements.needs_bytes,
-        )
-        .await;
-        ctx.headers = tmp_headers;
-        match normalize_result {
-            PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-                let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
-                    error!("request-body normalization rejection could not be normalized");
-                    record_request(&state, 500);
-                    return Ok(build_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        r#"{"error":"Internal error"}"#,
-                    ));
-                };
-                let status_code = plugin_reject.status_code;
-                plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
-                    &plugins,
-                    &mut ctx,
-                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    plugin_reject.body.clone(),
-                    plugin_reject.headers,
-                    is_grpc_request,
-                    grpc_web_response_content_type.is_none(),
-                )
-                .await;
-                apply_grpc_reject_metadata(&mut ctx, &reject);
-                let grpc_web_response = build_grpc_web_reject_response(
-                    &plugins,
-                    &mut ctx,
-                    grpc_web_response_content_type,
-                    &reject,
-                )
-                .await;
-                log_rejected_request(
-                    &plugins,
-                    &ctx,
-                    reject.http_status.as_u16(),
-                    start_time,
-                    "normalize_buffered_request_body",
-                    plugin_execution_ns,
-                )
-                .await;
-                record_request(&state, reject.http_status.as_u16());
-                if let Some(response) = grpc_web_response {
-                    return Ok(response);
+        let mut rejected: Option<(PluginResult, &'static str)> = None;
+        if let ClientRequestBody::Buffered(buffered) = &mut client_request_body {
+            if capabilities
+                .has(PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY)
+            {
+                let mut tmp_headers = std::mem::take(&mut ctx.headers);
+                let normalize_result =
+                    apply_buffered_request_body_normalization_before_before_proxy(
+                        &plugins,
+                        &mut ctx,
+                        &mut tmp_headers,
+                        &mut buffered.body,
+                        before_proxy_body_requirements.needs_text,
+                        before_proxy_body_requirements.needs_bytes,
+                    )
+                    .await;
+                ctx.headers = tmp_headers;
+                if !matches!(normalize_result, PluginResult::Continue) {
+                    rejected = Some((normalize_result, "normalize_buffered_request_body"));
                 }
-                return Ok(build_response_from_normalized_reject(reject));
             }
+            if rejected.is_none() && before_proxy_body_requirements.validates_client_contract {
+                let contract_result =
+                    apply_client_request_contract_validation(&plugins, &mut ctx, &buffered.body)
+                        .await;
+                if !matches!(contract_result, PluginResult::Continue) {
+                    rejected = Some((contract_result, CLIENT_REQUEST_CONTRACT_PHASE));
+                }
+            }
+        } else if streaming_body_proven_empty {
+            // The buffering attempt above already ran and deliberately returned
+            // the original streaming request: method/framing classification and
+            // the transport agree the client sent nothing. Validate the contract
+            // against that proven-empty representation without materializing a
+            // buffer. Any streaming body that is not end-of-stream falls through
+            // untouched, so an unread body is never mistaken for an empty one.
+            let contract_result =
+                apply_client_request_contract_validation(&plugins, &mut ctx, &[]).await;
+            if !matches!(contract_result, PluginResult::Continue) {
+                rejected = Some((contract_result, CLIENT_REQUEST_CONTRACT_PHASE));
+            }
+        }
+        if let Some((reject, reject_phase)) = rejected {
+            let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
+                error!(
+                    phase = reject_phase,
+                    "pre-before_proxy body-phase rejection could not be normalized"
+                );
+                record_request(&state, 500);
+                return Ok(build_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"error":"Internal error"}"#,
+                ));
+            };
+            let status_code = plugin_reject.status_code;
+            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+            let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                &plugins,
+                &mut ctx,
+                StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                plugin_reject.body.clone(),
+                plugin_reject.headers,
+                is_grpc_request,
+                grpc_web_response_content_type.is_none(),
+            )
+            .await;
+            apply_grpc_reject_metadata(&mut ctx, &reject);
+            let grpc_web_response = build_grpc_web_reject_response(
+                &plugins,
+                &mut ctx,
+                grpc_web_response_content_type,
+                &reject,
+            )
+            .await;
+            log_rejected_request(
+                &plugins,
+                &ctx,
+                reject.http_status.as_u16(),
+                start_time,
+                reject_phase,
+                plugin_execution_ns,
+            )
+            .await;
+            record_request(&state, reject.http_status.as_u16());
+            if let Some(response) = grpc_web_response {
+                return Ok(response);
+            }
+            return Ok(build_response_from_normalized_reject(reject));
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
@@ -22191,12 +22319,7 @@ async fn handle_proxy_request_inner(
     // will observe.
     ctx.set_replay_request_body_empty_proven(
         before_proxy_body_requirements.required
-            && match &client_request_body {
-                ClientRequestBody::Streaming(request) => {
-                    hyper::body::Body::is_end_stream(request.body())
-                }
-                ClientRequestBody::Buffered(buffered) => buffered.body.is_empty(),
-            },
+            && client_request_body_proven_empty(&client_request_body),
     );
 
     // before_proxy hooks — clone headers when the resolved capability set says
