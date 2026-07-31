@@ -153,7 +153,9 @@ async fn openapi_client_contract_rejects_empty_bodyless_methods_on_h1_h2_h3() {
 
         for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
             harness.backend.clear();
-            let (status, _) = harness.send_empty(protocol, method.clone(), "/audits").await;
+            let (status, _) = harness
+                .send_empty(protocol, method.clone(), "/audits")
+                .await;
             assert_eq!(
                 status,
                 StatusCode::BAD_REQUEST,
