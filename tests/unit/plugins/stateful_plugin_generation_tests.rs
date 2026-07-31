@@ -895,19 +895,27 @@ async fn load_testing_distinct_identities_do_not_share_run_admission() {
 }
 
 #[tokio::test]
-async fn load_testing_removed_policy_releases_run_admission() {
-    let config = load_testing_config(3);
+async fn load_testing_removed_policy_cancels_before_readd_can_start_again() {
+    let config = load_testing_config(1);
     let removed = load_testing_generation("ns-lt-churn", "lt-churn", &config);
     trigger_load_test(&removed).await;
     assert!(removed.is_running());
 
-    // Dropping the last owner cancels the cohort and releases the registry
-    // entry, so a later re-add starts clean.
+    // Dropping the last owner requests cancellation. The detached cohort still
+    // holds the state while it winds down, so an immediate re-add must recover
+    // that guard and remain blocked instead of overlapping the old workers.
     drop(removed);
     let readded = load_testing_generation("ns-lt-churn", "lt-churn", &config);
     assert!(
-        !readded.is_running(),
-        "a re-added policy with no surviving holder starts from clean admission"
+        readded.is_running(),
+        "an immediate re-add must observe the cancelling cohort"
+    );
+    wait_until_idle(&readded).await;
+
+    trigger_load_test(&readded).await;
+    assert!(
+        readded.is_running(),
+        "a new cohort is admitted after cancellation has completed"
     );
     wait_until_idle(&readded).await;
 }
