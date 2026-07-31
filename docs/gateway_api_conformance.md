@@ -13,14 +13,18 @@ in `CONFORMANCE.md`.
 The standalone `.github/workflows/gateway-api-conformance.yml` workflow is the
 authoritative Gateway API conformance check, and it **gates** merges:
 
-- **Triggers:** `pull_request`, `push` to `main`, a weekly `schedule`
+- **Triggers:** `pull_request`, `merge_group` (merge-queue synthesized SHA),
+  `push` to `main`, a weekly `schedule`
   (Mondays 07:00 UTC), and manual `workflow_dispatch` (whose inputs are
   `gateway_api_version`, `conformance_profile`, `supported_features`, and
   `skip_tests`). A lightweight `changes` job (path filter via
   `.github/scripts/live_suite_path_filter.py --suite gateway-api`) runs first
-  and skips the ~90-minute lab unless the PR touches routing, Kubernetes
+  and skips the ~90-minute lab unless the PR or merge-group change set touches
+  routing, Kubernetes
   translation/status, CP/DP sync, data-plane startup, plugins, charts, the
   runtime image, proto, the conformance script, dependencies, or related CI.
+  On `merge_group`, the filter diffs `merge_group.base_sha...HEAD` and fails
+  closed if that base SHA is missing.
 - **Gating:** the workflow's `gate` job fails the check when change detection,
   the upstream suite, or the black-box checks fail (a lab skipped on an
   irrelevant PR passes). The `gate` job (`Gateway API Conformance`) is a

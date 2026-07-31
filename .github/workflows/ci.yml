@@ -7,10 +7,13 @@ on:
   pull_request:
     branches:
       - main
+  merge_group:
+    types:
+      - checks_requested
   workflow_dispatch:
 
 concurrency:
-  group: ci-publish-${{ github.ref }}
+  group: ci-publish-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -65,6 +68,19 @@ jobs:
             # Otherwise this is the one-time bootstrap where the base has no
             # verifier to execute yet: `policy` stays the reviewed proposal and
             # runs in isolated mode. All later PRs take the trusted-base branch.
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "${MERGE_BASE_SHA}"
+            fi
+            if git cat-file -e "${MERGE_BASE_SHA}:${policy}" 2>/dev/null; then
+              trusted_policy="$RUNNER_TEMP/verify-cross-build-policy.py"
+              git show "${MERGE_BASE_SHA}:${policy}" > "$trusted_policy"
+              policy="$trusted_policy"
+            fi
           fi
 
           python3 -I "$policy" \
@@ -77,6 +93,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
 
       - name: Validate trusted PR CI planner examples
         run: |
@@ -102,15 +119,53 @@ jobs:
               > "$trusted_live_filter"
             planner="$trusted_planner"
             planner_dir="$trusted_dir"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "${MERGE_BASE_SHA}"
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}:${planner}" 2>/dev/null; then
+              echo "::error::merge_group base has no PR CI planner" >&2
+              exit 1
+            fi
+            trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"
+            trusted_planner="$trusted_dir/pr_ci_plan.py"
+            trusted_live_filter="$trusted_dir/live_suite_path_filter.py"
+            mkdir -p "$trusted_dir"
+            git show "${MERGE_BASE_SHA}:${planner}" > "$trusted_planner"
+            git show \
+              "${MERGE_BASE_SHA}:.github/scripts/live_suite_path_filter.py" \
+              > "$trusted_live_filter"
+            planner="$trusted_planner"
+            planner_dir="$trusted_dir"
           fi
           python3 -I -c 'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); sys.argv[0] = sys.argv.pop(1); runpy.run_path(sys.argv[0], run_name="__main__")' "$planner_dir" "$planner" --self-test
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
 
       - name: Check PR diff hygiene
         if: github.event_name == 'pull_request'
         run: git diff --check "origin/${{ github.base_ref }}...HEAD"
+
+      - name: Check merge-group diff hygiene
+        if: github.event_name == 'merge_group'
+        env:
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::merge_group base_sha missing or malformed" >&2
+            exit 1
+          fi
+          if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+            git fetch --no-tags origin "${MERGE_BASE_SHA}"
+          fi
+          git diff --check "${MERGE_BASE_SHA}...HEAD"
 
       - id: plan
         name: Select CI mode
@@ -140,6 +195,31 @@ jobs:
               git show "${base_ref}:${planner}" > "$trusted_planner"
               if git cat-file -e "${base_ref}:.github/scripts/live_suite_path_filter.py" 2>/dev/null; then
                 git show "${base_ref}:.github/scripts/live_suite_path_filter.py" > "$trusted_live_filter"
+              fi
+              planner="$trusted_planner"
+              planner_dir="$trusted_dir"
+            fi
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "${MERGE_BASE_SHA}"
+            fi
+            # Diff the synthesized merge-group commit against its payload base.
+            git diff --name-only --no-renames "${MERGE_BASE_SHA}...HEAD" | sort > "$changed_files"
+
+            # Use the merge-group base planner so a queued change that edits the
+            # planner cannot classify the combined SHA as light.
+            trusted_dir="$RUNNER_TEMP/pr-ci-plan"
+            trusted_planner="$trusted_dir/pr_ci_plan.py"
+            trusted_live_filter="$trusted_dir/live_suite_path_filter.py"
+            if git cat-file -e "${MERGE_BASE_SHA}:${planner}" 2>/dev/null; then
+              mkdir -p "$trusted_dir"
+              git show "${MERGE_BASE_SHA}:${planner}" > "$trusted_planner"
+              if git cat-file -e "${MERGE_BASE_SHA}:.github/scripts/live_suite_path_filter.py" 2>/dev/null; then
+                git show "${MERGE_BASE_SHA}:.github/scripts/live_suite_path_filter.py" > "$trusted_live_filter"
               fi
               planner="$trusted_planner"
               planner_dir="$trusted_dir"
@@ -204,6 +284,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
 
       - id: binary-matrix
         name: Select binary build matrix
@@ -247,18 +328,18 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
 
       - name: Install Rust formatting toolchain
-        if: steps.plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+        if: steps.plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
           components: rustfmt
 
       - name: Check Rust formatting
-        if: steps.plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+        if: steps.plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
         run: cargo fmt --all -- --check
 
       - name: Verify every integration_tests module is sharded
-        if: steps.plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+        if: steps.plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
         run: |
           set -euo pipefail
           # All non-helper test files (excluding mod.rs and the shared
@@ -282,7 +363,7 @@ jobs:
   test-unit:
     name: Unit Tests
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -352,7 +433,7 @@ jobs:
   test-secrets:
     name: Secret Backends
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -400,7 +481,7 @@ jobs:
   test-service-integration:
     name: Service Integration
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -426,7 +507,7 @@ jobs:
   test-pkcs11-softhsm:
     name: PKCS#11 SoftHSM Smoke Test
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -499,7 +580,7 @@ jobs:
   build-test-artifacts:
     name: Build Test Artifacts
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     # The gateway binary is packaged into a distroless Debian 13 image by
     # conformance consumers. Pin the build host so its glibc stays no newer
     # than the runtime image glibc; all native archive consumers use the same
@@ -601,7 +682,7 @@ jobs:
     # wall-clock waits in `wait_for_poll` / `wait_for_route` / fixed sleeps
     # make elapsed time, not CPU utilisation, the useful balancing signal.
     name: Integration Tests (${{ matrix.shard }})
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: build-test-artifacts
     runs-on: ubuntu-latest
     strategy:
@@ -794,7 +875,7 @@ jobs:
   test-conformance:
     name: Mesh Conformance Tests
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -829,7 +910,7 @@ jobs:
   dependency-audit:
     name: Dependency Audit (cargo-deny)
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     # cargo-deny only runs `cargo metadata` (no compilation), so this job does
     # not install sccache. Clear the checked-in sccache rustc-wrapper
@@ -878,7 +959,7 @@ jobs:
   test-vendor-patches:
     name: Vendored Patch Regressions
     needs: build-test-artifacts
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -930,7 +1011,7 @@ jobs:
 
   test-functional:
     name: Functional Tests (${{ matrix.shard }})
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: build-test-artifacts
     runs-on: ubuntu-latest
     strategy:
@@ -1652,7 +1733,7 @@ jobs:
 
   plugin-hardening-redis-regression:
     name: Plugin Hardening Redis Regression
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: build-test-artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -1734,7 +1815,7 @@ jobs:
 
   mesh-multicluster-federation:
     name: Mesh Multicluster Federation
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_mesh_federation == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_mesh_federation == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     needs: [ci-plan, build-test-artifacts]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -1781,7 +1862,7 @@ jobs:
 
   mesh-e2e-sidecar:
     name: Mesh E2E Sidecar
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_mesh_sidecar_smoke == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_mesh_sidecar_smoke == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     needs: [ci-plan, build-test-artifacts]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -1831,7 +1912,7 @@ jobs:
 
   helm-chart:
     name: Helm Chart
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_helm == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_helm == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     needs: [ci-plan, build-test-artifacts]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -3366,7 +3447,7 @@ jobs:
 
   test:
     name: Tests
-    if: always() && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     needs:
       - ci-plan
       - test-unit
@@ -3506,7 +3587,7 @@ jobs:
           require_live_gate "Two-cluster mesh live" "${{ needs.two-cluster-mesh-live.result }}"
           require_success "Performance regression" "${{ needs.performance-regression.result }}"
           require_success "Native platform binaries" "${{ needs.build-binaries.result }}"
-          if [ "$EVENT_NAME" = "pull_request" ]; then
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
             if [ "${{ needs.build-arm64-cross.result }}" != "skipped" ]; then
               echo "::error title=Unexpected ARM64 PR build::protected Cross invocation must run only after code reaches main"
               failures=1
@@ -3525,7 +3606,7 @@ jobs:
   lint:
     name: Lint
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -3548,7 +3629,7 @@ jobs:
     # list, add a step, or redirect this job at a repository-supplied script.
     name: Fuzz Smoke
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -3606,7 +3687,7 @@ jobs:
   build-ebpf:
     name: Build eBPF Programs
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_build == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_build == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -3652,7 +3733,7 @@ jobs:
   build-ebpf-userspace:
     name: Build eBPF Userspace Loader
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -3677,7 +3758,7 @@ jobs:
     needs: ci-plan
     # Live kernel validation is high-value for BPF/node-waypoint-sensitive
     # changes, but it adds several minutes to every PR when run unconditionally.
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_live == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -3778,7 +3859,7 @@ jobs:
     needs: ci-plan
     # The netns tests require privileged live-kernel operations; the path gate
     # keeps unrelated PRs fast while preserving coverage for capture/proxy paths.
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_live == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -3910,7 +3991,7 @@ jobs:
     # Shares the mesh/netns-sensitive path detector with the source-capture
     # lane. The gate is intentionally separate because it downloads two real
     # SPIRE control planes and runs the full cross-cluster protocol matrix.
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_live == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -3996,7 +4077,7 @@ jobs:
   performance-regression:
     name: Performance Regression Check
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -4023,6 +4104,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
         run: |
           set -euo pipefail
 
@@ -4034,8 +4116,20 @@ jobs:
           reason="Performance regression checks always run for ${EVENT_NAME} events."
           changed_files=""
 
-          if [ "${EVENT_NAME}" = "pull_request" ]; then
-            if changed_files="$(git diff --name-only "origin/${BASE_REF}...HEAD" 2>/dev/null)"; then
+          if [ "${EVENT_NAME}" = "pull_request" ] || [ "${EVENT_NAME}" = "merge_group" ]; then
+            if [ "${EVENT_NAME}" = "merge_group" ]; then
+              if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+                echo "::error::merge_group base_sha missing or malformed" >&2
+                exit 1
+              fi
+              if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+                git fetch --no-tags origin "${MERGE_BASE_SHA}"
+              fi
+              perf_base="$MERGE_BASE_SHA"
+            else
+              perf_base="origin/${BASE_REF}"
+            fi
+            if changed_files="$(git diff --name-only "${perf_base}...HEAD" 2>/dev/null)"; then
               run_benchmark=false
               reason="No performance-sensitive paths changed."
 
@@ -4076,24 +4170,24 @@ jobs:
               done <<<"${changed_files}"
             else
               run_benchmark=true
-              reason="Could not diff against origin/${BASE_REF}; running benchmark to be safe."
+              reason="Could not diff against ${perf_base}; running benchmark to be safe."
               changed_files=""
             fi
           fi
 
-          if [ "${EVENT_NAME}" != "pull_request" ] || grep -Eq '^(src/plugins/(ip_restriction\.rs|mod\.rs)|tests/performance/mesh/(Cargo\.(toml|lock)|benches/ip_restriction\.rs)|\.github/scripts/verify_ip_restriction_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
+          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || grep -Eq '^(src/plugins/(ip_restriction\.rs|mod\.rs)|tests/performance/mesh/(Cargo\.(toml|lock)|benches/ip_restriction\.rs)|\.github/scripts/verify_ip_restriction_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
             run_ip_restriction_benchmark=true
           fi
 
-          if [ "${EVENT_NAME}" != "pull_request" ] || grep -Eq '^(src/load_balancer\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/wrr_selection\.rs)|\.github/scripts/verify_wrr_selection_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
+          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || grep -Eq '^(src/load_balancer\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/wrr_selection\.rs)|\.github/scripts/verify_wrr_selection_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
             run_wrr_benchmark=true
           fi
 
-          if [ "${EVENT_NAME}" != "pull_request" ] || grep -Eq '^(src/load_balancer\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/rr_selection\.rs)|\.github/scripts/verify_rr_selection_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
+          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || grep -Eq '^(src/load_balancer\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/rr_selection\.rs)|\.github/scripts/verify_rr_selection_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
             run_rr_benchmark=true
           fi
 
-          if [ "${EVENT_NAME}" != "pull_request" ] || grep -Eq '^(src/plugins/ai_semantic_cache\.rs|tests/unit/plugins/ai_semantic_cache_tests\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/ai_semantic_cache_cleanup\.rs)|\.github/scripts/verify_ai_semantic_cache_cleanup_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
+          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || grep -Eq '^(src/plugins/ai_semantic_cache\.rs|tests/unit/plugins/ai_semantic_cache_tests\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/ai_semantic_cache_cleanup\.rs)|\.github/scripts/verify_ai_semantic_cache_cleanup_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
             run_ai_semantic_cache_benchmark=true
           fi
 
@@ -4320,7 +4414,7 @@ jobs:
   build-binaries:
     name: Build (${{ matrix.asset_name }})
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -4430,7 +4524,7 @@ jobs:
           $nasmBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
       - name: Build PR verification binary
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
         run: cargo build --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
 
       - name: Build release binary

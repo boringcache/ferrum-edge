@@ -1498,6 +1498,7 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
         run: |
           set -euo pipefail
 
@@ -1541,6 +1542,31 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
             fi
             # Pin the moving tip exactly once; nothing below re-resolves a ref.
             trusted_sha="$(git rev-parse --verify --quiet refs/ferrum/trusted-base^{commit} || true)"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            # Merge queues synthesize a combined SHA. Use the event's base_sha
+            # as the trusted filter source and the change-set base so a missing
+            # pull_request payload cannot force-skip or check only main.
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              fetched=false
+              for attempt in 1 2 3; do
+                if git fetch --no-tags --no-recurse-submodules origin \
+                  "${MERGE_BASE_SHA}"; then
+                  fetched=true
+                  break
+                fi
+                echo "git fetch of merge_group base failed (attempt ${attempt}/3); retrying" >&2
+                sleep $(( attempt * 10 ))
+              done
+              if [ "$fetched" != true ]; then
+                echo "::error::git fetch of merge_group base_sha failed after 3 attempts" >&2
+                exit 1
+              fi
+            fi
+            trusted_sha="$MERGE_BASE_SHA"
           else
             # A push to the default branch and a manual dispatch already run
             # trusted code, so the checked-out commit IS the trusted base.
@@ -1588,7 +1614,7 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
           fi
           git cat-file blob "$entry_object" > "$trusted_filter"
 
-          if [ "$EVENT_NAME" = "pull_request" ]; then
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
             git diff --name-only --no-renames "${trusted_sha}...HEAD" \
               | sort > "$changed_files"
           fi
@@ -1668,7 +1694,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     # list, add a step, or redirect this job at a repository-supplied script.
     name: Fuzz Smoke
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -22112,6 +22138,10 @@ pre_build = []
         'python3 -I "$trusted_filter" --self-test',
         "+refs/heads/${BASE_REF}:refs/ferrum/trusted-base",
         "^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$",
+        'elif [ "$EVENT_NAME" = "merge_group" ]; then',
+        'MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}',
+        'merge_group base_sha missing or malformed',
+        '[ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]',
         "            true|false) ;;",
     ):
         if required_token not in rendered_relevance:

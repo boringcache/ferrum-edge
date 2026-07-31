@@ -5,6 +5,9 @@ on:
     branches:
       - main
   pull_request:
+  merge_group:
+    types:
+      - checks_requested
   workflow_dispatch:
     inputs:
       gateway_api_version:
@@ -33,10 +36,10 @@ permissions:
 # behind stale labs for older SHAs. Scheduled/manual runs keep sharing one lane
 # for lab budget.
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('gateway-api-conformance-pr-{0}', github.event.pull_request.number) || (github.event_name == 'push' && format('gateway-api-conformance-{0}', github.ref) || 'gateway-api-conformance-shared') }}
-  # Cancel a superseded PR/main lab on rapid re-push. Scheduled and manual runs
-  # share one lane and must run to completion for lab budget.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+  group: ${{ github.event_name == 'pull_request' && format('gateway-api-conformance-pr-{0}', github.event.pull_request.number) || (github.event_name == 'merge_group' && format('gateway-api-conformance-merge-group-{0}', github.event.merge_group.head_sha) || (github.event_name == 'push' && format('gateway-api-conformance-{0}', github.ref) || 'gateway-api-conformance-shared')) }}
+  # Cancel a superseded PR/main/merge-group lab on rapid re-push. Scheduled and
+  # manual runs share one lane and must run to completion for lab budget.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push' }}
 
 env:
   FERRUM_IMAGE: ferrum-edge:gateway-api-conformance
@@ -58,6 +61,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
         run: |
           set -euo pipefail
 
@@ -91,6 +95,29 @@ jobs:
               exit 1
             fi
             git diff --name-only "${base_ref}...HEAD" | sort > "$changed_files"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            # Validate the synthesized merge-group SHA against its payload base.
+            # Do not consult pull_request fields; they are absent on merge_group.
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              fetched=false
+              for attempt in 1 2 3; do
+                if git fetch --no-tags origin "${MERGE_BASE_SHA}"; then
+                  fetched=true
+                  break
+                fi
+                echo "git fetch of merge_group base failed (attempt ${attempt}/3); retrying" >&2
+                sleep $(( attempt * 10 ))
+              done
+              if [ "$fetched" != true ]; then
+                echo "::error::git fetch of merge_group base_sha failed after 3 attempts" >&2
+                exit 1
+              fi
+            fi
+            git diff --name-only "${MERGE_BASE_SHA}...HEAD" | sort > "$changed_files"
           else
             filter_args+=(--force-run)
           fi

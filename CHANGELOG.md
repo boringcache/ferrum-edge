@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Required CI owners now declare `merge_group` triggers and event-aware
+  base/head selection so a future `main` merge queue can run the six required
+  checks (`Tests`, `Merge Coverage`, `Gateway API Conformance`,
+  `Mesh E2E Sidecar Live`, `Trusted Cross Build Policy`,
+  `Multicluster Federation Live`) on the synthesized queue SHA without
+  deadlocking. Repository ruleset/branch-protection enablement remains a
+  separate root-owned step (#2458).
+
 ### Added
 
 - API-spec YAML ingestion now expands anchors and aliases through a bounded

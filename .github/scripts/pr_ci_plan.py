@@ -678,12 +678,25 @@ def is_lightweight_path(path: str) -> bool:
     return any(pattern.search(path) for pattern in LIGHTWEIGHT_PATTERNS)
 
 
+def is_path_gated_event(event_name: str) -> bool:
+    """Return whether this event may use a changed-file path gate.
+
+    `pull_request` and `merge_group` both supply an accurate base/head range
+    when the workflow derives the file list from the event payload. Every other
+    event fails closed to full CI and every gated suite.
+    """
+
+    return event_name in {"pull_request", "merge_group"}
+
+
 def select_mode(event_name: str, changed_files: list[str]) -> tuple[str, str]:
-    if event_name != "pull_request":
+    if not is_path_gated_event(event_name):
         return "full", f"full CI is required for {event_name}"
 
-    # Fail closed when the diff cannot be established. An empty PR diff is
-    # unusual, and running full validation is safer than silently skipping it.
+    # Fail closed when the diff cannot be established. An empty PR/merge-group
+    # diff is unusual, and running full validation is safer than silently
+    # skipping it. Merge-group runs must never reduce to a no-op because
+    # pull_request payload fields are absent.
     if not changed_files:
         return "full", "no changed files were detected; defaulting to full CI"
 
@@ -699,7 +712,7 @@ def any_path_matches(patterns: list[re.Pattern[str]], changed_files: list[str]) 
 
 
 def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, bool]:
-    if event_name != "pull_request" or not changed_files:
+    if not is_path_gated_event(event_name) or not changed_files:
         return {name: True for name in JOB_GATE_NAMES}
 
     # These scripts decide which gated suites run. A PR that edits them is
@@ -765,6 +778,10 @@ def self_test() -> int:
         ("pull_request", [".github/workflows/ci.yml"], "full"),
         ("pull_request", ["tests/README.md", "tests/unit_tests.rs"], "full"),
         ("pull_request", [], "full"),
+        ("merge_group", ["docs/admin_api.md"], "light"),
+        ("merge_group", ["src/proxy/mod.rs"], "full"),
+        ("merge_group", [], "full"),
+        ("merge_group", ["docs/admin_api.md", "src/proxy/mod.rs"], "full"),
         ("push", ["docs/ci_cd.md"], "full"),
         ("workflow_dispatch", [], "full"),
     ]
@@ -850,6 +867,21 @@ def self_test() -> int:
         ),
         (
             "pull_request",
+            [],
+            {name: True for name in JOB_GATE_NAMES},
+        ),
+        (
+            "merge_group",
+            ["docs/admin_api.md"],
+            {name: False for name in JOB_GATE_NAMES},
+        ),
+        (
+            "merge_group",
+            ["charts/ferrum-gateway/values.yaml"],
+            {"run_helm": True},
+        ),
+        (
+            "merge_group",
             [],
             {name: True for name in JOB_GATE_NAMES},
         ),

@@ -34,14 +34,14 @@ adding, removing, or materially changing a workflow.
 
 | Workflow file | Display name | Triggers | Role |
 |---|---|---|---|
-| `ci.yml` | CI | PRs, push to `main`, manual | Required validation gate plus `latest` prerelease and Docker image publishing from `main`. |
-| `coverage.yml` | Coverage | PRs, push to `main`, weekly schedule, manual | Coverage planning/reporting and coverage floor enforcement; `Merge Coverage` is directly required on PRs. |
+| `ci.yml` | CI | PRs, `merge_group`, push to `main`, manual | Required validation gate plus `latest` prerelease and Docker image publishing from `main`. The `Tests` check runs on PRs and merge-queue groups. |
+| `coverage.yml` | Coverage | PRs, `merge_group`, push to `main`, weekly schedule, manual | Coverage planning/reporting and coverage floor enforcement; `Merge Coverage` is directly required on PRs and merge-queue groups. |
 | `release.yml` | Release | `v*` tag push | Versioned binary, GitHub Release, and Docker publishing after CI/Coverage validation. |
-| `gateway-api-conformance.yml` | Gateway API Conformance | PRs, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs. |
-| `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs. |
-| `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface; `Trusted Cross Build Policy` must be directly required after the bootstrap workflow merges. |
+| `gateway-api-conformance.yml` | Gateway API Conformance | PRs, `merge_group`, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs and merge-queue groups. |
+| `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs and merge-queue groups. |
+| `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface on PRs; merge-group mode verifies the synthesized combined SHA with `contents: read` only. `Trusted Cross Build Policy` is directly required. |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
-| `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs. |
+| `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs and merge-queue groups. |
 | `dependency-audit.yml` | Dependency Audit | Weekly schedule, manual | Scheduled supply-chain governance beyond the per-PR audit gate. |
 | `fuzz.yml` | Fuzz | Weekly schedule, manual | Sanitizer-backed libFuzzer lane for hostile parser targets; see [fuzz.md](fuzz.md). |
 | `scaling-regression.yml` | Scheduled Scaling Regression | Weekly schedule, manual | Runs the 30k proxy scale and 10k proxy load-stress tests excluded from PR CI. |
@@ -59,17 +59,17 @@ adding, removing, or materially changing a workflow.
 ### CI Pipeline Flow
 
 ```
-Pull Request
-    ├─► Trusted Cross Build Policy (`pull_request_target`, base code only)
-            └─► Validate proposed Cross/Cargo config, workflows, repo-local
-                actions, and referenced scripts as hostile data
-    ├─► CI plan
+Pull Request / Merge Queue group
+    ├─► Trusted Cross Build Policy
+            ├─► PR: `pull_request_target`, base code only, PR tree as data
+            └─► Merge group: synthesized queue SHA, `contents: read`, no secrets
+    ├─► CI plan (event-aware base/head; merge_group uses payload base_sha)
             ├─► Docs/license/agent-only: lightweight Tests aggregate
             └─► Full CI
                     ├─► Format + integration-shard coverage (in CI plan)
                     ├─► Unit+inline-lib / integration-shard / functional-shard tests
                     ├─► Lint, dependency audit, vendored regressions
-                    ├─► Fuzz smoke (libFuzzer + proptest budgets)
+                    ├─► Fuzz smoke (libFuzzer + property budgets)
                     ├─► eBPF/netns live checks when planner marks relevant
                     ├─► Planner-gated mesh / Helm / performance gates
                     └─► Five target release builds
@@ -87,6 +87,57 @@ Push to main
                     └─► Push per-arch Docker images to Docker Hub and GHCR
                             └─► Create multi-arch Docker manifest (`latest`, `main-<sha>`)
 ```
+
+### Required checks and merge queue
+
+Branch protection / repository rulesets for `main` must require these six
+GitHub Actions check names (exact spelling; source app is **GitHub Actions**,
+app id `15368`):
+
+| Required check name | Owning workflow | Owning job |
+|---|---|---|
+| `Tests` | `.github/workflows/ci.yml` | `test` |
+| `Merge Coverage` | `.github/workflows/coverage.yml` | `coverage-merge` |
+| `Gateway API Conformance` | `.github/workflows/gateway-api-conformance.yml` | `gate` |
+| `Mesh E2E Sidecar Live` | `.github/workflows/mesh-e2e-sidecar-live.yml` | `gate` |
+| `Trusted Cross Build Policy` | `.github/workflows/cross-build-policy.yml` | `verify` |
+| `Multicluster Federation Live` | `.github/workflows/multicluster-federation-live.yml` | `gate` |
+
+Each owner declares a `merge_group` (`types: [checks_requested]`) trigger in
+addition to its existing `pull_request` / `pull_request_target` / `push` /
+schedule / manual triggers. Merge queues run required checks on the
+`merge_group` event against a synthesized `gh-readonly-queue/main/...` commit.
+`github.sha` / `merge_group.head_sha` is the exact code under validation;
+`merge_group.base_sha` is the queue base. Workflows must not read
+`github.event.pull_request.*` on `merge_group` (those fields are absent) and
+must not silently fall back to a base/`main`-only check. Path-sensitive skips
+are allowed only when that base/head range is derived successfully; otherwise
+the required check fails closed or runs fully.
+
+Concurrency groups include the event name and a PR number or merge-group head
+SHA so a merge-group run cannot cancel an unrelated PR (or another group).
+
+**Admin / no-bypass intent (settings owned by root, not this workflow change):**
+apply rules to administrators, block force pushes and branch deletion, require
+up-to-date merge-queue results, and document any narrowly scoped automation
+bypass. This repository change only prepares workflow triggers and contracts;
+it does **not** enable the merge queue or mutate branch protection.
+
+**Staged enablement (root-owned after this prerequisite merges):**
+
+1. Merge the workflow/`docs/ci_cd.md` prerequisite so all six owners report on
+   `merge_group`.
+2. Enable the `main` ruleset / branch protection with the six required checks
+   above, merge queue enabled, admin enforcement as intended.
+3. Open a throwaway test PR, enqueue it, confirm each required check runs on
+   the synthesized SHA (not a stale PR SHA), and confirm release automation
+   still has only the permissions it needs.
+4. Only after that live exercise should closing language such as
+   `Closes #2458` be used on the settings follow-up.
+
+`.github/scripts/verify_required_ci.py` statically enforces merge_group
+triggers, check-name parity, event-aware SHA/base markers, and concurrency
+markers for all six owners.
 
 ### Release Pipeline Flow
 
@@ -109,16 +160,20 @@ Push tag v* (e.g., v0.2.0)
 
 ## CI Pipeline (ci.yml)
 
-The CI workflow is triggered by every pull request and every push to `main`.
-The `CI Plan` job first selects `full` or `light` mode. Pull requests whose
-entire diff is limited to ordinary documentation, `.agents/**`, `.claude/**`,
-Markdown outside `vendor/`, or license files use light mode and preserve a fast
-`Tests` aggregate without starting the Rust/build matrix. Documentation that
+The CI workflow is triggered by every pull request, every merge-queue
+`merge_group` check request, and every push to `main`.
+The `CI Plan` job first selects `full` or `light` mode. Pull requests and
+merge-group runs whose entire diff is limited to ordinary documentation,
+`.agents/**`, `.claude/**`, Markdown outside `vendor/`, or license files use
+light mode and preserve a fast `Tests` aggregate without starting the Rust/build
+matrix. Documentation that
 deliberately triggers a live datapath suite (including the mesh, SPIRE,
 configuration, NodeWaypoint, and CI contract/runbook files) remains full mode.
-The planner runs `git diff --check` for PR diff hygiene and disables rename
-detection when classifying paths, so both the source and destination of a rename
-are checked.
+The planner runs `git diff --check` for PR/merge-group diff hygiene and disables
+rename detection when classifying paths, so both the source and destination of a
+rename are checked. Merge-group planning diffs
+`merge_group.base_sha...HEAD` and executes the planner from that base SHA so a
+queued planner edit cannot self-classify as light.
 Any unrecognized path, an empty/unavailable diff, a mixed code-and-docs change,
 a push to `main`, or a manual run fails over to full mode. The decision table
 and its executable examples live in `.github/scripts/pr_ci_plan.py`. PR
@@ -189,14 +244,17 @@ and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
 matrix pass.
 
-Branch protection must require six independent PR checks: the unchanged `Tests`
-aggregate from `ci.yml`, `Merge Coverage` from `coverage.yml`, `Gateway API
-Conformance` from `gateway-api-conformance.yml`, `Mesh E2E Sidecar Live` from
-`mesh-e2e-sidecar-live.yml`, `Multicluster Federation Live` from
-`multicluster-federation-live.yml`, and `Trusted Cross Build Policy` from
-`cross-build-policy.yml`. Each dedicated workflow triggers on every pull
-request and fails closed on planning or validation failures. They are required
-directly rather than mirrored by runner-holding polling jobs in `ci.yml`.
+Branch protection must require six independent PR **and** merge-queue checks:
+the unchanged `Tests` aggregate from `ci.yml`, `Merge Coverage` from
+`coverage.yml`, `Gateway API Conformance` from `gateway-api-conformance.yml`,
+`Mesh E2E Sidecar Live` from `mesh-e2e-sidecar-live.yml`,
+`Multicluster Federation Live` from `multicluster-federation-live.yml`, and
+`Trusted Cross Build Policy` from `cross-build-policy.yml`. Each dedicated
+workflow triggers on every pull request and on `merge_group`, and fails closed
+on planning or validation failures. They are required directly rather than
+mirrored by runner-holding polling jobs in `ci.yml`. See
+[Required checks and merge queue](#required-checks-and-merge-queue) for the
+operator contract, queue SHA semantics, and staged enablement procedure.
 
 `cross-build-policy.yml` is bootstrapped by the change that introduces it, so
 it cannot emit a `pull_request_target` check until it exists on the default
@@ -204,8 +262,17 @@ branch. After that change merges and the first check is visible, a repository
 administrator must add `Trusted Cross Build Policy` to the required checks for
 `main`. Ordinary pull requests must not modify the trusted verifier or its
 workflow; such maintenance requires an explicit branch-protection bypass.
+Merge-group mode reuses the same check name while validating the synthesized
+queue commit with read-only permissions.
 
-CI uses `concurrency.group: ci-publish-${{ github.ref }}` with `cancel-in-progress: true`, so a newer push to the same branch cancels the older CI run. On `main`, that can interrupt an in-flight publish job such as Docker manifest creation. If the cancellation left publishing incomplete, re-run the newest workflow attempt (the one for the latest `main` SHA) — re-running the older, canceled run would re-publish stale binaries and images as `latest`.
+CI uses
+`concurrency.group: ci-publish-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}`
+with `cancel-in-progress: true`, so a newer push to the same PR or the same
+merge-group head cancels the older run without cancelling unrelated lanes. On
+`main`, that can interrupt an in-flight publish job such as Docker manifest
+creation. If the cancellation left publishing incomplete, re-run the newest
+workflow attempt (the one for the latest `main` SHA) — re-running the older,
+canceled run would re-publish stale binaries and images as `latest`.
 
 ### Jobs
 

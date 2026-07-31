@@ -34,9 +34,20 @@ def matches_any(path: str, patterns: list[re.Pattern[str]]) -> bool:
     return any(pattern.search(path) for pattern in patterns)
 
 
+def is_path_gated_event(event_name: str) -> bool:
+    """Return whether this event may skip or narrow coverage from a file list."""
+
+    return event_name in {"pull_request", "merge_group"}
+
+
 def select_mode(event_name: str, changed_files: list[str]) -> tuple[str, str]:
-    if event_name != "pull_request":
+    if not is_path_gated_event(event_name):
         return "full", f"full coverage is required for {event_name}"
+
+    # An empty merge-group/PR change list fails closed to full coverage so a
+    # missing pull_request payload cannot silently skip the required check.
+    if not changed_files:
+        return "full", "no changed files were detected; defaulting to full coverage"
 
     full_matches = [path for path in changed_files if matches_any(path, FULL_PATTERNS)]
     non_plugin_full_matches = [
@@ -72,6 +83,11 @@ def self_test() -> int:
         ("pull_request", ["src/plugins/cors.rs", "src/proxy/http.rs"], "full"),
         ("pull_request", [".github/scripts/coverage_plan.py"], "full"),
         ("pull_request", ["docs/configuration.md"], "skip"),
+        ("pull_request", [], "full"),
+        ("merge_group", ["src/proxy/http.rs"], "full"),
+        ("merge_group", ["src/plugins/cors.rs"], "plugin"),
+        ("merge_group", ["docs/configuration.md"], "skip"),
+        ("merge_group", [], "full"),
         ("push", [], "full"),
         ("workflow_dispatch", [], "full"),
         ("schedule", [], "full"),

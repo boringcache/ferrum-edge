@@ -4,9 +4,12 @@ on:
   pull_request_target:
     branches:
       - main
+  merge_group:
+    types:
+      - checks_requested
 
 concurrency:
-  group: cross-build-policy-${{ github.event.pull_request.number }}
+  group: ${{ github.event_name == 'merge_group' && format('cross-build-policy-merge-group-{0}', github.event.merge_group.head_sha) || format('cross-build-policy-{0}', github.event.pull_request.number) }}
   cancel-in-progress: true
 
 permissions:
@@ -18,74 +21,115 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      # pull_request_target loads this workflow from the base branch. Keep the
-      # checkout on the trusted base commit and treat the PR's configuration
-      # and workflow files only as data; no code from the PR is executed here.
+      # pull_request_target loads this workflow from the base branch and keeps
+      # the checkout on that trusted base commit while treating the PR as data.
+      # merge_group loads the workflow from the synthesized queue commit and
+      # checks out that same SHA so the required check validates the combined
+      # result without pull_request payload fields or write permissions.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event_name == 'merge_group' && github.sha || github.event.pull_request.base.sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Enforce trusted ARM64 cross-build policy
         env:
+          EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          MERGE_GROUP_BASE_REF: ${{ github.event.merge_group.base_ref }}
         run: |
           set -euo pipefail
 
-          if [[ ! "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::invalid triggering PR head SHA" >&2
-            exit 1
-          fi
-          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::invalid triggering base SHA" >&2
-            exit 1
-          fi
-          # The checkout is the only code this job executes, so it must be the
-          # trusted base commit the event was created from.
-          checked_out="$(git rev-parse HEAD)"
-          if [ "$checked_out" != "$BASE_SHA" ]; then
-            echo "::error::checkout ${checked_out} is not the triggering base ${BASE_SHA}" >&2
-            exit 1
-          fi
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            if [[ ! "$MERGE_GROUP_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::invalid merge_group head SHA" >&2
+              exit 1
+            fi
+            if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            checked_out="$(git rev-parse HEAD)"
+            if [ "$checked_out" != "$MERGE_GROUP_HEAD_SHA" ] || [ "$checked_out" != "${GITHUB_SHA}" ]; then
+              echo "::error::checkout ${checked_out} is not the merge_group head ${MERGE_GROUP_HEAD_SHA}" >&2
+              exit 1
+            fi
+            proposed_commit="$MERGE_GROUP_HEAD_SHA"
+            # The merge-group base is the exact main tip the queue synthesized
+            # against. Pin it and use it as every trusted baseline; do not fall
+            # back to pull_request fields (they are absent on merge_group).
+            if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "${BASE_SHA}"
+            fi
+            trusted_base="$BASE_SHA"
+            echo "merge_group proposed ${proposed_commit} against trusted base ${trusted_base}"
+          elif [ "$EVENT_NAME" = "pull_request_target" ]; then
+            if [[ ! "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::invalid triggering PR head SHA" >&2
+              exit 1
+            fi
+            if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::invalid triggering base SHA" >&2
+              exit 1
+            fi
+            # The checkout is the only code this job executes, so it must be the
+            # trusted base commit the event was created from.
+            checked_out="$(git rev-parse HEAD)"
+            if [ "$checked_out" != "$BASE_SHA" ]; then
+              echo "::error::checkout ${checked_out} is not the triggering base ${BASE_SHA}" >&2
+              exit 1
+            fi
 
-          # `main` can advance after the event is created. Comparing against the
-          # event's base SHA would then measure the PR against a stale policy
-          # surface, so fetch the live base branch tip from the trusted
-          # repository, authenticate it against the triggering base, and pin it
-          # to an immutable SHA that every later extraction reads.
-          if [[ ! "$BASE_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$BASE_REF" == *".."* ]] \
-            || [[ "$BASE_REF" == -* ]] || [[ "$BASE_REF" == */ ]]; then
-            echo "::error::invalid triggering base ref" >&2
-            exit 1
-          fi
-          git fetch --no-tags origin \
-            "+refs/heads/${BASE_REF}:refs/remotes/trusted-base"
-          trusted_base="$(git rev-parse "refs/remotes/trusted-base^{commit}")"
-          if [[ ! "$trusted_base" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::live trusted base did not resolve to a commit" >&2
-            exit 1
-          fi
-          # A live tip that does not descend from the triggering base is a
-          # rewritten or confused ref rather than an advance of trusted `main`.
-          if ! git merge-base --is-ancestor "$BASE_SHA" "$trusted_base"; then
-            echo "::error::live base ${trusted_base} does not descend from ${BASE_SHA}" >&2
-            exit 1
-          fi
-          echo "trusted base tip: ${trusted_base} (event base ${BASE_SHA})"
+            # `main` can advance after the event is created. Comparing against the
+            # event's base SHA would then measure the PR against a stale policy
+            # surface, so fetch the live base branch tip from the trusted
+            # repository, authenticate it against the triggering base, and pin it
+            # to an immutable SHA that every later extraction reads.
+            if [[ ! "$BASE_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$BASE_REF" == *".."* ]] \
+              || [[ "$BASE_REF" == -* ]] || [[ "$BASE_REF" == */ ]]; then
+              echo "::error::invalid triggering base ref" >&2
+              exit 1
+            fi
+            git fetch --no-tags origin \
+              "+refs/heads/${BASE_REF}:refs/remotes/trusted-base"
+            trusted_base="$(git rev-parse "refs/remotes/trusted-base^{commit}")"
+            if [[ ! "$trusted_base" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::live trusted base did not resolve to a commit" >&2
+              exit 1
+            fi
+            # A live tip that does not descend from the triggering base is a
+            # rewritten or confused ref rather than an advance of trusted `main`.
+            if ! git merge-base --is-ancestor "$BASE_SHA" "$trusted_base"; then
+              echo "::error::live base ${trusted_base} does not descend from ${BASE_SHA}" >&2
+              exit 1
+            fi
+            echo "trusted base tip: ${trusted_base} (event base ${BASE_SHA})"
 
-          # GitHub loaded this workflow file from the event base, so the
-          # extraction contract executing right now is the stale copy. It
-          # cannot be re-executed from the live tip, so authenticate it by
-          # comparison and fail closed when the trusted tip has moved it. The
-          # verifier itself is not subject to that limit and is executed from
-          # the live tip below.
-          if ! git diff --no-ext-diff --quiet "$BASE_SHA" "$trusted_base" \
-            -- ".github/workflows/cross-build-policy.yml"; then
-            echo "::error::the trusted extraction contract changed on ${BASE_REF} after this event was created; re-run once the pull request base is updated" >&2
+            # GitHub loaded this workflow file from the event base, so the
+            # extraction contract executing right now is the stale copy. It
+            # cannot be re-executed from the live tip, so authenticate it by
+            # comparison and fail closed when the trusted tip has moved it. The
+            # verifier itself is not subject to that limit and is executed from
+            # the live tip below.
+            if ! git diff --no-ext-diff --quiet "$BASE_SHA" "$trusted_base" \
+              -- ".github/workflows/cross-build-policy.yml"; then
+              echo "::error::the trusted extraction contract changed on ${BASE_REF} after this event was created; re-run once the pull request base is updated" >&2
+              exit 1
+            fi
+
+            git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+            fetched_head="$(git rev-parse FETCH_HEAD)"
+            if [ "$fetched_head" != "$PR_HEAD_SHA" ]; then
+              echo "::error::fetched PR head ${fetched_head} does not match triggering head ${PR_HEAD_SHA}" >&2
+              exit 1
+            fi
+            proposed_commit="$PR_HEAD_SHA"
+          else
+            echo "::error::unsupported event ${EVENT_NAME}" >&2
             exit 1
           fi
 
@@ -118,12 +162,6 @@ jobs:
           merge_base_actions="$RUNNER_TEMP/current-base-actions"
           proposed_automation="$RUNNER_TEMP/proposed-automation"
           merge_base_automation="$RUNNER_TEMP/current-base-automation"
-          git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
-          fetched_head="$(git rev-parse FETCH_HEAD)"
-          if [ "$fetched_head" != "$PR_HEAD_SHA" ]; then
-            echo "::error::fetched PR head ${fetched_head} does not match triggering head ${PR_HEAD_SHA}" >&2
-            exit 1
-          fi
 
           # These files define and invoke the trusted policy. Once this
           # bootstrap workflow is on main, changes to either require an
@@ -137,25 +175,25 @@ jobs:
           )
           for protected_path in "${protected_paths[@]}"; do
             if ! git diff --no-ext-diff --quiet \
-              "$trusted_base...$PR_HEAD_SHA" -- "$protected_path"; then
+              "$trusted_base...$proposed_commit" -- "$protected_path"; then
               echo "::error file=${protected_path}::trusted cross-build policy files cannot be changed by a pull request" >&2
               exit 1
             fi
           done
 
-          git show "FETCH_HEAD:Cross.toml" > "$proposed_cross"
-          git show "FETCH_HEAD:Cargo.toml" > "$proposed_cargo"
-          cargo_tool_entry="$(git ls-tree FETCH_HEAD -- .cargo/config.toml)"
+          git show "${proposed_commit}:Cross.toml" > "$proposed_cross"
+          git show "${proposed_commit}:Cargo.toml" > "$proposed_cargo"
+          cargo_tool_entry="$(git ls-tree "$proposed_commit" -- .cargo/config.toml)"
           if [[ "$cargo_tool_entry" != "100644 blob "* ]]; then
             echo "::error file=.cargo/config.toml::Cargo config must be a regular blob" >&2
             exit 1
           fi
-          git show "FETCH_HEAD:.cargo/config.toml" > "$proposed_cargo_tool"
-          if git cat-file -e "FETCH_HEAD:.cargo/config" 2>/dev/null; then
-            git show "FETCH_HEAD:.cargo/config" > "$proposed_cargo_legacy"
+          git show "${proposed_commit}:.cargo/config.toml" > "$proposed_cargo_tool"
+          if git cat-file -e "${proposed_commit}:.cargo/config" 2>/dev/null; then
+            git show "${proposed_commit}:.cargo/config" > "$proposed_cargo_legacy"
           fi
-          git show "FETCH_HEAD:.github/workflows/ci.yml" > "$proposed_ci"
-          git show "FETCH_HEAD:.github/workflows/release.yml" > "$proposed_release"
+          git show "${proposed_commit}:.github/workflows/ci.yml" > "$proposed_ci"
+          git show "${proposed_commit}:.github/workflows/release.yml" > "$proposed_release"
           # Compare executable/configuration surfaces to the live trusted base
           # tip rather than the event's base SHA. A stale event base therefore
           # cannot restore a Cross surface that current main removed.
@@ -190,7 +228,7 @@ jobs:
             done < "$listing"
           }
 
-          extract_workflows FETCH_HEAD "$proposed_workflows"
+          extract_workflows "$proposed_commit" "$proposed_workflows"
           extract_workflows "$trusted_base" "$merge_base_workflows"
 
           extract_actions() {
@@ -224,7 +262,7 @@ jobs:
             done < "$listing"
           }
 
-          extract_actions FETCH_HEAD "$proposed_actions"
+          extract_actions "$proposed_commit" "$proposed_actions"
           extract_actions "$trusted_base" "$merge_base_actions"
 
           extract_automation() {
@@ -270,7 +308,7 @@ jobs:
             done < "$listing"
           }
 
-          extract_automation FETCH_HEAD "$proposed_automation"
+          extract_automation "$proposed_commit" "$proposed_automation"
           extract_automation "$trusted_base" "$merge_base_automation"
 
           # Both the executed verifier and every trusted baseline now come from

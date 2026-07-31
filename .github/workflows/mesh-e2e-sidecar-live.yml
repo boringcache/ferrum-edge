@@ -3,6 +3,9 @@ name: Mesh E2E Sidecar Live Datapath
 on:
   workflow_dispatch:
   pull_request:
+  merge_group:
+    types:
+      - checks_requested
   # Every main push runs the FULL suite (the changes job force-runs on non-PR
   # events): the M2 sidecar GA contract is release-blocking, and release.yml's
   # `validate-release-sha` requires a successful PUSH run of this workflow for
@@ -17,7 +20,7 @@ permissions:
 # Cancel a superseded PR/main run on rapid re-push. Manual dispatches share one
 # lane and run to completion.
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('mesh-e2e-sidecar-live-pr-{0}', github.event.pull_request.number) || (github.event_name == 'push' && format('mesh-e2e-sidecar-live-{0}', github.ref) || 'mesh-e2e-sidecar-live-shared') }}
+  group: ${{ github.event_name == 'pull_request' && format('mesh-e2e-sidecar-live-pr-{0}', github.event.pull_request.number) || (github.event_name == 'merge_group' && format('mesh-e2e-sidecar-live-merge-group-{0}', github.event.merge_group.head_sha) || (github.event_name == 'push' && format('mesh-e2e-sidecar-live-{0}', github.ref) || 'mesh-e2e-sidecar-live-shared')) }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 env:
@@ -60,6 +63,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
         run: |
           set -euo pipefail
 
@@ -103,6 +107,31 @@ jobs:
             fi
             # Pin the moving tip exactly once; nothing below re-resolves a ref.
             trusted_sha="$(git rev-parse --verify --quiet refs/ferrum/trusted-base^{commit} || true)"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            # Merge queues synthesize a combined SHA. Use the event's base_sha
+            # as the trusted filter source and the change-set base so a missing
+            # pull_request payload cannot force-skip or check only main.
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              fetched=false
+              for attempt in 1 2 3; do
+                if git fetch --no-tags --no-recurse-submodules origin \
+                  "${MERGE_BASE_SHA}"; then
+                  fetched=true
+                  break
+                fi
+                echo "git fetch of merge_group base failed (attempt ${attempt}/3); retrying" >&2
+                sleep $(( attempt * 10 ))
+              done
+              if [ "$fetched" != true ]; then
+                echo "::error::git fetch of merge_group base_sha failed after 3 attempts" >&2
+                exit 1
+              fi
+            fi
+            trusted_sha="$MERGE_BASE_SHA"
           else
             # A push to the default branch and a manual dispatch already run
             # trusted code, so the checked-out commit IS the trusted base.
@@ -150,7 +179,7 @@ jobs:
           fi
           git cat-file blob "$entry_object" > "$trusted_filter"
 
-          if [ "$EVENT_NAME" = "pull_request" ]; then
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
             git diff --name-only --no-renames "${trusted_sha}...HEAD" \
               | sort > "$changed_files"
           fi
@@ -171,7 +200,6 @@ jobs:
           echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
           echo "Relevance decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
-
   mesh-e2e-sidecar-live:
     name: Mesh e2e sidecar live datapath
     needs: changes

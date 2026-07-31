@@ -80,15 +80,16 @@ orchestration:
 
 ## CI Baseline And Gates
 
-The `Coverage` workflow runs on pull requests, pushes to `main`, manual
-dispatch, and Sundays at 06:00 UTC. It publishes an HTML report, LCOV file, JSON
+The `Coverage` workflow runs on pull requests, merge-queue `merge_group`
+events, pushes to `main`, manual dispatch, and Sundays at 06:00 UTC. It
+publishes an HTML report, LCOV file, JSON
 summary, and terminal summary as a 30-day GitHub Actions artifact named
 `coverage-report` whenever coverage is collected. It also writes the overall
 coverage percentage and lowest/highest-covered files to the workflow step
 summary. The Coverage workflow's `Merge Coverage` job is a branch-protection
 required check in its own right; the main `CI` workflow no longer waits on it
-with a mirror job, so a PR merges only once coverage has completed for the
-same SHA via the required check.
+with a mirror job, so a PR or merge-queue group merges only once coverage has
+completed for the same SHA via the required check.
 
 The full default-branch gate is based on the latest completed `main` coverage
 artifact available when the gate was introduced on 2026-06-20:
