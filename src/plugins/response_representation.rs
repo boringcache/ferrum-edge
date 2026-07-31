@@ -715,7 +715,10 @@ impl Read for StrictBrotliReader<'_> {
         if self.done || buf.is_empty() {
             return Ok(0);
         }
-        let mut available_in = self.input.len() - self.input_offset;
+        let mut available_in = match self.input.len().checked_sub(self.input_offset) {
+            Some(len) => len,
+            None => return Err(Self::malformed()),
+        };
         let mut available_out = buf.len();
         let mut output_offset = 0usize;
         match brotli::BrotliDecompressStream(
