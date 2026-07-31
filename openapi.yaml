@@ -19267,7 +19267,17 @@ components:
         decoded protobuf messages must satisfy proto2 required-field
         initialization. Configuration errors use value-free field and category
         messages; supplied keys, paths, URIs, schema values, XML entries, and
-        compiler diagnostics are not reproduced.
+        compiler diagnostics are not reproduced. Applicability follows the
+        configured representation, never the request method: any request whose
+        Content-Type matches content_types (or is application/grpc for protobuf
+        configs) is buffered and validated, including GET, HEAD, OPTIONS,
+        DELETE, PUT, PATCH, and non-standard methods. Once a configured rule
+        applies, an empty, absent, or non-UTF-8 representation fails closed
+        (400 request, 502 response) instead of being skipped, and native gRPC
+        always runs frame validation. The only exemptions are protocol-defined:
+        gRPC Trailers-Only replies, and responses that carry no content by
+        status/method semantics (1xx, 204, 205, 304, and responses to HEAD).
+        Fail-closed diagnostics are fixed strings and never echo body bytes.
       properties:
         json_schema:
           type: object

@@ -92,6 +92,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `body_validator` no longer fails open on unusual methods, empty bodies, or
+  uninspectable data (GHSA-2vmr-ww8r-mww3,
+  <https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-2vmr-ww8r-mww3>).
+  Request-side applicability now follows the configured representation instead
+  of a hard-coded `GET`/`HEAD`/`OPTIONS`/`DELETE` exclusion, so a body-bearing
+  request under a governed media type is buffered and validated on any method.
+  Once a configured rule applies, an empty JSON/XML document, a body that is not
+  valid UTF-8, and a missing buffered representation are rejections (`400`
+  request, `502` response) rather than silent pass-throughs; the request hook
+  reads the raw buffered bytes rather than the shared UTF-8 string copy the
+  proxy deliberately removes for non-UTF-8 bodies. Native gRPC always runs frame
+  validation, so a zero-length transport body or anything shorter than the
+  five-byte frame header is rejected, while a well-formed frame carrying an
+  empty proto3 message is validated normally. Response-side no-body exemptions
+  are now explicit and protocol-correct (`1xx`, `204`, `205`, `304`, `HEAD`
+  responses, and gRPC Trailers-Only replies); an ordinary body-bearing success
+  such as `200` with an empty body is no longer exempt. All fail-closed
+  diagnostics are fixed strings that never log or echo body bytes.
 - Updated the transitive `event-listener` dependency from 5.4.1 to 5.4.2,
   removing the `StackSlot` cross-thread unsoundness reported as
   RUSTSEC-2026-0221.

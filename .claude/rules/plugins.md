@@ -177,6 +177,17 @@ on a native-gRPC request.
 - `PUT /consumers/:id/credentials/:type` replaces the array, `POST` appends one entry, and `DELETE .../:index` removes one entry.
 - Indexable credentials insert all entries into `ConsumerIndex`; secret-based credentials iterate over the array.
 - Body buffering is two-tier: `PluginCache.requires_request/response_body_buffering()` for the upper bound, then per-request `should_buffer_*_body(&RequestContext)`.
+- A body-consuming policy plugin selects on its configured representation, never
+  on the request method, and never degrades to `Continue` for an empty, absent,
+  or non-UTF-8 body once a configured rule applies (`GHSA-2vmr-ww8r-mww3`).
+  `body_validator` is the reference: it reads `ctx.request_body_bytes` (not the
+  UTF-8 `request_body` metadata copy, which the proxy removes for non-UTF-8
+  bytes), treats `ctx.replay_request_body_empty_proven()` as the transport's
+  own empty proof, and fails closed otherwise. Native gRPC always runs
+  `parse_grpc_frame`. The only exemptions are protocol-defined: gRPC
+  Trailers-Only replies, and responses with no content by status/method
+  semantics (1xx, 204, 205, 304, `HEAD`). Fail-closed diagnostics are fixed
+  strings and never echo body bytes.
 - A configured finalized-egress plugin forces buffered request-body
   finalization to complete BEFORE backend dispatch (the `has_finalized_request_egress`
   term in `final_request_body_requirements`), because the ordinary ladder

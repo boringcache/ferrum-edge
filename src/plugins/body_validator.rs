@@ -13,6 +13,14 @@
 //! Response validation runs in `on_final_response_body` (rejects with 502)
 //! and requires response body buffering when configured.
 //!
+//! Applicability is decided by the configured representation, never by the
+//! request method (advisory `GHSA-2vmr-ww8r-mww3`). Once a configured rule
+//! applies, an unusual method, an empty body, an uninspectable (non-UTF-8) body,
+//! or a missing buffered representation is a rejection — never a silent
+//! `Continue`. The only exemptions are the ones the protocol itself defines:
+//! gRPC Trailers-Only replies, and HTTP responses that carry no content by
+//! status/method semantics (1xx, 204, 205, 304, and responses to `HEAD`).
+//!
 //! Every configuration surface is fail-closed: unknown top-level keys, unknown keys
 //! inside a `protobuf_method_messages` entry, malformed schemas, unsupported drafts
 //! or vocabularies, non-local `$ref`s, and schemas outside the compile budgets all
@@ -386,10 +394,12 @@ impl BodyValidator {
             .map(String::as_str)
             .unwrap_or("");
 
-        if body.is_empty() {
-            return PluginResult::Continue;
-        }
-
+        // An empty body is deliberately NOT a skip. Whether "no bytes at all"
+        // satisfies the configured representation is a question only that
+        // representation can answer: an empty JSON/XML document is invalid, and
+        // a zero-length gRPC transport body is not a frame
+        // (`GHSA-2vmr-ww8r-mww3`). The applicability checks below still return
+        // `Continue` for representations this instance does not govern.
         if !is_grpc_content_type(content_type) {
             // Only run the JSON/XML branch when JSON or XML validation is
             // actually configured. A protobuf-only plugin must Continue on
@@ -407,14 +417,6 @@ impl BodyValidator {
                 return PluginResult::Continue;
             }
 
-            let body_str = match std::str::from_utf8(body) {
-                Ok(value) => value,
-                Err(_) => {
-                    debug!("body_validator: request body is not valid UTF-8, skipping validation");
-                    return PluginResult::Continue;
-                }
-            };
-
             // JSON branch matches `before_proxy`: any matching JSON-like body is
             // screened once request validation is active for this content type,
             // even when only XML rules (plus `content_types: ["application/json"]`)
@@ -423,7 +425,24 @@ impl BodyValidator {
             // backend-visible bytes are never checked. `has_json_validation` is
             // consulted only by the early Continue above so protobuf-only configs
             // still never treat arbitrary non-gRPC payloads as JSON.
-            let result = if is_json_like_content_type(content_type) {
+            let validate_as_json = is_json_like_content_type(content_type);
+            let validate_as_xml = !validate_as_json
+                && is_xml_like_content_type(content_type)
+                && self.has_xml_request_validation;
+            if !validate_as_json && !validate_as_xml {
+                // Allowlisted media type that no configured rule can inspect.
+                return PluginResult::Continue;
+            }
+
+            // A body the configured JSON/XML rules cannot even decode is not
+            // evidence that the policy passed. Reject with a fixed diagnostic
+            // that never reproduces any of the offending bytes.
+            let body_str = match std::str::from_utf8(body) {
+                Ok(value) => value,
+                Err(_) => return request_reject(NON_UTF8_REQUEST_BODY),
+            };
+
+            let result = if validate_as_json {
                 Self::validate_json_body(
                     body_str,
                     &self.required_fields,
@@ -431,28 +450,18 @@ impl BodyValidator {
                     Direction::Request,
                     json_scan_memo,
                 )
-            } else if is_xml_like_content_type(content_type) && self.has_xml_request_validation {
+            } else {
                 Self::validate_xml_body(
                     body_str,
                     &self.required_xml_elements,
                     self.xml_max_entities,
                     self.xml_reject_nested_entities,
                 )
-            } else {
-                Ok(())
             };
 
             return match result {
                 Ok(()) => PluginResult::Continue,
-                Err(msg) => PluginResult::Reject {
-                    status_code: 400,
-                    body: serde_json::json!({
-                        "error": "Request body validation failed",
-                        "details": msg
-                    })
-                    .to_string(),
-                    headers: HashMap::new(),
-                },
+                Err(msg) => request_reject(&msg),
             };
         }
 
@@ -2508,6 +2517,69 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Fixed, value-free diagnostic for a request body the configured JSON/XML
+/// rules cannot decode. Hostile bytes are never echoed or logged.
+const NON_UTF8_REQUEST_BODY: &str = "Request body is not valid UTF-8";
+
+/// Response counterpart of [`NON_UTF8_REQUEST_BODY`]. Deliberately coarse so an
+/// upstream body is not described back to the client.
+const NON_UTF8_RESPONSE_BODY: &str = "Response body is not valid UTF-8";
+
+/// Fixed diagnostic for the case where this instance selected request-body
+/// buffering but no buffered representation reached the hook. That is a gateway
+/// inconsistency, not a validated request, so it fails closed.
+const REQUEST_BODY_REPRESENTATION_UNAVAILABLE: &str =
+    "Request body representation was unavailable for validation";
+
+/// Build the client-facing 400 for a request-body validation failure.
+fn request_reject(msg: &str) -> PluginResult {
+    PluginResult::Reject {
+        status_code: 400,
+        body: serde_json::json!({
+            "error": "Request body validation failed",
+            "details": msg
+        })
+        .to_string(),
+        headers: HashMap::new(),
+    }
+}
+
+/// Build the client-facing 502 for a response-body validation failure.
+fn response_reject(msg: &str) -> PluginResult {
+    PluginResult::Reject {
+        status_code: 502,
+        body: serde_json::json!({
+            "error": "Response body validation failed",
+            "details": msg
+        })
+        .to_string(),
+        headers: HashMap::new(),
+    }
+}
+
+/// `true` when HTTP itself says this exchange carries no response content, so an
+/// empty buffered response body is the protocol's answer rather than a missing
+/// representation.
+///
+/// These are the ONLY response-side no-body exemptions. An ordinary
+/// body-bearing success such as `200` is not exempt merely because the backend
+/// returned zero bytes (`GHSA-2vmr-ww8r-mww3`).
+fn response_has_no_content_by_protocol(method: &str, status: u16) -> bool {
+    method.eq_ignore_ascii_case("HEAD")
+        || (100..200).contains(&status)
+        || matches!(status, 204 | 205 | 304)
+}
+
+/// `true` when a gRPC reply is a Trailers-Only response: the complete terminal
+/// metadata rides in the initial HEADERS block and no message frame is sent.
+///
+/// This is the one legitimate empty native-gRPC response body. A reply whose
+/// headers do not already carry `grpc-status` promised a message-bearing
+/// response, so an empty transport body there still fails frame validation.
+fn grpc_response_is_trailers_only(response_headers: &HashMap<String, String>) -> bool {
+    response_headers.contains_key("grpc-status")
+}
+
 /// Helper to build a rejection `PluginResult` for protobuf validation failures.
 fn protobuf_reject(status_code: u16, direction: &str, msg: &str) -> PluginResult {
     debug!(
@@ -2561,10 +2633,29 @@ impl Plugin for BodyValidator {
         self.has_request_validation
     }
 
+    /// The UTF-8 metadata copy is no longer this plugin's request-body view.
+    /// The proxy deliberately removes that copy when the collected bytes are not
+    /// valid UTF-8, which would turn an uninspectable body into "no body" and
+    /// silently skip the policy (`GHSA-2vmr-ww8r-mww3`).
+    fn needs_request_body_bytes(&self) -> bool {
+        self.has_pre_proxy_request_validation
+    }
+
+    fn needs_request_body_text(&self) -> bool {
+        false
+    }
+
+    /// Buffering follows the configured representation, not the request method.
+    ///
+    /// A body-bearing `DELETE`, `PUT`, `PATCH`, `OPTIONS`, `GET`, or any other
+    /// method carrying a governed media type must reach the validator; the old
+    /// `GET`/`HEAD`/`OPTIONS`/`DELETE` exclusion made the policy bypassable by
+    /// method alone (`GHSA-2vmr-ww8r-mww3`). Legitimate protocol semantics are
+    /// preserved because the proxy still never materializes a body the transport
+    /// proved absent, and the hooks validate that proven-empty representation
+    /// directly.
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        if !self.has_request_validation
-            || matches!(ctx.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "DELETE")
-        {
+        if !self.has_request_validation {
             return false;
         }
 
@@ -2574,12 +2665,16 @@ impl Plugin for BodyValidator {
             .map(String::as_str)
             .unwrap_or("");
 
-        // For gRPC protobuf validation, buffer if content-type is application/grpc
-        if self.has_protobuf_request_validation && is_grpc_content_type(content_type) {
-            return true;
+        // Native gRPC is governed only by configured protobuf descriptors.
+        if is_grpc_content_type(content_type) {
+            return self.has_protobuf_request_validation;
         }
 
-        content_type_matches(&self.content_types, content_type)
+        // Everything else is governed only by the configured JSON/XML rules. A
+        // protobuf-only instance must not pull unrelated media types onto the
+        // buffered path: its final hook would no-op on them anyway.
+        self.has_pre_proxy_request_validation
+            && content_type_matches(&self.content_types, content_type)
     }
 
     async fn before_proxy(
@@ -2587,8 +2682,10 @@ impl Plugin for BodyValidator {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Only validate methods that typically have a body
-        if matches!(ctx.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "DELETE") {
+        // Only the configured JSON/XML rules decide here; protobuf validation
+        // runs in `on_final_request_body`. The request method is deliberately
+        // not consulted (`GHSA-2vmr-ww8r-mww3`).
+        if !self.has_pre_proxy_request_validation {
             return PluginResult::Continue;
         }
 
@@ -2603,45 +2700,66 @@ impl Plugin for BodyValidator {
             return PluginResult::Continue;
         }
 
-        let should_validate = content_type_matches(&self.content_types, content_type);
-
-        if !should_validate {
+        if !content_type_matches(&self.content_types, content_type) {
             return PluginResult::Continue;
         }
 
-        // The request body lives in `ctx.metadata`, so the shared duplicate-key
-        // memo is moved out for the duration of the borrow and moved back
-        // before this hook returns. Taking it is not a reset: `JsonScanMemo` is
-        // keyed on body digests, so restoring it preserves every verdict.
+        let validate_as_json = is_json_like_content_type(content_type);
+        let validate_as_xml = !validate_as_json
+            && is_xml_like_content_type(content_type)
+            && self.has_xml_request_validation;
+        if !validate_as_json && !validate_as_xml {
+            // The media type is inside the configured allowlist but no
+            // configured rule can inspect it. Nothing to decide.
+            return PluginResult::Continue;
+        }
+
+        // The body views live on `ctx`, so the shared duplicate-key memo is
+        // moved out for the duration of the borrow and moved back before this
+        // hook returns. Taking it is not a reset: `JsonScanMemo` is keyed on
+        // body digests, so restoring it preserves every verdict.
         let mut json_scan_memo = std::mem::take(&mut ctx.json_scan_memo);
 
-        // Get body from metadata (set by proxy handler if body collection is early)
-        let result = match ctx.metadata.get("request_body") {
-            None => {
-                // No body available — can't validate
-                debug!("body_validator: no request body available for validation");
-                Ok(())
-            }
-            Some(body) if body.is_empty() => Ok(()),
-            // Determine validation type
-            Some(body) if is_json_like_content_type(content_type) => Self::validate_json_body(
-                body,
-                &self.required_fields,
-                self.json_validator.as_ref(),
-                Direction::Request,
-                Some(&mut json_scan_memo),
-            ),
-            Some(body)
-                if is_xml_like_content_type(content_type) && self.has_xml_request_validation =>
-            {
-                Self::validate_xml_body(
-                    body,
+        // Resolve the exact client representation this hook must decide over.
+        //
+        // `ctx.request_body_bytes` is authoritative: this plugin declares
+        // `needs_request_body_bytes()`, so the raw buffer exists for every
+        // request the gateway buffered on its behalf — including bodies that are
+        // not valid UTF-8, for which the proxy removes the shared string copy.
+        // `replay_request_body_empty_proven()` is the transport's own proof that
+        // the client sent nothing at all, which is the one case where the proxy
+        // legitimately materializes no buffer. The UTF-8 metadata copy is a
+        // fixture-only fallback and, when present, is by construction a faithful
+        // representation of a valid-UTF-8 body.
+        const TRANSPORT_PROVEN_EMPTY: &[u8] = &[];
+        let resolved: Option<&[u8]> = if let Some(bytes) = ctx.request_body_bytes.as_deref() {
+            Some(bytes)
+        } else if let Some(text) = ctx.metadata.get("request_body") {
+            Some(text.as_bytes())
+        } else if ctx.replay_request_body_empty_proven() {
+            Some(TRANSPORT_PROVEN_EMPTY)
+        } else {
+            None
+        };
+
+        let result = match resolved {
+            None => Err(REQUEST_BODY_REPRESENTATION_UNAVAILABLE.to_string()),
+            Some(body) => match std::str::from_utf8(body) {
+                Err(_) => Err(NON_UTF8_REQUEST_BODY.to_string()),
+                Ok(body_str) if validate_as_json => Self::validate_json_body(
+                    body_str,
+                    &self.required_fields,
+                    self.json_validator.as_ref(),
+                    Direction::Request,
+                    Some(&mut json_scan_memo),
+                ),
+                Ok(body_str) => Self::validate_xml_body(
+                    body_str,
                     &self.required_xml_elements,
                     self.xml_max_entities,
                     self.xml_reject_nested_entities,
-                )
-            }
-            Some(_) => Ok(()),
+                ),
+            },
         };
 
         ctx.json_scan_memo = json_scan_memo;
@@ -2649,16 +2767,17 @@ impl Plugin for BodyValidator {
         match result {
             Ok(()) => PluginResult::Continue,
             Err(msg) => {
-                debug!("body_validator: request validation failed: {}", msg);
-                PluginResult::Reject {
-                    status_code: 400,
-                    body: serde_json::json!({
-                        "error": "Request body validation failed",
-                        "details": msg
-                    })
-                    .to_string(),
-                    headers: HashMap::new(),
+                if msg == REQUEST_BODY_REPRESENTATION_UNAVAILABLE {
+                    // Fixed-cardinality operator signal: no request value, no
+                    // header value, and no body byte is recorded.
+                    warn!(
+                        plugin = "body_validator",
+                        "Request body representation unavailable; failing closed"
+                    );
+                } else {
+                    debug!("body_validator: request validation failed: {}", msg);
                 }
+                request_reject(&msg)
             }
         }
     }
@@ -2773,11 +2892,18 @@ impl Plugin for BodyValidator {
     async fn on_final_response_body(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
         if !self.has_response_validation {
+            return PluginResult::Continue;
+        }
+
+        // The ONLY no-body exemptions are the ones HTTP itself defines. An
+        // ordinary body-bearing success (200, 201, …) that arrives empty is a
+        // validation failure, not an exemption (`GHSA-2vmr-ww8r-mww3`).
+        if body.is_empty() && response_has_no_content_by_protocol(&ctx.method, response_status) {
             return PluginResult::Continue;
         }
 
@@ -2789,7 +2915,14 @@ impl Plugin for BodyValidator {
 
         // gRPC protobuf response validation
         if is_grpc_content_type(content_type) {
-            if !self.has_protobuf_response_validation || body.is_empty() {
+            if !self.has_protobuf_response_validation {
+                return PluginResult::Continue;
+            }
+            // A Trailers-Only reply carries its complete terminal metadata in
+            // the initial HEADERS block and legitimately sends no message. Any
+            // other empty gRPC body promised a message and still fails frame
+            // validation below.
+            if body.is_empty() && grpc_response_is_trailers_only(response_headers) {
                 return PluginResult::Continue;
             }
             // Resolve the gRPC method path from the request, NOT response headers.
@@ -2818,27 +2951,34 @@ impl Plugin for BodyValidator {
             };
         }
 
-        let should_validate = content_type_matches(&self.response_content_types, content_type);
-
-        if !should_validate {
+        // Mirror of the request side: a protobuf-only instance must not treat an
+        // ordinary HTTP response as a governed JSON/XML representation.
+        if !self.has_json_response_validation() && !self.has_xml_response_validation {
             return PluginResult::Continue;
         }
 
-        if body.is_empty() {
+        if !content_type_matches(&self.response_content_types, content_type) {
             return PluginResult::Continue;
         }
 
-        // Convert body bytes to string for validation
+        let validate_as_json = is_json_like_content_type(content_type);
+        let validate_as_xml = !validate_as_json
+            && is_xml_like_content_type(content_type)
+            && self.has_xml_response_validation;
+        if !validate_as_json && !validate_as_xml {
+            // Allowlisted media type that no configured rule can inspect.
+            return PluginResult::Continue;
+        }
+
+        // Convert body bytes to string for validation. A body the configured
+        // rules cannot decode is not a passing response.
         let body_str = match std::str::from_utf8(body) {
             Ok(s) => s,
-            Err(_) => {
-                debug!("body_validator: response body is not valid UTF-8, skipping validation");
-                return PluginResult::Continue;
-            }
+            Err(_) => return response_reject(NON_UTF8_RESPONSE_BODY),
         };
 
         // Determine validation type
-        let result = if is_json_like_content_type(content_type) {
+        let result = if validate_as_json {
             Self::validate_json_body(
                 body_str,
                 &self.response_required_fields,
@@ -2846,30 +2986,20 @@ impl Plugin for BodyValidator {
                 Direction::Response,
                 Some(&mut ctx.json_scan_memo),
             )
-        } else if is_xml_like_content_type(content_type) && self.has_xml_response_validation {
+        } else {
             Self::validate_xml_body(
                 body_str,
                 &self.response_required_xml_elements,
                 self.xml_max_entities,
                 self.xml_reject_nested_entities,
             )
-        } else {
-            Ok(())
         };
 
         match result {
             Ok(()) => PluginResult::Continue,
             Err(msg) => {
                 debug!("body_validator: response validation failed: {}", msg);
-                PluginResult::Reject {
-                    status_code: 502,
-                    body: serde_json::json!({
-                        "error": "Response body validation failed",
-                        "details": msg
-                    })
-                    .to_string(),
-                    headers: HashMap::new(),
-                }
+                response_reject(&msg)
             }
         }
     }
