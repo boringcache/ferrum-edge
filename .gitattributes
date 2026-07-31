@@ -1,2 +1,4 @@
 # Unified patch context lines intentionally retain their one-byte diff marker.
 *.patch whitespace=-blank-at-eol
+# PROXY v1 corpus entries intentionally use the protocol-mandated CRLF.
+fuzz/corpus/proxy_protocol/v1_tcp4 whitespace=cr-at-eol

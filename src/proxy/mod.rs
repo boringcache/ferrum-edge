@@ -3335,8 +3335,16 @@ pub(crate) fn final_request_body_requirements(
     request_may_need_buffering: bool,
     has_terminal_body_dispatch: bool,
     has_contextual_final_body_hook: bool,
+    // `true` when a finalized-request-egress plugin is configured for a chain
+    // whose dispatch ladder finalizes the body outside `proxy_to_backend`. The
+    // native-gRPC branch runs its own transform/final-hook pass and its own
+    // egress boundary, so callers pass `false` there.
+    has_finalized_request_egress: bool,
 ) -> (bool, bool, bool) {
-    if request_may_need_buffering && (has_terminal_body_dispatch || has_contextual_final_body_hook)
+    if request_may_need_buffering
+        && (has_terminal_body_dispatch
+            || has_contextual_final_body_hook
+            || has_finalized_request_egress)
     {
         let mut requires_buffering = false;
         let mut terminal_dispatch = false;
@@ -3348,6 +3356,12 @@ pub(crate) fn final_request_body_requirements(
                 needs_final_context |= plugin.needs_final_request_body_context();
             }
         }
+        // An egress plugin must observe the exact backend-visible request, and
+        // the ordinary ladder finalizes the body *inside* `proxy_to_backend`
+        // — while the backend request is already being built. Pull the
+        // finalization forward so the egress boundary is reached before any
+        // dispatch (GHSA-4vr5-4wm3-x5xv).
+        terminal_dispatch |= has_finalized_request_egress && requires_buffering;
         (requires_buffering, terminal_dispatch, needs_final_context)
     } else if request_may_need_buffering {
         (
@@ -4456,6 +4470,199 @@ pub(crate) async fn run_final_request_body_hooks_with_provenance(
         }
     }
     crate::plugins::RequestPluginDeadlineResult::Completed(PluginResult::Continue)
+}
+
+/// `TransactionSummary.rejection_phase` for a rejection produced by the
+/// finalized-request-egress phase. `serverless_function` terminate responses and
+/// egress failure policies previously reported `before_proxy`; they now report
+/// the phase that actually produced them.
+pub(crate) const FINALIZED_REQUEST_EGRESS_PHASE: &str = "finalized_request_egress";
+
+/// Select the rejection phase label for a finalization site that can reject
+/// from either the final request-body policy hooks or the egress phase.
+pub(crate) fn finalized_request_rejection_phase(rejected_by_egress: bool) -> &'static str {
+    if rejected_by_egress {
+        FINALIZED_REQUEST_EGRESS_PHASE
+    } else {
+        "on_final_request_body"
+    }
+}
+
+/// Rebase dispatch onto a plugin-selected backend path while preserving the
+/// private override for finalized-egress plugins.
+///
+/// Finalized-egress hooks deliberately receive the client-visible `ctx.path`
+/// for compatibility. Security-sensitive hooks such as `request_mirror` use
+/// `route_override_path` to recover the exact mesh-selected path instead. Do
+/// not consume the override here: doing so makes the primary use the rewrite
+/// while a later mirror silently falls back to the original client path.
+pub(crate) fn rebase_route_override_path(
+    ctx: &mut RequestContext,
+    original_path: String,
+) -> String {
+    let Some(rewritten) = ctx.route_override_path.clone() else {
+        return original_path;
+    };
+    ctx.path.clone_from(&rewritten);
+    rewritten
+}
+
+/// Outcome of the finalized-request-egress phase (GHSA-4vr5-4wm3-x5xv).
+pub(crate) struct FinalizedRequestEgressOutcome {
+    /// `Continue`, or the rejection an egress plugin used to terminate the
+    /// request (the `serverless_function` `terminate` contract).
+    pub result: PluginResult,
+    /// Additive backend request headers published during the phase. Empty for
+    /// every chain except `serverless_function` `pre_proxy`.
+    pub backend_header_overlay: HashMap<String, String>,
+}
+
+impl FinalizedRequestEgressOutcome {
+    fn skipped() -> Self {
+        Self {
+            result: PluginResult::Continue,
+            backend_header_overlay: HashMap::new(),
+        }
+    }
+}
+
+/// Run the finalized-request-egress phase.
+///
+/// This is the ONLY place a built-in plugin is allowed to perform irreversible
+/// outbound request egress. Callers must invoke it after request-body
+/// collection, after `apply_request_body_plugins_with_context`, and after
+/// `run_final_request_body_hooks` has returned `Continue` for the same
+/// `headers`/`body` pair — so the representation an egress plugin transmits is
+/// byte-identical to what the backend would receive, and every applicable final
+/// request-body policy has already accepted it. Backend admission, circuit
+/// breaking, and transport checks still occur later.
+///
+/// A request that finalizes nowhere — nothing required buffering, or it carries
+/// no body at all — has no transform and no final-body hook to run, so its
+/// client representation is already the backend-visible one and the H1/H2 and H3
+/// pre-dispatch boundaries invoke the phase with an empty body instead.
+///
+/// The phase is reachable from several dispatch ladders (H1/H2 terminal
+/// preparation, H1/H2 ordinary preparation, the native-gRPC branch, the H1/H2
+/// pre-dispatch boundary, and the H3 boundary after terminal preparation).
+/// `RequestContext::finalized_request_egress_dispatched` makes the external side
+/// effect exactly-once across all of them, including across retries, which
+/// replay the already-finalized body.
+pub(crate) async fn run_finalized_request_egress_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    // The path the CLIENT requested. Egress hooks keep the documented
+    // client-path request view that the deferred `before_proxy` passes gave
+    // them, rather than the route-override-rewritten backend path; plugins that
+    // need the authorized backend path read `ctx.authorized_backend_path()`.
+    client_request_path: &str,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> FinalizedRequestEgressOutcome {
+    if ctx.finalized_request_egress_dispatched {
+        return FinalizedRequestEgressOutcome::skipped();
+    }
+    if !plugins
+        .iter()
+        .any(|plugin| plugin.dispatches_finalized_request_egress())
+    {
+        return FinalizedRequestEgressOutcome::skipped();
+    }
+    // Claim the phase before the first hook runs: a plugin that terminates the
+    // request must not be re-invoked by a later ladder that also reaches this
+    // boundary.
+    ctx.finalized_request_egress_dispatched = true;
+    let backend_ctx_path = std::mem::replace(&mut ctx.path, client_request_path.to_string());
+    let outcome = run_finalized_request_egress_hooks_inner(plugins, ctx, headers, body).await;
+    ctx.path = backend_ctx_path;
+    outcome
+}
+
+async fn run_finalized_request_egress_hooks_inner(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> FinalizedRequestEgressOutcome {
+    let mut backend_header_overlay = HashMap::new();
+    for plugin in plugins {
+        if !plugin.dispatches_finalized_request_egress() {
+            continue;
+        }
+        let deadline = ctx.grpc_deadline_at();
+        match crate::plugins::await_request_plugin_deadline_with_provenance(
+            deadline,
+            plugin.dispatch_finalized_request_egress(
+                ctx,
+                headers,
+                body,
+                &mut backend_header_overlay,
+            ),
+        )
+        .await
+        .into_plugin_result(ctx)
+        {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                return FinalizedRequestEgressOutcome {
+                    result: reject,
+                    backend_header_overlay,
+                };
+            }
+        }
+    }
+    FinalizedRequestEgressOutcome {
+        result: PluginResult::Continue,
+        backend_header_overlay,
+    }
+}
+
+/// Merge the finalized-request-egress header overlay into the outbound header
+/// map, then restore gateway-owned assertions and re-apply the egress baggage
+/// policy.
+///
+/// The overlay is externally supplied content (a `pre_proxy` function response),
+/// so it is filtered exactly like the deferred `before_proxy` routing-header
+/// pass: it can never impersonate `x-consumer-*` / `x-geo-country`, and it
+/// cannot re-add a baggage key the operator configured Ferrum to strip.
+pub(crate) fn apply_finalized_request_egress_header_overlay(
+    ctx: &mut RequestContext,
+    owned_proxy_headers: &mut Option<HashMap<String, String>>,
+    overlay: HashMap<String, String>,
+    strip_baggage_keys: &[String],
+) {
+    if overlay.is_empty() {
+        return;
+    }
+    let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
+    for (name, value) in overlay {
+        headers.insert(name, value);
+    }
+    refresh_effective_backend_gateway_assertion_headers(ctx, owned_proxy_headers);
+    hbone_proxy::strip_egress_baggage_in_proxy_headers(
+        owned_proxy_headers,
+        &ctx.headers,
+        strip_baggage_keys,
+    );
+}
+
+/// Map-based variant of [`apply_finalized_request_egress_header_overlay`] for
+/// the native HTTP/3 frontend, which owns a plain outbound header map instead of
+/// the H1/H2 `Option<HashMap>` clone-on-write shape.
+pub(crate) fn apply_finalized_request_egress_header_overlay_in_map(
+    ctx: &RequestContext,
+    headers: &mut HashMap<String, String>,
+    overlay: HashMap<String, String>,
+    strip_baggage_keys: &[String],
+) {
+    if overlay.is_empty() {
+        return;
+    }
+    for (name, value) in overlay {
+        headers.insert(name, value);
+    }
+    refresh_backend_gateway_assertion_headers(ctx, headers);
+    crate::modes::mesh::hbone::strip_egress_baggage_in_map(headers, strip_baggage_keys);
 }
 
 pub(crate) struct RejectedResponseParts {
@@ -9861,6 +10068,11 @@ fn is_websocket_transport_managed_response_header(name: &str) -> bool {
 pub(crate) fn strip_websocket_transport_managed_response_header_map(
     response_headers: &mut HashMap<String, String>,
 ) {
+    // Parse and remove Connection-nominated extensions while the Connection
+    // value is still present. Removing the static WebSocket fields first would
+    // erase the only witness that an otherwise ordinary extension is
+    // hop-by-hop and let it cross the successful/reject handshake boundary.
+    headers_mod::strip_client_response_hop_by_hop_headers(response_headers);
     response_headers.retain(|name, _| !is_websocket_transport_managed_response_header(name));
 }
 
@@ -9910,13 +10122,27 @@ fn build_websocket_error_response(
 ) -> Response<ProxyBody> {
     let mut response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    // Strips WebSocket negotiation / hop-by-hop fields *and* any policy-authored
+    // `Content-Length` so the authoritative length below is the only one.
     finalize_websocket_response_headers(
         initial_response_header_policy_plugins,
         &mut response_headers,
     );
-    headers_mod::apply_response_headers(Response::builder().status(status), &response_headers)
-        .body(ProxyBody::from_string(body))
-        .unwrap_or_else(|_| build_websocket_error_fallback_response(status))
+    // A failed handshake is an ordinary HTTP response (RFC 6455 §4.2.2): it keeps
+    // the negotiated HTTP version and an authoritative `Content-Length` derived
+    // from the error body. Only the transport-owned negotiation fields above are
+    // forbidden. Forcing HTTP/1.0 here would make the reject unreadable to RFC
+    // 6455 clients, which require a 1.1-or-newer handshake response.
+    headers_mod::apply_sanitized_response_headers(
+        Response::builder().status(status),
+        &mut response_headers,
+        headers_mod::ClientResponseFraming::ExactBody {
+            status: status.as_u16(),
+            len: body.len() as u64,
+        },
+    )
+    .body(ProxyBody::from_string(body))
+    .unwrap_or_else(|_| build_websocket_error_fallback_response(status))
 }
 
 fn build_websocket_error_fallback_response(status: StatusCode) -> Response<ProxyBody> {
@@ -17162,6 +17388,20 @@ pub(crate) struct NormalizedRejectResponse {
     pub(crate) body: Bytes,
     pub(crate) grpc_status: Option<u32>,
     pub(crate) grpc_message: Option<String>,
+    /// Typed failed-WebSocket handshake boundary. Set from the request-context
+    /// flavor stamp (or an equivalent protocol-owned path), never inferred from
+    /// attacker/plugin-controlled response headers. When true, the response
+    /// builder re-strips transport-owned negotiation fields (and any
+    /// plugin-authored `Content-Length`) before framing repair, so only the
+    /// gateway-derived body length reaches the wire. The response stays a valid
+    /// HTTP/1.1-or-newer non-upgrade response.
+    pub(crate) failed_websocket_handshake: bool,
+    /// Trusted body-omission signal, derived from the request method and the
+    /// final status via the shared synthetic-response wire contract — never from
+    /// response headers. `WireBody` (the default) makes the final body slice
+    /// authoritative, so an ordinary empty reject publishes `Content-Length: 0`
+    /// instead of preserving a plugin-authored length.
+    pub(crate) body_disposition: headers_mod::RejectBodyDisposition,
     /// When non-empty together with a non-empty `body`, these are emitted as
     /// HTTP trailers after the unary DATA frame (serverless native-gRPC
     /// terminate). Ordinary trailers-only rejects leave this empty and keep
@@ -17225,6 +17465,10 @@ fn finalize_synthesized_reject_headers(
             initial_response_header_policy_plugins,
             &mut reject.headers,
         );
+        // Early strip protects intermediate observers; the builder still needs
+        // the typed signal so a later hook cannot reintroduce transport-owned
+        // negotiation fields immediately before the wire response is built.
+        reject.failed_websocket_handshake = true;
     } else {
         finalize_plain_gateway_error_response_headers(
             initial_response_header_policy_plugins,
@@ -17594,6 +17838,8 @@ pub(crate) fn normalize_reject_response_with_provenance(
             body,
             grpc_status: None,
             grpc_message: None,
+            failed_websocket_handshake: false,
+            body_disposition: headers_mod::RejectBodyDisposition::default(),
             grpc_trailers: HashMap::new(),
         };
     }
@@ -17699,6 +17945,10 @@ pub(crate) fn normalize_reject_response_with_provenance(
         body: Bytes::new(),
         grpc_status: Some(grpc_status),
         grpc_message,
+        failed_websocket_handshake: false,
+        // Trailers-only gRPC keeps streaming/trailer semantics through
+        // `grpc_status`; the disposition is unused on that branch.
+        body_disposition: headers_mod::RejectBodyDisposition::default(),
         grpc_trailers: HashMap::new(),
     }
 }
@@ -17779,6 +18029,11 @@ fn build_framed_grpc_unary_reject(
         body,
         grpc_status: Some(grpc_status),
         grpc_message,
+        // A native gRPC framed-unary terminate is never a WebSocket handshake,
+        // and its DATA frame is written under trailers-only gRPC framing, so no
+        // `Content-Length` is derived from the disposition here.
+        failed_websocket_handshake: false,
+        body_disposition: headers_mod::RejectBodyDisposition::default(),
         grpc_trailers: trailers,
     }
 }
@@ -17910,21 +18165,53 @@ pub(crate) async fn normalize_grpc_plugin_rejection_with_after_proxy_hooks(
     normalized
 }
 
-fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Response<ProxyBody> {
+pub(crate) fn build_response_from_normalized_reject(
+    reject: NormalizedRejectResponse,
+) -> Response<ProxyBody> {
     let is_grpc_error = reject.grpc_status.is_some();
-    let builder = headers_mod::apply_response_headers(
-        Response::builder().status(reject.http_status),
-        &reject.headers,
-    );
+    let failed_websocket_handshake = reject.failed_websocket_handshake;
+    let status = reject.http_status.as_u16();
+    let is_framed_unary_reject = framed_unary_reject_parts(&reject).is_some();
+    let mut headers = reject.headers;
+    // A failed WebSocket handshake is still an ordinary HTTP response (RFC 6455
+    // §4.2.2), so it keeps its negotiated HTTP version and an authoritative
+    // body length. What it must never carry is transport-owned negotiation
+    // metadata (`Upgrade`, `Connection`, `Sec-WebSocket-*`) or a plugin-authored
+    // `Content-Length`. Strip those *before* the framing sanitizer so the
+    // derived length below is the only one that can reach the wire.
+    if failed_websocket_handshake {
+        strip_websocket_transport_managed_response_header_map(&mut headers);
+    }
+    // Final protocol-aware boundary after reject after_proxy hooks: strip
+    // hop-by-hop / Connection-listed fields and derive Content-Length from the
+    // synthetic body. Emptiness alone is NOT the discriminator — an ordinary
+    // empty HTTP reject has an authoritative length of exactly zero and must
+    // replace any plugin-authored value. Only the trusted `body_disposition`
+    // signal (HEAD representation length from `prepare_synthetic_response_wire`,
+    // or a no-body status) selects `Head` framing. A native gRPC error is
+    // trailers-only: gRPC never frames with Content-Length, so the field is
+    // removed rather than invented as `0` or preserved from a plugin.
+    let framing = if is_grpc_error {
+        headers_mod::ClientResponseFraming::TrailersOnly
+    } else {
+        headers_mod::ClientResponseFraming::for_final_reject(
+            status,
+            reject.body.len(),
+            reject.body_disposition,
+        )
+    };
+    headers_mod::sanitize_client_response_headers_for_wire(&mut headers, framing);
+    let reject_builder = Response::builder().status(reject.http_status);
+    let builder = headers_mod::apply_response_headers(reject_builder, &headers);
 
-    let body = if framed_unary_reject_parts(&reject).is_some() {
+    let body = if is_framed_unary_reject {
         let trailers = grpc_proxy::buffered_grpc_trailers_to_header_map(&reject.grpc_trailers);
         ProxyBody::buffered_grpc_with_trailers(reject.body, trailers)
     } else if reject.body.is_empty() {
         // Status-aware empty body: 205 must not advertise Content-Length on H1
         // (Hyper would otherwise synthesize `Content-Length: 0` for ordinary
         // empty Full bodies; 204/304 are already special-cased upstream).
-        ProxyBody::empty_for_response_status(reject.http_status.as_u16())
+        ProxyBody::empty_for_response_status(status)
     } else {
         ProxyBody::full(reject.body)
     };
@@ -18083,6 +18370,12 @@ fn finalize_grpc_web_error_response_headers_with_policy_source(
         initial_response_header_policy_source.apply(&mut response.headers);
     }
 
+    // Consume Connection nominations before the fixed managed-field retain
+    // below removes `Connection` itself. Otherwise a policy could leave the
+    // nominated extension behind on this generated-error path even though
+    // ordinary responses run the shared final wire sanitizer.
+    headers_mod::strip_client_response_hop_by_hop_headers(&mut response.headers);
+
     let expose_headers = merge_grpc_web_expose_headers(
         Some(crate::plugins::grpc_web::BASE_EXPOSE_HEADERS_VALUE),
         &response.headers,
@@ -18123,9 +18416,12 @@ fn finalize_grpc_web_error_response_headers_with_policy_source(
             .headers
             .insert("access-control-expose-headers".to_string(), expose_headers);
     }
-    response.headers.insert(
-        "content-length".to_string(),
-        response.body.len().to_string(),
+    headers_mod::sanitize_client_response_headers_for_wire(
+        &mut response.headers,
+        headers_mod::ClientResponseFraming::ExactBody {
+            status: StatusCode::OK.as_u16(),
+            len: response.body.len() as u64,
+        },
     );
 }
 
@@ -18609,7 +18905,13 @@ pub(crate) fn strip_content_length_for_streaming_grpc_deadline(
     grpc_deadline_at: Option<tokio::time::Instant>,
 ) {
     if grpc_deadline_at.is_some() {
-        response_headers.remove("content-length");
+        // Case-insensitive, and load-bearing beyond the wire: ordinary
+        // Streaming framing removes `Content-Length` from the response the
+        // client sees, but the gateway's own declared-length captures
+        // (`preserved_response_content_length`, `content_length_header_value`)
+        // read this map first, and a length the deadline is about to invalidate
+        // must not inform truncation or coalescing decisions either.
+        headers_mod::remove_content_length_header(response_headers);
     }
 }
 
@@ -19051,13 +19353,31 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
         std::sync::atomic::Ordering::Relaxed,
     );
     let status = StatusCode::from_u16(response_status).unwrap_or(status);
-    normalize_reject_response_with_provenance(
+    // `response_body` is moved (not copied) into the normalizer: the reject
+    // payload keeps the shared allocation the synthetic-body hooks produced.
+    // The framed-unary provenance is read from the request context so an
+    // authorized `serverless_function` native-gRPC terminate keeps its DATA
+    // frame and terminal trailers, and every unauthorized body still falls
+    // through to trailers-only.
+    let mut normalized = normalize_reject_response_with_provenance(
         status,
         response_body,
         &headers,
         is_grpc_request,
         FramedGrpcUnaryProvenance::from_context(ctx),
-    )
+    );
+    // Carry the request-context WebSocket boundary into the normalized reject
+    // so the response builder can strip transport-managed fields after
+    // ExactBody length repair. Do not infer this from response header names.
+    normalized.failed_websocket_handshake = ctx.has_websocket_response_boundary();
+    // Carry the same body-omission decision the shared synthetic-response wire
+    // contract just applied inside `apply_reject_after_proxy_and_synthetic_body_hooks`
+    // (same trusted method + final status inputs), so the builder can tell a
+    // HEAD / no-body response apart from an ordinary empty reject without
+    // reading plugin-controlled headers.
+    normalized.body_disposition =
+        headers_mod::RejectBodyDisposition::for_request(&ctx.method, status.as_u16());
+    normalized
 }
 
 /// Finalize a terminal request-body read failure before any external operation
@@ -21647,6 +21967,12 @@ async fn handle_proxy_request_inner(
         .has(crate::plugin_cache::PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH);
     let has_contextual_final_body_hook =
         capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
+    // Native gRPC finalizes and reaches its own egress boundary inside the gRPC
+    // branch, so only the non-gRPC ladder pulls finalization forward for an
+    // egress plugin (GHSA-4vr5-4wm3-x5xv).
+    let has_finalized_request_egress_before_dispatch = !is_grpc_request
+        && capabilities
+            .has(crate::plugin_cache::PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS);
     let (
         initial_requires_request_body_buffering,
         initial_final_body_before_backend_dispatch,
@@ -21657,6 +21983,7 @@ async fn handle_proxy_request_inner(
         request_may_need_buffering,
         has_terminal_body_dispatch,
         has_contextual_final_body_hook,
+        has_finalized_request_egress_before_dispatch,
     );
     let before_proxy_body_requirements = if initial_requires_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY)
@@ -21872,9 +22199,12 @@ async fn handle_proxy_request_inner(
             },
     );
 
-    // before_proxy hooks — only clone headers if at least one plugin modifies them.
-    // When no plugin modifies headers, pass &mut ctx.headers directly to avoid
-    // an expensive per-request HashMap clone on the hot path.
+    // before_proxy hooks — clone headers when the resolved capability set says
+    // a plugin may change backend-visible headers. Most such plugins mutate in
+    // before_proxy; a later overlay publisher may advertise the same capability
+    // conservatively so replay/cache admission sees the mutation ordering.
+    // Otherwise pass &mut ctx.headers directly to avoid an expensive per-request
+    // HashMap clone on the hot path.
     let needs_header_clone = capabilities.has(PluginCapabilities::MODIFIES_REQUEST_HEADERS);
     let mut owned_proxy_headers: Option<HashMap<String, String>> = None;
     if needs_header_clone {
@@ -22020,6 +22350,7 @@ async fn handle_proxy_request_inner(
             request_may_need_buffering,
             has_terminal_body_dispatch,
             has_contextual_final_body_hook,
+            has_finalized_request_egress_before_dispatch,
         );
         std::mem::swap(&mut ctx.headers, transformed_headers);
         requirements
@@ -22149,15 +22480,11 @@ async fn handle_proxy_request_inner(
     // local `path`; the WS / HBONE branches read `ctx.path`, so mirror the
     // override onto `ctx.path` too). The original path was already used for
     // route selection; VS-derived proxies never set `strip_listen_path`, so
-    // the rewritten value is the literal forwarded path. No allocation when no
-    // rewrite is set.
-    let path = match ctx.route_override_path.take() {
-        Some(rewritten) => {
-            ctx.path = rewritten.clone();
-            rewritten
-        }
-        None => path,
-    };
+    // the rewritten value is the literal forwarded path. Preserve the private
+    // override so finalized-egress plugins can recover the selected backend
+    // path while their public `ctx.path` view is temporarily restored to the
+    // client path. No allocation when no rewrite is set.
+    let path = rebase_route_override_path(&mut ctx, path);
 
     // Resolve upstream target and hash key from the request epoch.
     // `ctx.orig_dst` (the captured SO_ORIGINAL_DST on mesh capture listeners)
@@ -22382,9 +22709,36 @@ async fn handle_proxy_request_inner(
         .await);
     }
 
-    // A terminal final-body plugin (currently `ai_federation`) owns its own
-    // external dispatch and returns the complete response. Finalize and invoke
-    // it after inbound transport policy, but before the placeholder route's
+    // Most protocol-classified gRPC requests finalize inside the native gRPC
+    // branch below. Pass-through gRPC-Web on a mesh transport instead rides the
+    // generic HTTP-family path, so classify it before terminal preparation:
+    // when one of its plugins requires the request body, that generic path must
+    // still run transforms, final policy, and finalized-request egress in that
+    // order before any mirror/function/provider can be contacted.
+    let grpc_request_is_web_translated =
+        crate::plugins::grpc_web::request_is_grpc_web_translated(&ctx);
+    let grpc_mesh_fall_through = is_grpc_request
+        && proxy.dispatch_kind.is_http_family()
+        && upstream_target.as_deref().is_some_and(|target| {
+            grpc_proxy::grpc_mesh_dispatch_falls_through(
+                grpc_proxy::classify_grpc_mesh_dispatch(target),
+                request_uses_grpc_content_type,
+                grpc_request_is_web_translated,
+                !requires_request_body_buffering,
+            )
+        });
+    let grpc_uses_native_dispatch =
+        is_grpc_request && proxy.dispatch_kind.is_http_family() && !grpc_mesh_fall_through;
+    let grpc_uses_generic_dispatch = is_grpc_request && !grpc_uses_native_dispatch;
+    let final_body_before_backend_dispatch = final_body_before_backend_dispatch
+        || (grpc_uses_generic_dispatch
+            && requires_request_body_buffering
+            && capabilities.has(PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS));
+
+    // A terminal finalized-egress plugin (currently `ai_federation`) owns its
+    // external dispatch and returns the complete response. Finalize the body,
+    // run every final request-policy hook, and then invoke the later egress
+    // phase after inbound transport policy but before the placeholder route's
     // backend circuit breaker and every backend-only preflight. Besides
     // preventing an unrelated backend policy from suppressing provider calls,
     // returning here keeps synthetic provider outcomes out of backend health,
@@ -22493,7 +22847,7 @@ async fn handle_proxy_request_inner(
                     buffered.body,
                 )
                 .await;
-                let final_body_result = run_final_request_body_hooks(
+                let mut final_body_result = run_final_request_body_hooks(
                     &plugins,
                     body_hook_ctx.as_mut(),
                     grpc_deadline_at,
@@ -22501,7 +22855,6 @@ async fn handle_proxy_request_inner(
                     &transformed,
                 )
                 .await;
-                plugin_execution_ns += terminal_hook_start.elapsed().as_nanos() as u64;
                 if let Some(body_hook_ctx) = body_hook_ctx {
                     let request_body = ctx.metadata.remove("request_body");
                     ctx.metadata = body_hook_ctx.metadata;
@@ -22518,6 +22871,36 @@ async fn handle_proxy_request_inner(
                     ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
                     ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
                 }
+                // Irreversible outbound egress runs here and nowhere earlier:
+                // `transformed` is the backend-visible body and every final
+                // request-policy hook has just accepted it, so no final-body
+                // policy can reject only after a mirror, function, or provider
+                // was contacted (GHSA-4vr5-4wm3-x5xv). Backend admission and
+                // transport checks still occur later. The hook context has
+                // already been written back, so the phase observes the live
+                // request context.
+                let mut rejected_by_egress = false;
+                if matches!(final_body_result, PluginResult::Continue)
+                    && capabilities.has(PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS)
+                {
+                    let egress = run_finalized_request_egress_hooks(
+                        &plugins,
+                        &mut ctx,
+                        &original_request_path,
+                        &hook_headers,
+                        &transformed,
+                    )
+                    .await;
+                    apply_finalized_request_egress_header_overlay(
+                        &mut ctx,
+                        &mut owned_proxy_headers,
+                        egress.backend_header_overlay,
+                        &state.mesh_egress_strip_baggage_keys,
+                    );
+                    rejected_by_egress = !matches!(egress.result, PluginResult::Continue);
+                    final_body_result = egress.result;
+                }
+                plugin_execution_ns += terminal_hook_start.elapsed().as_nanos() as u64;
                 match final_body_result {
                     PluginResult::Continue => {
                         request_body_prepared = true;
@@ -22559,7 +22942,7 @@ async fn handle_proxy_request_inner(
                             &ctx,
                             normalized.http_status.as_u16(),
                             start_time,
-                            "on_final_request_body",
+                            finalized_request_rejection_phase(rejected_by_egress),
                             plugin_execution_ns,
                             Some(&original_request_path),
                         )
@@ -22574,6 +22957,99 @@ async fn handle_proxy_request_inner(
             }
             bodyless => bodyless,
         };
+    }
+
+    // A request that never reaches a body-finalization site has no
+    // `transform_request_body` and no `on_final_request_body` phase, so its
+    // client representation is already the backend-visible one and this is the
+    // finalized-egress boundary for it. Two shapes land here:
+    //
+    // - nothing required buffering at all (WebSocket handshakes, streamed
+    //   requests with no body policy), and
+    // - a request that carries no body whatsoever on a proxy that *does*
+    //   require buffering. `buffer_request_body_for_before_proxy` deliberately
+    //   leaves such a request streaming, so the terminal preparation above falls
+    //   to its `bodyless` arm and runs neither transforms, nor final-body hooks,
+    //   nor an egress boundary of its own. Without this the whole phase would be
+    //   unreachable for, say, a bodyless `GET` on a `request_mirror` proxy
+    //   (`mirror_request_body` defaults to true, which requires buffering).
+    //
+    // A request that did finalize has already dispatched and is excluded by
+    // `finalized_request_egress_dispatched` before the header snapshot is
+    // cloned. A buffering gRPC request that uses generic dispatch (mesh
+    // fall-through or a non-HTTP-family dispatch kind) was pulled through
+    // terminal preparation above; if it carried no body, it deliberately
+    // remained streaming and reaches this empty-body boundary. Only a buffering
+    // request that will enter the native-gRPC branch is left out: that branch
+    // collects the message and reaches the boundary with those exact bytes.
+    if capabilities.has(PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS)
+        && !ctx.finalized_request_egress_dispatched
+        && !(grpc_uses_native_dispatch && requires_request_body_buffering)
+    {
+        let phase_start = Instant::now();
+        let egress_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
+        let egress = run_finalized_request_egress_hooks(
+            &plugins,
+            &mut ctx,
+            &original_request_path,
+            &egress_headers,
+            &[],
+        )
+        .await;
+        apply_finalized_request_egress_header_overlay(
+            &mut ctx,
+            &mut owned_proxy_headers,
+            egress.backend_header_overlay,
+            &state.mesh_egress_strip_baggage_keys,
+        );
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        match egress.result {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                    record_request(&state, 500);
+                    return Ok(build_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"Internal error"}"#,
+                    ));
+                };
+                let status = StatusCode::from_u16(reject.status_code)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let normalized = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    &plugins,
+                    &mut ctx,
+                    status,
+                    reject.body.clone(),
+                    reject.headers,
+                    is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
+                )
+                .await;
+                apply_grpc_reject_metadata(&mut ctx, &normalized);
+                let grpc_web_response = build_grpc_web_reject_response(
+                    &plugins,
+                    &mut ctx,
+                    grpc_web_response_content_type,
+                    &normalized,
+                )
+                .await;
+                log_rejected_request_with_path(
+                    &plugins,
+                    &ctx,
+                    normalized.http_status.as_u16(),
+                    start_time,
+                    FINALIZED_REQUEST_EGRESS_PHASE,
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                )
+                .await;
+                record_request(&state, normalized.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Ok(response);
+                }
+                return Ok(build_response_from_normalized_reject(normalized));
+            }
+        }
     }
 
     let upstream_balancer = selection.balancer;
@@ -22807,7 +23283,7 @@ async fn handle_proxy_request_inner(
                     buffered.body,
                 )
                 .await;
-                let final_body_result = run_final_request_body_hooks(
+                let mut final_body_result = run_final_request_body_hooks(
                     &plugins,
                     body_hook_ctx.as_mut(),
                     grpc_deadline_at,
@@ -22834,6 +23310,30 @@ async fn handle_proxy_request_inner(
                     // maps back, every semantic miss would silently store as exact-only.
                     ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
                     ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
+                }
+                // Finalized-request-egress boundary (GHSA-4vr5-4wm3-x5xv): the
+                // backend-visible body has been transformed and accepted by every
+                // final request-policy hook.
+                let mut rejected_by_egress = false;
+                if matches!(final_body_result, PluginResult::Continue)
+                    && capabilities.has(PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS)
+                {
+                    let egress = run_finalized_request_egress_hooks(
+                        &plugins,
+                        &mut ctx,
+                        &original_request_path,
+                        &hook_headers,
+                        &transformed,
+                    )
+                    .await;
+                    apply_finalized_request_egress_header_overlay(
+                        &mut ctx,
+                        &mut owned_proxy_headers,
+                        egress.backend_header_overlay,
+                        &state.mesh_egress_strip_baggage_keys,
+                    );
+                    rejected_by_egress = !matches!(egress.result, PluginResult::Continue);
+                    final_body_result = egress.result;
                 }
                 match final_body_result {
                     PluginResult::Continue => {
@@ -22882,7 +23382,7 @@ async fn handle_proxy_request_inner(
                             &ctx,
                             normalized.http_status.as_u16(),
                             start_time,
-                            "on_final_request_body",
+                            finalized_request_rejection_phase(rejected_by_egress),
                             plugin_execution_ns,
                             Some(&original_request_path),
                         )
@@ -23042,19 +23542,7 @@ async fn handle_proxy_request_inner(
     //     gRPC-Web, but text-mode translated gRPC-Web remains fail-closed here
     //     because it requires request-body buffering and the generic mesh-mTLS
     //     path does not accept pre-buffered request bodies.
-    let grpc_request_is_web_translated =
-        crate::plugins::grpc_web::request_is_grpc_web_translated(&ctx);
-    let grpc_mesh_fall_through = is_grpc_request
-        && proxy.dispatch_kind.is_http_family()
-        && upstream_target.as_deref().is_some_and(|target| {
-            grpc_proxy::grpc_mesh_dispatch_falls_through(
-                grpc_proxy::classify_grpc_mesh_dispatch(target),
-                request_uses_grpc_content_type,
-                grpc_request_is_web_translated,
-                !requires_request_body_buffering,
-            )
-        });
-    if is_grpc_request && proxy.dispatch_kind.is_http_family() && !grpc_mesh_fall_through {
+    if grpc_uses_native_dispatch {
         {
             let grpc_proxy_headers = owned_proxy_headers.as_mut().unwrap_or(&mut ctx.headers);
             apply_effective_backend_scheme_headers(
@@ -23064,7 +23552,9 @@ async fn handle_proxy_request_inner(
                 state.add_forwarded_header,
             );
         }
-        let owned_proxy_headers_ref = owned_proxy_headers.as_ref();
+        // `owned_proxy_headers` is read back through `as_ref()` at each use rather
+        // than held in a long-lived borrow: the finalized-request-egress phase below
+        // needs `&mut ctx` and may publish backend header overlay entries.
 
         // FAIL CLOSED on a gRPC request routed to a mesh-tagged target this
         // branch cannot dispatch over its secured transport (issue #2003):
@@ -23441,7 +23931,7 @@ async fn handle_proxy_request_inner(
             );
 
             // Transform request body via plugins (e.g., gRPC-Web base64 decoding)
-            let mut hook_headers = owned_proxy_headers_ref.unwrap_or(&ctx.headers).clone();
+            let mut hook_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
             hook_headers
                 .entry(":path".to_string())
                 .or_insert_with(|| path.clone());
@@ -23459,7 +23949,7 @@ async fn handle_proxy_request_inner(
 
             // Run on_final_request_body hooks (e.g., protobuf validation)
             let mut body_hook_ctx = deferred_body_hook_ctx.take();
-            let final_body_result = run_final_request_body_hooks(
+            let mut final_body_result = run_final_request_body_hooks(
                 &plugins,
                 body_hook_ctx.as_mut(),
                 grpc_deadline_at,
@@ -23489,6 +23979,36 @@ async fn handle_proxy_request_inner(
                 // maps back, every semantic miss would silently store as exact-only.
                 ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
                 ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
+            }
+            // Finalized-request-egress boundary for native gRPC
+            // (GHSA-4vr5-4wm3-x5xv). `grpc_req_body` is the transformed,
+            // backend-visible message and every final request-policy hook has
+            // accepted it. `hook_headers` carries the synthetic `:path` used by
+            // the body hooks, so the immutable snapshot handed to the phase is
+            // the outbound header map instead.
+            let mut rejected_by_egress = false;
+            if matches!(final_body_result, PluginResult::Continue)
+                && capabilities.has(PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS)
+            {
+                let egress_start = Instant::now();
+                let egress_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
+                let egress = run_finalized_request_egress_hooks(
+                    &plugins,
+                    &mut ctx,
+                    &original_request_path,
+                    &egress_headers,
+                    &grpc_req_body,
+                )
+                .await;
+                apply_finalized_request_egress_header_overlay(
+                    &mut ctx,
+                    &mut owned_proxy_headers,
+                    egress.backend_header_overlay,
+                    &state.mesh_egress_strip_baggage_keys,
+                );
+                plugin_execution_ns += egress_start.elapsed().as_nanos() as u64;
+                rejected_by_egress = !matches!(egress.result, PluginResult::Continue);
+                final_body_result = egress.result;
             }
             match final_body_result {
                 PluginResult::Continue => {}
@@ -23521,6 +24041,16 @@ async fn handle_proxy_request_inner(
                         &mut ctx,
                         grpc_web_response_content_type,
                         &normalized,
+                    )
+                    .await;
+                    log_rejected_request_with_path(
+                        &plugins,
+                        &ctx,
+                        normalized.http_status.as_u16(),
+                        start_time,
+                        finalized_request_rejection_phase(rejected_by_egress),
+                        plugin_execution_ns,
+                        Some(&original_request_path),
                     )
                     .await;
                     record_request(&state, normalized.http_status.as_u16());
@@ -23599,7 +24129,7 @@ async fn handle_proxy_request_inner(
                 &grpc_backend_url,
                 &state.grpc_pool,
                 &state.dns_cache,
-                owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                 grpc_should_stream,
                 effective_max_response_body_size_bytes,
                 ctx.grpc_deadline_at(),
@@ -23685,7 +24215,7 @@ async fn handle_proxy_request_inner(
                             let post_header_upload_timeout_ms =
                                 grpc_proxy::streaming_post_header_upload_timeout_ms_after_proxy_headers(
                                     request.headers(),
-                                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                                    owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                                     proxy.as_ref(),
                                 );
                             let recorder = Arc::new(GrpcStreamingProbeRecorder::new(
@@ -23751,7 +24281,7 @@ async fn handle_proxy_request_inner(
                     &grpc_backend_url,
                     &state.grpc_pool,
                     &state.dns_cache,
-                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                    owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                     effective_max_grpc_recv_size_bytes,
                     body_size_exceeded,
                     upload_observer,
@@ -23854,7 +24384,7 @@ async fn handle_proxy_request_inner(
                             &grpc_backend_url,
                             &state.grpc_pool,
                             &state.dns_cache,
-                            owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                            owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                             grpc_should_stream,
                             effective_max_response_body_size_bytes,
                             ctx.grpc_deadline_at(),
@@ -23959,7 +24489,7 @@ async fn handle_proxy_request_inner(
                         prev_target,
                         hash_key,
                         &ctx.client_ip,
-                        owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                     ) {
                     if !retry_target_preserves_backend_path(
                         backend_path_is_policy_bound,
@@ -24310,7 +24840,7 @@ async fn handle_proxy_request_inner(
                     &grpc_backend_url,
                     &state.grpc_pool,
                     &state.dns_cache,
-                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                    owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                     grpc_should_stream,
                     effective_max_response_body_size_bytes,
                     ctx.grpc_deadline_at(),
@@ -24854,12 +25384,30 @@ async fn handle_proxy_request_inner(
                     });
                 if grpc_web_streaming_content_type.is_some() {
                     // Incremental translation changes the representation size
-                    // and carries terminal metadata in a final DATA frame.
-                    response_headers.remove("content-length");
+                    // and carries terminal metadata in a final DATA frame, so
+                    // the backend length describes nothing that will be written.
+                    // Defense in depth: the Streaming boundary below removes
+                    // every case variant anyway.
+                    headers_mod::remove_content_length_header(&mut response_headers);
                 }
-                let cl = response_headers
-                    .get("content-length")
-                    .and_then(|v| v.parse::<u64>().ok());
+                // Native gRPC never frames with `Content-Length`, and the wire
+                // boundary below removes the field. Hyper reconstructs
+                // `Content-Length` from an exact `Body::size_hint()` when the
+                // header is absent, so the streaming body must not advertise a
+                // declared length either — otherwise the H2 writer would undo
+                // the strip.
+                let advertised_content_length: Option<u64> = None;
+
+                // Final protocol-aware boundary before the H2 gRPC streaming
+                // builder. Trailer frames are filtered separately by
+                // StripHopByHopTrailers.
+                // Native gRPC streaming: no HEAD exists on this dispatch and
+                // gRPC never frames with Content-Length, so ordinary Streaming
+                // framing (which removes it outright) is the whole contract.
+                headers_mod::sanitize_client_response_headers_for_wire(
+                    &mut response_headers,
+                    headers_mod::ClientResponseFraming::Streaming,
+                );
 
                 // Build the response with the live Incoming body — hyper will forward
                 // DATA frames and TRAILERS to the downstream client as they arrive.
@@ -24928,7 +25476,7 @@ async fn handle_proxy_request_inner(
                 {
                     crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
-                        cl,
+                        advertised_content_length,
                         grpc_read_timeout_ms,
                         grpc_total_deadline,
                         grpc_streaming_trailer_governor.take(),
@@ -24937,7 +25485,7 @@ async fn handle_proxy_request_inner(
                     crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
                         effective_max_response_body_size_bytes,
-                        cl,
+                        advertised_content_length,
                         state.h2_coalesce_target_bytes,
                         grpc_read_timeout_ms,
                         grpc_total_deadline,
@@ -24946,7 +25494,7 @@ async fn handle_proxy_request_inner(
                 } else {
                     crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
-                        cl,
+                        advertised_content_length,
                         state.h2_coalesce_target_bytes,
                         grpc_read_timeout_ms,
                         grpc_total_deadline,
@@ -25755,6 +26303,36 @@ async fn handle_proxy_request_inner(
 
                 // Build gRPC response with headers and trailers (splitting any
                 // newline-joined Set-Cookie into separate header lines).
+                //
+                // This path is fully buffered: `response_body` below IS the wire
+                // body, so framing is derived from it rather than from which
+                // plugin phase produced the response. An `after_proxy` reject is
+                // not the only way a plugin's header map reaches this builder —
+                // an `on_response_body` or `on_final_response_body` reject also
+                // replaces `response_headers` with `normalize_reject_response`
+                // output, which copies every plugin-supplied field except
+                // content-type / grpc-status / grpc-message. Keying on
+                // `after_proxy_rejected` therefore left those two arms on
+                // buffered framing that would publish a length for a
+                // trailers-only gRPC response carrying no DATA frames at all.
+                //
+                //   - empty body: no DATA frames (native trailers-only, or a
+                //     plugin-replaced gRPC error). gRPC never frames with
+                //     Content-Length, so remove it outright — never invent `0`,
+                //     never keep a plugin-authored length.
+                //   - non-empty body: the buffered representation is
+                //     authoritative, so publish its exact length. Every rewrite
+                //     site already resyncs `content-length` to the new body, so
+                //     this agrees with them and overrides them only when they
+                //     have drifted.
+                let grpc_framing = headers_mod::ClientResponseFraming::for_buffered_grpc(
+                    response_status,
+                    response_body.len(),
+                );
+                headers_mod::sanitize_client_response_headers_for_wire(
+                    &mut response_headers,
+                    grpc_framing,
+                );
                 let resp_builder = headers_mod::apply_response_headers(
                     Response::builder()
                         .status(StatusCode::from_u16(response_status).unwrap_or(StatusCode::OK)),
@@ -27607,8 +28185,18 @@ async fn handle_proxy_request_inner(
         None
     };
     if response_inspector.is_some() {
-        response_headers.remove("content-length");
+        // Inspector transforms the body, so the backend's declared length no
+        // longer describes anything. Omit case-insensitively BEFORE the
+        // `preserved_response_content_length` capture below: Streaming framing
+        // already removes the wire field, but the H3 graceful-close
+        // completeness gate would otherwise judge the transformed body against
+        // the untransformed length.
+        headers_mod::remove_content_length_header(&mut response_headers);
     }
+    // Capture this before `method` is moved into the optional transaction
+    // summary below. Response framing still needs the request-method semantic,
+    // but the hot path does not need to clone the method string.
+    let is_head = method.eq_ignore_ascii_case("HEAD");
     let needs_transaction_summary =
         !plugins.is_empty() || body_will_stream || backend_error_class.is_some();
     let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =
@@ -27719,7 +28307,11 @@ async fn handle_proxy_request_inner(
             already_ended,
             pristine_streaming_grpc_web_terminal_names.as_ref(),
         );
-        response_headers.remove("content-length");
+        // Omit case-insensitively before the declared-length capture below:
+        // gRPC-Web translation reframes the body, so the backend length must
+        // not reach the wire (Streaming framing removes it) nor the gateway's
+        // own truncation/coalescing decisions.
+        headers_mod::remove_content_length_header(&mut response_headers);
         Some((content_type.to_string(), terminal))
     } else {
         None
@@ -27729,9 +28321,58 @@ async fn handle_proxy_request_inner(
     let mut resp_builder = Response::builder()
         .status(StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY));
 
-    // Apply backend/plugin response headers, splitting newline-joined Set-Cookie
-    // into separate header lines (RFC 6265).
-    resp_builder = headers_mod::apply_response_headers(resp_builder, &response_headers);
+    // Final protocol-aware response-header boundary after every mutable hook
+    // and before the H1/H2 builder: strip hop-by-hop / Connection-listed fields
+    // and derive or repair Content-Length from the actual body/status/method.
+    // Gateway-owned Connection: close (drain/overload) is applied below.
+    // The arms below apply the same rules as
+    // `ClientResponseFraming::for_buffered_response` /
+    // `for_streaming_response`, spelled out here because `method` has already
+    // moved into the transaction summary and only the precomputed `is_head`
+    // flag remains. Keep the three buffered writers (this one, native H3, and
+    // the H3 bridge) in agreement.
+    //
+    // Streaming bodies capture their declared length for internal accounting
+    // FIRST: ordinary Streaming framing removes `Content-Length` from the wire
+    // map (a hook-authored value cannot be verified against bytes not yet
+    // written), while the H3 graceful-close classifier and the direct-H2
+    // large-response coalescer bypass still need the length the boundary would
+    // have accepted.
+    let declared_streaming_content_length =
+        headers_mod::preserved_response_content_length(&response_headers, response_status);
+    // What the WIRE may advertise, as opposed to what the gateway keeps for its
+    // own accounting. Hyper reconstructs `Content-Length` from an exact
+    // `Body::size_hint()` whenever the header is absent (the same mechanism
+    // `EmptyUnknownLengthBody` exists to defeat on 205), so stripping the header
+    // alone would leave a hook-authored length reaching H1/H2 clients through
+    // the streaming body's hint. Only `Head` framing may advertise one, and
+    // there it matches the representation length the boundary preserved.
+    let advertised_streaming_content_length = if is_head {
+        declared_streaming_content_length
+    } else {
+        None
+    };
+    let framing = if is_head {
+        // HEAD keeps a valid backend representation length whether the body was
+        // buffered or streamed: the wire body is empty by protocol, so the field
+        // cannot contradict the bytes sent. Do not invent Content-Length: 0 from
+        // the empty wire body either.
+        headers_mod::ClientResponseFraming::Head {
+            status: response_status,
+        }
+    } else {
+        match &response_body {
+            ResponseBody::Buffered(data) => headers_mod::ClientResponseFraming::ExactBody {
+                status: response_status,
+                len: data.len() as u64,
+            },
+            ResponseBody::Streaming { .. }
+            | ResponseBody::StreamingH2(_)
+            | ResponseBody::StreamingH3(_) => headers_mod::ClientResponseFraming::Streaming,
+        }
+    };
+    resp_builder =
+        headers_mod::apply_sanitized_response_headers(resp_builder, &mut response_headers, framing);
 
     // Add gateway error categorization headers so clients and ops teams
     // can distinguish different failure modes:
@@ -27922,9 +28563,12 @@ async fn handle_proxy_request_inner(
                 }
                 inspected
             } else {
-                let cl = response_headers
-                    .get("content-length")
-                    .and_then(|v| v.parse::<u64>().ok());
+                // `cl` drives the gateway's own construction choices only;
+                // `advertised_cl` is what the body may report as an exact size
+                // hint, and hence what hyper may turn back into a wire
+                // `Content-Length`.
+                let cl = declared_streaming_content_length;
+                let advertised_cl = advertised_streaming_content_length;
                 // Build the base body from the shared protocol-agnostic builders
                 // first, THEN optionally wrap it in latency tracking via
                 // `into_tracked`. This guarantees the tracked path inherits the
@@ -27938,17 +28582,17 @@ async fn handle_proxy_request_inner(
                 let base = if state.response_buffer_cutoff_bytes == 0
                     && effective_max_response_body_size_bytes == 0
                 {
-                    crate::proxy::body::direct_streaming_body(response, cl)
+                    crate::proxy::body::direct_streaming_body(response, advertised_cl)
                 } else if effective_max_response_body_size_bytes > 0 && cl.is_none() {
                     // No Content-Length — enforce size limit while streaming instead
                     // of buffering the entire body into memory.
                     crate::proxy::body::size_limited_streaming_body(
                         response,
                         effective_max_response_body_size_bytes,
-                        cl,
+                        advertised_cl,
                     )
                 } else {
-                    crate::proxy::body::coalescing_body(response, cl)
+                    crate::proxy::body::coalescing_body(response, advertised_cl)
                 };
                 let base = if let Some(guard) = reqwest_backend_guard {
                     base.with_reqwest_backend_guard(guard)
@@ -28016,9 +28660,12 @@ async fn handle_proxy_request_inner(
             }
         }
         ResponseBody::StreamingH2(resp) => {
-            let cl = response_headers
-                .get("content-length")
-                .and_then(|v| v.parse::<u64>().ok());
+            // `cl` is the gateway's internal size decision input (the
+            // large-response coalescer bypass); `advertised_cl` is the only one
+            // the body may expose as an exact size hint, which hyper would
+            // otherwise re-emit as a wire `Content-Length`.
+            let cl = declared_streaming_content_length;
+            let advertised_cl = advertised_streaming_content_length;
             // Plain-HTTPS direct-H2 large-response fast path.
             //
             // The backend's H2 writer already emits `http2_max_frame_size`
@@ -28072,7 +28719,7 @@ async fn handle_proxy_request_inner(
             {
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
-                    cl,
+                    advertised_cl,
                     h2_read_timeout_ms,
                     None,
                     streaming_trailer_governor.take(),
@@ -28084,7 +28731,7 @@ async fn handle_proxy_request_inner(
                 crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     effective_max_response_body_size_bytes,
-                    cl,
+                    advertised_cl,
                     state.h2_coalesce_target_bytes,
                     h2_read_timeout_ms,
                     None,
@@ -28098,7 +28745,7 @@ async fn handle_proxy_request_inner(
                 // bypass kicks in at body.rs:~1184.
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
-                    cl,
+                    advertised_cl,
                     h2_read_timeout_ms,
                     None,
                     streaming_trailer_governor.take(),
@@ -28106,7 +28753,7 @@ async fn handle_proxy_request_inner(
             } else {
                 crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
-                    cl,
+                    advertised_cl,
                     state.h2_coalesce_target_bytes,
                     h2_read_timeout_ms,
                     None,
@@ -28205,9 +28852,13 @@ async fn handle_proxy_request_inner(
             body
         }
         ResponseBody::StreamingH3(h3_resp) => {
-            let client_content_length = response_headers
-                .get("content-length")
-                .and_then(|v| v.parse::<u64>().ok());
+            // The length describing the CLIENT-facing representation (as
+            // opposed to `backend_content_length`, the backend's own
+            // pre-transform declaration). Captured before the final wire
+            // boundary removed the field: it is no longer advertised to the
+            // client, but the graceful-close success gate must still distinguish
+            // a complete body from a truncated one.
+            let client_content_length = declared_streaming_content_length;
             let success_on_drop_after_bytes =
                 h3_success_on_drop_after_response_bytes(inbound_version, client_content_length);
             let backend_content_length = streaming_h3_backend_content_length;
@@ -28239,6 +28890,7 @@ async fn handle_proxy_request_inner(
                     h3_method,
                     response_status,
                     backend_content_length,
+                    advertised_streaming_content_length,
                     h3_read_timeout_ms,
                     streaming_trailer_governor.take(),
                 )
@@ -28249,6 +28901,7 @@ async fn handle_proxy_request_inner(
                     h3_method,
                     response_status,
                     backend_content_length,
+                    advertised_streaming_content_length,
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
@@ -28261,6 +28914,7 @@ async fn handle_proxy_request_inner(
                     h3_method,
                     response_status,
                     backend_content_length,
+                    advertised_streaming_content_length,
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
@@ -36861,6 +37515,26 @@ async fn proxy_to_backend_http3_retry(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn route_rebase_preserves_rewrite_for_finalized_egress() {
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/shadow/ping".to_string(),
+        );
+        ctx.route_override_path = Some("/internal/ping".to_string());
+
+        let backend_path = super::rebase_route_override_path(&mut ctx, "/shadow/ping".to_string());
+
+        assert_eq!(backend_path, "/internal/ping");
+        assert_eq!(ctx.path, "/internal/ping");
+        assert_eq!(
+            ctx.route_override_path.as_deref(),
+            Some("/internal/ping"),
+            "the finalized-egress phase still needs the mesh-selected path"
+        );
+    }
+
+    #[test]
     fn request_signature_authority_normalization_preserves_identity() {
         assert_eq!(
             super::normalize_request_authority_for_signing("EXAMPLE.COM:80", Some("http")),
@@ -38966,9 +39640,15 @@ mod tests {
         let request_body_bytes = serde_json::to_vec(&request_body).unwrap();
         let mut ctx = request_ctx_with_ai_body(request_body);
         let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-        let synthetic = plugins[0]
-            .on_final_request_body_with_context(&mut ctx, &headers, &request_body_bytes)
-            .await;
+        let synthetic = run_finalized_request_egress_hooks(
+            &plugins,
+            &mut ctx,
+            "/v1/chat/completions",
+            &headers,
+            &request_body_bytes,
+        )
+        .await
+        .result;
 
         let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
 
