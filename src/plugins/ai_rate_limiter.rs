@@ -1130,6 +1130,41 @@ impl AiRateLimiter {
     }
 }
 
+/// Top-level output-cap field spellings read by [`requested_completion_tokens`]
+/// and excluded from the prompt walk only at the JSON root object.
+const TOP_LEVEL_TOKEN_CAP_FIELDS: &[&str] = &[
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "max_tokens_to_sample",
+    "max_new_tokens",
+    "maxOutputTokens",
+    "maxTokens",
+];
+
+/// Named provider containers whose immediate numeric child is an output cap.
+/// Only the root-level `(container, field)` pairs listed here match
+/// [`requested_completion_tokens`]; the same spellings deeper in tool schemas
+/// or content are billed prompt material.
+const NESTED_TOKEN_CAP_FIELDS: &[(&str, &str)] = &[
+    ("generationConfig", "maxOutputTokens"),
+    ("generation_config", "max_output_tokens"),
+    ("inferenceConfig", "maxTokens"),
+    ("inference_config", "max_tokens"),
+    ("textGenerationConfig", "maxTokenCount"),
+    ("parameters", "max_new_tokens"),
+];
+
+fn is_top_level_token_cap_field(key: &str) -> bool {
+    TOP_LEVEL_TOKEN_CAP_FIELDS.contains(&key)
+}
+
+fn nested_token_cap_field_for_container(container: &str) -> Option<&'static str> {
+    NESTED_TOKEN_CAP_FIELDS
+        .iter()
+        .find_map(|(name, field)| (*name == container).then_some(*field))
+}
+
 /// Output-token cap requested by the client, across OpenAI and provider-native
 /// request shapes. Sizes the `completion_tokens` portion of the pre-dispatch
 /// reservation. Returns the max across every recognized field (only one is
@@ -1145,37 +1180,24 @@ impl AiRateLimiter {
 /// Bedrock, or Titan request reserves 0 in `completion_tokens` mode, so a burst of
 /// capped completions can oversubscribe the budget until post-response
 /// reconciliation. Mirrors the token-field coverage in `ai_request_guard`.
+/// Field lists are shared with prompt-walk exclusion via
+/// [`TOP_LEVEL_TOKEN_CAP_FIELDS`] / [`NESTED_TOKEN_CAP_FIELDS`].
 fn requested_completion_tokens(json: &Value) -> u64 {
-    let top_level = [
-        "max_tokens",
-        "max_completion_tokens",
-        "max_output_tokens",
-        "max_tokens_to_sample",
-        "max_new_tokens",
-        "maxOutputTokens",
-        "maxTokens",
-    ]
-    .iter()
-    .filter_map(|field| json.get(*field).and_then(Value::as_u64))
-    .max()
-    .unwrap_or(0);
+    let top_level = TOP_LEVEL_TOKEN_CAP_FIELDS
+        .iter()
+        .filter_map(|field| json.get(*field).and_then(Value::as_u64))
+        .max()
+        .unwrap_or(0);
 
-    let nested = [
-        ("generationConfig", "maxOutputTokens"),
-        ("generation_config", "max_output_tokens"),
-        ("inferenceConfig", "maxTokens"),
-        ("inference_config", "max_tokens"),
-        ("textGenerationConfig", "maxTokenCount"),
-        ("parameters", "max_new_tokens"),
-    ]
-    .iter()
-    .filter_map(|(container, field)| {
-        json.get(*container)
-            .and_then(|nested| nested.get(*field))
-            .and_then(Value::as_u64)
-    })
-    .max()
-    .unwrap_or(0);
+    let nested = NESTED_TOKEN_CAP_FIELDS
+        .iter()
+        .filter_map(|(container, field)| {
+            json.get(*container)
+                .and_then(|nested| nested.get(*field))
+                .and_then(Value::as_u64)
+        })
+        .max()
+        .unwrap_or(0);
 
     top_level.max(nested)
 }
@@ -1281,121 +1303,103 @@ fn estimate_prompt_tokens(json: &Value) -> u64 {
 /// suppresses an unknown sibling, and distinct alias keys over-reserve rather
 /// than omit.
 ///
-/// Exclusions are **shape/value aware**, not name-only: numeric provider
-/// token-cap controls, structurally recognized multimodal binary payloads
-/// (OpenAI image/audio/file parts, Gemini inline data, well-formed `data:` URLs,
-/// Anthropic `source` with `type` `base64`/`url`/`file`), and member names inside
-/// those skipped subtrees stay excluded. A coincidental schema property named
-/// `max_tokens`, `image_url`, `source`, etc. whose value is not a recognized
-/// control/binary shape is counted fail-closed (name + billed descendants).
+/// Exclusions are **path/context aware**, not name- or shape-only at arbitrary
+/// depth:
+/// - Numeric output caps are excluded only at the exact paths read by
+///   [`requested_completion_tokens`] (root-level cap fields and the documented
+///   named provider containers). Nested schema/content numbers with the same
+///   spelling count fail-closed.
+/// - Multimodal binary URL/base64/file payloads are excluded only as **leaves**
+///   inside a recognized message content-block structure (OpenAI
+///   `messages`/`input` content parts, Gemini `contents` parts, Anthropic
+///   content-block `source`). Member names and every unrelated textual sibling
+///   still count. Ordinary strings — including well-formed `data:` URLs in
+///   `instructions`, `input`, schemas, or unknown fields — always count.
+/// - Unknown, malformed, or collision-shaped objects outside those contexts
+///   count fail-closed.
+///
 /// This is a conservative chars/4 estimate, not provider tokenizer parity.
 ///
-/// The hot path is allocation-light: no cloning, locks, or per-request key sets;
-/// recursion follows the `Value` tree the caller already parsed (bounded by the
-/// gateway's request-body limits). Non-integer JSON numbers may format once via
-/// `Number::to_string` (bounded by the already-parsed token).
+/// The hot path is allocation-light: recursion carries a `Copy` context enum
+/// (no per-request path vectors, maps, or locks) and follows the `Value` tree
+/// the caller already parsed (bounded by the gateway's request-body limits).
+/// Non-integer JSON numbers may format once via `Number::to_string` (bounded by
+/// the already-parsed token).
 fn prompt_character_count(json: &Value) -> u64 {
-    prompt_json_character_count(json)
+    prompt_json_character_count(json, PromptWalkCtx::root())
 }
 
-/// Object keys whose values *may* carry binary/non-text payloads (base64 image,
-/// audio, file, or document bytes) in the common multimodal request shapes.
-/// Counting those bytes as prompt characters wildly inflates the estimate — a
-/// 1 MB image is ~1.37 M base64 chars (~340k "tokens" at chars/4), which would
-/// deny a vision request with a `429` *before* it is ever proxied, and a
-/// pre-proxy reject never reconciles, so the bogus estimate is never corrected.
-/// Image/audio inputs actually cost a small fixed number of tokens, not
-/// `bytes/4`, so recognized binary *payload shapes* under these keys are skipped
-/// entirely (including nested member names). The key spelling alone is never
-/// enough: a tool-schema property that reuses one of these names must still have
-/// its name and textual descendants counted.
-///
-/// Recognized payload shapes (see [`value_is_binary_content_payload`]):
-/// - OpenAI vision part: `{"type":"image_url","image_url":{"url":"data:..."}}`
-///   or `image_url` as a data/http(s) URL string
-/// - OpenAI audio part: `{"type":"input_audio","input_audio":{"data":"..."}}`
-/// - OpenAI file part: `{"type":"file","file":{"file_data":"..."}}`
-/// - Google inline data: `{"inline_data":{"data":"..."}}` / `inlineData`
-///
-/// Anthropic's `source` block is handled separately (see
-/// [`source_is_recognized_binary_document`]): binary `type` values
-/// (`base64`/`url`/`file`) are skipped; `type:"text"` text documents and any
-/// unrecognized/schema-shaped object are counted fail-closed.
-const BINARY_CONTENT_KEYS: &[&str] = &[
-    "image_url",
-    "input_audio",
-    "inline_data",
-    "inlineData",
-    "file_data",
-];
+/// Compact walk context: where exclusions may apply. `Copy` and allocation-free.
+#[derive(Clone, Copy)]
+struct PromptWalkCtx {
+    location: PromptLocation,
+}
 
-/// Output-cap / token-control object key spellings. A member is excluded only
-/// when its value is a JSON **number** (the provider request-control shape also
-/// read by [`requested_completion_tokens`]). Object/array/string values under the
-/// same spelling — e.g. a billed tool-schema property named `max_tokens` — are
-/// counted fail-closed so a coincidental name cannot hide prose.
-const TOKEN_CAP_KEYS: &[&str] = &[
-    "max_tokens",
-    "max_completion_tokens",
-    "max_output_tokens",
-    "max_tokens_to_sample",
-    "max_new_tokens",
-    "maxOutputTokens",
-    "maxTokens",
-    "maxTokenCount",
-];
+impl PromptWalkCtx {
+    const fn root() -> Self {
+        Self {
+            location: PromptLocation::Root,
+        }
+    }
 
-/// Anthropic multimodal `source` types whose whole subtree is binary/non-text
-/// and must be skipped (including nested member names). Explicit `type:"text"`
-/// text-document sources and any other shape (JSON Schema objects, unknown
-/// types) are **not** listed here and are counted fail-closed.
+    const fn at(location: PromptLocation) -> Self {
+        Self { location }
+    }
+}
+
+/// Structural location for path-exact token-cap exclusion and multimodal
+/// leaf exclusion. Never stores paths or strings.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptLocation {
+    /// The JSON root value before entering the root object.
+    Root,
+    /// Members of the request root object.
+    RootObject,
+    /// Immediate members of a root-level provider cap container
+    /// (`generationConfig`, `parameters`, …). `field` is the only numeric key
+    /// excluded here.
+    RootCapContainer { field: &'static str },
+    /// Root-level `messages` / `contents` / `input` / `chat_history` value.
+    ProviderMessages,
+    /// One element of a provider messages array (a message / content object).
+    MessageObject,
+    /// A `content` / `parts` array under a message object.
+    ContentArray,
+    /// One multimodal/text content-part object.
+    ContentPart,
+    /// Recognized binary payload object under a content part.
+    BinaryObject { kind: BinaryObjectKind },
+    /// Everywhere else — count fail-closed; no binary/cap exclusions.
+    Nested,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BinaryObjectKind {
+    ImageUrl,
+    InputAudio,
+    InlineData,
+    File,
+    AnthropicSource,
+}
+
+/// Anthropic multimodal `source.type` values whose URL/base64/file **leaf**
+/// may be excluded inside a content-block `source` object.
 const BINARY_SOURCE_TYPES: &[&str] = &["base64", "url", "file"];
 
-/// Minimum length before an alphabet-only string under a binary key is treated
-/// as a base64 payload. Shorter labels/enums stay counted fail-closed.
+/// Minimum length before an alphabet-only string under a recognized binary
+/// payload leaf is treated as base64. Shorter labels stay counted.
 const MIN_BASE64_PAYLOAD_LEN: usize = 48;
 
-/// Whether an Anthropic-style `source` value is a recognized binary document
-/// (`type` ∈ [`BINARY_SOURCE_TYPES`]). Only those shapes skip the subtree;
-/// `type:"text"` prose and schema-like objects (e.g. `type:"string"`) count.
-fn source_is_recognized_binary_document(value: &Value) -> bool {
-    value
-        .as_object()
-        .and_then(|obj| obj.get("type"))
-        .and_then(Value::as_str)
-        .is_some_and(|ty| BINARY_SOURCE_TYPES.contains(&ty))
-}
-
-/// Whether `value` under a [`BINARY_CONTENT_KEYS`] member is a recognized
-/// multimodal binary payload (skip name + subtree) rather than ordinary schema
-/// / prose that merely reused the key spelling (count fail-closed).
-fn value_is_binary_content_payload(value: &Value) -> bool {
-    match value {
-        Value::String(s) => {
-            is_data_url(s) || is_remote_fetch_url(s) || is_likely_base64_payload(s)
-        }
-        Value::Object(obj) => {
-            // OpenAI `image_url` object: string `url` that is a data or http(s) URL.
-            if let Some(url) = obj.get("url").and_then(Value::as_str) {
-                if is_data_url(url) || is_remote_fetch_url(url) {
-                    return true;
-                }
-            }
-            // Gemini inline_data / OpenAI input_audio: string `data` with a media
-            // discriminator, or a data-URL / long base64 `data` payload.
-            let has_media_meta = obj.contains_key("mime_type")
-                || obj.contains_key("mimeType")
-                || obj.contains_key("format")
-                || obj.contains_key("media_type");
-            if let Some(data) = obj.get("data").and_then(Value::as_str) {
-                return has_media_meta
-                    || is_data_url(data)
-                    || is_likely_base64_payload(data);
-            }
-            false
-        }
-        // Numbers/bools/arrays/null under these keys are not recognized binary
-        // payloads — recurse/count fail-closed so a magic key cannot hide them.
+/// Whether this object member is an output-cap control at a path also read by
+/// [`requested_completion_tokens`]. Shared so reservation exclusion and
+/// completion-budget estimation cannot silently drift.
+fn is_excluded_token_cap_member(ctx: PromptWalkCtx, key: &str, value: &Value) -> bool {
+    if !matches!(value, Value::Number(_)) {
+        return false;
+    }
+    match ctx.location {
+        PromptLocation::RootObject => is_top_level_token_cap_field(key),
+        PromptLocation::RootCapContainer { field } => key == field,
         _ => false,
     }
 }
@@ -1418,13 +1422,18 @@ fn is_likely_base64_payload(value: &str) -> bool {
     })
 }
 
+/// True when `value` is a recognized multimodal URL/base64 leaf string.
+fn is_binary_payload_string(value: &str) -> bool {
+    is_data_url(value) || is_remote_fetch_url(value) || is_likely_base64_payload(value)
+}
+
 fn member_name_character_count(key: &str) -> u64 {
     key.chars().count() as u64
 }
 
-fn count_member_and_value(acc: u64, key: &str, value: &Value) -> u64 {
+fn count_member_and_value(acc: u64, key: &str, value: &Value, child_ctx: PromptWalkCtx) -> u64 {
     acc.saturating_add(member_name_character_count(key))
-        .saturating_add(prompt_json_character_count(value))
+        .saturating_add(prompt_json_character_count(value, child_ctx))
 }
 
 fn u64_decimal_character_count(mut value: u64) -> u64 {
@@ -1455,78 +1464,207 @@ fn json_number_literal_character_count(n: &serde_json::Number) -> u64 {
     n.to_string().len() as u64
 }
 
-/// Fail-closed prompt character walk: billable strings, member names, and JSON
-/// scalar literals, with shape/value-aware token-cap and binary exclusions.
-fn prompt_json_character_count(value: &Value) -> u64 {
+/// Child context when entering `key`'s value from `ctx`.
+fn child_context_for_member(ctx: PromptWalkCtx, key: &str, value: &Value) -> PromptWalkCtx {
+    match ctx.location {
+        PromptLocation::RootObject => {
+            if let Some(field) = nested_token_cap_field_for_container(key) {
+                return PromptWalkCtx::at(PromptLocation::RootCapContainer { field });
+            }
+            match key {
+                "messages" | "contents" | "input" | "chat_history" => {
+                    PromptWalkCtx::at(PromptLocation::ProviderMessages)
+                }
+                _ => PromptWalkCtx::at(PromptLocation::Nested),
+            }
+        }
+        PromptLocation::MessageObject => match key {
+            "content" | "parts" => PromptWalkCtx::at(PromptLocation::ContentArray),
+            _ => PromptWalkCtx::at(PromptLocation::Nested),
+        },
+        PromptLocation::ContentPart => content_part_binary_child_ctx(key, value),
+        _ => PromptWalkCtx::at(PromptLocation::Nested),
+    }
+}
+
+fn content_part_binary_kind(key: &str, value: &Value) -> Option<BinaryObjectKind> {
+    match key {
+        "image_url" if value.is_object() => Some(BinaryObjectKind::ImageUrl),
+        "input_audio" if value.is_object() => Some(BinaryObjectKind::InputAudio),
+        "inline_data" | "inlineData" if value.is_object() => Some(BinaryObjectKind::InlineData),
+        "file" if value.is_object() => Some(BinaryObjectKind::File),
+        "source" if value.is_object() => Some(BinaryObjectKind::AnthropicSource),
+        _ => None,
+    }
+}
+
+fn content_part_binary_child_ctx(key: &str, value: &Value) -> PromptWalkCtx {
+    match content_part_binary_kind(key, value) {
+        Some(kind) => PromptWalkCtx::at(PromptLocation::BinaryObject { kind }),
+        None => PromptWalkCtx::at(PromptLocation::Nested),
+    }
+}
+
+/// Array-element context when walking an array at `ctx`.
+fn child_context_for_array_element(ctx: PromptWalkCtx) -> PromptWalkCtx {
+    match ctx.location {
+        PromptLocation::ProviderMessages => PromptWalkCtx::at(PromptLocation::MessageObject),
+        PromptLocation::ContentArray => PromptWalkCtx::at(PromptLocation::ContentPart),
+        _ => PromptWalkCtx::at(PromptLocation::Nested),
+    }
+}
+
+/// Exclude a recognized binary leaf string under a content-part key or inside a
+/// binary payload object. Member names are counted by the caller.
+fn should_exclude_binary_leaf(ctx: PromptWalkCtx, key: &str, value: &Value) -> bool {
+    let Some(s) = value.as_str() else {
+        return false;
+    };
+
+    match ctx.location {
+        PromptLocation::ContentPart => match key {
+            // OpenAI / Responses image URL or file_data as a direct string on the part.
+            "image_url" | "file_data" => is_binary_payload_string(s),
+            _ => false,
+        },
+        PromptLocation::BinaryObject { kind } => match kind {
+            BinaryObjectKind::ImageUrl => {
+                key == "url" && (is_data_url(s) || is_remote_fetch_url(s))
+            }
+            BinaryObjectKind::InputAudio | BinaryObjectKind::InlineData => {
+                key == "data" && is_binary_payload_string(s)
+            }
+            BinaryObjectKind::File => {
+                (key == "file_data" || key == "data") && is_binary_payload_string(s)
+            }
+            // AnthropicSource uses [`count_anthropic_source_object`] instead.
+            BinaryObjectKind::AnthropicSource => false,
+        },
+        _ => false,
+    }
+}
+
+/// Count members of an Anthropic content-block `source` object: exclude only the
+/// binary payload leaf (`data` / `url` / `file_id`) when `type` is binary; count
+/// the member name and every other sibling fail-closed.
+fn count_anthropic_source_object(acc: u64, source: &serde_json::Map<String, Value>) -> u64 {
+    let binary_ty = source
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|ty| BINARY_SOURCE_TYPES.contains(ty));
+
+    source.iter().fold(acc, |acc, (key, value)| {
+        let acc = acc.saturating_add(member_name_character_count(key));
+        let exclude_leaf = match (binary_ty, key.as_str(), value) {
+            (Some("base64"), "data", Value::String(_)) => true,
+            (Some("url"), "url", Value::String(_)) => true,
+            (Some("file"), "file_id" | "data" | "url", Value::String(_)) => true,
+            _ => false,
+        };
+        if exclude_leaf {
+            acc
+        } else {
+            acc.saturating_add(prompt_json_character_count(
+                value,
+                PromptWalkCtx::at(PromptLocation::Nested),
+            ))
+        }
+    })
+}
+
+/// Count members of a recognized multimodal payload object, excluding only the
+/// binary URL/base64/file leaf string; names and textual siblings always count.
+fn count_binary_object_members(
+    acc: u64,
+    kind: BinaryObjectKind,
+    obj: &serde_json::Map<String, Value>,
+) -> u64 {
+    if kind == BinaryObjectKind::AnthropicSource {
+        return count_anthropic_source_object(acc, obj);
+    }
+
+    let ctx = PromptWalkCtx::at(PromptLocation::BinaryObject { kind });
+    obj.iter().fold(acc, |acc, (key, value)| {
+        if should_exclude_binary_leaf(ctx, key, value) {
+            return acc.saturating_add(member_name_character_count(key));
+        }
+        count_member_and_value(acc, key, value, PromptWalkCtx::at(PromptLocation::Nested))
+    })
+}
+
+/// Fail-closed prompt character walk with path/context-aware exclusions.
+fn prompt_json_character_count(value: &Value, ctx: PromptWalkCtx) -> u64 {
     match value {
         // JSON Schema and provider bodies include numeric/boolean/`null` keywords
-        // (`minimum`, `default`, `additionalProperties`, …) that appear in the
-        // serialized prompt. Count each at its JSON literal width so large schemas
-        // cannot omit scalars at scale. Token-cap **controls** remain excluded at
-        // the member level when the value is a number; binary subtrees stay skipped.
+        // that appear in the serialized prompt. Count each at its JSON literal
+        // width so large schemas cannot omit scalars at scale.
         Value::Null => 4,
         Value::Bool(true) => 4,
         Value::Bool(false) => 5,
         Value::Number(n) => json_number_literal_character_count(n),
-        // A data URL (`data:<mime>;base64,<payload>`) is an inline binary blob,
-        // not prose — count it as zero so a base64 image embedded directly in a
-        // text field (rather than under a known binary key) still can't inflate
-        // the estimate.
-        Value::String(value) => {
-            if is_data_url(value) {
-                0
-            } else {
-                value.chars().count() as u64
-            }
+        // Ordinary strings always count — including well-formed `data:` URLs in
+        // instructions, schemas, or unknown fields. Binary payload exclusion
+        // happens only at recognized multimodal leaves (member handling below).
+        Value::String(value) => value.chars().count() as u64,
+        Value::Array(values) => {
+            let elem_ctx = child_context_for_array_element(ctx);
+            values.iter().fold(0_u64, |acc, value| {
+                acc.saturating_add(prompt_json_character_count(value, elem_ctx))
+            })
         }
-        Value::Array(values) => values.iter().fold(0_u64, |acc, value| {
-            acc.saturating_add(prompt_json_character_count(value))
-        }),
-        Value::Object(values) => values.iter().fold(0_u64, |acc, (key, value)| {
-            if TOKEN_CAP_KEYS.contains(&key.as_str()) {
-                // Numeric provider caps only — schema-shaped values count.
-                if matches!(value, Value::Number(_)) {
+        Value::Object(values) => {
+            let member_ctx = match ctx.location {
+                PromptLocation::Root => PromptWalkCtx::at(PromptLocation::RootObject),
+                other => PromptWalkCtx::at(other),
+            };
+            values.iter().fold(0_u64, |acc, (key, value)| {
+                // Exact-path numeric caps (parity with requested_completion_tokens).
+                if is_excluded_token_cap_member(member_ctx, key, value) {
                     return acc;
                 }
-                return count_member_and_value(acc, key, value);
-            }
-            if key == "source" {
-                // Recognized Anthropic binary sources skip; text documents and
-                // unknown/schema objects (e.g. type:"string") count fail-closed.
-                if source_is_recognized_binary_document(value) {
-                    return acc;
+
+                // Content-part string image_url / file_data leaf.
+                if member_ctx.location == PromptLocation::ContentPart
+                    && should_exclude_binary_leaf(member_ctx, key, value)
+                {
+                    return acc.saturating_add(member_name_character_count(key));
                 }
-                return count_member_and_value(acc, key, value);
-            }
-            if BINARY_CONTENT_KEYS.contains(&key.as_str()) {
-                if value_is_binary_content_payload(value) {
-                    // Skip the binary member name and its entire subtree so
-                    // attacker-controlled keys nested under image/audio/file
-                    // payloads cannot manufacture prompt overcharge.
-                    return acc;
+
+                // Recognized multimodal payload objects: leaf-only exclusion.
+                if member_ctx.location == PromptLocation::ContentPart {
+                    if let (Some(kind), Some(obj)) =
+                        (content_part_binary_kind(key, value), value.as_object())
+                    {
+                        return count_binary_object_members(
+                            acc.saturating_add(member_name_character_count(key)),
+                            kind,
+                            obj,
+                        );
+                    }
                 }
-                // Coincidental schema/property reuse of the spelling: count.
-                return count_member_and_value(acc, key, value);
-            }
-            count_member_and_value(acc, key, value)
-        }),
+
+                let child_ctx = child_context_for_member(member_ctx, key, value);
+                count_member_and_value(acc, key, value, child_ctx)
+            })
+        }
     }
 }
 
 /// Maximum length of the header portion (`[<mediatype>][;base64]`) of a `data:`
 /// URL we will scan for the mandatory `,` separator. RFC 2397 mediatypes plus
-/// parameters are short; this bounds the prose check so an arbitrarily long
-/// string that merely starts with `data:` is not scanned end-to-end.
+/// parameters are short; this bounds the scan so an arbitrarily long string that
+/// merely starts with `data:` is not scanned end-to-end.
 const DATA_URL_MAX_HEADER_LEN: usize = 256;
 
-/// Whether a string is an inline `data:` URL carrying a (typically base64)
-/// binary payload, per RFC 2397: `data:[<mediatype>][;base64],<payload>`.
+/// Whether a string is an inline `data:` URL per RFC 2397:
+/// `data:[<mediatype>][;base64],<payload>`.
 ///
-/// Requiring the structural `,` separator (and rejecting whitespace/control
-/// chars in the header) avoids treating ordinary prose that merely begins with
-/// `data:` — e.g. `"data: my notes"` — as a 0-char binary blob. A real data URL
-/// has the comma and a whitespace-free header; the prose case has neither.
-/// Case-insensitive on the `data:` scheme; allocation-light (byte scan only).
+/// Used only to recognize multimodal binary **leaves** under content-block
+/// context. Ordinary billed strings that happen to be well-formed `data:` URLs
+/// (e.g. Responses `instructions`) are still counted by the walk. Requiring the
+/// structural `,` separator avoids treating prose like `"data: my notes"` as a
+/// binary URL when evaluating a leaf. Case-insensitive on the `data:` scheme;
+/// allocation-light (byte scan only).
 fn is_data_url(value: &str) -> bool {
     let Some(rest) = value
         .get(..5)
@@ -1536,9 +1674,6 @@ fn is_data_url(value: &str) -> bool {
         return false;
     };
 
-    // The header (between `data:` and the first `,`) is a mediatype + optional
-    // parameters: ASCII tokens with no whitespace or control characters. Scan up
-    // to a bounded length for the `,`; bail on the first disqualifying byte.
     for &byte in rest.as_bytes().iter().take(DATA_URL_MAX_HEADER_LEN) {
         match byte {
             b',' => return true,

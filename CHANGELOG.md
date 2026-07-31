@@ -51,13 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values, visited object member names (including nested tool / function JSON
   Schema property names), and JSON scalar literals (`null` / booleans / numbers
   at serialized width), so sibling instructions, schema keys, and schema scalars
-  cannot be omitted from the reservation. Exclusions are shape/value aware —
-  numeric token-cap controls, structurally recognized multimodal binary /
-  Anthropic `source` (`type` `base64`/`url`/`file`) / data-URL payloads (and
-  member names under those skipped subtrees), not arbitrary member-name matches —
-  so a tool-schema property that merely reuses a reserved spelling still
-  contributes. The walk remains a conservative `chars/4` heuristic, not provider
-  tokenizer parity.
+  cannot be omitted from the reservation. Exclusions are path/context aware —
+  numeric output caps only at the exact paths also read for completion-budget
+  reservation, and multimodal URL/base64/file leaves only inside recognized
+  message content-block structures (member names and unrelated textual siblings
+  still count). Ordinary strings, including well-formed `data:` URLs in
+  `instructions` or schemas, always count; collision-shaped reserved spellings
+  outside those contexts count fail-closed. The walk remains a conservative
+  `chars/4` heuristic, not provider tokenizer parity.
 - Irreversible request egress no longer precedes request-body transformation or
   final request policy (GHSA-4vr5-4wm3-x5xv). `request_mirror` and
   `serverless_function` previously ran their external dispatch in
