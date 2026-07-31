@@ -61,6 +61,7 @@ pub mod config_builder;
 pub mod echo_servers;
 pub mod gateway_harness;
 pub mod hmac_helpers;
+pub mod protocol_managed_response_headers;
 
 pub use backend_availability::{
     IsolatedSqlDatabase, continue_if_backend_available, continue_if_tls_fixture_available,
