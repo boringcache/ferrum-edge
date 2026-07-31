@@ -108,6 +108,10 @@ async fn openapi_client_contract_precedes_body_transforms_on_h1_h2_h3() {
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "{protocol}: an undeclared media type must not bypass the contract"
         );
+        harness
+            .assert_no_request_within("/orders", ABSENCE_PROOF_WINDOW)
+            .await
+            .unwrap_or_else(|error| panic!("{protocol}: {error}"));
 
         // 5. An empty body still fails the declared presence requirement.
         harness.backend.clear();
@@ -117,6 +121,10 @@ async fn openapi_client_contract_precedes_body_transforms_on_h1_h2_h3() {
             StatusCode::BAD_REQUEST,
             "{protocol}: a required body must not be evaded by sending nothing"
         );
+        harness
+            .assert_no_request_within("/orders", ABSENCE_PROOF_WINDOW)
+            .await
+            .unwrap_or_else(|error| panic!("{protocol}: {error}"));
     }
 
     harness.shutdown();
@@ -411,6 +419,8 @@ impl ContractHarness {
             // Arm the notification before scanning so a concurrent push cannot
             // be lost between the scan and a later wait.
             let notified = self.backend.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(request) = self
                 .backend
                 .requests()
@@ -454,6 +464,8 @@ impl ContractHarness {
         let deadline = tokio::time::Instant::now() + window;
         loop {
             let notified = self.backend.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(request) = self
                 .backend
                 .requests()
@@ -485,6 +497,8 @@ impl ContractHarness {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let notified = self.backend.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(request) = self.backend.requests().into_iter().find(|request| {
                 request.starts_with("POST /orders") || request.contains(" /orders ")
             }) {

@@ -8643,7 +8643,18 @@ fn h1_h2_and_h3_run_the_same_client_contract_phase() {
     // cannot silently apply to one protocol only.
     let h1_h2 = include_str!("../../../src/proxy/mod.rs");
     let h3 = include_str!("../../../src/http3/server.rs");
-    for (name, source) in [("H1/H2", h1_h2), ("native H3", h3)] {
+    for (name, source, before_proxy_anchor) in [
+        (
+            "H1/H2",
+            h1_h2,
+            "// before_proxy hooks — clone headers when",
+        ),
+        (
+            "native H3",
+            h3,
+            "// before_proxy hooks — only clone headers if at least one",
+        ),
+    ] {
         assert!(
             source.contains("apply_client_request_contract_validation("),
             "{name} must run the shared client-request-contract phase"
@@ -8652,10 +8663,11 @@ fn h1_h2_and_h3_run_the_same_client_contract_phase() {
             source.contains("before_proxy_body_requirements.validates_client_contract"),
             "{name} must gate the phase on the precomputed pre-before_proxy requirement"
         );
+        // Use the last occurrence so the H1/H2 helper definition cannot make
+        // this ordering assertion pass without a real dispatch-site call.
         let phase_at = source
-            .find("apply_client_request_contract_validation(")
+            .rfind("apply_client_request_contract_validation(")
             .expect("client-contract phase call");
-        let before_proxy_anchor = "// before_proxy hooks — only clone headers if at least one";
         let before_proxy_at = source
             .find(before_proxy_anchor)
             .expect("before_proxy hook phase");
