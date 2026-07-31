@@ -4207,7 +4207,7 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `inspect_multipart` | bool | `false` | Inspect `multipart/*` bodies. |
 | `inspect_binary_body` | bool | `false` | Inspect bodies whose content type is not in `body_content_types`. |
 | `max_scan_bytes` | usize | `1048576` | Maximum bytes scanned from each body. Must be greater than zero. |
-| `on_body_too_large` | string | `scan_truncated` | `scan_truncated` scans the first `max_scan_bytes`; `skip` skips known-oversized bodies; `block` fail-closes oversized bodies in enforce mode. |
+| `on_body_too_large` | string | `fail_closed` | `fail_closed` rejects an oversize governed body when that direction has an enforcing body rule or anomaly scoring, and otherwise scans the first `max_scan_bytes` and records truncation; `scan_truncated` is the explicit compatibility opt-out that always scans only the prefix and forwards the complete body; `skip` skips known-oversized bodies; `block` rejects every oversize governed body in enforce mode. |
 | `scan_budget_ms` | u64 | `50` | Post-hoc deadline for metadata/header and body scans. `0` disables the timeout wrapper. The synchronous scan cannot be cancelled mid-regex; over-budget scans are reported after the scan returns. |
 | `on_scan_timeout` | string | `log_and_allow` | Action when a body scan times out: `allow`, `block`, or `log_and_allow`. |
 | `disallowed_methods` | string[] | `[]` | Methods that should trigger the built-in `FE-METHOD-001` rule when that rule is active. |
@@ -4224,14 +4224,46 @@ response lifecycle. Metadata uses `waf.instances.<id>.score` plus deterministic
 `waf.instance_scores` when more than one instance contributes; `waf.score` is
 emitted only for single-instance scoring. See [waf.md](waf.md#anomaly-scoring).
 
+**Oversize bodies never silently bypass an enforcing body rule:** a body larger
+than `max_scan_bytes` cannot be completely inspected, and prefix-only inspection
+is not a body control — a client (or a compromised backend) can pad
+`max_scan_bytes` of benign bytes and place the blocked content in the unscanned
+suffix. The default `on_body_too_large: fail_closed` therefore rejects such a
+body whenever that direction actually carries an enforcing body policy: global
+`mode: enforce` plus either anomaly `scoring` or at least one `action: enforce`
+rule reading `body_text` / `body_json_path` (request) or `response_body`
+(response), including the body-scoped `FE-ENCODING-001` / `FE-ENCODING-002`
+specials, which read both directions. The request and response paths use the
+same decision, so H1, H2, and H3 behave identically. A body whose length is
+*exactly* `max_scan_bytes` is fully scanned and never treated as oversize.
+
+Monitor-only operation is unchanged: with `mode: monitor`, or with every body
+rule left at the built-in monitor default, an oversize body is prefix-scanned and
+recorded, never blocked. With `log_to_metadata: true` every oversize governed
+body sets the fixed-cardinality `waf.body_too_large=true` and
+`waf.body_too_large_target` (`request_body` or `response_body`); a blocked one
+adds `waf.action=blocked` and `waf.block_reason=body_too_large`, and a
+prefix-scanned one adds `waf.scan_truncated=true`. No body bytes are logged.
+
+Set `on_body_too_large: scan_truncated` to keep the previous prefix-only
+behavior. That is an explicit acceptance of the suffix bypass and should be
+paired with a compensating control. For high-assurance routes prefer raising
+`max_scan_bytes` to at least the effective request/response body ceiling
+(`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` / `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`,
+default 10 MiB each, plus any route-scoped ceiling) so no admitted body is
+oversize in the first place; `fail_closed` only rejects bodies WAF cannot scan.
+
 **Unbounded SSE responses:** Request-controlled `Accept: text/event-stream` and
 internal streaming markers never bypass response-body policy. When the pristine
 backend response is `text/event-stream` and response-body inspection is active,
 WAF decides before headers are committed. `on_body_too_large: skip` explicitly
-allows the stream uninspected; `block` rejects in global enforce mode; and the
-default `scan_truncated` rejects when an enforcing response-body rule or anomaly
-scoring policy would otherwise claim inspection, while monitor-only policy
-records and permits the stream. With `log_to_metadata: true`, the decision sets
+allows the stream uninspected; `block` rejects in global enforce mode; and both
+the default `fail_closed` and the `scan_truncated` opt-out reject when an
+enforcing response-body rule or anomaly scoring policy would otherwise claim
+inspection, while monitor-only policy records and permits the stream. The
+prefix-only opt-out does not reach an unbounded stream: it concedes the suffix
+of a *bounded* body, and an SSE stream has no scanned prefix at all. With
+`log_to_metadata: true`, the decision sets
 `waf.response_stream_uninspectable=true`; allowed streams use
 `waf.action=stream_uninspected`, and blocked streams use `waf.action=blocked`
 with `waf.block_reason=unbounded_response_stream`. `on_scan_timeout` governs a
