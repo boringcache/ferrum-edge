@@ -28,10 +28,77 @@ use ferrum_edge::tls::lease::{
     acme_renewal_lease_name,
 };
 
+/// Generous ceiling on "this must eventually happen". It is a diagnostic bound,
+/// never a schedule: a slow or paused runner spends longer here rather than
+/// turning correct behaviour red.
+const SETTLE_BUDGET: Duration = Duration::from_secs(30);
+
+/// Window held open to observe that something must *not* happen yet. These
+/// assertions are conservative in the only direction that matters — the wait
+/// can fail only by observing the forbidden event, so slowness never makes a
+/// correct run fail.
+const BLOCKED_WINDOW: Duration = Duration::from_millis(500);
+
 /// One replica's view of the shared lease table.
 fn instance(dir: &Path, holder: &str) -> Arc<TlsLeaseStore> {
     let opened = TlsLeaseStore::open_with_holder(dir, holder.to_string());
     Arc::new(opened.expect("open lease store"))
+}
+
+/// Bounded poll of a condition on the current thread, for the synchronous
+/// tests. `false` means the condition never held within `budget`.
+fn wait_until(budget: Duration, mut ready: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if ready() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// [`wait_until`] on the runtime, so a single-threaded test runtime keeps
+/// driving the keeper's own tasks while the condition is polled.
+async fn wait_until_async(budget: Duration, mut ready: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if ready() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Hold the lease store's own cross-process advisory lock from a *separate*
+/// open file, exactly as a second instance would.
+///
+/// Nothing is stubbed: `SharedStoreFile` locks the sidecar `.tls-leases.json.lock`
+/// with `flock`, whose locks are per open file description, so a second open in
+/// this same process contends for real. Dropping the returned handle releases
+/// it.
+///
+/// The acquisition retries rather than asserting on the first attempt: a
+/// heartbeat may legitimately be holding the lock at that instant, and the test
+/// wants the lock, not a verdict on who had it first.
+fn hold_store_lock(dir: &Path) -> std::fs::File {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(".tls-leases.json.lock"))
+        .expect("open the lease store's lock file");
+    assert!(
+        wait_until(SETTLE_BUDGET, || file.try_lock().is_ok()),
+        "the test must be able to take the lease store's lock"
+    );
+    file
 }
 
 /// Poll the persisted record until a heartbeat has advanced `expires_at` past
@@ -610,14 +677,23 @@ async fn a_missing_claim_refuses_the_commit() {
 /// the claim's nominal TTL has elapsed — the acquirer blocks on the same lease
 /// lock. Once the commit has finished, the newly expired claim is acquirable
 /// and the stale owner cannot commit a second time.
+///
+/// Every step is an explicit event, not an interval. The commit closure
+/// announces that it is running *inside* the lease lock and then blocks until
+/// this test releases it, so the window is opened and closed deliberately.
+/// Expiry is read back from the persisted record against wall-clock time. The
+/// exclusion itself is proved twice over: the takeover thread must not produce
+/// a result while the commit is held (a wait that can fail only by observing
+/// the forbidden grant), and the value it samples at the instant its
+/// acquisition returns must show the commit already complete.
 #[test]
 fn a_takeover_cannot_cross_a_fenced_commit() {
     let dir = tempfile::tempdir().expect("tempdir");
     let instance_a = instance(dir.path(), "replica-a");
     let instance_b = instance(dir.path(), "replica-b");
     let name = acme_renewal_lease_name("edge-cert");
-    // Short enough that the nominal TTL elapses during the commit below.
-    let ttl = Duration::from_millis(500);
+    // Short enough that the nominal TTL elapses while the commit below is held.
+    let ttl = Duration::from_millis(300);
 
     let held = instance_a.try_acquire(&name, ttl).expect("A claims");
     let lease = held.expect("A wins");
@@ -626,35 +702,89 @@ fn a_takeover_cannot_cross_a_fenced_commit() {
     // out. Leaking the guard reproduces that without racing the commit.
     std::mem::forget(lease);
 
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let finished = Arc::new(AtomicBool::new(false));
     let commit_flag = Arc::clone(&finished);
     let committing = Arc::clone(&instance_a);
     let commit_name = name.clone();
     let commit = std::thread::spawn(move || {
         committing.commit_fenced(&commit_name, fence, move || {
-            // A slow account/order/certificate mutation.
-            std::thread::sleep(Duration::from_millis(1_500));
+            // Stands in for a slow account/order/certificate mutation. It
+            // starts and ends where the test says, so "in flight" is a fact
+            // rather than an assumption about scheduling.
+            entered_tx.send(()).expect("the test observes commit entry");
+            release_rx
+                .recv_timeout(SETTLE_BUDGET)
+                .expect("the test releases the commit");
             commit_flag.store(true, Ordering::SeqCst);
             "published"
         })
     });
 
-    // Well past the nominal TTL, and well before the commit completes.
-    std::thread::sleep(Duration::from_millis(700));
+    // The mutation is running, which means `commit_fenced` verified ownership
+    // and is holding the lease store's exclusive lock right now.
+    entered_rx
+        .recv_timeout(SETTLE_BUDGET)
+        .expect("the fenced commit must start under the live claim");
+
+    // The claim's nominal TTL elapses while that lock is held. Read back from
+    // the persisted record and compared against wall-clock time, so this is an
+    // observed state rather than a slept-through duration. `peek` never takes
+    // the writer lock, so it answers while the commit holds it.
+    let expiry = instance_a.peek(&name).expect("read").expect("present").expires_at;
+    assert!(
+        wait_until(SETTLE_BUDGET, || Utc::now() > expiry),
+        "the claim's nominal TTL must elapse while the commit is in flight"
+    );
+
+    // The takeover runs on its own thread and reports the moment its
+    // acquisition returns, together with what it saw of the commit right then.
+    let (attempting_tx, attempting_rx) = std::sync::mpsc::channel::<()>();
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel::<bool>();
+    let acquiring = Arc::clone(&instance_b);
+    let acquire_name = name.clone();
+    let observed = Arc::clone(&finished);
+    let takeover = std::thread::spawn(move || {
+        attempting_tx.send(()).expect("the test observes the attempt");
+        let taken = acquiring.try_acquire(&acquire_name, ttl).expect("B attempts");
+        acquired_tx
+            .send(observed.load(Ordering::SeqCst))
+            .expect("the test observes the acquisition");
+        taken
+    });
+    attempting_rx
+        .recv_timeout(SETTLE_BUDGET)
+        .expect("B must reach its acquisition");
+
+    // No takeover may be granted while the commit holds the lease lock. This
+    // wait fails only by *receiving* a grant, so a slow machine lengthens it
+    // rather than reddening it.
+    let premature = acquired_rx.recv_timeout(BLOCKED_WINDOW);
+    assert_eq!(
+        premature,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        "a takeover must not be granted while a fenced commit holds the lease lock"
+    );
     assert!(
         !finished.load(Ordering::SeqCst),
         "the commit must still be in flight"
     );
 
-    let taken = instance_b.try_acquire(&name, ttl).expect("B attempts");
+    release_tx.send(()).expect("release the fenced commit");
+
+    let observed_finished = acquired_rx
+        .recv_timeout(SETTLE_BUDGET)
+        .expect("B's acquisition must be answered once the lock is free");
     assert!(
-        finished.load(Ordering::SeqCst),
-        "a takeover must not be granted while a fenced commit holds the lease lock"
+        observed_finished,
+        "the fenced commit must have completed before the takeover was granted"
     );
-    assert!(
-        taken.is_some(),
-        "once the commit released the lock, the expired claim must be acquirable"
-    );
+    let taken = takeover
+        .join()
+        .expect("takeover thread")
+        .expect("once the commit released the lock, the expired claim is acquirable");
+    assert_eq!(taken.holder(), "replica-b");
 
     let outcome = commit
         .join()
@@ -732,12 +862,21 @@ fn a_target_store_error_propagates_without_disturbing_the_claim() {
 /// republishes the same `_acme-challenge` names, so a superseded instance
 /// retracting them would break the new owner's validation — and nothing later
 /// in the renewal may publish either.
+///
+/// The check has to be *authoritative and up front*, not merely a cancellation
+/// scope over the published loss signal: the takeover lands in the lease table
+/// before any heartbeat has had a reason to observe it, and a retraction hook is
+/// perfectly capable of completing inside that gap. The TTL here is deliberately
+/// long enough that **no beat can run during the test**, and the cleanup future
+/// retracts on its very first poll — so `Lost` can only come from a check made
+/// before the future was polled at all.
 #[tokio::test]
 async fn losing_the_claim_cancels_dns_cleanup() {
     let dir = tempfile::tempdir().expect("tempdir");
     let instance_a = instance(dir.path(), "replica-a");
     let name = acme_renewal_lease_name("edge-cert");
-    let ttl = Duration::from_millis(600);
+    // Beats every 20s: the heartbeat cannot be what notices the takeover.
+    let ttl = Duration::from_secs(60);
 
     let held = instance_a.try_acquire(&name, ttl).expect("A claims");
     let keeper = RenewalLeaseKeeper::start(held.expect("A wins"), ttl);
@@ -746,24 +885,35 @@ async fn losing_the_claim_cancels_dns_cleanup() {
     // would otherwise run unguarded.
     std::fs::write(dir.path().join("tls-leases.json"), takeover_document(&name))
         .expect("simulate a takeover by another instance");
+    assert!(
+        !keeper.is_lost(),
+        "the takeover has not been published as a loss yet; the guard must not \
+         be relying on the heartbeat having noticed it"
+    );
 
     let retracted = Arc::new(AtomicBool::new(false));
     let retract = Arc::clone(&retracted);
-    // Stands in for the DNS-01 cleanup hook: slow enough that the heartbeat
-    // observes the takeover while it is in flight.
+    // Stands in for a DNS-01 cleanup hook that is ready to go: it retracts the
+    // records the instant it is polled, with no await in front of it.
     let cleanup = async move {
-        tokio::time::sleep(Duration::from_secs(30)).await;
         retract.store(true, Ordering::SeqCst);
         Ok::<(), String>(())
     };
     assert_eq!(
         keeper.guarded_cleanup(cleanup).await,
         GuardedCleanup::Lost,
-        "cleanup must be cancelled when the claim is lost"
+        "cleanup must fail closed against authoritative ownership, before the \
+         heartbeat has published anything"
     );
     assert!(
         !retracted.load(Ordering::SeqCst),
-        "a superseded instance must not retract the new owner's challenge records"
+        "a superseded instance must not retract the new owner's challenge \
+         records, so the cleanup future must never have been polled"
+    );
+    assert!(
+        keeper.is_lost(),
+        "the authoritative check must also mark the keeper lost, so concurrent \
+         guarded work is cancelled too"
     );
 
     let published = Arc::new(AtomicBool::new(false));
@@ -814,44 +964,78 @@ async fn an_ordinary_cleanup_failure_keeps_the_claim() {
 // Heartbeat shutdown.
 // ---------------------------------------------------------------------------
 
-/// `finish()` settles the heartbeat before releasing the claim.
+/// `finish()` settles an extension that is genuinely in flight before it
+/// releases the claim.
 ///
 /// Aborting the heartbeat task is not settlement: if it is parked on a
 /// `spawn_blocking` extension, dropping that join handle neither cancels nor
 /// joins the blocking work, so a beat can still land *after* the release and
 /// leave a claim alive that nobody is driving.
+///
+/// So the extension is put — and held — in flight for real, by taking the
+/// store's own advisory lock from a second open file the way another instance
+/// would. `HeartbeatProgress` makes that a state the test can wait for rather
+/// than an interval it has to guess: `started > settled` means the loop has
+/// handed an extension to the blocking pool and not yet awaited it back. The
+/// discriminating evidence is the final `settled == started`, which is reached
+/// only on the loop's own path *after* the extension's join handle resolves; a
+/// loop cancelled at that await never increments it.
 #[tokio::test]
 async fn finish_settles_an_in_flight_heartbeat_before_release() {
     let dir = tempfile::tempdir().expect("tempdir");
     let instance_a = instance(dir.path(), "replica-a");
     let instance_b = instance(dir.path(), "replica-b");
     let name = acme_renewal_lease_name("edge-cert");
-    // Beats every 200ms, so the loop is demonstrably active before `finish()`.
+    // Beats every 200ms, so an extension is offered promptly once the store
+    // lock is held against it.
     let ttl = Duration::from_millis(600);
 
     let held = instance_a.try_acquire(&name, ttl).expect("A claims");
     let keeper = RenewalLeaseKeeper::start(held.expect("A wins"), ttl);
-    let acquired = instance_a.peek(&name).expect("read").expect("present").expires_at;
+    let progress = keeper.heartbeat_progress();
 
-    wait_for_extension(&instance_a, &name, acquired, Duration::from_secs(30))
+    // Another instance is mid-write on the shared table. Nothing is stubbed:
+    // this is the same `flock` Ferrum's own writers take.
+    let blocker = hold_store_lock(dir.path());
+
+    // Observed, not assumed: an extension is in the blocking pool and the loop
+    // is awaiting it.
+    let extending = || progress.extension_in_flight();
+    assert!(
+        wait_until_async(SETTLE_BUDGET, extending).await,
+        "an extension must be in flight while the store lock is held against it"
+    );
+
+    let mut finishing = tokio::spawn(keeper.finish());
+
+    // `finish()` may not complete while the extension it has to settle is
+    // blocked. Bounded and conservative: only an early completion fails here.
+    let early = tokio::time::timeout(BLOCKED_WINDOW, &mut finishing).await;
+    assert!(
+        early.is_err(),
+        "finish() must not complete while a heartbeat extension is in flight"
+    );
+
+    // Hand the store back; the blocked extension can now run to completion.
+    std::mem::drop(blocker);
+
+    tokio::time::timeout(SETTLE_BUDGET, finishing)
         .await
-        .expect("the heartbeat must be running before finish() is exercised");
+        .expect("finish() must complete once the extension settles")
+        .expect("the finish task")
+        .expect("release");
 
-    keeper.finish().await.expect("release");
+    assert_eq!(
+        progress.settled(),
+        progress.started(),
+        "finish() must have awaited every extension it started; an aborted loop \
+         never settles the beat it was parked on"
+    );
 
     let released = instance_a.peek(&name).expect("read").expect("present");
     assert!(
         released.expires_at <= Utc::now(),
         "finish() must leave the claim released"
-    );
-
-    // Nothing may land afterwards. An aborted-but-unjoined beat would have been
-    // free to extend the record here, resurrecting a released claim.
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    let later = instance_a.peek(&name).expect("read").expect("present");
-    assert_eq!(
-        released, later,
-        "no heartbeat may land after finish() returned"
     );
 
     let taken = instance_b.try_acquire(&name, ttl).expect("B claims");

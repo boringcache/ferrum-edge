@@ -62,6 +62,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -453,7 +454,11 @@ pub struct RenewalLeaseLost;
 ///   so a superseded owner cannot publish certificate/order/account state;
 /// * [`Self::ensure_owned`] re-reads authoritative state without extending
 ///   anything, for the check immediately after a fenced commit and before the
-///   next stretch of external work.
+///   next stretch of external work;
+/// * [`Self::guarded_cleanup`] is [`Self::guarded`] preceded by that
+///   authoritative check, because a retraction hook that is ready to run
+///   immediately would otherwise slip through the gap between a takeover
+///   landing and the next beat observing it.
 ///
 /// A crashed process runs no heartbeat, so its claim expires and the
 /// certificate becomes reclaimable exactly as before.
@@ -466,7 +471,56 @@ pub struct RenewalLeaseKeeper {
     lost_tx: Arc<watch::Sender<bool>>,
     lost_rx: watch::Receiver<bool>,
     stop_tx: watch::Sender<bool>,
+    progress: HeartbeatProgress,
     heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// How far the heartbeat loop has got, as a state rather than an interval.
+///
+/// `started` counts extensions handed to the blocking pool; `settled` counts
+/// the ones the loop has since awaited back. `started > settled` therefore
+/// means an extension is in flight *right now*, which is precisely the
+/// condition [`RenewalLeaseKeeper::finish`] must clear before it releases the
+/// claim — see [`RenewalLeaseKeeper::stop_heartbeat`].
+///
+/// Two counters updated once per heartbeat interval (never faster than
+/// [`MIN_HEARTBEAT_INTERVAL`], and in production a third of a >= 60s TTL).
+/// Nothing on the request path reads or writes them.
+#[derive(Debug, Clone, Default)]
+pub struct HeartbeatProgress(Arc<HeartbeatCounters>);
+
+#[derive(Debug, Default)]
+struct HeartbeatCounters {
+    started: AtomicU64,
+    settled: AtomicU64,
+}
+
+impl HeartbeatProgress {
+    /// Extensions handed to the blocking pool since the keeper started.
+    #[allow(dead_code)]
+    pub fn started(&self) -> u64 {
+        self.0.started.load(Ordering::SeqCst)
+    }
+
+    /// Extensions the loop has awaited to completion.
+    #[allow(dead_code)]
+    pub fn settled(&self) -> u64 {
+        self.0.settled.load(Ordering::SeqCst)
+    }
+
+    /// Whether an extension has been started and not yet awaited back.
+    #[allow(dead_code)]
+    pub fn extension_in_flight(&self) -> bool {
+        self.started() > self.settled()
+    }
+
+    fn start(&self) {
+        self.0.started.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn settle(&self) {
+        self.0.settled.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl RenewalLeaseKeeper {
@@ -478,6 +532,7 @@ impl RenewalLeaseKeeper {
         let (lost_tx, lost_rx) = watch::channel(false);
         let lost_tx = Arc::new(lost_tx);
         let (stop_tx, stop_rx) = watch::channel(false);
+        let progress = HeartbeatProgress::default();
         let heartbeat = tokio::spawn(heartbeat_loop(
             Arc::clone(&store),
             name.clone(),
@@ -485,6 +540,7 @@ impl RenewalLeaseKeeper {
             ttl,
             Arc::clone(&lost_tx),
             stop_rx,
+            progress.clone(),
         ));
         Self {
             guard: Some(guard),
@@ -494,12 +550,20 @@ impl RenewalLeaseKeeper {
             lost_tx,
             lost_rx,
             stop_tx,
+            progress,
             heartbeat: Some(heartbeat),
         }
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Heartbeat progress, which outlives the keeper so shutdown settlement can
+    /// be checked after [`Self::finish`] has consumed it.
+    #[allow(dead_code)]
+    pub fn heartbeat_progress(&self) -> HeartbeatProgress {
+        self.progress.clone()
     }
 
     pub fn fence(&self) -> u64 {
@@ -531,17 +595,34 @@ impl RenewalLeaseKeeper {
         }
     }
 
-    /// Run a best-effort cleanup step inside the claim's cancellation scope.
+    /// Run a best-effort cleanup step inside the claim's cancellation scope,
+    /// after confirming authoritatively that the claim is still held.
     ///
     /// Cleanup is a side effect like any other: a DNS-01 provider hook that
     /// retracts `_acme-challenge` records must not run once the claim has moved
     /// on, because the instance that took it over republishes those same names
     /// and needs them to survive. An *ordinary* cleanup failure is not loss —
     /// the caller logs it and may keep working under the claim it still holds.
+    ///
+    /// # Why the loss signal alone is not enough here
+    ///
+    /// [`Self::guarded`] cancels on the *published* loss signal, which only
+    /// becomes true once a heartbeat has observed the takeover. A cleanup hook
+    /// that is ready to run immediately would be polled to completion in the
+    /// gap between the takeover landing in the lease table and the next beat
+    /// noticing it — retracting the new owner's records before this instance
+    /// had any reason to believe it had lost anything. So the check is
+    /// authoritative and up front: [`Self::ensure_owned`] re-reads the lease
+    /// table (and fails closed on a store error, marking the keeper lost) and
+    /// the cleanup future is **not polled at all** unless it succeeds. The
+    /// cancellation scope then still covers a claim lost *during* a slow hook.
     pub async fn guarded_cleanup<F, T, E>(&self, cleanup: F) -> GuardedCleanup<T, E>
     where
         F: Future<Output = Result<T, E>>,
     {
+        if self.ensure_owned().await.is_err() {
+            return GuardedCleanup::Lost;
+        }
         match self.guarded(cleanup).await {
             Ok(Ok(value)) => GuardedCleanup::Completed(value),
             Ok(Err(error)) => GuardedCleanup::Failed(error),
@@ -726,8 +807,10 @@ pub enum GuardedCleanup<T, E> {
     /// The cleanup ran and failed on its own terms. The claim is still held, so
     /// the caller may log this and continue.
     Failed(E),
-    /// The claim was lost before or during the cleanup, so it was cancelled and
-    /// the caller must abandon without publishing anything further.
+    /// The claim was already gone when the cleanup was asked for — so it never
+    /// ran — or it was lost while the cleanup was in flight and the cleanup was
+    /// cancelled. Either way the caller must abandon without publishing
+    /// anything further.
     Lost,
 }
 
@@ -736,7 +819,7 @@ pub enum GuardedCleanup<T, E> {
 /// The stop signal is only ever observed at the top of an iteration, so an
 /// extension already in flight is awaited rather than left running detached.
 /// That is what lets [`RenewalLeaseKeeper::finish`] guarantee no beat lands
-/// after the release.
+/// after the release. `progress` makes that in-flight window observable.
 async fn heartbeat_loop(
     store: Arc<TlsLeaseStore>,
     name: String,
@@ -744,6 +827,7 @@ async fn heartbeat_loop(
     ttl: Duration,
     lost_tx: Arc<watch::Sender<bool>>,
     mut stop_rx: watch::Receiver<bool>,
+    progress: HeartbeatProgress,
 ) {
     let interval = heartbeat_interval(ttl);
     loop {
@@ -756,8 +840,13 @@ async fn heartbeat_loop(
         }
         let store = Arc::clone(&store);
         let beat_name = name.clone();
+        progress.start();
         let outcome =
             tokio::task::spawn_blocking(move || store.renew_claim(&beat_name, fence, ttl)).await;
+        // Reached only when the loop itself awaited the extension back. A loop
+        // cancelled at that await never gets here, which is what makes
+        // "settled" mean settled.
+        progress.settle();
         match outcome {
             Ok(Ok(true)) => continue,
             Ok(Ok(false)) => {
