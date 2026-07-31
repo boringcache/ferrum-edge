@@ -1627,12 +1627,16 @@ fn count_anthropic_source_object(acc: u64, source: &serde_json::Map<String, Valu
 
     source.iter().fold(acc, |acc, (key, value)| {
         let acc = acc.saturating_add(member_name_character_count(key));
-        let exclude_leaf = match (binary_ty, key.as_str(), value) {
-            (Some("base64"), "data", Value::String(_)) => true,
-            (Some("url"), "url", Value::String(_)) => true,
-            (Some("file"), "file_id" | "data" | "url", Value::String(_)) => true,
-            _ => false,
-        };
+        let exclude_leaf = matches!(
+            (binary_ty, key.as_str(), value),
+            (Some("base64"), "data", Value::String(_))
+                | (Some("url"), "url", Value::String(_))
+                | (
+                    Some("file"),
+                    "file_id" | "data" | "url",
+                    Value::String(_)
+                )
+        );
         if exclude_leaf {
             acc
         } else {
@@ -1671,10 +1675,10 @@ fn count_content_part_object(family: ContentFamily, part: &serde_json::Map<Strin
     let part_type = part.get("type").and_then(Value::as_str);
 
     part.iter().fold(0_u64, |acc, (key, value)| {
-        if let Some(s) = value.as_str() {
-            if content_part_string_leaf_excluded(family, part_type, key, s) {
-                return acc.saturating_add(member_name_character_count(key));
-            }
+        if let Some(s) = value.as_str()
+            && content_part_string_leaf_excluded(family, part_type, key, s)
+        {
+            return acc.saturating_add(member_name_character_count(key));
         }
 
         if let (Some(kind), Some(obj)) = (
