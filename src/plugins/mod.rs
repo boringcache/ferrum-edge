@@ -6917,12 +6917,16 @@ pub trait Plugin: Send + Sync {
         PluginResult::Continue
     }
 
-    /// Returns `true` if this plugin may modify outgoing request headers
-    /// during the `before_proxy` phase. The gateway uses this hint to skip
-    /// cloning the header map when no plugin needs to modify it.
+    /// Returns `true` if this plugin may change backend-visible request
+    /// headers at or after its effective priority. The gateway uses this
+    /// capability both for replay/cache ordering admission and to decide
+    /// whether the `before_proxy` header map needs cloning.
     ///
-    /// Default is `false`. Override in plugins that insert, remove, or
-    /// modify headers in `before_proxy`.
+    /// Plugins that insert, remove, or modify headers during `before_proxy`
+    /// must return `true`. A plugin that publishes a later backend-header
+    /// overlay must also return `true` so earlier replay/cache plugins cannot
+    /// bind a request before its final backend-visible headers exist; the
+    /// resulting conservative clone is an accepted cost.
     fn modifies_request_headers(&self) -> bool {
         false
     }

@@ -22199,9 +22199,12 @@ async fn handle_proxy_request_inner(
             },
     );
 
-    // before_proxy hooks — only clone headers if at least one plugin modifies them.
-    // When no plugin modifies headers, pass &mut ctx.headers directly to avoid
-    // an expensive per-request HashMap clone on the hot path.
+    // before_proxy hooks — clone headers when the resolved capability set says
+    // a plugin may change backend-visible headers. Most such plugins mutate in
+    // before_proxy; a later overlay publisher may advertise the same capability
+    // conservatively so replay/cache admission sees the mutation ordering.
+    // Otherwise pass &mut ctx.headers directly to avoid an expensive per-request
+    // HashMap clone on the hot path.
     let needs_header_clone = capabilities.has(PluginCapabilities::MODIFIES_REQUEST_HEADERS);
     let mut owned_proxy_headers: Option<HashMap<String, String>> = None;
     if needs_header_clone {

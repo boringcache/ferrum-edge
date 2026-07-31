@@ -11642,8 +11642,8 @@ fn test_serverless_terminate_grpc_config_lifecycle_create_update_reload_delete()
         "the updated pre_proxy instance must be the one published, not the retained terminate one"
     );
     assert!(
-        !updated_instance.modifies_request_headers(),
-        "pre_proxy mode publishes a finalized backend overlay instead of mutating before_proxy headers"
+        updated_instance.modifies_request_headers(),
+        "pre_proxy mode must advertise its finalized backend-header overlay to replay/cache ordering admission"
     );
     assert!(!updated_instance.deferred_before_proxy_may_change_routing_headers());
     assert!(updated_instance.dispatches_finalized_request_egress());
