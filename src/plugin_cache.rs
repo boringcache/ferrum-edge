@@ -356,13 +356,15 @@ fn validate_plugin_security_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(
                 plugin.supported_protocols().contains(&protocol)
                     && plugin.name() != "request_deduplication"
                     && plugin.priority() >= deduplication.priority()
-                    && (plugin.modifies_request_headers() || plugin.modifies_request_query())
+                    && (plugin.modifies_request_headers()
+                        || plugin.modifies_request_query()
+                        || plugin.modifies_request_destination())
             }) {
                 return Err(format!(
                     "request mutation plugin '{}' at effective priority {} must run before \
                      every request_deduplication instance for protocol {:?}; \
-                     request_deduplication priority {} would fingerprint headers/query before \
-                     their backend-visible mutation",
+                     request_deduplication priority {} would fingerprint headers/query/destination \
+                     before their backend-visible mutation",
                     later_mutator.name(),
                     later_mutator.priority(),
                     protocol,

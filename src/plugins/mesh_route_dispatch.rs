@@ -1811,6 +1811,10 @@ impl Plugin for MeshRouteDispatch {
             .any(|rule| rule.rewrite.as_ref().is_some_and(|r| r.authority.is_some()))
     }
 
+    fn modifies_request_destination(&self) -> bool {
+        true
+    }
+
     fn enable_deferred_unmatched_rejection(&self) {
         self.aggregate_reject_unmatched
             .store(true, Ordering::Relaxed);

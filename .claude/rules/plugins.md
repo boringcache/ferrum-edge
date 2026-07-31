@@ -55,7 +55,8 @@ paths:
   Deduplication runs at priority 3010, after route dispatch and
   `request_transformer` header/query rules but before terminate-mode
   `serverless_function`. Plugin-cache admission rejects every same-protocol
-  header/query mutator at or after deduplication, including priority overrides,
+  header/query/destination mutator at or after deduplication, including priority
+  overrides,
   and rejects any deferred request-body transformer whose final bytes are not
   exactly the body produced by the pre-`before_proxy` normalization phase.
 - `response_caching` likewise requires the proxy's private proof that the

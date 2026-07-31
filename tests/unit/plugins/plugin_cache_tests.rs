@@ -3649,6 +3649,29 @@ fn request_deduplication_rejects_unwitnessable_request_mutation_order_and_body()
         )
     };
 
+    let mut late_route_dispatch = make_plugin_config(
+        "route-dispatch",
+        "mesh_route_dispatch",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    late_route_dispatch.priority_override = Some(3020);
+    let late_route_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "route-dispatch"])],
+        vec![dedup(), late_route_dispatch],
+    );
+    let late_route_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &late_route_config,
+        None,
+    )
+    .expect_err("deduplication must observe the final route destination");
+    assert!(
+        late_route_error.contains("mesh_route_dispatch")
+            && late_route_error.contains("headers/query/destination"),
+        "{late_route_error}"
+    );
+
     let mut late_headers = make_plugin_config_with_json(
         "transform",
         "request_transformer",
