@@ -1623,7 +1623,12 @@ fn recovery_active_to_recovering_then_resolve() {
 #[test]
 fn stale_resolve_settle_cannot_commit_a_newer_pending_resolve() {
     let gate = RecoveryGate::new();
-    gate.observe(1, "p", true, 60_000, 1_000, 0);
+
+    // First incident: Trigger → Active → recovery → PendingResolve.
+    assert_eq!(
+        gate.observe(1, "p", true, 60_000, 1_000, 0),
+        LifecycleOutcome::Trigger
+    );
     gate.settle_trigger_success(1, "p", 0, 1_000, 1_000);
     assert_eq!(
         gate.observe(1, "p", false, 60_000, 2_000, 0),
@@ -1634,29 +1639,89 @@ fn stale_resolve_settle_cannot_commit_a_newer_pending_resolve() {
         LifecycleOutcome::Resolve
     );
     assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::PendingResolve {
+            left_threshold_at_ms: 2_000,
+            reserved_at_ms: 62_000,
+        })
+    );
+    let old_resolve_token = 62_000u64;
+
+    // Re-breach parks in ResolveInFlightRebreached; further samples stay Quiet
+    // until that externally in-flight Resolve settles.
+    assert_eq!(
         gate.observe(1, "p", true, 60_000, 62_001, 0),
         LifecycleOutcome::Reactivate
     );
     assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::ResolveInFlightRebreached {
+            resolve_reserved_at_ms: 62_000,
+            rebreached_at_ms: 62_001,
+        })
+    );
+    assert_eq!(
         gate.observe(1, "p", false, 60_000, 62_002, 0),
+        LifecycleOutcome::Quiet
+    );
+
+    // Settle the first Resolve → compensating-trigger path.
+    gate.settle_resolve_success(1, "p", 0, old_resolve_token);
+    assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::CompensatingTrigger {
+            rebreached_at_ms: 62_001
+        })
+    );
+
+    // Compensating Trigger → Active.
+    assert_eq!(
+        gate.observe(1, "p", true, 60_000, 63_000, 0),
+        LifecycleOutcome::Trigger
+    );
+    assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::PendingTrigger {
+            reserved_at_ms: 63_000
+        })
+    );
+    gate.settle_trigger_success(1, "p", 0, 63_000, 63_000);
+    assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::Active { fired_at_ms: 63_000 })
+    );
+
+    // Second recovery cycle reserves a newer PendingResolve with a distinct token.
+    assert_eq!(
+        gate.observe(1, "p", false, 60_000, 64_000, 0),
         LifecycleOutcome::EnteringRecovery
     );
     assert_eq!(
-        gate.observe(1, "p", false, 60_000, 122_002, 0),
+        gate.observe(1, "p", false, 60_000, 124_000, 0),
         LifecycleOutcome::Resolve
     );
-
-    gate.settle_resolve_success(1, "p", 0, 62_000);
     assert_eq!(
         gate.current_state(1, "p", 0),
         Some(RuleState::PendingResolve {
-            left_threshold_at_ms: 62_002,
-            reserved_at_ms: 122_002,
+            left_threshold_at_ms: 64_000,
+            reserved_at_ms: 124_000,
+        })
+    );
+    let newer_resolve_token = 124_000u64;
+
+    // Old Resolve settle token must not commit the replacement reservation.
+    gate.settle_resolve_success(1, "p", 0, old_resolve_token);
+    assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::PendingResolve {
+            left_threshold_at_ms: 64_000,
+            reserved_at_ms: 124_000,
         }),
         "the old delivery must not settle a replacement reservation"
     );
 
-    gate.settle_resolve_success(1, "p", 0, 122_002);
+    // Matching newer token still commits Healthy.
+    gate.settle_resolve_success(1, "p", 0, newer_resolve_token);
     assert_eq!(gate.current_state(1, "p", 0), Some(RuleState::Healthy));
 }
 

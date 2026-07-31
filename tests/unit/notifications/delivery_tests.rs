@@ -818,7 +818,19 @@ async fn reload_retirement_cancels_stalled_in_flight_dispatch_and_settles_abando
         "reload retirement is NOT a shutdown-deadline abandonment; charging it \
          to that counter is what made the metric operationally false"
     );
-    assert_eq!(snapshot.total_rejected(), 0, "a real attempt ran");
+    // The intentional post-cancel `dispatch_one` above is a pre-task
+    // GenerationClosed rejection; that bounded counter must record it exactly
+    // once (it must not be conflated with the live attempt's retirement).
+    assert_eq!(
+        snapshot.rejected_for(AbandonReason::GenerationClosed),
+        1,
+        "post-retirement dispatch probe must witness GenerationClosed"
+    );
+    assert_eq!(
+        snapshot.total_rejected(),
+        1,
+        "exactly one pre-task rejection from the post-cancel probe"
+    );
     assert_eq!(snapshot.succeeded, 0);
     assert_eq!(snapshot.failed_transient, 0);
     assert_eq!(snapshot.failed_permanent, 0);
