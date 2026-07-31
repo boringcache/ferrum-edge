@@ -572,6 +572,16 @@ impl ProxyAlerts {
                     );
                 }
             }
+            // `observe` may have committed a different event reservation than
+            // the one evaluated above. No delivery is admitted for that
+            // mismatched event, so roll its exact token back as well.
+            self.recovery.rollback_unadmitted_reservation(
+                rule.id(),
+                proxy_id,
+                ownership_generation,
+                committed_outcome,
+                now_ms,
+            );
             return;
         }
         let (left_threshold_at_ms, recovery_reserved_at_ms) =
