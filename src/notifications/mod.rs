@@ -34,9 +34,7 @@ pub mod templating;
 #[allow(unused_imports)]
 pub use channels::{NotificationChannel, parse_channels};
 #[allow(unused_imports)]
-pub use dispatch::{
-    DeliveryCallback, DeliveryRetryPolicy, dispatch, dispatch_one, dispatch_one_with_delivery_slot,
-};
+pub use dispatch::{DeliveryCallback, DeliveryRetryPolicy, dispatch, dispatch_one};
 #[allow(unused_imports)]
 pub use generation::{DispatchGeneration, DispatchSettle};
 #[allow(unused_imports)]

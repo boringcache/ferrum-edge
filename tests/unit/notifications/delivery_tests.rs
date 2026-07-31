@@ -1067,13 +1067,19 @@ async fn admit_then_cancel_before_transport_counts_attempted_under_body_start_co
 /// metric in-flight. Reload retirement stays disjoint, and classification must
 /// read the exact admitted lifecycle even if a replacement generation is
 /// installed mid-drain.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+///
+/// Ordering is driven with Tokio paused virtual time so replacement-before-abort
+/// is causal: A begins shutdown under a long virtual budget, B is installed and
+/// proven admitting while A has not hard-aborted, and only then is virtual time
+/// advanced past A's deadline. A real-time 1 ms race cannot pass this test if
+/// drop classification incorrectly samples B.
+#[tokio::test(start_paused = true)]
 async fn hard_shutdown_deadline_aborts_admitted_notification_exactly_once() {
     let slot = Arc::new(DeliverySlot::new(0));
     let lifecycle_a_generation = slot.begin_cycle();
     let metrics = Arc::new(DeliveryMetrics::new());
     let generation = DispatchGeneration::with_metrics(88, Arc::clone(&metrics));
-    let mut endpoint = spawn_stalled_endpoint(Vec::new()).await;
+    let endpoint = spawn_stalled_endpoint(Vec::new()).await;
     let settles = SettleLog::new();
     let addr = endpoint.addr;
 
@@ -1093,29 +1099,46 @@ async fn hard_shutdown_deadline_aborts_admitted_notification_exactly_once() {
         &slot,
     ));
 
-    timeout(
-        Duration::from_secs(5),
-        &mut endpoint.stalled_request_started,
-    )
-    .await
-    .expect("server must observe the live transport before the deadline abort")
-    .expect("stall barrier sender must not be dropped");
+    // Causal: the real stalled transport must be live before drain starts.
+    endpoint
+        .stalled_request_started
+        .await
+        .expect("server must observe the live transport before the deadline abort");
     assert_eq!(generation.in_flight(), 1);
     assert_eq!(metrics.channel_snapshot("webhook").in_flight, 1);
     assert!(!generation.is_cancelled(), "reload retirement must stay disjoint");
 
+    // Comfortably long virtual budget: hard abort cannot fire until the test
+    // advances paused time past this deadline.
+    let drain_budget = Duration::from_secs(5);
     let drain_slot = Arc::clone(&slot);
-    let drain = tokio::spawn(async move {
-        // Near-zero budget forces the hard abort path once the stalled send
-        // cannot finish. Causal: the endpoint has already accepted.
-        drain_slot.shutdown(Duration::from_millis(1)).await
-    });
+    let drain = tokio::spawn(async move { drain_slot.shutdown(drain_budget).await });
 
-    // Wait until the draining generation rejects new external work so the
-    // replacement cycle below genuinely starts mid-drain.
+    // Wait until draining A rejects new external work so replacement is mid-drain.
     while slot.spawn_terminal(async {}) {
         tokio::task::yield_now().await;
     }
+
+    // A is admission-closed but must still be draining — not hard-aborting —
+    // because virtual time has not crossed the budget.
+    assert_eq!(
+        settles.len(),
+        0,
+        "A must not settle ShutdownDeadline before the virtual deadline advances"
+    );
+    assert_eq!(
+        generation.in_flight(),
+        1,
+        "stalled A delivery must still be in flight before the virtual deadline"
+    );
+    assert_eq!(
+        metrics
+            .channel_snapshot("webhook")
+            .abandoned_for(AbandonReason::ShutdownDeadline),
+        0,
+        "no shutdown-deadline abandonment before virtual time advances"
+    );
+
     let lifecycle_b_generation = slot.begin_cycle();
     assert_ne!(
         lifecycle_b_generation, lifecycle_a_generation,
@@ -1123,8 +1146,22 @@ async fn hard_shutdown_deadline_aborts_admitted_notification_exactly_once() {
     );
     assert!(
         slot.spawn_terminal(async {}),
-        "replacement lifecycle B must admit work while A hard-aborts"
+        "replacement lifecycle B must admit work while A is still not hard-aborting"
     );
+    assert_eq!(
+        settles.len(),
+        0,
+        "installing B must precede A's hard abort; no settle may land yet"
+    );
+    assert_eq!(
+        generation.in_flight(),
+        1,
+        "A's stalled delivery must still be alive after B opens"
+    );
+
+    // Only now advance past A's drain budget so cancel_remaining runs on A
+    // while B is the slot's current non-cancelling lifecycle.
+    tokio::time::advance(drain_budget + Duration::from_millis(1)).await;
 
     assert_eq!(
         settles.wait_for_settles(1).await,
@@ -1146,13 +1183,10 @@ async fn hard_shutdown_deadline_aborts_admitted_notification_exactly_once() {
         "stalled send must force the shutdown budget to expire"
     );
 
-    timeout(
-        Duration::from_secs(5),
-        &mut endpoint.stalled_connection_closed,
-    )
-    .await
-    .expect("hard abort must drop the in-flight transport future")
-    .expect("close witness sender must not be dropped");
+    endpoint
+        .stalled_connection_closed
+        .await
+        .expect("hard abort must drop the in-flight transport future");
 
     let snap = metrics.channel_snapshot("webhook");
     assert_eq!(snap.attempted, 1);

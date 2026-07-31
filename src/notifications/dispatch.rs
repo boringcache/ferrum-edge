@@ -189,6 +189,68 @@ pub fn dispatch_one(
     log_source: &'static str,
     on_settle: Option<DeliveryCallback>,
 ) -> bool {
+    dispatch_one_impl(
+        notification,
+        extras,
+        channel,
+        sem,
+        http,
+        generation,
+        retry,
+        log_source,
+        on_settle,
+        None,
+    )
+}
+
+/// Like [`dispatch_one`], but admits through an owned
+/// [`crate::observability_delivery::DeliverySlot`] instead of the process-global
+/// registry.
+///
+/// Hidden test seam only: external shutdown-deadline regressions drive a real
+/// hard abort without closing global delivery admission for concurrent suites.
+/// Production callers must use [`dispatch_one`] / the process-global registry.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_one_with_delivery_slot(
+    notification: Arc<Notification>,
+    extras: Arc<std::collections::HashMap<String, String>>,
+    channel: Arc<NotificationChannel>,
+    sem: Arc<Semaphore>,
+    http: PluginHttpClient,
+    generation: Arc<DispatchGeneration>,
+    retry: DeliveryRetryPolicy,
+    log_source: &'static str,
+    on_settle: Option<DeliveryCallback>,
+    slot: &crate::observability_delivery::DeliverySlot,
+) -> bool {
+    dispatch_one_impl(
+        notification,
+        extras,
+        channel,
+        sem,
+        http,
+        generation,
+        retry,
+        log_source,
+        on_settle,
+        Some(slot),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_one_impl(
+    notification: Arc<Notification>,
+    extras: Arc<std::collections::HashMap<String, String>>,
+    channel: Arc<NotificationChannel>,
+    sem: Arc<Semaphore>,
+    http: PluginHttpClient,
+    generation: Arc<DispatchGeneration>,
+    retry: DeliveryRetryPolicy,
+    log_source: &'static str,
+    on_settle: Option<DeliveryCallback>,
+    slot: Option<&crate::observability_delivery::DeliverySlot>,
+) -> bool {
     let channel_type = channel.kind();
     let permit = match Arc::clone(&sem).try_acquire_owned() {
         Ok(p) => p,
@@ -217,101 +279,27 @@ pub fn dispatch_one(
         }
     };
 
-    let spawned = generation.spawn(channel_type, on_settle, {
-        let channel = Arc::clone(&channel);
-        let generation = Arc::clone(&generation);
-        async move {
-            run_with_retries(
-                channel,
-                notification,
-                extras,
-                http,
-                permit,
-                retry,
-                &generation,
-                log_source,
-            )
-            .await
-        }
-    });
-
-    if !spawned {
-        warn!(
-            source = log_source,
-            channel = %channel.name(),
-            channel_type,
-            "notification dispatch rejected by delivery generation or shutdown registry"
-        );
-        return false;
-    }
-    true
-}
-
-/// Like [`dispatch_one`], but admits the delivery task through an owned
-/// [`crate::observability_delivery::DeliverySlot`] instead of the process-global
-/// registry.
-///
-/// External shutdown-deadline regressions use this so they can drive a real
-/// hard abort without closing global delivery admission for concurrent tests.
-#[allow(clippy::too_many_arguments)]
-pub fn dispatch_one_with_delivery_slot(
-    notification: Arc<Notification>,
-    extras: Arc<std::collections::HashMap<String, String>>,
-    channel: Arc<NotificationChannel>,
-    sem: Arc<Semaphore>,
-    http: PluginHttpClient,
-    generation: Arc<DispatchGeneration>,
-    retry: DeliveryRetryPolicy,
-    log_source: &'static str,
-    on_settle: Option<DeliveryCallback>,
-    slot: &crate::observability_delivery::DeliverySlot,
-) -> bool {
-    let channel_type = channel.kind();
-    let permit = match Arc::clone(&sem).try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            generation
-                .metrics()
-                .record_backpressure_dropped(channel_type);
-            warn!(
-                source = log_source,
-                channel = %channel.name(),
-                channel_type,
-                "notification dispatch backpressure: dropping notification"
-            );
-            if let Some(cb) = on_settle.as_ref() {
-                invoke_delivery_callback(
-                    cb,
-                    DispatchSettle::Abandoned(AbandonReason::Backpressure),
-                    channel_type,
-                );
-            }
-            return false;
-        }
+    let channel_for_task = Arc::clone(&channel);
+    let generation_for_task = Arc::clone(&generation);
+    let future = async move {
+        run_with_retries(
+            channel_for_task,
+            notification,
+            extras,
+            http,
+            permit,
+            retry,
+            &generation_for_task,
+            log_source,
+        )
+        .await
     };
-
-    let spawned = generation.spawn_with_delivery_slot(
-        channel_type,
-        on_settle,
-        slot,
-        {
-            let channel = Arc::clone(&channel);
-            let generation = Arc::clone(&generation);
-            async move {
-                run_with_retries(
-                    channel,
-                    notification,
-                    extras,
-                    http,
-                    permit,
-                    retry,
-                    &generation,
-                    log_source,
-                )
-                .await
-            }
-        },
-    );
+    let spawned = match slot {
+        Some(slot) => {
+            generation.spawn_with_delivery_slot(channel_type, on_settle, slot, future)
+        }
+        None => generation.spawn(channel_type, on_settle, future),
+    };
 
     if !spawned {
         warn!(
