@@ -764,3 +764,58 @@ When using load balancers:
 3. Issue client certificates to authorized clients
 4. Update client applications to present certificates
 5. Gradually enforce mTLS (start with optional, then required)
+
+## Managed TLS And ACME Across Multiple Replicas
+
+Admin-managed TLS records (`managed://`), ACME certificates/orders/accounts
+(`acme://`), and the ACME renewal claims all live as JSON documents under
+`FERRUM_TLS_MANAGED_STORE_PATH`. Several gateway instances may share that
+directory.
+
+### Deployment contract
+
+- **Shared writable volume — supported.** Point every replica's
+  `FERRUM_TLS_MANAGED_STORE_PATH` at the same directory on a filesystem that
+  supports POSIX advisory locks (`flock`) — a local volume, a
+  `ReadWriteMany` block/POSIX volume, or a host path shared by co-located
+  pods. Reads are revalidated against the file on every access and writes are
+  serialized read-modify-writes, so replicas see each other's records and
+  interleaved updates never overwrite one another.
+- **Per-replica (unshared) storage — single-writer only.** With per-pod
+  volumes there is no shared state to coordinate: a record uploaded through
+  replica A simply does not exist on replica B, and B can reject a config that
+  A can serve. Run exactly one instance with admin mutations and auto-renew
+  enabled, or move to a shared volume.
+- **Network filesystems without working advisory locks** (some NFS setups)
+  are not supported: mutual exclusion depends on `flock`, and without it the
+  store degrades to the unsafe whole-file-rewrite behaviour.
+
+### What is coordinated
+
+| Concern | Mechanism |
+| --- | --- |
+| Cross-instance visibility | Every read revalidates the document's identity stamp and re-reads on change. `managed://` / `acme://` source polling (`FERRUM_SECRET_REFRESH_INTERVAL_SECONDS`, or a per-source `?poll=`) therefore picks up another replica's rotation through the ordinary reload path. |
+| Lost-update prevention | Each mutation takes an exclusive advisory lock on a sidecar `.<file>.lock`, re-reads the authoritative document under that lock, applies the change, and republishes atomically. Create-without-overwrite and cross-kind ID conflicts are evaluated against authoritative state, so a concurrent create returns `409` rather than silently replacing another instance's record. |
+| Single renewer | Before renewing a certificate, an instance must win that certificate's claim in `tls-leases.json`. Exactly one holder is granted at a time, so two replicas cannot create duplicate orders or collide on challenge state. |
+| Crash recovery | A claim carries `expires_at` (`FERRUM_ACME_RENEWAL_LEASE_TTL_SECONDS`) and a monotonic fence. A holder that dies loses the claim when it expires and another replica takes over; the dead holder's fence is stale, so it can no longer renew or release the claim if it comes back. |
+| Fail-closed ambiguity | A lock that cannot be taken within `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`, an unreadable or unparseable document, or an unreadable lease table is an error. Admin mutations fail, HTTP-01/TLS-ALPN-01 challenges are not served from stale state, and the renewal is skipped rather than run twice. |
+
+### Operational notes
+
+- Store files (including `tls-leases.json` and the `.lock` sidecars) are
+  created with owner-only permissions on Unix. The lease table holds only
+  instance identities and timestamps — no certificates, keys, or account
+  credentials.
+- Set `FERRUM_TLS_STORE_INSTANCE_ID` to a stable per-replica value (for
+  example the pod name) so a restarting replica reclaims its own live renewal
+  claim instead of waiting out the TTL.
+- `FERRUM_ACME_RENEWAL_LEASE_TTL_SECONDS` must exceed one full ACME
+  order/finalize cycle, including `FERRUM_ACME_DNS01_PROPAGATION_SECONDS`. The
+  holder extends the claim after DNS-01 propagation and abandons the renewal if
+  it has already been taken over.
+- Managed TLS and ACME admin endpoints use the non-topology admin write gate
+  (read-only mode and database-unavailable) only. They deliberately do not
+  acquire a config-database write-topology pin and are not gated by
+  `FERRUM_DB_FAILOVER_ALLOW_WRITES`: these stores are independent of the
+  configuration database, and slow ACME network work must not defer database
+  failover or failback.

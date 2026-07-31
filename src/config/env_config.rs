@@ -29,6 +29,43 @@ pub fn tls_managed_store_path_from_env() -> String {
         .unwrap_or_else(|| DEFAULT_TLS_MANAGED_STORE_PATH.to_string())
 }
 
+/// Default bound on waiting for the shared managed-TLS/ACME store lock.
+pub const DEFAULT_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 10;
+const MIN_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 1;
+const MAX_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 120;
+
+/// How long a managed TLS / ACME store mutation waits for the cross-instance
+/// advisory lock before failing closed (`FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`).
+///
+/// Read directly rather than through `EnvConfig` because the stores are opened
+/// lazily by the admin API, the `managed://` / `acme://` source loaders, and the
+/// renewal scheduler — all of which can run before or without a full
+/// `EnvConfig`. An unparseable value falls back to the default; the setting only
+/// bounds a wait, so a hard startup failure here would be worse than the bound.
+pub fn tls_store_lock_timeout_from_env() -> std::time::Duration {
+    let key = "FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS";
+    let raw = crate::config::conf_file::resolve_ferrum_var(key);
+    let parsed = raw.and_then(|value| value.trim().parse::<u64>().ok());
+    let seconds = parsed.unwrap_or(DEFAULT_TLS_STORE_LOCK_TIMEOUT_SECONDS);
+    let seconds = seconds.clamp(
+        MIN_TLS_STORE_LOCK_TIMEOUT_SECONDS,
+        MAX_TLS_STORE_LOCK_TIMEOUT_SECONDS,
+    );
+    std::time::Duration::from_secs(seconds)
+}
+
+/// Operator-pinned identity for this instance's shared TLS store leases
+/// (`FERRUM_TLS_STORE_INSTANCE_ID`).
+///
+/// Blank is treated as unset so a templated-but-empty value falls back to the
+/// generated per-process identity rather than colliding across replicas.
+pub fn tls_store_instance_id_from_env() -> Option<String> {
+    let key = "FERRUM_TLS_STORE_INSTANCE_ID";
+    let raw = crate::config::conf_file::resolve_ferrum_var(key);
+    let trimmed = raw.map(|value| value.trim().to_string());
+    trimmed.filter(|value| !value.is_empty())
+}
+
 /// SQL connection target for secondary consumers that must track the gateway
 /// configuration database (`FERRUM_DB_TYPE` + effective `FERRUM_DB_URL`).
 ///
@@ -983,6 +1020,12 @@ pub struct EnvConfig {
     /// Seconds to wait after DNS-01 hook publication before marking the ACME
     /// challenge ready.
     pub acme_dns01_propagation_seconds: u64,
+    /// Lifetime of the shared per-certificate ACME renewal lease that makes one
+    /// instance the single renewer for a given certificate. A crashed holder's
+    /// claim expires after this long and another instance takes over, so the
+    /// value must comfortably exceed one full order/finalize cycle including
+    /// DNS-01 propagation. Default: 900.
+    pub acme_renewal_lease_ttl_seconds: u64,
     /// When true, streaming responses are wrapped with a lightweight tracker
     /// that records the final transfer time via a deferred task. Adds one
     /// `Arc<StreamingMetrics>` + one `tokio::spawn` per streaming request.
@@ -2508,6 +2551,7 @@ impl Default for EnvConfig {
             acme_renew_poll_timeout_seconds: 60,
             acme_dns01_hook_command: None,
             acme_dns01_propagation_seconds: 60,
+            acme_renewal_lease_ttl_seconds: 900,
             enable_streaming_latency_tracking: false,
             proxy_http_port: 8000,
             proxy_https_port: 8443,
@@ -2866,6 +2910,7 @@ impl EnvConfig {
             acme_renew_poll_timeout_seconds: u64 = "FERRUM_ACME_RENEW_POLL_TIMEOUT_SECONDS" => 60u64, clamp(1u64, 600u64);
             acme_dns01_hook_command: Option<String> = "FERRUM_ACME_DNS01_HOOK_COMMAND";
             acme_dns01_propagation_seconds: u64 = "FERRUM_ACME_DNS01_PROPAGATION_SECONDS" => 60u64, clamp(0u64, 3600u64);
+            acme_renewal_lease_ttl_seconds: u64 = "FERRUM_ACME_RENEWAL_LEASE_TTL_SECONDS" => 900u64, clamp(60u64, 7_200u64);
             enable_streaming_latency_tracking: bool = "FERRUM_ENABLE_STREAMING_LATENCY_TRACKING" => false;
         }
         let log_buffer_bytes = log_buffer_bytes.max(log_max_record_bytes);
@@ -3631,6 +3676,7 @@ impl EnvConfig {
             acme_renew_poll_timeout_seconds,
             acme_dns01_hook_command,
             acme_dns01_propagation_seconds,
+            acme_renewal_lease_ttl_seconds,
             enable_streaming_latency_tracking,
             proxy_http_port,
             proxy_https_port,

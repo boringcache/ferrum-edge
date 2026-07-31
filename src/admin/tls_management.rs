@@ -144,7 +144,10 @@ pub(super) async fn handle_list_managed(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    let records = store.list(kind);
+    let records = match store.list(kind) {
+        Ok(records) => records,
+        Err(error) => return Ok(managed_error_response(error)),
+    };
     let body = super::paginate_response(&records, pagination);
     Ok(super::json_response(StatusCode::OK, &body))
 }
@@ -156,7 +159,10 @@ pub(super) async fn handle_list_acme_certificates(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    let records = store.list_certificates();
+    let records = match store.list_certificates() {
+        Ok(records) => records,
+        Err(error) => return Ok(acme_error_response(error)),
+    };
     let body = super::paginate_response(&records, pagination);
     Ok(super::json_response(StatusCode::OK, &body))
 }
@@ -184,7 +190,10 @@ pub(super) async fn handle_list_acme_orders(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    let records = store.list_orders();
+    let records = match store.list_orders() {
+        Ok(records) => records,
+        Err(error) => return Ok(acme_error_response(error)),
+    };
     let body = super::paginate_response(&records, pagination);
     Ok(super::json_response(StatusCode::OK, &body))
 }
@@ -214,12 +223,24 @@ pub(super) async fn handle_list_acme_accounts(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    let certificates = certificate_store.list_certificates();
+    let certificates = match certificate_store.list_certificates() {
+        Ok(certificates) => certificates,
+        Err(error) => return Ok(acme_error_response(error)),
+    };
+    // A missing account store is an empty credential set (accounts are also
+    // derivable from orders), but an *unreadable* one is an error: reporting
+    // "no persisted credentials" from a failed read would be misleading.
     let persisted_accounts = match acme_account_store_response() {
-        Ok(store) => store.list_accounts(),
+        Ok(store) => match store.list_accounts() {
+            Ok(accounts) => accounts,
+            Err(error) => return Ok(acme_error_response(error)),
+        },
         Err(_) => Vec::new(),
     };
-    let accounts = order_store.list_accounts(&certificates, &persisted_accounts);
+    let accounts = match order_store.list_accounts(&certificates, &persisted_accounts) {
+        Ok(accounts) => accounts,
+        Err(error) => return Ok(acme_error_response(error)),
+    };
     let body = super::paginate_response(&accounts, pagination);
     Ok(super::json_response(StatusCode::OK, &body))
 }

@@ -4,6 +4,15 @@
 //! `acme://` source loader reads the stored material so issued certificates
 //! flow through the same reload/inventory path as file, provider, Kubernetes,
 //! and admin-managed sources.
+//!
+//! The certificate, order, and account documents are shared rather than
+//! process-local (issue #2409). Reads revalidate against the file, so an order
+//! or certificate another replica committed is visible without a restart;
+//! mutations run as exclusive-lock read-modify-writes against authoritative
+//! state, so interleaved writes cannot erase one another. Renewal itself is
+//! additionally serialized by a shared per-certificate lease
+//! (`crate::tls::lease`) so exactly one instance drives a given renewal and a
+//! crashed holder's claim expires into a takeover.
 
 // This module mixes always-compiled glue (the TLS-ALPN-01 resolver, HTTP-01
 // challenge serving) with order/account-store and challenge-validation helpers
@@ -16,7 +25,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(feature = "acme")]
 use std::time::Duration;
 
@@ -32,6 +41,7 @@ use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::prelude::*;
 
 use crate::config::types::validate_resource_id;
+use crate::tls::shared_store::{SharedStoreError, SharedStoreFile, VersionedStoreFile};
 use crate::tls::source::MaterialKind;
 
 const STORE_FILE_NAME: &str = "acme-certificates.json";
@@ -313,138 +323,156 @@ pub enum AcmeError {
     BlockedDirectoryUrl(String),
 }
 
+impl From<SharedStoreError> for AcmeError {
+    fn from(error: SharedStoreError) -> Self {
+        match &error {
+            SharedStoreError::Read { .. } => Self::Read(error.to_string()),
+            SharedStoreError::Parse { .. } => Self::Parse(error.to_string()),
+            // A lock timeout is a write-side ambiguity: the mutation did not
+            // land, and the caller must not treat it as applied.
+            SharedStoreError::Write { .. } | SharedStoreError::LockTimeout { .. } => {
+                Self::Write(error.to_string())
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AcmeCertificateStoreFile {
+    /// Monotonic version stamped by every committed shared-store write.
+    #[serde(default)]
+    store_version: u64,
     #[serde(default)]
     certificates: BTreeMap<String, AcmeCertificateRecord>,
+}
+
+impl VersionedStoreFile for AcmeCertificateStoreFile {
+    fn store_version(&self) -> u64 {
+        self.store_version
+    }
+
+    fn set_store_version(&mut self, version: u64) {
+        self.store_version = version;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AcmeOrderStoreFile {
     #[serde(default)]
+    store_version: u64,
+    #[serde(default)]
     orders: BTreeMap<String, AcmeOrderRecord>,
+}
+
+impl VersionedStoreFile for AcmeOrderStoreFile {
+    fn store_version(&self) -> u64 {
+        self.store_version
+    }
+
+    fn set_store_version(&mut self, version: u64) {
+        self.store_version = version;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AcmeAccountStoreFile {
     #[serde(default)]
+    store_version: u64,
+    #[serde(default)]
     accounts: BTreeMap<String, AcmeAccountRecord>,
+}
+
+impl VersionedStoreFile for AcmeAccountStoreFile {
+    fn store_version(&self) -> u64 {
+        self.store_version
+    }
+
+    fn set_store_version(&mut self, version: u64) {
+        self.store_version = version;
+    }
 }
 
 #[derive(Debug)]
 pub struct AcmeCertificateStore {
-    path: PathBuf,
-    certificates: RwLock<BTreeMap<String, AcmeCertificateRecord>>,
+    file: SharedStoreFile<AcmeCertificateStoreFile>,
 }
 
 #[derive(Debug)]
 pub struct AcmeOrderStore {
-    path: PathBuf,
-    orders: RwLock<BTreeMap<String, AcmeOrderRecord>>,
+    file: SharedStoreFile<AcmeOrderStoreFile>,
 }
 
 #[derive(Debug)]
 pub struct AcmeAccountStore {
-    path: PathBuf,
-    accounts: RwLock<BTreeMap<String, AcmeAccountRecord>>,
+    file: SharedStoreFile<AcmeAccountStoreFile>,
 }
 
 impl AcmeCertificateStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, AcmeError> {
-        let dir = dir.into();
-        if dir.as_os_str().is_empty() {
-            return Err(AcmeError::InvalidPath(
-                "store directory must not be empty".to_string(),
-            ));
-        }
-        std::fs::create_dir_all(&dir).map_err(|error| AcmeError::Write(error.to_string()))?;
-        let path = dir.join(STORE_FILE_NAME);
-        let file = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<AcmeCertificateStoreFile>(&bytes)
-                .map_err(|error| AcmeError::Parse(error.to_string()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                AcmeCertificateStoreFile::default()
-            }
-            Err(error) => return Err(AcmeError::Read(error.to_string())),
-        };
         Ok(Self {
-            path,
-            certificates: RwLock::new(file.certificates),
+            file: SharedStoreFile::open(acme_store_path(dir, STORE_FILE_NAME)?)?,
         })
     }
 
-    pub fn list_certificates(&self) -> Vec<AcmeCertificateSummary> {
-        match self.certificates.read() {
-            Ok(certificates) => certificates
-                .values()
-                .map(AcmeCertificateRecord::summary)
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+    /// Version of the authoritative document behind the last read. Non-secret.
+    #[allow(dead_code)]
+    pub fn store_version(&self) -> Result<u64, AcmeError> {
+        Ok(self.file.version()?)
+    }
+
+    pub fn list_certificates(&self) -> Result<Vec<AcmeCertificateSummary>, AcmeError> {
+        let document = self.file.snapshot()?;
+        let summaries = document.certificates.values();
+        Ok(summaries.map(AcmeCertificateRecord::summary).collect())
     }
 
     #[cfg(feature = "acme")]
-    pub fn list_certificate_records(&self) -> Vec<AcmeCertificateRecord> {
-        match self.certificates.read() {
-            Ok(certificates) => certificates.values().cloned().collect(),
-            Err(_) => Vec::new(),
-        }
+    pub fn list_certificate_records(&self) -> Result<Vec<AcmeCertificateRecord>, AcmeError> {
+        let document = self.file.snapshot()?;
+        Ok(document.certificates.values().cloned().collect())
     }
 
     pub fn get_certificate(&self, id: &str) -> Result<AcmeCertificateRecord, AcmeError> {
         validate_acme_id(id)?;
-        let certificates = self
-            .certificates
-            .read()
-            .map_err(|_| AcmeError::Read("ACME certificate store lock is poisoned".to_string()))?;
-        certificates
-            .get(id)
-            .cloned()
-            .ok_or_else(|| AcmeError::NotFound(id.to_string()))
+        let document = self.file.snapshot()?;
+        let record = document.certificates.get(id).cloned();
+        record.ok_or_else(|| AcmeError::NotFound(id.to_string()))
     }
 
     pub fn upsert_certificate(
         &self,
-        mut record: AcmeCertificateRecord,
+        record: AcmeCertificateRecord,
         allow_overwrite: bool,
     ) -> Result<AcmeCertificateRecord, AcmeError> {
         validate_acme_id(&record.id)?;
         validate_acme_domains(&record.domains)?;
-        let mut certificates = self
-            .certificates
-            .write()
-            .map_err(|_| AcmeError::Write("ACME certificate store lock is poisoned".to_string()))?;
-        let now = Utc::now();
-        if let Some(existing) = certificates.get(&record.id) {
-            if !allow_overwrite {
-                return Err(AcmeError::AlreadyExists(record.id));
+        self.file.mutate(move |document| {
+            let mut record = record;
+            let now = Utc::now();
+            if let Some(existing) = document.certificates.get(&record.id) {
+                if !allow_overwrite {
+                    return Err(AcmeError::AlreadyExists(record.id));
+                }
+                record.created_at = existing.created_at;
+                record.updated_at = now;
+            } else {
+                record.created_at = now;
+                record.updated_at = now;
             }
-            record.created_at = existing.created_at;
-            record.updated_at = now;
-        } else {
-            record.created_at = now;
-            record.updated_at = now;
-        }
-        let mut candidate = certificates.clone();
-        candidate.insert(record.id.clone(), record.clone());
-        self.persist_locked(&candidate)?;
-        *certificates = candidate;
-        Ok(record)
+            document
+                .certificates
+                .insert(record.id.clone(), record.clone());
+            Ok(record)
+        })
     }
 
     pub fn delete_certificate(&self, id: &str) -> Result<AcmeCertificateRecord, AcmeError> {
         validate_acme_id(id)?;
-        let mut certificates = self
-            .certificates
-            .write()
-            .map_err(|_| AcmeError::Write("ACME certificate store lock is poisoned".to_string()))?;
-        let mut candidate = certificates.clone();
-        let removed = candidate
-            .remove(id)
-            .ok_or_else(|| AcmeError::NotFound(id.to_string()))?;
-        self.persist_locked(&candidate)?;
-        *certificates = candidate;
-        Ok(removed)
+        let id = id.to_string();
+        self.file.mutate(move |document| {
+            let removed = document.certificates.remove(&id);
+            removed.ok_or_else(|| AcmeError::NotFound(id))
+        })
     }
 
     pub fn material(
@@ -456,83 +484,69 @@ impl AcmeCertificateStore {
         let record = self.get_certificate(&reference.id)?;
         reference.material_from(record)
     }
+}
 
-    fn persist_locked(
-        &self,
-        certificates: &BTreeMap<String, AcmeCertificateRecord>,
-    ) -> Result<(), AcmeError> {
-        let payload = serde_json::to_vec_pretty(&AcmeCertificateStoreFile {
-            certificates: certificates.clone(),
-        })
-        .map_err(|error| AcmeError::Write(error.to_string()))?;
-        crate::tls::private_file::replace_private_file(&self.path, &payload)
-            .map_err(|error| AcmeError::Write(error.to_string()))?;
-        Ok(())
+/// Resolve and create the shared ACME store directory, returning the document
+/// path inside it.
+fn acme_store_path(dir: impl Into<PathBuf>, file_name: &str) -> Result<PathBuf, AcmeError> {
+    let dir = dir.into();
+    if dir.as_os_str().is_empty() {
+        return Err(AcmeError::InvalidPath(
+            "store directory must not be empty".to_string(),
+        ));
     }
+    std::fs::create_dir_all(&dir).map_err(|error| AcmeError::Write(error.to_string()))?;
+    Ok(dir.join(file_name))
 }
 
 impl AcmeOrderStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, AcmeError> {
-        let dir = dir.into();
-        if dir.as_os_str().is_empty() {
-            return Err(AcmeError::InvalidPath(
-                "store directory must not be empty".to_string(),
-            ));
-        }
-        std::fs::create_dir_all(&dir).map_err(|error| AcmeError::Write(error.to_string()))?;
-        let path = dir.join(ORDER_STORE_FILE_NAME);
-        let file = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<AcmeOrderStoreFile>(&bytes)
-                .map_err(|error| AcmeError::Parse(error.to_string()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                AcmeOrderStoreFile::default()
-            }
-            Err(error) => return Err(AcmeError::Read(error.to_string())),
-        };
         Ok(Self {
-            path,
-            orders: RwLock::new(file.orders),
+            file: SharedStoreFile::open(acme_store_path(dir, ORDER_STORE_FILE_NAME)?)?,
         })
     }
 
-    pub fn list_orders(&self) -> Vec<AcmeOrderSummary> {
-        match self.orders.read() {
-            Ok(orders) => orders.values().map(AcmeOrderRecord::summary).collect(),
-            Err(_) => Vec::new(),
-        }
+    /// Version of the authoritative document behind the last read. Non-secret.
+    #[allow(dead_code)]
+    pub fn store_version(&self) -> Result<u64, AcmeError> {
+        Ok(self.file.version()?)
+    }
+
+    pub fn list_orders(&self) -> Result<Vec<AcmeOrderSummary>, AcmeError> {
+        let document = self.file.snapshot()?;
+        let orders = document.orders.values();
+        Ok(orders.map(AcmeOrderRecord::summary).collect())
     }
 
     pub fn get_order(&self, id: &str) -> Result<AcmeOrderRecord, AcmeError> {
         validate_acme_id(id)?;
-        let orders = self
-            .orders
-            .read()
-            .map_err(|_| AcmeError::Read("ACME order store lock is poisoned".to_string()))?;
-        orders
-            .get(id)
-            .cloned()
-            .ok_or_else(|| AcmeError::OrderNotFound(id.to_string()))
+        let document = self.file.snapshot()?;
+        let record = document.orders.get(id).cloned();
+        record.ok_or_else(|| AcmeError::OrderNotFound(id.to_string()))
     }
 
+    /// Most recently updated order for a certificate, across every instance.
+    ///
+    /// This is the duplicate-renewal guard's input, so it must be authoritative
+    /// rather than process-local: an order another replica just created has to
+    /// be visible here or two replicas order the same certificate.
     pub fn latest_order_for_certificate(
         &self,
         certificate_id: &str,
     ) -> Result<Option<AcmeOrderRecord>, AcmeError> {
         validate_acme_id(certificate_id)?;
-        let orders = self
+        let document = self.file.snapshot()?;
+        let latest = document
             .orders
-            .read()
-            .map_err(|_| AcmeError::Read("ACME order store lock is poisoned".to_string()))?;
-        Ok(orders
             .values()
             .filter(|order| order.certificate_id.as_deref() == Some(certificate_id))
-            .max_by_key(|order| order.updated_at)
-            .cloned())
+            .max_by_key(|order| order.updated_at);
+        Ok(latest.cloned())
     }
 
     pub fn upsert_order(
         &self,
-        mut record: AcmeOrderRecord,
+        record: AcmeOrderRecord,
         allow_overwrite: bool,
     ) -> Result<AcmeOrderRecord, AcmeError> {
         validate_acme_id(&record.id)?;
@@ -543,49 +557,44 @@ impl AcmeOrderStore {
         validate_http01_challenges(&record.http01_challenges)?;
         validate_tls_alpn01_challenges(&record.tls_alpn01_challenges)?;
         validate_dns01_challenges(&record.dns01_challenges)?;
-        let mut orders = self
-            .orders
-            .write()
-            .map_err(|_| AcmeError::Write("ACME order store lock is poisoned".to_string()))?;
-        let now = Utc::now();
-        if let Some(existing) = orders.get(&record.id) {
-            if !allow_overwrite {
-                return Err(AcmeError::OrderAlreadyExists(record.id));
+        self.file.mutate(move |document| {
+            let mut record = record;
+            let now = Utc::now();
+            if let Some(existing) = document.orders.get(&record.id) {
+                if !allow_overwrite {
+                    return Err(AcmeError::OrderAlreadyExists(record.id));
+                }
+                record.created_at = existing.created_at;
+                record.updated_at = now;
+            } else {
+                record.created_at = now;
+                record.updated_at = now;
             }
-            record.created_at = existing.created_at;
-            record.updated_at = now;
-        } else {
-            record.created_at = now;
-            record.updated_at = now;
-        }
-        let mut candidate = orders.clone();
-        candidate.insert(record.id.clone(), record.clone());
-        self.persist_locked(&candidate)?;
-        *orders = candidate;
-        Ok(record)
+            document.orders.insert(record.id.clone(), record.clone());
+            Ok(record)
+        })
     }
 
     pub fn delete_order(&self, id: &str) -> Result<AcmeOrderRecord, AcmeError> {
         validate_acme_id(id)?;
-        let mut orders = self
-            .orders
-            .write()
-            .map_err(|_| AcmeError::Write("ACME order store lock is poisoned".to_string()))?;
-        let mut candidate = orders.clone();
-        let removed = candidate
-            .remove(id)
-            .ok_or_else(|| AcmeError::OrderNotFound(id.to_string()))?;
-        self.persist_locked(&candidate)?;
-        *orders = candidate;
-        Ok(removed)
+        let id = id.to_string();
+        self.file.mutate(move |document| {
+            let removed = document.orders.remove(&id);
+            removed.ok_or_else(|| AcmeError::OrderNotFound(id))
+        })
     }
 
+    /// Key authorization for a pending HTTP-01 token.
+    ///
+    /// Fails closed: an unreadable shared document serves no challenge rather
+    /// than answering from a stale local map.
     pub fn http01_key_authorization(&self, token: &str) -> Option<String> {
         if validate_http01_token(token).is_err() {
             return None;
         }
-        let orders = self.orders.read().ok()?;
-        orders
+        let document = self.file.snapshot().ok()?;
+        document
+            .orders
             .values()
             .filter(|order| {
                 matches!(
@@ -602,8 +611,9 @@ impl AcmeOrderStore {
 
     pub fn tls_alpn01_key_authorization(&self, identifier: &str) -> Option<String> {
         let identifier = normalize_tls_alpn_identifier(identifier)?;
-        let orders = self.orders.read().ok()?;
-        orders
+        let document = self.file.snapshot().ok()?;
+        document
+            .orders
             .values()
             .filter(|order| {
                 matches!(
@@ -624,7 +634,7 @@ impl AcmeOrderStore {
         &self,
         certificates: &[AcmeCertificateSummary],
         persisted_accounts: &[AcmeAccountRecord],
-    ) -> Vec<AcmeAccountSummary> {
+    ) -> Result<Vec<AcmeAccountSummary>, AcmeError> {
         let mut accounts = BTreeMap::new();
         for persisted in persisted_accounts {
             let account = account_summary_entry(
@@ -647,61 +657,36 @@ impl AcmeOrderStore {
                 Some(certificate.updated_at),
             );
         }
-        if let Ok(orders) = self.orders.read() {
-            for order in orders.values() {
-                let Some(account_id) = order.account_id.as_deref() else {
-                    continue;
-                };
-                let account =
-                    account_summary_entry(&mut accounts, account_id, &order.directory_url);
-                account.order_count += 1;
-                account.has_persisted_credentials |= order.account_credentials_json.is_some();
-                account.last_order_at = max_datetime(account.last_order_at, Some(order.updated_at));
-            }
+        let document = self.file.snapshot()?;
+        for order in document.orders.values() {
+            let Some(account_id) = order.account_id.as_deref() else {
+                continue;
+            };
+            let account = account_summary_entry(&mut accounts, account_id, &order.directory_url);
+            account.order_count += 1;
+            account.has_persisted_credentials |= order.account_credentials_json.is_some();
+            account.last_order_at = max_datetime(account.last_order_at, Some(order.updated_at));
         }
-        accounts.into_values().collect()
-    }
-
-    fn persist_locked(&self, orders: &BTreeMap<String, AcmeOrderRecord>) -> Result<(), AcmeError> {
-        let payload = serde_json::to_vec_pretty(&AcmeOrderStoreFile {
-            orders: orders.clone(),
-        })
-        .map_err(|error| AcmeError::Write(error.to_string()))?;
-        crate::tls::private_file::replace_private_file(&self.path, &payload)
-            .map_err(|error| AcmeError::Write(error.to_string()))?;
-        Ok(())
+        Ok(accounts.into_values().collect())
     }
 }
 
 impl AcmeAccountStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, AcmeError> {
-        let dir = dir.into();
-        if dir.as_os_str().is_empty() {
-            return Err(AcmeError::InvalidPath(
-                "store directory must not be empty".to_string(),
-            ));
-        }
-        std::fs::create_dir_all(&dir).map_err(|error| AcmeError::Write(error.to_string()))?;
-        let path = dir.join(ACCOUNT_STORE_FILE_NAME);
-        let file = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<AcmeAccountStoreFile>(&bytes)
-                .map_err(|error| AcmeError::Parse(error.to_string()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                AcmeAccountStoreFile::default()
-            }
-            Err(error) => return Err(AcmeError::Read(error.to_string())),
-        };
         Ok(Self {
-            path,
-            accounts: RwLock::new(file.accounts),
+            file: SharedStoreFile::open(acme_store_path(dir, ACCOUNT_STORE_FILE_NAME)?)?,
         })
     }
 
-    pub fn list_accounts(&self) -> Vec<AcmeAccountRecord> {
-        match self.accounts.read() {
-            Ok(accounts) => accounts.values().cloned().collect(),
-            Err(_) => Vec::new(),
-        }
+    /// Version of the authoritative document behind the last read. Non-secret.
+    #[allow(dead_code)]
+    pub fn store_version(&self) -> Result<u64, AcmeError> {
+        Ok(self.file.version()?)
+    }
+
+    pub fn list_accounts(&self) -> Result<Vec<AcmeAccountRecord>, AcmeError> {
+        let document = self.file.snapshot()?;
+        Ok(document.accounts.values().cloned().collect())
     }
 
     pub fn get_credentials(
@@ -712,13 +697,9 @@ impl AcmeAccountStore {
         validate_acme_directory_url(directory_url)?;
         validate_acme_account_identifier(account_id)?;
         let key = acme_account_store_key(directory_url, account_id);
-        let accounts = self
-            .accounts
-            .read()
-            .map_err(|_| AcmeError::Read("ACME account store lock is poisoned".to_string()))?;
-        Ok(accounts
-            .get(&key)
-            .map(|account| account.credentials_json.clone()))
+        let document = self.file.snapshot()?;
+        let account = document.accounts.get(&key);
+        Ok(account.map(|account| account.credentials_json.clone()))
     }
 
     pub fn upsert_account(
@@ -731,48 +712,24 @@ impl AcmeAccountStore {
         validate_acme_account_identifier(&account_id)?;
         validate_acme_account_credentials_json(&credentials_json)?;
         let key = acme_account_store_key(&directory_url, &account_id);
-        let mut accounts = self
-            .accounts
-            .write()
-            .map_err(|_| AcmeError::Write("ACME account store lock is poisoned".to_string()))?;
-        let now = Utc::now();
-        let record = if let Some(existing) = accounts.get(&key) {
-            AcmeAccountRecord {
+        self.file.mutate(move |document| {
+            let now = Utc::now();
+            let created_at = document
+                .accounts
+                .get(&key)
+                .map(|existing| existing.created_at)
+                .unwrap_or(now);
+            let record = AcmeAccountRecord {
                 account_id,
                 directory_url,
                 credentials_json,
-                created_at: existing.created_at,
+                created_at,
                 updated_at: now,
                 last_used_at: Some(now),
-            }
-        } else {
-            AcmeAccountRecord {
-                account_id,
-                directory_url,
-                credentials_json,
-                created_at: now,
-                updated_at: now,
-                last_used_at: Some(now),
-            }
-        };
-        let mut candidate = accounts.clone();
-        candidate.insert(key, record.clone());
-        self.persist_locked(&candidate)?;
-        *accounts = candidate;
-        Ok(record)
-    }
-
-    fn persist_locked(
-        &self,
-        accounts: &BTreeMap<String, AcmeAccountRecord>,
-    ) -> Result<(), AcmeError> {
-        let payload = serde_json::to_vec_pretty(&AcmeAccountStoreFile {
-            accounts: accounts.clone(),
+            };
+            document.accounts.insert(key, record.clone());
+            Ok(record)
         })
-        .map_err(|error| AcmeError::Write(error.to_string()))?;
-        crate::tls::private_file::replace_private_file(&self.path, &payload)
-            .map_err(|error| AcmeError::Write(error.to_string()))?;
-        Ok(())
     }
 }
 
@@ -1782,6 +1739,9 @@ pub struct AcmeRenewalSchedulerConfig {
     pub challenge_type: AcmeRenewalChallengeType,
     pub dns01_hook_command: Option<String>,
     pub dns01_propagation: Duration,
+    /// Lifetime of the shared per-certificate renewal claim
+    /// (`FERRUM_ACME_RENEWAL_LEASE_TTL_SECONDS`).
+    pub renewal_lease_ttl: Duration,
     pub dns_cache: crate::dns::DnsCache,
 }
 
@@ -1792,6 +1752,10 @@ pub struct AcmeRenewalRunSummary {
     pub skipped: usize,
     pub renewed: usize,
     pub failed: usize,
+    /// Certificates skipped because another instance holds the renewal lease.
+    /// Non-zero on the replicas that are *not* the renewer, which is the
+    /// expected steady state in a multi-replica deployment.
+    pub lease_denied: usize,
 }
 
 #[cfg(feature = "acme")]
@@ -1815,6 +1779,7 @@ pub fn start_renewal_scheduler(
                                 skipped = summary.skipped,
                                 renewed = summary.renewed,
                                 failed = summary.failed,
+                                lease_denied = summary.lease_denied,
                                 challenge_type = config.challenge_type.as_str(),
                                 "ACME renewal scan completed"
                             );
@@ -1840,11 +1805,14 @@ pub async fn run_due_renewals(
     let certificate_store = global_certificate_store().map_err(AcmeError::Read)?;
     let order_store = global_order_store().map_err(AcmeError::Read)?;
     let account_store = global_account_store().map_err(AcmeError::Read)?;
+    // Fail closed: without the shared lease table there is no way to tell
+    // whether another replica is already renewing, so nothing is renewed.
+    let lease_store = crate::tls::lease::global_lease_store().map_err(AcmeError::Read)?;
     let mut summary = AcmeRenewalRunSummary::default();
     let renew_before = Utc::now()
         + chrono::Duration::days(i64::try_from(config.renew_when_remaining_days).unwrap_or(30));
 
-    for certificate in certificate_store.list_certificate_records() {
+    for certificate in certificate_store.list_certificate_records()? {
         summary.checked += 1;
         if certificate.status != AcmeCertificateStatus::Issued {
             summary.skipped += 1;
@@ -1862,10 +1830,39 @@ pub async fn run_due_renewals(
             summary.skipped += 1;
             continue;
         }
+        // Single-renewer claim. Exactly one instance can hold this name at a
+        // time; the claim expires on its own so a crashed holder does not wedge
+        // renewal for the certificate.
+        let lease_name = crate::tls::lease::acme_renewal_lease_name(&certificate.id);
+        let claim = lease_store.try_acquire(&lease_name, config.renewal_lease_ttl);
+        let lease = match claim {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                summary.lease_denied += 1;
+                summary.skipped += 1;
+                continue;
+            }
+            Err(error) => {
+                summary.failed += 1;
+                tracing::warn!(
+                    certificate_id = %certificate.id,
+                    error = %error,
+                    "could not claim the ACME renewal lease; skipping this certificate"
+                );
+                continue;
+            }
+        };
+        // Re-check under the claim: another instance may have created an order
+        // between the scan above and the moment this lease was granted.
+        if has_active_renewal_order(&order_store, &certificate.id)? {
+            summary.skipped += 1;
+            continue;
+        }
         match renew_certificate_once(
             &certificate_store,
             &order_store,
             &account_store,
+            &lease,
             certificate,
             config,
         )
@@ -1905,6 +1902,7 @@ async fn renew_certificate_once(
     certificate_store: &AcmeCertificateStore,
     order_store: &AcmeOrderStore,
     account_store: &AcmeAccountStore,
+    lease: &crate::tls::lease::TlsLeaseGuard,
     certificate: AcmeCertificateRecord,
     config: &AcmeRenewalSchedulerConfig,
 ) -> Result<bool, AcmeError> {
@@ -1945,6 +1943,12 @@ async fn renew_certificate_once(
         if !config.dns01_propagation.is_zero() {
             tokio::time::sleep(config.dns01_propagation).await;
         }
+        // DNS-01 propagation can consume a large share of the lease. Extend the
+        // claim before finalizing, and abandon the renewal if it was already
+        // taken over so two instances cannot finalize the same order.
+        if !renew_renewal_lease(lease, config, &certificate.id)? {
+            return Ok(false);
+        }
     }
 
     let completion_result = complete_prepared_renewal_order(&order, config).await;
@@ -1975,6 +1979,29 @@ async fn renew_certificate_once(
     order_store.upsert_order(updated_order, true)?;
     let _ = crate::tls::source::subscription::request_all_material_set_reloads();
     Ok(true)
+}
+
+/// Extend the per-certificate renewal claim mid-flight.
+///
+/// `false` means another instance now owns the claim (this holder's lease
+/// expired and was taken over); the caller must stop acting on the renewal.
+#[cfg(feature = "acme")]
+fn renew_renewal_lease(
+    lease: &crate::tls::lease::TlsLeaseGuard,
+    config: &AcmeRenewalSchedulerConfig,
+    certificate_id: &str,
+) -> Result<bool, AcmeError> {
+    match lease.renew(config.renewal_lease_ttl) {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            tracing::warn!(
+                certificate_id = %certificate_id,
+                "ACME renewal lease was taken over by another instance; abandoning this renewal"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(AcmeError::Write(error.to_string())),
+    }
 }
 
 #[cfg(feature = "acme")]
@@ -3636,6 +3663,7 @@ mod tests {
             challenge_type: AcmeRenewalChallengeType::Http01,
             dns01_hook_command: None,
             dns01_propagation: Duration::ZERO,
+            renewal_lease_ttl: Duration::from_secs(900),
             dns_cache: client::default_acme_dns_cache(),
         };
 
@@ -3684,7 +3712,13 @@ mod tests {
         assert_eq!(cert.source_id, "acme://certificates/edge-cert#cert");
 
         let reopened = AcmeCertificateStore::open(dir.path()).expect("reopen store");
-        assert_eq!(reopened.list_certificates().len(), 1);
+        assert_eq!(
+            reopened
+                .list_certificates()
+                .expect("list certificates")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -3740,7 +3774,7 @@ mod tests {
             Some("abc_DEF-123.thumbprint")
         );
         assert_eq!(
-            store.list_orders()[0].http01_challenges[0].path,
+            store.list_orders().expect("list orders")[0].http01_challenges[0].path,
             "/.well-known/acme-challenge/abc_DEF-123"
         );
 
@@ -3807,11 +3841,11 @@ mod tests {
             Some("abc_DEF-123.thumbprint")
         );
         assert_eq!(
-            store.list_orders()[0].tls_alpn01_challenges[0].alpn_protocol,
+            store.list_orders().expect("list orders")[0].tls_alpn01_challenges[0].alpn_protocol,
             "acme-tls/1"
         );
         assert!(
-            !store.list_orders()[0].tls_alpn01_challenges[0]
+            !store.list_orders().expect("list orders")[0].tls_alpn01_challenges[0]
                 .key_authorization_sha256_base64url
                 .is_empty()
         );
@@ -3948,8 +3982,12 @@ mod tests {
             .upsert_order(order, false)
             .expect("upsert order");
 
-        let certificates = certificate_store.list_certificates();
-        let accounts = order_store.list_accounts(&certificates, &[]);
+        let certificates = certificate_store
+            .list_certificates()
+            .expect("list certificates");
+        let accounts = order_store
+            .list_accounts(&certificates, &[])
+            .expect("list accounts");
         let serialized = serde_json::to_string(&accounts).expect("serialize accounts");
 
         assert_eq!(accounts.len(), 1);
@@ -3984,7 +4022,9 @@ mod tests {
             Some(r#"{"private_key":"secret"}"#)
         );
 
-        let accounts = order_store.list_accounts(&[], &reopened.list_accounts());
+        let accounts = order_store
+            .list_accounts(&[], &reopened.list_accounts().expect("persisted accounts"))
+            .expect("list accounts");
         let serialized = serde_json::to_string(&accounts).expect("serialize accounts");
 
         assert_eq!(accounts.len(), 1);
