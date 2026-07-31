@@ -384,6 +384,7 @@ async fn backup_unknown_resources_token_is_rejected_without_persisting_canary() 
 }
 
 #[tokio::test]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
 async fn cached_backup_without_db_uses_local_fallback_audit_sink() {
     let fallback = TempDir::new().unwrap();
     let mut state = cached_only_state(sample_cached_config(), true);

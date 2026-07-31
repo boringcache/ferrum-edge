@@ -26,7 +26,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, TryLockError, Weak};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Duration, MissedTickBehavior, interval};
@@ -776,12 +776,13 @@ struct FallbackFileLock {
 ///
 /// Enforces a non-symlink directory/data/lock target, owner-only Unix
 /// permissions, collision-resistant temp publication with directory sync, and
-/// cross-process exclusion where the platform supports it. Never logs event
-/// contents.
+/// cross-process exclusion where the platform supports it. In-process and
+/// cross-process locks are acquired without waiting (`try_lock` /
+/// `LOCK_EX|LOCK_NB` on Unix; immediate share denial on Windows): contention
+/// or poisoning fails closed so a credential-bearing admit path cannot hang a
+/// Tokio blocking-pool thread. Never logs event contents.
 pub fn append_local_fallback_event(dir: &Path, event: &AuditEvent) -> Result<(), anyhow::Error> {
-    let _process_guard = LOCAL_FALLBACK_LOCK
-        .lock()
-        .map_err(|_| anyhow!("audit local fallback lock poisoned"))?;
+    let _process_guard = acquire_local_fallback_process_lock()?;
     prepare_fallback_directory(dir)?;
     let lock_path = dir.join(AUDIT_LOCAL_FALLBACK_LOCK_FILE_NAME);
     let _cross_process = acquire_fallback_file_lock(&lock_path)?;
@@ -797,16 +798,37 @@ pub fn append_local_fallback_event(dir: &Path, event: &AuditEvent) -> Result<(),
 }
 
 /// Read all events currently retained in the local fallback store.
+///
+/// Uses the same non-blocking process and cross-process lock acquisition as
+/// [`append_local_fallback_event`]; contention fails closed immediately.
 pub fn list_local_fallback_events(dir: &Path) -> Result<Vec<AuditEvent>, anyhow::Error> {
-    let _process_guard = LOCAL_FALLBACK_LOCK
-        .lock()
-        .map_err(|_| anyhow!("audit local fallback lock poisoned"))?;
+    let _process_guard = acquire_local_fallback_process_lock()?;
     prepare_existing_fallback_directory(dir)?;
     let lock_path = dir.join(AUDIT_LOCAL_FALLBACK_LOCK_FILE_NAME);
     let _cross_process = acquire_fallback_file_lock(&lock_path)?;
     let path = audit_local_fallback_file(dir);
     reject_symlink_or_non_regular_file(&path, "audit local fallback data file")?;
     read_local_fallback_events_unlocked(&path)
+}
+
+/// Non-blocking in-process mutex for the local fallback critical section.
+///
+/// Contention and poisoning both return a static, non-sensitive error so
+/// security-sensitive admit never waits indefinitely on another holder.
+fn acquire_local_fallback_process_lock() -> Result<MutexGuard<'static, ()>, anyhow::Error> {
+    match LOCAL_FALLBACK_LOCK.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(TryLockError::WouldBlock) => {
+            Err(anyhow!("audit local fallback process lock contended"))
+        }
+        Err(TryLockError::Poisoned(_)) => Err(anyhow!("audit local fallback lock poisoned")),
+    }
+}
+
+/// Test seam: hold the in-process fallback mutex without waiting.
+pub(crate) fn hold_local_fallback_process_lock_for_test()
+-> Result<MutexGuard<'static, ()>, anyhow::Error> {
+    acquire_local_fallback_process_lock()
 }
 
 fn prepare_fallback_directory(dir: &Path) -> Result<(), anyhow::Error> {
@@ -892,12 +914,19 @@ fn acquire_fallback_file_lock(lock_path: &Path) -> Result<FallbackFileLock, anyh
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
 
     // SAFETY: `file` owns a valid descriptor for the lifetime of this guard.
-    // `flock` does not access Rust-managed memory.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    // `flock` does not access Rust-managed memory. `LOCK_NB` fails immediately
+    // on contention so admit cannot hang a blocking-pool thread.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result != 0 {
+        let error = std::io::Error::last_os_error();
+        let errno = error.raw_os_error();
+        if errno == Some(libc::EWOULDBLOCK) || errno == Some(libc::EAGAIN) {
+            return Err(anyhow!(
+                "audit local fallback cross-process lock contended"
+            ));
+        }
         return Err(anyhow!(
-            "failed to acquire audit local fallback cross-process lock: {}",
-            std::io::Error::last_os_error()
+            "failed to acquire audit local fallback cross-process lock: {error}"
         ));
     }
 
@@ -921,7 +950,8 @@ fn acquire_fallback_file_lock(lock_path: &Path) -> Result<FallbackFileLock, anyh
 
     reject_symlink_or_non_regular_file(lock_path, "audit local fallback lock file")?;
     // `share_mode(0)` denies all share access for as long as this handle is
-    // held — a std-only cross-process exclusive critical section.
+    // held — a std-only cross-process exclusive critical section. Open fails
+    // immediately when another holder already has the file (no wait).
     let file = OpenOptions::new()
         .read(true)
         .write(true)

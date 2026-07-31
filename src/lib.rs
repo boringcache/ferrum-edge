@@ -1088,6 +1088,15 @@ pub mod _test_support {
         crate::admin::crud::lock_local_namespace_config_admission(namespace).await
     }
 
+    /// Hold the admin audit local-fallback in-process mutex without waiting.
+    ///
+    /// Used by external tests to prove contention fails closed immediately.
+    pub fn hold_audit_local_fallback_process_lock_for_test()
+    -> Result<std::sync::MutexGuard<'static, ()>, String> {
+        crate::admin::audit::hold_local_fallback_process_lock_for_test()
+            .map_err(|error| error.to_string())
+    }
+
     /// Acquire the durable namespace config admission lease (same primitive as
     /// admin mutations and api_specs-emitting backups) for external tests.
     pub async fn lock_namespace_config_admission_db_for_test(

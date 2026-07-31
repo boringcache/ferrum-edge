@@ -144,6 +144,7 @@ fn backup_event_builder_attaches_context_and_outcome() {
 }
 
 #[test]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
 fn local_fallback_persists_event_without_secret_canaries() {
     let dir = TempDir::new().expect("tempdir");
     let secret = "cookie=session-canary; Authorization: Bearer jwt-canary";
@@ -183,6 +184,7 @@ fn local_fallback_persists_event_without_secret_canaries() {
 
 #[cfg(unix)]
 #[test]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
 fn local_fallback_rejects_symlink_directory() {
     let parent = TempDir::new().expect("tempdir");
     let real = parent.path().join("real");
@@ -203,6 +205,7 @@ fn local_fallback_rejects_symlink_directory() {
 
 #[cfg(unix)]
 #[test]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
 fn local_fallback_rejects_symlink_data_file() {
     let dir = TempDir::new().expect("tempdir");
     let outside = dir.path().join("outside.json");
@@ -223,6 +226,7 @@ fn local_fallback_rejects_symlink_data_file() {
 
 #[cfg(unix)]
 #[test]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
 fn local_fallback_rejects_non_regular_data_target() {
     let dir = TempDir::new().expect("tempdir");
     let data = dir.path().join("admin-audit-fallback.json");
@@ -237,6 +241,112 @@ fn local_fallback_rejects_non_regular_data_target() {
     );
     let err = append_local_fallback_event(dir.path(), &event).expect_err("non-regular");
     assert!(err.to_string().contains("regular file"));
+}
+
+fn sample_backup_event() -> AuditEvent {
+    AuditEvent::new(
+        &admin_actor(),
+        "backup",
+        "gateway_config",
+        "ferrum",
+        "ferrum",
+        backup_success_diff("cached", json!("all"), json!({"proxies": 0}), 2),
+    )
+    .with_outcome(audit::outcome::SUCCESS)
+}
+
+#[test]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
+fn local_fallback_fails_closed_on_process_lock_contention() {
+    let _holder = ferrum_edge::_test_support::hold_audit_local_fallback_process_lock_for_test()
+        .expect("hold process lock");
+    let dir = TempDir::new().expect("tempdir");
+    // Mutex is not reentrant: same-thread try_lock while held fails immediately.
+    let err = append_local_fallback_event(dir.path(), &sample_backup_event())
+        .expect_err("contended process lock must fail closed");
+    assert!(
+        err.to_string().contains("process lock contended"),
+        "unexpected error: {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
+fn local_fallback_fails_closed_on_cross_process_lock_contention() {
+    use std::os::unix::io::AsRawFd;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let lock_path = dir.path().join("admin-audit-fallback.lock");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open lock file");
+    let flock_rc = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(flock_rc, 0, "test setup must hold exclusive flock");
+
+    let event = sample_backup_event();
+    let path = dir.path().to_path_buf();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = append_local_fallback_event(&path, &event);
+        let _ = tx.send(result);
+    });
+    // Generous channel timeout only guards against a hang; the functional
+    // assertion is the admission failure itself.
+    let result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("cross-process lock contention must return promptly");
+    let err = result.expect_err("contended flock must fail closed");
+    assert!(
+        err.to_string().contains("cross-process lock contended"),
+        "unexpected error: {err}"
+    );
+    drop(held);
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
+fn list_local_fallback_fails_closed_on_cross_process_lock_contention() {
+    use std::os::unix::io::AsRawFd;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let lock_path = dir.path().join("admin-audit-fallback.lock");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open lock file");
+    let flock_rc = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(flock_rc, 0, "test setup must hold exclusive flock");
+
+    let path = dir.path().to_path_buf();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = list_local_fallback_events(&path);
+        let _ = tx.send(result);
+    });
+    let result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("list flock contention must return promptly");
+    let err = result.expect_err("contended flock must fail closed on list");
+    assert!(
+        err.to_string().contains("cross-process lock contended"),
+        "unexpected error: {err}"
+    );
+    drop(held);
 }
 
 #[tokio::test]
@@ -256,6 +366,7 @@ async fn admit_security_sensitive_event_disabled_is_noop() {
 }
 
 #[tokio::test]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
 async fn admit_security_sensitive_event_uses_local_fallback_without_db() {
     let dir = TempDir::new().expect("tempdir");
     let event = AuditEvent::new(
