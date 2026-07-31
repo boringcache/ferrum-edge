@@ -8644,11 +8644,7 @@ fn h1_h2_and_h3_run_the_same_client_contract_phase() {
     let h1_h2 = include_str!("../../../src/proxy/mod.rs");
     let h3 = include_str!("../../../src/http3/server.rs");
     for (name, source, before_proxy_anchor) in [
-        (
-            "H1/H2",
-            h1_h2,
-            "// before_proxy hooks — clone headers when",
-        ),
+        ("H1/H2", h1_h2, "// before_proxy hooks — clone headers when"),
         (
             "native H3",
             h3,

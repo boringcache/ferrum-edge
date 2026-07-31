@@ -186,9 +186,7 @@ async fn openapi_client_contract_rejects_empty_bodyless_methods_on_h1_h2_h3() {
             harness
                 .assert_no_request_within("/audits", ABSENCE_PROOF_WINDOW)
                 .await
-                .unwrap_or_else(|error| {
-                    panic!("{protocol} {method}: {error}")
-                });
+                .unwrap_or_else(|error| panic!("{protocol} {method}: {error}"));
         }
     }
 
@@ -248,9 +246,8 @@ impl ContractHarness {
                 }
                 Err(error) => {
                     // Bound diagnostics only — never echo env values or secrets.
-                    last_error = format!(
-                        "attempt {attempt}/{MAX_ATTEMPTS}: gateway spawn failed: {error}"
-                    );
+                    last_error =
+                        format!("attempt {attempt}/{MAX_ATTEMPTS}: gateway spawn failed: {error}");
                 }
             }
         }
@@ -445,11 +442,7 @@ impl ContractHarness {
     /// loop so an empty capture cannot pass vacuously after a dead backend.
     /// Arms `notified()` before each scan to avoid lost wakeups, then selects
     /// against the remaining deadline.
-    async fn assert_no_request_within(
-        &self,
-        path: &str,
-        window: Duration,
-    ) -> Result<(), String> {
+    async fn assert_no_request_within(&self, path: &str, window: Duration) -> Result<(), String> {
         if self.backend.total_observed() == 0 {
             return Err(format!(
                 "cannot prove absence for `{path}`: backend has never been observed alive"
