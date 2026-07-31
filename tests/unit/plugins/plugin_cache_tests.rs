@@ -3442,6 +3442,53 @@ fn serverless_finalized_body_egress_allows_request_body_transform_composition() 
     }
 }
 
+/// Moving `pre_proxy` header injection into the finalized-request-egress
+/// overlay makes it land LATER than the `before_proxy` write it replaced, so
+/// the `request_deduplication` ordering gate must keep firing — and candidate
+/// admission (which sees the pure `ServerlessSecurityCompositionPlugin` view)
+/// must keep agreeing with runtime cache construction.
+#[test]
+fn serverless_pre_proxy_overlay_keeps_deduplication_gate_in_candidate_and_runtime() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "function"])],
+        vec![
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "function",
+                "serverless_function",
+                json!({
+                    "provider": "azure_functions",
+                    "function_url": "https://example.com/policy"
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+
+    let candidate_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+            .expect_err("candidate must reject a pre_proxy function ordered after deduplication");
+    assert!(
+        candidate_error.contains("must run before every request_deduplication"),
+        "{candidate_error}"
+    );
+
+    let runtime_error = PluginCache::new(&config)
+        .err()
+        .expect("runtime cache must repeat the fail-closed ordering check");
+    assert!(
+        runtime_error.contains("must run before every request_deduplication"),
+        "{runtime_error}"
+    );
+}
+
 #[test]
 fn candidate_security_validation_constructs_custom_capabilities_without_builtin_gate() {
     let source = include_str!("../../../src/plugin_cache.rs");

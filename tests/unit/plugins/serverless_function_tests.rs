@@ -102,6 +102,42 @@ fn test_supported_protocols() {
     assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
 }
 
+/// A `pre_proxy` function publishes backend-visible request headers through the
+/// finalized-request-egress overlay, which lands even later than the
+/// `before_proxy` write it replaced. The capability must keep reporting that
+/// mutation so the `request_deduplication` / `response_caching` ordering gates
+/// still fire, and so runtime construction agrees with the pure candidate view
+/// in `plugin_cache::ServerlessSecurityCompositionPlugin`.
+#[test]
+fn pre_proxy_mode_still_reports_backend_visible_header_mutation() {
+    let pre_proxy = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://my-func.azurewebsites.net/api/transform"
+        }),
+        default_client(),
+    )
+    .unwrap();
+    assert!(
+        pre_proxy.modifies_request_headers(),
+        "pre_proxy injects backend request headers through the finalized-egress overlay"
+    );
+
+    let terminate = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "mode": "terminate",
+            "function_url": "https://my-func.azurewebsites.net/api/transform"
+        }),
+        default_client(),
+    )
+    .unwrap();
+    assert!(
+        !terminate.modifies_request_headers(),
+        "terminate answers the client and never reaches a backend request"
+    );
+}
+
 #[test]
 fn test_warmup_hostnames() {
     let plugin = ServerlessFunction::new(

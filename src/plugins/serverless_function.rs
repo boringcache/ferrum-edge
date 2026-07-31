@@ -2717,11 +2717,22 @@ impl Plugin for ServerlessFunction {
         super::HTTP_GRPC_PROTOCOLS
     }
 
-    /// `pre_proxy` header injection happens in the finalized-request-egress
-    /// phase through the backend header overlay, not by mutating the
-    /// `before_proxy` header map — this plugin has no `before_proxy` hook.
+    /// A `pre_proxy` function still publishes backend-visible request headers.
+    /// It no longer mutates the `before_proxy` header map — this plugin has no
+    /// `before_proxy` hook — but its injections land in the backend header
+    /// overlay during the finalized-request-egress phase, which is LATER than
+    /// the `before_proxy` write it replaced.
+    ///
+    /// This capability is the composition signal for "backend-visible request
+    /// headers change at or after my effective priority", not "I write the
+    /// `before_proxy` map". Reporting `false` here would silently admit
+    /// `request_deduplication` (priority 3010) alongside a `pre_proxy` function
+    /// at 3025, letting deduplication fingerprint headers the function goes on
+    /// to change, and would diverge from the pure candidate view in
+    /// `plugin_cache::ServerlessSecurityCompositionPlugin` — candidate admission
+    /// would reject a chain runtime construction accepted.
     fn modifies_request_headers(&self) -> bool {
-        false
+        self.mode == InvocationMode::PreProxy
     }
 
     /// The function is invoked in the finalized-request-egress phase, after
