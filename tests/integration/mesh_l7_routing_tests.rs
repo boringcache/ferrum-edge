@@ -153,8 +153,9 @@ async fn mesh_l7_routing_istio_query_match_sets_route_override() {
         "GET".to_string(),
         "/search?variant=beta".to_string(),
     );
-    ctx.query_params
-        .insert("variant".to_string(), "beta".to_string());
+    // Query predicates read the canonical decoding of the forwarded query, not
+    // the lossy single-value map (GHSA-j2j6-f9c7-hh85 / GHSA-gr4p-3qw3-87r5).
+    ctx.set_raw_query_string("variant=beta".to_string());
     assert!(matches!(
         dispatch.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
@@ -2210,8 +2211,9 @@ async fn mesh_tier3_mirror_vs_emits_working_request_mirror_plugin() {
     );
     assert_eq!(mirror.config["mirror_port"].as_u64(), Some(9090));
 
-    // The emitted config builds into a real plugin instance, and a 100%
-    // mirror sets up a mirror result channel on the request context.
+    // The emitted config builds into a real plugin instance, and the
+    // finalized-request-egress phase for a 100% mirror sets up a mirror result
+    // channel on the request context.
     let plugin = create_plugin("request_mirror", &mirror.config)
         .expect("plugin builds")
         .expect("plugin is Some");
@@ -2222,9 +2224,13 @@ async fn mesh_tier3_mirror_vs_emits_working_request_mirror_plugin() {
     );
     // A matched_proxy is required so the mirror can derive its timeout budget.
     ctx.matched_proxy = Some(Arc::new(result.config.proxies[0].clone()));
-    let mut headers = HashMap::new();
-    let res = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let headers = HashMap::new();
+    let mut backend_header_overlay = HashMap::new();
+    let res = plugin
+        .dispatch_finalized_request_egress(&mut ctx, &headers, &[], &mut backend_header_overlay)
+        .await;
     assert!(matches!(res, PluginResult::Continue));
+    assert!(backend_header_overlay.is_empty());
     assert!(
         ctx.mirror_result_rxs.len() == 1,
         "a 100% mirror must arm the mirror result channel (request was mirrored)"

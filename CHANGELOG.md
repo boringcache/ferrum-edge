@@ -45,6 +45,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Irreversible request egress no longer precedes request-body transformation or
+  final request policy (GHSA-4vr5-4wm3-x5xv). `request_mirror` and
+  `serverless_function` previously ran their external dispatch in
+  `before_proxy`, consuming the *pre-transform* metadata body: a mirror, a
+  serverless function, or a pre-proxy authorization function could receive a
+  field `request_transformer` was configured to remove or redact, and could be
+  handed a request that WAF body rules, OpenAPI request-schema validation,
+  request-body validation, or the post-transform `request_size_limiting`
+  ceiling went on to reject — a disclosure or billable side effect that no
+  later local rejection could retract. Both plugins now have no `before_proxy`
+  hook at all and instead run in a new **finalized-request-egress** phase that
+  the gateway reaches only after request-body collection, canonical
+  `transform_request_body` rewrites, and every `on_final_request_body` policy
+  hook have accepted the exact backend-visible representation. The phase hands
+  plugins an immutable header/body snapshot; a `pre_proxy` `serverless_function`
+  publishes its header injections through a backend header overlay that the
+  proxy merges only after re-establishing gateway-owned assertions and the
+  egress baggage policy. `ai_federation` also dispatches from this boundary
+  rather than from inside the ordered final-body hook pass, so
+  `priority_override` cannot move provider I/O ahead of a final request policy.
+  The phase is wired on H1/H2 (HTTP, WebSocket handshakes, and native gRPC) and
+  HTTP/3, runs at most once per request, and is therefore not repeated by
+  retries, which replay the already-finalized body.
+
+  Consequences worth reading before upgrading:
+  - A body-forwarding `serverless_function` may now share a proxy with
+    `request_transformer`; that composition was previously refused outright
+    because the function saw different bytes than the backend. The refusal is
+    retained — and widened to cover final request-body policy plugins — for
+    registered custom plugins that still declare
+    `egresses_request_body_before_finalization()`.
+  - A buffered request on a proxy with an egress plugin now finalizes its body
+    *before* the backend circuit-breaker gate rather than inside backend
+    dispatch, so an open breaker is reported after the upload is read.
+  - A mirrored body is now the transformed body and is metered against
+    `max_mirrored_request_body_bytes` at its post-transform length; a transform
+    that inflates the body past that ceiling drops the mirror instead of
+    replaying a truncated payload.
+  - Rejections produced by these plugins report
+    `rejection_phase = "finalized_request_egress"` instead of `"before_proxy"`.
+  - Egress plugins no longer run for HBONE `CONNECT` tunnels, which
+    short-circuit the dispatch ladder before the phase boundary.
 - Retained-response replay now follows one fail-closed partition contract across
   `response_caching`, `request_deduplication`, and `ai_semantic_cache`
   (GHSA-w27g-65rf-h7xm, GHSA-v4g3-2r4f-f6pc, GHSA-37gg-v9m4-8445). A new shared

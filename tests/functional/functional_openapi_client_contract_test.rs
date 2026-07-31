@@ -11,18 +11,24 @@
 
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
+use crate::scaffolding::ports::reserve_port;
 
 use bytes::Bytes;
 use http::{Method, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+
+/// Bounded window for proving a rejected request never reached the backend.
+/// Event-driven against the capture notify; not a fixed sleep.
+const ABSENCE_PROOF_WINDOW: Duration = Duration::from_secs(1);
 
 /// Minimal upstream reply for an admitted request.
 const OK_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
@@ -73,10 +79,10 @@ async fn openapi_client_contract_precedes_body_transforms_on_h1_h2_h3() {
             body.contains("Request body validation failed"),
             "{protocol}: unexpected rejection body: {body}"
         );
-        assert!(
-            harness.no_request_within(Duration::from_millis(300)).await,
-            "{protocol}: a rejected request must never reach the backend"
-        );
+        harness
+            .assert_no_request_within("/orders", ABSENCE_PROOF_WINDOW)
+            .await
+            .unwrap_or_else(|error| panic!("{protocol}: {error}"));
 
         // 3. A nonempty body with no Content-Type at all cannot vote the
         //    validator out of the request; it fails closed as unsupported media.
@@ -87,10 +93,10 @@ async fn openapi_client_contract_precedes_body_transforms_on_h1_h2_h3() {
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "{protocol}: an omitted Content-Type must not bypass the contract"
         );
-        assert!(
-            harness.no_request_within(Duration::from_millis(300)).await,
-            "{protocol}: an unsupported representation must never reach the backend"
-        );
+        harness
+            .assert_no_request_within("/orders", ABSENCE_PROOF_WINDOW)
+            .await
+            .unwrap_or_else(|error| panic!("{protocol}: {error}"));
 
         // 4. An undeclared media type is refused the same way.
         harness.backend.clear();
@@ -169,12 +175,12 @@ async fn openapi_client_contract_rejects_empty_bodyless_methods_on_h1_h2_h3() {
             // `None` for an empty body), so the asserted 400 plus no backend
             // request proves the client contract ran before `before_proxy` and,
             // transitively, before any final body transform.
-            assert!(
-                harness
-                    .no_backend_request_for("/audits", Duration::from_millis(300))
-                    .await,
-                "{protocol} {method}: a rejected request must never reach the backend"
-            );
+            harness
+                .assert_no_request_within("/audits", ABSENCE_PROOF_WINDOW)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{protocol} {method}: {error}")
+                });
         }
     }
 
@@ -190,33 +196,59 @@ struct ContractHarness {
 impl ContractHarness {
     async fn spawn() -> Self {
         let backend = CapturingBackend::spawn().await;
-        let https_listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("reserve https port");
-        let https_port = https_listener.local_addr().expect("https addr").port();
-        drop(https_listener);
+        // Keep the capturing backend alive across attempts, but allocate a
+        // fresh HTTPS port for every bounded gateway spawn. Retrying the same
+        // reserve-then-drop port leaves a sticky-port TOCTOU under parallel CI.
+        const MAX_ATTEMPTS: usize = 5;
+        let mut last_error = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            let reservation = match reserve_port().await {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    last_error = format!("reserve https port: {error}");
+                    continue;
+                }
+            };
+            let https_port = reservation.port;
+            drop(reservation);
 
-        let gateway = TestGateway::builder()
-            .mode_file(contract_config(backend.port))
-            .log_level("warn")
-            .env("FERRUM_ENABLE_HTTP3", "true")
-            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-            .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
-            .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
-            .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-            .spawn()
-            .await
-            .expect("start openapi client-contract gateway");
-        gateway
-            .wait_for_proxy_port(Duration::from_secs(5))
-            .await
-            .expect("proxy port ready");
-
-        Self {
-            gateway,
-            backend,
-            https_port,
+            match TestGateway::builder()
+                .mode_file(contract_config(backend.port))
+                .log_level("warn")
+                .max_attempts(1)
+                .env("FERRUM_ENABLE_HTTP3", "true")
+                .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+                .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+                .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+                .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+                .spawn()
+                .await
+            {
+                Ok(mut gateway) => {
+                    if let Err(error) = gateway.wait_for_proxy_port(Duration::from_secs(5)).await {
+                        last_error = format!(
+                            "attempt {attempt}/{MAX_ATTEMPTS}: proxy port not ready: {error}"
+                        );
+                        gateway.shutdown();
+                        continue;
+                    }
+                    return Self {
+                        gateway,
+                        backend,
+                        https_port,
+                    };
+                }
+                Err(error) => {
+                    // Bound diagnostics only — never echo env values or secrets.
+                    last_error = format!(
+                        "attempt {attempt}/{MAX_ATTEMPTS}: gateway spawn failed: {error}"
+                    );
+                }
+            }
         }
+        panic!(
+            "failed to start openapi client-contract gateway after {MAX_ATTEMPTS} attempts: {last_error}"
+        );
     }
 
     async fn post(
@@ -376,6 +408,9 @@ impl ContractHarness {
     async fn wait_for_backend_path(&self, path: &str, timeout: Duration) -> Option<String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
+            // Arm the notification before scanning so a concurrent push cannot
+            // be lost between the scan and a later wait.
+            let notified = self.backend.notify.notified();
             if let Some(request) = self
                 .backend
                 .requests()
@@ -388,24 +423,68 @@ impl ContractHarness {
                 return None;
             }
             tokio::select! {
-                _ = self.backend.notify.notified() => {}
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => {}
             }
         }
     }
 
-    async fn no_backend_request_for(&self, path: &str, window: Duration) -> bool {
-        tokio::time::sleep(window).await;
-        !self
-            .backend
-            .requests()
-            .iter()
-            .any(|request| request.contains(path))
+    /// Event-driven, bounded proof that no backend request for `path` arrives.
+    ///
+    /// Requires prior observability (`total_observed() > 0`) and a live accept
+    /// loop so an empty capture cannot pass vacuously after a dead backend.
+    /// Arms `notified()` before each scan to avoid lost wakeups, then selects
+    /// against the remaining deadline.
+    async fn assert_no_request_within(
+        &self,
+        path: &str,
+        window: Duration,
+    ) -> Result<(), String> {
+        if self.backend.total_observed() == 0 {
+            return Err(format!(
+                "cannot prove absence for `{path}`: backend has never been observed alive"
+            ));
+        }
+        if !self.backend.accept_loop_alive() {
+            return Err(format!(
+                "cannot prove absence for `{path}`: capturing backend accept loop is not alive"
+            ));
+        }
+
+        let deadline = tokio::time::Instant::now() + window;
+        loop {
+            let notified = self.backend.notify.notified();
+            if let Some(request) = self
+                .backend
+                .requests()
+                .into_iter()
+                .find(|request| request.contains(path))
+            {
+                return Err(format!(
+                    "rejected request must never reach the backend for `{path}`; saw: {}",
+                    request.lines().next().unwrap_or(&request)
+                ));
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                if !self.backend.accept_loop_alive() {
+                    return Err(format!(
+                        "absence window for `{path}` ended with a dead backend accept loop"
+                    ));
+                }
+                return Ok(());
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
+        }
     }
 
     async fn wait_for_request(&self, timeout: Duration) -> Option<String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
+            let notified = self.backend.notify.notified();
             if let Some(request) = self.backend.requests().into_iter().find(|request| {
                 request.starts_with("POST /orders") || request.contains(" /orders ")
             }) {
@@ -415,19 +494,10 @@ impl ContractHarness {
                 return None;
             }
             tokio::select! {
-                _ = self.backend.notify.notified() => {}
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => {}
             }
         }
-    }
-
-    async fn no_request_within(&self, window: Duration) -> bool {
-        tokio::time::sleep(window).await;
-        !self
-            .backend
-            .requests()
-            .iter()
-            .any(|request| request.contains("/orders"))
     }
 
     fn shutdown(&mut self) {
@@ -579,6 +649,9 @@ fn contract_config(backend_port: u16) -> String {
 struct CapturingBackend {
     port: u16,
     requests: Arc<Mutex<Vec<String>>>,
+    /// Lifetime count of captured requests; `clear()` does not reset this, so
+    /// absence proofs can require prior observability.
+    total_observed: Arc<AtomicU64>,
     notify: Arc<Notify>,
     handle: Option<JoinHandle<()>>,
 }
@@ -590,20 +663,24 @@ impl CapturingBackend {
             .expect("bind capture backend");
         let port = listener.local_addr().expect("local addr").port();
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let total_observed = Arc::new(AtomicU64::new(0));
         let notify = Arc::new(Notify::new());
         let requests_task = requests.clone();
+        let total_task = total_observed.clone();
         let notify_task = notify.clone();
         let handle = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((mut stream, _)) => {
                         let requests = requests_task.clone();
+                        let total_observed = total_task.clone();
                         let notify = notify_task.clone();
                         tokio::spawn(async move {
                             let Some(request) = read_full_request(&mut stream).await else {
                                 return;
                             };
                             requests.lock().expect("requests lock").push(request);
+                            total_observed.fetch_add(1, Ordering::Relaxed);
                             notify.notify_waiters();
                             let _ = stream.write_all(OK_RESPONSE).await;
                             let _ = stream.shutdown().await;
@@ -616,6 +693,7 @@ impl CapturingBackend {
         Self {
             port,
             requests,
+            total_observed,
             notify,
             handle: Some(handle),
         }
@@ -623,6 +701,16 @@ impl CapturingBackend {
 
     fn requests(&self) -> Vec<String> {
         self.requests.lock().expect("requests lock").clone()
+    }
+
+    fn total_observed(&self) -> u64 {
+        self.total_observed.load(Ordering::Relaxed)
+    }
+
+    fn accept_loop_alive(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
     }
 
     fn clear(&self) {

@@ -43,6 +43,7 @@ adding, removing, or materially changing a workflow.
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs. |
 | `dependency-audit.yml` | Dependency Audit | Weekly schedule, manual | Scheduled supply-chain governance beyond the per-PR audit gate. |
+| `fuzz.yml` | Fuzz | Weekly schedule, manual | Sanitizer-backed libFuzzer lane for hostile parser targets; see [fuzz.md](fuzz.md). |
 | `scaling-regression.yml` | Scheduled Scaling Regression | Weekly schedule, manual | Runs the 30k proxy scale and 10k proxy load-stress tests excluded from PR CI. |
 | `protocol-perf-regression.yml` | Protocol Performance Regression | Weekly schedule, manual | Scheduled multi-protocol throughput/latency regression with churn, soak, resource plateaus, reload-under-load, versioned alert-only budgets, and machine-readable trends. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md). |
 | `claude-review.yml` | Claude PR Review | `@claude review` issue comment on PRs | Maintainer-triggered AI review comments. |
@@ -68,6 +69,7 @@ Pull Request
                     ├─► Format + integration-shard coverage (in CI plan)
                     ├─► Unit+inline-lib / integration-shard / functional-shard tests
                     ├─► Lint, dependency audit, vendored regressions
+                    ├─► Fuzz smoke (libFuzzer + proptest budgets)
                     ├─► eBPF/netns live checks when planner marks relevant
                     ├─► Planner-gated mesh / Helm / performance gates
                     └─► Five target release builds
@@ -1142,9 +1144,13 @@ shapes and nothing else:
   `-timeout`, `-rss_limit_mb`) is part of the contract. All automation commands
   are inline and cannot be redirected through a repository-supplied script;
   the read-only job necessarily compiles and executes pull-request-authored Rust
-  tests and fuzz targets. Its environment clears both repository sccache wrapper
-  inputs and `RUSTFLAGS`, because the isolated lane installs neither sccache nor
-  the mold linker selected by the root Cargo configuration.
+  tests and fuzz targets. The frozen job installs `protobuf-compiler` before
+  invoking Cargo because the workspace build script requires `protoc`. Its
+  1024 MiB RSS cap leaves bounded headroom above the roughly 400 MiB baseline
+  of the fully linked, sanitizer-instrumented fuzz binaries. The job's
+  environment clears both repository sccache wrapper inputs and `RUSTFLAGS`,
+  because the isolated lane installs neither sccache nor the mold linker selected
+  by the root Cargo configuration.
 - `FUZZ_WORKFLOW` — the whole of `.github/workflows/fuzz.yml`. A repository
   that has not adopted it may omit it; once the trusted base carries it, a pull
   request may neither remove nor alter it. Whole-file
@@ -1159,6 +1165,9 @@ shapes and nothing else:
   count **before** publication — with the upload gated on that bounding step
   having succeeded, from one fixed path, at short retention. Its environment
   carries the same empty wrapper and `RUSTFLAGS` overrides as the smoke job.
+  Each matrix job gives cold sanitizer compilation a 90-minute outer deadline
+  and uses 16 codegen units; the target itself remains independently capped at
+  300 seconds, so build variance cannot widen the actual fuzzing budget.
 
 A lane nothing observes is not a gate, so adopting `CI_FUZZ_SMOKE_JOB` also has
 to make it a required input of the `test` (`Tests`) aggregate. That aggregate is

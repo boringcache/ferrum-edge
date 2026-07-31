@@ -156,17 +156,15 @@ enum ValidationSide {
 /// The two are deliberately distinct lifecycle phases, not two spellings of one
 /// check. `Client` is the documented contract: the original client bytes after
 /// gateway-owned `Content-Encoding` decoding and before any transform. `Backend`
-/// is the pre-existing final-body hook, retained as a fallback for the request
-/// paths the client phase cannot cover, so disabling it would be a silent
-/// downgrade to no enforcement at all:
-///
-/// - unknown-operation admission (`fail_on_unknown_operation`), which the client
-///   phase deliberately leaves to `before_proxy`/the final hook so it is not
-///   reordered ahead of unrelated `before_proxy` hooks;
-/// - a request where this validator was not selected over the pristine client
-///   view but is over the effective backend-visible view — an operation match or
-///   bypass state that only materializes after a `before_proxy` route override
-///   or request header/target rewrite.
+/// is the pre-existing final-body hook, retained as a fallback when this
+/// validator did not select over the pristine client view but can select over
+/// the effective backend-visible view — an operation match or bypass state that
+/// only materializes after a `before_proxy` route override or request
+/// header/target rewrite. Disabling that fallback would be a silent downgrade
+/// for those post-rewrite selections. Unknown-operation admission
+/// (`fail_on_unknown_operation`) is rejected in `before_proxy` so it is not
+/// reordered ahead of unrelated `before_proxy` hooks; the client phase
+/// deliberately leaves unmatched operations undecided for that reason.
 ///
 /// An HBONE CONNECT tunnel is NOT one of those paths. This plugin governs plain
 /// HTTP request bodies; a CONNECT tunnel's bytes are not a request body, the
@@ -1106,6 +1104,14 @@ impl Plugin for OpenapiValidator {
 
     fn priority(&self) -> u16 {
         super::priority::OPENAPI_VALIDATOR
+    }
+
+    /// This plugin's enforcement decision is taken in the final request-body
+    /// phase, over the exact backend-visible representation. Composition
+    /// admission refuses to pair it with a plugin that egresses the request
+    /// before finalization (GHSA-4vr5-4wm3-x5xv).
+    fn enforces_finalized_request_policy(&self) -> bool {
+        true
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {

@@ -8,6 +8,14 @@
 //! - **terminate**: Invoke the function and return its response directly to the
 //!   client, bypassing backend proxying entirely.
 //!
+//! Both modes run in the finalized-request-egress phase, never `before_proxy`:
+//! the function is invoked only after request-body transforms and every
+//! `on_final_request_body` policy hook have accepted the exact backend-visible
+//! representation (advisory `GHSA-4vr5-4wm3-x5xv`). A `pre_proxy` function's
+//! header injections are published through the backend header overlay, which the
+//! proxy merges after re-establishing gateway-owned assertions and the egress
+//! baggage policy.
+//!
 //! ## Providers
 //!
 //! - **AWS Lambda**: Uses the Lambda Invoke API with SigV4 request signing.
@@ -73,6 +81,7 @@ use tracing::{debug, info, warn};
 use url::{Host, Url};
 
 use super::utils::aws_sigv4;
+use super::utils::query::{QueryAmbiguity, canonical_query_for_policy, has_valid_percent_triplets};
 use super::utils::response_body::{
     BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
 };
@@ -626,10 +635,16 @@ impl ServerlessFunction {
     }
 
     /// Build the JSON payload sent to the serverless function.
+    ///
+    /// `finalized_body` is the backend-visible request body: request-body
+    /// transforms have run and every final request-policy hook has accepted it
+    /// (GHSA-4vr5-4wm3-x5xv). The function therefore observes exactly what the
+    /// backend would, including operator-configured removals and redactions.
     fn build_invocation_payload(
         &self,
         ctx: &RequestContext,
         proxy_headers: &HashMap<String, String>,
+        finalized_body: &[u8],
     ) -> Result<Value, InvocationFailure> {
         let mut payload = serde_json::Map::new();
 
@@ -684,17 +699,23 @@ impl ServerlessFunction {
         // Forward request body
         if self.forward_body {
             reject_encoded_request_body(ctx, proxy_headers)?;
-            let empty_body = Bytes::new();
-            let body = if let Some(body) = ctx.request_body_bytes.as_ref() {
-                body
-            } else if !crate::proxy::request_may_have_body(&ctx.method, proxy_headers) {
-                &empty_body
-            } else {
+            // `finalized_body` is authoritative. `ctx.request_body_bytes` is not
+            // read for content — it would be the PRE-transform client body — but
+            // its absence still witnesses that the gateway never collected a
+            // body for this request, which is the one case where an empty
+            // `finalized_body` is not a faithful representation of a request
+            // that may carry one. Fail closed rather than invoke the function on
+            // a silently truncated payload.
+            let body: &[u8] = finalized_body;
+            if body.is_empty()
+                && ctx.request_body_bytes.is_none()
+                && crate::proxy::request_may_have_body(&ctx.method, proxy_headers)
+            {
                 return Err(InvocationFailure::governed_input(
                     "request_body_unavailable",
                     "governed request body was unavailable before function invocation",
                 ));
-            };
+            }
             // Keep a single authoritative, lossless body representation. JSON
             // parsing here would collapse duplicate object members and rewrite
             // lexical number/whitespace forms before the external policy sees
@@ -1067,50 +1088,40 @@ fn reject_encoded_request_body(
 fn unambiguous_query_params(
     ctx: &RequestContext,
 ) -> Result<serde_json::Map<String, Value>, InvocationFailure> {
-    // Start from the same canonical backend-visible query primary dispatch
-    // uses: transformer-published outbound query (when present) composed with
-    // authentication-owned credential strips. That representation already
-    // honors operator query transforms without resurrecting stripped secrets.
-    let mut ordered = BTreeMap::new();
-    let effective_query = crate::proxy::effective_backend_query_string(ctx);
-    if !effective_query.is_empty() {
-        for pair in effective_query.split('&').filter(|pair| !pair.is_empty()) {
-            let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-            if raw_key.contains('+') || raw_value.contains('+') {
-                return Err(InvocationFailure::governed_input(
-                    "ambiguous_query_encoding",
-                    "query forwarding rejected a raw '+' character",
-                ));
-            }
-            if !has_valid_percent_triplets(raw_key) || !has_valid_percent_triplets(raw_value) {
-                return Err(InvocationFailure::governed_input(
-                    "invalid_query_encoding",
-                    "query forwarding rejected malformed percent encoding",
-                ));
-            }
-            let key = percent_decode_str(raw_key).decode_utf8().map_err(|_| {
-                InvocationFailure::governed_input(
-                    "invalid_query_encoding",
-                    "query parameter name was not valid percent-encoded UTF-8",
-                )
-            })?;
-            let value = percent_decode_str(raw_value).decode_utf8().map_err(|_| {
-                InvocationFailure::governed_input(
-                    "invalid_query_encoding",
-                    "query parameter value was not valid percent-encoded UTF-8",
-                )
-            })?;
-            if ordered
-                .insert(key.into_owned(), value.into_owned())
-                .is_some()
-            {
-                return Err(InvocationFailure::governed_input(
-                    "duplicate_query_parameter",
-                    "query forwarding rejected a duplicate decoded parameter name",
-                ));
-            }
-        }
-    } else if ctx.raw_query_string().is_none()
+    // Decode the exact backend-visible bytes — transformer-published outbound
+    // query (when present) composed with authentication-owned credential
+    // strips — through the same shared canonicalizer OPA and
+    // `mesh_route_dispatch` use, so a delegated pre-proxy decision can never be
+    // made on a value different from the one the backend executes (advisories
+    // GHSA-j2j6-f9c7-hh85, GHSA-gr4p-3qw3-87r5).
+    let canonical = canonical_query_for_policy(ctx);
+    if let Some(ambiguity) = canonical.first_ambiguity() {
+        // Fixed-cardinality classes; never echo query bytes.
+        return Err(match ambiguity {
+            QueryAmbiguity::LiteralPlus => InvocationFailure::governed_input(
+                "ambiguous_query_encoding",
+                "query forwarding rejected a raw '+' character",
+            ),
+            QueryAmbiguity::MalformedPercentEncoding => InvocationFailure::governed_input(
+                "invalid_query_encoding",
+                "query forwarding rejected malformed percent encoding",
+            ),
+            QueryAmbiguity::NonUtf8Name => InvocationFailure::governed_input(
+                "invalid_query_encoding",
+                "query parameter name was not valid percent-encoded UTF-8",
+            ),
+            QueryAmbiguity::NonUtf8Value => InvocationFailure::governed_input(
+                "invalid_query_encoding",
+                "query parameter value was not valid percent-encoded UTF-8",
+            ),
+            QueryAmbiguity::DuplicateName => InvocationFailure::governed_input(
+                "duplicate_query_parameter",
+                "query forwarding rejected a duplicate decoded parameter name",
+            ),
+        });
+    }
+    if canonical.is_empty()
+        && ctx.raw_query_string().is_none()
         && ctx.outbound_query_string().is_none()
         && !ctx.query_params.is_empty()
     {
@@ -1119,29 +1130,18 @@ fn unambiguous_query_params(
             "query parameters were materialized without their original encoded representation",
         ));
     }
+    // Sorted by decoded name for a stable payload. Safe only because the
+    // canonical query is unambiguous here: every name occurs exactly once, so
+    // reordering cannot pick a different value than the backend executes.
+    let ordered: BTreeMap<&str, &str> = canonical
+        .params()
+        .iter()
+        .map(|param| (param.name.as_str(), param.value.as_str()))
+        .collect();
     Ok(ordered
         .into_iter()
-        .map(|(key, value)| (key, Value::String(value)))
+        .map(|(key, value)| (key.to_string(), Value::String(value.to_string())))
         .collect())
-}
-
-fn has_valid_percent_triplets(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len()
-                || !bytes[index + 1].is_ascii_hexdigit()
-                || !bytes[index + 2].is_ascii_hexdigit()
-            {
-                return false;
-            }
-            index += 3;
-        } else {
-            index += 1;
-        }
-    }
-    true
 }
 
 #[derive(Clone)]
@@ -2717,28 +2717,51 @@ impl Plugin for ServerlessFunction {
         super::HTTP_GRPC_PROTOCOLS
     }
 
+    /// A `pre_proxy` function still publishes backend-visible request headers.
+    /// It no longer mutates the `before_proxy` header map — this plugin has no
+    /// `before_proxy` hook — but its injections land in the backend header
+    /// overlay during the finalized-request-egress phase, which is LATER than
+    /// the `before_proxy` write it replaced.
+    ///
+    /// This capability is the composition signal for "backend-visible request
+    /// headers change at or after my effective priority", not "I write the
+    /// `before_proxy` map". Reporting `false` here would silently admit
+    /// `request_deduplication` (priority 3010) alongside a `pre_proxy` function
+    /// at 3025, letting deduplication fingerprint headers the function goes on
+    /// to change, and would diverge from the pure candidate view in
+    /// `plugin_cache::ServerlessSecurityCompositionPlugin` — candidate admission
+    /// would reject a chain runtime construction accepted.
     fn modifies_request_headers(&self) -> bool {
         self.mode == InvocationMode::PreProxy
     }
 
-    fn egresses_request_body_before_finalization(&self) -> bool {
-        self.forward_body
+    /// The function is invoked in the finalized-request-egress phase, after
+    /// body transforms and every final request-policy hook, so no request
+    /// egress happens before finalization (GHSA-4vr5-4wm3-x5xv).
+    fn dispatches_finalized_request_egress(&self) -> bool {
+        true
     }
 
     fn requires_prior_request_deduplication(&self) -> bool {
         self.mode == InvocationMode::Terminate
     }
 
-    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
-        true
-    }
-
-    fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
-        self.mode == InvocationMode::PreProxy
-    }
-
+    /// Keeps the buffered-body collection (and therefore
+    /// `ctx.request_body_bytes`, the "a body was collected" witness) in front of
+    /// the transform/final-hook phases. The bytes the function receives come
+    /// from the finalized phase parameter, never from this early buffer.
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.requires_body
+    }
+
+    /// The invocation payload itself is built from the canonical decoding of
+    /// the forwarded query, so it is already identical on H1/H2/H3. This opts
+    /// the proxy's shared `ctx.query_params` map into the decoded form as well,
+    /// so a query-forwarding function and the rest of its plugin chain never
+    /// see one representation on H1/H2 and a raw percent-escaped one on H3
+    /// (advisory GHSA-gr4p-3qw3-87r5).
+    fn requires_decoded_query_params(&self) -> bool {
+        self.forward_query_params
     }
 
     fn should_buffer_request_body(&self, _ctx: &RequestContext) -> bool {
@@ -2760,10 +2783,22 @@ impl Plugin for ServerlessFunction {
             .unwrap_or_default()
     }
 
-    async fn before_proxy(
+    /// Invoke the function over the finalized, backend-visible request.
+    ///
+    /// `headers` is the immutable finalized pre-egress baseline and `body` is
+    /// exactly what the primary backend would receive; every final
+    /// request-policy hook (WAF body rules, OpenAPI request schema, body
+    /// validation, the post-transform request-size ceiling) has already accepted
+    /// that representation. A `pre_proxy` function publishes its supported
+    /// post-policy header injections through `backend_header_overlay`, which the
+    /// proxy merges into the outbound map after re-establishing gateway-owned
+    /// assertions and the egress baggage policy.
+    async fn dispatch_finalized_request_egress(
         &self,
         ctx: &mut RequestContext,
-        headers: &mut HashMap<String, String>,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        backend_header_overlay: &mut HashMap<String, String>,
     ) -> PluginResult {
         if ctx
             .metadata
@@ -2795,7 +2830,7 @@ impl Plugin for ServerlessFunction {
         let native_grpc_terminate =
             self.mode == InvocationMode::Terminate && is_native_grpc_terminate_request(ctx);
 
-        let payload = match self.build_invocation_payload(ctx, headers) {
+        let payload = match self.build_invocation_payload(ctx, headers, body) {
             Ok(payload) => payload,
             Err(failure) => return self.pre_invocation_failure_result(ctx, failure),
         };
@@ -2965,7 +3000,11 @@ impl Plugin for ServerlessFunction {
                             {
                                 continue;
                             }
-                            headers.insert(key, value);
+                            // Published as an overlay rather than written into
+                            // the finalized snapshot: the representation this
+                            // function just decided on must stay exactly the one
+                            // policy accepted and the backend receives.
+                            backend_header_overlay.insert(key, value);
                         }
                     }
 

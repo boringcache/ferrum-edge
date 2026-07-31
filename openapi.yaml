@@ -15870,7 +15870,19 @@ components:
                     type: object
                     additionalProperties:
                       type: string
-                    description: Query parameter equality matches (all-of). Decoded after percent-decoding.
+                    description: >-
+                      Query parameter equality matches (all-of), compared after
+                      percent-decoding the backend-bound query representation
+                      available at the dispatch hook, including
+                      authentication-owned credential strips and any
+                      priority-overridden request_transformer that already ran.
+                      A deliberately later route/request transform remains a
+                      separate ordered operation. A request whose query cannot
+                      be decoded to one value is rejected with 400 before any
+                      rule is evaluated: a repeated or percent-encoded duplicate
+                      name, a literal '+' (RFC 3986 plus vs form-urlencoded
+                      space), malformed percent-encoding, or a non-UTF-8
+                      decoding.
                   uri:
                     description: |
                       Optional URI predicate (Istio `StringMatch` shape).
@@ -16066,6 +16078,16 @@ components:
                   `http[].headers.response.{set,add,remove}`). Same shape as
                   `request_transform` but applied on the response path via
                   the `response_transformer` plugin.
+
+                  Because this publishes onto the `response_transformer`
+                  write surface, it shares that plugin's closed destination
+                  set: add/update of a protocol-managed hop-by-hop or
+                  framing name (`connection`, `content-length`,
+                  `keep-alive`, `proxy-authenticate`, `proxy-connection`,
+                  `te`, `trailer`, `transfer-encoding`, `upgrade`,
+                  case-insensitive) is rejected at construction. Remove of
+                  those names remains allowed. `request_transform` keeps its
+                  existing contract.
                 items:
                   type: object
                   additionalProperties: false
@@ -17367,7 +17389,14 @@ components:
           additionalProperties:
             type: string
           default: {}
-          description: Headers added to the policy-denial response.
+          description: >-
+            Headers added to the policy-denial response. Names and values are
+            validated at config load. Protocol-managed hop-by-hop and framing
+            destinations (`connection`, `content-length`, `keep-alive`,
+            `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
+            `transfer-encoding`, `upgrade`, case-insensitive) are rejected: the
+            gateway derives Content-Length from the reject body and strips
+            connection/framing fields at the final H1/H2/H3 response boundary.
         fail_closed_status:
           type: integer
           format: uint16
@@ -17386,7 +17415,10 @@ components:
           additionalProperties:
             type: string
           default: {}
-          description: Headers added to fail-closed OPA error responses.
+          description: >-
+            Headers added to fail-closed OPA error responses. Same name/value
+            validation and protocol-managed hop-by-hop / framing destination
+            rejection as deny_headers.
         decision_pointer:
           type: array
           items:
@@ -17403,16 +17435,19 @@ components:
           type: boolean
           default: true
           description: >-
-            Include decoded, non-redacted query parameters as input.query.
-            Present query parameters configured as authentication credential
-            locations are omitted by default.
+            Include the backend-bound request query as input.query (a flat
+            decoded map, emitted only when unambiguous), input.query_pairs (an
+            ordered, occurrence-complete pair list), and
+            input.query_ambiguity (fixed-cardinality ambiguity
+            classifications). Present query parameters configured as
+            authentication credential locations are omitted by default.
         include_query_credentials:
           type: boolean
           default: false
           description: >-
             Unsafe opt-in to include built-in and authentication-plugin-marked
-            query credentials in input.query. Keys listed in redact_query_keys
-            remain redacted.
+            query credentials in input.query and input.query_pairs. Keys
+            listed in redact_query_keys remain redacted from both views.
         include_headers:
           type: boolean
           default: true
@@ -17442,17 +17477,30 @@ components:
         include_service:
           type: boolean
           default: true
-        reject_duplicate_query_keys:
-          type: boolean
-          default: true
+        query_ambiguity_policy:
+          type: string
+          enum:
+            - reject
+            - delegate
+          default: reject
           description: >-
-            When include_query is enabled, reject requests whose query string
-            contains duplicate keys with conflicting values (e.g. a=1&a=2) to
-            prevent OPA/backend authorization mismatch. Identical-value
-            duplicates (a=1&a=1) are allowed. Rejection uses the configured
-            deny_status and deny_body. Set to false for APIs that use
-            array-style repeated query keys, or disable include_query entirely
-            to skip the check.
+            When include_query is enabled, controls what happens to a request
+            whose query cannot be decoded to one value OPA and the backend are
+            guaranteed to read identically: a duplicate decoded parameter name
+            (including a percent-encoded alias such as a=1&%61=2 or a bare/valued
+            pair such as flag&flag=1), a literal '+' (RFC 3986 plus vs
+            form-urlencoded space), malformed percent-encoding, or a non-UTF-8
+            decoding. 'reject' denies the request with the configured deny_status
+            and deny_body before calling OPA. 'delegate' calls OPA anyway and
+            lets the policy decide from the ordered, occurrence-complete
+            input.query_pairs array and the input.query_ambiguity
+            classifications; non-UTF-8 components are replacement-decoded and
+            explicitly classified. input.query is omitted in that case so no
+            rule can read from the flat map a value the backend does not
+            execute. Omission is not itself a denial: an undefined input.query
+            makes a deny-style Rego rule undefined rather than true, so a
+            'delegate' policy must deny on any input.query_ambiguity
+            classification it does not handle.
         redact_headers:
           type: array
           items:
@@ -17481,10 +17529,11 @@ components:
             minLength: 1
           default: []
           description: >-
-            Additional query parameter names to omit from input.query,
-            matched case-insensitively. Built-in credential names and query
-            locations marked by authentication plugins are already omitted
-            unless include_query_credentials is explicitly enabled.
+            Additional query parameter names to omit from input.query and
+            input.query_pairs, matched case-insensitively. Built-in credential
+            names and query locations marked by authentication plugins are
+            already omitted unless include_query_credentials is explicitly
+            enabled.
 
     AccessControlConfig:
       type: object
@@ -18080,13 +18129,21 @@ components:
         unknown per-rule keys are rejected at plugin load time. Header
         rules enforce operation-exact fields (only add/update accept
         `value`; only rename accepts `new_key`; remove accepts neither).
-        Every configured header `value` must be a valid HTTP `HeaderValue`
-        (same complete syntax accepted at emission), including rejection of
-        non-CR/LF forbidden control bytes. Unknown operations / targets and
-        missing required fields are also rejected. Every rule must set an
-        explicit `target` (`header` or `body`); there is no default. Valid
-        targets are `header` and `body` only — unlike request_transformer,
-        there is no `query` target.
+        Protocol-managed hop-by-hop and framing destinations are rejected
+        for add/update and as rename destinations (`Connection`,
+        `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`,
+        `Trailer`, `Transfer-Encoding`, `Upgrade`, `Content-Length`,
+        case-insensitive); remove of those names remains allowed. The
+        gateway derives Content-Length and strips connection/framing
+        fields at the final H1/H2/H3 response boundary after every
+        mutable hook. Every configured header `value` must be a valid
+        HTTP `HeaderValue` (same complete syntax accepted at emission),
+        including rejection of non-CR/LF forbidden control bytes. Unknown
+        operations / targets and missing required fields are also
+        rejected. Every rule must set an explicit `target` (`header` or
+        `body`); there is no default. Valid targets are `header` and
+        `body` only — unlike request_transformer, there is no `query`
+        target.
 
         When `apply_route_overrides: true`, the plugin consumes per-rule
         header transforms published by `mesh_route_dispatch` onto
@@ -18156,7 +18213,12 @@ components:
           const: header
         key:
           type: string
-          description: HTTP header name.
+          description: |
+            HTTP header name. For add/update, must not be a protocol-managed
+            hop-by-hop or framing destination (`connection`, `content-length`,
+            `keep-alive`, `proxy-authenticate`, `proxy-connection`, `te`,
+            `trailer`, `transfer-encoding`, `upgrade`). Remove may target
+            those names.
         value:
           type: string
           description: |
@@ -18168,6 +18230,10 @@ components:
           type: string
           description: |
             Required for rename; must not be set for add/update/remove.
+            Must not be a protocol-managed hop-by-hop or framing destination
+            (`connection`, `content-length`, `keep-alive`,
+            `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
+            `transfer-encoding`, `upgrade`).
 
     ResponseTransformerBodyRule:
       type: object
@@ -18208,7 +18274,7 @@ components:
     SecurityHeadersConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: security_headers — Injects validated response security headers (secure defaults) and strips fingerprinting headers at the client-visible initial-header boundary, including buffered gRPC/gRPC-Web and WebSocket handshakes. Unknown configuration keys are rejected."
+      description: "Plugin: security_headers — Injects validated response security headers (secure defaults) and strips fingerprinting headers at the client-visible initial-header boundary, including buffered gRPC/gRPC-Web and WebSocket handshakes. Unknown configuration keys are rejected, and `set` rejects protocol-managed hop-by-hop / framing destinations (`remove` of those names remains allowed)."
       properties:
         content_type_options:
           oneOf:
@@ -18272,7 +18338,7 @@ components:
           additionalProperties:
             type: string
             pattern: '^[\u0009\u0020-\u007E]*$'
-          description: "Arbitrary response headers to set (name -> value). Names accept the complete HTTP field-name token grammar, are limited to 65,535 ASCII bytes, and are canonicalized to lowercase. Values must satisfy the HTTP HeaderValue builder rules: only HTAB and printable ASCII are accepted."
+          description: "Arbitrary response headers to set (name -> value). Names accept the complete HTTP field-name token grammar, are limited to 65,535 ASCII bytes, and are canonicalized to lowercase, EXCEPT protocol-managed hop-by-hop and framing destinations (`connection`, `content-length`, `keep-alive`, `proxy-authenticate`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`, case-insensitive), which are rejected at construction — the gateway owns those fields at the final H1/H2/H3 response boundary, where it derives Content-Length from the final body, preserves a valid representation length only for HEAD, and removes it on ordinary streamed responses. Use remove for those names instead. Values must satisfy the HTTP HeaderValue builder rules: only HTAB and printable ASCII are accepted."
         remove:
           type: [array, "null"]
           items:
@@ -19959,15 +20025,20 @@ components:
         (`application/grpc` on H2/H3) is unsupported — the plugin is not
         selected for that protocol because Reject results normalize to
         trailers-only gRPC errors that discard configured bodies. Unknown
-        top-level and per-rule keys are rejected; the free-form headers map
-        remains open for string-valued response headers. Status codes must be
-        final (200–599) or 101 for a synthetic WebSocket handshake; other
-        informational statuses are rejected. A configured 101 fails closed
-        with 500 when the matching request is not an actual WebSocket
-        handshake. HEAD omits content bytes while keeping representation
-        Content-Length; 204/205/304 omit body and Content-Length on every
-        frontend (H1/H2/H3). Runtime construction and request-flavor
-        enforcement are the authoritative final boundaries.
+        top-level and per-rule keys are rejected. The free-form headers map
+        accepts string-valued response headers but rejects protocol-managed
+        hop-by-hop and framing names (`Connection`, `Keep-Alive`,
+        `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`,
+        `Transfer-Encoding`, `Upgrade`, `Content-Length`, including case
+        variants); the gateway derives Content-Length from the mock
+        body/status/method and strips connection/framing fields at the final
+        H1/H2/H3 response boundary. Status codes must be final (200–599) or
+        101 for a synthetic WebSocket handshake; other informational statuses
+        are rejected. A configured 101 fails closed with 500 when the matching
+        request is not an actual WebSocket handshake. HEAD omits content bytes
+        while keeping representation Content-Length; 204/205/304 omit body and
+        Content-Length on every frontend (H1/H2/H3). Runtime construction and
+        request-flavor enforcement are the authoritative final boundaries.
       required:
         - rules
       properties:
@@ -20017,7 +20088,12 @@ components:
                 type: object
                 additionalProperties:
                   type: string
-                description: Response headers (default content-type application/json)
+                description: >-
+                  Response headers (default content-type application/json).
+                  Protocol-managed hop-by-hop and framing names (`connection`,
+                  `content-length`, `keep-alive`, `proxy-authenticate`,
+                  `proxy-connection`, `te`, `trailer`, `transfer-encoding`,
+                  `upgrade`) are rejected at construction.
               body:
                 type: string
                 description: >-
@@ -20175,7 +20251,14 @@ components:
       description: |
         Plugin: request_mirror — Duplicates live proxy traffic to a secondary
         destination for shadow testing, validation, or migration checks
-        without affecting client responses. Only the properties below are
+        without affecting client responses. The shadow request is dispatched in
+        the finalized-request-egress phase, after request-body transforms and
+        after every final request-policy hook has accepted the backend-visible
+        representation, so the mirror receives the byte-identical finalized body
+        plus the finalized pre-egress header baseline. A preceding function may
+        add a later backend-only header overlay. Final request-body policy never
+        rejects only after mirror dispatch; backend admission or transport still
+        can. Only the properties below are
         admitted; unknown top-level keys are rejected so misspelled sampling,
         body, protocol, or endpoint controls cannot silently fall back to
         security-sensitive defaults (cleartext http, 100% mirroring, body
@@ -20373,7 +20456,13 @@ components:
       additionalProperties: false
       description: |
         Plugin: serverless_function — Invokes AWS Lambda, Azure Functions, or
-        Google Cloud Functions as middleware in the proxy pipeline. In
+        Google Cloud Functions as middleware in the proxy pipeline. The function
+        is invoked in the finalized-request-egress phase, after request-body
+        transforms and after every final request-policy hook (WAF body rules,
+        OpenAPI request schema, body validation, the post-transform request-size
+        ceiling) has accepted the exact backend-visible body, so those policies
+        never reject only after the function was contacted. Backend admission,
+        circuit-breaker, or transport checks can still fail later. In
         `pre_proxy` mode the function response can inject request headers and
         metadata before the backend call. In `terminate` mode the function
         response is returned directly to the client. Native gRPC terminate
@@ -20548,16 +20637,16 @@ components:
         forward_body:
           type: boolean
           default: false
-          description: "Include one authoritative lossless request-body representation in the function payload for every HTTP method. Ferrum never parses JSON into a structured value: exact UTF-8 bytes are carried as a string with body_encoding=utf8, arbitrary bytes are base64 with body_encoding=base64, and the active hook Content-Type is carried separately as body_content_type. The plugin buffers before invocation and fails closed if bytes are unavailable or the active request headers use a non-identity Content-Encoding. Candidate admission and runtime cache construction reject combination with a request-body transformer on the same protocol chain."
+          description: "Include one authoritative lossless finalized request-body representation in the function payload for every HTTP method. Ferrum never parses JSON into a structured value: exact UTF-8 bytes are carried as a string with body_encoding=utf8, arbitrary bytes are base64 with body_encoding=base64, and the active hook Content-Type is carried separately as body_content_type. The plugin buffers before invocation and fails closed if bytes are unavailable or either the original or active request headers use a non-identity Content-Encoding. Because invocation occurs after request-body transforms and final request-policy acceptance, this plugin may share a protocol chain with a request-body transformer and observes the exact backend-visible bytes. Candidate admission and runtime cache construction retain the fail-closed composition refusal only for registered custom plugins that declare pre-finalization request-body egress."
         forward_headers:
           type: array
           items:
             type: string
-          description: "Header names to forward into the function payload (lowercased at config load). Values come from the effective before_proxy header view, so a header an earlier plugin removed - authorization under strip_authorization_on_success, or a gateway-owned claim_headers destination with no verified claim - is omitted rather than re-read from the client's original request."
+          description: "Header names to forward into the function payload (lowercased at config load). Values come from the finalized backend-visible header view (the function is invoked in the finalized-request-egress phase, after request-body transforms and every final request-policy hook), so a header an earlier plugin removed - authorization under strip_authorization_on_success, or a gateway-owned claim_headers destination with no verified claim - is omitted rather than re-read from the client's original request."
         forward_query_params:
           type: boolean
           default: false
-          description: "Include decoded query parameters in the function payload after omitting credentials that an earlier auth plugin marked for backend stripping. Duplicate decoded names, invalid percent-encoded UTF-8, raw '+' ambiguity, and parameters lacking their original encoded representation are rejected before invocation even when on_error=continue."
+          description: "Include decoded query parameters from the shared canonical backend-bound query view in the function payload, after omitting credentials that an earlier auth plugin marked for backend stripping. Behavior is identical on HTTP/1.1, HTTP/2, and HTTP/3 and includes any earlier ordered query transform. Duplicate decoded names (including percent-encoded aliases and bare/valued pairs), literal '+', malformed percent-encoding, non-UTF-8 decodings, and parameters lacking their original encoded representation are rejected before invocation even when on_error=continue."
         timeout_ms:
           type: integer
           format: uint64
@@ -22846,7 +22935,7 @@ components:
     AiFederationConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_federation — HTTP-family OpenAI Chat Completions gateway. Translates final request bodies to provider-native JSON with a 64 MiB serialization cap and normalizes bounded, non-streaming responses back to OpenAI format. Native gRPC is not supported or advertised. Provider and OAuth redirects are never followed. Configuration is strict: unknown root, provider, and circuit fields are rejected. Streaming Chat Completions (`stream: true`) return 501. Priority fallback is allowed for configured statuses, malformed provider success responses, and proven pre-wire transport failures. Ambiguous POST outcomes are not replayed by default. Fails closed by default when a JSON POST cannot be inspected, lacks a string `model`, or has no matching provider. Outbound calls use the shared PluginHttpClient and global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY); per-proxy backend TLS overrides do not apply."
+      description: "Plugin: ai_federation — HTTP-family OpenAI Chat Completions gateway. Dispatches from the finalized-request-egress phase after request-body transforms and the complete final request-policy hook pass, so priority_override cannot move provider I/O ahead of WAF/OpenAPI/body/size policy. Translates final request bodies to provider-native JSON with a 64 MiB serialization cap and normalizes bounded, non-streaming responses back to OpenAI format. Native gRPC is not supported or advertised. Provider and OAuth redirects are never followed. Configuration is strict: unknown root, provider, and circuit fields are rejected. Streaming Chat Completions (`stream: true`) return 501. Priority fallback is allowed for configured statuses, malformed provider success responses, and proven pre-wire transport failures. Ambiguous POST outcomes are not replayed by default. Fails closed by default when a JSON POST cannot be inspected, lacks a string `model`, or has no matching provider. Outbound calls use the shared PluginHttpClient and global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY); per-proxy backend TLS overrides do not apply."
       required: [providers]
       properties:
         providers:
@@ -23353,7 +23442,14 @@ components:
             downstream_session_header:
               type: string
               default: mcp-session-id
-              description: Must be a valid HTTP header name; rejected at config validation otherwise.
+              description: >-
+                Must be a valid HTTP header name; rejected at config validation
+                otherwise. This name is stamped onto the client response, so
+                protocol-managed hop-by-hop and framing destinations
+                (`connection`, `content-length`, `keep-alive`,
+                `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
+                `transfer-encoding`, `upgrade`, case-insensitive) are also
+                rejected.
             upstream_session_header:
               type: string
               default: mcp-session-id

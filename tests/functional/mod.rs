@@ -94,6 +94,7 @@ mod functional_request_transformer_query_test;
 mod functional_response_body_limits_test;
 mod functional_response_mock_grpc_exclusion_test;
 mod functional_response_mock_semantics_test;
+mod functional_response_protocol_managed_headers_test;
 mod functional_retry_test;
 mod functional_router_cache_test;
 mod functional_scale_perf_test;
