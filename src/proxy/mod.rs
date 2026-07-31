@@ -3335,8 +3335,16 @@ pub(crate) fn final_request_body_requirements(
     request_may_need_buffering: bool,
     has_terminal_body_dispatch: bool,
     has_contextual_final_body_hook: bool,
+    // `true` when a finalized-request-egress plugin is configured for a chain
+    // whose dispatch ladder finalizes the body outside `proxy_to_backend`. The
+    // native-gRPC branch runs its own transform/final-hook pass and its own
+    // egress boundary, so callers pass `false` there.
+    has_finalized_request_egress: bool,
 ) -> (bool, bool, bool) {
-    if request_may_need_buffering && (has_terminal_body_dispatch || has_contextual_final_body_hook)
+    if request_may_need_buffering
+        && (has_terminal_body_dispatch
+            || has_contextual_final_body_hook
+            || has_finalized_request_egress)
     {
         let mut requires_buffering = false;
         let mut terminal_dispatch = false;
@@ -3348,6 +3356,12 @@ pub(crate) fn final_request_body_requirements(
                 needs_final_context |= plugin.needs_final_request_body_context();
             }
         }
+        // An egress plugin must observe the exact backend-visible request, and
+        // the ordinary ladder finalizes the body *inside* `proxy_to_backend`
+        // — while the backend request is already being built. Pull the
+        // finalization forward so the egress boundary is reached before any
+        // dispatch (GHSA-4vr5-4wm3-x5xv).
+        terminal_dispatch |= has_finalized_request_egress && requires_buffering;
         (requires_buffering, terminal_dispatch, needs_final_context)
     } else if request_may_need_buffering {
         (
@@ -4456,6 +4470,199 @@ pub(crate) async fn run_final_request_body_hooks_with_provenance(
         }
     }
     crate::plugins::RequestPluginDeadlineResult::Completed(PluginResult::Continue)
+}
+
+/// `TransactionSummary.rejection_phase` for a rejection produced by the
+/// finalized-request-egress phase. `serverless_function` terminate responses and
+/// egress failure policies previously reported `before_proxy`; they now report
+/// the phase that actually produced them.
+pub(crate) const FINALIZED_REQUEST_EGRESS_PHASE: &str = "finalized_request_egress";
+
+/// Select the rejection phase label for a finalization site that can reject
+/// from either the final request-body policy hooks or the egress phase.
+pub(crate) fn finalized_request_rejection_phase(rejected_by_egress: bool) -> &'static str {
+    if rejected_by_egress {
+        FINALIZED_REQUEST_EGRESS_PHASE
+    } else {
+        "on_final_request_body"
+    }
+}
+
+/// Rebase dispatch onto a plugin-selected backend path while preserving the
+/// private override for finalized-egress plugins.
+///
+/// Finalized-egress hooks deliberately receive the client-visible `ctx.path`
+/// for compatibility. Security-sensitive hooks such as `request_mirror` use
+/// `route_override_path` to recover the exact mesh-selected path instead. Do
+/// not consume the override here: doing so makes the primary use the rewrite
+/// while a later mirror silently falls back to the original client path.
+pub(crate) fn rebase_route_override_path(
+    ctx: &mut RequestContext,
+    original_path: String,
+) -> String {
+    let Some(rewritten) = ctx.route_override_path.clone() else {
+        return original_path;
+    };
+    ctx.path.clone_from(&rewritten);
+    rewritten
+}
+
+/// Outcome of the finalized-request-egress phase (GHSA-4vr5-4wm3-x5xv).
+pub(crate) struct FinalizedRequestEgressOutcome {
+    /// `Continue`, or the rejection an egress plugin used to terminate the
+    /// request (the `serverless_function` `terminate` contract).
+    pub result: PluginResult,
+    /// Additive backend request headers published during the phase. Empty for
+    /// every chain except `serverless_function` `pre_proxy`.
+    pub backend_header_overlay: HashMap<String, String>,
+}
+
+impl FinalizedRequestEgressOutcome {
+    fn skipped() -> Self {
+        Self {
+            result: PluginResult::Continue,
+            backend_header_overlay: HashMap::new(),
+        }
+    }
+}
+
+/// Run the finalized-request-egress phase.
+///
+/// This is the ONLY place a built-in plugin is allowed to perform irreversible
+/// outbound request egress. Callers must invoke it after request-body
+/// collection, after `apply_request_body_plugins_with_context`, and after
+/// `run_final_request_body_hooks` has returned `Continue` for the same
+/// `headers`/`body` pair — so the representation an egress plugin transmits is
+/// byte-identical to what the backend would receive, and every applicable final
+/// request-body policy has already accepted it. Backend admission, circuit
+/// breaking, and transport checks still occur later.
+///
+/// A request that finalizes nowhere — nothing required buffering, or it carries
+/// no body at all — has no transform and no final-body hook to run, so its
+/// client representation is already the backend-visible one and the H1/H2 and H3
+/// pre-dispatch boundaries invoke the phase with an empty body instead.
+///
+/// The phase is reachable from several dispatch ladders (H1/H2 terminal
+/// preparation, H1/H2 ordinary preparation, the native-gRPC branch, the H1/H2
+/// pre-dispatch boundary, and the H3 boundary after terminal preparation).
+/// `RequestContext::finalized_request_egress_dispatched` makes the external side
+/// effect exactly-once across all of them, including across retries, which
+/// replay the already-finalized body.
+pub(crate) async fn run_finalized_request_egress_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    // The path the CLIENT requested. Egress hooks keep the documented
+    // client-path request view that the deferred `before_proxy` passes gave
+    // them, rather than the route-override-rewritten backend path; plugins that
+    // need the authorized backend path read `ctx.authorized_backend_path()`.
+    client_request_path: &str,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> FinalizedRequestEgressOutcome {
+    if ctx.finalized_request_egress_dispatched {
+        return FinalizedRequestEgressOutcome::skipped();
+    }
+    if !plugins
+        .iter()
+        .any(|plugin| plugin.dispatches_finalized_request_egress())
+    {
+        return FinalizedRequestEgressOutcome::skipped();
+    }
+    // Claim the phase before the first hook runs: a plugin that terminates the
+    // request must not be re-invoked by a later ladder that also reaches this
+    // boundary.
+    ctx.finalized_request_egress_dispatched = true;
+    let backend_ctx_path = std::mem::replace(&mut ctx.path, client_request_path.to_string());
+    let outcome = run_finalized_request_egress_hooks_inner(plugins, ctx, headers, body).await;
+    ctx.path = backend_ctx_path;
+    outcome
+}
+
+async fn run_finalized_request_egress_hooks_inner(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> FinalizedRequestEgressOutcome {
+    let mut backend_header_overlay = HashMap::new();
+    for plugin in plugins {
+        if !plugin.dispatches_finalized_request_egress() {
+            continue;
+        }
+        let deadline = ctx.grpc_deadline_at();
+        match crate::plugins::await_request_plugin_deadline_with_provenance(
+            deadline,
+            plugin.dispatch_finalized_request_egress(
+                ctx,
+                headers,
+                body,
+                &mut backend_header_overlay,
+            ),
+        )
+        .await
+        .into_plugin_result(ctx)
+        {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                return FinalizedRequestEgressOutcome {
+                    result: reject,
+                    backend_header_overlay,
+                };
+            }
+        }
+    }
+    FinalizedRequestEgressOutcome {
+        result: PluginResult::Continue,
+        backend_header_overlay,
+    }
+}
+
+/// Merge the finalized-request-egress header overlay into the outbound header
+/// map, then restore gateway-owned assertions and re-apply the egress baggage
+/// policy.
+///
+/// The overlay is externally supplied content (a `pre_proxy` function response),
+/// so it is filtered exactly like the deferred `before_proxy` routing-header
+/// pass: it can never impersonate `x-consumer-*` / `x-geo-country`, and it
+/// cannot re-add a baggage key the operator configured Ferrum to strip.
+pub(crate) fn apply_finalized_request_egress_header_overlay(
+    ctx: &mut RequestContext,
+    owned_proxy_headers: &mut Option<HashMap<String, String>>,
+    overlay: HashMap<String, String>,
+    strip_baggage_keys: &[String],
+) {
+    if overlay.is_empty() {
+        return;
+    }
+    let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
+    for (name, value) in overlay {
+        headers.insert(name, value);
+    }
+    refresh_effective_backend_gateway_assertion_headers(ctx, owned_proxy_headers);
+    hbone_proxy::strip_egress_baggage_in_proxy_headers(
+        owned_proxy_headers,
+        &ctx.headers,
+        strip_baggage_keys,
+    );
+}
+
+/// Map-based variant of [`apply_finalized_request_egress_header_overlay`] for
+/// the native HTTP/3 frontend, which owns a plain outbound header map instead of
+/// the H1/H2 `Option<HashMap>` clone-on-write shape.
+pub(crate) fn apply_finalized_request_egress_header_overlay_in_map(
+    ctx: &RequestContext,
+    headers: &mut HashMap<String, String>,
+    overlay: HashMap<String, String>,
+    strip_baggage_keys: &[String],
+) {
+    if overlay.is_empty() {
+        return;
+    }
+    for (name, value) in overlay {
+        headers.insert(name, value);
+    }
+    refresh_backend_gateway_assertion_headers(ctx, headers);
+    crate::modes::mesh::hbone::strip_egress_baggage_in_map(headers, strip_baggage_keys);
 }
 
 pub(crate) struct RejectedResponseParts {
@@ -21760,6 +21967,12 @@ async fn handle_proxy_request_inner(
         .has(crate::plugin_cache::PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH);
     let has_contextual_final_body_hook =
         capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
+    // Native gRPC finalizes and reaches its own egress boundary inside the gRPC
+    // branch, so only the non-gRPC ladder pulls finalization forward for an
+    // egress plugin (GHSA-4vr5-4wm3-x5xv).
+    let has_finalized_request_egress_before_dispatch = !is_grpc_request
+        && capabilities
+            .has(crate::plugin_cache::PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS);
     let (
         initial_requires_request_body_buffering,
         initial_final_body_before_backend_dispatch,
@@ -21770,6 +21983,7 @@ async fn handle_proxy_request_inner(
         request_may_need_buffering,
         has_terminal_body_dispatch,
         has_contextual_final_body_hook,
+        has_finalized_request_egress_before_dispatch,
     );
     let before_proxy_body_requirements = if initial_requires_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY)
@@ -21985,9 +22199,12 @@ async fn handle_proxy_request_inner(
             },
     );
 
-    // before_proxy hooks — only clone headers if at least one plugin modifies them.
-    // When no plugin modifies headers, pass &mut ctx.headers directly to avoid
-    // an expensive per-request HashMap clone on the hot path.
+    // before_proxy hooks — clone headers when the resolved capability set says
+    // a plugin may change backend-visible headers. Most such plugins mutate in
+    // before_proxy; a later overlay publisher may advertise the same capability
+    // conservatively so replay/cache admission sees the mutation ordering.
+    // Otherwise pass &mut ctx.headers directly to avoid an expensive per-request
+    // HashMap clone on the hot path.
     let needs_header_clone = capabilities.has(PluginCapabilities::MODIFIES_REQUEST_HEADERS);
     let mut owned_proxy_headers: Option<HashMap<String, String>> = None;
     if needs_header_clone {
@@ -22133,6 +22350,7 @@ async fn handle_proxy_request_inner(
             request_may_need_buffering,
             has_terminal_body_dispatch,
             has_contextual_final_body_hook,
+            has_finalized_request_egress_before_dispatch,
         );
         std::mem::swap(&mut ctx.headers, transformed_headers);
         requirements
@@ -22262,15 +22480,11 @@ async fn handle_proxy_request_inner(
     // local `path`; the WS / HBONE branches read `ctx.path`, so mirror the
     // override onto `ctx.path` too). The original path was already used for
     // route selection; VS-derived proxies never set `strip_listen_path`, so
-    // the rewritten value is the literal forwarded path. No allocation when no
-    // rewrite is set.
-    let path = match ctx.route_override_path.take() {
-        Some(rewritten) => {
-            ctx.path = rewritten.clone();
-            rewritten
-        }
-        None => path,
-    };
+    // the rewritten value is the literal forwarded path. Preserve the private
+    // override so finalized-egress plugins can recover the selected backend
+    // path while their public `ctx.path` view is temporarily restored to the
+    // client path. No allocation when no rewrite is set.
+    let path = rebase_route_override_path(&mut ctx, path);
 
     // Resolve upstream target and hash key from the request epoch.
     // `ctx.orig_dst` (the captured SO_ORIGINAL_DST on mesh capture listeners)
@@ -22495,9 +22709,36 @@ async fn handle_proxy_request_inner(
         .await);
     }
 
-    // A terminal final-body plugin (currently `ai_federation`) owns its own
-    // external dispatch and returns the complete response. Finalize and invoke
-    // it after inbound transport policy, but before the placeholder route's
+    // Most protocol-classified gRPC requests finalize inside the native gRPC
+    // branch below. Pass-through gRPC-Web on a mesh transport instead rides the
+    // generic HTTP-family path, so classify it before terminal preparation:
+    // when one of its plugins requires the request body, that generic path must
+    // still run transforms, final policy, and finalized-request egress in that
+    // order before any mirror/function/provider can be contacted.
+    let grpc_request_is_web_translated =
+        crate::plugins::grpc_web::request_is_grpc_web_translated(&ctx);
+    let grpc_mesh_fall_through = is_grpc_request
+        && proxy.dispatch_kind.is_http_family()
+        && upstream_target.as_deref().is_some_and(|target| {
+            grpc_proxy::grpc_mesh_dispatch_falls_through(
+                grpc_proxy::classify_grpc_mesh_dispatch(target),
+                request_uses_grpc_content_type,
+                grpc_request_is_web_translated,
+                !requires_request_body_buffering,
+            )
+        });
+    let grpc_uses_native_dispatch =
+        is_grpc_request && proxy.dispatch_kind.is_http_family() && !grpc_mesh_fall_through;
+    let grpc_uses_generic_dispatch = is_grpc_request && !grpc_uses_native_dispatch;
+    let final_body_before_backend_dispatch = final_body_before_backend_dispatch
+        || (grpc_uses_generic_dispatch
+            && requires_request_body_buffering
+            && capabilities.has(PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS));
+
+    // A terminal finalized-egress plugin (currently `ai_federation`) owns its
+    // external dispatch and returns the complete response. Finalize the body,
+    // run every final request-policy hook, and then invoke the later egress
+    // phase after inbound transport policy but before the placeholder route's
     // backend circuit breaker and every backend-only preflight. Besides
     // preventing an unrelated backend policy from suppressing provider calls,
     // returning here keeps synthetic provider outcomes out of backend health,
@@ -22606,7 +22847,7 @@ async fn handle_proxy_request_inner(
                     buffered.body,
                 )
                 .await;
-                let final_body_result = run_final_request_body_hooks(
+                let mut final_body_result = run_final_request_body_hooks(
                     &plugins,
                     body_hook_ctx.as_mut(),
                     grpc_deadline_at,
@@ -22614,7 +22855,6 @@ async fn handle_proxy_request_inner(
                     &transformed,
                 )
                 .await;
-                plugin_execution_ns += terminal_hook_start.elapsed().as_nanos() as u64;
                 if let Some(body_hook_ctx) = body_hook_ctx {
                     let request_body = ctx.metadata.remove("request_body");
                     ctx.metadata = body_hook_ctx.metadata;
@@ -22631,6 +22871,36 @@ async fn handle_proxy_request_inner(
                     ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
                     ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
                 }
+                // Irreversible outbound egress runs here and nowhere earlier:
+                // `transformed` is the backend-visible body and every final
+                // request-policy hook has just accepted it, so no final-body
+                // policy can reject only after a mirror, function, or provider
+                // was contacted (GHSA-4vr5-4wm3-x5xv). Backend admission and
+                // transport checks still occur later. The hook context has
+                // already been written back, so the phase observes the live
+                // request context.
+                let mut rejected_by_egress = false;
+                if matches!(final_body_result, PluginResult::Continue)
+                    && capabilities.has(PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS)
+                {
+                    let egress = run_finalized_request_egress_hooks(
+                        &plugins,
+                        &mut ctx,
+                        &original_request_path,
+                        &hook_headers,
+                        &transformed,
+                    )
+                    .await;
+                    apply_finalized_request_egress_header_overlay(
+                        &mut ctx,
+                        &mut owned_proxy_headers,
+                        egress.backend_header_overlay,
+                        &state.mesh_egress_strip_baggage_keys,
+                    );
+                    rejected_by_egress = !matches!(egress.result, PluginResult::Continue);
+                    final_body_result = egress.result;
+                }
+                plugin_execution_ns += terminal_hook_start.elapsed().as_nanos() as u64;
                 match final_body_result {
                     PluginResult::Continue => {
                         request_body_prepared = true;
@@ -22672,7 +22942,7 @@ async fn handle_proxy_request_inner(
                             &ctx,
                             normalized.http_status.as_u16(),
                             start_time,
-                            "on_final_request_body",
+                            finalized_request_rejection_phase(rejected_by_egress),
                             plugin_execution_ns,
                             Some(&original_request_path),
                         )
@@ -22687,6 +22957,99 @@ async fn handle_proxy_request_inner(
             }
             bodyless => bodyless,
         };
+    }
+
+    // A request that never reaches a body-finalization site has no
+    // `transform_request_body` and no `on_final_request_body` phase, so its
+    // client representation is already the backend-visible one and this is the
+    // finalized-egress boundary for it. Two shapes land here:
+    //
+    // - nothing required buffering at all (WebSocket handshakes, streamed
+    //   requests with no body policy), and
+    // - a request that carries no body whatsoever on a proxy that *does*
+    //   require buffering. `buffer_request_body_for_before_proxy` deliberately
+    //   leaves such a request streaming, so the terminal preparation above falls
+    //   to its `bodyless` arm and runs neither transforms, nor final-body hooks,
+    //   nor an egress boundary of its own. Without this the whole phase would be
+    //   unreachable for, say, a bodyless `GET` on a `request_mirror` proxy
+    //   (`mirror_request_body` defaults to true, which requires buffering).
+    //
+    // A request that did finalize has already dispatched and is excluded by
+    // `finalized_request_egress_dispatched` before the header snapshot is
+    // cloned. A buffering gRPC request that uses generic dispatch (mesh
+    // fall-through or a non-HTTP-family dispatch kind) was pulled through
+    // terminal preparation above; if it carried no body, it deliberately
+    // remained streaming and reaches this empty-body boundary. Only a buffering
+    // request that will enter the native-gRPC branch is left out: that branch
+    // collects the message and reaches the boundary with those exact bytes.
+    if capabilities.has(PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS)
+        && !ctx.finalized_request_egress_dispatched
+        && !(grpc_uses_native_dispatch && requires_request_body_buffering)
+    {
+        let phase_start = Instant::now();
+        let egress_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
+        let egress = run_finalized_request_egress_hooks(
+            &plugins,
+            &mut ctx,
+            &original_request_path,
+            &egress_headers,
+            &[],
+        )
+        .await;
+        apply_finalized_request_egress_header_overlay(
+            &mut ctx,
+            &mut owned_proxy_headers,
+            egress.backend_header_overlay,
+            &state.mesh_egress_strip_baggage_keys,
+        );
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        match egress.result {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                    record_request(&state, 500);
+                    return Ok(build_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"Internal error"}"#,
+                    ));
+                };
+                let status = StatusCode::from_u16(reject.status_code)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let normalized = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    &plugins,
+                    &mut ctx,
+                    status,
+                    reject.body.clone(),
+                    reject.headers,
+                    is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
+                )
+                .await;
+                apply_grpc_reject_metadata(&mut ctx, &normalized);
+                let grpc_web_response = build_grpc_web_reject_response(
+                    &plugins,
+                    &mut ctx,
+                    grpc_web_response_content_type,
+                    &normalized,
+                )
+                .await;
+                log_rejected_request_with_path(
+                    &plugins,
+                    &ctx,
+                    normalized.http_status.as_u16(),
+                    start_time,
+                    FINALIZED_REQUEST_EGRESS_PHASE,
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                )
+                .await;
+                record_request(&state, normalized.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Ok(response);
+                }
+                return Ok(build_response_from_normalized_reject(normalized));
+            }
+        }
     }
 
     let upstream_balancer = selection.balancer;
@@ -22920,7 +23283,7 @@ async fn handle_proxy_request_inner(
                     buffered.body,
                 )
                 .await;
-                let final_body_result = run_final_request_body_hooks(
+                let mut final_body_result = run_final_request_body_hooks(
                     &plugins,
                     body_hook_ctx.as_mut(),
                     grpc_deadline_at,
@@ -22947,6 +23310,30 @@ async fn handle_proxy_request_inner(
                     // maps back, every semantic miss would silently store as exact-only.
                     ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
                     ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
+                }
+                // Finalized-request-egress boundary (GHSA-4vr5-4wm3-x5xv): the
+                // backend-visible body has been transformed and accepted by every
+                // final request-policy hook.
+                let mut rejected_by_egress = false;
+                if matches!(final_body_result, PluginResult::Continue)
+                    && capabilities.has(PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS)
+                {
+                    let egress = run_finalized_request_egress_hooks(
+                        &plugins,
+                        &mut ctx,
+                        &original_request_path,
+                        &hook_headers,
+                        &transformed,
+                    )
+                    .await;
+                    apply_finalized_request_egress_header_overlay(
+                        &mut ctx,
+                        &mut owned_proxy_headers,
+                        egress.backend_header_overlay,
+                        &state.mesh_egress_strip_baggage_keys,
+                    );
+                    rejected_by_egress = !matches!(egress.result, PluginResult::Continue);
+                    final_body_result = egress.result;
                 }
                 match final_body_result {
                     PluginResult::Continue => {
@@ -22995,7 +23382,7 @@ async fn handle_proxy_request_inner(
                             &ctx,
                             normalized.http_status.as_u16(),
                             start_time,
-                            "on_final_request_body",
+                            finalized_request_rejection_phase(rejected_by_egress),
                             plugin_execution_ns,
                             Some(&original_request_path),
                         )
@@ -23155,19 +23542,7 @@ async fn handle_proxy_request_inner(
     //     gRPC-Web, but text-mode translated gRPC-Web remains fail-closed here
     //     because it requires request-body buffering and the generic mesh-mTLS
     //     path does not accept pre-buffered request bodies.
-    let grpc_request_is_web_translated =
-        crate::plugins::grpc_web::request_is_grpc_web_translated(&ctx);
-    let grpc_mesh_fall_through = is_grpc_request
-        && proxy.dispatch_kind.is_http_family()
-        && upstream_target.as_deref().is_some_and(|target| {
-            grpc_proxy::grpc_mesh_dispatch_falls_through(
-                grpc_proxy::classify_grpc_mesh_dispatch(target),
-                request_uses_grpc_content_type,
-                grpc_request_is_web_translated,
-                !requires_request_body_buffering,
-            )
-        });
-    if is_grpc_request && proxy.dispatch_kind.is_http_family() && !grpc_mesh_fall_through {
+    if grpc_uses_native_dispatch {
         {
             let grpc_proxy_headers = owned_proxy_headers.as_mut().unwrap_or(&mut ctx.headers);
             apply_effective_backend_scheme_headers(
@@ -23177,7 +23552,9 @@ async fn handle_proxy_request_inner(
                 state.add_forwarded_header,
             );
         }
-        let owned_proxy_headers_ref = owned_proxy_headers.as_ref();
+        // `owned_proxy_headers` is read back through `as_ref()` at each use rather
+        // than held in a long-lived borrow: the finalized-request-egress phase below
+        // needs `&mut ctx` and may publish backend header overlay entries.
 
         // FAIL CLOSED on a gRPC request routed to a mesh-tagged target this
         // branch cannot dispatch over its secured transport (issue #2003):
@@ -23554,7 +23931,7 @@ async fn handle_proxy_request_inner(
             );
 
             // Transform request body via plugins (e.g., gRPC-Web base64 decoding)
-            let mut hook_headers = owned_proxy_headers_ref.unwrap_or(&ctx.headers).clone();
+            let mut hook_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
             hook_headers
                 .entry(":path".to_string())
                 .or_insert_with(|| path.clone());
@@ -23572,7 +23949,7 @@ async fn handle_proxy_request_inner(
 
             // Run on_final_request_body hooks (e.g., protobuf validation)
             let mut body_hook_ctx = deferred_body_hook_ctx.take();
-            let final_body_result = run_final_request_body_hooks(
+            let mut final_body_result = run_final_request_body_hooks(
                 &plugins,
                 body_hook_ctx.as_mut(),
                 grpc_deadline_at,
@@ -23602,6 +23979,36 @@ async fn handle_proxy_request_inner(
                 // maps back, every semantic miss would silently store as exact-only.
                 ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
                 ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
+            }
+            // Finalized-request-egress boundary for native gRPC
+            // (GHSA-4vr5-4wm3-x5xv). `grpc_req_body` is the transformed,
+            // backend-visible message and every final request-policy hook has
+            // accepted it. `hook_headers` carries the synthetic `:path` used by
+            // the body hooks, so the immutable snapshot handed to the phase is
+            // the outbound header map instead.
+            let mut rejected_by_egress = false;
+            if matches!(final_body_result, PluginResult::Continue)
+                && capabilities.has(PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS)
+            {
+                let egress_start = Instant::now();
+                let egress_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
+                let egress = run_finalized_request_egress_hooks(
+                    &plugins,
+                    &mut ctx,
+                    &original_request_path,
+                    &egress_headers,
+                    &grpc_req_body,
+                )
+                .await;
+                apply_finalized_request_egress_header_overlay(
+                    &mut ctx,
+                    &mut owned_proxy_headers,
+                    egress.backend_header_overlay,
+                    &state.mesh_egress_strip_baggage_keys,
+                );
+                plugin_execution_ns += egress_start.elapsed().as_nanos() as u64;
+                rejected_by_egress = !matches!(egress.result, PluginResult::Continue);
+                final_body_result = egress.result;
             }
             match final_body_result {
                 PluginResult::Continue => {}
@@ -23634,6 +24041,16 @@ async fn handle_proxy_request_inner(
                         &mut ctx,
                         grpc_web_response_content_type,
                         &normalized,
+                    )
+                    .await;
+                    log_rejected_request_with_path(
+                        &plugins,
+                        &ctx,
+                        normalized.http_status.as_u16(),
+                        start_time,
+                        finalized_request_rejection_phase(rejected_by_egress),
+                        plugin_execution_ns,
+                        Some(&original_request_path),
                     )
                     .await;
                     record_request(&state, normalized.http_status.as_u16());
@@ -23712,7 +24129,7 @@ async fn handle_proxy_request_inner(
                 &grpc_backend_url,
                 &state.grpc_pool,
                 &state.dns_cache,
-                owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                 grpc_should_stream,
                 effective_max_response_body_size_bytes,
                 ctx.grpc_deadline_at(),
@@ -23798,7 +24215,7 @@ async fn handle_proxy_request_inner(
                             let post_header_upload_timeout_ms =
                                 grpc_proxy::streaming_post_header_upload_timeout_ms_after_proxy_headers(
                                     request.headers(),
-                                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                                    owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                                     proxy.as_ref(),
                                 );
                             let recorder = Arc::new(GrpcStreamingProbeRecorder::new(
@@ -23864,7 +24281,7 @@ async fn handle_proxy_request_inner(
                     &grpc_backend_url,
                     &state.grpc_pool,
                     &state.dns_cache,
-                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                    owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                     effective_max_grpc_recv_size_bytes,
                     body_size_exceeded,
                     upload_observer,
@@ -23967,7 +24384,7 @@ async fn handle_proxy_request_inner(
                             &grpc_backend_url,
                             &state.grpc_pool,
                             &state.dns_cache,
-                            owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                            owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                             grpc_should_stream,
                             effective_max_response_body_size_bytes,
                             ctx.grpc_deadline_at(),
@@ -24072,7 +24489,7 @@ async fn handle_proxy_request_inner(
                         prev_target,
                         hash_key,
                         &ctx.client_ip,
-                        owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                     ) {
                     if !retry_target_preserves_backend_path(
                         backend_path_is_policy_bound,
@@ -24423,7 +24840,7 @@ async fn handle_proxy_request_inner(
                     &grpc_backend_url,
                     &state.grpc_pool,
                     &state.dns_cache,
-                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                    owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
                     grpc_should_stream,
                     effective_max_response_body_size_bytes,
                     ctx.grpc_deadline_at(),
@@ -37098,6 +37515,26 @@ async fn proxy_to_backend_http3_retry(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn route_rebase_preserves_rewrite_for_finalized_egress() {
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/shadow/ping".to_string(),
+        );
+        ctx.route_override_path = Some("/internal/ping".to_string());
+
+        let backend_path = super::rebase_route_override_path(&mut ctx, "/shadow/ping".to_string());
+
+        assert_eq!(backend_path, "/internal/ping");
+        assert_eq!(ctx.path, "/internal/ping");
+        assert_eq!(
+            ctx.route_override_path.as_deref(),
+            Some("/internal/ping"),
+            "the finalized-egress phase still needs the mesh-selected path"
+        );
+    }
+
+    #[test]
     fn request_signature_authority_normalization_preserves_identity() {
         assert_eq!(
             super::normalize_request_authority_for_signing("EXAMPLE.COM:80", Some("http")),
@@ -39203,9 +39640,15 @@ mod tests {
         let request_body_bytes = serde_json::to_vec(&request_body).unwrap();
         let mut ctx = request_ctx_with_ai_body(request_body);
         let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-        let synthetic = plugins[0]
-            .on_final_request_body_with_context(&mut ctx, &headers, &request_body_bytes)
-            .await;
+        let synthetic = run_finalized_request_egress_hooks(
+            &plugins,
+            &mut ctx,
+            "/v1/chat/completions",
+            &headers,
+            &request_body_bytes,
+        )
+        .await
+        .result;
 
         let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
 

@@ -2731,6 +2731,11 @@ async fn handle_h3_request(
         .has(crate::plugin_cache::PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH);
     let has_contextual_final_body_hook =
         capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
+    // A finalized-request-egress plugin must observe the exact backend-visible
+    // request, so a buffered H3 request finalizes before dispatch rather than
+    // inside the backend bridge (GHSA-4vr5-4wm3-x5xv).
+    let has_finalized_request_egress = capabilities
+        .has(crate::plugin_cache::PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS);
     let (
         initial_plugin_needs_request_buffering,
         initial_final_body_before_backend_dispatch,
@@ -2741,6 +2746,7 @@ async fn handle_h3_request(
         request_may_need_plugin_buffering,
         has_terminal_body_dispatch,
         has_contextual_final_body_hook,
+        has_finalized_request_egress,
     );
     let before_proxy_body_requirements = if initial_plugin_needs_request_buffering
         && capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY)
@@ -3255,6 +3261,7 @@ async fn handle_h3_request(
             request_may_need_plugin_buffering,
             has_terminal_body_dispatch,
             has_contextual_final_body_hook,
+            has_finalized_request_egress,
         );
         std::mem::swap(&mut ctx.headers, transformed_headers);
         requirements
@@ -3344,13 +3351,9 @@ async fn handle_h3_request(
     // contract by rebasing the request path used to build the backend URL when
     // `mesh_route_dispatch` set `ctx.route_override_path`. Keep in sync with
     // `src/proxy/mod.rs::handle_proxy_request_inner`.
-    let path = match ctx.route_override_path.take() {
-        Some(rewritten) => {
-            ctx.path = rewritten.clone();
-            rewritten
-        }
-        None => path,
-    };
+    // Preserve the private override for finalized-egress plugins. The shared
+    // helper also keeps H3 path selection in lockstep with H1/H2.
+    let path = crate::proxy::rebase_route_override_path(&mut ctx, path);
 
     // Enforce request body size limit via Content-Length fast path. Apply
     // the gRPC-specific ceiling to gRPC requests so H3 matches H1/H2.
@@ -3873,6 +3876,124 @@ async fn handle_h3_request(
                     log_status_code,
                     start_time,
                     "on_final_request_body",
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                )
+                .await;
+                send_h3_reject_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    http_status,
+                    reject.body.clone(),
+                    &headers,
+                    RejectBodyDisposition::for_request(&ctx.method, http_status.as_u16()),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
+
+    // Finalized-request-egress boundary for HTTP/3 (GHSA-4vr5-4wm3-x5xv).
+    //
+    // A buffered H3 request always reaches the terminal-finalization block
+    // above (a configured egress plugin forces `final_body_before_backend_
+    // dispatch`), so `prebuffered_body_data` here is the transformed,
+    // backend-visible body that every final request-policy hook has already
+    // accepted. A request that never buffers has no transform and no final
+    // policy hook, so its client representation is already final and the empty
+    // slice is the faithful body view. Either way, no mirror, function, or
+    // provider has been contacted before this point.
+    if capabilities
+        .has(crate::plugin_cache::PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS)
+    {
+        let phase_start = std::time::Instant::now();
+        let egress_headers = proxy_headers.clone();
+        let egress_body: &[u8] = prebuffered_body_data.as_deref().unwrap_or(&[]);
+        let egress = crate::proxy::run_finalized_request_egress_hooks(
+            &plugins,
+            &mut ctx,
+            &original_request_path,
+            &egress_headers,
+            egress_body,
+        )
+        .await;
+        crate::proxy::apply_finalized_request_egress_header_overlay_in_map(
+            &ctx,
+            &mut proxy_headers,
+            egress.backend_header_overlay,
+            &state.mesh_egress_strip_baggage_keys,
+        );
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        match egress.result {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
+                    record_request(&state, 500);
+                    let mut body = Bytes::from_static(b"Internal Server Error");
+                    let mut headers = HashMap::new();
+                    if crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
+                        &ctx.method,
+                        StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                        &mut headers,
+                        body.len(),
+                    ) {
+                        // HEAD/204/205/304: drop capacity, no DATA frame.
+                        body = Bytes::new();
+                    }
+                    send_h3_reject_flavor_aware(
+                        &mut stream,
+                        http_flavor,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        body,
+                        &headers,
+                        RejectBodyDisposition::for_request(
+                            &ctx.method,
+                            StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                let mut headers = reject.headers;
+                let rejection_hook_start = std::time::Instant::now();
+                crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
+                    &plugins,
+                    &mut ctx,
+                    &mut reject.status_code,
+                    &mut headers,
+                    &mut reject.body,
+                    matches!(http_flavor, HttpFlavor::Grpc),
+                    false,
+                )
+                .await;
+                let http_status =
+                    StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_REQUEST);
+                run_h3_reject_response_committed_hooks(
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type,
+                    http_status,
+                    reject.body.clone(),
+                    &headers,
+                )
+                .await;
+                plugin_execution_ns += rejection_hook_start.elapsed().as_nanos() as u64;
+                let log_status_code = h3_reject_log_status_and_metadata(
+                    &mut ctx,
+                    http_flavor,
+                    http_status,
+                    &reject.body,
+                    &headers,
+                );
+                record_request(&state, log_status_code);
+                log_rejected_request_with_path(
+                    &plugins,
+                    &ctx,
+                    log_status_code,
+                    start_time,
+                    crate::proxy::FINALIZED_REQUEST_EGRESS_PHASE,
                     plugin_execution_ns,
                     Some(&original_request_path),
                 )

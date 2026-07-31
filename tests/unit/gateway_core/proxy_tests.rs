@@ -537,9 +537,7 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
     for plugin_source in [
         include_str!("../../../src/plugins/fault_injection.rs"),
         include_str!("../../../src/plugins/grpc_deadline.rs"),
-        include_str!("../../../src/plugins/request_mirror.rs"),
         include_str!("../../../src/plugins/response_mock.rs"),
-        include_str!("../../../src/plugins/serverless_function.rs"),
         include_str!("../../../src/plugins/load_testing.rs"),
     ] {
         assert!(
@@ -548,10 +546,23 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
         );
     }
 
-    let serverless = include_str!("../../../src/plugins/serverless_function.rs");
-    assert!(
-        serverless.contains("fn deferred_before_proxy_may_change_routing_headers(&self) -> bool")
-    );
+    // Irreversible built-in egress has no `before_proxy` hook and dispatches in
+    // the finalized-request-egress phase, which is strictly later than the
+    // backend-path policy gate and the complete final-body policy pass
+    // (GHSA-4vr5-4wm3-x5xv).
+    for plugin_source in [
+        include_str!("../../../src/plugins/request_mirror.rs"),
+        include_str!("../../../src/plugins/serverless_function.rs"),
+        include_str!("../../../src/plugins/ai_federation.rs"),
+    ] {
+        assert!(plugin_source.contains("fn dispatches_finalized_request_egress(&self) -> bool"));
+        assert!(plugin_source.contains("async fn dispatch_finalized_request_egress("));
+        assert!(!plugin_source.contains("    async fn before_proxy("));
+        assert!(
+            !plugin_source
+                .contains("fn defer_before_proxy_until_backend_path_resolved(&self) -> bool")
+        );
+    }
 }
 
 #[test]
@@ -3832,6 +3843,159 @@ fn streaming_grpc_web_adapters_honor_preserved_response_statuses() {
         "generic preserved statuses must retain native headers and body framing"
     );
 }
+/// GHSA-4vr5-4wm3-x5xv: irreversible outbound request egress must be its own
+/// phase, reachable only after request-body finalization.
+///
+/// Structural because the property is an ordering across two 10k+ line dispatch
+/// ladders that no single unit-level call can witness: at every site that runs
+/// `run_final_request_body_hooks`, the egress phase must run *after* it and only
+/// on `Continue`, and the no-buffering fallback must be gated so it cannot fire
+/// ahead of a finalization that is still to come.
+#[test]
+fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch() {
+    let src = include_str!("../../../src/proxy/mod.rs");
+
+    // The dispatcher is exactly-once and refuses to run without a declared
+    // egress plugin, so an ordinary chain pays nothing.
+    let dispatcher = src
+        .split("pub(crate) async fn run_finalized_request_egress_hooks(")
+        .nth(1)
+        .expect("finalized-request-egress dispatcher must remain present")
+        .split("async fn run_finalized_request_egress_hooks_inner(")
+        .next()
+        .expect("dispatcher must remain bounded");
+    assert!(dispatcher.contains("if ctx.finalized_request_egress_dispatched {"));
+    assert!(dispatcher.contains("ctx.finalized_request_egress_dispatched = true;"));
+    assert!(dispatcher.contains("plugin.dispatches_finalized_request_egress()"));
+
+    let handler = src
+        .find("async fn handle_proxy_request_inner(")
+        .map(|start| &src[start..])
+        .expect("H1/H2 request handler must remain present");
+
+    // Every egress call site in the handler must be preceded by the final
+    // request-body hook pass, or be the explicitly gated no-buffering fallback.
+    let egress_sites: Vec<usize> = handler
+        .match_indices("run_finalized_request_egress_hooks(")
+        .map(|(index, _)| index)
+        .collect();
+    assert!(
+        egress_sites.len() >= 4,
+        "H1/H2 must reach the egress boundary from the terminal, ordinary, gRPC, \
+         and no-buffering sites; found {}",
+        egress_sites.len()
+    );
+    let first_final_hook = handler
+        .find("run_final_request_body_hooks(")
+        .expect("final request-body hooks must remain present");
+    assert!(
+        egress_sites[0] > first_final_hook,
+        "no egress site may precede the first final request-body hook pass"
+    );
+    assert!(
+        handler
+            .matches("finalized_request_rejection_phase(rejected_by_egress)")
+            .count()
+            >= 3,
+        "ordinary, terminal, and native-gRPC egress rejections must retain the \
+         finalized_request_egress transaction phase"
+    );
+
+    // The fallback site is the only one not preceded by a final-body hook pass.
+    // It must be exactly-once gated rather than gated on "this chain never
+    // buffers": a request that carries no body at all is left streaming by
+    // `buffer_request_body_for_before_proxy`, so the terminal preparation runs
+    // neither transforms nor final-body hooks for it and reaches no boundary of
+    // its own. Gating the fallback on `!requires_request_body_buffering` made the
+    // whole phase unreachable for a bodyless request on any buffering chain —
+    // e.g. a `GET` on a `request_mirror` proxy, whose `mirror_request_body`
+    // default requires buffering.
+    let fallback = handler
+        .find("&& !ctx.finalized_request_egress_dispatched")
+        .expect("the fallback egress site must remain exactly-once gated");
+    assert!(
+        handler[..fallback]
+            .rfind("DISPATCHES_FINALIZED_REQUEST_EGRESS")
+            .is_some_and(|capability| fallback - capability < 200),
+        "the fallback egress site must stay capability-gated"
+    );
+    assert!(
+        handler[fallback..]
+            .find("!(grpc_uses_native_dispatch && requires_request_body_buffering)")
+            .is_some_and(|offset| offset < 300),
+        "only a buffering request that will enter the native-gRPC branch may defer to \
+         that branch's own egress boundary; mesh fall-through requests must still be \
+         dispatched here when they carry no body (GHSA-4vr5-4wm3-x5xv)"
+    );
+
+    let mesh_fall_through = handler
+        .find("let grpc_mesh_fall_through")
+        .expect("mesh gRPC fall-through must be classified before terminal preparation");
+    let terminal = handler
+        .find("if final_body_before_backend_dispatch")
+        .expect("terminal body preparation must remain present");
+    assert!(
+        mesh_fall_through < terminal
+            && handler[mesh_fall_through..terminal].contains(
+                "grpc_uses_generic_dispatch\n            && requires_request_body_buffering",
+            ),
+        "every buffering gRPC request that will use generic dispatch must be pulled through \
+         transforms, final policy, and finalized-request egress before dispatch"
+    );
+
+    // A buffered request on an egress chain finalizes before backend dispatch
+    // rather than inside `proxy_to_backend`.
+    let helper = src
+        .split("pub(crate) fn final_request_body_requirements(")
+        .nth(1)
+        .expect("shared final-body applicability helper must remain present")
+        .split("pub(crate) fn request_body_requirements_before_authenticate(")
+        .next()
+        .expect("shared final-body applicability helper must remain bounded");
+    assert!(
+        helper.contains("terminal_dispatch |= has_finalized_request_egress && requires_buffering;")
+    );
+
+    // HTTP/3 reaches the same boundary after its own terminal finalization.
+    let h3 = include_str!("../../../src/http3/server.rs");
+    let h3_final_hook = h3
+        .find("let final_body_result = crate::proxy::run_final_request_body_hooks(")
+        .expect("H3 terminal final-body hooks must remain present");
+    let h3_egress = h3
+        .find("crate::proxy::run_finalized_request_egress_hooks(")
+        .expect("H3 must reach the finalized-request-egress boundary");
+    assert!(
+        h3_final_hook < h3_egress,
+        "H3 egress must run after the terminal final request-body hooks"
+    );
+
+    // Composition admission still fails closed for anything egressing earlier.
+    let cache = include_str!("../../../src/plugin_cache.rs");
+    assert!(cache.contains("plugin.enforces_finalized_request_policy()"));
+    assert!(cache.contains("plugin.dispatches_finalized_request_egress()"));
+
+    // Every built-in final request hook that can reject the backend-visible
+    // representation must advertise the composition marker. Otherwise a
+    // registered custom plugin could egress earlier and bypass that policy.
+    for policy_source in [
+        include_str!("../../../src/plugins/ai_prompt_compressor.rs"),
+        include_str!("../../../src/plugins/ai_prompt_shield.rs"),
+        include_str!("../../../src/plugins/ai_request_guard.rs"),
+        include_str!("../../../src/plugins/ai_semantic_firewall.rs"),
+        include_str!("../../../src/plugins/ai_stream_router.rs"),
+        include_str!("../../../src/plugins/ai_tool_governor.rs"),
+        include_str!("../../../src/plugins/ai_transcript_audit.rs"),
+        include_str!("../../../src/plugins/body_validator.rs"),
+        include_str!("../../../src/plugins/grpc_web.rs"),
+        include_str!("../../../src/plugins/openapi_validator.rs"),
+        include_str!("../../../src/plugins/request_size_limiting.rs"),
+        include_str!("../../../src/plugins/soap_ws_security.rs"),
+        include_str!("../../../src/plugins/waf/mod.rs"),
+    ] {
+        assert!(policy_source.contains("fn enforces_finalized_request_policy(&self) -> bool"));
+    }
+}
+
 /// `Content-Length` acceptance at the final wire boundary must be RFC 9110
 /// §8.6 `1*DIGIT`, not "whatever `u64::from_str` tolerates".
 ///

@@ -20230,7 +20230,14 @@ components:
       description: |
         Plugin: request_mirror — Duplicates live proxy traffic to a secondary
         destination for shadow testing, validation, or migration checks
-        without affecting client responses. Only the properties below are
+        without affecting client responses. The shadow request is dispatched in
+        the finalized-request-egress phase, after request-body transforms and
+        after every final request-policy hook has accepted the backend-visible
+        representation, so the mirror receives the byte-identical finalized body
+        plus the finalized pre-egress header baseline. A preceding function may
+        add a later backend-only header overlay. Final request-body policy never
+        rejects only after mirror dispatch; backend admission or transport still
+        can. Only the properties below are
         admitted; unknown top-level keys are rejected so misspelled sampling,
         body, protocol, or endpoint controls cannot silently fall back to
         security-sensitive defaults (cleartext http, 100% mirroring, body
@@ -20428,7 +20435,13 @@ components:
       additionalProperties: false
       description: |
         Plugin: serverless_function — Invokes AWS Lambda, Azure Functions, or
-        Google Cloud Functions as middleware in the proxy pipeline. In
+        Google Cloud Functions as middleware in the proxy pipeline. The function
+        is invoked in the finalized-request-egress phase, after request-body
+        transforms and after every final request-policy hook (WAF body rules,
+        OpenAPI request schema, body validation, the post-transform request-size
+        ceiling) has accepted the exact backend-visible body, so those policies
+        never reject only after the function was contacted. Backend admission,
+        circuit-breaker, or transport checks can still fail later. In
         `pre_proxy` mode the function response can inject request headers and
         metadata before the backend call. In `terminate` mode the function
         response is returned directly to the client. Native gRPC terminate
@@ -20603,12 +20616,12 @@ components:
         forward_body:
           type: boolean
           default: false
-          description: "Include one authoritative lossless request-body representation in the function payload for every HTTP method. Ferrum never parses JSON into a structured value: exact UTF-8 bytes are carried as a string with body_encoding=utf8, arbitrary bytes are base64 with body_encoding=base64, and the active hook Content-Type is carried separately as body_content_type. The plugin buffers before invocation and fails closed if bytes are unavailable or the active request headers use a non-identity Content-Encoding. Candidate admission and runtime cache construction reject combination with a request-body transformer on the same protocol chain."
+          description: "Include one authoritative lossless finalized request-body representation in the function payload for every HTTP method. Ferrum never parses JSON into a structured value: exact UTF-8 bytes are carried as a string with body_encoding=utf8, arbitrary bytes are base64 with body_encoding=base64, and the active hook Content-Type is carried separately as body_content_type. The plugin buffers before invocation and fails closed if bytes are unavailable or either the original or active request headers use a non-identity Content-Encoding. Because invocation occurs after request-body transforms and final request-policy acceptance, this plugin may share a protocol chain with a request-body transformer and observes the exact backend-visible bytes. Candidate admission and runtime cache construction retain the fail-closed composition refusal only for registered custom plugins that declare pre-finalization request-body egress."
         forward_headers:
           type: array
           items:
             type: string
-          description: "Header names to forward into the function payload (lowercased at config load). Values come from the effective before_proxy header view, so a header an earlier plugin removed - authorization under strip_authorization_on_success, or a gateway-owned claim_headers destination with no verified claim - is omitted rather than re-read from the client's original request."
+          description: "Header names to forward into the function payload (lowercased at config load). Values come from the finalized backend-visible header view (the function is invoked in the finalized-request-egress phase, after request-body transforms and every final request-policy hook), so a header an earlier plugin removed - authorization under strip_authorization_on_success, or a gateway-owned claim_headers destination with no verified claim - is omitted rather than re-read from the client's original request."
         forward_query_params:
           type: boolean
           default: false
@@ -22901,7 +22914,7 @@ components:
     AiFederationConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_federation — HTTP-family OpenAI Chat Completions gateway. Translates final request bodies to provider-native JSON with a 64 MiB serialization cap and normalizes bounded, non-streaming responses back to OpenAI format. Native gRPC is not supported or advertised. Provider and OAuth redirects are never followed. Configuration is strict: unknown root, provider, and circuit fields are rejected. Streaming Chat Completions (`stream: true`) return 501. Priority fallback is allowed for configured statuses, malformed provider success responses, and proven pre-wire transport failures. Ambiguous POST outcomes are not replayed by default. Fails closed by default when a JSON POST cannot be inspected, lacks a string `model`, or has no matching provider. Outbound calls use the shared PluginHttpClient and global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY); per-proxy backend TLS overrides do not apply."
+      description: "Plugin: ai_federation — HTTP-family OpenAI Chat Completions gateway. Dispatches from the finalized-request-egress phase after request-body transforms and the complete final request-policy hook pass, so priority_override cannot move provider I/O ahead of WAF/OpenAPI/body/size policy. Translates final request bodies to provider-native JSON with a 64 MiB serialization cap and normalizes bounded, non-streaming responses back to OpenAI format. Native gRPC is not supported or advertised. Provider and OAuth redirects are never followed. Configuration is strict: unknown root, provider, and circuit fields are rejected. Streaming Chat Completions (`stream: true`) return 501. Priority fallback is allowed for configured statuses, malformed provider success responses, and proven pre-wire transport failures. Ambiguous POST outcomes are not replayed by default. Fails closed by default when a JSON POST cannot be inspected, lacks a string `model`, or has no matching provider. Outbound calls use the shared PluginHttpClient and global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY); per-proxy backend TLS overrides do not apply."
       required: [providers]
       properties:
         providers:
