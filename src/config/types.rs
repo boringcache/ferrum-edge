@@ -2550,7 +2550,8 @@ pub struct GatewayConfig {
     /// * [`K8sMeshOverlay::NoAuthority`] — Kubernetes owns none of `mesh`;
     ///   every object there belongs to some other source.
     /// * [`K8sMeshOverlay::Authoritative`] — `mesh` is
-    ///   `base_mesh` (everything owned by native / file / xDS / DB sources)
+    ///   `base_mesh` (everything owned by native / file / xDS or another
+    ///   non-Kubernetes source; CP database snapshots never carry `mesh`)
     ///   with the Kubernetes overlay layered on top. Retaining the base layer
     ///   verbatim is what lets an authoritatively empty Kubernetes snapshot
     ///   withdraw exactly its own objects — including objects sharing a
