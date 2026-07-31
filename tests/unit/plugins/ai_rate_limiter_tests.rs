@@ -4042,6 +4042,134 @@ async fn prompt_estimate_counts_wrong_family_content_part_binary_collisions() {
 }
 
 #[tokio::test]
+async fn prompt_estimate_counts_malformed_anthropic_source_payload_leaves() {
+    // Anthropic `source` leaves share the OpenAI/Responses/Gemini payload-shape
+    // gate: a block that declares a binary `source.type` but whose leaf carries
+    // prose (no `data:` / `http(s)` prefix, not base64-shaped) is MALFORMED and
+    // must count fail-closed, so a reserved spelling alone cannot drop unbounded
+    // billed text. Baselines keep the same keys so each delta isolates the value.
+    let prose = "not a payload just ordinary text"; // 32 chars; spaces => not base64
+    assert_eq!(prose.chars().count(), 32);
+
+    // `type: "base64"` with prose at `data` must count at full width.
+    let b64_empty = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": ""}
+        }]}]
+    }))
+    .await;
+    let b64_prose = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": prose}
+        }]}]
+    }))
+    .await;
+    assert_eq!(
+        b64_prose - b64_empty,
+        8,
+        "prose under a base64-declared Anthropic source must reserve ceil(32/4)=8"
+    );
+
+    // `type: "url"` with prose at `url` must count at full width.
+    let url_empty = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "url", "url": ""}
+        }]}]
+    }))
+    .await;
+    let url_prose = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "url", "url": prose}
+        }]}]
+    }))
+    .await;
+    assert_eq!(
+        url_prose - url_empty,
+        8,
+        "prose under a url-declared Anthropic source must reserve ceil(32/4)=8"
+    );
+
+    // `type: "file"` with prose at `file_id` / `data` / `url` must count.
+    let file_empty = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "document",
+            "source": {"type": "file", "file_id": "", "data": "", "url": ""}
+        }]}]
+    }))
+    .await;
+    let file_prose = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "document",
+            "source": {"type": "file", "file_id": prose, "data": prose, "url": prose}
+        }]}]
+    }))
+    .await;
+    assert_eq!(
+        file_prose - file_empty,
+        24,
+        "prose under a file-declared Anthropic source must reserve ceil(96/4)=24"
+    );
+
+    // Genuine binary payloads at the same leaves stay excluded: growing them by
+    // 32 chars must not move the reservation at all.
+    let real_b64_short = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "A".repeat(100_000)}
+        }]}]
+    }))
+    .await;
+    let real_b64_long = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "A".repeat(100_032)}
+        }]}]
+    }))
+    .await;
+    assert_eq!(
+        real_b64_long, real_b64_short,
+        "real base64 Anthropic source payloads must stay excluded"
+    );
+    assert!(
+        real_b64_short < 80,
+        "real base64 Anthropic source payload must stay excluded; got {real_b64_short}"
+    );
+
+    let real_url_short = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "url", "url": "https://e.test/"}
+        }]}]
+    }))
+    .await;
+    let real_url_long = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "url", "url": format!("https://e.test/{PROMPT_DELTA_32}")}
+        }]}]
+    }))
+    .await;
+    assert_eq!(
+        real_url_long, real_url_short,
+        "real https Anthropic source URLs must stay excluded"
+    );
+}
+
+#[tokio::test]
 async fn prompt_estimate_counts_non_u64_token_caps_at_exact_paths() {
     // Exclusion shares requested_completion_tokens' as_u64 contract: negative and
     // fractional numbers at exact cap paths are not recognized controls and must

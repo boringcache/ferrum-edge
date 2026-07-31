@@ -1617,8 +1617,13 @@ fn should_exclude_binary_leaf(ctx: PromptWalkCtx, key: &str, value: &Value) -> b
 }
 
 /// Count members of an Anthropic content-block `source` object: exclude only the
-/// binary payload leaf (`data` / `url` / `file_id`) when `type` is binary; count
-/// the member name and every other sibling fail-closed.
+/// binary payload leaf (`data` / `url` / `file_id`) when `type` is binary **and**
+/// the leaf string is itself a recognized URL/base64 payload
+/// ([`is_binary_payload_string`]); count the member name and every other sibling
+/// fail-closed. The payload-shape gate mirrors the OpenAI / Responses / Gemini
+/// leaves: a `source` that merely declares `type: "base64"` / `"url"` / `"file"`
+/// while carrying prose is malformed, so a reserved spelling alone can never drop
+/// unbounded billed text from the reservation.
 fn count_anthropic_source_object(acc: u64, source: &serde_json::Map<String, Value>) -> u64 {
     let binary_ty = source
         .get("type")
@@ -1627,12 +1632,14 @@ fn count_anthropic_source_object(acc: u64, source: &serde_json::Map<String, Valu
 
     source.iter().fold(acc, |acc, (key, value)| {
         let acc = acc.saturating_add(member_name_character_count(key));
-        let exclude_leaf = matches!(
-            (binary_ty, key.as_str(), value),
-            (Some("base64"), "data", Value::String(_))
-                | (Some("url"), "url", Value::String(_))
-                | (Some("file"), "file_id" | "data" | "url", Value::String(_))
-        );
+        let exclude_leaf = match (binary_ty, key.as_str(), value) {
+            (Some("base64"), "data", Value::String(payload))
+            | (Some("url"), "url", Value::String(payload))
+            | (Some("file"), "file_id" | "data" | "url", Value::String(payload)) => {
+                is_binary_payload_string(payload)
+            }
+            _ => false,
+        };
         if exclude_leaf {
             acc
         } else {
