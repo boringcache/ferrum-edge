@@ -29553,10 +29553,13 @@ pub(crate) fn cap_proxy_retry_for_target(
 /// [`resolve_effective_proxy_for_target`]: a single field read on the
 /// precomputed `Proxy.dispatch_port_overrides` map, no `ArcSwap` load.
 ///
-/// `dispatch_port` is the port the dial will actually use: the LB-selected
-/// `UpstreamTarget.port` for upstream proxies, or `proxy.backend_port` for a
-/// direct-backend proxy with no upstream. This mirrors how the raw-TCP path
-/// reads the same field via `ResolvedPortOverride.max_connections`.
+/// `dispatch_port` is the DestinationRule policy key: callers with a selected
+/// target pass `UpstreamTarget::dispatch_policy_port()` (the declared Service
+/// port when `targetPort` remapping applies), while a direct-backend proxy with
+/// no selected target passes `proxy.backend_port`. The transport may dial a
+/// different workload or mesh-listener port; that address must not become the
+/// policy source. This mirrors how the raw-TCP path reads the same field via
+/// `ResolvedPortOverride.max_connections`.
 pub(crate) fn resolve_backend_max_connections(proxy: &Proxy, dispatch_port: u16) -> Option<u32> {
     proxy
         .dispatch_port_overrides
@@ -29574,9 +29577,11 @@ pub(crate) fn resolve_backend_max_connections(proxy: &Proxy, dispatch_port: u16)
 /// matches [`resolve_backend_max_connections`]: a single field read on the
 /// precomputed `Proxy.dispatch_port_overrides` map, no `ArcSwap` load.
 ///
-/// `dispatch_port` is the port the dial will actually use: the LB-selected
-/// `UpstreamTarget.port` for upstream proxies, or `proxy.backend_port` for a
-/// direct-backend proxy with no upstream.
+/// `dispatch_port` is the DestinationRule policy key: callers with a selected
+/// target pass `UpstreamTarget::dispatch_policy_port()`, while a direct-backend
+/// proxy with no selected target passes `proxy.backend_port`. A remapped
+/// workload port or mesh listener remains a transport address, not the policy
+/// source.
 ///
 /// FIELD-level fallback (#1806 codex r1): when the per-port entry carries no
 /// `http1_max_pending_requests`, inherit the service-discovery top-level
