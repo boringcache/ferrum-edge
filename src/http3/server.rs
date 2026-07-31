@@ -3947,6 +3947,10 @@ async fn handle_h3_request(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         body,
                         &headers,
+                        RejectBodyDisposition::for_request(
+                            &ctx.method,
+                            StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                        ),
                     )
                     .await?;
                     return Ok(());
@@ -4000,6 +4004,7 @@ async fn handle_h3_request(
                     http_status,
                     reject.body.clone(),
                     &headers,
+                    RejectBodyDisposition::for_request(&ctx.method, http_status.as_u16()),
                 )
                 .await?;
                 return Ok(());
