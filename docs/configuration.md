@@ -634,6 +634,8 @@ UDP capture (`FERRUM_MESH_CAPTURE_UDP_ENABLED`, default off) is read by both the
 | `FERRUM_MAX_HEADER_COUNT` | No | `100` | Max number of request headers allowed (0=unlimited) |
 | `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` | No | `10485760` | Maximum request body size (0=unlimited) |
 | `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` | No | `10485760` | Maximum response body size from backends (0=unlimited) |
+| `FERRUM_RESPONSE_BUFFER_FALLBACK_MAX_BYTES` | No | `10485760` | Fail-closed per-response ceiling used **only** when the effective response-body limit resolves to `0` ("unlimited") *and* the body is being retained in memory for a plugin instead of streamed. `0 = unlimited` stays a valid *streaming* policy; it is not a valid *buffering* policy, because a client-chosen response could otherwise grow a single buffer without bound. A configured non-zero `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` (or route ceiling) always wins over this value |
+| `FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES` | No | `268435456` | Aggregate ceiling on everything concurrent buffered responses retain at once, across all proxies and protocols. A finite per-response ceiling still multiplies by concurrency, so this is the bound that actually caps gateway memory when many clients request buffered (transformed/cached/inspected) responses at the same time. Charged in 64 KiB blocks as each body grows, so a small response costs one block and the reservation is released on every completion, error, and cancellation path. A response that cannot reserve capacity is refused with `503` and a fixed body rather than collected. Clamped up to at least one per-response ceiling so at least one buffered response is always admissible. Applied at startup; changing it requires a restart |
 | `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES` | No | `65536` | Eager-buffer known-size responses at or below this size; `0` always streams |
 | `FERRUM_H2_COALESCE_TARGET_BYTES` | No | `131072` | Target chunk size for HTTP/2 response body coalescing; clamped 16 KiB..1 MiB |
 | `FERRUM_MAX_URL_LENGTH_BYTES` | No | `8192` | Maximum URL length in bytes (path + query string, 0=unlimited) |
@@ -659,7 +661,11 @@ calling out:
 
 - Setting a global limit to `0` ("unlimited") **does not** disable an active
   route limit — the route limit remains authoritative for that proxy. Only a
-  proxy with no size-limiting instance is genuinely unbounded at `0`.
+  proxy with no size-limiting instance is genuinely unbounded at `0`, and only
+  while the body is *streamed*: a response the gateway retains in memory for a
+  plugin always gets a finite ceiling
+  (`FERRUM_RESPONSE_BUFFER_FALLBACK_MAX_BYTES`) plus a share of the aggregate
+  retention budget (`FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES`).
 - The bound applies before bytes are forwarded or retained, so a chunked or
   unknown-length upload and a strict buffered response collection are both held
   to the route ceiling rather than to the generally larger global one. A proxy

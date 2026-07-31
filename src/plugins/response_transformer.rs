@@ -983,15 +983,43 @@ impl Plugin for ResponseTransformer {
         _response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
-        // Body transforms operate on an assembled JSON document. A backend
-        // response that actually declares `text/event-stream` is outside that
-        // policy and must be released after headers rather than collected until
-        // the response-body ceiling. Missing, JSON, and every ambiguous type
-        // stay on the conservative buffered path. The shared refinement refuses
-        // this downgrade when any later hook may rewrite Content-Type, so a
-        // relabel cannot bypass the final client-visible policy decision.
-        self.should_buffer_response_body(ctx)
-            && !content_type.is_some_and(is_text_event_stream_media_type)
+        // Body transforms operate on an assembled JSON document. Once the
+        // backend named the media type, every representation this plugin
+        // provably declines can be released instead of collected up to the
+        // response-body ceiling and then rejected unread
+        // (GHSA-pwcm-6rh8-f2gh). The release condition is the EXACT negation of
+        // what `transform_response_body` acts on, so eligibility is unchanged —
+        // only the moment the decision is taken moves earlier:
+        //
+        //   * a DECLARED non-JSON type (binary downloads, `text/event-stream`,
+        //     video, `application/octet-stream`, …) — the transform returns
+        //     `None` for it, and `enforces_response_body_policy` declines it for
+        //     the same reason, so nothing was ever going to read these bytes;
+        //   * framed gRPC `+json` flavors — length-prefixed frames, declined by
+        //     both the transform and the claim predicate.
+        //
+        // An ABSENT `Content-Type` is deliberately NOT released: the transform
+        // treats it as JSON, so those bytes are still inspected and a body rule
+        // still applies (including the fail-closed rejection of an untyped
+        // unparseable document). A non-identity `Content-Encoding` over a JSON
+        // type is likewise not released — the buffered path is what turns an
+        // undecodable representation into a fail-closed refusal instead of
+        // forwarding opaque bytes past a configured redaction.
+        //
+        // Two guards keep this from becoming a bypass: the shared refinement
+        // refuses the downgrade outright when any later hook may rewrite
+        // `Content-Type`, and a translated gRPC-Web response whose terminal
+        // metadata this instance polices stays buffered.
+        if !self.should_buffer_response_body(ctx) {
+            return false;
+        }
+        if self.requires_buffered_grpc_web_trailer_policy(ctx) {
+            return true;
+        }
+        !content_type.is_some_and(|ct| {
+            !body_transform::is_json_content_type(ct)
+                || body_transform::is_framed_grpc_content_type(ct)
+        })
     }
 
     fn enforces_response_body_policy(

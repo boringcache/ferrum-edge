@@ -57,6 +57,7 @@ pub mod netns_capture;
 pub mod netns_udp_capture;
 pub(crate) mod node_waypoint_ingress_capture;
 pub mod proxy_protocol;
+pub(crate) mod response_buffer_budget;
 pub mod sni;
 pub mod stream_error;
 pub mod stream_listener;
@@ -30120,11 +30121,15 @@ pub(crate) async fn proxy_to_backend_retry(
                     }
                 }
             } else {
-                // Buffered mode: use size-limited collection when a limit is
-                // configured so an oversized chunked response cannot exhaust
-                // memory.
-                if effective_max_response_body_size_bytes > 0 {
-                    let max_size = effective_max_response_body_size_bytes;
+                // Buffered mode: always collect under the buffered ceiling and
+                // the aggregate retention budget. A configured `0` means
+                // "unlimited" for streaming only — retaining an unbounded body
+                // is folded to the fail-closed fallback ceiling here
+                // (GHSA-pwcm-6rh8-f2gh), so there is no unbounded arm left.
+                {
+                    let max_size = response_buffer_budget::buffered_response_body_ceiling(
+                        effective_max_response_body_size_bytes,
+                    );
                     let collected = match crate::plugins::await_grpc_deadline(
                         request_ctx.grpc_deadline_at(),
                         collect_response_with_limit(response, max_size),
@@ -30149,37 +30154,15 @@ pub(crate) async fn proxy_to_backend_retry(
                             backend_resolved_ip: resolved_ip.clone(),
                             error_class: None,
                         },
-                        Err(err_body) => retry::BackendResponse {
-                            status_code: 502,
-                            body: ResponseBody::buffered(err_body),
+                        Err(failure) => retry::BackendResponse {
+                            status_code: failure.status_code,
+                            body: ResponseBody::buffered(failure.body),
                             headers: HashMap::new(),
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
-                            error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                            error_class: Some(failure.error_class),
                         },
                     }
-                } else {
-                    let body_read = match crate::plugins::await_grpc_deadline(
-                        request_ctx.grpc_deadline_at(),
-                        response.bytes(),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(()) => {
-                            return client_grpc_deadline_exceeded_response_for_request(
-                                request_ctx,
-                                headers,
-                                resolved_ip,
-                            );
-                        }
-                    };
-                    buffered_backend_response_from_body_read(
-                        body_read,
-                        status,
-                        resp_headers,
-                        resolved_ip.clone(),
-                    )
                 }
             }
         }
@@ -32238,8 +32221,11 @@ async fn proxy_to_backend(
                     );
                 }
 
-                // Buffered mode: stream-collect with size limit
-                let max_size = effective_max_response_body_size_bytes;
+                // Buffered mode: stream-collect under the buffered ceiling and
+                // the aggregate retention budget.
+                let max_size = response_buffer_budget::buffered_response_body_ceiling(
+                    effective_max_response_body_size_bytes,
+                );
                 let collected = match crate::plugins::await_grpc_deadline(
                     request_ctx.grpc_deadline_at(),
                     collect_response_with_limit(response, max_size),
@@ -32268,13 +32254,13 @@ async fn proxy_to_backend(
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: None,
                     },
-                    Err(err_body) => retry::BackendResponse {
-                        status_code: 502,
-                        body: ResponseBody::buffered(err_body),
+                    Err(failure) => retry::BackendResponse {
+                        status_code: failure.status_code,
+                        body: ResponseBody::buffered(failure.body),
                         headers: HashMap::new(),
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
-                        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                        error_class: Some(failure.error_class),
                     },
                 }
             } else if stream_response {
@@ -32330,9 +32316,17 @@ async fn proxy_to_backend(
                     }
                 }
             } else {
-                let body_read = match crate::plugins::await_grpc_deadline(
+                // Buffered with no operator ceiling. `0 = unlimited` is a
+                // streaming policy only: retaining the body still gets the
+                // fail-closed fallback ceiling and the aggregate retention
+                // budget, so this arm can no longer grow without bound
+                // (GHSA-pwcm-6rh8-f2gh).
+                let max_size = response_buffer_budget::buffered_response_body_ceiling(
+                    effective_max_response_body_size_bytes,
+                );
+                let collected = match crate::plugins::await_grpc_deadline(
                     request_ctx.grpc_deadline_at(),
-                    response.bytes(),
+                    collect_response_with_limit(response, max_size),
                 )
                 .await
                 {
@@ -32349,12 +32343,24 @@ async fn proxy_to_backend(
                         );
                     }
                 };
-                buffered_backend_response_from_body_read(
-                    body_read,
-                    status,
-                    resp_headers,
-                    resolved_ip.clone(),
-                )
+                match collected {
+                    Ok((resp_body, _)) => retry::BackendResponse {
+                        status_code: status,
+                        body: ResponseBody::buffered(resp_body),
+                        headers: resp_headers,
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
+                        error_class: None,
+                    },
+                    Err(failure) => retry::BackendResponse {
+                        status_code: failure.status_code,
+                        body: ResponseBody::buffered(failure.body),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
+                        error_class: Some(failure.error_class),
+                    },
+                }
             }
         }
         Err(e) => {
@@ -32429,13 +32435,73 @@ fn is_streaming_content_type(resp_headers: &HashMap<String, String>) -> bool {
     })
 }
 
-/// Collect a response body with a size limit, returning Err with error body if exceeded.
+/// Why a buffered collection could not produce a complete body, together with
+/// the response the caller must surface instead.
+///
+/// The aggregate-budget arm is deliberately distinguishable from the
+/// per-response size arm: the backend did nothing wrong when the gateway is out
+/// of retention capacity, so it is a transient `503` rather than a `502`
+/// attributing the refusal to the origin (GHSA-pwcm-6rh8-f2gh).
+pub(crate) struct BufferedCollectFailure {
+    pub(crate) status_code: u16,
+    pub(crate) body: Vec<u8>,
+    pub(crate) error_class: retry::ErrorClass,
+}
+
+impl BufferedCollectFailure {
+    fn too_large() -> Self {
+        Self {
+            status_code: 502,
+            body: r#"{"error":"Backend response body exceeds maximum size"}"#
+                .as_bytes()
+                .to_vec(),
+            error_class: retry::ErrorClass::ResponseBodyTooLarge,
+        }
+    }
+
+    /// Mid-body read failure. The class is deliberately unchanged from before
+    /// this failure type existed — both former `Err` arms of the collector were
+    /// mapped to `ResponseBodyTooLarge` by every call site. Re-labelling it is a
+    /// telemetry change with no bearing on the buffering bounds, so it is left
+    /// for a separate change.
+    fn read_error() -> Self {
+        Self {
+            status_code: 502,
+            body: r#"{"error":"Backend response read error"}"#.as_bytes().to_vec(),
+            error_class: retry::ErrorClass::ResponseBodyTooLarge,
+        }
+    }
+
+    /// Aggregate buffered-response budget exhausted. Reuses
+    /// `ResponseBodyTooLarge` as the retry/telemetry class — both mean "this
+    /// body will not be retained", and neither is retryable against another
+    /// upstream — while carrying the distinct `503` to the client.
+    fn budget_exhausted() -> Self {
+        Self {
+            status_code: response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS,
+            body: response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY
+                .as_bytes()
+                .to_vec(),
+            error_class: retry::ErrorClass::ResponseBodyTooLarge,
+        }
+    }
+}
+
+/// Collect a backend response body into memory under both buffered-path bounds.
+///
+/// `max_size` must already be the *buffered* ceiling
+/// ([`response_buffer_budget::buffered_response_body_ceiling`]), never the raw
+/// `0 = unlimited` value: retaining an unbounded body is not a policy this path
+/// can honor. Retained bytes are additionally charged against the process-wide
+/// budget as they accumulate, and the reservation is released on every exit —
+/// success, size rejection, read error, or the future being dropped.
 async fn collect_response_with_limit(
     response: reqwest::Response,
     max_size: usize,
-) -> Result<(Vec<u8>, usize), Vec<u8>> {
+) -> Result<(Vec<u8>, usize), BufferedCollectFailure> {
     use futures_util::StreamExt as _;
     let mut body = Vec::new();
+    let mut reservation = response_buffer_budget::ResponseBufferReservation::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
@@ -32445,15 +32511,19 @@ async fn collect_response_with_limit(
                         "Backend response truncated: exceeded {} byte limit",
                         max_size
                     );
-                    return Err(r#"{"error":"Backend response body exceeds maximum size"}"#
-                        .as_bytes()
-                        .to_vec());
+                    return Err(BufferedCollectFailure::too_large());
+                }
+                if !reservation.reserve(body.len() + chunk.len()) {
+                    warn!(
+                        "Response buffering refused: aggregate retained-response budget exhausted"
+                    );
+                    return Err(BufferedCollectFailure::budget_exhausted());
                 }
                 body.extend_from_slice(&chunk);
             }
             Err(e) => {
                 error!("Error reading backend response: {}", e);
-                return Err(r#"{"error":"Backend response read error"}"#.as_bytes().to_vec());
+                return Err(BufferedCollectFailure::read_error());
             }
         }
     }
@@ -33191,6 +33261,11 @@ fn hbone_hyper_error_response(
 }
 
 enum HyperBodyCollectError {
+    /// Either the per-response ceiling or the process-wide aggregate retention
+    /// budget refused these bytes. Both are "this body will not be retained",
+    /// and the direct-H2 / HBONE / mesh-mTLS arms surface them identically as
+    /// the existing `502` too-large refusal; only the reqwest and H3 collectors
+    /// distinguish the aggregate case with a `503` (GHSA-pwcm-6rh8-f2gh).
     TooLarge,
     Read(hyper::Error),
     ReadTimeout { timeout_ms: u64 },
@@ -33217,6 +33292,13 @@ async fn collect_hyper_body_and_trailers_with_limit(
     max_size: usize,
     backend_read_timeout_ms: u64,
 ) -> Result<(Vec<u8>, Option<hyper::HeaderMap>), HyperBodyCollectError> {
+    // This helper only ever RETAINS, so the streaming `0 = unlimited` policy is
+    // folded to the fail-closed fallback ceiling and the retained bytes are
+    // charged against the process-wide aggregate budget. The reservation is
+    // released on every exit, including the caller dropping this future
+    // (GHSA-pwcm-6rh8-f2gh).
+    let max_size = response_buffer_budget::buffered_response_body_ceiling(max_size);
+    let mut reservation = response_buffer_budget::ResponseBufferReservation::new();
     let mut body_bytes = Vec::new();
     let mut trailers: Option<hyper::HeaderMap> = None;
     loop {
@@ -33239,7 +33321,13 @@ async fn collect_hyper_body_and_trailers_with_limit(
         };
         let frame = frame.map_err(HyperBodyCollectError::Read)?;
         if let Some(data) = frame.data_ref() {
-            if max_size > 0 && body_bytes.len().saturating_add(data.len()) > max_size {
+            if body_bytes.len().saturating_add(data.len()) > max_size {
+                return Err(HyperBodyCollectError::TooLarge);
+            }
+            if !reservation.reserve(body_bytes.len().saturating_add(data.len())) {
+                warn!(
+                    "Response buffering refused: aggregate retained-response budget exhausted"
+                );
                 return Err(HyperBodyCollectError::TooLarge);
             }
             body_bytes.extend_from_slice(data);
@@ -37033,6 +37121,25 @@ async fn drain_h3_streaming_response_to_buffered(
                 status_code: 502,
                 body: ResponseBody::buffered(
                     r#"{"error":"Backend response body exceeds maximum size"}"#
+                        .as_bytes()
+                        .to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+            }
+        }
+        Err(crate::http3::client::H3BodyDrainError::BufferBudgetExhausted) => {
+            warn!(
+                proxy_id = %proxy.id,
+                backend_url = %strip_query_params(backend_url),
+                "HTTP/3 response buffering refused: aggregate retained-response budget exhausted"
+            );
+            retry::BackendResponse {
+                status_code: response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS,
+                body: ResponseBody::buffered(
+                    response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY
                         .as_bytes()
                         .to_vec(),
                 ),

@@ -3460,20 +3460,40 @@ pub(crate) async fn proxy_grpc_request_core(
     let mut body_bytes = Vec::with_capacity(body_capacity);
     let mut trailers = HashMap::new();
 
+    // This arm RETAINS the whole gRPC payload, so a `0` ("unlimited") ceiling is
+    // folded to the fail-closed fallback and the retained bytes are charged
+    // against the process-wide aggregate budget. Exhaustion surfaces as the
+    // existing `ResponseTooLarge` refusal — the gRPC status mapping for
+    // "this payload will not be retained" is the same either way
+    // (GHSA-pwcm-6rh8-f2gh). The reservation is released when it drops.
+    let max_response_body_size_bytes =
+        crate::proxy::response_buffer_budget::buffered_response_body_ceiling(
+            max_response_body_size_bytes,
+        );
+    let mut reservation = crate::proxy::response_buffer_budget::ResponseBufferReservation::new();
+
     let body_collection = async {
         let mut body = response.into_body();
         while let Some(frame_result) = body.frame().await {
             match frame_result {
                 Ok(frame) => {
                     if let Some(data) = frame.data_ref() {
-                        if max_response_body_size_bytes > 0
-                            && body_bytes.len().saturating_add(data.len())
-                                > max_response_body_size_bytes
+                        if body_bytes.len().saturating_add(data.len())
+                            > max_response_body_size_bytes
                         {
                             return Err(GrpcProxyError::ResponseTooLarge(format!(
                                 "gRPC response payload size exceeds maximum of {} bytes",
                                 max_response_body_size_bytes
                             )));
+                        }
+                        if !reservation
+                            .reserve(body_bytes.len().saturating_add(data.len()))
+                        {
+                            return Err(GrpcProxyError::ResponseTooLarge(
+                                "gRPC response buffering refused: aggregate retained-response \
+                                 budget exhausted"
+                                    .to_string(),
+                            ));
                         }
                         body_bytes.extend_from_slice(data);
                     } else if let Ok(trailer_map) = frame.into_trailers() {

@@ -195,6 +195,14 @@ const CACHE_PENDING_INVALIDATE_PATH_SUFFIX: &str = "cache_pending_invalidate_pat
 ///
 /// [`Self::stage_pending_invalidation`]: ResponseCaching::stage_pending_invalidation
 const CACHE_LOOKUP_PATH_SUFFIX: &str = "cache_lookup_path";
+/// Set by `before_proxy` when this request provably has no store path left, so
+/// the response body must NOT be pinned onto the buffered path just because a
+/// cache instance is configured on the proxy (GHSA-pwcm-6rh8-f2gh).
+///
+/// This is a *positive* release marker rather than the absence of staging: the
+/// pre-flight buffering vote runs on every protocol path and must keep its
+/// conservative answer whenever `before_proxy` has not spoken yet.
+const CACHE_RELEASE_RESPONSE_BUFFER_SUFFIX: &str = "cache_release_response_buffer";
 
 static CACHE_CLOCK_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 static NEXT_RESPONSE_CACHING_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -1205,6 +1213,8 @@ pub struct ResponseCaching {
     meta_pending_invalidate_path: String,
     /// Precomputed `response_caching.<id>.cache_lookup_path`.
     meta_lookup_path: String,
+    /// Precomputed `response_caching.<id>.cache_release_response_buffer`.
+    meta_release_buffer: String,
     /// Parsed configuration, including how anonymous callers are partitioned
     /// (`config.anonymous_caller_scope`, see [`AnonymousCallerScope`]). The
     /// scope is deliberately *not* mirrored onto a second field: one owner
@@ -1283,6 +1293,10 @@ impl ResponseCaching {
                 CACHE_PENDING_INVALIDATE_PATH_SUFFIX,
             ),
             meta_lookup_path: staging_metadata_key(instance_id, CACHE_LOOKUP_PATH_SUFFIX),
+            meta_release_buffer: staging_metadata_key(
+                instance_id,
+                CACHE_RELEASE_RESPONSE_BUFFER_SUFFIX,
+            ),
             config,
             cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
             vary_index: Arc::new(DashMap::with_shard_amount(shard_amount)),
@@ -1326,6 +1340,26 @@ impl ResponseCaching {
 
     fn cache_status<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
         ctx.metadata.get(&self.meta_status).map(String::as_str)
+    }
+
+    /// Record that this instance has no remaining store path for this request,
+    /// so the proxy may stream the response instead of retaining it.
+    ///
+    /// Only called from `before_proxy` after a decision that no later hook can
+    /// reverse: an uncacheable method, a request that advertises SSE, a request
+    /// that carries a body (no complete replay partition), a refused partition,
+    /// a request `Cache-Control: no-store`, or a variant the uncacheable
+    /// predictor has already learned about. Each of those makes
+    /// `on_final_response_body` a no-op, so the collected body would be
+    /// discarded unread — exactly the amplification GHSA-pwcm-6rh8-f2gh
+    /// describes.
+    fn release_response_buffer(&self, ctx: &mut RequestContext) {
+        ctx.metadata
+            .insert(self.meta_release_buffer.clone(), "1".to_string());
+    }
+
+    fn response_buffer_released(&self, ctx: &RequestContext) -> bool {
+        ctx.metadata.contains_key(&self.meta_release_buffer)
     }
 
     /// Drop this instance's lookup/store staging inputs without touching
@@ -2490,7 +2524,70 @@ impl Plugin for ResponseCaching {
         // `on_final_response_body` will not be invoked, so the cache state
         // stays correct without any other code paths needing to special-case
         // SSE.
-        !super::utils::sse::is_sse_request(ctx)
+        //
+        // Every other request-side fact that provably removes the store path is
+        // folded in through the release marker `before_proxy` sets: an
+        // uncacheable method, a request that carries a body, a refused replay
+        // partition, a request `Cache-Control: no-store`, and a variant the
+        // uncacheable predictor already knows about. Those decisions need the
+        // live header view and the built cache key, so they are taken in
+        // `before_proxy` — which runs before this vote on every dispatch path —
+        // rather than re-derived here. An ABSENT marker keeps the conservative
+        // answer, so a path that votes before `before_proxy` ran still buffers
+        // (GHSA-pwcm-6rh8-f2gh).
+        !self.response_buffer_released(ctx) && !super::utils::sse::is_sse_request(ctx)
+    }
+
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        if !self.should_buffer_response_body(ctx) {
+            return false;
+        }
+        // Header-time refinement. These are exactly the store-side refusals in
+        // `on_final_response_body` whose only side effect is the (heuristic)
+        // uncacheable-predictor mark, so taking them here changes nothing but
+        // the moment: the body was going to be collected in full and then
+        // discarded unread.
+        //
+        // Deliberately NOT released, because their store-side branches also
+        // INVALIDATE an existing entry — skipping the final hook would leave a
+        // superseded representation live:
+        //   * response `Cache-Control: no-store` / `private` / `no-cache`,
+        //   * a zero freshness lifetime,
+        //   * an unusable `Vary` header.
+        // Those keep the buffered path and reach `on_final_response_body`
+        // exactly as before.
+        let uncacheable_status = !self
+            .config
+            .cacheable_status_codes
+            .contains(&response_status)
+            || !is_supported_cacheable_status(response_status);
+        if uncacheable_status {
+            return false;
+        }
+        // A `Content-Range` answer describes bytes, not the resource, and is
+        // refused as a reusable representation. A `Set-Cookie` response is
+        // per-client and never stored.
+        if response_headers.contains_key("content-range")
+            || response_headers.contains_key("set-cookie")
+        {
+            return false;
+        }
+        // Origin-selected SSE: the client never advertised `text/event-stream`,
+        // so the request-side vote could not see it, but the backend just did.
+        // Retaining it destroys event latency and accumulates frames until the
+        // response ceiling; a stored event stream is not a representation any
+        // later request can reuse. Released here rather than collected and then
+        // stored.
+        if content_type.is_some_and(super::utils::sse::is_text_event_stream_media_type) {
+            return false;
+        }
+        true
     }
 
     async fn before_proxy(
@@ -2530,12 +2627,14 @@ impl Plugin for ResponseCaching {
             // invalidation host is intentionally retained until origin success
             // is observed (or cleared on a later HIT of a cacheable sibling).
             self.clear_lookup_staging(ctx);
+            self.release_response_buffer(ctx);
             self.set_cache_status(ctx, "BYPASS");
             return PluginResult::Continue;
         }
 
         if super::utils::sse::headers_accept_sse(headers) {
             self.clear_lookup_staging(ctx);
+            self.release_response_buffer(ctx);
             self.set_cache_status(ctx, "BYPASS");
             return PluginResult::Continue;
         }
@@ -2553,6 +2652,7 @@ impl Plugin for ResponseCaching {
         // for inconsistent or malformed framing views.
         if !ctx.replay_request_body_empty_proven() || request_declares_body(headers) {
             self.clear_lookup_staging(ctx);
+            self.release_response_buffer(ctx);
             self.set_cache_status(ctx, "BYPASS");
             return PluginResult::Continue;
         }
@@ -2571,6 +2671,7 @@ impl Plugin for ResponseCaching {
                      caller"
                 );
                 self.clear_lookup_staging(ctx);
+                self.release_response_buffer(ctx);
                 self.set_cache_status(ctx, "BYPASS");
                 return PluginResult::Continue;
             }
@@ -2611,6 +2712,19 @@ impl Plugin for ResponseCaching {
             && let Some(cc) = headers.get("cache-control")
         {
             let directives = parse_cache_control(cc);
+            if directives.no_store {
+                // RFC 9111 §5.2.1.5: a cache MUST NOT store any part of a
+                // request carrying `no-store`, or of the response to it. That
+                // makes the store path unreachable, so the staging goes and the
+                // response body is released rather than collected for a store
+                // that can never happen (GHSA-pwcm-6rh8-f2gh). Pending unsafe
+                // invalidation is retained — the request still contacts the
+                // origin and a successful mutation must still evict peers.
+                self.clear_lookup_staging(ctx);
+                self.release_response_buffer(ctx);
+                self.set_cache_status(ctx, "BYPASS");
+                return PluginResult::Continue;
+            }
             if directives.request_bypasses_cache() {
                 // Keep this instance's staged base/snapshot/predict so a
                 // no-cache refresh can still store the replacement response
@@ -2629,6 +2743,18 @@ impl Plugin for ResponseCaching {
             .uncacheable_predictor
             .is_predicted_cacheable(&cache_key)
         {
+            // The predictor already learned this variant is uncacheable, so the
+            // store path would collect the whole body only to reject it again.
+            // Release it — and retire the mark in the same step so the very next
+            // request for this variant re-learns instead of being starved of a
+            // store attempt forever (`mark_cacheable` is otherwise only reached
+            // from a completed store). Steady state alternates: at most every
+            // other request for a persistently uncacheable variant pays for a
+            // buffer, and a variant that becomes cacheable is picked up on the
+            // next request rather than never.
+            self.uncacheable_predictor.mark_cacheable(&cache_key);
+            self.clear_lookup_staging(ctx);
+            self.release_response_buffer(ctx);
             self.set_cache_status(ctx, "PREDICTED-BYPASS");
             return PluginResult::Continue;
         }

@@ -2287,3 +2287,107 @@ async fn test_response_transformer_header_mutations_never_log_configured_values(
         "remove should still emit a name-only diagnostic"
     );
 }
+
+// ---------------------------------------------------------------------------
+// GHSA-pwcm-6rh8-f2gh — a representation the body transform provably declines
+// must be released once the backend named its media type, not collected up to
+// the response ceiling and then rejected unread.
+// ---------------------------------------------------------------------------
+
+fn headers_from(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect()
+}
+
+#[test]
+fn non_transformable_media_types_are_released_after_headers() {
+    let plugin = body_update_plugin();
+    let ctx = make_ctx();
+    assert!(
+        plugin.should_buffer_response_body(&ctx),
+        "the pre-header vote stays conservative"
+    );
+
+    for (content_type, extra) in [
+        ("application/octet-stream", Vec::new()),
+        ("image/png", Vec::new()),
+        ("video/mp4", vec![("content-range", "bytes 0-99/100000000")]),
+        ("text/event-stream", Vec::new()),
+        // Encoded, but not a JSON document: the transform declines it on media
+        // type alone, so nothing was ever going to read these bytes.
+        (
+            "application/octet-stream",
+            vec![("content-encoding", "gzip")],
+        ),
+        // Framed gRPC satisfies `is_json_content_type` via `+json` but carries
+        // length-prefixed frames the transform declines.
+        ("application/grpc+json", Vec::new()),
+    ] {
+        let mut pairs = vec![("content-type", content_type)];
+        pairs.extend(extra.iter().copied());
+        let response_headers = headers_from(&pairs);
+        assert!(
+            !plugin.should_buffer_response_body_for_content_type(
+                &ctx,
+                Some(content_type),
+                200,
+                &response_headers,
+            ),
+            "`{content_type}` is declined by the transform and must not be buffered"
+        );
+    }
+}
+
+#[test]
+fn json_and_untyped_representations_keep_the_buffered_path() {
+    let plugin = body_update_plugin();
+    let ctx = make_ctx();
+
+    let json_headers = headers_from(&[("content-type", "application/json")]);
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &json_headers,
+    ));
+
+    // Encoded JSON stays buffered: releasing opaque wire bytes would forward a
+    // representation past a configured redaction instead of failing closed.
+    let encoded_json = headers_from(&[
+        ("content-type", "application/json"),
+        ("content-encoding", "gzip"),
+    ]);
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &encoded_json,
+    ));
+
+    // An ABSENT Content-Type is treated as JSON by the transform, so it must
+    // still be inspected.
+    let untyped = HashMap::new();
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &untyped));
+}
+
+#[test]
+fn a_disabled_or_header_only_instance_never_pins_a_body() {
+    // No body rules at all: nothing to collect for.
+    let header_only = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "x-demo", "value": "1"}
+        ]
+    }))
+    .unwrap();
+    let ctx = make_ctx();
+    assert!(!header_only.should_buffer_response_body(&ctx));
+    let headers = headers_from(&[("content-type", "application/json")]);
+    assert!(!header_only.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &headers,
+    ));
+}

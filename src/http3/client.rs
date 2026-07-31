@@ -195,6 +195,10 @@ pub(crate) enum H3BodyDrainError {
     ResponseTooLarge {
         limit: usize,
     },
+    /// The process-wide aggregate budget for retained response bodies could not
+    /// admit this one. The origin behaved correctly, so this is transient
+    /// gateway capacity rather than a backend fault (GHSA-pwcm-6rh8-f2gh).
+    BufferBudgetExhausted,
     ReadTimeout {
         timeout_ms: u64,
     },
@@ -217,6 +221,9 @@ impl std::fmt::Display for H3BodyDrainError {
                     "Backend response body exceeds maximum size of {limit} bytes"
                 )
             }
+            Self::BufferBudgetExhausted => {
+                write!(f, "Response buffering capacity exceeded")
+            }
             Self::ReadTimeout { timeout_ms } => {
                 write!(f, "Backend response read timeout after {timeout_ms}ms")
             }
@@ -238,9 +245,10 @@ impl std::error::Error for H3BodyDrainError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Stream(err) => Some(err),
-            Self::ResponseTooLarge { .. } | Self::ReadTimeout { .. } | Self::Truncated { .. } => {
-                None
-            }
+            Self::ResponseTooLarge { .. }
+            | Self::BufferBudgetExhausted
+            | Self::ReadTimeout { .. }
+            | Self::Truncated { .. } => None,
         }
     }
 }
@@ -305,9 +313,18 @@ pub(crate) async fn drain_h3_response_body(
     max_response_body_size_bytes: usize,
     backend_read_timeout_ms: u64,
 ) -> Result<(Vec<u8>, Option<http::HeaderMap>), H3BodyDrainError> {
-    if max_response_body_size_bytes > 0
-        && content_length.is_some_and(|len| len > max_response_body_size_bytes as u64)
-    {
+    // This helper only ever RETAINS the body, so the documented streaming
+    // `0 = unlimited` cannot apply here: it is folded to the fail-closed
+    // fallback ceiling, and retained bytes are additionally charged against the
+    // process-wide aggregate budget (GHSA-pwcm-6rh8-f2gh). The reservation is
+    // released when it drops — success, refusal, timeout, stream error, or the
+    // caller dropping this future.
+    let max_response_body_size_bytes =
+        crate::proxy::response_buffer_budget::buffered_response_body_ceiling(
+            max_response_body_size_bytes,
+        );
+    let mut reservation = crate::proxy::response_buffer_budget::ResponseBufferReservation::new();
+    if content_length.is_some_and(|len| len > max_response_body_size_bytes as u64) {
         return Err(H3BodyDrainError::ResponseTooLarge {
             limit: max_response_body_size_bytes,
         });
@@ -338,12 +355,13 @@ pub(crate) async fn drain_h3_response_body(
         match recv_result {
             Ok(Some(chunk)) => {
                 let chunk = chunk.chunk();
-                if max_response_body_size_bytes > 0
-                    && body.len().saturating_add(chunk.len()) > max_response_body_size_bytes
-                {
+                if body.len().saturating_add(chunk.len()) > max_response_body_size_bytes {
                     return Err(H3BodyDrainError::ResponseTooLarge {
                         limit: max_response_body_size_bytes,
                     });
+                }
+                if !reservation.reserve(body.len().saturating_add(chunk.len())) {
+                    return Err(H3BodyDrainError::BufferBudgetExhausted);
                 }
                 body.extend_from_slice(chunk);
             }

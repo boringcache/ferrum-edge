@@ -915,19 +915,49 @@ fn reqwest_error_response_for_cross_protocol(
     }
 }
 
+/// Collect a cross-protocol (H3 client → HTTP/1.1+2 backend) response body
+/// under both buffered-path bounds.
+///
+/// `max_response_body_size_bytes` is the operator's effective ceiling; a `0`
+/// here means "unlimited", which is a streaming policy the retained path cannot
+/// honor, so it is folded to the fail-closed fallback ceiling
+/// (GHSA-pwcm-6rh8-f2gh). Retained bytes are charged against the process-wide
+/// aggregate budget as they accumulate; the reservation is released on every
+/// exit, including the caller dropping this future.
+///
+/// The failure arm carries the client-visible status because the two refusals
+/// are not the same fault: an oversized body is the origin's (`502`), while an
+/// exhausted retention budget is transient gateway capacity (`503`).
 async fn collect_reqwest_response_body_with_limit(
     mut response: reqwest::Response,
     max_response_body_size_bytes: usize,
-) -> Result<Vec<u8>, (Vec<u8>, Option<ErrorClass>)> {
+) -> Result<Vec<u8>, (u16, Vec<u8>, Option<ErrorClass>)> {
+    use crate::proxy::response_buffer_budget;
+
+    let max_response_body_size_bytes =
+        response_buffer_budget::buffered_response_body_ceiling(max_response_body_size_bytes);
     let mut body = Vec::new();
+    let mut reservation = response_buffer_budget::ResponseBufferReservation::new();
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => {
-                if max_response_body_size_bytes > 0
-                    && body.len() + chunk.len() > max_response_body_size_bytes
-                {
+                if body.len() + chunk.len() > max_response_body_size_bytes {
                     return Err((
+                        502,
                         r#"{"error":"Backend response body exceeds maximum size"}"#
+                            .as_bytes()
+                            .to_vec(),
+                        Some(ErrorClass::ResponseBodyTooLarge),
+                    ));
+                }
+                if !reservation.reserve(body.len() + chunk.len()) {
+                    warn!(
+                        "cross-protocol H3→HTTP: response buffering refused, aggregate \
+                         retained-response budget exhausted"
+                    );
+                    return Err((
+                        response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS,
+                        response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY
                             .as_bytes()
                             .to_vec(),
                         Some(ErrorClass::ResponseBodyTooLarge),
@@ -939,6 +969,7 @@ async fn collect_reqwest_response_body_with_limit(
             Err(error) => {
                 warn!("cross-protocol H3→HTTP: failed to read buffered response body: {error}");
                 return Err((
+                    502,
                     r#"{"error":"Backend response body read failed"}"#.as_bytes().to_vec(),
                     Some(crate::retry::classify_reqwest_error(&error)),
                 ));
@@ -2730,7 +2761,13 @@ where
         .await
         {
             Ok(Ok(body)) => bytes::Bytes::from(body),
-            Ok(Err((error_body, error_class))) => {
+            Ok(Err((reject_status, error_body, error_class))) => {
+                // `reject_status` distinguishes an origin-attributed refusal
+                // (`502`) from an exhausted gateway retention budget (`503`);
+                // outcome recording follows the same status so passive health
+                // and admission see the classification actually returned.
+                let reject_status_code = StatusCode::from_u16(reject_status)
+                    .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
                 record_backend_outcome(
                     state,
                     proxy,
@@ -2738,7 +2775,7 @@ where
                     upstream_balancer,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
-                    502,
+                    reject_status,
                     false,
                     error_class,
                     cb_retry_probe_slot_available,
@@ -2747,7 +2784,7 @@ where
                 );
                 record_cross_protocol_backend_admission_outcome(
                     &mut backend_admission_permits,
-                    502,
+                    reject_status,
                     error_class.is_some_and(|class| class != ErrorClass::ClientDisconnect),
                     error_class,
                     backend_admission_elapsed,
@@ -2756,7 +2793,7 @@ where
                 let mut outcome = write_plain_gateway_reject(
                     stream,
                     ctx,
-                    StatusCode::BAD_GATEWAY,
+                    reject_status_code,
                     bytes::Bytes::from(error_body),
                     &empty_headers,
                     backend_start,

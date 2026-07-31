@@ -6272,3 +6272,225 @@ async fn concurrent_writers_keep_exact_entry_and_byte_accounting() {
     );
     assert_size_accounting_exact(&plugin);
 }
+
+// ---------------------------------------------------------------------------
+// GHSA-pwcm-6rh8-f2gh — response buffering must be released as soon as the
+// store path is provably unreachable, instead of collecting a body that
+// `on_final_response_body` will discard unread.
+// ---------------------------------------------------------------------------
+
+fn response_headers_from(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect()
+}
+
+/// A request-side fact `before_proxy` established must reach the buffering vote.
+#[tokio::test]
+async fn uncacheable_method_releases_the_response_buffer() {
+    let plugin = default_plugin();
+    let mut ctx = make_ctx("POST", "/api/orders");
+    let mut headers = HashMap::new();
+
+    assert!(
+        plugin.should_buffer_response_body(&ctx),
+        "before before_proxy the vote must stay conservative"
+    );
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_status(&plugin, &ctx, "BYPASS");
+    assert!(
+        !plugin.should_buffer_response_body(&ctx),
+        "an uncacheable method has no store path, so the body must stream"
+    );
+}
+
+#[tokio::test]
+async fn request_no_store_releases_the_response_buffer_and_does_not_store() {
+    let plugin = default_plugin();
+    let mut ctx = make_ctx("GET", "/api/no-store");
+    let mut headers = HashMap::new();
+    headers.insert("cache-control".to_string(), "no-store".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_status(&plugin, &ctx, "BYPASS");
+    assert!(!plugin.should_buffer_response_body(&ctx));
+
+    // RFC 9111 §5.2.1.5: nothing from a `no-store` request may be retained.
+    let response_headers = public_response_headers();
+    plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, b"secret")
+        .await;
+    assert!(
+        response_caching_cache_keys_for_test(&plugin).is_empty(),
+        "a no-store request must not produce a stored representation"
+    );
+}
+
+#[tokio::test]
+async fn request_with_a_body_releases_the_response_buffer() {
+    let plugin = default_plugin();
+    let mut ctx = make_ctx("GET", "/api/with-body");
+    set_replay_request_body_empty_proven_for_test(&mut ctx, false);
+    let mut headers = HashMap::new();
+
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_status(&plugin, &ctx, "BYPASS");
+    assert!(!plugin.should_buffer_response_body(&ctx));
+}
+
+#[tokio::test]
+async fn predicted_uncacheable_variant_releases_and_re_learns() {
+    let plugin = default_plugin();
+
+    // Teach the predictor: 500 is not in the default cacheable status set
+    // (`[200, 301, 404]`), so the store path marks this variant uncacheable.
+    let mut ctx = make_ctx("GET", "/api/always-500");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_status(&plugin, &ctx, "MISS");
+    plugin
+        .on_final_response_body(&mut ctx, 500, &public_response_headers(), b"boom")
+        .await;
+
+    // Next request rides the prediction: no lookup, no store, no buffer.
+    let mut ctx = make_ctx("GET", "/api/always-500");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_status(&plugin, &ctx, "PREDICTED-BYPASS");
+    assert!(
+        !plugin.should_buffer_response_body(&ctx),
+        "a variant already known to be uncacheable must not be buffered again"
+    );
+
+    // The mark is retired in the same step, so the variant is re-learned on the
+    // following request rather than being starved of a store attempt forever.
+    let mut ctx = make_ctx("GET", "/api/always-500");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_status(&plugin, &ctx, "MISS");
+    assert!(plugin.should_buffer_response_body(&ctx));
+}
+
+#[tokio::test]
+async fn origin_selected_sse_is_released_after_headers() {
+    let plugin = default_plugin();
+    let mut ctx = make_ctx("GET", "/api/events");
+    let mut headers = HashMap::new();
+    // No `Accept: text/event-stream` — the request side cannot predict this.
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_status(&plugin, &ctx, "MISS");
+    assert!(plugin.should_buffer_response_body(&ctx));
+
+    let response_headers = response_headers_from(&[
+        ("content-type", "text/event-stream"),
+        ("cache-control", "public, max-age=60"),
+    ]);
+    assert!(
+        !plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("text/event-stream"),
+            200,
+            &response_headers,
+        ),
+        "an origin-selected event stream must not be collected until termination"
+    );
+}
+
+#[tokio::test]
+async fn uncacheable_status_range_and_set_cookie_are_released_after_headers() {
+    let plugin = default_plugin();
+    let mut ctx = make_ctx("GET", "/api/resource");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let plain = response_headers_from(&[("content-type", "application/octet-stream")]);
+    assert!(
+        !plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/octet-stream"),
+            500,
+            &plain,
+        ),
+        "a status outside cacheable_status_codes has no store path"
+    );
+
+    let ranged = response_headers_from(&[
+        ("content-type", "video/mp4"),
+        ("content-range", "bytes 0-1023/999999999"),
+    ]);
+    assert!(
+        !plugin.should_buffer_response_body_for_content_type(&ctx, Some("video/mp4"), 206, &ranged),
+        "a partial representation is never stored as a reusable entry"
+    );
+
+    let cookied = response_headers_from(&[
+        ("content-type", "application/json"),
+        ("set-cookie", "session=abc"),
+    ]);
+    assert!(
+        !plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/json"),
+            200,
+            &cookied,
+        ),
+        "a per-client Set-Cookie response is never stored"
+    );
+}
+
+/// The refinement must NOT release the branches whose store-side counterpart
+/// also invalidates an existing entry — skipping the final hook there would
+/// leave a superseded representation live.
+#[tokio::test]
+async fn invalidating_response_directives_keep_the_buffered_path() {
+    let plugin = default_plugin();
+    let mut ctx = make_ctx("GET", "/api/resource");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    for directive in ["no-store", "private", "no-cache", "max-age=0"] {
+        let response_headers = response_headers_from(&[
+            ("content-type", "application/json"),
+            ("cache-control", directive),
+        ]);
+        assert!(
+            plugin.should_buffer_response_body_for_content_type(
+                &ctx,
+                Some("application/json"),
+                200,
+                &response_headers,
+            ),
+            "`{directive}` must still reach on_final_response_body so a stale entry is evicted"
+        );
+    }
+}
+
+/// An ordinary cacheable response is unaffected by every narrowing above.
+#[tokio::test]
+async fn ordinary_cacheable_response_still_buffers_and_stores() {
+    let plugin = default_plugin();
+    let mut ctx = make_ctx("GET", "/api/widgets");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_status(&plugin, &ctx, "MISS");
+    assert!(plugin.should_buffer_response_body(&ctx));
+
+    let response_headers = response_headers_from(&[
+        ("content-type", "application/json"),
+        ("cache-control", "public, max-age=60"),
+    ]);
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &response_headers,
+    ));
+    plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, b"{\"ok\":true}")
+        .await;
+    assert_eq!(response_caching_cache_keys_for_test(&plugin).len(), 1);
+}

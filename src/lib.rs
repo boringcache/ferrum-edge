@@ -5963,6 +5963,29 @@ pub mod _test_support {
         crate::proxy::stricter_optional_limit(a, b)
     }
 
+    /// Ceiling a *retained* (buffered) response body is collected under. A
+    /// legacy `0` ("unlimited") folds to the fail-closed fallback rather than
+    /// producing an unbounded buffer (`GHSA-pwcm-6rh8-f2gh`).
+    pub fn buffered_response_body_ceiling_for_test(effective_limit: usize) -> usize {
+        crate::proxy::response_buffer_budget::buffered_response_body_ceiling(effective_limit)
+    }
+
+    /// Blocks the aggregate buffered-response budget would expose for a given
+    /// configuration, without touching the process-global budget.
+    pub fn response_buffer_budget_blocks_for_test(
+        fallback_per_response_bytes: usize,
+        total_bytes: usize,
+    ) -> usize {
+        crate::proxy::response_buffer_budget::available_blocks_for_config(
+            fallback_per_response_bytes,
+            total_bytes,
+        )
+    }
+
+    /// Granularity, in bytes, of one aggregate-budget block.
+    pub const RESPONSE_BUFFER_RESERVATION_UNIT_BYTES: usize =
+        crate::proxy::response_buffer_budget::RESERVATION_UNIT_BYTES;
+
     /// Canonical declared `Content-Length` from a raw header map, honoring
     /// standards-valid repeated identical values and refusing ambiguity.
     pub fn canonical_header_content_length_for_test(headers: &http::HeaderMap) -> Option<u64> {
