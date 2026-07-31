@@ -1406,13 +1406,7 @@ fn non_event_commit_racing_resolve_settle_does_not_orphan_pending_trigger() {
 
     // Phase 4: roll back the unadmitted reservation (non-event path has no
     // dispatch permits/callbacks to settle it).
-    gate.rollback_unadmitted_reservation(
-        RACE_RULE,
-        RACE_PROXY,
-        RACE_GEN,
-        committed,
-        9_000,
-    );
+    gate.rollback_unadmitted_reservation(RACE_RULE, RACE_PROXY, RACE_GEN, committed, 9_000);
     assert_eq!(
         gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
         Some(RuleState::Healthy),
