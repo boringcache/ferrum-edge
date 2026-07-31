@@ -20,6 +20,23 @@
 //!   `PendingTrigger` / `PendingResolve` when a send is admitted; state moves
 //!   to `Active` / `Healthy` only after a successful settle (or rolls back on
 //!   failure so the next sample can retry).
+//! - **Compensating Trigger after an uncertain Resolve**: a Resolve that is
+//!   already externally in flight cannot be unsent, and retiring its local
+//!   future is not a rollback. If the rule breaches again in that window the
+//!   incident parks in `ResolveInFlightRebreached` (no notification — a Trigger
+//!   emitted now could overtake the Resolve on the wire), and the Resolve's
+//!   settle — success, failure, or abandonment alike — converges to
+//!   `CompensatingTrigger`. The next breaching sample then re-alerts through
+//!   the ordinary cooldown gate, so a possibly-delivered Resolve can never
+//!   leave a genuinely breached incident silently suppressed. If the rule is no
+//!   longer breaching by then, the Resolve was accurate and the state returns
+//!   to `Healthy` with no phantom alert.
+//! - **At-least-once at the endpoint**: transport timeouts, post-write
+//!   connection errors, and cancellation after bytes left the process are all
+//!   reported as failure/abandonment even though the endpoint may have acted on
+//!   the send. Retries and compensating Triggers can therefore duplicate an
+//!   alert at the receiver. See the duplicate-delivery contract in
+//!   `src/notifications/dispatch.rs` and `docs/notifications.md`.
 //! - **Bounded-concurrency dispatch**: `tokio::Semaphore`. When exhausted,
 //!   alerts are dropped with a `warn!` rather than queued — alert storms
 //!   during a partial channel outage should be visible, not buffered.
@@ -659,6 +676,27 @@ impl ProxyAlerts {
         self.dispatch_generation.cancel();
     }
 
+    /// Borrow this instance's dispatch generation so a deterministic external
+    /// test can observe retirement and drain *after* the plugin itself has been
+    /// dropped (the reload boundary this contract is about).
+    #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
+    pub fn dispatch_generation_for_test(&self) -> Arc<DispatchGeneration> {
+        Arc::clone(&self.dispatch_generation)
+    }
+
+    /// Borrow this instance's recovery gate so a deterministic external test can
+    /// assert producer state settled after the plugin was dropped.
+    #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
+    pub fn recovery_gate_for_test(&self) -> Arc<RecoveryGate> {
+        Arc::clone(&self.recovery)
+    }
+
     /// In-flight dispatch count for this instance generation.
     #[doc(hidden)]
     // External tests consume this through the library target; the binary target
@@ -900,6 +938,11 @@ fn non_event_outcome_needs_commit(
         (LifecycleOutcome::EnteringRecovery | LifecycleOutcome::Reactivate, _) => true,
         (LifecycleOutcome::Quiet, Some(RuleState::Active { .. })) => true,
         (LifecycleOutcome::Quiet, Some(RuleState::Recovering { .. })) if recovery_ms == 0 => true,
+        // A rule that owes a compensating Trigger but is no longer breaching
+        // must commit its return to Healthy, otherwise the possibly-delivered
+        // Resolve would keep an unnecessary compensating seat resident and the
+        // row would never become evictable.
+        (LifecycleOutcome::Quiet, Some(RuleState::CompensatingTrigger { .. })) => true,
         _ => false,
     }
 }

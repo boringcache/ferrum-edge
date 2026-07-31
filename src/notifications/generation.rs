@@ -4,12 +4,30 @@
 //! the generation is admitting, new work may be spawned through the process
 //! observability delivery registry. On reload/`Drop` the generation stops
 //! admitting and cooperatively cancels in-flight work; tasks that observe the
-//! cancel flag settle as [`DispatchSettle::Abandoned`]. In-flight transport
+//! cancel flag settle as `Abandoned(GenerationRetired)`. In-flight transport
 //! attempts race [`DispatchGeneration::cancelled`] and are dropped on
 //! retirement rather than held until the transport timeout. Process shutdown
 //! drains the same tasks under the global observability budget and aborts
-//! whatever remains when the deadline expires — those aborts also settle as
-//! abandoned via [`DeliveryTaskGuard`].
+//! whatever remains when the deadline expires — those aborts settle as
+//! `Abandoned(ShutdownDeadline)` via [`DeliveryTaskGuard`].
+//!
+//! # Abandonment is not one thing
+//!
+//! Every non-outcome exit carries a precise, compiled-in
+//! [`AbandonReason`], and the metrics layer keeps two disjoint families:
+//!
+//! - **Pre-attempt rejections** (`GenerationClosed`, `RegistryRejected`) —
+//!   counted in `rejected_total{reason}`. No `attempted`, no `in_flight`.
+//! - **Post-attempt abandonment** (`GenerationRetired`, `ShutdownDeadline`,
+//!   `TaskDropped`) — counted in `abandoned_total{reason}`, releasing the
+//!   `in_flight` reservation the attempt took.
+//!
+//! Only `ShutdownDeadline` advances `abandoned_at_deadline_total`, so that
+//! metric is a true hard-deadline signal rather than a catch-all.
+//!
+//! In every case — including the paths that record no attempt — the producer
+//! callback runs exactly once, so reserved cooldown / pending incident state is
+//! always rolled back.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -18,6 +36,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
 use super::metrics::{DeliveryMetrics, global as global_metrics};
+use super::outcome::AbandonReason;
 
 /// Optional completion callback invoked exactly once after a delivery settles.
 ///
@@ -170,8 +189,14 @@ impl DispatchGeneration {
     ///
     /// Returns `false` when this generation is closed or the global registry
     /// rejects admission (shutdown / capacity). Rejection is a visible drop —
-    /// never queued. The generation invokes `on_settle(Abandoned)` on every
-    /// rejection path; admitted attempts also record `abandoned_at_deadline`.
+    /// never queued.
+    ///
+    /// Every rejection path settles exactly once with a precise, compiled-in
+    /// [`AbandonReason`], so the producer callback always runs and the
+    /// operator can tell a pre-attempt admission rejection apart from a
+    /// genuine hard abort at the shutdown deadline. A path that never ran a
+    /// transport attempt records a `rejected_total{reason}` increment and does
+    /// **not** inflate `attempted`.
     pub fn spawn<F>(
         self: &Arc<Self>,
         channel_type: &'static str,
@@ -186,18 +211,31 @@ impl DispatchGeneration {
             generation: self.as_ref(),
         };
         if !self.is_admitting() || self.is_cancelled() {
+            // Pre-`begin_task` admission rejection. Historically this path
+            // invoked the producer callback and incremented nothing at all,
+            // leaving reload-time rejections completely invisible. It is now
+            // counted under its own bounded reason without pretending a
+            // transport attempt was made.
+            self.metrics
+                .record_rejected(channel_type, AbandonReason::GenerationClosed);
             if let Some(callback) = on_settle {
-                invoke_delivery_callback(&callback, DispatchSettle::Abandoned, channel_type);
+                invoke_delivery_callback(
+                    &callback,
+                    DispatchSettle::Abandoned(AbandonReason::GenerationClosed),
+                    channel_type,
+                );
             }
             return false;
         }
         let generation = Arc::clone(self);
         let _task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
 
-        // Reserve local in-flight + attempted before asking the global registry
-        // so a successful handoff cannot race a zero in-flight read on Drop.
+        // Reserve local drain accounting before asking the global registry so a
+        // successful handoff cannot race a zero in-flight read on Drop. The
+        // `attempted` metric is deliberately NOT reserved here: it is recorded
+        // by the task body, so a task the registry never runs stays a
+        // rejection rather than a phantom attempt.
         generation.begin_task();
-        generation.metrics.record_attempted(channel_type);
 
         // Construct the settlement guard before handing the future to the
         // process registry. If admission rejects, shutdown aborts the task
@@ -208,15 +246,23 @@ impl DispatchGeneration {
             channel_type,
             on_settle,
             settled: AtomicBool::new(false),
+            attempt_started: AtomicBool::new(false),
         });
         let guard = DeliveryTaskGuard {
             settlement: Arc::clone(&settlement),
         };
         let admitted = crate::observability_delivery::spawn_terminal({
             let generation = Arc::clone(&generation);
+            let settlement = Arc::clone(&settlement);
             async move {
+                // First statement of the task body: the registry actually ran
+                // us. This is what makes the drop classification deterministic
+                // rather than a race against the spawning thread — a task the
+                // registry rejected can never reach this line, so an unsettled
+                // drop before it is unambiguously a registry rejection.
+                settlement.mark_attempt_started();
                 let settle = if generation.is_cancelled() {
-                    DispatchSettle::Abandoned
+                    DispatchSettle::Abandoned(AbandonReason::GenerationRetired)
                 } else {
                     future.await
                 };
@@ -228,7 +274,7 @@ impl DispatchGeneration {
             // The registry may drop/abort its future asynchronously. Settle
             // synchronously here; the captured guard is protected by the same
             // atomic exactly-once edge and becomes a no-op when it is dropped.
-            settlement.settle(DispatchSettle::Abandoned);
+            settlement.settle(DispatchSettle::Abandoned(AbandonReason::RegistryRejected));
             return false;
         }
         true
@@ -246,12 +292,29 @@ impl Drop for SpawnRegistration<'_> {
 }
 
 /// Terminal settle outcome recorded exactly once per dispatch task.
+///
+/// [`DispatchSettle::Abandoned`] carries the precise, fixed-cardinality reason
+/// so producers and metrics can distinguish a hard shutdown-deadline abort from
+/// reload retirement, registry rejection, backpressure, or a dropped task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchSettle {
     Succeeded,
     FailedTransient,
     FailedPermanent,
-    Abandoned,
+    Abandoned(AbandonReason),
+}
+
+impl DispatchSettle {
+    pub const fn is_success(self) -> bool {
+        matches!(self, Self::Succeeded)
+    }
+
+    pub const fn abandon_reason(self) -> Option<AbandonReason> {
+        match self {
+            Self::Abandoned(reason) => Some(reason),
+            _ => None,
+        }
+    }
 }
 
 /// Shared exactly-once settlement edge. The caller keeps a reference until the
@@ -261,9 +324,34 @@ struct DeliveryTaskSettlement {
     channel_type: &'static str,
     on_settle: Option<DeliveryCallback>,
     settled: AtomicBool,
+    /// Set by the first statement of the task body. `false` means the registry
+    /// never ran the task, so `attempted`/`in_flight` were never reserved and
+    /// an unsettled drop is a rejection rather than an abandoned attempt.
+    attempt_started: AtomicBool,
 }
 
 impl DeliveryTaskSettlement {
+    /// Publish that the registry actually started this task, and reserve the
+    /// attempt in metrics. Called exactly once, before the transport future is
+    /// polled.
+    fn mark_attempt_started(&self) {
+        self.attempt_started.store(true, Ordering::Release);
+        self.generation.metrics.record_attempted(self.channel_type);
+    }
+
+    /// Reason to record when the task future is dropped without an explicit
+    /// settle.
+    fn drop_reason(&self) -> AbandonReason {
+        if !self.attempt_started.load(Ordering::Acquire) {
+            // The registry refused or aborted the task before its body ran.
+            AbandonReason::RegistryRejected
+        } else if crate::observability_delivery::is_aborting_at_deadline() {
+            AbandonReason::ShutdownDeadline
+        } else {
+            AbandonReason::TaskDropped
+        }
+    }
+
     fn settle(&self, outcome: DispatchSettle) {
         if self
             .settled
@@ -286,10 +374,20 @@ impl DeliveryTaskSettlement {
                     .metrics
                     .record_failed_permanent(self.channel_type);
             }
-            DispatchSettle::Abandoned => {
-                self.generation
-                    .metrics
-                    .record_abandoned_at_deadline(self.channel_type);
+            DispatchSettle::Abandoned(reason) => {
+                if self.attempt_started.load(Ordering::Acquire) {
+                    // An attempt ran: release the `in_flight` reservation and
+                    // count it under the post-attempt taxonomy.
+                    self.generation
+                        .metrics
+                        .record_abandoned(self.channel_type, reason);
+                } else {
+                    // No attempt ever ran: never inflate `attempted`, and never
+                    // decrement an `in_flight` reservation that was not taken.
+                    self.generation
+                        .metrics
+                        .record_rejected(self.channel_type, reason);
+                }
             }
         }
         if let Some(callback) = self.on_settle.as_ref() {
@@ -330,7 +428,12 @@ impl DeliveryTaskGuard {
 
 impl Drop for DeliveryTaskGuard {
     fn drop(&mut self) {
-        // Hard abort (shutdown deadline) or panic: count as abandoned.
-        self.settlement.settle(DispatchSettle::Abandoned);
+        // Unsettled drop: classify precisely instead of blanket-charging the
+        // shutdown-deadline counter. `drop_reason` distinguishes a registry
+        // rejection (task body never ran), a hard abort while the process
+        // delivery registry is cancelling at its drain deadline, and any other
+        // dropped task.
+        let reason = self.settlement.drop_reason();
+        self.settlement.settle(DispatchSettle::Abandoned(reason));
     }
 }

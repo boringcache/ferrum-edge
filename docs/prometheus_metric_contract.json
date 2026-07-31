@@ -1814,7 +1814,7 @@
   {
     "name": "ferrum_notification_delivery_abandoned_at_deadline_total",
     "type": "counter",
-    "help": "Notification deliveries abandoned when reload retirement or the global shutdown drain deadline cancelled the task.",
+    "help": "Notification deliveries hard-aborted because the global observability shutdown drain deadline expired; the shutdown_deadline slice of ferrum_notification_delivery_abandoned_total.",
     "labels": [
       "channel_type"
     ],
@@ -1824,9 +1824,22 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_notification_delivery_abandoned_total",
+    "type": "counter",
+    "help": "Notification delivery attempts that ran but settled without a committed outcome, by fixed reason (generation_retired = producer reload/Drop, shutdown_deadline = hard abort at the global drain deadline, task_dropped = dispatch task dropped without settling).",
+    "labels": [
+      "channel_type",
+      "reason"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_notification_delivery_attempted_total",
     "type": "counter",
-    "help": "Notification delivery attempts admitted past the dispatch semaphore (includes retries' parent task once).",
+    "help": "Notification delivery tasks that started a transport attempt (counted once per admitted task, not once per bounded retry).",
     "labels": [
       "channel_type"
     ],
@@ -1877,6 +1890,19 @@
     "help": "Notification deliveries currently executing (including bounded retry backoff).",
     "labels": [
       "channel_type"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_notification_delivery_rejected_total",
+    "type": "counter",
+    "help": "Notification deliveries rejected before any transport attempt ran, by fixed reason (generation_closed = producer reload/Drop closed admission, registry_rejected = process delivery registry refused the task).",
+    "labels": [
+      "channel_type",
+      "reason"
     ],
     "subsystem": "notifications",
     "export_surface": "/metrics",

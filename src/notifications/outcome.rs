@@ -20,6 +20,108 @@ use reqwest::StatusCode;
 /// cardinality stays bounded at five series per metric family.
 pub const CHANNEL_TYPES: &[&str] = &["slack", "teams", "discord", "webhook", "email"];
 
+/// Why a delivery ended without a defined transport outcome.
+///
+/// The variants are compiled-in discriminants, never operator- or
+/// attacker-influenced strings, so the `reason` label set is fixed at six
+/// values and Prometheus cardinality stays bounded.
+///
+/// The taxonomy separates two operationally different things that the first
+/// implementation of #2448 collapsed into one counter:
+///
+/// - **Pre-attempt rejections** ([`AbandonReason::Backpressure`],
+///   [`AbandonReason::GenerationClosed`], [`AbandonReason::RegistryRejected`]):
+///   the notification never reached the transport. No `attempted` is recorded.
+/// - **Post-attempt abandonment** ([`AbandonReason::GenerationRetired`],
+///   [`AbandonReason::ShutdownDeadline`], [`AbandonReason::TaskDropped`]): a
+///   transport attempt ran but produced no committed success/failure.
+///
+/// Only [`AbandonReason::ShutdownDeadline`] increments
+/// `ferrum_notification_delivery_abandoned_at_deadline_total`, so that signal
+/// means exactly what the issue asked for: sends still outstanding when the
+/// global shutdown drain deadline expired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbandonReason {
+    /// The bounded dispatch semaphore was exhausted. No task, no attempt.
+    Backpressure,
+    /// The producer generation stopped admitting (reload / plugin `Drop`)
+    /// before the dispatch task was created. No attempt.
+    GenerationClosed,
+    /// The process observability delivery registry refused admission
+    /// (shutdown in progress, or the aggregate task budget is exhausted).
+    /// The task body never ran, so no attempt.
+    RegistryRejected,
+    /// The generation was retired (reload / plugin `Drop`) while a transport
+    /// attempt or its backoff was in flight.
+    GenerationRetired,
+    /// The task was hard-aborted because the global observability shutdown
+    /// drain deadline expired.
+    ShutdownDeadline,
+    /// The task future was dropped without settling for any other reason
+    /// (most plausibly a panic inside the transport future).
+    TaskDropped,
+}
+
+/// Fixed `reason` label values for `ferrum_notification_delivery_rejected_total`.
+pub const REJECT_REASONS: &[AbandonReason] = &[
+    AbandonReason::GenerationClosed,
+    AbandonReason::RegistryRejected,
+];
+
+/// Fixed `reason` label values for `ferrum_notification_delivery_abandoned_total`.
+pub const ABANDON_REASONS: &[AbandonReason] = &[
+    AbandonReason::GenerationRetired,
+    AbandonReason::ShutdownDeadline,
+    AbandonReason::TaskDropped,
+];
+
+impl AbandonReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Backpressure => "backpressure",
+            Self::GenerationClosed => "generation_closed",
+            Self::RegistryRejected => "registry_rejected",
+            Self::GenerationRetired => "generation_retired",
+            Self::ShutdownDeadline => "shutdown_deadline",
+            Self::TaskDropped => "task_dropped",
+        }
+    }
+
+    /// Index into [`REJECT_REASONS`], or `None` when this reason is not a
+    /// pre-attempt rejection. `Backpressure` is deliberately `None`: it keeps
+    /// its own dedicated `backpressure_dropped_total` family so no drop is
+    /// counted twice.
+    pub const fn reject_index(self) -> Option<usize> {
+        match self {
+            Self::GenerationClosed => Some(0),
+            Self::RegistryRejected => Some(1),
+            _ => None,
+        }
+    }
+
+    /// Index into [`ABANDON_REASONS`], or `None` when this reason cannot
+    /// describe an attempt that actually ran.
+    pub const fn abandon_index(self) -> Option<usize> {
+        match self {
+            Self::GenerationRetired => Some(0),
+            Self::ShutdownDeadline => Some(1),
+            Self::TaskDropped => Some(2),
+            _ => None,
+        }
+    }
+
+    /// Whether this reason is the true hard shutdown-deadline abort.
+    pub const fn is_shutdown_deadline(self) -> bool {
+        matches!(self, Self::ShutdownDeadline)
+    }
+}
+
+impl fmt::Display for AbandonReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Whether a failed delivery may be retried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureClass {

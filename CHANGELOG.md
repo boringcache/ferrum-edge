@@ -56,6 +56,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   budget), and commit Trigger/Resolve cooldown + incident state only after
   a defined delivery settle (`PendingTrigger` / `PendingResolve`). See
   `docs/proxy_alerts.md` and `docs/notifications.md` (#2448).
+- Abandonment is now reported under a fixed, compiled-in reason taxonomy
+  instead of one catch-all counter. New
+  `ferrum_notification_delivery_rejected_total{channel_type,reason}`
+  (`generation_closed`, `registry_rejected`) covers drops with no transport
+  attempt — including the pre-`begin_task` generation rejection that
+  previously incremented nothing at all — and new
+  `ferrum_notification_delivery_abandoned_total{channel_type,reason}`
+  (`generation_retired`, `shutdown_deadline`, `task_dropped`) covers attempts
+  that ran without a committed outcome.
+  `ferrum_notification_delivery_abandoned_at_deadline_total` now increments
+  **only** for the true hard abort at the global shutdown drain deadline; a
+  rejected or reload-retired send no longer inflates it, and neither inflates
+  `attempted`. Every rejection path still runs the producer settle callback
+  exactly once (#2448).
+- `proxy_alerts` re-breach during an externally in-flight Resolve no longer
+  silently suppresses the follow-up alert. The incident parks in
+  `ResolveInFlightRebreached` (no notification that could overtake the Resolve
+  on the wire), and the Resolve's settle — success, failure, or abandonment
+  alike, because none of those proves the endpoint did not act — converges to
+  `CompensatingTrigger`, so the next breaching sample re-alerts through the
+  ordinary cooldown gate. A rule that recovered again in the meantime returns
+  to `Healthy` with no phantom alert (#2448).
+- Documented the at-least-once endpoint delivery contract: transport timeouts,
+  connection errors after the request was written, and cancellation after bytes
+  left the process can all duplicate a delivery on retry or report an abandoned
+  outcome despite endpoint action. Webhook/email consumers must be idempotent
+  or duplicate-tolerant (#2448).
 
 ### Security
 

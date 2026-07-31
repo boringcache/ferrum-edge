@@ -18,9 +18,42 @@
 //! generation cannot commit [`DispatchSettle::Succeeded`],
 //! [`DispatchSettle::FailedTransient`], or [`DispatchSettle::FailedPermanent`];
 //! cannot schedule another retry or invoke a success/failure completion
-//! outcome; and settles exactly once as [`DispatchSettle::Abandoned`], with the
-//! exactly-once settlement edge invoking the producer callback once with
-//! `Abandoned` to roll back reserved/pending producer state.
+//! outcome; and settles exactly once as
+//! `Abandoned(AbandonReason::GenerationRetired)`, with the exactly-once
+//! settlement edge invoking the producer callback once with that outcome to
+//! roll back reserved/pending producer state.
+//!
+//! # Duplicate-delivery contract (at-least-once, not exactly-once)
+//!
+//! Notification delivery is **at-least-once at the endpoint** and exactly-once
+//! only in Ferrum's own accounting. Three boundaries are genuinely
+//! indistinguishable from inside this process:
+//!
+//! 1. **Transport timeout.** A request that times out may have been fully
+//!    received and acted on by the peer; the response was simply never read.
+//!    It is classified [`FailureClass::Transient`] and retried, so the peer can
+//!    see the same alert twice.
+//! 2. **Connection error after the request was written.** A reset or early EOF
+//!    on the response side carries no proof the peer did not process the body.
+//!    It is likewise transient and retried.
+//! 3. **Cancellation after bytes left the process.** Reload retirement and the
+//!    shutdown-deadline abort drop the in-flight transport future. That cannot
+//!    unsend anything. Ferrum reports the send as `Abandoned` and rolls
+//!    producer state back, so the *next* breach sample may dispatch the same
+//!    logical alert again while the endpoint already acted on the first one.
+//!
+//! A 2xx followed by a response-body drain failure is deliberately classified
+//! [`FailureClass::Permanent`] for the same reason in the other direction: the
+//! peer already committed, so retrying would only duplicate.
+//!
+//! Operator expectation: **webhook and email consumers must be idempotent, or
+//! tolerant of duplicates.** Deduplicate on the stable notification identity
+//! (rule + proxy + `event_action` + `fired_at`) rather than on delivery count,
+//! and treat `abandoned_total{reason="shutdown_deadline"}` /
+//! `{reason="generation_retired"}` as "delivery state unknown", not as
+//! "definitely not delivered". Setting `max_delivery_retries: 0` narrows
+//! duplicate windows 1 and 2 at the cost of dropping recoverable transient
+//! failures; it cannot close window 3.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,7 +68,7 @@ use super::channels::NotificationChannel;
 pub use super::generation::DeliveryCallback;
 use super::generation::{DispatchGeneration, DispatchSettle, invoke_delivery_callback};
 use super::notification::Notification;
-use super::outcome::{DeliveryAttempt, FailureClass};
+use super::outcome::{AbandonReason, DeliveryAttempt, FailureClass};
 
 /// Default retry policy for notification channels.
 ///
@@ -163,9 +196,15 @@ pub fn dispatch_one(
                 "notification dispatch backpressure: dropping notification"
             );
             if let Some(cb) = on_settle.as_ref() {
-                // Backpressure is not a delivery attempt; surface as abandoned
-                // so callers that reserved pending state can roll it back.
-                invoke_delivery_callback(cb, DispatchSettle::Abandoned, channel_type);
+                // Backpressure is not a delivery attempt; surface it as
+                // abandoned-with-reason so callers that reserved pending state
+                // roll it back, while metrics keep it out of `attempted` and
+                // out of the shutdown-deadline counter.
+                invoke_delivery_callback(
+                    cb,
+                    DispatchSettle::Abandoned(AbandonReason::Backpressure),
+                    channel_type,
+                );
             }
             return false;
         }
@@ -217,7 +256,7 @@ pub(crate) async fn run_with_retries(
     let mut attempt = 0u32;
     loop {
         if generation.is_cancelled() {
-            return DispatchSettle::Abandoned;
+            return DispatchSettle::Abandoned(AbandonReason::GenerationRetired);
         }
         attempt = attempt.saturating_add(1);
         // Reload retirement can race an already-running network attempt, so the
@@ -232,21 +271,24 @@ pub(crate) async fn run_with_retries(
         // Losing the race drops the in-flight transport future here. That
         // cannot unsend bytes already on the wire (the endpoint may still
         // observe, and act on, a delivery this generation will report as
-        // abandoned). A retired generation cannot commit
+        // abandoned — see the duplicate-delivery contract in the module docs).
+        // A retired generation cannot commit
         // Succeeded/FailedTransient/FailedPermanent, cannot schedule another
         // retry, or invoke a success/failure completion outcome; it settles
-        // exactly once as Abandoned, and the exactly-once settlement edge
-        // invokes the producer callback once with Abandoned to roll back
-        // reserved/pending producer state.
+        // exactly once as Abandoned(GenerationRetired), and the exactly-once
+        // settlement edge invokes the producer callback once with that outcome
+        // to roll back reserved/pending producer state.
         let outcome = tokio::select! {
             biased;
-            () = cancel_wait(generation) => return DispatchSettle::Abandoned,
+            () = cancel_wait(generation) => {
+                return DispatchSettle::Abandoned(AbandonReason::GenerationRetired);
+            }
             outcome = channel.dispatch_classified(&notification, &extras, &http) => outcome,
         };
         // A cancel that lands between the transport returning and this check
         // must still be honored: same commit boundary, no retry.
         if generation.is_cancelled() {
-            return DispatchSettle::Abandoned;
+            return DispatchSettle::Abandoned(AbandonReason::GenerationRetired);
         }
         match outcome {
             DeliveryAttempt::Success => return DispatchSettle::Succeeded,
@@ -268,7 +310,7 @@ pub(crate) async fn run_with_retries(
                     tokio::select! {
                         biased;
                         () = cancel_wait(generation) => {
-                            return DispatchSettle::Abandoned;
+                            return DispatchSettle::Abandoned(AbandonReason::GenerationRetired);
                         }
                         _ = tokio::time::sleep(delay) => {}
                     }

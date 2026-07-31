@@ -45,4 +45,6 @@ pub use metrics::{
 #[allow(unused_imports)]
 pub use notification::{EventAction, Notification, NotificationField, Severity};
 #[allow(unused_imports)]
-pub use outcome::{CHANNEL_TYPES, DeliveryAttempt, FailureClass};
+pub use outcome::{
+    ABANDON_REASONS, AbandonReason, CHANNEL_TYPES, DeliveryAttempt, FailureClass, REJECT_REASONS,
+};

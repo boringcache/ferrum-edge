@@ -13,11 +13,12 @@ use ferrum_edge::notifications::dispatch::{DeliveryRetryPolicy, dispatch_one};
 use ferrum_edge::notifications::generation::{DispatchGeneration, DispatchSettle};
 use ferrum_edge::notifications::metrics::DeliveryMetrics;
 use ferrum_edge::notifications::outcome::{
-    FailureClass, classify_http_status, classify_smtp_failure,
+    ABANDON_REASONS, AbandonReason, FailureClass, REJECT_REASONS, classify_http_status,
+    classify_smtp_failure,
 };
 use ferrum_edge::notifications::{EventAction, Notification, NotificationField, Severity};
 use ferrum_edge::plugins::proxy_alerts::ProxyAlerts;
-use ferrum_edge::plugins::proxy_alerts::cooldown::RuleState;
+use ferrum_edge::plugins::proxy_alerts::cooldown::{LifecycleOutcome, RecoveryGate, RuleState};
 use ferrum_edge::plugins::proxy_alerts::windows::monotonic_now_ms;
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use ferrum_edge::plugins::{Plugin, TransactionSummary};
@@ -98,23 +99,93 @@ async fn spawn_status_sequence_server(
     (addr, count, notify, handle)
 }
 
-async fn wait_for_count(count: &AtomicUsize, notify: &Notify, expected: usize) {
+/// Await an observable condition without any sleep or polling cadence.
+///
+/// The `Notified` future is pinned and `enable()`d *before* `ready` is
+/// evaluated. That ordering is load-bearing: `notify_waiters` retains no permit
+/// for a waiter that is not yet registered, and merely constructing
+/// `notified()` does not register — registration happens on first poll or on
+/// `enable()`. Without it, a signal landing between the state read and the
+/// first poll would be lost and the test would hang until its timeout.
+async fn wait_until<F>(notify: &Notify, ready: F, what: &str)
+where
+    F: Fn() -> bool,
+{
     let wait = async {
         loop {
-            // Register before checking the counter so notify_waiters cannot
-            // land in the gap between the authoritative observation and the
-            // waiter registration. Unlike notify_one, notify_waiters does not
-            // retain a permit when no waiter is present.
             let notified = notify.notified();
-            if count.load(Ordering::SeqCst) >= expected {
-                break;
+            tokio::pin!(notified);
+            let _ = notified.as_mut().enable();
+            if ready() {
+                return;
             }
-            notified.await;
+            notified.as_mut().await;
         }
     };
-    timeout(Duration::from_secs(3), wait)
+    timeout(Duration::from_secs(10), wait)
         .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {expected} requests"));
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+async fn wait_for_count(count: &AtomicUsize, notify: &Notify, expected: usize) {
+    wait_until(
+        notify,
+        || count.load(Ordering::SeqCst) >= expected,
+        &format!("{expected} requests"),
+    )
+    .await;
+}
+
+/// Records every producer settle callback and lets a test await the Nth one
+/// event-driven, so no assertion depends on a sleep landing after the callback.
+#[derive(Default)]
+struct SettleLog {
+    settles: std::sync::Mutex<Vec<DispatchSettle>>,
+    changed: Notify,
+}
+
+impl SettleLog {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn snapshot(&self) -> Vec<DispatchSettle> {
+        self.settles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn len(&self) -> usize {
+        self.settles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    /// Producer callback. Runs synchronously on the settling task — never
+    /// re-spawned — so "the callback ran" and "the task settled" are the same
+    /// observable event.
+    fn callback(self: &Arc<Self>) -> Arc<dyn Fn(DispatchSettle) + Send + Sync> {
+        let log = Arc::clone(self);
+        Arc::new(move |settle| {
+            log.settles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(settle);
+            log.changed.notify_waiters();
+        })
+    }
+
+    async fn wait_for_settles(&self, expected: usize) -> Vec<DispatchSettle> {
+        wait_until(
+            &self.changed,
+            || self.len() >= expected,
+            &format!("{expected} delivery settles"),
+        )
+        .await;
+        self.snapshot()
+    }
 }
 
 #[test]
@@ -175,6 +246,94 @@ fn prometheus_contract_emits_fixed_channel_type_series() {
     assert!(text.contains("# HELP ferrum_notification_delivery_abandoned_at_deadline_total"));
     assert!(text.contains("# HELP ferrum_notification_delivery_backpressure_dropped_total"));
     assert!(!text.contains("channel_name="));
+
+    // The reason taxonomy is fixed and fully materialized from the first
+    // scrape, and the two families are disjoint: a pre-attempt rejection reason
+    // must never appear on the abandoned family and vice versa.
+    for kind in ["slack", "teams", "discord", "webhook", "email"] {
+        for reason in REJECT_REASONS {
+            let reason = reason.as_str();
+            assert!(
+                text.contains(&format!(
+                    "ferrum_notification_delivery_rejected_total{{channel_type=\"{kind}\",reason=\"{reason}\"}}"
+                )),
+                "missing rejected series for {kind}/{reason}"
+            );
+            assert!(
+                !text.contains(&format!(
+                    "ferrum_notification_delivery_abandoned_total{{channel_type=\"{kind}\",reason=\"{reason}\"}}"
+                )),
+                "pre-attempt reason {reason} must not appear on the abandoned family"
+            );
+        }
+        for reason in ABANDON_REASONS {
+            let reason = reason.as_str();
+            assert!(
+                text.contains(&format!(
+                    "ferrum_notification_delivery_abandoned_total{{channel_type=\"{kind}\",reason=\"{reason}\"}}"
+                )),
+                "missing abandoned series for {kind}/{reason}"
+            );
+            assert!(
+                !text.contains(&format!(
+                    "ferrum_notification_delivery_rejected_total{{channel_type=\"{kind}\",reason=\"{reason}\"}}"
+                )),
+                "post-attempt reason {reason} must not appear on the rejected family"
+            );
+        }
+    }
+    // Backpressure keeps its own dedicated family and is never double counted
+    // into the rejection taxonomy.
+    assert!(!text.contains("reason=\"backpressure\""));
+    // Exactly the fixed cardinality: 5 channel types x each reason set.
+    assert_eq!(
+        text.matches("ferrum_notification_delivery_rejected_total{").count(),
+        5 * REJECT_REASONS.len()
+    );
+    assert_eq!(
+        text.matches("ferrum_notification_delivery_abandoned_total{")
+            .count(),
+        5 * ABANDON_REASONS.len()
+    );
+}
+
+/// The reason taxonomy must stay closed and the two families disjoint, so a
+/// future variant cannot silently land in both (or in neither, losing the
+/// signal entirely).
+#[test]
+fn abandon_reason_taxonomy_is_closed_and_partitioned() {
+    let all = [
+        AbandonReason::Backpressure,
+        AbandonReason::GenerationClosed,
+        AbandonReason::RegistryRejected,
+        AbandonReason::GenerationRetired,
+        AbandonReason::ShutdownDeadline,
+        AbandonReason::TaskDropped,
+    ];
+    for reason in all {
+        assert!(
+            reason.reject_index().is_none() || reason.abandon_index().is_none(),
+            "{reason} must not belong to both families"
+        );
+        // Backpressure is the deliberate exception: it has its own family.
+        if reason != AbandonReason::Backpressure {
+            assert!(
+                reason.reject_index().is_some() || reason.abandon_index().is_some(),
+                "{reason} must be counted somewhere"
+            );
+        }
+    }
+    assert!(AbandonReason::ShutdownDeadline.is_shutdown_deadline());
+    for reason in all {
+        if reason != AbandonReason::ShutdownDeadline {
+            assert!(
+                !reason.is_shutdown_deadline(),
+                "{reason} must not inflate abandoned_at_deadline"
+            );
+        }
+    }
+    assert_eq!(REJECT_REASONS.len(), 2);
+    assert_eq!(ABANDON_REASONS.len(), 3);
 }
 
 #[tokio::test]
@@ -186,6 +345,7 @@ async fn semaphore_exhaustion_increments_backpressure_and_skips_send() {
     let sem = Arc::new(Semaphore::new(0));
     let channel = webhook_channel_to(format!("http://{addr}/notify"));
     let notification = Arc::new(fixed_notification());
+    let settles = SettleLog::new();
 
     let admitted = dispatch_one(
         notification,
@@ -199,16 +359,97 @@ async fn semaphore_exhaustion_increments_backpressure_and_skips_send() {
             ..DeliveryRetryPolicy::DEFAULT
         },
         "test",
-        Some(Arc::new(|_| panic!("callback panic must be contained"))),
+        Some(settles.callback()),
     );
     assert!(!admitted);
-    assert_eq!(metrics.channel_snapshot("webhook").backpressure_dropped, 1);
+    let snap = metrics.channel_snapshot("webhook");
+    assert_eq!(snap.backpressure_dropped, 1);
+    // Backpressure is a *pre-attempt* drop: it must not inflate `attempted`,
+    // must not move the in-flight gauge, must not be double counted into the
+    // rejection taxonomy, and above all must not charge the shutdown-deadline
+    // counter.
+    assert_eq!(snap.attempted, 0);
+    assert_eq!(snap.in_flight, 0);
+    assert_eq!(snap.total_rejected(), 0);
+    assert_eq!(snap.total_abandoned(), 0);
+    assert_eq!(snap.abandoned_at_deadline, 0);
+    // The producer is still rolled back exactly once, with a reason it can act
+    // on. `dispatch_one` invokes this synchronously before returning.
+    assert_eq!(
+        settles.snapshot(),
+        vec![DispatchSettle::Abandoned(AbandonReason::Backpressure)]
+    );
     assert!(
         timeout(Duration::from_millis(100), listener.accept())
             .await
             .is_err(),
         "exhausted semaphore must not connect"
     );
+}
+
+/// A generation that already stopped admitting rejects *before* `begin_task()`.
+/// That path historically incremented nothing at all — no attempt, no
+/// backpressure, no failure, no abandonment — so a reload that raced a breach
+/// was completely invisible. It must now be visible under its own bounded
+/// reason, without inventing a transport attempt that never happened.
+#[tokio::test]
+async fn pre_task_generation_rejection_is_visible_without_inflating_attempted() {
+    let metrics = Arc::new(DeliveryMetrics::new());
+    let generation = DispatchGeneration::with_metrics(4242, Arc::clone(&metrics));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let settles = SettleLog::new();
+
+    // Retire the generation first: this is the reload/Drop boundary.
+    generation.cancel();
+    assert!(!generation.is_admitting());
+
+    let admitted = dispatch_one(
+        Arc::new(fixed_notification()),
+        Arc::new(Default::default()),
+        webhook_channel_to(format!("http://{addr}/notify")),
+        // A wide-open semaphore, so the rejection provably comes from the
+        // generation rather than from backpressure.
+        Arc::new(Semaphore::new(16)),
+        PluginHttpClient::default(),
+        Arc::clone(&generation),
+        DeliveryRetryPolicy::DEFAULT,
+        "test",
+        Some(settles.callback()),
+    );
+
+    assert!(!admitted, "a retired generation must not admit new work");
+    let snap = metrics.channel_snapshot("webhook");
+    assert_eq!(
+        snap.rejected_for(AbandonReason::GenerationClosed),
+        1,
+        "pre-task rejection must be counted"
+    );
+    assert_eq!(
+        snap.attempted, 0,
+        "no channel attempt ran, so `attempted` must not be inflated"
+    );
+    assert_eq!(snap.in_flight, 0);
+    assert_eq!(snap.backpressure_dropped, 0);
+    assert_eq!(
+        snap.abandoned_at_deadline, 0,
+        "reload rejection is not a shutdown-deadline abandonment"
+    );
+    assert_eq!(snap.total_abandoned(), 0);
+    assert_eq!(
+        settles.snapshot(),
+        vec![DispatchSettle::Abandoned(AbandonReason::GenerationClosed)],
+        "the producer callback must still run exactly once, with a precise reason"
+    );
+    // Non-vacuous: prove nothing was ever sent.
+    assert!(
+        timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "a rejected dispatch must not reach the endpoint"
+    );
+    assert_eq!(generation.in_flight(), 0);
+    assert!(generation.wait_drain(Duration::from_secs(5)).await);
 }
 
 #[tokio::test]
@@ -218,8 +459,7 @@ async fn transient_retry_then_success() {
     let (addr, count, notify, server) = spawn_status_sequence_server(vec![503, 200]).await;
     let sem = Arc::new(Semaphore::new(1));
     let channel = webhook_channel_to(format!("http://{addr}/notify"));
-    let settled = Arc::new(tokio::sync::Mutex::new(None));
-    let settled_cb = Arc::clone(&settled);
+    let settles = SettleLog::new();
 
     assert!(dispatch_one(
         Arc::new(fixed_notification()),
@@ -234,29 +474,28 @@ async fn transient_retry_then_success() {
             max_delay: Duration::from_millis(20),
         },
         "test",
-        Some(Arc::new(move |s| {
-            let settled_cb = Arc::clone(&settled_cb);
-            tokio::spawn(async move {
-                *settled_cb.lock().await = Some(s);
-            });
-        })),
+        Some(settles.callback()),
     ));
 
     wait_for_count(&count, &notify, 2).await;
     server.await.unwrap();
-    timeout(
-        Duration::from_secs(2),
-        generation.wait_drain(Duration::from_secs(2)),
-    )
-    .await
-    .unwrap();
-    // Allow callback task to land.
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(*settled.lock().await, Some(DispatchSettle::Succeeded));
+    // The settle callback runs synchronously on the settling task, so awaiting
+    // it is the authoritative completion barrier — no sleep, no detached task.
+    assert_eq!(
+        settles.wait_for_settles(1).await,
+        vec![DispatchSettle::Succeeded]
+    );
+    assert!(
+        generation.wait_drain(Duration::from_secs(5)).await,
+        "a settled dispatch must drain"
+    );
     let snap = metrics.channel_snapshot("webhook");
     assert_eq!(snap.attempted, 1);
     assert_eq!(snap.succeeded, 1);
     assert_eq!(snap.failed_transient, 0);
+    assert_eq!(snap.in_flight, 0);
+    assert_eq!(snap.total_abandoned(), 0);
+    assert_eq!(snap.total_rejected(), 0);
 }
 
 #[tokio::test]
@@ -313,7 +552,7 @@ async fn permanent_failure_does_not_retry() {
 
 #[tokio::test]
 async fn proxy_alerts_failed_trigger_releases_cooldown_and_pending_state() {
-    let (addr, _count, _notify, server) = spawn_status_sequence_server(vec![500]).await;
+    let (addr, count, notify, server) = spawn_status_sequence_server(vec![500]).await;
     let cfg = json!({
         "max_concurrent_dispatches": 2,
         "max_delivery_retries": 0,
@@ -327,6 +566,7 @@ async fn proxy_alerts_failed_trigger_releases_cooldown_and_pending_state() {
         ]
     });
     let plugin = ProxyAlerts::new(&cfg, PluginHttpClient::default()).unwrap();
+    let generation = plugin.dispatch_generation_for_test();
     let summary = TransactionSummary {
         namespace: "ferrum".to_string(),
         proxy_id: Some("p1".to_string()),
@@ -336,23 +576,22 @@ async fn proxy_alerts_failed_trigger_releases_cooldown_and_pending_state() {
     };
     plugin.log(&summary).await;
 
-    timeout(Duration::from_secs(3), async {
-        loop {
-            match plugin.recovery_state_for_test(0, "ferrum|p1", 0) {
-                Some(RuleState::PendingTrigger { .. }) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Some(RuleState::Healthy) | None => break,
-                Some(RuleState::Active { .. }) => {
-                    panic!("failed trigger must not permanently mark Active")
-                }
-                other => panic!("unexpected state {other:?}"),
-            }
-        }
-    })
-    .await
-    .expect("pending trigger should settle");
+    // Non-vacuous ordering: first prove the endpoint really observed the send
+    // (so the 500 classification is the thing under test, not a connect
+    // failure), then use the generation drain as the settle barrier. `settle()`
+    // runs the producer callback before `end_task()`, so a drained generation
+    // means producer state is already committed — no sleep, no state polling.
+    wait_for_count(&count, &notify, 1).await;
+    assert!(
+        generation.wait_drain(Duration::from_secs(10)).await,
+        "the failed dispatch must settle and drain"
+    );
 
+    assert_eq!(
+        plugin.recovery_state_for_test(0, "ferrum|p1", 0),
+        Some(RuleState::Healthy),
+        "a permanently failed trigger must roll back to Healthy, never Active"
+    );
     assert!(
         plugin.try_acquire_cooldown_for_test(0, "ferrum|p1", 0, 60_000, monotonic_now_ms(), 0,),
         "failed trigger must release cooldown"
@@ -383,24 +622,22 @@ async fn proxy_alerts_successful_trigger_commits_active_and_cooldown() {
         response_status_code: 500,
         ..TransactionSummary::default()
     };
+    let generation = plugin.dispatch_generation_for_test();
     plugin.log(&summary).await;
     wait_for_count(&count, &notify, 1).await;
     server.await.unwrap();
+    assert!(
+        generation.wait_drain(Duration::from_secs(10)).await,
+        "the successful dispatch must settle and drain"
+    );
 
-    timeout(Duration::from_secs(3), async {
-        loop {
-            if matches!(
-                plugin.recovery_state_for_test(0, "ferrum|p1", 0),
-                Some(RuleState::Active { .. })
-            ) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("successful trigger should become Active");
-
+    assert!(
+        matches!(
+            plugin.recovery_state_for_test(0, "ferrum|p1", 0),
+            Some(RuleState::Active { .. })
+        ),
+        "successful trigger should commit Active"
+    );
     assert!(
         !plugin.try_acquire_cooldown_for_test(0, "ferrum|p1", 0, 60_000, monotonic_now_ms(), 0,),
         "successful trigger must consume cooldown"
@@ -486,8 +723,7 @@ async fn reload_retirement_cancels_stalled_in_flight_dispatch_and_settles_abando
     let sem = Arc::new(Semaphore::new(1));
     let addr = endpoint.addr;
     let channel = webhook_channel_to(format!("http://{addr}/slow"));
-    let settles = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let callback_settles = Arc::clone(&settles);
+    let settles = SettleLog::new();
     let notification = Arc::new(fixed_notification());
     let extras: Arc<HashMap<String, String>> = Arc::new(HashMap::new());
 
@@ -506,12 +742,7 @@ async fn reload_retirement_cancels_stalled_in_flight_dispatch_and_settles_abando
             max_delay: Duration::from_millis(20),
         },
         "test",
-        Some(Arc::new(move |settle| {
-            callback_settles
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(settle);
-        })),
+        Some(settles.callback()),
     ));
 
     timeout(
@@ -558,17 +789,27 @@ async fn reload_retirement_cancels_stalled_in_flight_dispatch_and_settles_abando
 
     let snapshot = metrics.channel_snapshot("webhook");
     assert_eq!(snapshot.attempted, 1);
-    assert_eq!(snapshot.abandoned_at_deadline, 1);
+    assert_eq!(
+        snapshot.abandoned_for(AbandonReason::GenerationRetired),
+        1,
+        "reload retirement must be reported as retirement"
+    );
+    assert_eq!(
+        snapshot.abandoned_at_deadline, 0,
+        "reload retirement is NOT a shutdown-deadline abandonment; charging it \
+         to that counter is what made the metric operationally false"
+    );
+    assert_eq!(snapshot.total_rejected(), 0, "a real attempt ran");
     assert_eq!(snapshot.succeeded, 0);
     assert_eq!(snapshot.failed_transient, 0);
     assert_eq!(snapshot.failed_permanent, 0);
     assert_eq!(snapshot.in_flight, 0);
+    // A double settle would `fetch_sub` this counter twice and wrap, so an
+    // exact zero is itself the exactly-once witness for in-flight accounting.
     assert_eq!(generation.in_flight(), 0);
     assert_eq!(
-        *settles
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        vec![DispatchSettle::Abandoned],
+        settles.snapshot(),
+        vec![DispatchSettle::Abandoned(AbandonReason::GenerationRetired)],
         "retirement must roll producer state back exactly once"
     );
     // A drained generation means the dispatch future itself is gone, not just
@@ -585,8 +826,7 @@ async fn retirement_cancels_stalled_retry_attempt_after_transient_failure() {
     let mut endpoint = spawn_stalled_endpoint(vec![503]).await;
     let metrics = Arc::new(DeliveryMetrics::new());
     let generation = DispatchGeneration::with_metrics(101, Arc::clone(&metrics));
-    let settles = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let callback_settles = Arc::clone(&settles);
+    let settles = SettleLog::new();
     let addr = endpoint.addr;
 
     assert!(dispatch_one(
@@ -602,12 +842,7 @@ async fn retirement_cancels_stalled_retry_attempt_after_transient_failure() {
             max_delay: Duration::from_millis(5),
         },
         "test",
-        Some(Arc::new(move |settle| {
-            callback_settles
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(settle);
-        })),
+        Some(settles.callback()),
     ));
 
     timeout(
@@ -643,15 +878,17 @@ async fn retirement_cancels_stalled_retry_attempt_after_transient_failure() {
     );
     let snapshot = metrics.channel_snapshot("webhook");
     assert_eq!(snapshot.attempted, 1, "retries share one admitted task");
-    assert_eq!(snapshot.abandoned_at_deadline, 1);
+    assert_eq!(snapshot.abandoned_for(AbandonReason::GenerationRetired), 1);
+    assert_eq!(
+        snapshot.abandoned_at_deadline, 0,
+        "a retired retry is not a shutdown-deadline abandonment"
+    );
     assert_eq!(snapshot.failed_transient, 0);
     assert_eq!(snapshot.succeeded, 0);
     assert_eq!(snapshot.in_flight, 0);
     assert_eq!(
-        *settles
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        vec![DispatchSettle::Abandoned],
+        settles.snapshot(),
+        vec![DispatchSettle::Abandoned(AbandonReason::GenerationRetired)],
         "a cancelled retry must settle exactly once"
     );
     endpoint.server.abort();
@@ -691,21 +928,387 @@ async fn generation_cancelled_future_resolves_without_polling_cadence() {
         .expect("an already-cancelled generation must resolve immediately");
 }
 
+/// Dropping the plugin — the reload boundary — must retire the *old*
+/// generation's live transport, not merely stop admitting new work.
+///
+/// The endpoint accepts the connection and then never answers, so before the
+/// cancellation path existed the task would have stayed alive until the 60s
+/// `PluginHttpClient` request timeout and the plugin's pending incident state
+/// would have stayed reserved for just as long. Every bound here is orders of
+/// magnitude under that, so passing proves preemption rather than expiry.
+///
+/// This is deliberately driven through the real plugin `log()` hook rather than
+/// `dispatch_one`, so the whole producer chain (window → recovery gate →
+/// cooldown reservation → fan-out settle) is exercised across the drop.
 #[tokio::test]
-async fn proxy_alerts_drop_cancels_dispatch_generation() {
+async fn proxy_alerts_drop_retires_stalled_dispatch_and_settles_producer_state_once() {
+    let mut endpoint = spawn_stalled_endpoint(Vec::new()).await;
+    let addr = endpoint.addr;
     let cfg = json!({
-        "max_concurrent_dispatches": 1,
-        "max_delivery_retries": 0,
+        "max_concurrent_dispatches": 2,
+        // A retry budget on purpose: retirement must also suppress the retry
+        // this stall would otherwise earn.
+        "max_delivery_retries": 3,
+        "delivery_retry_base_ms": 10,
+        "delivery_retry_max_ms": 20,
         "channels": {
-            "c": { "type": "webhook", "url": "http://127.0.0.1:9/alert", "body_template": "x" }
+            "c": { "type": "webhook", "url": format!("http://{addr}/alert"), "body_template": "x" }
         },
         "rules": [
             { "name": "status", "type": "status_code_count",
               "status_codes": [500], "threshold_count": 1,
-              "cooldown_seconds": 1, "channels": ["c"] }
+              "cooldown_seconds": 60, "channels": ["c"] }
         ]
     });
     let plugin = ProxyAlerts::new(&cfg, PluginHttpClient::default()).unwrap();
-    plugin.cancel_dispatch_generation_for_test();
-    assert_eq!(plugin.dispatch_in_flight_for_test(), 0);
+    // Held across the drop: after the plugin is gone these are the only
+    // handles that can witness retirement and producer settlement.
+    let generation = plugin.dispatch_generation_for_test();
+    let recovery = plugin.recovery_gate_for_test();
+
+    plugin
+        .log(&TransactionSummary {
+            namespace: "ferrum".to_string(),
+            proxy_id: Some("p1".to_string()),
+            proxy_name: Some("api".to_string()),
+            response_status_code: 500,
+            ..TransactionSummary::default()
+        })
+        .await;
+
+    // Prove the fixture actually reached the intended blocked state before
+    // asserting anything about cancellation: the server has read the request
+    // headers, so bytes are on the wire and the transport future is parked
+    // inside the call, not merely queued.
+    timeout(
+        Duration::from_secs(10),
+        &mut endpoint.stalled_request_started,
+    )
+    .await
+    .expect("the endpoint must observe the live send before the plugin is dropped")
+    .expect("stall barrier sender must not be dropped");
+    assert_eq!(
+        generation.in_flight(),
+        1,
+        "the stalled send must be accounted in flight"
+    );
+    assert!(
+        matches!(
+            recovery.current_state(0, "ferrum|p1", 0),
+            Some(RuleState::PendingTrigger { .. })
+        ),
+        "the incident must be holding a pending delivery seat while stalled"
+    );
+
+    // The reload boundary.
+    drop(plugin);
+
+    assert!(
+        generation.is_cancelled(),
+        "Drop must retire the dispatch generation"
+    );
+    assert!(
+        !generation.is_admitting(),
+        "a retired generation must not admit new work"
+    );
+    assert!(
+        generation.wait_drain(Duration::from_secs(10)).await,
+        "retirement must abandon the stalled send promptly, not wait out the transport timeout"
+    );
+    // An unanswered request can never be pooled or reused, so EOF on this
+    // socket is a deterministic witness that the old generation's transport
+    // future was really dropped — it does not depend on any timeout.
+    timeout(
+        Duration::from_secs(10),
+        &mut endpoint.stalled_connection_closed,
+    )
+    .await
+    .expect("the retired dispatch future must be dropped, closing the stalled connection")
+    .expect("close witness sender must not be dropped");
+
+    assert_eq!(
+        endpoint.requests.load(Ordering::SeqCst),
+        1,
+        "a retired attempt must not be retried"
+    );
+    assert_eq!(
+        recovery.current_state(0, "ferrum|p1", 0),
+        Some(RuleState::Healthy),
+        "abandonment must roll the pending trigger back so a later generation can re-alert"
+    );
+    // `end_task` decrements this once per settle, so a double settle would wrap
+    // it: an exact zero is the exactly-once witness.
+    assert_eq!(generation.in_flight(), 0);
+    endpoint.server.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Resolve / re-breach race and the compensating Trigger (#2448)
+//
+// These drive `RecoveryGate` directly with an injected monotonic clock, which
+// is exactly the surface `proxy_alerts::process_observation` and
+// `PendingDeliveryFanout::on_channel_settle` use. There is no timing luck: the
+// "Resolve is externally in flight" window is the interval between admitting
+// the Resolve (`observe` → `PendingResolve`) and its settle, and the test owns
+// both ends of it.
+// ---------------------------------------------------------------------------
+
+const RACE_RULE: u32 = 7;
+const RACE_PROXY: &str = "ferrum|p1";
+const RACE_GEN: u64 = 0;
+const RECOVERY_MS: u64 = 5_000;
+
+/// Drive a gate to the exact instant a Resolve has been admitted for dispatch
+/// but has not settled, then re-breach. Returns the gate and the Resolve's
+/// reservation token.
+fn gate_with_resolve_in_flight_then_rebreach() -> (RecoveryGate, u64) {
+    let gate = RecoveryGate::new();
+
+    assert_eq!(
+        gate.observe(RACE_RULE, RACE_PROXY, true, RECOVERY_MS, 1_000, RACE_GEN),
+        LifecycleOutcome::Trigger
+    );
+    gate.settle_trigger_success(RACE_RULE, RACE_PROXY, RACE_GEN, 1_000, 1_000);
+    assert!(matches!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::Active { .. })
+    ));
+
+    assert_eq!(
+        gate.observe(RACE_RULE, RACE_PROXY, false, RECOVERY_MS, 2_000, RACE_GEN),
+        LifecycleOutcome::EnteringRecovery
+    );
+    // Resolved window elapsed: the Resolve is admitted and now externally in
+    // flight. This is the reservation the producer hands to the fan-out.
+    assert_eq!(
+        gate.observe(RACE_RULE, RACE_PROXY, false, RECOVERY_MS, 8_000, RACE_GEN),
+        LifecycleOutcome::Resolve
+    );
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::PendingResolve {
+            left_threshold_at_ms: 2_000,
+            reserved_at_ms: 8_000,
+        }),
+        "the fixture must actually hold an in-flight Resolve seat before racing it"
+    );
+
+    // The race: observations breach again while that Resolve is on the wire.
+    assert_eq!(
+        gate.observe(RACE_RULE, RACE_PROXY, true, RECOVERY_MS, 9_000, RACE_GEN),
+        LifecycleOutcome::Reactivate,
+        "a re-breach during an in-flight Resolve must not itself emit a notification"
+    );
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::ResolveInFlightRebreached {
+            resolve_reserved_at_ms: 8_000,
+            rebreached_at_ms: 9_000,
+        }),
+        "the re-breach must be retained against the outstanding Resolve token"
+    );
+
+    (gate, 8_000)
+}
+
+/// A Resolve that succeeded at the endpoint told the operator the incident is
+/// over. If observations breached again while it was in flight, the incident is
+/// genuinely alerting and must get a compensating Trigger — the old
+/// `PendingResolve + breach -> Active` shortcut suppressed it forever, because
+/// `Active` never re-enters the `Trigger` transition.
+#[test]
+fn successful_resolve_racing_a_rebreach_schedules_a_compensating_trigger() {
+    let (gate, resolve_token) = gate_with_resolve_in_flight_then_rebreach();
+
+    // While the Resolve is still outstanding, further breaching samples stay
+    // quiet: a Trigger emitted now could overtake the Resolve on the wire and
+    // leave "resolved" as the operator's last view.
+    assert_eq!(
+        gate.observe(RACE_RULE, RACE_PROXY, true, RECOVERY_MS, 9_500, RACE_GEN),
+        LifecycleOutcome::Quiet
+    );
+    assert!(matches!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::ResolveInFlightRebreached { .. })
+    ));
+
+    // The Resolve lands successfully. It is now known-stale.
+    gate.settle_resolve_success(RACE_RULE, RACE_PROXY, RACE_GEN, resolve_token);
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::CompensatingTrigger {
+            rebreached_at_ms: 9_000
+        }),
+        "a delivered-but-stale Resolve must leave the incident owing a Trigger"
+    );
+
+    // The next breaching sample re-alerts.
+    assert_eq!(
+        gate.observe(RACE_RULE, RACE_PROXY, true, RECOVERY_MS, 10_000, RACE_GEN),
+        LifecycleOutcome::Trigger,
+        "the compensating Trigger must actually be emitted"
+    );
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::PendingTrigger {
+            reserved_at_ms: 10_000
+        })
+    );
+    gate.settle_trigger_success(RACE_RULE, RACE_PROXY, RACE_GEN, 10_000, 10_000);
+    assert!(matches!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::Active { .. })
+    ));
+}
+
+/// A failed or abandoned Resolve is *not* proof the endpoint did not act on it:
+/// transport timeouts, post-write connection errors, and cancellation after
+/// bytes left the process all report failure while the peer may have processed
+/// the send. The uncertain boundary therefore converges the same way, so the
+/// worst case is one extra Trigger rather than a silently suppressed alert.
+#[test]
+fn failed_or_abandoned_resolve_racing_a_rebreach_also_compensates() {
+    let (gate, resolve_token) = gate_with_resolve_in_flight_then_rebreach();
+
+    gate.settle_resolve_failure(RACE_RULE, RACE_PROXY, RACE_GEN, 2_000, resolve_token);
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::CompensatingTrigger {
+            rebreached_at_ms: 9_000
+        }),
+        "an uncertain Resolve delivery must not silently return to Recovering \
+         while the incident is breached"
+    );
+    assert_eq!(
+        gate.observe(RACE_RULE, RACE_PROXY, true, RECOVERY_MS, 10_000, RACE_GEN),
+        LifecycleOutcome::Trigger
+    );
+}
+
+/// If the rule is no longer breaching by the time the compensating decision is
+/// due, the possibly-delivered Resolve already matches reality: no phantom
+/// alert, and the row becomes evictable again.
+#[test]
+fn compensating_trigger_is_dropped_when_the_rule_recovered_again() {
+    let (gate, resolve_token) = gate_with_resolve_in_flight_then_rebreach();
+    gate.settle_resolve_success(RACE_RULE, RACE_PROXY, RACE_GEN, resolve_token);
+    assert!(matches!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::CompensatingTrigger { .. })
+    ));
+
+    assert_eq!(
+        gate.observe(RACE_RULE, RACE_PROXY, false, RECOVERY_MS, 11_000, RACE_GEN),
+        LifecycleOutcome::Quiet,
+        "a recovered rule must not emit a phantom compensating Trigger"
+    );
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::Healthy)
+    );
+    gate.evict_resolved();
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        None,
+        "the terminal Healthy row must become evictable"
+    );
+}
+
+/// Both new states are non-terminal incidents, so background eviction must
+/// retain them: sweeping either one would drop a breached incident's
+/// compensating obligation on the floor.
+#[test]
+fn eviction_retains_in_flight_rebreach_and_compensating_states() {
+    let (gate, resolve_token) = gate_with_resolve_in_flight_then_rebreach();
+    gate.evict_resolved();
+    assert!(
+        matches!(
+            gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+            Some(RuleState::ResolveInFlightRebreached { .. })
+        ),
+        "an outstanding Resolve race must survive the eviction sweep"
+    );
+
+    gate.settle_resolve_success(RACE_RULE, RACE_PROXY, RACE_GEN, resolve_token);
+    gate.evict_resolved();
+    assert!(
+        matches!(
+            gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+            Some(RuleState::CompensatingTrigger { .. })
+        ),
+        "an owed compensating Trigger must survive the eviction sweep"
+    );
+}
+
+/// Stale-token isolation must hold across the new states too: a settle carrying
+/// a superseded reservation must never commit or clear the current row.
+#[test]
+fn stale_resolve_settle_cannot_clear_a_rebreached_incident() {
+    let (gate, resolve_token) = gate_with_resolve_in_flight_then_rebreach();
+
+    gate.settle_resolve_success(RACE_RULE, RACE_PROXY, RACE_GEN, resolve_token + 1);
+    gate.settle_resolve_failure(RACE_RULE, RACE_PROXY, RACE_GEN, 2_000, resolve_token + 1);
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::ResolveInFlightRebreached {
+            resolve_reserved_at_ms: 8_000,
+            rebreached_at_ms: 9_000,
+        }),
+        "a stale-token settle must not resolve or compensate the live incident"
+    );
+
+    // A settle for a different ownership generation is likewise isolated.
+    gate.settle_resolve_success(RACE_RULE, RACE_PROXY, RACE_GEN + 1, resolve_token);
+    assert!(matches!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::ResolveInFlightRebreached { .. })
+    ));
+
+    // The matching token still works, proving the assertions above were not
+    // vacuously passing on an unreachable row.
+    gate.settle_resolve_success(RACE_RULE, RACE_PROXY, RACE_GEN, resolve_token);
+    assert!(matches!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::CompensatingTrigger { .. })
+    ));
+}
+
+/// The ordinary (unraced) Resolve paths must be unchanged by the compensating
+/// machinery.
+#[test]
+fn unraced_resolve_settles_keep_their_original_semantics() {
+    let gate = RecoveryGate::new();
+    assert_eq!(
+        gate.observe(RACE_RULE, RACE_PROXY, true, RECOVERY_MS, 1_000, RACE_GEN),
+        LifecycleOutcome::Trigger
+    );
+    gate.settle_trigger_success(RACE_RULE, RACE_PROXY, RACE_GEN, 1_000, 1_000);
+    assert_eq!(
+        gate.observe(RACE_RULE, RACE_PROXY, false, RECOVERY_MS, 2_000, RACE_GEN),
+        LifecycleOutcome::EnteringRecovery
+    );
+    assert_eq!(
+        gate.observe(RACE_RULE, RACE_PROXY, false, RECOVERY_MS, 8_000, RACE_GEN),
+        LifecycleOutcome::Resolve
+    );
+
+    // Failure rolls back to Recovering so the next healthy sample retries.
+    gate.settle_resolve_failure(RACE_RULE, RACE_PROXY, RACE_GEN, 2_000, 8_000);
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::Recovering {
+            left_threshold_at_ms: 2_000
+        })
+    );
+    assert_eq!(
+        gate.observe(RACE_RULE, RACE_PROXY, false, RECOVERY_MS, 9_000, RACE_GEN),
+        LifecycleOutcome::Resolve
+    );
+
+    // Success commits Healthy.
+    gate.settle_resolve_success(RACE_RULE, RACE_PROXY, RACE_GEN, 9_000);
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::Healthy)
+    );
 }

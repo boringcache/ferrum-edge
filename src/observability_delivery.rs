@@ -233,6 +233,19 @@ impl DeliverySlot {
         self.current.load().rejected_task_count()
     }
 
+    /// Whether the current generation has begun hard-aborting admitted tasks
+    /// because its shutdown drain deadline expired.
+    ///
+    /// `cancel_remaining` is the only writer, and it runs only after
+    /// `wait_for_tasks`/`wait_for_workers` exhausted the shared deadline. A
+    /// deferred-work owner whose task future is dropped without settling can
+    /// therefore use this to tell a true deadline abort apart from an ordinary
+    /// drop or panic, instead of labelling every unsettled drop as a deadline
+    /// abandonment.
+    pub fn is_aborting_at_deadline(&self) -> bool {
+        self.current.load().cancelling_tasks.load(Ordering::Acquire)
+    }
+
     /// Budget-exhaustion rejects only, for the current generation.
     ///
     /// The aggregate `rejected_tasks` counter also covers closed-admission and
@@ -1066,6 +1079,14 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     global().spawn_terminal(future)
+}
+
+/// Whether the process delivery registry is hard-aborting admitted tasks
+/// because the global shutdown drain deadline expired.
+///
+/// See [`DeliverySlot::is_aborting_at_deadline`].
+pub fn is_aborting_at_deadline() -> bool {
+    global().is_aborting_at_deadline()
 }
 
 /// Register mirror work spawned by an already admitted delivery task.
