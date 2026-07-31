@@ -271,7 +271,29 @@ fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), Stri
 
 /// Reject security-sensitive plugin compositions whose ordering or body view
 /// cannot preserve the configured enforcement contract.
-fn validate_plugin_security_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
+pub(crate) fn validate_plugin_security_composition(
+    plugins: &[Arc<dyn Plugin>],
+) -> Result<(), String> {
+    // The client-request-contract phase runs only over the pre-`before_proxy`
+    // buffer. A plugin that claims to decide a client-facing body contract but
+    // does not also require that buffer would silently never be invoked, and its
+    // declared contract would be inert on every request
+    // (`GHSA-6p78-6x8c-9g9x` / `GHSA-896v-jx23-9g6p`). Reject the composition at
+    // admission/cache construction instead of composing an unsafe cache; the
+    // hot path stays free of this check.
+    if let Some(plugin) = plugins.iter().find(|plugin| {
+        plugin.validates_client_request_body_contract()
+            && !plugin.requires_request_body_before_before_proxy()
+    }) {
+        return Err(format!(
+            "plugin '{}' declares validates_client_request_body_contract() but not \
+             requires_request_body_before_before_proxy(); the client-request-contract phase \
+             runs only over the pre-before_proxy buffer, so the declared contract would never \
+             be enforced",
+            plugin.name()
+        ));
+    }
+
     for protocol in ALL_PROXY_PROTOCOLS {
         let identity_soap_count = plugins
             .iter()

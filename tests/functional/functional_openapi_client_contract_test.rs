@@ -116,6 +116,66 @@ async fn openapi_client_contract_precedes_body_transforms_on_h1_h2_h3() {
     harness.shutdown();
 }
 
+/// A `request_required` contract on a body-less method must be enforced
+/// identically on every protocol.
+///
+/// HTTP/1.1 and HTTP/2 keep an empty `GET`/`HEAD`/`OPTIONS` in the zero-copy
+/// streaming representation (the transport itself proves end-of-stream), while
+/// HTTP/3 collects the same request into an empty buffer. Before the fix the
+/// client-contract phase only ran over the buffered representation, so H1/H2
+/// forwarded the request to the backend with status 200 while H3 rejected it.
+///
+/// Each protocol first issues a control `GET /open` that must reach the backend
+/// and return 200, so a failed connection, handshake, or gateway startup can
+/// never be mistaken for a contract rejection.
+#[ignore]
+#[tokio::test]
+async fn openapi_client_contract_rejects_empty_bodyless_methods_on_h1_h2_h3() {
+    let mut harness = ContractHarness::spawn().await;
+
+    for protocol in ["HTTP/1.1", "HTTP/2", "HTTP/3"] {
+        // Positive control: the transport works and unmatched paths are
+        // forwarded, so a later 400 is a decision and not a setup failure.
+        harness.backend.clear();
+        let (status, _) = harness.send_empty(protocol, Method::GET, "/open").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{protocol}: control request must reach the backend"
+        );
+        assert!(
+            harness
+                .wait_for_backend_path("/open", Duration::from_secs(5))
+                .await
+                .is_some(),
+            "{protocol}: control request must be observed by the backend"
+        );
+
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            harness.backend.clear();
+            let (status, _) = harness.send_empty(protocol, method.clone(), "/audits").await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{protocol} {method}: an empty body must fail the declared request_required \
+                 contract; 200 means the request was forwarded unvalidated"
+            );
+            // The declared schema requires exactly the property the configured
+            // `request_transformer` body rule injects. Reaching the transformer
+            // first would therefore admit the request, so a 400 also proves the
+            // client contract is decided before any body-transform hook.
+            assert!(
+                harness
+                    .no_backend_request_for("/audits", Duration::from_millis(300))
+                    .await,
+                "{protocol} {method}: a rejected request must never reach the backend"
+            );
+        }
+    }
+
+    harness.shutdown();
+}
+
 struct ContractHarness {
     gateway: TestGateway,
     backend: CapturingBackend,
@@ -240,6 +300,104 @@ impl ContractHarness {
         }
     }
 
+    /// Issue a request with no body at all on the requested protocol.
+    async fn send_empty(&self, protocol: &str, method: Method, path: &str) -> (StatusCode, String) {
+        match protocol {
+            "HTTP/1.1" => {
+                let client = reqwest::Client::builder()
+                    .http1_only()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .expect("http1 client");
+                let response = client
+                    .request(method, self.gateway.proxy_url(path))
+                    .send()
+                    .await
+                    .expect("http1 request");
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                (status, text)
+            }
+            "HTTP/2" => {
+                let stream = TcpStream::connect(("127.0.0.1", self.gateway.proxy_port))
+                    .await
+                    .expect("connect h2c");
+                let _ = stream.set_nodelay(true);
+                let io = TokioIo::new(stream);
+                let (mut sender, conn) =
+                    hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+                        .await
+                        .expect("h2 handshake");
+                let conn_task = tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                let uri = format!("http://127.0.0.1:{}{path}", self.gateway.proxy_port);
+                let request = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Full::<Bytes>::new(Bytes::new()))
+                    .expect("build h2 request");
+                let response = sender.send_request(request).await.expect("send h2 request");
+                let status = response.status();
+                let collected = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("collect h2 body")
+                    .to_bytes();
+                drop(sender);
+                conn_task.abort();
+                (status, String::from_utf8_lossy(&collected).to_string())
+            }
+            "HTTP/3" => {
+                let client = Http3Client::insecure().expect("h3 client");
+                let url = format!("https://localhost:{}{path}", self.https_port);
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let options = GetOptions::default().method(method.clone());
+                    match client.get_with_options(&url, options).await {
+                        Ok(response) => return (response.status, response.body_text()),
+                        Err(_) if std::time::Instant::now() < deadline => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        Err(error) => panic!("H3 bodyless request did not complete: {error}"),
+                    }
+                }
+            }
+            other => panic!("unsupported protocol {other}"),
+        }
+    }
+
+    async fn wait_for_backend_path(&self, path: &str, timeout: Duration) -> Option<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(request) = self
+                .backend
+                .requests()
+                .into_iter()
+                .find(|request| request.contains(path))
+            {
+                return Some(request);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::select! {
+                _ = self.backend.notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    }
+
+    async fn no_backend_request_for(&self, path: &str, window: Duration) -> bool {
+        tokio::time::sleep(window).await;
+        !self
+            .backend
+            .requests()
+            .iter()
+            .any(|request| request.contains(path))
+    }
+
     async fn wait_for_request(&self, timeout: Duration) -> Option<String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -303,25 +461,83 @@ fn contract_config(backend_port: u16) -> String {
                     "schema_draft": "draft7",
                     "validate_response": false,
                     "fail_on_unknown_operation": false,
-                    "operations": [{
-                        "method": "POST",
-                        "path_template": "/orders",
-                        "path_regex": "^/orders$",
-                        "request_required": true,
-                        "request_body": {
-                            "content": {
-                                "application/json": {
-                                    "type": "object",
-                                    "additionalProperties": false,
-                                    "required": ["id", "client_attestation"],
-                                    "properties": {
-                                        "id": {"type": "string"},
-                                        "client_attestation": {"type": "string"}
+                    "operations": [
+                        {
+                            "method": "POST",
+                            "path_template": "/orders",
+                            "path_regex": "^/orders$",
+                            "request_required": true,
+                            "request_body": {
+                                "content": {
+                                    "application/json": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "required": ["id", "client_attestation"],
+                                        "properties": {
+                                            "id": {"type": "string"},
+                                            "client_attestation": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        // Body-less methods that the imported document declares a
+                        // required request body for. The schema requires exactly
+                        // the property the configured transformer injects, so an
+                        // enforcement point placed after body transforms would
+                        // admit these requests instead of rejecting them.
+                        {
+                            "method": "GET",
+                            "path_template": "/audits",
+                            "path_regex": "^/audits$",
+                            "request_required": true,
+                            "request_body": {
+                                "content": {
+                                    "application/json": {
+                                        "type": "object",
+                                        "required": ["client_attestation"],
+                                        "properties": {
+                                            "client_attestation": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "method": "HEAD",
+                            "path_template": "/audits",
+                            "path_regex": "^/audits$",
+                            "request_required": true,
+                            "request_body": {
+                                "content": {
+                                    "application/json": {
+                                        "type": "object",
+                                        "required": ["client_attestation"],
+                                        "properties": {
+                                            "client_attestation": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "method": "OPTIONS",
+                            "path_template": "/audits",
+                            "path_regex": "^/audits$",
+                            "request_required": true,
+                            "request_body": {
+                                "content": {
+                                    "application/json": {
+                                        "type": "object",
+                                        "required": ["client_attestation"],
+                                        "properties": {
+                                            "client_attestation": {"type": "string"}
+                                        }
                                     }
                                 }
                             }
                         }
-                    }]
+                    ]
                 }
             },
             {

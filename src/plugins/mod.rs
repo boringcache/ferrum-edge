@@ -7036,7 +7036,12 @@ pub trait Plugin: Send + Sync {
     ///
     /// A plugin that opts in also has to declare
     /// [`Plugin::requires_request_body_before_before_proxy`] so the pre-
-    /// `before_proxy` buffer actually exists, and it must select buffering in
+    /// `before_proxy` buffer actually exists. That is not documentation-only:
+    /// `plugin_cache::validate_plugin_security_composition` rejects a plugin
+    /// that declares this capability without it at admission and at every cache
+    /// construction, because the phase runs only over that buffer and the
+    /// declared contract would otherwise be silently inert. The plugin must also
+    /// select buffering in
     /// [`Plugin::should_buffer_request_body`] from request properties it
     /// controls — never from an attacker-supplied representation hint such as a
     /// `Content-Type` it may simply omit (`GHSA-6p78-6x8c-9g9x`).

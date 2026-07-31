@@ -156,10 +156,23 @@ enum ValidationSide {
 /// The two are deliberately distinct lifecycle phases, not two spellings of one
 /// check. `Client` is the documented contract: the original client bytes after
 /// gateway-owned `Content-Encoding` decoding and before any transform. `Backend`
-/// is the pre-existing final-body hook, retained only as a fallback for request
-/// paths that never prebuffer (for example an HBONE CONNECT tunnel or a proxy
-/// whose body buffering is disallowed), so disabling the phase can never be a
-/// silent downgrade to no enforcement at all.
+/// is the pre-existing final-body hook, retained as a fallback for the request
+/// paths the client phase cannot cover, so disabling it would be a silent
+/// downgrade to no enforcement at all:
+///
+/// - unknown-operation admission (`fail_on_unknown_operation`), which the client
+///   phase deliberately leaves to `before_proxy`/the final hook so it is not
+///   reordered ahead of unrelated `before_proxy` hooks;
+/// - a request where this validator was not selected over the pristine client
+///   view but is over the effective backend-visible view — an operation match or
+///   bypass state that only materializes after a `before_proxy` route override
+///   or request header/target rewrite.
+///
+/// An HBONE CONNECT tunnel is NOT one of those paths. This plugin governs plain
+/// HTTP request bodies; a CONNECT tunnel's bytes are not a request body, the
+/// proxy skips request-body buffering for HBONE entirely, and it short-circuits
+/// into `handle_hbone_request` immediately after `before_proxy` — before any
+/// final-request-body hook — so neither phase ever observes tunnel bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestContractPhase {
     Client,

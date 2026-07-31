@@ -277,6 +277,16 @@ pub mod _test_support {
         )
     }
 
+    /// The exact effective-chain security-composition validator every plugin
+    /// cache construction and every admin candidate admission runs. Exposed so
+    /// tests can drive it with a synthetic capability plugin that no built-in
+    /// can express.
+    pub fn validate_plugin_security_composition_for_test(
+        plugins: &[Arc<dyn Plugin>],
+    ) -> Result<(), String> {
+        crate::plugin_cache::validate_plugin_security_composition(plugins)
+    }
+
     pub fn validate_correlation_id_composition_for_test(
         plugins: &[Arc<dyn Plugin>],
     ) -> Result<(), String> {

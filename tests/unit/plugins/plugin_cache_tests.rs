@@ -56,6 +56,32 @@ impl Plugin for RawCorrelationClaimPlugin {
     }
 }
 
+/// Stands in for a custom plugin declaring the client-request-contract
+/// capability. No built-in can express the violating combination, so the
+/// invariant has to be exercised with a synthetic capability plugin.
+struct ClientContractCapabilityPlugin {
+    requires_prebuffer: bool,
+}
+
+#[async_trait::async_trait]
+impl Plugin for ClientContractCapabilityPlugin {
+    fn name(&self) -> &str {
+        "custom_client_contract"
+    }
+
+    fn validates_client_request_body_contract(&self) -> bool {
+        true
+    }
+
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        self.requires_prebuffer
+    }
+
+    fn should_buffer_request_body(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+}
+
 struct StalledDeadlineResponseTransformer;
 
 #[async_trait::async_trait]
@@ -9650,6 +9676,64 @@ fn test_empty_third_party_correlation_capability_claims_fail_closed_clearly() {
             "got: {error}"
         );
     }
+}
+
+#[test]
+fn client_contract_capability_without_prebuffer_requirement_fails_closed() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ClientContractCapabilityPlugin {
+        requires_prebuffer: false,
+    })];
+
+    let error = ferrum_edge::_test_support::validate_plugin_security_composition_for_test(&plugins)
+        .expect_err("a client-contract plugin without the pre-before_proxy buffer must be refused");
+
+    assert!(
+        error.contains("custom_client_contract"),
+        "error must name the offending plugin: {error}"
+    );
+    assert!(
+        error.contains("validates_client_request_body_contract()")
+            && error.contains("requires_request_body_before_before_proxy()"),
+        "error must name both capabilities: {error}"
+    );
+}
+
+#[test]
+fn client_contract_capability_with_prebuffer_requirement_is_admitted() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ClientContractCapabilityPlugin {
+        requires_prebuffer: true,
+    })];
+
+    ferrum_edge::_test_support::validate_plugin_security_composition_for_test(&plugins)
+        .expect("a correctly declared client-contract plugin must be admitted");
+}
+
+#[test]
+fn builtin_openapi_validator_satisfies_the_client_contract_capability_invariant() {
+    let validator = ferrum_edge::plugins::openapi_validator::OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/orders",
+            "path_regex": "^/orders$",
+            "request_required": true,
+            "request_body": {
+                "content": {
+                    "application/json": {"type": "object"}
+                }
+            }
+        }]
+    }))
+    .expect("construct openapi_validator");
+
+    assert!(validator.validates_client_request_body_contract());
+    assert!(
+        validator.requires_request_body_before_before_proxy(),
+        "the built-in must keep declaring the buffer its client-contract phase reads"
+    );
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(validator)];
+    ferrum_edge::_test_support::validate_plugin_security_composition_for_test(&plugins)
+        .expect("the built-in validator must pass the composition invariant");
 }
 
 #[test]
