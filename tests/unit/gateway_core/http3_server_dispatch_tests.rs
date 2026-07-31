@@ -760,8 +760,17 @@ fn h3_request_plugin_deadlines_mark_and_bound_terminal_rejections() {
     assert!(before_proxy_helper.contains("plugin.before_proxy(ctx, headers)"));
     assert!(before_proxy_helper.contains(".into_plugin_result(ctx)"));
 
-    let initial_clone_before_proxy = server
-        .split("// before_proxy hooks — only clone headers if at least one plugin modifies them.")
+    let initial_before_proxy_start = server
+        .find("// before_proxy hooks — only clone headers if at least one plugin modifies them.")
+        .expect("native H3 initial before_proxy block must remain present");
+    let initial_before_proxy_end = server[initial_before_proxy_start..]
+        .find("// Keep H3 body-plugin applicability aligned with the H1/H2 path:")
+        .map(|offset| initial_before_proxy_start + offset)
+        .expect("native H3 initial before_proxy block must remain bounded");
+    let initial_before_proxy = &server[initial_before_proxy_start..initial_before_proxy_end];
+
+    let initial_clone_before_proxy = initial_before_proxy
+        .split("let mut cloned = ctx.headers.clone();")
         .nth(1)
         .expect("native H3 header-clone before_proxy path must remain present")
         .split("owned_proxy_headers = Some(cloned);")
@@ -773,7 +782,7 @@ fn h3_request_plugin_deadlines_mark_and_bound_terminal_rejections() {
         "native H3 header-clone path must delegate before_proxy to the shared helper"
     );
 
-    let initial_take_before_proxy = server
+    let initial_take_before_proxy = initial_before_proxy
         .split("let mut tmp_headers = std::mem::take(&mut ctx.headers);")
         .nth(1)
         .expect("native H3 zero-clone before_proxy path must remain present")
