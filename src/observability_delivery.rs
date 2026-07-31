@@ -313,6 +313,7 @@ impl DeliverySlot {
     /// Hidden test seam only: external paused-time regressions use the signal
     /// as a causal barrier instead of polling admission or relying on scheduler
     /// order. Production callers use [`Self::shutdown`].
+    #[allow(dead_code)] // Used by external lifecycle tests; production callers use `shutdown`.
     #[doc(hidden)]
     pub async fn shutdown_with_admission_closed_for_test(
         &self,
