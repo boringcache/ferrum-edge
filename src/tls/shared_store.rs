@@ -24,6 +24,28 @@
 //!   file, or a poisoned in-process guard is an error — never a silent
 //!   local-only write.
 //!
+//! # Readers never wait on a writer
+//!
+//! Reads are deliberately **lock-free with respect to writer contention**.
+//! ACME HTTP-01 and TLS-ALPN-01 challenge lookups happen on the request path
+//! and admin reads run on Tokio workers, so making a reader poll a contended
+//! advisory lock for up to `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS` would let a
+//! slow writer stall runtime threads — a denial-of-service amplification.
+//!
+//! That is safe because publication is `create_new` temp file + fsync +
+//! `rename` (`tls::private_file`): the destination path always names a
+//! *complete* document, never a partially written one. A reader therefore
+//! opens either the previous or the replacement inode, and reads the whole of
+//! whichever it got. A reader that loses the race with a rename returns the
+//! previous complete generation **once**; because its cached stamp is taken
+//! from the open handle it read (not from a later `stat` of the path), the very
+//! next observation compares the pinned old identity against the new one and
+//! re-reads. Corruption is never papered over: a document that does not parse
+//! is an error, not an empty map.
+//!
+//! Writers still take the exclusive advisory lock, because a read-modify-write
+//! must be serialized across processes.
+//!
 //! Nothing here logs document contents. Managed records and ACME accounts hold
 //! private key material, so errors carry only the operator-configured store
 //! path (local configuration, not a secret-provider reference) and an
@@ -39,15 +61,6 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
-
-/// How close to "now" a store file's modification time may be before the cached
-/// snapshot is treated as possibly stale regardless of the recorded stamp.
-///
-/// Filesystems with coarse timestamp granularity can record two distinct writes
-/// with the same `mtime`, and inode numbers can in principle be reused, so a
-/// freshly written file is always re-read. Outside that window an unchanged
-/// stamp is trusted and a read costs one `stat`.
-const COARSE_MTIME_WINDOW: Duration = Duration::from_secs(2);
 
 /// Retry cadence while waiting for a contended advisory lock.
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -105,52 +118,88 @@ pub trait VersionedStoreFile:
     fn set_store_version(&mut self, version: u64);
 }
 
-/// Identity of the on-disk document at the moment it was last loaded.
+/// Whether the filesystem exposes an exact *replacement identity* for the store
+/// document, i.e. a value that is guaranteed to differ between two generations
+/// of the file.
 ///
-/// Publication is temp-file + rename, so on Unix the inode changes on every
-/// commit and is an exact change detector; length and modification time cover
-/// platforms without inode identity.
+/// Change detection must be deterministic: a missed replacement means an
+/// instance serves another replica's superseded TLS material indefinitely. So
+/// there is no probabilistic middle ground here — either the platform gives an
+/// exact identity and the cheap `stat` fast path is used, or every read
+/// re-reads the (small) document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreIdentityMode {
+    /// Use the platform's file identity: Unix `st_dev` + `st_ino`, pinned by an
+    /// open handle so the inode number cannot be recycled underneath the cache.
+    Native,
+    /// No usable replacement identity. Every read re-reads the document.
+    Unavailable,
+}
+
+impl StoreIdentityMode {
+    /// Identity support on the target this build runs on.
+    pub const fn platform_default() -> Self {
+        if cfg!(unix) {
+            Self::Native
+        } else {
+            Self::Unavailable
+        }
+    }
+}
+
+/// Exact identity of one generation of the on-disk document.
+///
+/// Only meaningful while the corresponding open handle is retained: publication
+/// is temp-file + `rename`, and an inode number is reusable once the old inode
+/// is both unlinked and closed. [`Cached::pinned`] keeps the handle open, so the
+/// inode we last read cannot be handed to a later temp file and an equal
+/// `(device, inode)` therefore proves the path still names the bytes we hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata, mode: StoreIdentityMode) -> Option<Self> {
+        if mode == StoreIdentityMode::Unavailable {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            None
+        }
+    }
+}
+
+/// State of the on-disk document at the moment it was last loaded.
+///
+/// `identity` is the load-bearing field. `len` and `modified` are a secondary
+/// check against an in-place rewrite by something other than Ferrum; they are
+/// never sufficient on their own, because two atomic replacements can share a
+/// length and a coarse-granularity `mtime`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
     len: u64,
     modified: Option<SystemTime>,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    device: u64,
+    identity: Option<FileIdentity>,
 }
 
 impl FileStamp {
-    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            Self {
-                len: metadata.len(),
-                modified: metadata.modified().ok(),
-                inode: metadata.ino(),
-                device: metadata.dev(),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            Self {
-                len: metadata.len(),
-                modified: metadata.modified().ok(),
-            }
-        }
-    }
-
-    /// Whether the file was written recently enough that timestamp granularity
-    /// could hide a subsequent change.
-    fn written_recently(&self, now: SystemTime) -> bool {
-        let Some(modified) = self.modified else {
-            return true;
-        };
-        match now.duration_since(modified) {
-            Ok(age) => age < COARSE_MTIME_WINDOW,
-            // Modified in the future (clock skew): treat as freshly written.
-            Err(_) => true,
+    fn from_metadata(metadata: &std::fs::Metadata, mode: StoreIdentityMode) -> Self {
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            identity: FileIdentity::from_metadata(metadata, mode),
         }
     }
 }
@@ -159,6 +208,9 @@ struct Cached<T> {
     value: Arc<T>,
     /// `None` means the document did not exist at the last load.
     stamp: Option<FileStamp>,
+    /// Open handle to exactly the inode `stamp` describes, retained so the
+    /// identity stays unique. Never read from again.
+    pinned: Option<File>,
 }
 
 /// Releases an advisory file lock on drop.
@@ -178,6 +230,7 @@ pub struct SharedStoreFile<T: VersionedStoreFile> {
     path: PathBuf,
     lock_path: PathBuf,
     lock_timeout: Duration,
+    identity_mode: StoreIdentityMode,
     cached: RwLock<Cached<T>>,
     /// Serializes writers inside this process before they contend for the
     /// cross-process advisory lock.
@@ -200,18 +253,32 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
     /// is an error, so a corrupt shared volume is never silently replaced by an
     /// empty local map.
     pub fn open(path: PathBuf) -> Result<Self, SharedStoreError> {
+        Self::open_with_identity_mode(path, StoreIdentityMode::platform_default())
+    }
+
+    /// [`Self::open`] with an explicit replacement-identity mode.
+    ///
+    /// [`StoreIdentityMode::Unavailable`] is the always-correct fallback used on
+    /// platforms without file identity; it is exposed so the no-identity path
+    /// can be exercised (and regression-tested) on any target.
+    pub fn open_with_identity_mode(
+        path: PathBuf,
+        identity_mode: StoreIdentityMode,
+    ) -> Result<Self, SharedStoreError> {
         let lock_path = lock_path_for(&path)?;
         let store = Self {
             path,
             lock_path,
             lock_timeout: crate::config::env_config::tls_store_lock_timeout_from_env(),
+            identity_mode,
             cached: RwLock::new(Cached {
                 value: Arc::new(T::default()),
                 stamp: None,
+                pinned: None,
             }),
             write_gate: Mutex::new(()),
         };
-        store.reload()?;
+        store.read_authoritative()?;
         Ok(store)
     }
 
@@ -225,11 +292,15 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
     }
 
     /// The authoritative document, re-read whenever the file changed.
+    ///
+    /// Never waits on the advisory lock: see the module header. A reader that
+    /// races a writer's `rename` observes one complete generation or the other,
+    /// and the stamp it caches guarantees the next call notices the newer one.
     pub fn snapshot(&self) -> Result<Arc<T>, SharedStoreError> {
         if let Some(value) = self.cached_if_fresh()? {
             return Ok(value);
         }
-        self.reload()
+        self.read_authoritative()
     }
 
     /// Serialized read-modify-write against authoritative shared state.
@@ -261,8 +332,8 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
         E: From<SharedStoreError>,
     {
         let _local = self.write_gate.lock().map_err(|_| self.poisoned())?;
-        let _lock = self.lock(/*exclusive=*/ true)?;
-        let current = self.reload_locked()?;
+        let _lock = self.lock_exclusive()?;
+        let current = self.read_authoritative()?;
         let mut candidate = (*current).clone();
         let (committed, outcome) = apply(&mut candidate)?;
         if !committed {
@@ -278,19 +349,24 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
         SharedStoreError::write(&self.path, POISONED_GUARD)
     }
 
-    /// Cached document when the on-disk identity still matches it.
+    /// Cached document when the on-disk identity provably still matches it.
+    ///
+    /// Deterministic in both directions. Absence is exact (`NotFound` against a
+    /// cache that recorded absence). Presence is trusted only when an exact
+    /// replacement identity is available *and* equal; without one — a non-Unix
+    /// target, or [`StoreIdentityMode::Unavailable`] — the answer is always
+    /// "re-read", because equal length and equal (possibly coarse) `mtime` do
+    /// not imply equal contents and a missed write would be permanent.
     fn cached_if_fresh(&self) -> Result<Option<Arc<T>>, SharedStoreError> {
         let cached = self.cached.read().map_err(|_| self.poisoned())?;
         let current = match std::fs::metadata(&self.path) {
-            Ok(metadata) => Some(FileStamp::from_metadata(&metadata)),
+            Ok(metadata) => Some(FileStamp::from_metadata(&metadata, self.identity_mode)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(SharedStoreError::read(&self.path, error)),
         };
         let unchanged = match (cached.stamp, current) {
             (None, None) => true,
-            (Some(previous), Some(current)) => {
-                previous == current && !current.written_recently(SystemTime::now())
-            }
+            (Some(previous), Some(current)) => previous.identity.is_some() && previous == current,
             _ => false,
         };
         if unchanged {
@@ -300,32 +376,38 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
         }
     }
 
-    fn reload(&self) -> Result<Arc<T>, SharedStoreError> {
-        let _lock = self.lock(/*exclusive=*/ false)?;
-        self.reload_locked()
-    }
-
-    /// Read the authoritative document. The caller must already hold the lock.
-    fn reload_locked(&self) -> Result<Arc<T>, SharedStoreError> {
+    /// Read the authoritative document from disk and republish the cache.
+    ///
+    /// Takes no advisory lock. Writers call it while already holding the
+    /// exclusive lock; readers call it unlocked, which is safe because the
+    /// destination path only ever names a complete, atomically renamed
+    /// document.
+    fn read_authoritative(&self) -> Result<Arc<T>, SharedStoreError> {
         let mut file = match File::open(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let value = Arc::new(T::default());
-                self.publish_cached(value.clone(), None)?;
+                self.publish_cached(value.clone(), None, None)?;
                 return Ok(value);
             }
             Err(error) => return Err(SharedStoreError::read(&self.path, error)),
         };
-        // Stamp from the open handle so it describes exactly the bytes read.
+        // Stamp from the open handle so it describes exactly the bytes read,
+        // not whatever the path may point at by the time the read finishes.
         let stamp = file.metadata().ok();
-        let stamp = stamp.as_ref().map(FileStamp::from_metadata);
+        let stamp = stamp
+            .as_ref()
+            .map(|metadata| FileStamp::from_metadata(metadata, self.identity_mode));
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(|error| SharedStoreError::read(&self.path, error))?;
+        // A document that does not parse is an error. A partially written one
+        // cannot be observed (rename is atomic), so this is real corruption and
+        // must never degrade to an empty local map.
         let parsed = serde_json::from_slice::<T>(&bytes)
             .map_err(|error| SharedStoreError::parse(&self.path, error))?;
         let value = Arc::new(parsed);
-        self.publish_cached(value.clone(), stamp)?;
+        self.publish_cached(value.clone(), stamp, Some(file))?;
         Ok(value)
     }
 
@@ -334,31 +416,41 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
             .map_err(|error| SharedStoreError::write(&self.path, error))?;
         crate::tls::private_file::replace_private_file(&self.path, &payload)
             .map_err(|error| SharedStoreError::write(&self.path, error))?;
-        let stamp = std::fs::metadata(&self.path).ok();
-        let stamp = stamp.as_ref().map(FileStamp::from_metadata);
-        self.publish_cached(Arc::new(value.clone()), stamp)
+        // Pin the freshly published inode the same way a read does. If it
+        // cannot be reopened the cache simply records no stamp, which makes
+        // every later read re-read — degraded, never stale.
+        let pinned = File::open(&self.path).ok();
+        let stamp = pinned
+            .as_ref()
+            .and_then(|file| file.metadata().ok())
+            .map(|metadata| FileStamp::from_metadata(&metadata, self.identity_mode));
+        self.publish_cached(Arc::new(value.clone()), stamp, pinned)
     }
 
     fn publish_cached(
         &self,
         value: Arc<T>,
         stamp: Option<FileStamp>,
+        pinned: Option<File>,
     ) -> Result<(), SharedStoreError> {
         let mut cached = self.cached.write().map_err(|_| self.poisoned())?;
-        *cached = Cached { value, stamp };
+        *cached = Cached {
+            value,
+            stamp,
+            pinned,
+        };
         Ok(())
     }
 
-    fn lock(&self, exclusive: bool) -> Result<FileLockGuard, SharedStoreError> {
+    /// Take the cross-process advisory lock for a read-modify-write.
+    ///
+    /// Only writers call this. The bounded poll loop sleeps a thread, which is
+    /// why no read path may reach it.
+    fn lock_exclusive(&self) -> Result<FileLockGuard, SharedStoreError> {
         let file = self.open_lock_file()?;
         let deadline = Instant::now() + self.lock_timeout;
         loop {
-            let attempt = if exclusive {
-                file.try_lock()
-            } else {
-                file.try_lock_shared()
-            };
-            match attempt {
+            match file.try_lock() {
                 Ok(()) => return Ok(FileLockGuard { file }),
                 Err(TryLockError::WouldBlock) => {
                     if Instant::now() >= deadline {

@@ -239,3 +239,49 @@ fn concurrent_writes_from_two_instances_all_commit() {
         "each committed write must advance the store version, got {version}"
     );
 }
+
+/// Reads must not be serialized behind a writer's cross-instance lock.
+///
+/// `managed://` material lookups feed frontend/admin TLS reload and the admin
+/// API, both of which run on Tokio workers. Polling a contended advisory lock
+/// for up to `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS` (10s by default) would let
+/// one slow writer — on this host or another replica — stall runtime threads,
+/// turning a shared volume into a denial-of-service amplifier.
+#[test]
+fn reads_do_not_wait_for_a_writer_holding_the_store_lock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = ManagedTlsStore::open(dir.path()).expect("open");
+    store
+        .upsert(ca_record("edge-ca", "v1"), false)
+        .expect("seed");
+
+    // Hold the sidecar advisory lock exactly as a mid-flight writer in another
+    // process does: a separate open file description on the same lock file.
+    let lock = std::fs::File::options()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.path().join(".managed-tls.json.lock"))
+        .expect("open the lock sidecar");
+    lock.lock().expect("hold the writer lock");
+
+    let reader = ManagedTlsStore::open(dir.path()).expect("open a second instance");
+    let started = std::time::Instant::now();
+    let seen = reader.get("edge-ca").expect("read under a held writer lock");
+    let listed = ca_ids(&reader);
+    let material = reader
+        .material("ca-bundles/edge-ca", MaterialKind::CaBundle)
+        .expect("material read under a held writer lock");
+    let elapsed = started.elapsed();
+
+    assert_eq!(seen.ca_bundle_pem.as_deref(), Some("v1"));
+    assert_eq!(listed, vec!["edge-ca".to_string()]);
+    assert_eq!(material.bytes, b"v1");
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "reads must not wait on the writer lock; took {elapsed:?}"
+    );
+
+    lock.unlock().expect("release the writer lock");
+}

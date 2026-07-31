@@ -57,13 +57,15 @@ pub fn tls_store_lock_timeout_from_env() -> std::time::Duration {
 /// Operator-pinned identity for this instance's shared TLS store leases
 /// (`FERRUM_TLS_STORE_INSTANCE_ID`).
 ///
-/// Blank is treated as unset so a templated-but-empty value falls back to the
-/// generated per-process identity rather than colliding across replicas.
+/// Returned **verbatim**: `tls::lease` validates it and fails closed on an
+/// empty, overlong, or otherwise unusable value. Trimming or filtering here
+/// would be a silent normalization, and normalizing two distinct configured
+/// identities onto one is precisely what lets two replicas collide on a single
+/// renewal claim. A setting that is simply absent yields `None`, which selects
+/// the always-distinct generated identity.
 pub fn tls_store_instance_id_from_env() -> Option<String> {
     let key = "FERRUM_TLS_STORE_INSTANCE_ID";
-    let raw = crate::config::conf_file::resolve_ferrum_var(key);
-    let trimmed = raw.map(|value| value.trim().to_string());
-    trimmed.filter(|value| !value.is_empty())
+    crate::config::conf_file::resolve_ferrum_var(key)
 }
 
 /// SQL connection target for secondary consumers that must track the gateway

@@ -31,6 +31,8 @@ pub mod managed;
 pub mod pkcs11;
 pub(crate) mod private_file;
 pub mod shared_store;
+#[cfg(test)]
+mod shared_store_tests;
 pub mod source;
 #[cfg(test)]
 mod store_atomicity_tests;

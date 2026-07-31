@@ -794,11 +794,13 @@ directory.
 
 | Concern | Mechanism |
 | --- | --- |
-| Cross-instance visibility | Every read revalidates the document's identity stamp and re-reads on change. `managed://` / `acme://` source polling (`FERRUM_SECRET_REFRESH_INTERVAL_SECONDS`, or a per-source `?poll=`) therefore picks up another replica's rotation through the ordinary reload path. |
+| Cross-instance visibility | Every read revalidates the document against the file's replacement identity and re-reads on change. `managed://` / `acme://` source polling (`FERRUM_SECRET_REFRESH_INTERVAL_SECONDS`, or a per-source `?poll=`) therefore picks up another replica's rotation through the ordinary reload path. |
+| Read availability | Reads never wait on the writer lock. Publication is fsync + atomic rename, so a reader observes one complete generation or the other and its next read detects the newer one. Challenge lookups and admin reads cannot be stalled by a slow writer. |
 | Lost-update prevention | Each mutation takes an exclusive advisory lock on a sidecar `.<file>.lock`, re-reads the authoritative document under that lock, applies the change, and republishes atomically. Create-without-overwrite and cross-kind ID conflicts are evaluated against authoritative state, so a concurrent create returns `409` rather than silently replacing another instance's record. |
-| Single renewer | Before renewing a certificate, an instance must win that certificate's claim in `tls-leases.json`. Exactly one holder is granted at a time, so two replicas cannot create duplicate orders or collide on challenge state. |
-| Crash recovery | A claim carries `expires_at` (`FERRUM_ACME_RENEWAL_LEASE_TTL_SECONDS`) and a monotonic fence. A holder that dies loses the claim when it expires and another replica takes over; the dead holder's fence is stale, so it can no longer renew or release the claim if it comes back. |
-| Fail-closed ambiguity | A lock that cannot be taken within `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`, an unreadable or unparseable document, or an unreadable lease table is an error. Admin mutations fail, HTTP-01/TLS-ALPN-01 challenges are not served from stale state, and the renewal is skipped rather than run twice. |
+| Single renewer | Before renewing a certificate, an instance must win that certificate's claim in `tls-leases.json`. Exactly one holder is granted at a time — a live claim excludes *every* other acquirer, including one presenting the same instance identity — so two replicas cannot create duplicate orders or collide on challenge state. |
+| Ownership for the whole operation | The winner heartbeats its claim at a third of the TTL for as long as the renewal runs, and every stretch of external work (account/order calls, the DNS-01 hook, the propagation wait, authorization polling, finalization, certificate download) is cancelled if the claim is lost. Store commits are additionally fenced by an ownership check on both sides. |
+| Crash recovery | A claim carries `expires_at` (`FERRUM_ACME_RENEWAL_LEASE_TTL_SECONDS`) and a monotonic fence. A dead holder runs no heartbeat, so the claim expires and another replica takes over; the dead holder's fence is stale, so it can no longer renew or release the claim if it comes back. |
+| Fail-closed ambiguity | A lock that cannot be taken within `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`, an unreadable or unparseable document, an unreadable lease table, or any heartbeat error is an error. Admin mutations fail, HTTP-01/TLS-ALPN-01 challenges are not served from stale state, and the renewal is abandoned rather than run twice. |
 
 ### Operational notes
 
@@ -806,13 +808,26 @@ directory.
   created with owner-only permissions on Unix. The lease table holds only
   instance identities and timestamps — no certificates, keys, or account
   credentials.
-- Set `FERRUM_TLS_STORE_INSTANCE_ID` to a stable per-replica value (for
-  example the pod name) so a restarting replica reclaims its own live renewal
-  claim instead of waiting out the TTL.
-- `FERRUM_ACME_RENEWAL_LEASE_TTL_SECONDS` must exceed one full ACME
-  order/finalize cycle, including `FERRUM_ACME_DNS01_PROPAGATION_SECONDS`. The
-  holder extends the claim after DNS-01 propagation and abandons the renewal if
-  it has already been taken over.
+- `FERRUM_TLS_STORE_INSTANCE_ID` pins a stable, attributable identity for this
+  replica's claims (for example the pod name). It does **not** let a restarting
+  replica reclaim its own still-live claim: a live claim excludes every
+  acquirer, because two processes can legitimately present the same identity
+  (a duplicated setting, or an overlapping rolling replacement) and letting the
+  newcomer in would start a second renewal while the first is still mid-ACME.
+  A restarted replica waits out the previous claim's expiry, which is the same
+  path a crash takes. The value is validated, never sanitized: an empty,
+  overlong (>128 characters), or otherwise disallowed value fails startup of
+  the store rather than being silently folded onto another identity. Permitted
+  characters are `A-Z a-z 0-9 - _ . :`. Leave the setting unset for a generated
+  per-process identity, which is always valid and always distinct.
+- `FERRUM_ACME_RENEWAL_LEASE_TTL_SECONDS` no longer has to cover a whole ACME
+  cycle, because the heartbeat extends the claim while the renewal runs; it has
+  to cover one heartbeat interval (a third of the TTL) plus scheduling slack,
+  and it is how long a *crashed* holder's certificate stays unrenewable. Note
+  that the TTL by itself guarantees nothing: ACME does not fence side effects
+  for Ferrum, so a renewal that outran a static TTL would previously have
+  overlapped with its successor. Continuous maintenance plus
+  cancel-on-loss — not the TTL value — is what bounds overlap.
 - Managed TLS and ACME admin endpoints use the non-topology admin write gate
   (read-only mode and database-unavailable) only. They deliberately do not
   acquire a config-database write-topology pin and are not gated by

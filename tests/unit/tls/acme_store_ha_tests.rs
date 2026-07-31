@@ -226,3 +226,66 @@ fn account_credentials_written_by_one_instance_are_readable_by_the_other() {
         .expect("B persists a second account");
     assert_eq!(instance_a.list_accounts().expect("A lists").len(), 2);
 }
+
+/// ACME challenge lookups are request-adjacent: HTTP-01 answers
+/// `/.well-known/acme-challenge/{token}` before route matching, and TLS-ALPN-01
+/// answers a ClientHello. Neither may wait on the store's cross-instance writer
+/// lock — a peer holding it for up to
+/// `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS` would otherwise stall runtime
+/// threads on every challenge request.
+#[test]
+fn challenge_reads_do_not_wait_for_a_writer_holding_the_store_lock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let instance_a = AcmeOrderStore::open(dir.path()).expect("open A");
+    create_order(&instance_a, "renew-1", "edge-cert", "tok_a");
+
+    // Hold the sidecar advisory lock as a mid-flight writer in another process
+    // does.
+    let lock = std::fs::File::options()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.path().join(".acme-orders.json.lock"))
+        .expect("open the lock sidecar");
+    lock.lock().expect("hold the writer lock");
+
+    let serving = AcmeOrderStore::open(dir.path()).expect("open a serving instance");
+    let started = std::time::Instant::now();
+    let http01 = serving.http01_key_authorization("tok_a");
+    let alpn = serving.tls_alpn01_key_authorization("example.com");
+    let scanned = serving.latest_order_for_certificate("edge-cert");
+    let elapsed = started.elapsed();
+
+    assert!(http01.is_some(), "HTTP-01 must be answerable");
+    // This fixture's order carries no TLS-ALPN-01 challenge; the point is that
+    // the lookup returns rather than blocking.
+    assert!(alpn.is_none());
+    assert!(scanned.expect("scan").is_some());
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "challenge reads must not wait on the writer lock; took {elapsed:?}"
+    );
+
+    lock.unlock().expect("release the writer lock");
+}
+
+/// A record another replica commits while this one is serving must become
+/// visible on the next read, with no restart and no timing luck.
+#[test]
+fn a_challenge_committed_by_another_instance_becomes_visible() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let serving = AcmeOrderStore::open(dir.path()).expect("open the serving instance");
+    let renewer = AcmeOrderStore::open(dir.path()).expect("open the renewing instance");
+
+    // The serving instance primes its cache on the empty document.
+    assert!(serving.http01_key_authorization("tok_a").is_none());
+
+    for (index, token) in ["tok_a", "tok_b", "tok_c"].into_iter().enumerate() {
+        create_order(&renewer, &format!("renew-{index}"), "edge-cert", token);
+        assert!(
+            serving.http01_key_authorization(token).is_some(),
+            "each committed generation must be observable immediately"
+        );
+    }
+}

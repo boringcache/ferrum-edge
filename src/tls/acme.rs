@@ -12,7 +12,10 @@
 //! state, so interleaved writes cannot erase one another. Renewal itself is
 //! additionally serialized by a shared per-certificate lease
 //! (`crate::tls::lease`) so exactly one instance drives a given renewal and a
-//! crashed holder's claim expires into a takeover.
+//! crashed holder's claim expires into a takeover. That claim is heartbeated
+//! for the whole renewal — ACME does not fence side effects for us, so a
+//! configured TTL alone would not bound overlap once an order/finalize cycle
+//! ran long — and losing it cancels the renewal before the next side effect.
 
 // This module mixes always-compiled glue (the TLS-ALPN-01 resolver, HTTP-01
 // challenge serving) with order/account-store and challenge-validation helpers
@@ -1832,17 +1835,24 @@ pub async fn run_due_renewals(
         }
         // Single-renewer claim. Exactly one instance can hold this name at a
         // time; the claim expires on its own so a crashed holder does not wedge
-        // renewal for the certificate.
+        // renewal for the certificate. Acquisition is a synchronous
+        // read-modify-write under the store's advisory lock, so it runs on a
+        // blocking thread rather than on this runtime worker.
         let lease_name = crate::tls::lease::acme_renewal_lease_name(&certificate.id);
-        let claim = lease_store.try_acquire(&lease_name, config.renewal_lease_ttl);
+        let claim = {
+            let store = Arc::clone(&lease_store);
+            let name = lease_name.clone();
+            let ttl = config.renewal_lease_ttl;
+            tokio::task::spawn_blocking(move || store.try_acquire(&name, ttl)).await
+        };
         let lease = match claim {
-            Ok(Some(lease)) => lease,
-            Ok(None) => {
+            Ok(Ok(Some(lease))) => lease,
+            Ok(Ok(None)) => {
                 summary.lease_denied += 1;
                 summary.skipped += 1;
                 continue;
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 summary.failed += 1;
                 tracing::warn!(
                     certificate_id = %certificate.id,
@@ -1851,23 +1861,46 @@ pub async fn run_due_renewals(
                 );
                 continue;
             }
+            Err(error) => {
+                summary.failed += 1;
+                tracing::warn!(
+                    certificate_id = %certificate.id,
+                    error = %error,
+                    "ACME renewal lease acquisition could not be joined; skipping this certificate"
+                );
+                continue;
+            }
         };
+        // The claim now stays alive for the whole external operation: the
+        // keeper heartbeats it off-runtime and cancels the renewal the moment
+        // it is lost, so an order/finalize cycle longer than the TTL cannot
+        // leave two instances acting on the same certificate.
+        let keeper = crate::tls::lease::RenewalLeaseKeeper::start(lease, config.renewal_lease_ttl);
         // Re-check under the claim: another instance may have created an order
         // between the scan above and the moment this lease was granted.
-        if has_active_renewal_order(&order_store, &certificate.id)? {
-            summary.skipped += 1;
-            continue;
+        let active_order = has_active_renewal_order(&order_store, &certificate.id);
+        let outcome = match active_order {
+            Ok(true) => Ok(false),
+            Ok(false) => {
+                renew_certificate_once(
+                    &certificate_store,
+                    &order_store,
+                    &account_store,
+                    &keeper,
+                    certificate,
+                    config,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = keeper.finish().await {
+            tracing::warn!(
+                error = %error,
+                "failed to release the ACME renewal lease; it will expire on its own"
+            );
         }
-        match renew_certificate_once(
-            &certificate_store,
-            &order_store,
-            &account_store,
-            &lease,
-            certificate,
-            config,
-        )
-        .await
-        {
+        match outcome {
             Ok(true) => summary.renewed += 1,
             Ok(false) => summary.skipped += 1,
             Err(error) => {
@@ -1897,12 +1930,27 @@ fn has_active_renewal_order(
         }))
 }
 
+/// Renew one certificate under a continuously maintained shared claim.
+///
+/// Every stretch of external work — account registration, order creation, the
+/// DNS-01 provider hook, the propagation wait, authorization polling,
+/// finalization, and certificate download — runs inside the keeper's
+/// cancellation scope, so losing the claim abandons the renewal at the next
+/// await point rather than at some later checkpoint. Every synchronous store
+/// commit runs off the runtime and is fenced by an ownership check on both
+/// sides, so final certificate/order state is never published by an instance
+/// that has been superseded.
+///
+/// One residual is inherent to ACME: an order already created with the CA
+/// cannot be un-created if the claim is lost immediately afterwards. The check
+/// after that commit bounds the damage to that one order instead of letting the
+/// renewal continue.
 #[cfg(feature = "acme")]
 async fn renew_certificate_once(
-    certificate_store: &AcmeCertificateStore,
-    order_store: &AcmeOrderStore,
-    account_store: &AcmeAccountStore,
-    lease: &crate::tls::lease::TlsLeaseGuard,
+    certificate_store: &Arc<AcmeCertificateStore>,
+    order_store: &Arc<AcmeOrderStore>,
+    account_store: &Arc<AcmeAccountStore>,
+    keeper: &crate::tls::lease::RenewalLeaseKeeper,
     certificate: AcmeCertificateRecord,
     config: &AcmeRenewalSchedulerConfig,
 ) -> Result<bool, AcmeError> {
@@ -1917,19 +1965,35 @@ async fn renew_certificate_once(
         return Ok(false);
     };
 
-    let prepared = prepare_renewal_order(&certificate, account_credentials_json, config).await?;
-    let prepared_credentials_json = prepared.account_credentials_json.clone().ok_or_else(|| {
+    let preparation = prepare_renewal_order(&certificate, account_credentials_json, config);
+    let prepared = match keeper.guarded(preparation).await {
+        Ok(prepared) => prepared?,
+        Err(_) => return Ok(abandon_renewal(&certificate.id)),
+    };
+    let creds = prepared.account_credentials_json.clone().ok_or_else(|| {
         AcmeError::InvalidId("ACME renewal order has no account credentials".to_string())
     })?;
-    account_store.upsert_account(
-        prepared
-            .account_id
-            .clone()
-            .unwrap_or_else(|| account_id.to_string()),
-        prepared.directory_url.clone(),
-        prepared_credentials_json,
-    )?;
-    let order = order_store.upsert_order(prepared, false)?;
+
+    if keeper.ensure_owned().await.is_err() {
+        return Ok(abandon_renewal(&certificate.id));
+    }
+    let acct_id = prepared
+        .account_id
+        .clone()
+        .unwrap_or_else(|| account_id.to_string());
+    let dir_url = prepared.directory_url.clone();
+    let accounts = Arc::clone(account_store);
+    commit_blocking(move || accounts.upsert_account(acct_id, dir_url, creds)).await?;
+
+    if keeper.ensure_owned().await.is_err() {
+        return Ok(abandon_renewal(&certificate.id));
+    }
+    let orders = Arc::clone(order_store);
+    let order = commit_blocking(move || orders.upsert_order(prepared, false)).await?;
+    if keeper.ensure_owned().await.is_err() {
+        return Ok(abandon_renewal(&certificate.id));
+    }
+
     if config.challenge_type == AcmeRenewalChallengeType::Dns01 {
         let Some(command) = config.dns01_hook_command.as_deref() else {
             tracing::warn!(
@@ -1939,19 +2003,30 @@ async fn renew_certificate_once(
             );
             return Ok(false);
         };
-        publish_dns01_challenges_with_hook(command, &order.dns01_challenges).await?;
-        if !config.dns01_propagation.is_zero() {
-            tokio::time::sleep(config.dns01_propagation).await;
+        let publication = publish_dns01_challenges_with_hook(command, &order.dns01_challenges);
+        match keeper.guarded(publication).await {
+            Ok(result) => result?,
+            Err(_) => return Ok(abandon_renewal(&certificate.id)),
         }
-        // DNS-01 propagation can consume a large share of the lease. Extend the
-        // claim before finalizing, and abandon the renewal if it was already
-        // taken over so two instances cannot finalize the same order.
-        if !renew_renewal_lease(lease, config, &certificate.id)? {
-            return Ok(false);
+        if !config.dns01_propagation.is_zero() {
+            let wait = tokio::time::sleep(config.dns01_propagation);
+            if keeper.guarded(wait).await.is_err() {
+                return Ok(abandon_renewal(&certificate.id));
+            }
         }
     }
 
-    let completion_result = complete_prepared_renewal_order(&order, config).await;
+    // Readiness polling, finalization, and certificate download are the longest
+    // external stretch on *every* challenge type, HTTP-01 and TLS-ALPN-01
+    // included, and are bounded only by FERRUM_ACME_RENEW_POLL_TIMEOUT_SECONDS.
+    let completion = complete_prepared_renewal_order(&order, config);
+    let completion_result = match keeper.guarded(completion).await {
+        Ok(result) => result,
+        // Deliberately no DNS-01 cleanup here: the instance that took the claim
+        // over republishes the same `_acme-challenge` names, and retracting them
+        // would break its validation.
+        Err(_) => return Ok(abandon_renewal(&certificate.id)),
+    };
     if config.challenge_type == AcmeRenewalChallengeType::Dns01
         && let Some(command) = config.dns01_hook_command.as_deref()
         && let Err(error) =
@@ -1971,36 +2046,56 @@ async fn renew_certificate_once(
         key_pem: completed.key_pem,
         chain_pem: None,
     })?;
-    certificate_store.upsert_certificate(issued, true)?;
 
-    let mut updated_order = order;
-    updated_order.status = AcmeOrderStatus::Valid;
-    updated_order.error = None;
-    order_store.upsert_order(updated_order, true)?;
+    // Final publication. A superseded instance must not overwrite the material
+    // the new owner is issuing.
+    if keeper.ensure_owned().await.is_err() {
+        return Ok(abandon_renewal(&certificate.id));
+    }
+    let certs = Arc::clone(certificate_store);
+    commit_blocking(move || certs.upsert_certificate(issued, true)).await?;
+
+    if keeper.ensure_owned().await.is_err() {
+        return Ok(abandon_renewal(&certificate.id));
+    }
+    let mut updated = order;
+    updated.status = AcmeOrderStatus::Valid;
+    updated.error = None;
+    let orders = Arc::clone(order_store);
+    commit_blocking(move || orders.upsert_order(updated, true)).await?;
     let _ = crate::tls::source::subscription::request_all_material_set_reloads();
     Ok(true)
 }
 
-/// Extend the per-certificate renewal claim mid-flight.
+/// Record that the shared claim was lost and this renewal is being abandoned.
 ///
-/// `false` means another instance now owns the claim (this holder's lease
-/// expired and was taken over); the caller must stop acting on the renewal.
+/// Not an error: another instance legitimately owns the certificate now, so the
+/// scan counts it as skipped.
 #[cfg(feature = "acme")]
-fn renew_renewal_lease(
-    lease: &crate::tls::lease::TlsLeaseGuard,
-    config: &AcmeRenewalSchedulerConfig,
-    certificate_id: &str,
-) -> Result<bool, AcmeError> {
-    match lease.renew(config.renewal_lease_ttl) {
-        Ok(true) => Ok(true),
-        Ok(false) => {
-            tracing::warn!(
-                certificate_id = %certificate_id,
-                "ACME renewal lease was taken over by another instance; abandoning this renewal"
-            );
-            Ok(false)
-        }
-        Err(error) => Err(AcmeError::Write(error.to_string())),
+fn abandon_renewal(certificate_id: &str) -> bool {
+    tracing::warn!(
+        certificate_id = %certificate_id,
+        "ACME renewal claim lost; abandoning this renewal before further side effects"
+    );
+    false
+}
+
+/// Run a synchronous shared-store commit off the runtime.
+///
+/// Store commits are read-modify-writes under a cross-process advisory lock and
+/// can wait up to `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`, which must never
+/// occupy a Tokio worker.
+#[cfg(feature = "acme")]
+async fn commit_blocking<T, F>(commit: F) -> Result<T, AcmeError>
+where
+    F: FnOnce() -> Result<T, AcmeError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(commit).await {
+        Ok(result) => result,
+        Err(error) => Err(AcmeError::Write(format!(
+            "ACME store commit task failed: {error}"
+        ))),
     }
 }
 
