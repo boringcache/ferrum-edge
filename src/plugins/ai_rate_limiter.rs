@@ -1506,16 +1506,12 @@ fn child_context_for_member(ctx: PromptWalkCtx, key: &str) -> PromptWalkCtx {
                 _ => None,
             };
             match family {
-                Some(family) => {
-                    PromptWalkCtx::at(PromptLocation::ProviderMessages { family })
-                }
+                Some(family) => PromptWalkCtx::at(PromptLocation::ProviderMessages { family }),
                 None => PromptWalkCtx::at(PromptLocation::Nested),
             }
         }
         PromptLocation::MessageObject { family } => match key {
-            "content" | "parts" => {
-                PromptWalkCtx::at(PromptLocation::ContentArray { family })
-            }
+            "content" | "parts" => PromptWalkCtx::at(PromptLocation::ContentArray { family }),
             _ => PromptWalkCtx::at(PromptLocation::Nested),
         },
         // Content-part binary children are handled by [`count_content_part_object`].
@@ -1539,9 +1535,7 @@ fn content_part_binary_kind(
             (Some("image_url"), "image_url") => Some(BinaryObjectKind::ImageUrl),
             (Some("input_audio"), "input_audio") => Some(BinaryObjectKind::InputAudio),
             (Some("file"), "file") => Some(BinaryObjectKind::File),
-            (Some("image") | Some("document"), "source") => {
-                Some(BinaryObjectKind::AnthropicSource)
-            }
+            (Some("image") | Some("document"), "source") => Some(BinaryObjectKind::AnthropicSource),
             _ => None,
         },
         ContentFamily::ResponsesInput => match (part_type, key) {
@@ -1673,10 +1667,7 @@ fn count_binary_object_members(
 /// Count a provider content-part object: inspect part `type` (when the family
 /// defines one) and exclude only matching binary leaves; wrong-family /
 /// malformed reserved spellings count fail-closed.
-fn count_content_part_object(
-    family: ContentFamily,
-    part: &serde_json::Map<String, Value>,
-) -> u64 {
+fn count_content_part_object(family: ContentFamily, part: &serde_json::Map<String, Value>) -> u64 {
     let part_type = part.get("type").and_then(Value::as_str);
 
     part.iter().fold(0_u64, |acc, (key, value)| {

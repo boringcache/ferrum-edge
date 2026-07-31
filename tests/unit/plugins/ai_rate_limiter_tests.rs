@@ -4376,7 +4376,10 @@ async fn concurrent_sibling_heavy_requests_cannot_oversubscribe_on_omitted_instr
     // If instructions were omitted, each request would reserve ~1 token and both
     // would fit. Fail-closed whole-body counting makes only one fit.
     assert_eq!(allowed, 1, "only one sibling-heavy reservation should fit");
-    assert_eq!(rejected, 1, "the second sibling-heavy request must be rejected");
+    assert_eq!(
+        rejected, 1,
+        "the second sibling-heavy request must be rejected"
+    );
 }
 
 #[tokio::test]
@@ -4442,7 +4445,10 @@ async fn concurrent_schema_property_heavy_requests_cannot_oversubscribe() {
         + u8::from(matches!(&result_b, PluginResult::Reject { .. }));
 
     assert_eq!(allowed, 1, "only one schema-heavy reservation should fit");
-    assert_eq!(rejected, 1, "the second schema-heavy request must be rejected");
+    assert_eq!(
+        rejected, 1,
+        "the second schema-heavy request must be rejected"
+    );
 }
 
 #[tokio::test]
