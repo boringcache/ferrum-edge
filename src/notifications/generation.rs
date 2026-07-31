@@ -223,13 +223,9 @@ impl DispatchGeneration {
     /// Spawn through an owned [`crate::observability_delivery::DeliverySlot`]
     /// instead of the process-global registry.
     ///
-    /// Hidden test seam only: external shutdown-deadline regressions must drive
-    /// a hard abort on an owned slot without closing process-global admission,
-    /// and must inject a future that cannot settle by ordinary delivery. The
-    /// wrapper stays public solely because those regressions live under
-    /// `tests/`; production callers use [`Self::spawn`].
-    #[doc(hidden)]
-    pub fn spawn_with_delivery_slot<F>(
+    /// Crate-private seam for internal owned-slot dispatch. Production callers
+    /// use [`Self::spawn`].
+    pub(crate) fn spawn_with_delivery_slot<F>(
         self: &Arc<Self>,
         channel_type: &'static str,
         on_settle: Option<DeliveryCallback>,
@@ -240,6 +236,37 @@ impl DispatchGeneration {
         F: Future<Output = DispatchSettle> + Send + 'static,
     {
         self.spawn_impl(channel_type, on_settle, future, Some(slot))
+    }
+
+    /// Spawn a never-completing delivery body through an owned
+    /// [`crate::observability_delivery::DeliverySlot`].
+    ///
+    /// Hidden test seam only: external shutdown-deadline regressions must drive
+    /// a hard abort on an owned slot without closing process-global admission.
+    /// The pending body is constructed internally — callers cannot inject an
+    /// arbitrary future. External regressions live under `tests/`; production
+    /// callers use [`Self::spawn`].
+    #[doc(hidden)]
+    pub fn spawn_pending_with_delivery_slot_for_test(
+        self: &Arc<Self>,
+        channel_type: &'static str,
+        on_settle: Option<DeliveryCallback>,
+        slot: &crate::observability_delivery::DeliverySlot,
+        body_entered_tx: tokio::sync::oneshot::Sender<()>,
+        pending_body_dropped_tx: tokio::sync::oneshot::Sender<()>,
+    ) -> bool {
+        self.spawn_with_delivery_slot(
+            channel_type,
+            on_settle,
+            slot,
+            async move {
+                let _drop_witness = PendingDeliveryBodyDropWitness {
+                    tx: Some(pending_body_dropped_tx),
+                };
+                let _ = body_entered_tx.send(());
+                std::future::pending::<DispatchSettle>().await
+            },
+        )
     }
 
     fn spawn_impl<F>(
@@ -341,6 +368,19 @@ impl DispatchGeneration {
             return false;
         }
         true
+    }
+}
+
+/// Drop witness for a delivery body that must stay pending until hard-aborted.
+struct PendingDeliveryBodyDropWitness {
+    tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for PendingDeliveryBodyDropWitness {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(());
+        }
     }
 }
 

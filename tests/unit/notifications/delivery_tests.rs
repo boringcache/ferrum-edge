@@ -1054,23 +1054,6 @@ async fn admit_then_cancel_before_transport_counts_attempted_under_body_start_co
     }
 }
 
-/// Drop witness for a delivery body that must stay pending until hard-aborted.
-///
-/// Fires exactly when the admitted future is dropped (shutdown abort), never
-/// when ordinary delivery settles — the body uses `pending()` and cannot
-/// return.
-struct PendingBodyDropWitness {
-    tx: Option<oneshot::Sender<()>>,
-}
-
-impl Drop for PendingBodyDropWitness {
-    fn drop(&mut self) {
-        if let Some(tx) = self.tx.take() {
-            let _ = tx.send(());
-        }
-    }
-}
-
 /// A hard process-shutdown deadline must abort an admitted notification and
 /// compose exactly: one `Abandoned(ShutdownDeadline)` callback, one
 /// `abandoned_total{reason="shutdown_deadline"}`, one `abandoned_at_deadline`,
@@ -1080,10 +1063,10 @@ impl Drop for PendingBodyDropWitness {
 /// installed mid-drain.
 ///
 /// The delivery body is a deterministic never-completing future admitted
-/// through the owned-slot seam: ordinary channel/transport completion cannot
-/// race `FailedTransient` (or any other settle) ahead of the hard abort. The
-/// body signals once it is parked after registry-owned attempt start, and a
-/// drop witness fires only when the hard abort drops that future.
+/// through the owned-slot test seam: ordinary channel/transport completion
+/// cannot race `FailedTransient` (or any other settle) ahead of the hard
+/// abort. One-shot oneshot barriers prove body entry after attempt start and
+/// pending-body drop on hard abort — no polling loops or scheduler luck.
 ///
 /// Ordering is driven with Tokio paused virtual time so replacement-before-abort
 /// is causal: A begins shutdown under a long virtual budget, B is installed and
@@ -1098,38 +1081,24 @@ async fn hard_shutdown_deadline_aborts_admitted_notification_exactly_once() {
     let generation = DispatchGeneration::with_metrics(88, Arc::clone(&metrics));
     let settles = SettleLog::new();
 
-    let body_pending = Arc::new(Notify::new());
-    let body_pending_flag = Arc::new(AtomicUsize::new(0));
-    let (dropped_tx, mut dropped_rx) = oneshot::channel::<()>();
-    let body_pending_signal = Arc::clone(&body_pending);
-    let body_pending_flag_set = Arc::clone(&body_pending_flag);
+    let (body_entered_tx, body_entered_rx) = oneshot::channel::<()>();
+    let (pending_body_dropped_tx, dropped_rx) = oneshot::channel::<()>();
 
     assert!(
-        generation.spawn_with_delivery_slot(
+        generation.spawn_pending_with_delivery_slot_for_test(
             "webhook",
             Some(settles.callback()),
             &slot,
-            async move {
-                // Reaching this future proves `mark_attempt_started` already
-                // ran. Park forever: ordinary delivery has no path to settle.
-                let _drop_witness = PendingBodyDropWitness {
-                    tx: Some(dropped_tx),
-                };
-                body_pending_flag_set.store(1, Ordering::Release);
-                body_pending_signal.notify_waiters();
-                std::future::pending::<DispatchSettle>().await
-            },
+            body_entered_tx,
+            pending_body_dropped_tx,
         ),
         "open owned-slot lifecycle must admit the pending body"
     );
 
     // Causal: the admitted body must be live-and-pending before drain starts.
-    wait_until(
-        &body_pending,
-        || body_pending_flag.load(Ordering::Acquire) == 1,
-        "admitted delivery body parked after attempt start",
-    )
-    .await;
+    body_entered_rx
+        .await
+        .expect("admitted delivery body must signal entry after attempt start");
     assert_eq!(generation.in_flight(), 1);
     assert_eq!(metrics.channel_snapshot("webhook").in_flight, 1);
     assert!(
