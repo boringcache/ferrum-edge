@@ -1688,7 +1688,9 @@ fn stale_resolve_settle_cannot_commit_a_newer_pending_resolve() {
     gate.settle_trigger_success(1, "p", 0, 63_000, 63_000);
     assert_eq!(
         gate.current_state(1, "p", 0),
-        Some(RuleState::Active { fired_at_ms: 63_000 })
+        Some(RuleState::Active {
+            fired_at_ms: 63_000
+        })
     );
 
     // Second recovery cycle reserves a newer PendingResolve with a distinct token.
