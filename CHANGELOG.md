@@ -92,6 +92,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `ai_stream_router` now enforces its provider credential and model policy
+  against the **final** backend-visible request instead of only at claim time
+  (GHSA-xhp5-hqj8-3mwg). The plugin selected a provider, stripped client
+  credentials, injected the provider key, and translated the body at priority
+  2984, while the generic `request_transformer` runs at 3000 — so a later header
+  rule could add, overwrite, or rename the credential (leaking a normal-backend
+  static secret to the third-party provider, or restoring a client-controlled
+  credential header), and a later body rule could replace the already-selected
+  `model` after `model_patterns` matched. Two shared lifecycle boundaries close
+  it, neither of which depends on relative priority: a new non-rejecting
+  `enforce_final_backend_header_policy` phase re-strips every credential and
+  gateway-identity header and re-installs only the selected provider's
+  credential over the finalized outbound header map — after every `before_proxy`
+  pass, after each deferred routing/remaining pass, and after a finalized-egress
+  header overlay, on the H1/H2 and native HTTP/3 ladders alike — and
+  `on_final_request_body` now fails closed unless the provider-visible `model` is
+  a non-empty string equal to the committed model that still matches the selected
+  provider's `model_patterns`, the final body is unambiguous JSON, and the
+  committed `route_override_*` still targets the claimed provider. Model failures
+  return an OpenAI-shaped `400` (`model_policy_violation`); a broken
+  provider/route invariant returns `500` (`provider_policy_violation`). No model,
+  header, or body value is echoed or logged. Headers outside the plugin's owned
+  set are untouched, so intended non-credential transforms still apply. Because
+  the header re-assertion happens after every `before_proxy` hook, plugin-cache
+  admission now **rejects** `ai_stream_router` composed with
+  `request_deduplication` on the same proxy and protocol (`response_caching` was
+  already refused alongside it by the deferred-request-body-transformer rule).
 - Irreversible request egress no longer precedes request-body transformation or
   final request policy (GHSA-4vr5-4wm3-x5xv). `request_mirror` and
   `serverless_function` previously ran their external dispatch in

@@ -767,6 +767,19 @@ pub mod _test_support {
         (transformed, result)
     }
 
+    /// Run the shared final backend-header-policy pass exactly as every dispatch
+    /// ladder does: after all `before_proxy` header transforms, over the
+    /// finalized backend-visible header map (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// `plugins` must already be sorted by effective priority.
+    pub fn run_final_backend_header_policy_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::run_final_backend_header_policy_hooks(plugins, ctx, headers);
+    }
+
     pub async fn run_context_free_final_request_body_hooks_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,

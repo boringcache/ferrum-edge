@@ -3344,6 +3344,15 @@ async fn handle_h3_request(
         &mut proxy_headers,
         &state.mesh_egress_strip_baggage_keys,
     );
+    // Backend-boundary header policy over the finalized H3 outbound map, after
+    // every generic `before_proxy` header transform, the gateway-assertion
+    // refresh, and the baggage strip (`GHSA-xhp5-hqj8-3mwg`). Keep this in sync
+    // with the H1/H2 site in `proxy/mod.rs`; the deferred passes below re-run it.
+    if capabilities
+        .has(crate::plugin_cache::PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY)
+    {
+        crate::proxy::run_final_backend_header_policy_hooks(&plugins, &ctx, &mut proxy_headers);
+    }
     let effective_query_string =
         crate::proxy::effective_backend_query_string_with_raw(&ctx, &query_string);
 
@@ -3563,6 +3572,17 @@ async fn handle_h3_request(
                 &mut proxy_headers,
                 &state.mesh_egress_strip_baggage_keys,
             );
+            // A deferred pass can add or rename headers again, so re-assert the
+            // backend-boundary header policy over the new map.
+            if capabilities
+                .has(crate::plugin_cache::PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY)
+            {
+                crate::proxy::run_final_backend_header_policy_hooks(
+                    &plugins,
+                    &ctx,
+                    &mut proxy_headers,
+                );
+            }
         }
     }
 
@@ -3589,6 +3609,17 @@ async fn handle_h3_request(
                 &mut proxy_headers,
                 &state.mesh_egress_strip_baggage_keys,
             );
+            // A deferred pass can add or rename headers again, so re-assert the
+            // backend-boundary header policy over the new map.
+            if capabilities
+                .has(crate::plugin_cache::PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY)
+            {
+                crate::proxy::run_final_backend_header_policy_hooks(
+                    &plugins,
+                    &ctx,
+                    &mut proxy_headers,
+                );
+            }
         }
         match deferred_result {
             PluginResult::Continue => {}
@@ -3938,6 +3969,7 @@ async fn handle_h3_request(
         )
         .await;
         crate::proxy::apply_finalized_request_egress_header_overlay_in_map(
+            &plugins,
             &ctx,
             &mut proxy_headers,
             egress.backend_header_overlay,

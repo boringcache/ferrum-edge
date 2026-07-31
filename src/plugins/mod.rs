@@ -7009,6 +7009,51 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when this plugin owns a backend-boundary HEADER policy
+    /// that must be re-asserted over the FINAL backend-visible header map,
+    /// after every generic `before_proxy` header transform has run
+    /// (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// `before_proxy` is a shared, ordered phase: a plugin that strips client
+    /// credentials and installs its own third-party credential there is only
+    /// protected against plugins that run BEFORE it. A later generic header
+    /// rule (`request_transformer` at 3000, a `pre_proxy` function's backend
+    /// header overlay, a deferred routing-header hook) can still add, replace,
+    /// or rename that header. Declaring this capability moves the decisive
+    /// application of the policy to the finalized header map instead, so the
+    /// guarantee no longer depends on relative priority.
+    fn enforces_final_backend_header_policy(&self) -> bool {
+        false
+    }
+
+    /// Re-assert this plugin's backend-boundary header policy over the
+    /// finalized outbound header map.
+    ///
+    /// The gateway calls this for plugins that declare
+    /// [`Plugin::enforces_final_backend_header_policy`], in configured priority
+    /// order, at every point where the backend-visible header map is complete:
+    /// after the `before_proxy` pass, after each deferred routing/remaining
+    /// `before_proxy` pass, and after a finalized-request-egress header overlay
+    /// is merged. All of those sites run after gateway-owned assertion refresh
+    /// and the egress baggage strip, so this hook has the last word.
+    ///
+    /// The hook is deliberately synchronous and NON-REJECTING: it exists to
+    /// re-apply a decision the plugin already committed, not to make a new one.
+    /// A plugin that must fail the request on finalized state decides that in
+    /// `on_final_request_body*`, which has the full rejection plumbing on every
+    /// dispatcher. Implementations must be idempotent (the hook runs more than
+    /// once on the deferred ladders), allocation-light, and must never log
+    /// header values.
+    ///
+    /// `ctx` is the real request context, read-only. Mutating the outbound
+    /// header map is the hook's only effect.
+    fn enforce_final_backend_header_policy(
+        &self,
+        _ctx: &RequestContext,
+        _headers: &mut HashMap<String, String>,
+    ) {
+    }
+
     /// Returns `true` when this plugin performs irreversible outbound request
     /// egress — or any other external side effect that cannot be retracted —
     /// and must therefore observe the exact backend-visible request

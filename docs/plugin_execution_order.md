@@ -274,6 +274,44 @@ keeps final transformed-body provider dispatch outside placeholder-backend
 health accounting without allowing it to bypass backend-effective gRPC method
 policy.
 
+## Final Backend Header Policy
+
+Priority ordering inside `before_proxy` only protects a plugin from the plugins
+that run *before* it. A plugin that strips client credentials and installs a
+third-party credential there — today only `ai_stream_router` (2984) — is still
+followed by the generic `request_transformer` (3000), by a deferred
+routing-header hook, and by a `pre_proxy` function's backend header overlay, any
+of which can add, overwrite, or rename that header afterwards (advisory
+`GHSA-xhp5-hqj8-3mwg`).
+
+A plugin declaring `enforces_final_backend_header_policy()` therefore gets a
+second, decisive application point: the gateway calls
+`enforce_final_backend_header_policy()` — in configured priority order — over
+the **finalized backend-visible header map**, at every site where that map is
+complete:
+
+- after the `before_proxy` pass, and after each deferred routing-header /
+  remaining-deferred pass, on both the H1/H2 ladder (`src/proxy/mod.rs`) and the
+  native HTTP/3 ladder (`src/http3/server.rs`);
+- after a finalized-request-egress header overlay is merged.
+
+Every one of those sites runs the hook *after* the reserved gateway-assertion
+refresh and the egress baggage strip, so the plugin's policy has the last word.
+The hook is synchronous, non-rejecting, and must be idempotent — it re-applies a
+decision already committed in `before_proxy` rather than making a new one. A
+plugin that must *fail* on finalized state does that in `on_final_request_body*`,
+which has rejection plumbing on every dispatcher. The whole pass is gated on the
+precomputed `ENFORCES_FINAL_BACKEND_HEADER_POLICY` capability bit, so chains
+without such a plugin do no extra work.
+
+Because the mutation happens after every `before_proxy` hook, no fingerprint
+taken during that phase can witness it. Plugin-cache construction therefore
+fails closed on `request_deduplication` composed with a plugin declaring this
+capability. `response_caching` needs no separate rule: today's only declarer is
+already refused by its deferred-request-body-transformer rule, and its lookup
+population (GET/HEAD with a transport-proven empty upload) cannot overlap a POST
+JSON claim.
+
 ## Finalized Request Egress
 
 Irreversible outbound request egress is its own phase (advisory
@@ -768,7 +806,7 @@ Given all built-in plugins enabled, the execution order is:
 | 41 | `ai_semantic_firewall` | 2968 | before_proxy, on_final_request_body, on_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
 | 42 | `ai_request_guard` | 2975 | before_proxy, transform_request_body, on_final_request_body |
 | 43 | `ai_tool_governor` | 2978 | before_proxy, on_final_request_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
-| 44 | `ai_stream_router` | 2984 | before_proxy, transform_request_body, normalize_response_body, response_stream_inspector |
+| 44 | `ai_stream_router` | 2984 | before_proxy, transform_request_body, enforce_final_backend_header_policy, on_final_request_body, normalize_response_body, response_stream_inspector |
 | 45 | `mcp_gateway` | 2992 | before_proxy, transform_request_body, transform_response_body |
 | 46 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body, response_stream_inspector |
 | 47 | `mesh_route_dispatch` | 2995 | before_proxy |

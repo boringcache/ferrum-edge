@@ -88,6 +88,26 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
 4. `normalize_buffered_request_body_before_before_proxy`: configured request decompression (and any future early body normalizers) after the pre-`before_proxy` buffer is stored
 4b. `validate_client_request_body_contract`: CLIENT-contract admission over the ORIGINAL client representation, after normalization and before any `before_proxy`/`transform_request_body` hook can reshape it. Read-only (admit or reject, never rewrite). `openapi_validator` owns this phase; its `on_final_request_body` is the BACKEND-contract fallback when this validator did not select over the pristine client view but can select after a `before_proxy` route override or header/target rewrite, and is skipped per instance once the client phase decided, so one request is never charged twice (`GHSA-896v-jx23-9g6p`). Unknown-operation admission (`fail_on_unknown_operation`) is rejected in `before_proxy`, not deferred to the final fallback. HBONE CONNECT is NOT a fallback path — the proxy skips request-body buffering for it and returns into `handle_hbone_request` before any final-body hook, so tunnel bytes are never a request body here. The phase also covers the transport-proven-empty H1/H2 `GET`/`HEAD`/`OPTIONS` fast path (validated against `&[]` without materializing a buffer), so a required client body is enforced identically on H1/H2/H3. A plugin declaring `validates_client_request_body_contract()` MUST also declare `requires_request_body_before_before_proxy()`; `validate_plugin_security_composition` rejects the composition otherwise. A plugin here must select buffering from the matched route/operation, never from an attacker-omittable `Content-Type` (`GHSA-6p78-6x8c-9g9x`).
 5. `before_proxy`: SOAP, AI plugins, workload metrics, transformers, mock, gRPC deadline, load, cache, compression
+5b. `enforce_final_backend_header_policy`: synchronous, NON-rejecting
+    re-assertion of a plugin-owned backend-boundary header set over the
+    FINAL backend-visible header map (`GHSA-xhp5-hqj8-3mwg`). Runs after the
+    `before_proxy` pass, after each deferred routing/remaining pass, and after a
+    finalized-egress header overlay — always after the reserved gateway-assertion
+    refresh and the egress baggage strip, on the H1/H2 ladder
+    (`src/proxy/mod.rs`) and the native H3 ladder (`src/http3/server.rs`). Gated
+    on `PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY`. Implementations
+    must be idempotent and must never log header values. `ai_stream_router` owns
+    this phase: priority 2984 does not order it after `request_transformer`
+    (3000), so re-asserting here is what actually keeps a client or
+    normal-backend credential off the third-party provider. Its matching
+    fail-closed decision (final provider-visible `model` must still equal the
+    committed model AND match the selected provider's `model_patterns`; committed
+    `route_override_*` must still target the claimed provider) lives in
+    `on_final_request_body`, which has rejection plumbing on every dispatcher.
+    A plugin declaring this capability may not be composed with
+    `request_deduplication` (a before_proxy fingerprint cannot witness a later
+    mutation). `response_caching` needs no added rule: it already refuses any
+    deferred request-body transformer, which `ai_stream_router` is.
 6. `on_final_request_body`: body validator, gRPC-Web validation, WAF body rules, OpenAPI request schema (backend-final fallback), post-transform request-size ceiling, `ai_prompt_compressor` staged marker-sanitization rejection (4055), and `ai_semantic_cache` exact/semantic lookup (4057). `ai_semantic_cache` looks up here — not in `before_proxy` — so its replay partition binds the finalized outbound headers/query/destination and fully transformed request body, and a hit cannot bypass fail-closed final-body policy.
 6b. `dispatch_finalized_request_egress`: irreversible outbound request egress
     (`request_mirror`, `serverless_function`, `ai_federation`) over the immutable

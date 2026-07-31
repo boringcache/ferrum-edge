@@ -533,6 +533,28 @@ pub(crate) fn validate_plugin_security_composition(
                     deduplication.priority()
                 ));
             }
+
+            // A backend-boundary header policy is re-asserted after EVERY
+            // `before_proxy` hook (`GHSA-xhp5-hqj8-3mwg`), so priority order
+            // cannot make it visible to a fingerprint taken during that phase.
+            // Same population as deduplication (both admit request-body POSTs),
+            // so the composition fails closed rather than retaining an
+            // operation keyed on headers the backend never receives.
+            if let Some(final_header_policy) = plugins.iter().find(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && plugin.name() != "request_deduplication"
+                    && plugin.enforces_final_backend_header_policy()
+            }) {
+                return Err(format!(
+                    "plugin '{}' re-asserts a backend-boundary header policy after every \
+                     before_proxy hook for protocol {:?}; request_deduplication at priority {} \
+                     fingerprints headers during before_proxy and cannot witness that final \
+                     mutation",
+                    final_header_policy.name(),
+                    protocol,
+                    deduplication.priority()
+                ));
+            }
         }
 
         for response_cache in plugins.iter().filter(|plugin| {
@@ -582,6 +604,12 @@ pub(crate) fn validate_plugin_security_composition(
                     response_cache.priority()
                 ));
             }
+            // No separate `enforces_final_backend_header_policy` rule here
+            // (`GHSA-xhp5-hqj8-3mwg`): today's only declarer, `ai_stream_router`,
+            // is already refused by the deferred request-body transformer rule
+            // above, and response caching admits only GET/HEAD with a
+            // transport-proven empty upload — a population no POST JSON claim can
+            // reach. Add one if a body-less plugin ever declares the capability.
         }
 
         for side_effecting_plugin in plugins.iter().filter(|plugin| {
@@ -769,6 +797,16 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn dispatches_finalized_request_egress(&self) -> bool {
         self.inner.dispatches_finalized_request_egress()
+    }
+    fn enforces_final_backend_header_policy(&self) -> bool {
+        self.inner.enforces_final_backend_header_policy()
+    }
+    fn enforce_final_backend_header_policy(
+        &self,
+        ctx: &RequestContext,
+        headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        self.inner.enforce_final_backend_header_policy(ctx, headers)
     }
     async fn dispatch_finalized_request_egress(
         &self,
@@ -3404,6 +3442,13 @@ impl PluginCapabilities {
     /// (GHSA-4vr5-4wm3-x5xv). Chains without an egress plugin skip the phase
     /// entirely — no extra scan, clone, or hook pass on the ordinary hot path.
     pub const DISPATCHES_FINALIZED_REQUEST_EGRESS: u32 = 1 << 16;
+    /// At least one plugin declared `enforces_final_backend_header_policy()`,
+    /// so the dispatch ladders must re-assert that plugin's backend-boundary
+    /// header policy over the finalized outbound header map after every generic
+    /// `before_proxy` header transform (`GHSA-xhp5-hqj8-3mwg`). Chains without
+    /// such a plugin skip the pass entirely — no extra scan or hook call on the
+    /// ordinary hot path.
+    pub const ENFORCES_FINAL_BACKEND_HEADER_POLICY: u32 = 1 << 17;
 
     // Bit 31 is the LAST bit of the `u32` backing store. A thirty-third flag
     // must widen `PluginCapabilities` (to `u64`) rather than shift further;
@@ -3657,6 +3702,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.dispatches_finalized_request_egress() {
             caps |= PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS;
+        }
+        if p.enforces_final_backend_header_policy() {
+            caps |= PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY;
         }
         if p.requires_response_committed_hook() {
             caps |= PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK;

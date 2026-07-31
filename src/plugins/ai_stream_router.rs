@@ -76,6 +76,31 @@
 //!   against the same effective proxy, rotating only the load-balancer target
 //!   within one upstream. It has no per-attempt re-preparation boundary.
 //!
+//! ## Final provider boundary (`GHSA-xhp5-hqj8-3mwg`)
+//!
+//! Claiming in `before_proxy` at 2984 only orders this plugin ahead of the
+//! plugins that run before it. The generic `request_transformer` runs at 3000,
+//! a `serverless_function` `pre_proxy` backend overlay is merged later still,
+//! and both can add, overwrite, or rename any header — including the credential
+//! this plugin just installed — or rewrite the already-translated provider body.
+//! Two shared lifecycle boundaries close that window, and neither depends on
+//! relative priority:
+//!
+//! - `enforce_final_backend_header_policy` re-strips client/backend credential
+//!   and gateway-identity headers and re-installs ONLY the selected provider's
+//!   credential over the finalized backend-visible header map. The gateway runs
+//!   it after every `before_proxy` pass (including the deferred routing/remaining
+//!   passes) and after an egress header overlay, on H1/H2 and H3 alike.
+//! - `on_final_request_body_with_context` re-parses the backend-visible body
+//!   after every `transform_request_body` hook and fails closed unless the
+//!   provider-visible `model` is still exactly the model that selected this
+//!   provider and still matches that provider's `model_patterns`. It also
+//!   re-checks that the committed route override still points at the claimed
+//!   provider, so the credential and the destination cannot drift apart.
+//!
+//! Both fail closed. Neither logs header values, credentials, or body bytes,
+//! and neither echoes the offending value into the client error envelope.
+//!
 //! A second provider needs a different endpoint/authority, different
 //! credentials, a different backend TLS resolution, a different translated
 //! body, and a different response-normalization decision — none of which are
@@ -183,6 +208,11 @@ const META_PROVIDER: &str = "ai_stream_router.provider";
 const META_PROVIDER_TYPE: &str = "ai_stream_router.provider_type";
 const META_MODEL: &str = "ai_stream_router.model";
 const META_NORMALIZED: &str = "ai_stream_router.normalized_response_stream";
+/// Backend path (including any folded endpoint query) the router committed for
+/// the claimed provider. Compared against the live `route_override_path` at the
+/// final request-body boundary so a later plugin cannot silently repoint the
+/// request while the provider credential stays installed (`GHSA-xhp5-hqj8-3mwg`).
+const META_ROUTE_PATH: &str = "ai_stream_router.committed_backend_path";
 const META_REQUEST_TRANSLATED: &str = "ai_stream_router.request_translated";
 /// Set when the translated Anthropic request carries `tool_choice: {"type":"none"}`.
 /// Request-local only: the response normalizer fails closed if the provider
@@ -1627,6 +1657,47 @@ fn openai_error_response(
     }
 }
 
+/// Whether the committed route override still points at the claimed provider.
+///
+/// The router writes every one of these fields when it claims a request, so a
+/// mismatch means another plugin rewrote the destination while this plugin's
+/// credential stayed installed. Only the destination identity is compared —
+/// the client query string is appended by the dispatch layer and is not part of
+/// the credential boundary.
+fn route_override_still_targets(ctx: &RequestContext, provider: &StreamProvider) -> bool {
+    ctx.route_override_backend_scheme == Some(provider.scheme)
+        && ctx.route_override_backend_port == Some(provider.port)
+        && ctx.route_override_path_is_absolute
+        && ctx.route_override_backend_host.as_deref() == Some(provider.host.as_str())
+        && ctx.route_override_authority.as_deref() == Some(provider.authority.as_str())
+        && ctx.route_override_path.as_deref()
+            == ctx.metadata.get(META_ROUTE_PATH).map(String::as_str)
+}
+
+/// Fail-closed envelope for a broken provider-boundary invariant. Fixed
+/// cardinality: never echoes a model, header, or body value.
+fn provider_policy_violation(message: &str) -> PluginResult {
+    openai_error_response(
+        500,
+        message,
+        "api_error",
+        None,
+        Some("provider_policy_violation"),
+    )
+}
+
+/// Fail-closed envelope for a final provider-visible model that no longer
+/// satisfies the policy that selected the provider.
+fn model_policy_violation(message: &str) -> PluginResult {
+    openai_error_response(
+        400,
+        message,
+        "invalid_request_error",
+        Some("model"),
+        Some("model_policy_violation"),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Plugin impl
 // ---------------------------------------------------------------------------
@@ -1839,7 +1910,7 @@ impl Plugin for AiStreamRouter {
         ctx.route_override_backend_scheme = Some(provider.scheme);
         ctx.route_override_backend_host = Some(provider.host.clone());
         ctx.route_override_backend_port = Some(provider.port);
-        ctx.route_override_path = Some(backend_path);
+        ctx.route_override_path = Some(backend_path.clone());
         ctx.route_override_path_is_absolute = true;
         ctx.route_override_authority = Some(provider.authority.clone());
         // Default: public providers verify against the system trust store.
@@ -1858,38 +1929,14 @@ impl Plugin for AiStreamRouter {
         }
 
         // --- Rewrite headers: strip client credentials, insert provider auth. ---
-        strip_client_credentials(headers);
-        match &provider.auth {
-            ProviderAuth::Bearer { api_key } => {
-                headers.insert("authorization".to_string(), format!("Bearer {api_key}"));
-            }
-            ProviderAuth::Header { name, api_key } => {
-                headers.insert(name.clone(), api_key.clone());
-            }
-        }
-        if provider.provider_type == ProviderType::Anthropic {
-            headers.insert(
-                "anthropic-version".to_string(),
-                provider.anthropic_version.clone(),
-            );
-        }
-        headers.insert("host".to_string(), provider.authority.clone());
-        headers.insert("content-type".to_string(), "application/json".to_string());
-        // A provider streams SSE; make the intent explicit to the upstream.
-        headers.insert("accept".to_string(), "text/event-stream".to_string());
+        // This is the FIRST application of the owned header set. It is not the
+        // decisive one: `enforce_final_backend_header_policy` re-applies exactly
+        // the same policy over the finalized backend-visible map after every
+        // later generic header transform (`GHSA-xhp5-hqj8-3mwg`).
+        let normalizes = provider.normalizes_response(self.normalize_response_stream);
+        apply_provider_boundary_headers(provider, normalizes, headers);
 
         // --- Metadata (observability + downstream-hook coordination). ---
-        let normalizes = provider.normalizes_response(self.normalize_response_stream);
-        // Normalization parses line-delimited SSE. Strip client content-coding
-        // negotiation and explicitly request identity so the provider does not
-        // return gzip/br octets that the normalizer would misread as plaintext
-        // events. Residual encodings are still handled fail-safe in
-        // `after_proxy` / the normalizer.
-        if normalizes {
-            remove_header_ci(headers, "accept-encoding");
-            headers.insert("accept-encoding".to_string(), "identity".to_string());
-        }
-
         ctx.metadata
             .insert(META_ENABLED.to_string(), "true".to_string());
         ctx.metadata
@@ -1903,9 +1950,10 @@ impl Plugin for AiStreamRouter {
         ctx.metadata
             .insert(META_STREAMING_SHARED.to_string(), "true".to_string());
         // The provider is a third party: the proxy must not append the
-        // gateway-asserted `x-consumer-*` identity headers after the
-        // credential strip below (see the suppression contract on
-        // `RequestContext::backend_consumer_username`).
+        // gateway-asserted `x-consumer-*` identity headers after the credential
+        // strip above (see the suppression contract on
+        // `RequestContext::backend_consumer_username`). The final header policy
+        // additionally strips any that a later generic rule reintroduced.
         ctx.metadata.insert(
             super::SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY.to_string(),
             "true".to_string(),
@@ -1917,6 +1965,11 @@ impl Plugin for AiStreamRouter {
             provider.provider_type.as_str().to_string(),
         );
         ctx.metadata.insert(META_MODEL.to_string(), model);
+        // Witness for the final boundary: the exact backend path this claim
+        // committed, so a later plugin cannot repoint the request inside the
+        // provider's credential boundary without being detected.
+        ctx.metadata
+            .insert(META_ROUTE_PATH.to_string(), backend_path);
         ctx.metadata
             .insert(META_NORMALIZED.to_string(), normalizes.to_string());
         // No `ai_stream_router.fallback_attempts` key: this plugin never
@@ -1973,14 +2026,71 @@ impl Plugin for AiStreamRouter {
         }
     }
 
+    fn enforces_final_backend_header_policy(&self) -> bool {
+        self.enabled
+    }
+
+    /// Re-assert the provider credential boundary over the FINAL backend-visible
+    /// header map (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// `before_proxy` already applied this policy, but a later generic header
+    /// rule (`request_transformer` at 3000), a deferred routing-header hook, or
+    /// a `pre_proxy` function's backend overlay can add/overwrite/rename the
+    /// credential afterwards. The gateway calls this at every point where the
+    /// outbound header map is complete, so the last word is always this policy
+    /// rather than whichever plugin happened to run last.
+    fn enforce_final_backend_header_policy(
+        &self,
+        ctx: &RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        if !self.enabled || ctx.metadata.get(META_CLAIMED).map(String::as_str) != Some("true") {
+            return;
+        }
+        let provider = ctx
+            .metadata
+            .get(META_PROVIDER)
+            .and_then(|name| self.provider_by_name(name));
+        let Some(provider) = provider else {
+            // The claim names a provider this instance does not own, so a
+            // second effective `ai_stream_router` instance made it and will
+            // enforce its own boundary from this same pass. Re-applying THIS
+            // instance's credential here would install the wrong key.
+            return;
+        };
+        let normalizes = provider.normalizes_response(self.normalize_response_stream);
+        apply_provider_boundary_headers(provider, normalizes, headers);
+    }
+
+    /// Revalidate the FINAL provider-visible body and route against the policy
+    /// that selected the provider (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// Runs after every `transform_request_body` hook, so `body` is exactly what
+    /// the provider would receive. Every failure is fail-closed and carries a
+    /// fixed-cardinality message: the offending model, header, or body bytes are
+    /// never echoed back or logged, because a later transform could have placed
+    /// a secret there.
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
         _headers: &HashMap<String, String>,
-        _body: &[u8],
+        body: &[u8],
     ) -> PluginResult {
-        if ctx.metadata.get(META_CLAIMED).map(String::as_str) == Some("true")
-            && ctx.metadata.get(META_PROVIDER_TYPE).map(String::as_str) == Some("anthropic")
+        if !self.enabled || ctx.metadata.get(META_CLAIMED).map(String::as_str) != Some("true") {
+            return PluginResult::Continue;
+        }
+
+        let provider = ctx
+            .metadata
+            .get(META_PROVIDER)
+            .and_then(|name| self.provider_by_name(name));
+        let Some(provider) = provider else {
+            // Not this instance's claim — a second effective `ai_stream_router`
+            // owns it and runs the identical revalidation from this same phase.
+            return PluginResult::Continue;
+        };
+
+        if provider.provider_type == ProviderType::Anthropic
             && ctx
                 .metadata
                 .get(META_REQUEST_TRANSLATED)
@@ -1995,6 +2105,57 @@ impl Plugin for AiStreamRouter {
                 Some("invalid_messages"),
             );
         }
+
+        // The credential installed at the boundary is only safe if it is still
+        // going to the destination that claimed it.
+        if !route_override_still_targets(ctx, provider) {
+            return provider_policy_violation(
+                "The routed AI provider destination changed after provider selection",
+            );
+        }
+
+        // A duplicate `model` member makes the provider-visible generation
+        // parser-dependent: `serde_json` keeps the last occurrence while a
+        // first-wins provider parser would read the other one, so an equality
+        // check against either value proves nothing. Screen with the shared
+        // bounded scanner (memoized per request body) before parsing.
+        if ctx.json_scan_memo.ambiguity(body).is_some() {
+            return model_policy_violation(
+                "The final AI provider request body has ambiguous duplicate JSON members",
+            );
+        }
+
+        let Some(committed_model) = ctx.metadata.get(META_MODEL) else {
+            return provider_policy_violation(
+                "The routed AI model could not be revalidated before dispatch",
+            );
+        };
+
+        // The router committed a JSON provider contract; anything else at this
+        // point means a later transform reshaped the backend-visible body.
+        let Ok(final_body) = serde_json::from_slice::<Value>(body) else {
+            return model_policy_violation(
+                "The final AI provider request body is not valid JSON after request transforms",
+            );
+        };
+        let final_model = match final_body.get("model") {
+            Some(Value::String(model)) if !model.is_empty() => model.as_str(),
+            _ => {
+                return model_policy_violation(
+                    "The final AI provider request body has no usable 'model' field",
+                );
+            }
+        };
+        // Equality pins the exact generation that was priced, allowed, and (for
+        // `{model}` endpoints) baked into the backend URL; the pattern re-check
+        // proves the surviving value is still inside this provider's configured
+        // policy rather than merely unchanged.
+        if final_model != committed_model.as_str() || !provider.matches_model(final_model) {
+            return model_policy_violation(
+                "The final AI provider request model does not match the routed model policy",
+            );
+        }
+
         PluginResult::Continue
     }
 
@@ -2176,6 +2337,74 @@ fn strip_client_credentials(headers: &mut HashMap<String, String>) {
         let lk = k.to_ascii_lowercase();
         !CREDENTIAL_HEADERS.contains(&lk.as_str())
     });
+}
+
+/// Gateway-asserted consumer/geo identity must never cross a third-party
+/// provider boundary. `before_proxy` sets
+/// `SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY` so proxy core stops
+/// appending them; this strip additionally removes any value a later generic
+/// header rule reintroduced (`GHSA-xhp5-hqj8-3mwg`).
+fn strip_gateway_identity_assertions(headers: &mut HashMap<String, String>) {
+    headers.retain(|name, _| {
+        !name.eq_ignore_ascii_case("x-consumer-username")
+            && !name.eq_ignore_ascii_case("x-consumer-custom-id")
+            && !name.eq_ignore_ascii_case("x-geo-country")
+    });
+}
+
+/// The complete set of request headers this plugin owns at the provider
+/// boundary.
+///
+/// Applied twice by design: once when `before_proxy` claims the request, and
+/// again over the FINAL backend-visible header map
+/// (`enforce_final_backend_header_policy`) after every later generic header
+/// transform. It is idempotent, allocation-light, and never logs a value.
+///
+/// Everything a client or a normal-backend rule could use to authenticate is
+/// removed first, so no credential other than the selected provider's own key
+/// can survive to egress. Headers outside this owned set are left untouched —
+/// intended, non-credential operator transforms still reach the provider.
+fn apply_provider_boundary_headers(
+    provider: &StreamProvider,
+    normalizes_response: bool,
+    headers: &mut HashMap<String, String>,
+) {
+    strip_client_credentials(headers);
+    strip_gateway_identity_assertions(headers);
+    match &provider.auth {
+        ProviderAuth::Bearer { api_key } => {
+            headers.insert("authorization".to_string(), format!("Bearer {api_key}"));
+        }
+        ProviderAuth::Header { name, api_key } => {
+            // The credential header name is provider-specific and may collide
+            // with a case variant a later rule added; strip every case variant
+            // before installing the canonical one.
+            remove_header_ci(headers, name);
+            headers.insert(name.clone(), api_key.clone());
+        }
+    }
+    if provider.provider_type == ProviderType::Anthropic {
+        headers.insert(
+            "anthropic-version".to_string(),
+            provider.anthropic_version.clone(),
+        );
+    }
+    remove_header_ci(headers, "host");
+    headers.insert("host".to_string(), provider.authority.clone());
+    remove_header_ci(headers, "content-type");
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    // A provider streams SSE; make the intent explicit to the upstream.
+    remove_header_ci(headers, "accept");
+    headers.insert("accept".to_string(), "text/event-stream".to_string());
+    // Normalization parses line-delimited SSE. Strip client content-coding
+    // negotiation and explicitly request identity so the provider does not
+    // return gzip/br octets that the normalizer would misread as plaintext
+    // events. Residual encodings are still handled fail-safe in `after_proxy` /
+    // the normalizer.
+    if normalizes_response {
+        remove_header_ci(headers, "accept-encoding");
+        headers.insert("accept-encoding".to_string(), "identity".to_string());
+    }
 }
 
 fn remove_header_ci(headers: &mut HashMap<String, String>, name: &str) {
