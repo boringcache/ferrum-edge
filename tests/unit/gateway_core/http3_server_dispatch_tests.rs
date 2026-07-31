@@ -761,9 +761,7 @@ fn h3_request_plugin_deadlines_mark_and_bound_terminal_rejections() {
     assert!(before_proxy_helper.contains(".into_plugin_result(ctx)"));
 
     let initial_clone_before_proxy = server
-        .split(
-            "// before_proxy hooks — only clone headers if at least one plugin modifies them.",
-        )
+        .split("// before_proxy hooks — only clone headers if at least one plugin modifies them.")
         .nth(1)
         .expect("native H3 header-clone before_proxy path must remain present")
         .split("owned_proxy_headers = Some(cloned);")
