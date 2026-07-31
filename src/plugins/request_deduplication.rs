@@ -495,6 +495,10 @@ enum DeduplicationEntry {
     /// detection so abandoned in-flight entries don't permanently block retries.
     InFlight {
         started_at: Instant,
+        /// Lease duration captured by the generation that admitted the
+        /// operation. A replacement generation must not shorten an existing
+        /// lease by evaluating it with a newly configured timeout.
+        retention: Duration,
         fingerprint: String,
         owner_token: String,
     },
@@ -777,9 +781,11 @@ static SHARED_LOCAL_STATES: OnceLock<Mutex<HashMap<String, Weak<RequestDeduplica
 /// framed explicitly and `anonymous_caller_scope` is framed by
 /// `replay_partition::append_caller_partition` as `caller.address_scope` — so a
 /// change there produces different keys instead of colliding with a retained
-/// entry. `ttl_seconds`, `inflight_ttl_seconds`, and the capacity/size bounds
-/// are enforced per entry or per operation against the *live* instance, so a
-/// tightened bound applies to already-retained state instead of resetting it.
+/// entry. Retention is captured by each admitted in-flight operation,
+/// completion, or execution barrier, so a replacement generation cannot
+/// shorten an existing protection window; new operations use the replacement
+/// policy. Capacity/size bounds are applied by the live instance without
+/// resetting already-retained protection state.
 ///
 /// The fields below are the ones that are not key-bound and do change what a
 /// retained entry means:
@@ -1271,12 +1277,29 @@ impl RequestDeduplication {
     #[allow(dead_code)]
     pub(crate) fn expire_inflight_entries_for_tests(&self) {
         let _guard = self.accounting_guard();
-        let expired_at = Instant::now()
-            .checked_sub(self.inflight_ttl.saturating_add(Duration::from_secs(1)))
-            .unwrap_or_else(Instant::now);
+        let now = Instant::now();
+        for mut entry in self.local.local_cache.iter_mut() {
+            if let DeduplicationEntry::InFlight {
+                started_at,
+                retention,
+                ..
+            } = entry.value_mut()
+            {
+                *started_at = now
+                    .checked_sub(retention.saturating_add(Duration::from_secs(1)))
+                    .unwrap_or(now);
+            }
+        }
+        self.local.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn backdate_inflight_entries_for_tests(&self, age: Duration) {
+        let _guard = self.accounting_guard();
+        let now = Instant::now();
         for mut entry in self.local.local_cache.iter_mut() {
             if let DeduplicationEntry::InFlight { started_at, .. } = entry.value_mut() {
-                *started_at = expired_at;
+                *started_at = now.checked_sub(age).unwrap_or(now);
             }
         }
         self.local.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
@@ -1485,6 +1508,7 @@ impl RequestDeduplication {
             Entry::Vacant(entry) => {
                 entry.insert(DeduplicationEntry::InFlight {
                     started_at: now,
+                    retention: self.inflight_ttl,
                     fingerprint: fingerprint.to_string(),
                     owner_token: owner_token.to_string(),
                 });
@@ -1526,12 +1550,14 @@ impl RequestDeduplication {
                     }
                     DeduplicationEntry::InFlight {
                         started_at,
+                        retention,
                         fingerprint: cached_fingerprint,
                         ..
                     } => {
-                        if now.duration_since(*started_at) >= self.inflight_ttl {
+                        if now.duration_since(*started_at) >= *retention {
                             entry.insert(DeduplicationEntry::InFlight {
                                 started_at: now,
+                                retention: self.inflight_ttl,
                                 fingerprint: fingerprint.to_string(),
                                 owner_token: owner_token.to_string(),
                             });
@@ -1590,6 +1616,7 @@ impl RequestDeduplication {
             Entry::Vacant(entry) => {
                 entry.insert(DeduplicationEntry::InFlight {
                     started_at: now,
+                    retention: self.inflight_ttl,
                     fingerprint: fingerprint.to_string(),
                     owner_token: owner_token.to_string(),
                 });
@@ -1619,6 +1646,7 @@ impl RequestDeduplication {
                         self.local.inflight_count.fetch_add(1, Ordering::Relaxed);
                         entry.insert(DeduplicationEntry::InFlight {
                             started_at: now,
+                            retention: self.inflight_ttl,
                             fingerprint: fingerprint.to_string(),
                             owner_token: owner_token.to_string(),
                         });
@@ -1645,6 +1673,7 @@ impl RequestDeduplication {
                         self.release_execution_barrier();
                         entry.insert(DeduplicationEntry::InFlight {
                             started_at: now,
+                            retention: self.inflight_ttl,
                             fingerprint: fingerprint.to_string(),
                             owner_token: owner_token.to_string(),
                         });
@@ -1653,12 +1682,14 @@ impl RequestDeduplication {
                 }
                 DeduplicationEntry::InFlight {
                     started_at,
+                    retention,
                     fingerprint: cached_fingerprint,
                     ..
                 } => {
-                    if now.duration_since(*started_at) >= self.inflight_ttl {
+                    if now.duration_since(*started_at) >= *retention {
                         entry.insert(DeduplicationEntry::InFlight {
                             started_at: now,
+                            retention: self.inflight_ttl,
                             fingerprint: fingerprint.to_string(),
                             owner_token: owner_token.to_string(),
                         });
@@ -2429,8 +2460,12 @@ impl RequestDeduplication {
             // connection drop) without ever reaching `on_final_response_body`.
             // Without this, duplicate requests would receive 409 Conflict
             // forever.
-            DeduplicationEntry::InFlight { started_at, .. } => {
-                let keep = now.duration_since(*started_at) < self.inflight_ttl;
+            DeduplicationEntry::InFlight {
+                started_at,
+                retention,
+                ..
+            } => {
+                let keep = now.duration_since(*started_at) < *retention;
                 if !keep {
                     decrement_atomic(&self.local.inflight_count);
                 }

@@ -15,7 +15,8 @@
 use chrono::Utc;
 use ferrum_edge::PluginCache;
 use ferrum_edge::_test_support::{
-    load_testing_with_policy_identity_for_test, request_deduplication_with_instance_id_for_test,
+    load_testing_with_policy_identity_for_test, request_deduplication_backdate_inflight_for_test,
+    request_deduplication_with_instance_id_for_test,
     request_deduplication_with_policy_identity_for_test,
     set_response_presentation_policy_digest_for_test,
 };
@@ -525,8 +526,9 @@ async fn dedup_compatible_ttl_and_capacity_changes_keep_retained_state() {
     assert!(matches!(leased, PluginResult::Continue));
     dedup_complete(&first, &mut ctx, b"kept", 201).await;
 
-    // TTL and capacity are enforced per entry/operation against the live
-    // instance, so tightening them is a compatible change, not a reset.
+    // Retention and capacity changes are compatible rather than resetting the
+    // protection domain. Existing operations retain the window under which
+    // they were admitted; new operations use the replacement settings.
     let narrow = json!({
         "ttl_seconds": 60,
         "max_entries": 10,
@@ -542,6 +544,35 @@ async fn dedup_compatible_ttl_and_capacity_changes_keep_retained_state() {
         replay_status(&replay),
         Some(201),
         "the retained completion must survive a compatible capacity change"
+    );
+}
+
+#[tokio::test]
+async fn dedup_reload_cannot_shorten_an_existing_inflight_lease() {
+    let first = dedup_generation(
+        "ns-dedup-inflight-retention",
+        "dedup-inflight-retention",
+        json!({"inflight_ttl_seconds": 300}),
+    );
+    let (leased, _ctx) = dedup_lookup(&first, DEDUP_HEADER, "retention-key").await;
+    assert!(matches!(leased, PluginResult::Continue));
+
+    // Make the existing lease older than the replacement's timeout while it
+    // remains well inside the 300-second window under which it was admitted.
+    // This is deterministic and does not depend on wall-clock sleeps.
+    request_deduplication_backdate_inflight_for_test(&first, Duration::from_secs(120));
+
+    let replacement = dedup_generation(
+        "ns-dedup-inflight-retention",
+        "dedup-inflight-retention",
+        json!({"inflight_ttl_seconds": 60}),
+    );
+    assert!(replacement.shares_local_state_with(&first));
+    let (duplicate, _) = dedup_lookup(&replacement, DEDUP_HEADER, "retention-key").await;
+    assert_eq!(
+        reject_status(&duplicate),
+        Some(409),
+        "a reload must not evaluate an existing lease with its shorter timeout"
     );
 }
 

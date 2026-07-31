@@ -61,7 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changing `on_redis_unavailable` is a semantic change that isolates onto fresh
   state, so a retired generation's late completion lands on the state it took
   its lease from and cannot corrupt the replacement policy. Capacity and TTL
-  changes are compatible and are applied against already-retained state.
+  changes are compatible without resetting the protection domain. Each
+  admitted operation, completion, and execution barrier retains its original
+  protection window, so a reload cannot shorten an in-flight lease; new
+  operations use the replacement settings.
   Retention is bounded to currently configured policies plus whatever in-flight
   work still holds a reference.
 - `load_testing` now admits at most **one** effective instance per proxy after

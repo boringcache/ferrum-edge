@@ -94,8 +94,10 @@ paths:
   corrupt the replacement. For deduplication the semantic set is deliberately
   narrow — `header_name`, `local` vs `redis`, and `on_redis_unavailable` —
   because everything else is either bound into the logical key or enforced per
-  operation against the live instance. Do not reintroduce per-instance
-  ownership for any of these.
+  operation. In-flight operations, completions, and execution barriers retain
+  their admission-time protection windows across reloads; never evaluate an
+  existing lease with a replacement generation's shorter timeout. Do not
+  reintroduce per-instance ownership for any of these.
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order

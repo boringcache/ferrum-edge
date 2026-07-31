@@ -1375,6 +1375,13 @@ pub mod _test_support {
         )
     }
 
+    pub fn request_deduplication_backdate_inflight_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+        age: std::time::Duration,
+    ) {
+        plugin.backdate_inflight_entries_for_tests(age);
+    }
+
     pub fn request_deduplication_logical_keys_from_context_for_test(
         ctx: &crate::plugins::RequestContext,
     ) -> Vec<String> {
