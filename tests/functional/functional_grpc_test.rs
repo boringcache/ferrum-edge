@@ -1398,9 +1398,17 @@ async fn test_grpc_early_rejects_use_grpc_error_shape() {
         headers2.get("content-type").map(String::as_str),
         Some("application/grpc")
     );
-    assert_ne!(
-        headers2.get("content-length").map(String::as_str),
-        Some("999")
+    // Trailers-only gRPC carries no DATA frames and gRPC never frames with
+    // Content-Length, so the final wire boundary removes the field outright —
+    // it neither preserves a policy-authored value nor invents `0`. Assert the
+    // absence rather than one sentinel value: `security_headers.set` can no
+    // longer author `Content-Length`, so a value-specific check would pass
+    // vacuously while a leaked backend length still slipped through.
+    assert!(
+        !headers2
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length")),
+        "trailers-only gRPC error must not advertise Content-Length; headers={headers2:?}"
     );
     assert!(!headers2.contains_key("transfer-encoding"));
 

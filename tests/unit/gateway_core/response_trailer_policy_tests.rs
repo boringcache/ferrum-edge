@@ -1101,7 +1101,7 @@ fn streaming_h2_capture_precedes_the_first_response_header_phase() {
         .expect("sanitized response builder header application");
     assert!(
         builder_at < seal_at,
-        "the governor must be sealed after the final protocol-aware response-header \\
+        "the governor must be sealed after the final protocol-aware response-header \
          sanitizer populated the builder"
     );
 }

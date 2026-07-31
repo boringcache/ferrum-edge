@@ -530,11 +530,16 @@ fn gateway_startup_error(
 
 /// Write a YAML config file with a WebSocket proxy pointing to the given backend port.
 ///
-/// Keep transport/framing destinations out of `security_headers.set`: the
-/// plugin now rejects those destinations during construction. Their rejection
-/// matrix is covered by the plugin unit tests, while hostile upstream fields
-/// and the final client-wire boundary are covered by the dedicated
-/// protocol-managed response-header functional tests.
+/// Keep protocol-managed hop-by-hop/framing destinations (`Connection`,
+/// `Upgrade`, `Content-Length`, …) out of `security_headers.set`: the plugin now
+/// rejects those at construction, and their rejection matrix is covered by the
+/// plugin unit tests.
+///
+/// The WebSocket negotiation names (`Sec-WebSocket-*`) are deliberately KEPT:
+/// they are still admissible configuration, and stripping them at the WebSocket
+/// response boundary is a separate production guarantee. Without these sentinel
+/// values `assert_no_ws_transport_policy_values` would pass vacuously on both
+/// successful handshakes and rejects.
 fn write_ws_config(config_path: &std::path::Path, backend_port: u16) {
     let config = format!(
         r#"
@@ -555,6 +560,8 @@ plugin_configs:
       hsts: true
       set:
         X-WS-Security: "gateway-enforced"
+        Sec-WebSocket-Accept: "policy-must-not-escape"
+        Sec-WebSocket-Protocol: "policy-must-not-escape"
       remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
@@ -625,6 +632,8 @@ plugin_configs:
       hsts: true
       set:
         X-WS-Security: "gateway-enforced"
+        Sec-WebSocket-Accept: "policy-must-not-escape"
+        Sec-WebSocket-Protocol: "policy-must-not-escape"
       remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
@@ -705,6 +714,8 @@ plugin_configs:
       set:
         X-WS-Security: "gateway-enforced"
         X-WS-Reject-Order: "security-policy"
+        Sec-WebSocket-Accept: "policy-must-not-escape"
+        Sec-WebSocket-Protocol: "policy-must-not-escape"
       remove: ["server", "x-powered-by", "content-type"]
     scope: global
     enabled: true
@@ -755,6 +766,11 @@ plugin_configs:
       hsts: true
       set:
         X-WS-Security: "gateway-enforced"
+        Sec-WebSocket-Accept: "policy-must-not-escape"
+        Sec-WebSocket-Key: "policy-must-not-escape"
+        Sec-WebSocket-Version: "policy-must-not-escape"
+        Sec-WebSocket-Protocol: "policy-must-not-escape"
+        Sec-WebSocket-Extensions: "policy-must-not-escape"
       remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
@@ -790,6 +806,8 @@ plugin_configs:
       hsts: true
       set:
         X-WS-Security: "gateway-enforced"
+        Sec-WebSocket-Accept: "policy-must-not-escape"
+        Sec-WebSocket-Protocol: "policy-must-not-escape"
       remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
@@ -839,6 +857,8 @@ plugin_configs:
       hsts: true
       set:
         X-WS-Security: "gateway-enforced"
+        Sec-WebSocket-Accept: "policy-must-not-escape"
+        Sec-WebSocket-Protocol: "policy-must-not-escape"
       remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
@@ -1368,12 +1388,24 @@ fn assert_ws_later_reject_hook_wins(headers: &http::HeaderMap) {
     );
 }
 
+/// A response-header policy must never control a transport-managed WebSocket
+/// field, on a successful handshake or on a reject.
+///
+/// The `sec-websocket-*` sentinels are the load-bearing ones: those names are
+/// still admissible `security_headers.set` destinations, so the fixtures author
+/// `policy-must-not-escape` for them and only the WebSocket response boundary
+/// can keep it off the wire. `upgrade` / `connection` are additionally rejected
+/// at plugin construction now, so their sentinel can no longer be authored —
+/// they stay here as a cheap belt-and-braces check against a future writer.
 fn assert_no_ws_transport_policy_values(headers: &http::HeaderMap) {
     for name in [
         "upgrade",
         "connection",
         "sec-websocket-accept",
+        "sec-websocket-key",
+        "sec-websocket-version",
         "sec-websocket-protocol",
+        "sec-websocket-extensions",
     ] {
         assert_ne!(
             headers.get(name).and_then(|value| value.to_str().ok()),

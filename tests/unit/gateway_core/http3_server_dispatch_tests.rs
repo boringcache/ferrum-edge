@@ -1602,7 +1602,7 @@ fn buffered_h3_trailers_reconcile_with_response_policy_not_chain_emptiness() {
         .expect("buffered H3 response-header sanitization");
     assert!(
         sanitize_at < strip_at && strip_at < reconcile_at,
-        "buffered H3 must sanitize final response headers, then strip hop-by-hop \\
+        "buffered H3 must sanitize final response headers, then strip hop-by-hop \
          trailer names, before reconciling surviving trailers"
     );
     let forward_region = src
