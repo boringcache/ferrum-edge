@@ -6968,11 +6968,12 @@ pub trait Plugin: Send + Sync {
     /// integrity validation, WAF/OpenAPI/body/size policy, AI request
     /// guardrails, and mandatory audit admission.
     ///
-    /// Composition admission uses this to refuse a chain in which a plugin
-    /// egresses BEFORE finalization (`egresses_request_body_before_finalization`)
-    /// alongside a validator that only decides afterwards — the operator would
-    /// otherwise be promised a fail-closed body policy that a mirror, function,
-    /// or provider had already bypassed.
+    /// Composition admission uses this to refuse an HTTP/gRPC request-body
+    /// protocol chain in which a plugin egresses BEFORE finalization
+    /// (`egresses_request_body_before_finalization`) alongside a validator that
+    /// only decides afterwards — the operator would otherwise be promised a
+    /// fail-closed body policy that a mirror, function, or provider had already
+    /// bypassed. TCP/UDP stream protocols are outside this body-lifecycle gate.
     fn enforces_finalized_request_policy(&self) -> bool {
         false
     }

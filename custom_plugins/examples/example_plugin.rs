@@ -201,7 +201,8 @@ impl Plugin for ExamplePlugin {
 
     /// Pedagogical stand-in for a custom plugin that still egresses the buffered
     /// request body from `before_proxy` before finalization. Core composition
-    /// admission must refuse same-protocol final request-body policy plugins.
+    /// admission must refuse same HTTP/gRPC-protocol final request-body policy
+    /// plugins.
     fn egresses_request_body_before_finalization(&self) -> bool {
         self.egresses_request_body_before_finalization
     }

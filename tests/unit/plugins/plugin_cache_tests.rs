@@ -3737,6 +3737,88 @@ fn candidate_rejects_legacy_early_egress_with_omitted_final_policy_validators() 
         .expect("runtime cache must admit unrelated-protocol early egress + openapi");
 }
 
+#[test]
+fn candidate_and_runtime_agree_on_early_egress_with_stream_enabled_waf() {
+    // Stream-enabled WAF advertises ALL_PROTOCOLS at runtime while the cheap
+    // candidate view stays on HTTP_FAMILY. The body-policy collision gate is
+    // scoped to HTTP/gRPC, so TCP-only early egress must admit on both paths
+    // and HTTP early egress must still fail closed on both.
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    let stream_waf = || {
+        make_plugin_config_with_json(
+            "waf",
+            "waf",
+            json!({
+                "include_default_rules": false,
+                "stream": {
+                    "signatures": [{
+                        "id": "STREAM-EARLY-EGRESS-1",
+                        "pattern": "(?i)union\\s+select"
+                    }]
+                }
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )
+    };
+
+    let tcp_egress = make_plugin_config_with_json(
+        "early-egress",
+        "example_plugin",
+        json!({
+            "protocol": "tcp",
+            "egresses_request_body_before_finalization": true
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let tcp_safe = make_config(
+        vec![make_proxy("p1", "/api", vec!["early-egress", "waf"])],
+        vec![tcp_egress, stream_waf()],
+    );
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&tcp_safe, None).expect(
+        "candidate admission must admit TCP-only early egress with stream-enabled WAF",
+    );
+    PluginCache::new(&tcp_safe).expect(
+        "runtime PluginCache must admit TCP-only early egress with stream-enabled WAF",
+    );
+
+    let http_egress = make_plugin_config_with_json(
+        "early-egress",
+        "example_plugin",
+        json!({"egresses_request_body_before_finalization": true}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let http_collision = make_config(
+        vec![make_proxy("p1", "/api", vec!["early-egress", "waf"])],
+        vec![http_egress, stream_waf()],
+    );
+    let candidate_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&http_collision, None)
+            .expect_err(
+                "candidate admission must reject HTTP early egress with stream-enabled WAF",
+            );
+    assert!(
+        candidate_error.contains("example_plugin")
+            && candidate_error.contains("waf")
+            && candidate_error.contains("final request-body policy"),
+        "got: {candidate_error}"
+    );
+    let runtime_error = PluginCache::new(&http_collision)
+        .err()
+        .expect("runtime cache must reject HTTP early egress with stream-enabled WAF");
+    assert!(
+        runtime_error.contains("example_plugin")
+            && runtime_error.contains("waf")
+            && runtime_error.contains("final request-body policy"),
+        "got: {runtime_error}"
+    );
+}
+
 #[tokio::test]
 async fn transcript_audit_must_precede_every_request_deduplication_instance() {
     let audit_config = || {

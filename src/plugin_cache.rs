@@ -174,11 +174,13 @@ const FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS: &[FinalizedRequestPolicyCompos
     FinalizedRequestPolicyCompositionSpec {
         name: "waf",
         default_priority: crate::plugins::priority::WAF,
-        // Stream-enabled WAF expands to ALL_PROTOCOLS at runtime. Early body
-        // egress is an HTTP-family contract, so HTTP_FAMILY is the cheap
-        // composition surface without compiling rule packs or parsing stream
-        // config. A TCP/UDP-only early-egress claim cannot collide with this
-        // view; overlapping HTTP/gRPC collisions still fail closed.
+        // Stream-enabled WAF expands to ALL_PROTOCOLS at runtime for separate
+        // stream inspection. The early-body-egress vs finalized-request-body
+        // policy gate is scoped to HTTP/gRPC request-body protocols, so a
+        // TCP/UDP-only early-egress claim cannot collide with that expansion.
+        // HTTP_FAMILY remains the cheap composition surface without compiling
+        // rule packs or parsing stream config; overlapping HTTP/gRPC
+        // collisions still fail closed.
         protocols: crate::plugins::HTTP_FAMILY_PROTOCOLS,
     },
 ];
@@ -435,10 +437,16 @@ fn validate_plugin_security_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(
                     protocol
                 ));
             }
-            if let Some(validator) = plugins
-                .iter()
-                .filter(|plugin| plugin.supported_protocols().contains(&protocol))
-                .find(|plugin| plugin.enforces_finalized_request_policy())
+            // Final request-body policy is an HTTP/gRPC request-body lifecycle
+            // contract. Plugins such as stream-enabled WAF may also advertise
+            // TCP/UDP for unrelated stream inspection; do not treat that
+            // advertisement as a body-policy collision with a TCP/UDP-only
+            // early-egress claim. Same-protocol HTTP and gRPC still fail closed.
+            if crate::plugins::HTTP_GRPC_PROTOCOLS.contains(&protocol)
+                && let Some(validator) = plugins
+                    .iter()
+                    .filter(|plugin| plugin.supported_protocols().contains(&protocol))
+                    .find(|plugin| plugin.enforces_finalized_request_policy())
             {
                 return Err(format!(
                     "request-body egress plugin '{}' cannot be combined with final request-body policy plugin '{}' for protocol {:?} on the same proxy; '{}' only decides after the external request has already been sent, so its rejection could not retract the disclosure or side effect",

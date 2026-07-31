@@ -187,7 +187,8 @@ on a native-gRPC request.
 - Composition admission fails closed for anything that still egresses earlier:
   `egresses_request_body_before_finalization()` may not coexist with a
   request-body transformer, with any built-in final request hook that can reject
-  the backend-visible body (`enforces_finalized_request_policy()`), or with
+  the backend-visible body on an HTTP/gRPC request-body protocol
+  (`enforces_finalized_request_policy()`), or with
   `dispatches_finalized_request_egress()` on the same plugin.
 - gRPC uses `GrpcBody::Streaming(Incoming)` when there are no body plugins and no retries; otherwise `Buffered(Full<Bytes>)`.
 - In `before_proxy(ctx, headers)`, read headers from the `headers` parameter, never `ctx.headers`. The handler may have moved headers out of `ctx.headers` when no plugin modifies request headers.
