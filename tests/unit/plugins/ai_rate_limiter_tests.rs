@@ -2851,7 +2851,7 @@ async fn inline_data_url_in_text_field_is_counted() {
     )
     .unwrap();
 
-    let data_url = format!("data:text/plain,{}", "X".repeat(33)); // 15+33=48
+    let data_url = format!("data:text/plain,{}", "X".repeat(32)); // 16+32=48
     assert_eq!(data_url.chars().count(), 48);
 
     let mut empty_ctx = create_test_context();
