@@ -3458,6 +3458,8 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
     assert!(candidate.contains("is_security_composition_candidate_plugin("));
     assert!(candidate.contains("security_composition_capabilities("));
     assert!(candidate.contains("ServerlessSecurityCompositionPlugin"));
+    assert!(candidate.contains("finalized_request_policy_composition_spec("));
+    assert!(candidate.contains("FinalizedRequestPolicyCompositionPlugin"));
     let candidate_names_start = source
         .find("const SECURITY_COMPOSITION_PLUGIN_NAMES")
         .expect("security-composition candidate allowlist must exist");
@@ -3474,6 +3476,40 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
         candidate_names.contains("\"workload_metrics\""),
         "candidate construction must include every built-in request-header mutator so replay plugins cannot pass admission ahead of workload tracing rewrites"
     );
+    for expensive_final_policy in [
+        "waf",
+        "openapi_validator",
+        "body_validator",
+        "request_size_limiting",
+        "ai_tool_governor",
+        "ai_semantic_firewall",
+    ] {
+        assert!(
+            !candidate_names.contains(&format!("\"{expensive_final_policy}\"")),
+            "{expensive_final_policy} must use the pure finalized-policy composition view, not full construction"
+        );
+    }
+    let cheap_specs_start = source
+        .find("const FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS")
+        .expect("cheap finalized-policy composition inventory must exist");
+    let cheap_specs_end = source[cheap_specs_start..]
+        .find("];")
+        .map(|offset| cheap_specs_start + offset)
+        .expect("cheap finalized-policy composition inventory must terminate");
+    let cheap_specs = &source[cheap_specs_start..cheap_specs_end];
+    for expensive_final_policy in [
+        "waf",
+        "openapi_validator",
+        "body_validator",
+        "request_size_limiting",
+        "ai_tool_governor",
+        "ai_semantic_firewall",
+    ] {
+        assert!(
+            cheap_specs.contains(&format!("\"{expensive_final_policy}\"")),
+            "candidate admission must inventory {expensive_final_policy} in the pure capability view"
+        );
+    }
     let effective_chain_start = source
         .find("fn validate_plugin_security_composition(")
         .expect("effective-chain security validator must exist");
@@ -3485,6 +3521,220 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
     );
     assert!(candidate.contains("validate_plugin_security_composition(&merged)"));
     assert!(candidate.contains("validate_plugin_security_composition(plugins)"));
+}
+
+#[test]
+fn finalized_request_policy_candidate_inventory_covers_every_builtin_override() {
+    // Mechanically pin candidate admission inventories against every production
+    // Plugin override of enforces_finalized_request_policy() so a new final
+    // validator cannot ship without either full construction or the cheap view.
+    let cache_source = include_str!("../../../src/plugin_cache.rs");
+    let full_names_start = cache_source
+        .find("const SECURITY_COMPOSITION_PLUGIN_NAMES")
+        .expect("security-composition allowlist must exist");
+    let full_names_end = cache_source[full_names_start..]
+        .find("];")
+        .map(|offset| full_names_start + offset)
+        .expect("security-composition allowlist must terminate");
+    let full_names = &cache_source[full_names_start..full_names_end];
+    let cheap_specs_start = cache_source
+        .find("const FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS")
+        .expect("cheap finalized-policy inventory must exist");
+    let cheap_specs_end = cache_source[cheap_specs_start..]
+        .find("];")
+        .map(|offset| cheap_specs_start + offset)
+        .expect("cheap finalized-policy inventory must terminate");
+    let cheap_specs = &cache_source[cheap_specs_start..cheap_specs_end];
+
+    let plugins_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plugins");
+    let mut plugin_sources = Vec::new();
+    for entry in std::fs::read_dir(&plugins_dir).expect("src/plugins must be readable") {
+        let entry = entry.expect("directory entry");
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            plugin_sources.push(std::fs::read_to_string(&path).expect("read plugin source"));
+        } else if path.is_dir() {
+            let mod_rs = path.join("mod.rs");
+            if mod_rs.is_file() {
+                plugin_sources.push(std::fs::read_to_string(&mod_rs).expect("read plugin mod"));
+            }
+        }
+    }
+
+    let mut found = Vec::new();
+    for source in &plugin_sources {
+        let mut search = source.as_str();
+        while let Some(offset) = search.find("fn enforces_finalized_request_policy") {
+            let after = &search[offset..];
+            let body_end = after.find("\n    fn ").unwrap_or(after.len().min(200));
+            let body = &after[..body_end];
+            if body.contains("true") {
+                // Walk backward to the nearest `fn name(&self)` return literal.
+                let before = &search[..offset];
+                let name_fn = before
+                    .rfind("fn name(&self)")
+                    .expect("enforces_finalized_request_policy override must follow fn name()");
+                let name_slice = &before[name_fn..];
+                let quote = name_slice
+                    .find('"')
+                    .expect("plugin name() must return a string literal");
+                let rest = &name_slice[quote + 1..];
+                let end = rest.find('"').expect("plugin name literal must terminate");
+                found.push(rest[..end].to_string());
+            }
+            search = &search[offset + "fn enforces_finalized_request_policy".len()..];
+        }
+    }
+    found.sort();
+    found.dedup();
+    assert!(
+        !found.is_empty(),
+        "expected at least one enforces_finalized_request_policy override"
+    );
+
+    for plugin_name in &found {
+        let in_full = full_names.contains(&format!("\"{plugin_name}\""));
+        let in_cheap = cheap_specs.contains(&format!("\"{plugin_name}\""));
+        assert!(
+            in_full ^ in_cheap,
+            "{plugin_name} must appear in exactly one candidate inventory \
+             (SECURITY_COMPOSITION_PLUGIN_NAMES or FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS); \
+             full={in_full} cheap={in_cheap}"
+        );
+    }
+}
+
+#[test]
+fn candidate_rejects_legacy_early_egress_with_omitted_final_policy_validators() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    let early_egress = || {
+        make_plugin_config_with_json(
+            "early-egress",
+            "example_plugin",
+            json!({"egresses_request_body_before_finalization": true}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )
+    };
+
+    // HTTP-only representative previously absent from the candidate allowlist.
+    let openapi = make_plugin_config_with_json(
+        "openapi",
+        "openapi_validator",
+        json!({
+            "operations": [{
+                "method": "GET",
+                "path_template": "/health",
+                "path_regex": "^/health$",
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": { "type": "object" }
+                        }
+                    }
+                }
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let http_only = make_config(
+        vec![make_proxy("p1", "/api", vec!["early-egress", "openapi"])],
+        vec![early_egress(), openapi],
+    );
+    let candidate_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&http_only, None)
+            .expect_err("candidate admission must reject early egress + openapi_validator");
+    assert!(
+        candidate_error.contains("example_plugin")
+            && candidate_error.contains("openapi_validator")
+            && candidate_error.contains("final request-body policy"),
+        "got: {candidate_error}"
+    );
+    let runtime_error = PluginCache::new(&http_only)
+        .err()
+        .expect("runtime cache must repeat the fail-closed refusal");
+    assert!(
+        runtime_error.contains("example_plugin")
+            && runtime_error.contains("openapi_validator")
+            && runtime_error.contains("final request-body policy"),
+        "got: {runtime_error}"
+    );
+
+    // HTTP+gRPC representative previously absent from the candidate allowlist.
+    let size_limit = make_plugin_config_with_json(
+        "size",
+        "request_size_limiting",
+        json!({"max_bytes": 1048576}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let http_grpc = make_config(
+        vec![make_proxy("p1", "/api", vec!["early-egress", "size"])],
+        vec![early_egress(), size_limit],
+    );
+    let candidate_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&http_grpc, None)
+            .expect_err("candidate admission must reject early egress + request_size_limiting");
+    assert!(
+        candidate_error.contains("example_plugin")
+            && candidate_error.contains("request_size_limiting")
+            && candidate_error.contains("final request-body policy"),
+        "got: {candidate_error}"
+    );
+    let runtime_error = PluginCache::new(&http_grpc)
+        .err()
+        .expect("runtime cache must repeat the fail-closed refusal");
+    assert!(
+        runtime_error.contains("example_plugin")
+            && runtime_error.contains("request_size_limiting")
+            && runtime_error.contains("final request-body policy"),
+        "got: {runtime_error}"
+    );
+
+    // Unrelated protocols: TCP-only early egress must not collide with an
+    // HTTP-only final validator on the shared proxy chain.
+    let tcp_egress = make_plugin_config_with_json(
+        "early-egress",
+        "example_plugin",
+        json!({
+            "protocol": "tcp",
+            "egresses_request_body_before_finalization": true
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let openapi_safe = make_plugin_config_with_json(
+        "openapi",
+        "openapi_validator",
+        json!({
+            "operations": [{
+                "method": "GET",
+                "path_template": "/health",
+                "path_regex": "^/health$",
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": { "type": "object" }
+                        }
+                    }
+                }
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let safe = make_config(
+        vec![make_proxy("p1", "/api", vec!["early-egress", "openapi"])],
+        vec![tcp_egress, openapi_safe],
+    );
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&safe, None)
+        .expect("TCP-only early egress must compose with an HTTP-only final validator");
+    PluginCache::new(&safe)
+        .expect("runtime cache must admit unrelated-protocol early egress + openapi");
 }
 
 #[tokio::test]

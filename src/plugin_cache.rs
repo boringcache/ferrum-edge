@@ -103,6 +103,94 @@ impl Plugin for ServerlessSecurityCompositionPlugin {
     }
 }
 
+/// Pure capability view for built-in final request-body policy plugins whose
+/// full construction would compile expensive rule sets, schema packs, or
+/// remote-endpoint clients merely to learn static name/protocol/capability
+/// metadata for candidate admission (GHSA-4vr5-4wm3-x5xv).
+struct FinalizedRequestPolicyCompositionPlugin {
+    name: &'static str,
+    priority: u16,
+    protocols: &'static [ProxyProtocol],
+}
+
+#[async_trait]
+impl Plugin for FinalizedRequestPolicyCompositionPlugin {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn priority(&self) -> u16 {
+        self.priority
+    }
+
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        self.protocols
+    }
+
+    fn enforces_finalized_request_policy(&self) -> bool {
+        true
+    }
+}
+
+/// Static inventory for [`FinalizedRequestPolicyCompositionPlugin`]. Keep this
+/// aligned with every built-in that overrides `enforces_finalized_request_policy()`
+/// to `true` and is *not* already constructed via
+/// [`SECURITY_COMPOSITION_PLUGIN_NAMES`] for other composition-relevant
+/// capabilities. A source-scan external test pins both inventories against
+/// production capability overrides so candidate/runtime admission parity cannot
+/// silently drift.
+struct FinalizedRequestPolicyCompositionSpec {
+    name: &'static str,
+    default_priority: u16,
+    protocols: &'static [ProxyProtocol],
+}
+
+const FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS: &[FinalizedRequestPolicyCompositionSpec] = &[
+    FinalizedRequestPolicyCompositionSpec {
+        name: "ai_semantic_firewall",
+        default_priority: crate::plugins::priority::AI_SEMANTIC_FIREWALL,
+        protocols: crate::plugins::HTTP_ONLY_PROTOCOLS,
+    },
+    FinalizedRequestPolicyCompositionSpec {
+        name: "ai_tool_governor",
+        default_priority: crate::plugins::priority::AI_TOOL_GOVERNOR,
+        protocols: crate::plugins::HTTP_ONLY_PROTOCOLS,
+    },
+    FinalizedRequestPolicyCompositionSpec {
+        name: "body_validator",
+        default_priority: crate::plugins::priority::BODY_VALIDATOR,
+        protocols: crate::plugins::HTTP_GRPC_PROTOCOLS,
+    },
+    FinalizedRequestPolicyCompositionSpec {
+        name: "openapi_validator",
+        default_priority: crate::plugins::priority::OPENAPI_VALIDATOR,
+        protocols: crate::plugins::HTTP_ONLY_PROTOCOLS,
+    },
+    FinalizedRequestPolicyCompositionSpec {
+        name: "request_size_limiting",
+        default_priority: crate::plugins::priority::REQUEST_SIZE_LIMITING,
+        protocols: crate::plugins::HTTP_GRPC_PROTOCOLS,
+    },
+    FinalizedRequestPolicyCompositionSpec {
+        name: "waf",
+        default_priority: crate::plugins::priority::WAF,
+        // Stream-enabled WAF expands to ALL_PROTOCOLS at runtime. Early body
+        // egress is an HTTP-family contract, so HTTP_FAMILY is the cheap
+        // composition surface without compiling rule packs or parsing stream
+        // config. A TCP/UDP-only early-egress claim cannot collide with this
+        // view; overlapping HTTP/gRPC collisions still fail closed.
+        protocols: crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    },
+];
+
+fn finalized_request_policy_composition_spec(
+    plugin_name: &str,
+) -> Option<&'static FinalizedRequestPolicyCompositionSpec> {
+    FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS
+        .iter()
+        .find(|spec| spec.name == plugin_name)
+}
+
 /// Per-chain CORS wrapper. It avoids mutating a shared plugin instance when a
 /// proxy-group or global CORS policy participates in a multiple-instance chain
 /// for only some proxies.
@@ -3000,12 +3088,14 @@ struct ProxyGroupPluginInstance {
 /// constructed because their capability is defined by their implementation
 /// rather than a core allowlist.
 ///
-/// `enforces_finalized_request_policy()` deliberately does NOT extend this list:
-/// its only rule fires against a plugin that still egresses before finalization,
-/// which after GHSA-4vr5-4wm3-x5xv can only be a registered custom plugin
-/// (already constructed here). Adding every built-in final validator would make
-/// every admin write compile their rule sets for a check that runtime cache
-/// construction already performs fail-closed over the complete plugin chain.
+/// Built-ins that only need `enforces_finalized_request_policy()` for the
+/// early-egress composition gate are *not* listed here: they live in
+/// [`FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS`] and are admitted through a
+/// pure capability view so candidate writes do not compile expensive rule sets
+/// merely to learn static protocol/capability metadata. Plugins that both
+/// enforce finalized request policy *and* participate in another composition
+/// invariant (body/header mutation, auth sole-gate, etc.) remain here and are
+/// fully constructed.
 const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "a2a_gateway",
     "ai_prompt_compressor",
@@ -3042,6 +3132,7 @@ fn is_security_composition_candidate_plugin(
     custom_plugin_names: &[&str],
 ) -> bool {
     SECURITY_COMPOSITION_PLUGIN_NAMES.contains(&plugin_name)
+        || finalized_request_policy_composition_spec(plugin_name).is_some()
         || custom_plugin_names.contains(&plugin_name)
 }
 
@@ -3086,6 +3177,16 @@ pub(crate) fn validate_plugin_security_composition_candidate(
                     terminate,
                 }) as Arc<dyn Plugin>)
             })
+        } else if let Some(spec) =
+            finalized_request_policy_composition_spec(plugin_config.plugin_name.as_str())
+        {
+            Ok(Some(Arc::new(FinalizedRequestPolicyCompositionPlugin {
+                name: spec.name,
+                priority: plugin_config
+                    .priority_override
+                    .unwrap_or(spec.default_priority),
+                protocols: spec.protocols,
+            }) as Arc<dyn Plugin>))
         } else {
             try_create_plugin(
                 plugin_config,
@@ -3194,11 +3295,11 @@ fn remove_shadowed_global_plugin(
 }
 
 /// Cross-plugin composition candidate validation. The security composition
-/// candidate walker constructs every composition-relevant plugin once, except
-/// for the environment-bound serverless plugin whose static capability view is
-/// sufficient, and runs both the security-sensitive ordering/body-view
-/// invariants and the correlation-header invariants. This remains the single
-/// admission entrypoint for both concerns.
+/// candidate walker constructs every composition-relevant plugin once — using a
+/// pure capability view for environment-bound `serverless_function` and for
+/// expensive final request-body policy plugins — and runs both the
+/// security-sensitive ordering/body-view invariants and the correlation-header
+/// invariants. This remains the single admission entrypoint for both concerns.
 pub(crate) fn validate_plugin_composition_candidate(
     config: &GatewayConfig,
     http_client: &PluginHttpClient,
