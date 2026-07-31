@@ -2,7 +2,6 @@
 //! proxy_alerts pending-state / generation retirement contracts (#2448).
 
 use std::collections::HashMap;
-use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,6 +22,7 @@ use ferrum_edge::plugins::proxy_alerts::cooldown::{LifecycleOutcome, RecoveryGat
 use ferrum_edge::plugins::proxy_alerts::windows::monotonic_now_ms;
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use ferrum_edge::plugins::{Plugin, TransactionSummary};
+use futures_util::FutureExt as _;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -413,8 +413,8 @@ async fn semaphore_exhaustion_increments_backpressure_and_skips_send() {
         settles.snapshot(),
         vec![DispatchSettle::Abandoned(AbandonReason::Backpressure)]
     );
-    match listener.try_accept() {
-        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+    match listener.accept().now_or_never() {
+        None => {}
         other => panic!("exhausted semaphore must not connect: {other:?}"),
     }
 }
@@ -474,8 +474,8 @@ async fn pre_task_generation_rejection_is_visible_without_inflating_attempted() 
         "the producer callback must still run exactly once, with a precise reason"
     );
     // Non-vacuous: prove nothing was ever sent.
-    match listener.try_accept() {
-        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+    match listener.accept().now_or_never() {
+        None => {}
         other => panic!("a rejected dispatch must not reach the endpoint: {other:?}"),
     }
     assert_eq!(generation.in_flight(), 0);
