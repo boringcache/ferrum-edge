@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_proxy};
 
@@ -8138,6 +8139,39 @@ fn skip_reason(ctx: &RequestContext) -> Option<&str> {
         .map(String::as_str)
 }
 
+struct UnselectedClientContract {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Plugin for UnselectedClientContract {
+    fn name(&self) -> &str {
+        "unselected_client_contract"
+    }
+
+    fn validates_client_request_body_contract(&self) -> bool {
+        true
+    }
+
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        true
+    }
+
+    fn should_buffer_request_body(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
+    async fn validate_client_request_body_contract(
+        &self,
+        _ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        PluginResult::Continue
+    }
+}
+
 #[tokio::test]
 async fn buffering_ignores_the_received_content_type() {
     let plugin = OpenapiValidator::new(&attestation_config("block")).unwrap();
@@ -8612,6 +8646,32 @@ async fn response_only_sibling_keeps_its_backend_final_fallback_after_route_rewr
         Some(400),
     );
     assert_eq!(contract_phase(&ctx), Some("backend_final"));
+}
+
+#[tokio::test]
+async fn shared_runner_honors_each_instances_buffering_predicate() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(OpenapiValidator::new(&attestation_config("block")).unwrap()),
+        Arc::new(UnselectedClientContract {
+            calls: calls.clone(),
+        }),
+    ];
+    let mut ctx = orders_ctx();
+
+    assert_continue(
+        apply_client_request_contract_validation_for_test(
+            &plugins,
+            &mut ctx,
+            br#"{"id":"a","client_attestation":"real"}"#,
+        )
+        .await,
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "a sibling-selected phase must not invoke an instance whose own buffering predicate is false"
+    );
 }
 
 #[tokio::test]
