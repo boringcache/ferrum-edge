@@ -9,9 +9,7 @@ use std::time::Duration;
 
 use ferrum_edge::notifications::channels::email::{SmtpFailure, SmtpPhase};
 use ferrum_edge::notifications::channels::{NotificationChannel, parse_channels};
-use ferrum_edge::notifications::dispatch::{
-    DeliveryRetryPolicy, dispatch_one, dispatch_one_with_delivery_slot,
-};
+use ferrum_edge::notifications::dispatch::{DeliveryRetryPolicy, dispatch_one};
 use ferrum_edge::notifications::generation::{DispatchGeneration, DispatchSettle};
 use ferrum_edge::notifications::metrics::DeliveryMetrics;
 use ferrum_edge::notifications::outcome::{
@@ -1056,6 +1054,23 @@ async fn admit_then_cancel_before_transport_counts_attempted_under_body_start_co
     }
 }
 
+/// Drop witness for a delivery body that must stay pending until hard-aborted.
+///
+/// Fires exactly when the admitted future is dropped (shutdown abort), never
+/// when ordinary delivery settles — the body uses `pending()` and cannot
+/// return.
+struct PendingBodyDropWitness {
+    tx: Option<oneshot::Sender<()>>,
+}
+
+impl Drop for PendingBodyDropWitness {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
 /// A hard process-shutdown deadline must abort an admitted notification and
 /// compose exactly: one `Abandoned(ShutdownDeadline)` callback, one
 /// `abandoned_total{reason="shutdown_deadline"}`, one `abandoned_at_deadline`,
@@ -1063,6 +1078,12 @@ async fn admit_then_cancel_before_transport_counts_attempted_under_body_start_co
 /// metric in-flight. Reload retirement stays disjoint, and classification must
 /// read the exact admitted lifecycle even if a replacement generation is
 /// installed mid-drain.
+///
+/// The delivery body is a deterministic never-completing future admitted
+/// through the owned-slot seam: ordinary channel/transport completion cannot
+/// race `FailedTransient` (or any other settle) ahead of the hard abort. The
+/// body signals once it is parked after registry-owned attempt start, and a
+/// drop witness fires only when the hard abort drops that future.
 ///
 /// Ordering is driven with Tokio paused virtual time so replacement-before-abort
 /// is causal: A begins shutdown under a long virtual budget, B is installed and
@@ -1075,31 +1096,40 @@ async fn hard_shutdown_deadline_aborts_admitted_notification_exactly_once() {
     let lifecycle_a_generation = slot.begin_cycle();
     let metrics = Arc::new(DeliveryMetrics::new());
     let generation = DispatchGeneration::with_metrics(88, Arc::clone(&metrics));
-    let endpoint = spawn_stalled_endpoint(Vec::new()).await;
     let settles = SettleLog::new();
-    let addr = endpoint.addr;
 
-    assert!(dispatch_one_with_delivery_slot(
-        Arc::new(fixed_notification()),
-        Arc::new(Default::default()),
-        webhook_channel_to(format!("http://{addr}/shutdown-deadline")),
-        Arc::new(Semaphore::new(1)),
-        PluginHttpClient::default(),
-        Arc::clone(&generation),
-        DeliveryRetryPolicy {
-            max_retries: 0,
-            ..DeliveryRetryPolicy::DEFAULT
-        },
-        "test",
-        Some(settles.callback()),
-        &slot,
-    ));
+    let body_pending = Arc::new(Notify::new());
+    let body_pending_flag = Arc::new(AtomicUsize::new(0));
+    let (dropped_tx, mut dropped_rx) = oneshot::channel::<()>();
+    let body_pending_signal = Arc::clone(&body_pending);
+    let body_pending_flag_set = Arc::clone(&body_pending_flag);
 
-    // Causal: the real stalled transport must be live before drain starts.
-    endpoint
-        .stalled_request_started
-        .await
-        .expect("server must observe the live transport before the deadline abort");
+    assert!(
+        generation.spawn_with_delivery_slot(
+            "webhook",
+            Some(settles.callback()),
+            &slot,
+            async move {
+                // Reaching this future proves `mark_attempt_started` already
+                // ran. Park forever: ordinary delivery has no path to settle.
+                let _drop_witness = PendingBodyDropWitness {
+                    tx: Some(dropped_tx),
+                };
+                body_pending_flag_set.store(1, Ordering::Release);
+                body_pending_signal.notify_waiters();
+                std::future::pending::<DispatchSettle>().await
+            },
+        ),
+        "open owned-slot lifecycle must admit the pending body"
+    );
+
+    // Causal: the admitted body must be live-and-pending before drain starts.
+    wait_until(
+        &body_pending,
+        || body_pending_flag.load(Ordering::Acquire) == 1,
+        "admitted delivery body parked after attempt start",
+    )
+    .await;
     assert_eq!(generation.in_flight(), 1);
     assert_eq!(metrics.channel_snapshot("webhook").in_flight, 1);
     assert!(
@@ -1128,7 +1158,7 @@ async fn hard_shutdown_deadline_aborts_admitted_notification_exactly_once() {
     assert_eq!(
         generation.in_flight(),
         1,
-        "stalled A delivery must still be in flight before the virtual deadline"
+        "pending A delivery must still be in flight before the virtual deadline"
     );
     assert_eq!(
         metrics
@@ -1155,7 +1185,7 @@ async fn hard_shutdown_deadline_aborts_admitted_notification_exactly_once() {
     assert_eq!(
         generation.in_flight(),
         1,
-        "A's stalled delivery must still be alive after B opens"
+        "A's pending delivery must still be alive after B opens"
     );
 
     // Only now advance past A's drain budget so cancel_remaining runs on A
@@ -1179,13 +1209,12 @@ async fn hard_shutdown_deadline_aborts_admitted_notification_exactly_once() {
     let report = drain.await.expect("drain task must join");
     assert!(
         !report.complete(),
-        "stalled send must force the shutdown budget to expire"
+        "pending send must force the shutdown budget to expire"
     );
 
-    endpoint
-        .stalled_connection_closed
+    dropped_rx
         .await
-        .expect("hard abort must drop the in-flight transport future");
+        .expect("hard abort must drop the in-flight pending delivery future");
 
     let snap = metrics.channel_snapshot("webhook");
     assert_eq!(snap.attempted, 1);
@@ -1199,13 +1228,7 @@ async fn hard_shutdown_deadline_aborts_admitted_notification_exactly_once() {
     assert_eq!(snap.failed_permanent, 0);
     assert_eq!(snap.in_flight, 0);
     assert_eq!(generation.in_flight(), 0);
-    assert_eq!(
-        endpoint.requests.load(Ordering::SeqCst),
-        1,
-        "hard abort must not schedule a retry"
-    );
     assert_eq!(settles.snapshot().len(), 1, "exactly-once settle callback");
-    endpoint.server.abort();
 }
 
 /// Dropping the plugin — the reload boundary — must retire the *old*

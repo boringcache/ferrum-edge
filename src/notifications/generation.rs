@@ -223,10 +223,13 @@ impl DispatchGeneration {
     /// Spawn through an owned [`crate::observability_delivery::DeliverySlot`]
     /// instead of the process-global registry.
     ///
-    /// Crate-private seam for the hidden owned-slot dispatch wrapper used by
-    /// external shutdown-deadline regressions. Production callers use
-    /// [`Self::spawn`].
-    pub(crate) fn spawn_with_delivery_slot<F>(
+    /// Hidden test seam only: external shutdown-deadline regressions must drive
+    /// a hard abort on an owned slot without closing process-global admission,
+    /// and must inject a future that cannot settle by ordinary delivery. The
+    /// wrapper stays public solely because those regressions live under
+    /// `tests/`; production callers use [`Self::spawn`].
+    #[doc(hidden)]
+    pub fn spawn_with_delivery_slot<F>(
         self: &Arc<Self>,
         channel_type: &'static str,
         on_settle: Option<DeliveryCallback>,
