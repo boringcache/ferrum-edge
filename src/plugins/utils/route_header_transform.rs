@@ -103,6 +103,13 @@ fn finalize_route_override_response_headers_inner(
             ctx.record_deadline_owned_response_headers(&owned, response_headers);
         }
     }
+    // Whole-value ownership above covers writes whose final bytes can be
+    // indistinguishable from the backend baseline. Record the completed route
+    // phase as well so ordinary removals and appends are reconciled into
+    // deadline provenance. This must live in the finalizer rather than its
+    // callers: rejection/deadline early-return paths can finalize outside the
+    // ordinary after-proxy loop.
+    ctx.record_deadline_response_header_mutations(response_headers);
 }
 
 /// Operation in a route-level header transform.

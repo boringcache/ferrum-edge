@@ -17477,11 +17477,6 @@ pub(crate) async fn run_after_proxy_hooks(
         };
         match result {
             PluginResult::Continue => {
-                ctx.record_buffered_initial_response_header_plugin(
-                    plugin.as_ref(),
-                    response_headers,
-                );
-                ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
                 // After the last eligible response_transformer static-rule pass,
                 // apply matched route response-header transforms exactly once so
                 // later same-type instances cannot undo route policy
@@ -17497,6 +17492,15 @@ pub(crate) async fn run_after_proxy_hooks(
                         response_headers,
                     );
                 }
+                // Snapshot the complete phase, including the chain-level route
+                // finalization above. Recording before finalization would omit
+                // route removals/appends from buffered gRPC trailer policy and
+                // deadline provenance.
+                ctx.record_buffered_initial_response_header_plugin(
+                    plugin.as_ref(),
+                    response_headers,
+                );
+                ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
             }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let RejectedResponseParts {

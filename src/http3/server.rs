@@ -3019,23 +3019,18 @@ async fn handle_h3_request(
     if needs_header_clone {
         let phase_start = std::time::Instant::now();
         let mut cloned = ctx.headers.clone();
-        for plugin in plugins.iter() {
-            if backend_path_is_policy_bound
-                && plugin.defer_before_proxy_until_backend_path_resolved()
-            {
-                continue;
-            }
-            let deadline = ctx.grpc_deadline_at();
-            match crate::plugins::await_request_plugin_deadline_with_provenance(
-                deadline,
-                plugin.before_proxy(&mut ctx, &mut cloned),
-            )
-            .await
-            .into_plugin_result(&mut ctx)
-            {
-                PluginResult::Continue => {}
-                reject @ PluginResult::Reject { .. }
-                | reject @ PluginResult::RejectBinary { .. } => {
+        match crate::proxy::run_before_proxy_hooks_for_backend_path_policy(
+            &plugins,
+            &mut ctx,
+            &mut cloned,
+            backend_path_is_policy_bound,
+            crate::proxy::BackendPathBeforeProxyPass::Initial,
+        )
+        .await
+        {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. }
+            | reject @ PluginResult::RejectBinary { .. } => {
                     let Some(reject) = plugin_result_into_reject_parts(reject) else {
                         tracing::error!("Plugin result could not be converted to rejection parts");
                         run_h3_reject_response_committed_hooks(
@@ -3132,7 +3127,6 @@ async fn handle_h3_request(
                     )
                     .await?;
                     return Ok(());
-                }
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -3142,23 +3136,18 @@ async fn handle_h3_request(
         // satisfy the borrow checker without cloning (zero allocation hot path).
         let phase_start = std::time::Instant::now();
         let mut tmp_headers = std::mem::take(&mut ctx.headers);
-        for plugin in plugins.iter() {
-            if backend_path_is_policy_bound
-                && plugin.defer_before_proxy_until_backend_path_resolved()
-            {
-                continue;
-            }
-            let deadline = ctx.grpc_deadline_at();
-            match crate::plugins::await_request_plugin_deadline_with_provenance(
-                deadline,
-                plugin.before_proxy(&mut ctx, &mut tmp_headers),
-            )
-            .await
-            .into_plugin_result(&mut ctx)
-            {
-                PluginResult::Continue => {}
-                reject @ PluginResult::Reject { .. }
-                | reject @ PluginResult::RejectBinary { .. } => {
+        match crate::proxy::run_before_proxy_hooks_for_backend_path_policy(
+            &plugins,
+            &mut ctx,
+            &mut tmp_headers,
+            backend_path_is_policy_bound,
+            crate::proxy::BackendPathBeforeProxyPass::Initial,
+        )
+        .await
+        {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. }
+            | reject @ PluginResult::RejectBinary { .. } => {
                     let Some(reject) = plugin_result_into_reject_parts(reject) else {
                         tracing::error!("Plugin result could not be converted to rejection parts");
                         ctx.headers = tmp_headers;
@@ -3257,7 +3246,6 @@ async fn handle_h3_request(
                     )
                     .await?;
                     return Ok(());
-                }
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
