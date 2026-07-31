@@ -6107,13 +6107,20 @@ pub mod _test_support {
         response_headers: &mut std::collections::HashMap<String, String>,
         response_body: &mut bytes::Bytes,
     ) {
-        crate::plugins::install_response_buffer_capacity_refusal(
+        crate::proxy::replace_buffered_response_with_capacity_refusal(
             ctx,
             response_status,
             response_headers,
             response_body,
+            &[],
         );
     }
+
+    /// The exact metadata key that stamps a request as a translated/retained
+    /// gRPC-Web exchange, so a test can drive the gRPC-Web terminal shape through
+    /// the same provenance the proxy uses.
+    pub const GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY: &str =
+        crate::plugins::grpc_web::META_GRPC_WEB_ORIGINAL_CT;
 
     /// Whether ANY active buffering plugin will let the shared retry refinement
     /// consider releasing this response.

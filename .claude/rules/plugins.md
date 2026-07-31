@@ -107,6 +107,16 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
      `apply_websocket_handshake_response_headers` boundary in configured order.
      Transport-owned handshake/framing fields are stripped afterward and
      restored only by proxy core.
+7b. `on_final_response_headers`: header-only effects for the response the proxy
+    actually selected, run at the END of the `after_proxy` chain (so a later
+    hook's header rules are already applied) and on BOTH the streaming and
+    buffered paths. Non-rejecting. This is where work that must not depend on
+    collecting a body lives — `response_caching` completes its RFC 9111
+    invalidation and cacheability-predictor marking here, which is what lets it
+    release a response whose store path the headers already closed
+    (GHSA-pwcm-6rh8-f2gh). A plugin that also runs `on_final_response_body` must
+    stage this phase's outcome under its own instance-namespaced metadata key and
+    consume it there, so one semantic effect never happens twice.
 8. `normalize_response_body`: provider/protocol adapters produce the client-visible buffered representation
 9. `on_response_body`: AI response guard and token metrics inspect the normalized body
 10. `transform_response_body`: ordinary client-facing body rewrites

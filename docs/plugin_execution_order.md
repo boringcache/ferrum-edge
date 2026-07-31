@@ -120,6 +120,11 @@ Request In
 └────────────┬────────────┘
              │
              ▼
+┌──────────────────────────────┐
+│ 7b. on_final_response_headers │ Header-only effects for the selected response
+└────────────┬─────────────────┘
+             │
+             ▼
 ┌─────────────────────────┐
 │ 8. normalize_response_body │ Provider/protocol normalization
 └────────────┬────────────┘
@@ -146,6 +151,8 @@ Request In
              │
              │  Streamed non-buffered bodies skip phases 8-12 and call
              │  on_response_stream_terminated here when the body terminates.
+             │  Phase 7b is the last one they DO run, which is why it owns any
+             │  response-side effect that must not depend on collecting a body.
              │
              ▼
 ┌─────────────────────────┐
@@ -780,7 +787,7 @@ Given all built-in plugins enabled, the execution order is:
 | 53 | `load_testing` | 3070 | before_proxy |
 | 54 | `request_mirror` | 3075 | authorize (pre-buffer mirror admission; never rejects), finalized request egress |
 | 55 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
-| 56 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
+| 56 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_headers, on_final_response_body |
 | 57 | `response_transformer` | 4000 | after_proxy, transform_response_body |
 | 58 | `compression` | 4050 | normalize_buffered_request_body_before_before_proxy, before_proxy, after_proxy, transform_request_body, transform_response_body |
 | 59 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body_with_context, on_final_request_body_with_context |

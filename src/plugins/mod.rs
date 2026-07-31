@@ -8,12 +8,19 @@
 //! deferred routing-header hooks → remaining deferred `before_proxy` hooks →
 //! `transform_request_body` →
 //! `on_final_request_body` → `dispatch_finalized_request_egress` →
-//! `backend_admission` → `after_proxy` →
+//! `backend_admission` → `after_proxy` → `on_final_response_headers` →
 //! `normalize_response_body` → `on_response_body` →
 //! `transform_response_body` → `on_final_response_body` →
 //! `on_response_committed` (buffered responses only) →
 //! `on_response_stream_terminated` (streamed responses only) → `log` →
 //! `on_ws_frame`.
+//!
+//! `on_final_response_headers` closes the `after_proxy` chain for the response
+//! the proxy actually selected. It is the only response-side phase that runs
+//! identically for streamed and buffered bodies after the headers are final, so
+//! a plugin whose remaining work is decidable from status + headers completes it
+//! there instead of stranding it behind `on_final_response_body`, which a
+//! streaming response never reaches (`GHSA-pwcm-6rh8-f2gh`).
 //!
 //! `dispatch_finalized_request_egress` is irreversible outbound request egress
 //! (`request_mirror`, `serverless_function`, `ai_federation`) after every
@@ -5243,93 +5250,29 @@ pub(crate) fn clear_response_stream_inspector_state(ctx: &mut RequestContext) {
     ctx.response_stream_completion = None;
 }
 
-/// Whether the response the gateway is about to emit is gRPC-flavored, so a
-/// gateway-authored refusal must terminate through gRPC status metadata instead
-/// of an HTTP status change.
+/// Run the final response-header phase over the response the proxy actually
+/// selected.
 ///
-/// Two provenances, because either one alone misses a real case: a native gRPC
-/// response names itself through `content-type`, while a translated gRPC-Web
-/// response carries a `grpc-web…` type whose terminal metadata is body-framed
-/// and is recognised from the request-scoped translation marker.
-pub(crate) fn response_is_grpc_flavored(
-    ctx: &RequestContext,
-    response_headers: &HashMap<String, String>,
-) -> bool {
-    if crate::plugins::grpc_web::request_is_grpc_web_translated(ctx) {
-        return true;
-    }
-    response_headers.get("content-type").is_some_and(|value| {
-        crate::proxy::backend_dispatch::is_native_grpc_content_type(value.as_bytes())
-    })
-}
-
-/// Install the gateway-local retained-response-capacity refusal over whatever
-/// buffered representation was being assembled (GHSA-pwcm-6rh8-f2gh).
+/// This is the last point at which the client-visible response headers are
+/// complete and no longer speculative: every `after_proxy` hook has run and
+/// accepted, retry selection is finished, and the same call happens whether the
+/// body will be streamed or buffered. Plugins whose only remaining work is
+/// decidable from status + headers own it here instead of hiding it behind a
+/// buffered-body hook that never runs for a streaming response
+/// (GHSA-pwcm-6rh8-f2gh).
 ///
-/// One helper for every buffered response phase that can be refused after the
-/// backend already answered (normalization, body transform), so the
-/// client-visible outcome cannot drift between them:
-///
-/// * **HTTP** — the status becomes [`RESPONSE_BUFFER_OVERLOAD_STATUS`] (`503`),
-///   not the backend's, because the representation the backend chose no longer
-///   exists and its status would advertise a body the client is not getting.
-///   The body is the fixed, redaction-safe overload payload; `Content-Type` and
-///   `Content-Length` describe those bytes, and any backend `Content-Encoding` /
-///   `Content-Range` / `Transfer-Encoding` / `ETag` / `Digest` metadata is
-///   removed because it described bytes the gateway just discarded.
-/// * **gRPC / gRPC-Web** — the HTTP status is left alone (gRPC errors ride
-///   HTTP 200) and the refusal is expressed as `RESOURCE_EXHAUSTED` terminal
-///   metadata with the fixed message, over an empty body. The caller reconciles
-///   that metadata from the header map exactly as it does for every other
-///   gateway-authored gRPC terminal.
-///
-/// [`RESPONSE_BUFFER_OVERLOAD_STATUS`]:
-///     crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS
-pub(crate) fn install_response_buffer_capacity_refusal(
+/// Deliberately non-rejecting and synchronous: it exists to let a plugin
+/// *complete* a decision it already made, not to introduce a new terminal
+/// boundary after the response has been shaped.
+pub(crate) fn run_final_response_header_hooks(
+    plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
-    response_status: &mut u16,
-    response_headers: &mut HashMap<String, String>,
-    response_body: &mut bytes::Bytes,
+    response_status: u16,
+    response_headers: &HashMap<String, String>,
 ) {
-    use crate::proxy::response_buffer_budget as budget;
-
-    // Header fields that describe the *discarded* representation. Leaving any
-    // of them beside the gateway's own payload would advertise an encoding,
-    // framing, byte range, or validator for bytes the client is not receiving.
-    const STALE_REPRESENTATION_HEADERS: [&str; 6] = [
-        "content-encoding",
-        "content-range",
-        "transfer-encoding",
-        "etag",
-        "digest",
-        "content-digest",
-    ];
-
-    let grpc_flavored = response_is_grpc_flavored(ctx, response_headers);
-    response_headers.retain(|name, _| {
-        !STALE_REPRESENTATION_HEADERS
-            .iter()
-            .any(|stale| name.eq_ignore_ascii_case(stale))
-    });
-    if grpc_flavored {
-        *response_body = bytes::Bytes::new();
-        response_headers.insert(
-            "grpc-status".to_string(),
-            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS.to_string(),
-        );
-        response_headers.insert(
-            "grpc-message".to_string(),
-            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE.to_string(),
-        );
-        response_headers.insert("content-length".to_string(), "0".to_string());
-    } else {
-        *response_status = budget::RESPONSE_BUFFER_OVERLOAD_STATUS;
-        *response_body =
-            bytes::Bytes::from_static(budget::RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
-        response_headers.insert("content-type".to_string(), "application/json".to_string());
-        response_headers.insert("content-length".to_string(), response_body.len().to_string());
+    for plugin in plugins {
+        plugin.on_final_response_headers(ctx, response_status, response_headers);
     }
-    ctx.record_deadline_response_header_mutations(response_headers);
 }
 
 /// Run buffered provider/protocol normalizers before response-body policy
@@ -5399,10 +5342,10 @@ pub async fn normalize_response_body_for_inspection(
             // request: the permit is returned when the last handle to those
             // bytes drops, wherever they end up (GHSA-pwcm-6rh8-f2gh).
             //
-            // Refusal fails closed: the oversized replacement is dropped unread
-            // and the gateway's own transient-capacity response — `503` plus the
-            // fixed redaction-safe body, or the gRPC `RESOURCE_EXHAUSTED`
-            // terminal for a gRPC-flavored response — is installed instead.
+            // Refusal fails closed through the SAME gateway-authored terminal
+            // machinery the deadline and representation-error replacements use,
+            // so a gRPC-Web refusal is body-framed and no header describing the
+            // discarded representation survives.
             let body_len = body.len();
             let Some(charged) = crate::proxy::response_buffer_budget::charge_replacement_body(body)
             else {
@@ -5410,11 +5353,12 @@ pub async fn normalize_response_body_for_inspection(
                     plugin = plugin.name(),
                     "Response normalization refused: aggregate retained-response budget exhausted"
                 );
-                install_response_buffer_capacity_refusal(
+                crate::proxy::replace_buffered_response_with_capacity_refusal(
                     ctx,
                     response_status,
                     response_headers,
                     response_body,
+                    initial_response_header_policy_plugins,
                 );
                 return true;
             };
@@ -8025,6 +7969,42 @@ pub trait Plugin: Send + Sync {
         _body: &[u8],
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Complete this plugin's header-only response work over the response the
+    /// proxy actually selected.
+    ///
+    /// Called once per request, at the end of the `after_proxy` chain, only when
+    /// every hook there accepted the response. Three properties make this the
+    /// exact boundary for a decision that must not depend on the body:
+    ///
+    ///   * **Final.** Retry selection is complete, so a discarded attempt never
+    ///     reaches it and the headers are the ones the client will see, after
+    ///     every `after_proxy` header rule (route overrides, `response_transformer`
+    ///     rules, security headers) has been applied.
+    ///   * **Protocol-uniform.** It runs from `run_after_proxy_hooks`, which every
+    ///     H1/H2, buffered and streaming H3, native gRPC, and gRPC-Web path funnels
+    ///     through, so no frontend protocol can skip it.
+    ///   * **Body-independent.** It runs identically whether the body will be
+    ///     streamed or buffered, which is what lets a plugin release a response to
+    ///     the streaming path *without* silently dropping a header-only side
+    ///     effect that used to ride `on_final_response_body`
+    ///     (GHSA-pwcm-6rh8-f2gh).
+    ///
+    /// Non-rejecting by contract: the response has already been shaped and
+    /// committed to by the `after_proxy` chain. A plugin that needs to reject
+    /// must do so in `after_proxy` or a body hook.
+    ///
+    /// A plugin that also runs `on_final_response_body` must make the pair
+    /// idempotent — typically by staging this phase's outcome in its own
+    /// instance-namespaced metadata and consuming it there, so one semantic
+    /// effect never happens twice on the buffered path.
+    fn on_final_response_headers(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) {
     }
 
     /// Transform the request body before it is sent to the backend.

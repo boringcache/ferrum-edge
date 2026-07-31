@@ -17460,6 +17460,20 @@ pub(crate) async fn run_after_proxy_hooks(
     ctx.metadata
         .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
     ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
+
+    // Final response-header phase. Reached only when the whole `after_proxy`
+    // chain accepted this response, which makes `response_headers` the
+    // client-visible header set for the response the proxy actually selected:
+    // retries are already resolved, and every header rule in the chain above has
+    // run. Placed inside this function rather than at its call sites so every
+    // protocol path — H1/H2, buffered and streaming H3, native gRPC, gRPC-Web —
+    // reaches it identically and none can be forgotten
+    // (GHSA-pwcm-6rh8-f2gh).
+    //
+    // A rejected response deliberately does NOT reach it: the backend
+    // representation was discarded, exactly as today's buffered
+    // `on_final_response_body` is skipped for an `after_proxy` reject.
+    crate::plugins::run_final_response_header_hooks(plugins, ctx, response_status, response_headers);
     None
 }
 
@@ -18551,6 +18565,129 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
     StatusCode::OK
 }
 
+/// Replace a buffered response whose replacement allocation the aggregate
+/// retained-response budget refused with the gateway's own transient-capacity
+/// terminal (GHSA-pwcm-6rh8-f2gh).
+///
+/// One helper for every buffered phase that can be refused after the backend
+/// already answered (normalization, body transform), so the client-visible
+/// outcome cannot drift between them — and deliberately built from the SAME
+/// three-branch machinery as [`replace_buffered_grpc_response_with_deadline`]
+/// and `replace_buffered_response_with_representation_error`, because a
+/// hand-rolled terminal gets the protocol shape wrong in two ways that matter:
+///
+/// * **gRPC-Web** carries terminal metadata in a body trailer FRAME, never as
+///   response header fields. Writing `grpc-status` into the header map and
+///   emptying the body would emit unframed terminal metadata a gRPC-Web client
+///   cannot read as the RPC's status.
+/// * **Every gRPC flavor** must shed the backend's terminal metadata, not just
+///   its entity headers: a surviving `grpc-status-details-bin` (or a custom
+///   trailer already merged into the header view) would ship beside
+///   `RESOURCE_EXHAUSTED` while describing a different status.
+///   `retain_deadline_response_gateway_headers` rebuilds from provenance-known
+///   gateway output, so nothing the backend authored can survive by name.
+///
+/// Plain HTTP keeps the narrower discipline it already had: this path does not
+/// re-run the reject-path `after_proxy` decorators, so wholesale-clearing the
+/// map would strip CORS, correlation, and tracing headers with nothing to
+/// restore them. Only the fields describing the discarded representation go.
+///
+/// The native-gRPC branch is selected from the request-scoped inbound flavor
+/// (`ctx.is_native_grpc_request()`), never from a mutable effective
+/// `content-type` that a response hook may have relabelled.
+///
+/// The gateway terminal itself is a small fixed payload (an empty body, a
+/// trailer frame, or [`response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY`])
+/// and is deliberately not charged against the budget — same as every other
+/// gateway-authored terminal. Charging it could only fail, and failing to
+/// install a refusal is the one outcome this path must never produce.
+pub(crate) fn replace_buffered_response_with_capacity_refusal(
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) {
+    use crate::proxy::response_buffer_budget as budget;
+
+    let owned_grpc_web_response_content_type =
+        crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
+    let grpc_web_response_content_type = owned_grpc_web_response_content_type.as_deref();
+    let native_grpc_request = ctx.is_native_grpc_request();
+
+    // Both gRPC branches rebuild from provenance-known gateway output. With no
+    // state recorded this idempotent ensure still makes
+    // `retain_deadline_response_gateway_headers` clear the map wholesale rather
+    // than trusting backend fields by name.
+    if grpc_web_response_content_type.is_some() || native_grpc_request {
+        ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
+    }
+
+    if let Some(content_type) = grpc_web_response_content_type {
+        ctx.retain_deadline_response_gateway_headers(response_headers);
+        let mut response = crate::plugins::grpc_web::error_response_for_content_type(
+            content_type,
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+        );
+        response.headers.extend(response_headers.drain());
+        finalize_grpc_web_error_response_headers(
+            &mut response,
+            initial_response_header_policy_plugins,
+            None,
+        );
+        *response_headers = response.headers;
+        *response_body = Bytes::from(response.body);
+        *response_status = StatusCode::OK.as_u16();
+        ctx.sync_deadline_response_terminal_headers(response_headers);
+        insert_grpc_error_metadata(
+            &mut ctx.metadata,
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+        );
+    } else if native_grpc_request {
+        ctx.retain_deadline_response_gateway_headers(response_headers);
+        grpc_proxy::finalize_grpc_error_response_headers(
+            response_headers,
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+            initial_response_header_policy_plugins,
+        );
+        *response_body = Bytes::new();
+        *response_status = StatusCode::OK.as_u16();
+        ctx.sync_deadline_response_terminal_headers(response_headers);
+        insert_grpc_error_metadata(
+            &mut ctx.metadata,
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+        );
+    } else {
+        // Plain HTTP keeps the narrower discipline: drop exactly the fields that
+        // described the DISCARDED representation — an encoding, framing, byte
+        // range, or validator for bytes the client is not receiving — while
+        // leaving gateway decorations (CORS, correlation, tracing) that this path
+        // does not re-run reject hooks to restore.
+        const STALE_REPRESENTATION_HEADERS: [&str; 6] = [
+            "content-encoding",
+            "content-range",
+            "transfer-encoding",
+            "etag",
+            "digest",
+            "content-digest",
+        ];
+        response_headers.retain(|name, _| {
+            !STALE_REPRESENTATION_HEADERS
+                .iter()
+                .any(|stale| name.eq_ignore_ascii_case(stale))
+        });
+        *response_status = budget::RESPONSE_BUFFER_OVERLOAD_STATUS;
+        *response_body = Bytes::from_static(budget::RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
+        response_headers.insert("content-type".to_string(), "application/json".to_string());
+        response_headers.insert("content-length".to_string(), response_body.len().to_string());
+    }
+    ctx.record_deadline_response_header_mutations(response_headers);
+}
+
 /// Client-visible message when a configured response body policy could not be
 /// applied to the representation the backend produced.
 ///
@@ -18972,11 +19109,12 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
                     plugin = plugin.name(),
                     "Response body transform refused: aggregate retained-response budget exhausted"
                 );
-                crate::plugins::install_response_buffer_capacity_refusal(
+                replace_buffered_response_with_capacity_refusal(
                     ctx,
                     response_status,
                     response_headers,
                     response_body,
+                    initial_response_header_policy_plugins,
                 );
                 return (true, true);
             };

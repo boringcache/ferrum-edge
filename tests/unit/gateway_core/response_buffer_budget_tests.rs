@@ -596,16 +596,31 @@ fn a_refused_http_replacement_becomes_a_gateway_503_with_clean_metadata() {
     assert!(!rendered.contains("backend representation"));
 }
 
-/// A gRPC-flavored response terminates through gRPC status metadata instead:
-/// gRPC errors ride HTTP 200, so rewriting the HTTP status would break the
-/// protocol contract rather than express the refusal.
+/// A NATIVE gRPC response terminates through Trailers-Only gRPC status metadata
+/// instead: gRPC errors ride HTTP 200, so rewriting the HTTP status would break
+/// the protocol contract rather than express the refusal.
+///
+/// The flavor is taken from the request-scoped inbound classification, never
+/// from a response `Content-Type` a hook may have relabelled.
 #[test]
-fn a_refused_grpc_replacement_terminates_through_grpc_metadata() {
+fn a_refused_native_grpc_replacement_terminates_through_grpc_metadata() {
     let mut ctx = refusal_ctx();
+    ferrum_edge::_test_support::set_request_http_flavor_for_test(
+        &mut ctx,
+        ferrum_edge::HttpFlavor::Grpc,
+    );
     let mut status = 200u16;
     let mut headers = refusal_headers(&[
         ("content-type", "application/grpc+proto"),
         ("content-encoding", "gzip"),
+        // Terminal metadata the BACKEND authored for a different status. It
+        // describes an outcome the client is not getting and must not ship
+        // beside RESOURCE_EXHAUSTED.
+        ("grpc-status", "0"),
+        ("grpc-status-details-bin", "AAAA"),
+        ("x-backend-trailer", "leaked"),
+        ("set-cookie", "session=abc"),
+        ("etag", "\"v1\""),
     ]);
     let mut body = bytes::Bytes::from_static(b"\x00\x00\x00\x00\x05hello");
 
@@ -622,11 +637,85 @@ fn a_refused_grpc_replacement_terminates_through_grpc_metadata() {
     assert_eq!(
         headers.get("grpc-status"),
         Some(&expected_grpc_status),
-        "the resource/capacity status, not UNAVAILABLE or INTERNAL"
+        "the resource/capacity status, not UNAVAILABLE, INTERNAL, or the backend's OK"
     );
     assert!(headers.contains_key("grpc-message"));
-    assert_eq!(headers.get("content-length").map(String::as_str), Some("0"));
-    assert!(!headers.contains_key("content-encoding"));
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+    for stale in [
+        "grpc-status-details-bin",
+        "x-backend-trailer",
+        "set-cookie",
+        "etag",
+        "content-encoding",
+    ] {
+        assert!(
+            !headers.contains_key(stale),
+            "`{stale}` describes the discarded backend outcome and must not survive"
+        );
+    }
+}
+
+/// A TRANSLATED gRPC-Web response carries terminal metadata in a body trailer
+/// FRAME, never as response header fields. A refusal that wrote `grpc-status`
+/// into the header map and emptied the body would emit terminal metadata the
+/// client cannot read as the RPC's status.
+#[test]
+fn a_refused_grpc_web_replacement_terminates_through_a_body_trailer_frame() {
+    let mut ctx = refusal_ctx();
+    ctx.metadata.insert(
+        ferrum_edge::_test_support::GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY.to_string(),
+        "application/grpc-web+proto".to_string(),
+    );
+    let mut status = 200u16;
+    let mut headers = refusal_headers(&[
+        ("content-type", "application/grpc-web+proto"),
+        ("grpc-status", "0"),
+        ("grpc-status-details-bin", "AAAA"),
+        ("etag", "\"v1\""),
+    ]);
+    let mut body = bytes::Bytes::from_static(b"\x00\x00\x00\x00\x05hello");
+
+    ferrum_edge::_test_support::install_response_buffer_capacity_refusal_for_test(
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    );
+
+    assert_eq!(status, 200, "a gRPC-Web terminal must stay on HTTP 200");
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/grpc-web+proto")
+    );
+
+    // The terminal block is FRAMED: a trailer frame (flag byte 0x80) carrying
+    // the capacity status, not header fields.
+    assert!(
+        !body.is_empty(),
+        "gRPC-Web terminal metadata must be in the body, not header fields"
+    );
+    assert_eq!(body[0], 0x80, "leading byte marks a gRPC-Web trailer frame");
+    let rendered = String::from_utf8_lossy(&body).to_string();
+    let expected_grpc_status = RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS.to_string();
+    assert!(
+        rendered.contains(&format!("grpc-status: {expected_grpc_status}")),
+        "trailer frame must carry the capacity status: {rendered:?}"
+    );
+
+    for stale in ["grpc-status-details-bin", "etag"] {
+        assert!(
+            !headers.contains_key(stale),
+            "`{stale}` describes the discarded backend outcome and must not survive"
+        );
+    }
+    assert_ne!(
+        headers.get("grpc-status").map(String::as_str),
+        Some("0"),
+        "the backend's OK status must never survive a refusal"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -708,6 +797,79 @@ fn the_replacement_charge_is_not_request_scoped() {
         proxy.contains("charge_replacement_body(transformed)"),
         "the body-transform replacement must be charged to the allocation"
     );
+}
+
+/// Both buffered phases that can be refused after the backend answered must
+/// route through the SHARED gateway-terminal helper. A hand-rolled refusal is
+/// how the gRPC-Web branch came to emit unframed terminal metadata.
+#[test]
+fn every_capacity_refusal_uses_the_shared_gateway_terminal() {
+    let plugins = include_str!("../../../src/plugins/mod.rs");
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    for source in [plugins, proxy] {
+        assert!(
+            !source.contains("install_response_buffer_capacity_refusal"),
+            "the hand-rolled refusal installer must not return; it wrote gRPC-Web \
+             terminal metadata into header fields instead of a body trailer frame \
+             (GHSA-pwcm-6rh8-f2gh)"
+        );
+    }
+    assert_eq!(
+        proxy
+            .matches("replace_buffered_response_with_capacity_refusal(")
+            .count(),
+        2,
+        "one definition plus the body-transform call site; the normalize call \
+         site lives in src/plugins/mod.rs"
+    );
+    assert!(
+        plugins.contains("replace_buffered_response_with_capacity_refusal("),
+        "the normalize phase must use the same shared terminal"
+    );
+    assert!(
+        proxy.contains("crate::plugins::grpc_web::error_response_for_content_type("),
+        "a gRPC-Web capacity terminal must be built as a body trailer frame"
+    );
+}
+
+/// The final response-header phase is the whole basis for releasing a body, so
+/// it must run from the one boundary every protocol path funnels through, and
+/// the cache's own header effects must live in that hook rather than in a
+/// speculative buffering predicate.
+#[test]
+fn the_final_response_header_phase_runs_at_the_after_proxy_boundary() {
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let caching = include_str!("../../../src/plugins/response_caching.rs");
+    assert_eq!(
+        proxy
+            .matches("crate::plugins::run_final_response_header_hooks(")
+            .count(),
+        1,
+        "exactly one call site, inside `run_after_proxy_hooks`, so no protocol \
+         path can skip it (GHSA-pwcm-6rh8-f2gh)"
+    );
+    assert!(
+        caching.contains("fn on_final_response_headers("),
+        "response_caching must own its header-only effects in the header phase"
+    );
+    assert!(
+        caching.contains("fn classify_final_response_headers("),
+        "the release predicate must be a pure classification"
+    );
+    // The speculative predicates must call the PURE classifier, never the
+    // effect-taking one: an effect fired from a buffering vote would apply to
+    // attempts the proxy never adopts.
+    for speculative in [
+        "fn should_buffer_response_body_for_content_type(",
+        "fn should_release_response_body_under_retries(",
+    ] {
+        let start = caching.find(speculative).expect(speculative);
+        let body: String = caching[start..].chars().take(1400).collect();
+        assert!(
+            !body.contains("apply_final_response_header_effects("),
+            "`{speculative}` is speculative and must take no cache effect"
+        );
+    }
 }
 
 #[test]

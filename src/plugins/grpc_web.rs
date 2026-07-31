@@ -125,7 +125,7 @@ static INSTANCE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Written once by the translation owner; read by proxy/H3 dispatch helpers.
 const META_GRPC_WEB_MODE: &str = "grpc_web_mode";
 /// Metadata key storing the negotiated gRPC-Web response content-type.
-const META_GRPC_WEB_ORIGINAL_CT: &str = "grpc_web_original_ct";
+pub(crate) const META_GRPC_WEB_ORIGINAL_CT: &str = "grpc_web_original_ct";
 /// Metadata key storing the backend HTTP status observed in `after_proxy`.
 ///
 /// `transform_response_body` cannot see response status directly, so the

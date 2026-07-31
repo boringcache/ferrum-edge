@@ -489,7 +489,8 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "response_caching",
         classification: BuiltinPluginClassification::Public,
         priority: 3500,
-        active_phases: "before_proxy, after_proxy, on_final_response_body",
+        active_phases:
+            "before_proxy, after_proxy, on_final_response_headers, on_final_response_body",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "HTTP-only response cache lookup and store",
     },
