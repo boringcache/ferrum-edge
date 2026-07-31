@@ -5029,10 +5029,9 @@ pub mod _test_support {
     pub async fn apply_client_request_contract_validation_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
-        headers: &HashMap<String, String>,
         body: &[u8],
     ) -> crate::plugins::PluginResult {
-        crate::proxy::apply_client_request_contract_validation(plugins, ctx, headers, body).await
+        crate::proxy::apply_client_request_contract_validation(plugins, ctx, body).await
     }
 
     /// `true` when the pre-`before_proxy` requirements this request computes

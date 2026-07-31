@@ -3284,21 +3284,29 @@ pub(crate) const CLIENT_REQUEST_CONTRACT_PHASE: &str = "validate_client_request_
 pub(crate) async fn apply_client_request_contract_validation(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
-    headers: &HashMap<String, String>,
     body: &[u8],
 ) -> PluginResult {
     for plugin in plugins {
-        if !plugin.validates_client_request_body_contract() {
+        // The phase is scheduled once when any instance selects it, but each
+        // instance keeps its own request-time applicability. Recheck the same
+        // predicate with the effective post-normalization headers restored on
+        // the live context; otherwise an unrelated sibling could be invoked and
+        // incorrectly record that it decided a contract for this request.
+        if !plugin.validates_client_request_body_contract()
+            || !plugin.should_buffer_request_body(ctx)
+        {
             continue;
         }
+        let headers = std::mem::take(&mut ctx.headers);
         let deadline = ctx.grpc_deadline_at();
-        match crate::plugins::await_request_plugin_deadline_with_provenance(
+        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
             deadline,
-            plugin.validate_client_request_body_contract(ctx, headers, body),
+            plugin.validate_client_request_body_contract(ctx, &headers, body),
         )
         .await
-        .into_plugin_result(ctx)
-        {
+        .into_plugin_result(ctx);
+        ctx.headers = headers;
+        match result {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 return reject;
@@ -22233,15 +22241,9 @@ async fn handle_proxy_request_inner(
                 }
             }
             if rejected.is_none() && before_proxy_body_requirements.validates_client_contract {
-                let client_headers = std::mem::take(&mut ctx.headers);
-                let contract_result = apply_client_request_contract_validation(
-                    &plugins,
-                    &mut ctx,
-                    &client_headers,
-                    &buffered.body,
-                )
-                .await;
-                ctx.headers = client_headers;
+                let contract_result =
+                    apply_client_request_contract_validation(&plugins, &mut ctx, &buffered.body)
+                        .await;
                 if !matches!(contract_result, PluginResult::Continue) {
                     rejected = Some((contract_result, CLIENT_REQUEST_CONTRACT_PHASE));
                 }
@@ -22253,11 +22255,8 @@ async fn handle_proxy_request_inner(
             // against that proven-empty representation without materializing a
             // buffer. Any streaming body that is not end-of-stream falls through
             // untouched, so an unread body is never mistaken for an empty one.
-            let client_headers = std::mem::take(&mut ctx.headers);
             let contract_result =
-                apply_client_request_contract_validation(&plugins, &mut ctx, &client_headers, &[])
-                    .await;
-            ctx.headers = client_headers;
+                apply_client_request_contract_validation(&plugins, &mut ctx, &[]).await;
             if !matches!(contract_result, PluginResult::Continue) {
                 rejected = Some((contract_result, CLIENT_REQUEST_CONTRACT_PHASE));
             }

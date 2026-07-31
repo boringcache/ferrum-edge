@@ -8440,7 +8440,6 @@ async fn transform_injected_field_cannot_satisfy_the_client_contract() {
         apply_client_request_contract_validation_for_test(
             &plugins,
             &mut ctx,
-            &json_headers(),
             &client_body,
         )
         .await,
@@ -8591,7 +8590,6 @@ async fn response_only_sibling_keeps_its_backend_final_fallback_after_route_rewr
         apply_client_request_contract_validation_for_test(
             &plugins,
             &mut ctx,
-            &headers,
             br#"{"id":"a","client_attestation":"real"}"#,
         )
         .await,

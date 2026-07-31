@@ -2898,15 +2898,12 @@ async fn handle_h3_request(
             }
         }
         if rejected.is_none() && before_proxy_body_requirements.validates_client_contract {
-            let client_headers = std::mem::take(&mut ctx.headers);
             let contract_result = crate::proxy::apply_client_request_contract_validation(
                 &plugins,
                 &mut ctx,
-                &client_headers,
                 body_data,
             )
             .await;
-            ctx.headers = client_headers;
             if !matches!(contract_result, PluginResult::Continue) {
                 rejected = Some((contract_result, crate::proxy::CLIENT_REQUEST_CONTRACT_PHASE));
             }
