@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Admin audit events gain optional `source_address`, `request_id`, and
+  `outcome` fields (folded into the baseline `audit_events` schema). When
+  `FERRUM_ADMIN_AUDIT_ENABLED=true`, `GET /backup` admits a durable
+  security record before releasing unredacted configuration: synchronous
+  primary insert when available, otherwise the bounded local fallback under
+  `FERRUM_ADMIN_AUDIT_FALLBACK_PATH`, failing closed with `503` if neither
+  sink admits the event. Authenticated denied/failed backup attempts are
+  audited with fixed failure categories only; backup payload bytes and
+  secrets never enter audit events or logs (#2422).
 - API-spec YAML ingestion now expands anchors and aliases through a bounded
   libyaml event graph (node, depth, alias-reference, expanded-byte, and work
   budgets) with cycle / undefined-alias / duplicate-anchor /

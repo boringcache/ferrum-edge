@@ -3541,16 +3541,19 @@ paths:
       operationId: listAuditEvents
       summary: List admin audit events
       description: |
-        Returns successful admin API mutation events for the selected namespace.
-        Requires an admin-role JWT. Each event includes actor, action, resource
-        identity, timestamp, and a JSON diff. Consumer credential data is
-        redacted before it is written to the audit log. Sensitive plugin
-        configuration is redacted as well, through the same schema-aware
-        sensitivity contract used for non-admin plugin reads: credential-bearing
-        endpoint URLs keep only scheme/host/port with structural
-        `[REDACTED_PATH]`/`[REDACTED_QUERY]`/`[REDACTED_FRAGMENT]` markers and
-        never userinfo, all values of arbitrary header maps and webhook body
-        templates are replaced by `[REDACTED]`, as are
+        Returns successful admin API mutation events for the selected namespace,
+        plus security-sensitive backup export and authenticated backup attempt
+        records when auditing is enabled. Requires an admin-role JWT. Each event
+        includes actor, action, resource identity, timestamp, and a JSON diff.
+        Events may also include `source_address` (canonical socket peer), a
+        bounded `request_id`, and a fixed-cardinality `outcome`. Consumer
+        credential data is redacted before it is written to the audit log.
+        Sensitive plugin configuration is redacted as well, through the same
+        schema-aware sensitivity contract used for non-admin plugin reads:
+        credential-bearing endpoint URLs keep only scheme/host/port with
+        structural `[REDACTED_PATH]`/`[REDACTED_QUERY]`/`[REDACTED_FRAGMENT]`
+        markers and never userinfo, all values of arbitrary header maps and
+        webhook body templates are replaced by `[REDACTED]`, as are
         `serverless_function.azure_function_key` and every
         `kafka_logging.producer_config` property outside the safe-tuning
         allow-list. Redis envelope signing keys (`redis_integrity_key` and any
@@ -3753,6 +3756,14 @@ paths:
 
         Falls back to the in-memory cached configuration when the database is
         unavailable, indicated by the `X-Data-Source: cached` response header.
+
+        When `FERRUM_ADMIN_AUDIT_ENABLED=true`, a durable security audit record
+        is admitted before the unredacted body is released (synchronous
+        `audit_events` insert, or bounded local fallback under
+        `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` when the primary store is unavailable).
+        If admission fails, the endpoint returns `503` without an attachment.
+        Authenticated denials and validation failures are audited with
+        fixed-cardinality categories only.
 
         ### Size guidance
 
@@ -6792,7 +6803,9 @@ components:
           description: JWT `sub` claim of the admin actor
         action:
           type: string
-          description: Mutation action, such as `create`, `update`, `delete`, or `restore`
+          description: >-
+            Mutation or security-sensitive action, such as `create`, `update`,
+            `delete`, `restore`, or `backup`
         resource_type:
           type: string
           description: Mutated resource category
@@ -6802,11 +6815,34 @@ components:
         namespace:
           type: string
           description: Namespace selected by `X-Ferrum-Namespace`
+        source_address:
+          type: string
+          description: >-
+            Canonical admin connection peer address. Derived from the socket
+            peer only — never from client-spoofable forwarding headers. Omitted
+            when empty (legacy mutation events without request context).
+        request_id:
+          type: string
+          maxLength: 128
+          description: >-
+            Bounded request/correlation ID. Taken from a validated
+            `X-Request-Id` or `X-Correlation-Id` when present and safe;
+            otherwise generated. Omitted when empty.
+        outcome:
+          type: string
+          description: >-
+            Fixed-cardinality result for security-sensitive events:
+            `success`, `denied`, `validation_failed`, `unavailable`, or
+            `audit_admit_failed`. Omitted when empty (legacy mutation events).
         diff:
           type: object
           additionalProperties: true
           description: >-
-            Redacted JSON diff for the successful mutation. Basic credential
+            Redacted JSON diff for the successful mutation, or a fixed-shape
+            backup audit payload. Backup success diffs carry only
+            `data_source`, `resources`, `counts`, and `bytes` — never backup
+            body bytes or secrets. Backup failure diffs carry only
+            `failure_category` and `resources`. Basic credential
             changes expose only the credential type, action, and a stable
             `[REDACTED]` marker, never values, entry fields, shape, or count.
             Unknown/custom credential types are omitted from audit payloads so

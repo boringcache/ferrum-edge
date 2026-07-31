@@ -990,6 +990,9 @@ impl V001SqlBuilder {
                 resource_type VARCHAR(128) COLLATE utf8mb4_0900_bin NOT NULL,
                 resource_id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
+                source_address VARCHAR(128) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '',
+                request_id VARCHAR(128) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '',
+                outcome VARCHAR(64) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '',
                 diff LONGTEXT NOT NULL
             )
             "#
@@ -1003,6 +1006,9 @@ impl V001SqlBuilder {
                 resource_type TEXT NOT NULL,
                 resource_id TEXT NOT NULL,
                 namespace TEXT NOT NULL DEFAULT 'ferrum',
+                source_address TEXT NOT NULL DEFAULT '',
+                request_id TEXT NOT NULL DEFAULT '',
+                outcome TEXT NOT NULL DEFAULT '',
                 diff TEXT NOT NULL
             )
             "#

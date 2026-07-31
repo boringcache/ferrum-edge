@@ -88,6 +88,9 @@ fn test_audit_event_new_populates_metadata_and_preserves_diff() {
     assert_eq!(event.resource_type, "plugin_config");
     assert_eq!(event.resource_id, "auth-plugin");
     assert_eq!(event.namespace, "tenant-a");
+    assert!(event.source_address.is_empty());
+    assert!(event.request_id.is_empty());
+    assert!(event.outcome.is_empty());
     assert_eq!(event.diff, diff);
 }
 

@@ -6,6 +6,14 @@
 //! response can proceed after logging the audit failure. Audit persistence is
 //! best-effort and happens after the mutation response path has enqueued the
 //! event.
+//!
+//! Security-sensitive surfaces that must not release unredacted material without
+//! a durable record (notably `GET /backup`) use [`admit_security_sensitive_event`]
+//! instead: that path awaits a synchronous database insert when a backend is
+//! available, and otherwise appends to a bounded local fallback file so capture
+//! does not depend solely on the same unavailable primary used for config load.
+//! General mutation delivery-loss hardening remains issue #2421 and is out of
+//! scope for the backup-specific admit path.
 
 use crate::admin::jwt_auth::{AdminClaims, AdminRole};
 use crate::config::db_backend::DatabaseBackend;
@@ -14,15 +22,43 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::{Arc, LazyLock, Weak};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Duration, MissedTickBehavior, interval};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const AUDIT_CHANNEL_CAPACITY: usize = 1024;
 const AUDIT_SINK_STALE_CHECK_INTERVAL_SECONDS: u64 = 60;
+/// Max accepted client-supplied admin request/correlation ID length.
+pub const AUDIT_REQUEST_ID_MAX_LEN: usize = 128;
+/// Bound on local fallback events retained on disk (newest kept).
+pub const AUDIT_LOCAL_FALLBACK_CAPACITY: usize = 4_096;
+const AUDIT_LOCAL_FALLBACK_FILE_NAME: &str = "admin-audit-fallback.json";
+const AUDIT_LOCAL_FALLBACK_DEFAULT_DIR: &str = "./ferrum-admin-audit";
+
+/// Fixed-cardinality outcomes stored on [`AuditEvent::outcome`].
+pub mod outcome {
+    pub const SUCCESS: &str = "success";
+    pub const DENIED: &str = "denied";
+    pub const VALIDATION_FAILED: &str = "validation_failed";
+    pub const UNAVAILABLE: &str = "unavailable";
+    pub const AUDIT_ADMIT_FAILED: &str = "audit_admit_failed";
+}
+
+/// Fixed-cardinality failure categories for backup audit `diff` payloads.
+pub mod failure_category {
+    pub const FORBIDDEN: &str = "forbidden";
+    pub const NAMESPACE_DENIED: &str = "namespace_denied";
+    pub const VALIDATION_FAILED: &str = "validation_failed";
+    pub const UNAVAILABLE: &str = "unavailable";
+    pub const AUDIT_ADMIT_FAILED: &str = "audit_admit_failed";
+}
 
 /// Upper bound for `FERRUM_AUDIT_RETENTION_DAYS` (100 years).
 pub const AUDIT_RETENTION_DAYS_MAX: u64 = 36_500;
@@ -224,7 +260,39 @@ pub struct AuditEvent {
     pub resource_type: String,
     pub resource_id: String,
     pub namespace: String,
+    /// Canonical peer/source address for the admin connection. Never derived
+    /// from client-spoofable forwarding headers. Empty for legacy mutation
+    /// events that predate request-context capture.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_address: String,
+    /// Bounded request/correlation ID (client-supplied when valid, otherwise
+    /// generated). Empty for legacy mutation events.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub request_id: String,
+    /// Fixed-cardinality outcome (`success`, `denied`, `validation_failed`,
+    /// `unavailable`, `audit_admit_failed`). Empty for legacy mutation events
+    /// that only recorded successful commits.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub outcome: String,
     pub diff: Value,
+}
+
+/// Trustworthy per-request context carried through the admin dispatcher into
+/// security-sensitive audit events. Source address is always the socket peer;
+/// request IDs are validated/bounded before storage.
+#[derive(Debug, Clone)]
+pub struct AuditRequestContext {
+    pub source_address: String,
+    pub request_id: String,
+}
+
+impl AuditRequestContext {
+    pub fn from_peer_and_headers(peer: IpAddr, headers: &hyper::HeaderMap) -> Self {
+        Self {
+            source_address: crate::util::client_identity::canonical_ip_string(peer),
+            request_id: extract_or_generate_request_id(headers),
+        }
+    }
 }
 
 impl AuditEvent {
@@ -244,8 +312,22 @@ impl AuditEvent {
             resource_type: resource_type.into(),
             resource_id: resource_id.into(),
             namespace: namespace.into(),
+            source_address: String::new(),
+            request_id: String::new(),
+            outcome: String::new(),
             diff,
         }
+    }
+
+    pub fn with_request_context(mut self, ctx: &AuditRequestContext) -> Self {
+        self.source_address = ctx.source_address.clone();
+        self.request_id = ctx.request_id.clone();
+        self
+    }
+
+    pub fn with_outcome(mut self, outcome: impl Into<String>) -> Self {
+        self.outcome = outcome.into();
+        self
     }
 }
 
@@ -446,4 +528,229 @@ pub fn credential_update_diff(credential_type: &str, before: Value, after: Value
 
 pub fn delete_diff(before: Value) -> Value {
     json!({ "before": before })
+}
+
+/// Which durable sink admitted a security-sensitive audit event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditAdmitSink {
+    /// Audit disabled — no record required.
+    Disabled,
+    /// Synchronous insert into the primary audit store.
+    Database,
+    /// Bounded local fallback file (used when the primary store is absent or
+    /// rejected the insert, including cached-backup paths).
+    LocalFallback,
+}
+
+/// Resolve the local audit fallback directory from env/config, defaulting to
+/// [`AUDIT_LOCAL_FALLBACK_DEFAULT_DIR`].
+pub fn audit_local_fallback_dir() -> PathBuf {
+    crate::config::conf_file::resolve_ferrum_var("FERRUM_ADMIN_AUDIT_FALLBACK_PATH")
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(AUDIT_LOCAL_FALLBACK_DEFAULT_DIR))
+}
+
+fn audit_local_fallback_file(dir: &Path) -> PathBuf {
+    dir.join(AUDIT_LOCAL_FALLBACK_FILE_NAME)
+}
+
+/// Extract a bounded request/correlation ID from admin headers, or mint one.
+///
+/// Accepts `X-Request-Id` or `X-Correlation-Id` only when every character is in
+/// a conservative printable allow-list and length ≤ [`AUDIT_REQUEST_ID_MAX_LEN`].
+/// Invalid or missing values are replaced with a fresh UUID — the rejected
+/// header bytes are never stored or logged.
+pub fn extract_or_generate_request_id(headers: &hyper::HeaderMap) -> String {
+    for name in ["x-request-id", "x-correlation-id"] {
+        if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok())
+            && is_safe_request_id(value)
+        {
+            return value.to_string();
+        }
+    }
+    Uuid::new_v4().to_string()
+}
+
+fn is_safe_request_id(value: &str) -> bool {
+    if value.is_empty() || value.len() > AUDIT_REQUEST_ID_MAX_LEN {
+        return false;
+    }
+    value
+        .bytes()
+        .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b':'))
+}
+
+/// Fixed-shape backup success diff. Never includes payload bytes or secrets.
+pub fn backup_success_diff(
+    data_source: &str,
+    resources: Value,
+    counts: Value,
+    bytes: usize,
+) -> Value {
+    json!({
+        "data_source": data_source,
+        "resources": resources,
+        "counts": counts,
+        "bytes": bytes,
+    })
+}
+
+/// Fixed-shape backup failure/denied diff. Categories are closed enums only.
+pub fn backup_failure_diff(category: &str, resources: Value) -> Value {
+    json!({
+        "failure_category": category,
+        "resources": resources,
+    })
+}
+
+/// Canonical resource-filter representation for audit events (sorted names, or
+/// the sentinel `"all"` when unfiltered).
+pub fn backup_resources_audit_value(filter: Option<&std::collections::HashSet<&str>>) -> Value {
+    match filter {
+        None => json!("all"),
+        Some(set) => {
+            let mut names: Vec<&str> = set.iter().copied().collect();
+            names.sort_unstable();
+            json!(names)
+        }
+    }
+}
+
+/// Admit a security-sensitive audit event before releasing unredacted material.
+///
+/// When auditing is disabled this is a no-op success. Otherwise:
+/// 1. Prefer a synchronous `insert_audit_event` on the provided backend.
+/// 2. If no backend is present or the insert fails, append to the bounded local
+///    fallback file under `fallback_dir` (or the configured default).
+/// 3. If neither sink admits the event, return an error so the caller can fail
+///    closed without emitting the sensitive response body.
+///
+/// This is intentionally narrower than #2421 (general mutation durability): it
+/// only covers surfaces that must not silently export secrets without a record.
+pub async fn admit_security_sensitive_event(
+    enabled: bool,
+    db: Option<&Arc<dyn DatabaseBackend>>,
+    event: &AuditEvent,
+    fallback_dir: Option<&Path>,
+) -> Result<AuditAdmitSink, anyhow::Error> {
+    if !enabled {
+        return Ok(AuditAdmitSink::Disabled);
+    }
+
+    if let Some(db) = db {
+        match db.insert_audit_event(event).await {
+            Ok(()) => return Ok(AuditAdmitSink::Database),
+            Err(_error) => {
+                // Detail withheld: the primary may be the same unavailable store
+                // that forced a cached backup. Fall through to local capture.
+                warn!(
+                    audit_event_id = %event.id,
+                    surface = "audit_security_admit_database",
+                    detail_withheld = true,
+                    "Primary audit store rejected a security-sensitive event; trying local fallback"
+                );
+            }
+        }
+    }
+
+    let dir = fallback_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(audit_local_fallback_dir);
+    append_local_fallback_event(&dir, event).map_err(|_error| {
+        error!(
+            audit_event_id = %event.id,
+            surface = "audit_security_admit_local_fallback",
+            detail_withheld = true,
+            "Failed to admit security-sensitive audit event to local fallback"
+        );
+        anyhow!("security-sensitive audit event could not be admitted")
+    })?;
+    Ok(AuditAdmitSink::LocalFallback)
+}
+
+/// Best-effort admit for authenticated backup denials/validation failures.
+/// Never changes the caller's HTTP response path on failure — only logs that
+/// the security record could not be stored.
+pub async fn record_backup_attempt_best_effort(
+    enabled: bool,
+    db: Option<&Arc<dyn DatabaseBackend>>,
+    event: &AuditEvent,
+    fallback_dir: Option<&Path>,
+) {
+    if let Err(_error) = admit_security_sensitive_event(enabled, db, event, fallback_dir).await {
+        warn!(
+            audit_event_id = %event.id,
+            surface = "backup_audit_attempt",
+            detail_withheld = true,
+            "Authenticated backup attempt could not be audited"
+        );
+    }
+}
+
+static LOCAL_FALLBACK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Append one event to the bounded local fallback store. Creates the directory
+/// with owner-only permissions when possible. Never logs event contents.
+pub fn append_local_fallback_event(dir: &Path, event: &AuditEvent) -> Result<(), anyhow::Error> {
+    let _guard = LOCAL_FALLBACK_LOCK
+        .lock()
+        .map_err(|_| anyhow!("audit local fallback lock poisoned"))?;
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    let path = audit_local_fallback_file(dir);
+    let mut events = read_local_fallback_events_unlocked(&path)?;
+    events.push(event.clone());
+    if events.len() > AUDIT_LOCAL_FALLBACK_CAPACITY {
+        let overflow = events.len() - AUDIT_LOCAL_FALLBACK_CAPACITY;
+        events.drain(0..overflow);
+    }
+    write_local_fallback_events_unlocked(&path, &events)
+}
+
+/// Read all events currently retained in the local fallback store.
+pub fn list_local_fallback_events(dir: &Path) -> Result<Vec<AuditEvent>, anyhow::Error> {
+    let _guard = LOCAL_FALLBACK_LOCK
+        .lock()
+        .map_err(|_| anyhow!("audit local fallback lock poisoned"))?;
+    read_local_fallback_events_unlocked(&audit_local_fallback_file(dir))
+}
+
+fn read_local_fallback_events_unlocked(path: &Path) -> Result<Vec<AuditEvent>, anyhow::Error> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(path)?;
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&raw).map_err(|e| anyhow!("corrupt audit local fallback store: {e}"))
+}
+
+fn write_local_fallback_events_unlocked(
+    path: &Path,
+    events: &[AuditEvent],
+) -> Result<(), anyhow::Error> {
+    let tmp = path.with_extension("json.tmp");
+    let body = serde_json::to_vec_pretty(events)?;
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        file.write_all(&body)?;
+        file.sync_all()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
 }

@@ -13331,6 +13331,9 @@ mod inner {
                 resource_type: "proxy".to_string(),
                 resource_id: "proxy-1".to_string(),
                 namespace: "ferrum".to_string(),
+                source_address: String::new(),
+                request_id: String::new(),
+                outcome: String::new(),
                 diff: serde_json::json!({
                     "changed": true,
                     "after": {

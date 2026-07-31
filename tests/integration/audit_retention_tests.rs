@@ -39,6 +39,9 @@ fn event_at(namespace: &str, id: &str, days_ago: i64, id_suffix: &str) -> AuditE
         resource_type: "proxy".to_string(),
         resource_id: id.to_string(),
         namespace: namespace.to_string(),
+        source_address: String::new(),
+        request_id: String::new(),
+        outcome: String::new(),
         diff: json!({ "after": { "id": id } }),
     }
 }
@@ -52,6 +55,9 @@ fn event_ordered(namespace: &str, id: &str, minutes_ago: i64) -> AuditEvent {
         resource_type: "proxy".to_string(),
         resource_id: id.to_string(),
         namespace: namespace.to_string(),
+        source_address: String::new(),
+        request_id: String::new(),
+        outcome: String::new(),
         diff: json!({ "after": { "id": id } }),
     }
 }
