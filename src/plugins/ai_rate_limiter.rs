@@ -1631,11 +1631,7 @@ fn count_anthropic_source_object(acc: u64, source: &serde_json::Map<String, Valu
             (binary_ty, key.as_str(), value),
             (Some("base64"), "data", Value::String(_))
                 | (Some("url"), "url", Value::String(_))
-                | (
-                    Some("file"),
-                    "file_id" | "data" | "url",
-                    Value::String(_)
-                )
+                | (Some("file"), "file_id" | "data" | "url", Value::String(_))
         );
         if exclude_leaf {
             acc
