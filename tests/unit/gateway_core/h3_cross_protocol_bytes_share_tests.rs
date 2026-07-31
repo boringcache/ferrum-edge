@@ -242,11 +242,28 @@ fn buffered_backend_response_from_body_read_keeps_reqwest_bytes() {
         "successful reqwest body reads must stay as Bytes"
     );
     assert!(
-        reader.contains("ResponseBody::buffered(b)"),
-        "buffered backend responses must store Bytes directly"
+        reader.contains("charged_shared_bytes(b, reservation)"),
+        "the eagerly read Bytes must be charged IN PLACE — attaching the \
+         aggregate retained-response permit to reqwest's own allocation, not to \
+         a copy of it (GHSA-pwcm-6rh8-f2gh)"
     );
     assert!(
-        !reader.contains("b.to_vec()"),
-        "buffered backend responses must not force Vec conversion"
+        reader.contains("ResponseBody::buffered(charged)"),
+        "buffered backend responses must store the charged Bytes directly"
+    );
+    assert!(
+        !reader.contains("b.to_vec()") && !reader.contains("copy_from_slice"),
+        "buffered backend responses must not force a Vec conversion or a copy"
+    );
+    assert!(
+        reader.contains("reservation.reserve(b.len())"),
+        "the charge must be grown to the ACTUAL body length before it is \
+         attached, so a body larger than its declared Content-Length cannot be \
+         retained under-charged"
+    );
+    assert!(
+        reader.contains("response_buffer_capacity_response(proxy, resolved_ip, transport)"),
+        "an unaffordable eager buffer must fail closed with the shared neutral \
+         gateway-capacity response"
     );
 }

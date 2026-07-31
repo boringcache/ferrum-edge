@@ -2584,10 +2584,11 @@ async fn response_normalizer_deadline_replaces_buffered_grpc_response() {
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut body = bytes::Bytes::from_static(b"backend response");
 
+    let mut normalize_status = 200u16;
     let normalized = normalize_response_body_for_inspection(
         &plugins,
         &mut ctx,
-        200,
+        &mut normalize_status,
         &mut headers,
         &mut body,
         &[],
@@ -2662,11 +2663,12 @@ async fn response_normalizer_deadline_preserves_grpc_web_framing() {
         set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
         let mut body = bytes::Bytes::from_static(b"backend response");
 
+        let mut normalize_status = 200u16;
         assert!(
             normalize_response_body_for_inspection(
                 &plugins,
                 &mut ctx,
-                200,
+                &mut normalize_status,
                 &mut headers,
                 &mut body,
                 &[],

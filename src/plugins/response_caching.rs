@@ -1362,6 +1362,97 @@ impl ResponseCaching {
         ctx.metadata.contains_key(&self.meta_release_buffer)
     }
 
+    /// Whether `on_final_response_body` would reach one of its INVALIDATING
+    /// branches for this response.
+    ///
+    /// Those branches evict an existing entry that this response supersedes
+    /// (`invalidate_base_key` / `invalidate_zero_freshness_response`), so the
+    /// body must stay buffered to reach them — releasing it to the streaming
+    /// path would silently leave a superseded representation servable:
+    ///
+    ///   * response `Cache-Control: no-store` / `private` / `no-cache`,
+    ///   * a zero freshness lifetime (including a configured `ttl_seconds: 0`,
+    ///     where EVERY response takes that branch),
+    ///   * a `Vary` this cache cannot key on (`Vary: *`).
+    ///
+    /// Evaluated exactly as the store path evaluates it — same
+    /// `respect_cache_control` gate, same `parse_cache_control`, same
+    /// `freshness_lifetime`, same `merged_vary_headers` — so the two cannot
+    /// drift (GHSA-pwcm-6rh8-f2gh).
+    fn response_requires_invalidation_visit(
+        &self,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        let directives = if self.config.respect_cache_control {
+            response_headers
+                .get("cache-control")
+                .map(|cc| parse_cache_control(cc))
+                .unwrap_or_default()
+        } else {
+            CacheControlDirectives::default()
+        };
+        if directives.no_store || directives.private || directives.no_cache {
+            return true;
+        }
+        if self.freshness_lifetime(&directives).is_zero() {
+            return true;
+        }
+        self.merged_vary_headers(response_headers).is_none()
+    }
+
+    /// Whether releasing this response to the streaming path is observably
+    /// equivalent to collecting it and running `on_final_response_body`, apart
+    /// from the heuristic uncacheable-predictor mark.
+    ///
+    /// The store path is a strict sequence, and this predicate mirrors its
+    /// order rather than cherry-picking refusals out of it:
+    ///
+    ///   1. A status outside `cacheable_status_codes`, a status whose caching
+    ///      semantics this plugin does not implement, and a `Content-Range`
+    ///      partial answer are refused *before* any invalidating branch, so the
+    ///      final hook provably returns without evicting anything. Releasing is
+    ///      equivalent.
+    ///   2. Everything else is refused *after* the invalidating branches. Such a
+    ///      response may be released only once
+    ///      [`Self::response_requires_invalidation_visit`] proves none of those
+    ///      branches applies — this is the check whose absence made the earlier
+    ///      `Set-Cookie` / origin-selected-SSE releases skip a required
+    ///      eviction.
+    ///   3. With that proven, a `Set-Cookie` response (per-client, never stored)
+    ///      and an origin-selected `text/event-stream` (retaining it destroys
+    ///      event latency, and a stored event stream is not a representation any
+    ///      later request can reuse) are released.
+    ///
+    /// The predictor mark those branches would have set is deliberately skipped
+    /// rather than performed here: it is a lookup-skipping heuristic that
+    /// re-learns on the next request, and taking a side effect inside a
+    /// speculative buffering predicate would fire it for decisions the proxy
+    /// never adopts.
+    fn response_body_release_is_side_effect_free(
+        &self,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        content_type: Option<&str>,
+    ) -> bool {
+        let status_refused_before_invalidation = !self
+            .config
+            .cacheable_status_codes
+            .contains(&response_status)
+            || !is_supported_cacheable_status(response_status);
+        if status_refused_before_invalidation || response_headers.contains_key("content-range") {
+            return true;
+        }
+        if self.response_requires_invalidation_visit(response_headers) {
+            return false;
+        }
+        if response_headers.contains_key("set-cookie") {
+            return true;
+        }
+        content_type
+            .or_else(|| response_headers.get("content-type").map(String::as_str))
+            .is_some_and(super::utils::sse::is_text_event_stream_media_type)
+    }
+
     /// Drop this instance's lookup/store staging inputs without touching
     /// sibling instances' namespaced keys. Used on method/SSE bypass and
     /// HIT/REVALIDATED so leftover base/snapshot/predict/timing from an
@@ -2548,46 +2639,41 @@ impl Plugin for ResponseCaching {
         if !self.should_buffer_response_body(ctx) {
             return false;
         }
-        // Header-time refinement. These are exactly the store-side refusals in
-        // `on_final_response_body` whose only side effect is the (heuristic)
-        // uncacheable-predictor mark, so taking them here changes nothing but
-        // the moment: the body was going to be collected in full and then
-        // discarded unread.
-        //
-        // Deliberately NOT released, because their store-side branches also
-        // INVALIDATE an existing entry — skipping the final hook would leave a
-        // superseded representation live:
-        //   * response `Cache-Control: no-store` / `private` / `no-cache`,
-        //   * a zero freshness lifetime,
-        //   * an unusable `Vary` header.
-        // Those keep the buffered path and reach `on_final_response_body`
-        // exactly as before.
-        let uncacheable_status = !self
-            .config
-            .cacheable_status_codes
-            .contains(&response_status)
-            || !is_supported_cacheable_status(response_status);
-        if uncacheable_status {
-            return false;
-        }
-        // A `Content-Range` answer describes bytes, not the resource, and is
-        // refused as a reusable representation. A `Set-Cookie` response is
-        // per-client and never stored.
-        if response_headers.contains_key("content-range")
-            || response_headers.contains_key("set-cookie")
-        {
-            return false;
-        }
-        // Origin-selected SSE: the client never advertised `text/event-stream`,
-        // so the request-side vote could not see it, but the backend just did.
-        // Retaining it destroys event latency and accumulates frames until the
-        // response ceiling; a stored event stream is not a representation any
-        // later request can reuse. Released here rather than collected and then
-        // stored.
-        if content_type.is_some_and(super::utils::sse::is_text_event_stream_media_type) {
-            return false;
-        }
-        true
+        !self.response_body_release_is_side_effect_free(
+            response_status,
+            response_headers,
+            content_type,
+        )
+    }
+
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        // Retry-enabled dispatch buffers by default so a failed attempt stays
+        // replayable, and every active buffering plugin must opt in before the
+        // shared refinement will release. Opt in only while this instance is a
+        // reason for buffering; the confirmation hook below still releases only
+        // a response whose store path is provably a no-op
+        // (GHSA-pwcm-6rh8-f2gh). Without this, a proxy whose ONLY buffering
+        // plugin is `response_caching` kept every response — including an
+        // origin-selected event stream — fully buffered whenever retries were
+        // configured.
+        self.should_buffer_response_body(ctx)
+    }
+
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        // Same predicate as the header-time refinement; the retry decision
+        // context carries no separate `content_type` argument, so it is read
+        // from the response headers the refinement would have derived it from.
+        self.should_buffer_response_body(ctx)
+            && self.response_body_release_is_side_effect_free(
+                response_status,
+                response_headers,
+                None,
+            )
     }
 
     async fn before_proxy(
@@ -3152,7 +3238,29 @@ impl Plugin for ResponseCaching {
         // path can emit them. The client that produced this miss still receives
         // the untouched `response_headers`.
         sanitize_cached_response_headers(&mut cached_response_headers, &directives);
-        let cached_body = Bytes::copy_from_slice(body);
+        // The entry body is a DISTINCT allocation from the one the collector
+        // charged: the collected body is released when this response finishes,
+        // while the entry stays resident until eviction. It therefore acquires
+        // its OWN charge against the aggregate retained-response budget, owned
+        // by the entry's `Bytes` — so it is held for the entry's whole lifetime
+        // and returned when the last clone (entry + any in-flight replay) drops
+        // (GHSA-pwcm-6rh8-f2gh). Reserving before the copy also means a refusal
+        // never materialises it.
+        //
+        // A refusal skips the store, which is exactly what the
+        // `max_entry_size_bytes` refusal immediately above does: the client
+        // still receives its response, the request is a plain miss, and no
+        // uncharged bytes are retained. It is not an uncacheable-*resource*
+        // signal, so the predictor is deliberately left alone.
+        let Some(cached_body) = crate::proxy::response_buffer_budget::charge_retained_copy(body)
+        else {
+            debug!(
+                body_size = body.len(),
+                "response_caching: aggregate retained-response budget refused the cache entry \
+                 copy, skipping store"
+            );
+            return PluginResult::Continue;
+        };
 
         let (cache_key, entry_size) = {
             // Lock ordering: acquire `accounting_lock` before mutating

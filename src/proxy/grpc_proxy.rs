@@ -3506,15 +3506,19 @@ pub(crate) async fn proxy_grpc_request_core(
             match frame_result {
                 Ok(frame) => {
                     if let Some(data) = frame.data_ref() {
-                        if body_bytes.len().saturating_add(data.len())
-                            > max_response_body_size_bytes
-                        {
+                        // One prospective length, reused by the ceiling check
+                        // and the budget charge (GHSA-pwcm-6rh8-f2gh).
+                        let prospective = response_buffer_budget::prospective_retained_len(
+                            body_bytes.len(),
+                            data.len(),
+                        );
+                        if prospective > max_response_body_size_bytes {
                             return Err(GrpcProxyError::ResponseTooLarge(format!(
                                 "gRPC response payload size exceeds maximum of {} bytes",
                                 max_response_body_size_bytes
                             )));
                         }
-                        if !reservation.reserve(body_bytes.len().saturating_add(data.len())) {
+                        if !reservation.reserve(prospective) {
                             return Err(GrpcProxyError::ResponseBufferCapacity(
                                 response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE
                                     .to_string(),

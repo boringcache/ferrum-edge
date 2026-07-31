@@ -1698,44 +1698,6 @@ impl HeldResponseBufferPermit {
     }
 }
 
-/// Aggregate-budget charge for plugin-authored REPLACEMENTS of the retained
-/// response body (GHSA-pwcm-6rh8-f2gh).
-///
-/// A collected body carries its own charge inside its `Bytes` owner, so it is
-/// accounted for its whole residency. A plugin phase that installs a *different*
-/// allocation (a normalizer's reshaped representation, a
-/// `transform_response_body` rewrite, a decoded representation) escapes that
-/// charge: the old `Bytes` drops and returns its permit while the new bytes are
-/// uncharged. This holds the charge for those replacements.
-///
-/// It is a single MONOTONIC reservation for the request rather than one per
-/// replacement: successive rewrites in one request charge only the high-water
-/// mark, which is conservative (the peak is never under-charged) and cannot
-/// double-count a rewrite chain. It is released when the request context drops,
-/// which is when the last request-scoped view of the replacement body is gone.
-///
-/// Clones are empty for the same reason [`HeldResponseBufferPermit`]'s are: a
-/// compatibility clone must not mint a second charge, and the original still
-/// holds it.
-#[derive(Default)]
-struct HeldResponseBodyReplacementCharge(
-    crate::proxy::response_buffer_budget::ResponseBufferReservation,
-);
-
-impl std::fmt::Debug for HeldResponseBodyReplacementCharge {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("HeldResponseBodyReplacementCharge")
-            .field(&self.0.reserved_bytes())
-            .finish()
-    }
-}
-
-impl Clone for HeldResponseBodyReplacementCharge {
-    fn clone(&self) -> Self {
-        Self::default()
-    }
-}
-
 /// Complete provenance of the response-side presentation policy a finalized
 /// replay (`RequestContext::finalized_response_replay`) intentionally skips.
 ///
@@ -2400,10 +2362,6 @@ pub struct RequestContext {
     /// releases this slot on cancellation; clones do not duplicate the
     /// exclusive permit.
     compression_response_buffer_permit: HeldResponseBufferPermit,
-    /// Aggregate retained-response-budget charge covering plugin-authored
-    /// REPLACEMENTS of the buffered response body (GHSA-pwcm-6rh8-f2gh). See
-    /// [`HeldResponseBodyReplacementCharge`].
-    response_body_replacement_charge: HeldResponseBodyReplacementCharge,
     /// Validated plaintext staged by the rare buffered request-decode fallback
     /// (headers stripped in `before_proxy` without a mutable body view). The
     /// owning transform must emit these bytes so the backend never sees a
@@ -2894,7 +2852,6 @@ impl RequestContext {
             compression_response_admission_owner: None,
             compression_response_admission_declined: false,
             compression_response_buffer_permit: HeldResponseBufferPermit::default(),
-            response_body_replacement_charge: HeldResponseBodyReplacementCharge::default(),
             compression_staged_request_plaintext: None,
             compression_response_encode_aborted: false,
             response_stream_id: None,
@@ -3247,25 +3204,6 @@ impl RequestContext {
         &mut self,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
         self.compression_response_buffer_permit.take()
-    }
-
-    /// Charge `replacement_len` retained bytes for a plugin-authored
-    /// replacement of the buffered response body, against the process-wide
-    /// retained-response budget (GHSA-pwcm-6rh8-f2gh).
-    ///
-    /// Returns `false` when the budget cannot admit the growth; the caller MUST
-    /// fail closed and must not install the replacement. Non-blocking: it never
-    /// queues behind other buffers.
-    ///
-    /// Monotonic for the request: a rewrite chain is charged at its high-water
-    /// mark rather than cumulatively, and a shrinking rewrite keeps the peak
-    /// (conservative — the budget is never under-charged while a request is
-    /// still able to grow the body again). The charge is released when this
-    /// context drops.
-    pub(crate) fn charge_replacement_response_body(&mut self, replacement_len: usize) -> bool {
-        self.response_body_replacement_charge
-            .0
-            .reserve(replacement_len)
     }
 
     pub(crate) fn set_compression_staged_request_plaintext(&mut self, plaintext: Vec<u8>) {
@@ -3855,7 +3793,6 @@ impl RequestContext {
             // (only `metadata`/WAF/AI state is copied back), releasing admission
             // while the live context still owns the response encode.
             compression_response_buffer_permit: HeldResponseBufferPermit::default(),
-            response_body_replacement_charge: HeldResponseBodyReplacementCharge::default(),
             compression_staged_request_plaintext: std::mem::take(
                 &mut self.compression_staged_request_plaintext,
             ),
@@ -5306,24 +5243,119 @@ pub(crate) fn clear_response_stream_inspector_state(ctx: &mut RequestContext) {
     ctx.response_stream_completion = None;
 }
 
+/// Whether the response the gateway is about to emit is gRPC-flavored, so a
+/// gateway-authored refusal must terminate through gRPC status metadata instead
+/// of an HTTP status change.
+///
+/// Two provenances, because either one alone misses a real case: a native gRPC
+/// response names itself through `content-type`, while a translated gRPC-Web
+/// response carries a `grpc-web…` type whose terminal metadata is body-framed
+/// and is recognised from the request-scoped translation marker.
+pub(crate) fn response_is_grpc_flavored(
+    ctx: &RequestContext,
+    response_headers: &HashMap<String, String>,
+) -> bool {
+    if crate::plugins::grpc_web::request_is_grpc_web_translated(ctx) {
+        return true;
+    }
+    response_headers.get("content-type").is_some_and(|value| {
+        crate::proxy::backend_dispatch::is_native_grpc_content_type(value.as_bytes())
+    })
+}
+
+/// Install the gateway-local retained-response-capacity refusal over whatever
+/// buffered representation was being assembled (GHSA-pwcm-6rh8-f2gh).
+///
+/// One helper for every buffered response phase that can be refused after the
+/// backend already answered (normalization, body transform), so the
+/// client-visible outcome cannot drift between them:
+///
+/// * **HTTP** — the status becomes [`RESPONSE_BUFFER_OVERLOAD_STATUS`] (`503`),
+///   not the backend's, because the representation the backend chose no longer
+///   exists and its status would advertise a body the client is not getting.
+///   The body is the fixed, redaction-safe overload payload; `Content-Type` and
+///   `Content-Length` describe those bytes, and any backend `Content-Encoding` /
+///   `Content-Range` / `Transfer-Encoding` / `ETag` / `Digest` metadata is
+///   removed because it described bytes the gateway just discarded.
+/// * **gRPC / gRPC-Web** — the HTTP status is left alone (gRPC errors ride
+///   HTTP 200) and the refusal is expressed as `RESOURCE_EXHAUSTED` terminal
+///   metadata with the fixed message, over an empty body. The caller reconciles
+///   that metadata from the header map exactly as it does for every other
+///   gateway-authored gRPC terminal.
+///
+/// [`RESPONSE_BUFFER_OVERLOAD_STATUS`]:
+///     crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS
+pub(crate) fn install_response_buffer_capacity_refusal(
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut bytes::Bytes,
+) {
+    use crate::proxy::response_buffer_budget as budget;
+
+    // Header fields that describe the *discarded* representation. Leaving any
+    // of them beside the gateway's own payload would advertise an encoding,
+    // framing, byte range, or validator for bytes the client is not receiving.
+    const STALE_REPRESENTATION_HEADERS: [&str; 6] = [
+        "content-encoding",
+        "content-range",
+        "transfer-encoding",
+        "etag",
+        "digest",
+        "content-digest",
+    ];
+
+    let grpc_flavored = response_is_grpc_flavored(ctx, response_headers);
+    response_headers.retain(|name, _| {
+        !STALE_REPRESENTATION_HEADERS
+            .iter()
+            .any(|stale| name.eq_ignore_ascii_case(stale))
+    });
+    if grpc_flavored {
+        *response_body = bytes::Bytes::new();
+        response_headers.insert(
+            "grpc-status".to_string(),
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS.to_string(),
+        );
+        response_headers.insert(
+            "grpc-message".to_string(),
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE.to_string(),
+        );
+        response_headers.insert("content-length".to_string(), "0".to_string());
+    } else {
+        *response_status = budget::RESPONSE_BUFFER_OVERLOAD_STATUS;
+        *response_body =
+            bytes::Bytes::from_static(budget::RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
+        response_headers.insert("content-type".to_string(), "application/json".to_string());
+        response_headers.insert("content-length".to_string(), response_body.len().to_string());
+    }
+    ctx.record_deadline_response_header_mutations(response_headers);
+}
+
 /// Run buffered provider/protocol normalizers before response-body policy
 /// inspection. Returns whether any plugin replaced the bytes.
 ///
 /// This is shared by the H1/H2 and all buffered H3 bridge/native paths so a
 /// frontend protocol cannot change which representation guardrails inspect.
+///
+/// `response_status` is `&mut` because a normalizer's replacement can be refused
+/// by the aggregate retained-response budget, and that refusal must produce the
+/// gateway's own overload response rather than the backend's status over a body
+/// the client is not receiving (GHSA-pwcm-6rh8-f2gh).
 pub async fn normalize_response_body_for_inspection(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
-    response_status: u16,
+    response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
     response_body: &mut bytes::Bytes,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> bool {
+    let response_status_in = *response_status;
     // Seed provenance before the rewrite gate: a status that forbids body
     // rewrites can still be replaced by the request's gRPC deadline, and an
     // unseeded provenance strips every header from that replacement.
     ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
-    if !response_body_rewrite_allowed(response_status) {
+    if !response_body_rewrite_allowed(response_status_in) {
         return false;
     }
     let content_type = response_headers.get("content-type").cloned();
@@ -5334,7 +5366,7 @@ pub async fn normalize_response_body_for_inspection(
             deadline,
             plugin.normalize_response_body_with_context(
                 ctx,
-                response_status,
+                response_status_in,
                 response_body,
                 content_type.as_deref(),
                 response_headers,
@@ -5362,33 +5394,32 @@ pub async fn normalize_response_body_for_inspection(
         };
         if let Some(body) = body {
             // A normalizer installs a DIFFERENT allocation than the one the
-            // collector charged, so the replacement is charged before it is
-            // retained. Refusal fails closed: the oversized replacement is
-            // dropped unread and the fixed, redaction-safe overload payload is
-            // installed instead (GHSA-pwcm-6rh8-f2gh).
+            // collector charged, so the replacement carries its OWN charge,
+            // attached to the replacement allocation rather than to this
+            // request: the permit is returned when the last handle to those
+            // bytes drops, wherever they end up (GHSA-pwcm-6rh8-f2gh).
             //
-            // Residual: this hook has no mutable status, so the HTTP status the
-            // backend chose is preserved on that refusal (a gRPC-flavored
-            // response still terminates correctly through its terminal
-            // metadata, which the caller reconciles from the header map). The
-            // memory bound holds either way — the refused bytes are never
-            // retained.
-            if !ctx.charge_replacement_response_body(body.len()) {
+            // Refusal fails closed: the oversized replacement is dropped unread
+            // and the gateway's own transient-capacity response — `503` plus the
+            // fixed redaction-safe body, or the gRPC `RESOURCE_EXHAUSTED`
+            // terminal for a gRPC-flavored response — is installed instead.
+            let body_len = body.len();
+            let Some(charged) = crate::proxy::response_buffer_budget::charge_replacement_body(body)
+            else {
                 warn!(
                     plugin = plugin.name(),
                     "Response normalization refused: aggregate retained-response budget exhausted"
                 );
-                let refusal =
-                    crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes();
-                response_headers.insert("content-length".to_string(), refusal.len().to_string());
-                *response_body = bytes::Bytes::from_static(
-                    crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes(),
+                install_response_buffer_capacity_refusal(
+                    ctx,
+                    response_status,
+                    response_headers,
+                    response_body,
                 );
-                ctx.record_deadline_response_header_mutations(response_headers);
                 return true;
-            }
-            response_headers.insert("content-length".to_string(), body.len().to_string());
-            *response_body = bytes::Bytes::from(body);
+            };
+            response_headers.insert("content-length".to_string(), body_len.to_string());
+            *response_body = charged;
             normalized = true;
         }
         ctx.record_deadline_response_header_mutations(response_headers);

@@ -18957,29 +18957,31 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
         if let Some(transformed) = transformed {
             // The transform installs a DIFFERENT allocation than the one the
             // collector charged (and a decode can be far larger than its
-            // input), so the replacement is charged before it is retained.
-            // Refusal fails closed with the neutral gateway-capacity terminal
-            // rather than retaining uncharged bytes (GHSA-pwcm-6rh8-f2gh).
-            if !ctx.charge_replacement_response_body(transformed.len()) {
+            // input), so the replacement carries its OWN charge, owned by the
+            // replacement allocation rather than by this request: the permit is
+            // returned when the last handle to those bytes drops, wherever they
+            // are copied or stored (GHSA-pwcm-6rh8-f2gh).
+            //
+            // Refusal fails closed with the shared gateway-capacity terminal —
+            // `503` plus the fixed redaction-safe body, or the gRPC
+            // `RESOURCE_EXHAUSTED` terminal for a gRPC-flavored response —
+            // rather than retaining uncharged bytes.
+            let transformed_len = transformed.len();
+            let Some(charged) = response_buffer_budget::charge_replacement_body(transformed) else {
                 warn!(
                     plugin = plugin.name(),
                     "Response body transform refused: aggregate retained-response budget exhausted"
                 );
-                *response_status = response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS;
-                *response_body = Bytes::from_static(
-                    response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes(),
+                crate::plugins::install_response_buffer_capacity_refusal(
+                    ctx,
+                    response_status,
+                    response_headers,
+                    response_body,
                 );
-                response_headers.insert("content-type".to_string(), "application/json".to_string());
-                response_headers
-                    .insert("content-length".to_string(), response_body.len().to_string());
-                // The gateway authored these bytes, so a backend-declared
-                // encoding no longer describes them.
-                response_headers.retain(|name, _| !name.eq_ignore_ascii_case("content-encoding"));
-                ctx.record_deadline_response_header_mutations(response_headers);
                 return (true, true);
-            }
-            response_headers.insert("content-length".to_string(), transformed.len().to_string());
-            *response_body = Bytes::from(transformed);
+            };
+            response_headers.insert("content-length".to_string(), transformed_len.to_string());
+            *response_body = charged;
             crate::plugins::finalize_response_body_transformation(
                 plugin.as_ref(),
                 ctx,
@@ -25969,7 +25971,7 @@ async fn handle_proxy_request_inner(
                     crate::plugins::normalize_response_body_for_inspection(
                         &plugins,
                         &mut ctx,
-                        response_status,
+                        &mut response_status,
                         &mut plugin_response_headers,
                         &mut response_body,
                         initial_response_header_policy_plugins.as_ref(),
@@ -28029,7 +28031,7 @@ async fn handle_proxy_request_inner(
         crate::plugins::normalize_response_body_for_inspection(
             &plugins,
             &mut ctx,
-            response_status,
+            &mut response_status,
             &mut response_headers,
             data,
             initial_response_header_policy_plugins.as_ref(),
@@ -30134,12 +30136,27 @@ pub(crate) async fn proxy_to_backend_retry(
                 // streams) and responses without Content-Length (unknown size).
                 let cutoff = state.response_buffer_cutoff_bytes;
                 if cutoff > 0
-                    && content_length.is_some_and(|cl| cl <= cutoff)
+                    && let Some(declared_len) = content_length.filter(|cl| *cl <= cutoff)
                     && !is_streaming_content_type(&resp_headers)
                 {
                     // Content-Length is within cutoff (and within max_response
                     // _body_size_bytes if set, checked above), so eager
-                    // collection is bounded.
+                    // collection is bounded PER RESPONSE. Concurrency still
+                    // multiplies that cutoff, so the retained bytes are charged
+                    // against the aggregate budget before the read starts and the
+                    // charge is then handed to the payload
+                    // (GHSA-pwcm-6rh8-f2gh). Refusal is the neutral transient
+                    // capacity response, never a backend fault; the streaming
+                    // arm below is untouched and retains nothing.
+                    let Some(reservation) =
+                        response_buffer_budget::try_reserve_retained(declared_len)
+                    else {
+                        return response_buffer_capacity_response(
+                            proxy,
+                            resolved_ip.clone(),
+                            "reqwest-eager-retry",
+                        );
+                    };
                     let body_read = match crate::plugins::await_grpc_deadline(
                         request_ctx.grpc_deadline_at(),
                         response.bytes(),
@@ -30160,6 +30177,9 @@ pub(crate) async fn proxy_to_backend_retry(
                         status,
                         resp_headers,
                         resolved_ip.clone(),
+                        reservation,
+                        proxy,
+                        "reqwest-eager-retry",
                     )
                 } else {
                     // Streaming path — the downstream body builder applies
@@ -30385,21 +30405,41 @@ fn record_h2_pool_admission_failure(
 /// admission (and passive health) record a mid-body backend failure as a healthy
 /// success and can grow the limit. Mirrors the size-limited buffered read paths
 /// that already classify this.
+///
+/// `reservation` is the aggregate retained-response charge the caller acquired
+/// for the declared `Content-Length` BEFORE the read started, so concurrency
+/// cannot multiply the eager cutoff into unbounded resident memory
+/// (GHSA-pwcm-6rh8-f2gh). It is grown to the actual body length and then MOVED
+/// into the returned `Bytes` (`charged_shared_bytes`, `O(1)` — reqwest's
+/// allocation is not copied), so the charge lives exactly as long as the
+/// payload. A body that turns out larger than its declared length and no longer
+/// fits the budget is refused with the same neutral gateway-capacity response
+/// every other retained path uses; a read failure keeps its existing
+/// classification untouched.
 fn buffered_backend_response_from_body_read(
     result: Result<bytes::Bytes, reqwest::Error>,
     status: u16,
     resp_headers: HashMap<String, String>,
     resolved_ip: Option<String>,
+    mut reservation: response_buffer_budget::ResponseBufferReservation,
+    proxy: &Proxy,
+    transport: &'static str,
 ) -> retry::BackendResponse {
     match result {
-        Ok(b) => retry::BackendResponse {
-            status_code: status,
-            body: ResponseBody::buffered(b),
-            headers: resp_headers,
-            connection_error: false,
-            backend_resolved_ip: resolved_ip,
-            error_class: None,
-        },
+        Ok(b) => {
+            if !reservation.reserve(b.len()) {
+                return response_buffer_capacity_response(proxy, resolved_ip, transport);
+            }
+            let charged = response_buffer_budget::charged_shared_bytes(b, reservation);
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::buffered(charged),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            }
+        }
         Err(e) => {
             let (status_code, error_class) =
                 eager_buffer_body_read_status_and_class(retry::classify_reqwest_error(&e));
@@ -32207,9 +32247,25 @@ async fn proxy_to_backend(
                 if stream_response && content_length.is_some() {
                     let cutoff = state.response_buffer_cutoff_bytes;
                     if cutoff > 0
-                        && content_length.is_some_and(|cl| cl <= cutoff)
+                        && let Some(declared_len) = content_length.filter(|cl| *cl <= cutoff)
                         && !is_streaming_content_type(&resp_headers)
                     {
+                        // Eagerly buffered, therefore RETAINED: charged against
+                        // the aggregate budget before the read so concurrency
+                        // cannot multiply the cutoff (GHSA-pwcm-6rh8-f2gh).
+                        let Some(reservation) =
+                            response_buffer_budget::try_reserve_retained(declared_len)
+                        else {
+                            return backend_dispatch_response(
+                                response_buffer_capacity_response(
+                                    proxy,
+                                    resolved_ip.clone(),
+                                    "reqwest-eager",
+                                ),
+                                retained_body,
+                                backend_admission_permits,
+                            );
+                        };
                         let body_read = match crate::plugins::await_grpc_deadline(
                             request_ctx.grpc_deadline_at(),
                             response.bytes(),
@@ -32235,6 +32291,9 @@ async fn proxy_to_backend(
                                 status,
                                 resp_headers,
                                 resolved_ip.clone(),
+                                reservation,
+                                proxy,
+                                "reqwest-eager",
                             ),
                             retained_body,
                             backend_admission_permits,
@@ -32331,9 +32390,26 @@ async fn proxy_to_backend(
                     .and_then(|v| v.parse::<usize>().ok());
                 let cutoff = state.response_buffer_cutoff_bytes;
                 if cutoff > 0
-                    && content_length.is_some_and(|cl| cl <= cutoff)
+                    && let Some(declared_len) = content_length.filter(|cl| *cl <= cutoff)
                     && !is_streaming_content_type(&resp_headers)
                 {
+                    // Same eager retention as the limited arm above, and the same
+                    // aggregate charge: "no configured per-response ceiling"
+                    // never means "unbounded resident memory"
+                    // (GHSA-pwcm-6rh8-f2gh).
+                    let Some(reservation) =
+                        response_buffer_budget::try_reserve_retained(declared_len)
+                    else {
+                        return backend_dispatch_response(
+                            response_buffer_capacity_response(
+                                proxy,
+                                resolved_ip.clone(),
+                                "reqwest-eager-unlimited",
+                            ),
+                            retained_body,
+                            backend_admission_permits,
+                        );
+                    };
                     let body_read = match crate::plugins::await_grpc_deadline(
                         request_ctx.grpc_deadline_at(),
                         response.bytes(),
@@ -32358,6 +32434,9 @@ async fn proxy_to_backend(
                         status,
                         resp_headers,
                         resolved_ip.clone(),
+                        reservation,
+                        proxy,
+                        "reqwest-eager-unlimited",
                     )
                 } else {
                     retry::BackendResponse {
@@ -32570,14 +32649,21 @@ async fn collect_response_with_limit(
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
             Ok(chunk) => {
-                if body.len() + chunk.len() > max_size {
+                // ONE prospective length for the ceiling check, the budget
+                // reservation, and the allocation that follows: a hostile chunk
+                // sequence must not be able to make the bound check and the
+                // charge disagree, and saturation keeps an impossible length
+                // failing every finite ceiling instead of wrapping past it.
+                let prospective =
+                    response_buffer_budget::prospective_retained_len(body.len(), chunk.len());
+                if prospective > max_size {
                     warn!(
                         "Backend response truncated: exceeded {} byte limit",
                         max_size
                     );
                     return Err(BufferedCollectFailure::too_large());
                 }
-                if !reservation.reserve(body.len() + chunk.len()) {
+                if !reservation.reserve(prospective) {
                     warn!(
                         "Response buffering refused: aggregate retained-response budget exhausted"
                     );
@@ -33394,10 +33480,14 @@ async fn collect_hyper_body_and_trailers_with_limit(
         };
         let frame = frame.map_err(HyperBodyCollectError::Read)?;
         if let Some(data) = frame.data_ref() {
-            if body_bytes.len().saturating_add(data.len()) > max_size {
+            // One prospective length, reused by the ceiling check and the
+            // charge, so they cannot disagree (GHSA-pwcm-6rh8-f2gh).
+            let prospective =
+                response_buffer_budget::prospective_retained_len(body_bytes.len(), data.len());
+            if prospective > max_size {
                 return Err(HyperBodyCollectError::TooLarge);
             }
-            if !reservation.reserve(body_bytes.len().saturating_add(data.len())) {
+            if !reservation.reserve(prospective) {
                 warn!("Response buffering refused: aggregate retained-response budget exhausted");
                 return Err(HyperBodyCollectError::BudgetExhausted);
             }

@@ -7235,7 +7235,7 @@ async fn handle_h3_request(
             if normalize_response_body_for_inspection(
                 &plugins,
                 &mut ctx,
-                response_status,
+                &mut response_status,
                 &mut response_headers,
                 &mut response_body,
                 initial_response_header_policy_plugins.as_ref(),

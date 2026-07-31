@@ -944,7 +944,13 @@ async fn collect_reqwest_response_body_with_limit(
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => {
-                if body.len() + chunk.len() > max_response_body_size_bytes {
+                // One saturating prospective length shared by the ceiling check
+                // and the budget charge: a hostile response must not be able to
+                // wrap the sum past the ceiling or panic a debug build
+                // (GHSA-pwcm-6rh8-f2gh).
+                let prospective =
+                    response_buffer_budget::prospective_retained_len(body.len(), chunk.len());
+                if prospective > max_response_body_size_bytes {
                     return Err((
                         502,
                         r#"{"error":"Backend response body exceeds maximum size"}"#
@@ -953,7 +959,7 @@ async fn collect_reqwest_response_body_with_limit(
                         Some(ErrorClass::ResponseBodyTooLarge),
                     ));
                 }
-                if !reservation.reserve(body.len() + chunk.len()) {
+                if !reservation.reserve(prospective) {
                     warn!(
                         "cross-protocol H3→HTTP: response buffering refused, aggregate \
                          retained-response budget exhausted"
@@ -2844,7 +2850,7 @@ where
                 normalize_response_body_for_inspection(
                     plugins,
                     ctx,
-                    response_status,
+                    &mut response_status,
                     &mut response_headers,
                     &mut response_body,
                     initial_response_header_policy_plugins,
@@ -4992,7 +4998,7 @@ where
             if normalize_response_body_for_inspection(
                 plugins,
                 ctx,
-                response_status,
+                &mut response_status,
                 &mut plugin_response_headers,
                 &mut response_body,
                 initial_response_header_policy_plugins,

@@ -24,18 +24,20 @@
 //! A collector-local reservation does not: collection finishes, the local
 //! drops, and the bytes stay resident in `BackendResponse` / `GrpcResponse` /
 //! `H3BufferedResponse`, in retry state, through the response-plugin phases,
-//! inside a `response_caching` entry, and all the way down to the wire. Many
-//! responses could therefore each pass admission, release, and remain resident
-//! at once — which is exactly the bypass this module exists to prevent.
+//! and all the way down to the wire — and anything copied out of them (a
+//! `response_caching` entry) stays resident longer still. Many responses could
+//! therefore each pass admission, release, and remain resident at once — which
+//! is exactly the bypass this module exists to prevent.
 //!
 //! So the charge is not a collector local. [`charged_bytes`] moves the retained
 //! `Vec<u8>` *and* its permit into one owner and hands back a
 //! [`bytes::Bytes`] view of it ([`bytes::Bytes::from_owner`], `O(1)`, no copy).
 //! From then on:
 //!
-//! * every cheap clone (cache store, dedup replay, concurrent delivery) shares
-//!   the one owner, so the allocation is charged **exactly once** no matter how
-//!   many handles exist — a clone never mints a second permit;
+//! * every cheap clone (dedup replay, concurrent delivery, cache-entry replay)
+//!   shares the one owner, so the allocation is charged **exactly once** no
+//!   matter how many handles exist — a clone never mints a second permit. A
+//!   *copy* is a different allocation and takes its own charge (below);
 //! * the permit is returned when the **last** handle drops, which covers
 //!   success, retry abandonment, plugin replacement, response conversion,
 //!   deadline expiry, client disconnect, and task cancellation identically,
@@ -47,7 +49,23 @@
 //! which the collector's charge does not cover. Those go through
 //! [`charge_replacement_body`], which fails closed when the added retained
 //! bytes cannot be reserved. Dropping the old `Bytes` returns its permit, so a
-//! replacement is a move of the charge rather than a second one.
+//! replacement is a move of the charge rather than a second one. The charge is
+//! attached to the **replacement allocation**, never to the request that
+//! produced it: a replacement that is copied into a longer-lived structure
+//! keeps its charge, and a request context that drops (or is cloned) neither
+//! releases nor duplicates it.
+//!
+//! The same rule covers a body a plugin *copies out* into storage that outlives
+//! the request — `response_caching`'s entry copy is a distinct allocation from
+//! the collected body, so it acquires its own charge through
+//! [`charge_retained_copy`] and holds it until the entry is evicted and the last
+//! clone of it drops. If the budget cannot admit that copy, the store is skipped
+//! (a cache miss, exactly like the `max_entry_size_bytes` refusal beside it)
+//! rather than retaining an uncharged entry.
+//!
+//! An eagerly read body that reqwest already owns as [`Bytes`] is charged
+//! without a copy through [`charged_shared_bytes`], which moves the existing
+//! handle and the permit into one owner.
 //!
 //! # Preallocation
 //!
@@ -226,7 +244,14 @@ impl ResponseBufferReservation {
     }
 
     fn reserve_against(&mut self, budget: &Budget, retained_bytes: usize) -> bool {
-        let wanted = u32::try_from(retained_bytes.div_ceil(RESERVATION_UNIT_BYTES).max(1))
+        // Nothing retained, nothing charged. A zero-length body occupies no
+        // memory, so rounding it up to a block would both over-charge the
+        // budget and let memory pressure refuse a bodyless response that costs
+        // nothing to serve.
+        if retained_bytes == 0 {
+            return true;
+        }
+        let wanted = u32::try_from(retained_bytes.div_ceil(RESERVATION_UNIT_BYTES))
             .unwrap_or(u32::MAX);
         if wanted <= self.blocks {
             return true;
@@ -255,6 +280,36 @@ impl ResponseBufferReservation {
     }
 }
 
+/// The length a retained buffer would have after appending `added` bytes to
+/// `current`, computed once so the ceiling check, the budget reservation, and
+/// the allocation that follows all use the SAME value.
+///
+/// Saturating rather than wrapping: on a 64-bit target the sum cannot really
+/// overflow, but a hostile `Content-Length`/frame sequence must not be able to
+/// turn a bounds check into a debug-build panic or a release-build wrap that
+/// *passes* the ceiling comparison. Saturation pins the prospective length at
+/// `usize::MAX`, which fails every finite ceiling — the fail-closed direction.
+#[inline]
+pub(crate) fn prospective_retained_len(current: usize, added: usize) -> usize {
+    current.saturating_add(added)
+}
+
+/// Reserve `bytes` of retained capacity up front, before the allocation exists.
+///
+/// `None` means the aggregate budget refused; the caller must not retain the
+/// bytes. The returned reservation can be grown with
+/// [`ResponseBufferReservation::reserve`] and must be handed to
+/// [`charged_bytes`] / [`charged_shared_bytes`] so the charge outlives the
+/// collector.
+pub(crate) fn try_reserve_retained(bytes: usize) -> Option<ResponseBufferReservation> {
+    let mut reservation = ResponseBufferReservation::new();
+    if reservation.reserve_against(budget(), bytes) {
+        Some(reservation)
+    } else {
+        None
+    }
+}
+
 /// One retained buffered-response allocation and the budget permit that paid
 /// for it, owned together so neither can outlive the other.
 struct ChargedBuffer {
@@ -279,15 +334,76 @@ impl AsRef<[u8]> for ChargedBuffer {
 /// exactly once for as long as any handle to it exists.
 pub(crate) fn charged_bytes(data: Vec<u8>, reservation: ResponseBufferReservation) -> Bytes {
     if data.is_empty() {
-        // Nothing is retained, so nothing should stay charged. Dropping the
-        // reservation here returns the (at most one) block a zero-length
-        // collection rounded up to.
+        // Nothing is retained, so nothing should stay charged. A zero-length
+        // collection reserves no block in the first place, so dropping the
+        // reservation here is a no-op rather than a correction.
         return Bytes::new();
     }
     Bytes::from_owner(ChargedBuffer {
         data,
         _permit: reservation.into_permit(),
     })
+}
+
+/// One retained buffered-response allocation that is already published as
+/// [`Bytes`] (reqwest's eager `bytes()` read), plus the permit that paid for it.
+///
+/// Same contract as [`ChargedBuffer`], expressed over a `Bytes` handle instead
+/// of a `Vec`: no copy is made, and the permit is returned when the last clone
+/// of the wrapper drops.
+struct ChargedShared {
+    data: Bytes,
+    /// Released on drop. `None` only for the degenerate empty case.
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl AsRef<[u8]> for ChargedShared {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+/// Attach `reservation` to bytes that are already a [`Bytes`] handle, without
+/// copying them.
+///
+/// Used by the eager small-response paths, where reqwest hands back an owned
+/// `Bytes` rather than a `Vec`. The returned handle owns both, so — exactly as
+/// with [`charged_bytes`] — every clone shares the single charge and the budget
+/// is returned when the last handle drops.
+pub(crate) fn charged_shared_bytes(data: Bytes, reservation: ResponseBufferReservation) -> Bytes {
+    if data.is_empty() {
+        return Bytes::new();
+    }
+    Bytes::from_owner(ChargedShared {
+        data,
+        _permit: reservation.into_permit(),
+    })
+}
+
+/// Charge a COPY that will outlive the request which produced it — the
+/// `response_caching` entry body.
+///
+/// The copy is a distinct allocation from the collected body, so it cannot
+/// share the collector's charge: the collected body is released when the
+/// response finishes while the entry stays resident until eviction. Reserving
+/// before `to_vec` also means a refusal never materialises the copy at all.
+///
+/// `None` means the budget refused; the caller must skip the store rather than
+/// retain an uncharged entry.
+pub(crate) fn charge_retained_copy(data: &[u8]) -> Option<Bytes> {
+    charge_retained_copy_against(budget(), data)
+}
+
+fn charge_retained_copy_against(budget: &Budget, data: &[u8]) -> Option<Bytes> {
+    if data.is_empty() {
+        return Some(Bytes::new());
+    }
+    let mut reservation = ResponseBufferReservation::new();
+    if !reservation.reserve_against(budget, data.len()) {
+        return None;
+    }
+    Some(charged_bytes(data.to_vec(), reservation))
 }
 
 /// Charge a retained body that was produced without a collector reservation —
@@ -353,6 +469,22 @@ impl IsolatedBudget {
     /// bytes so it survives the collector's return.
     pub(crate) fn charge_retained_body(&self, data: Vec<u8>) -> Option<Bytes> {
         charge_replacement_body_against(&self.0, data)
+    }
+
+    /// Charge a copy that outlives the request that produced it, exactly as the
+    /// `response_caching` entry store does.
+    pub(crate) fn charge_retained_copy(&self, data: &[u8]) -> Option<Bytes> {
+        charge_retained_copy_against(&self.0, data)
+    }
+
+    /// Attach a reservation to an already-owned `Bytes`, exactly as the eager
+    /// small-response paths do.
+    pub(crate) fn attach_shared(
+        &self,
+        data: Bytes,
+        reservation: ResponseBufferReservation,
+    ) -> Bytes {
+        charged_shared_bytes(data, reservation)
     }
 }
 

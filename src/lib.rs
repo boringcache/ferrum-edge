@@ -6071,6 +6071,71 @@ pub mod _test_support {
         pub fn attach(&self, data: Vec<u8>, charge: ResponseBufferChargeProbe) -> bytes::Bytes {
             crate::proxy::response_buffer_budget::charged_bytes(data, charge.0)
         }
+
+        /// Hand an existing claim to bytes the transport already owns, without
+        /// copying — the eager reqwest small-response path
+        /// (`buffered_backend_response_from_body_read`).
+        pub fn attach_shared(
+            &self,
+            data: bytes::Bytes,
+            charge: ResponseBufferChargeProbe,
+        ) -> bytes::Bytes {
+            self.0.attach_shared(data, charge.0)
+        }
+
+        /// Charge a COPY that outlives the request which produced it — the
+        /// `response_caching` entry body. `None` when the budget refuses, which
+        /// is the signal to skip the store rather than retain uncharged bytes.
+        pub fn charge_retained_copy(&self, data: &[u8]) -> Option<bytes::Bytes> {
+            self.0.charge_retained_copy(data)
+        }
+    }
+
+    impl ResponseBufferChargeProbe {
+        /// Whole reserved blocks expressed in bytes.
+        pub fn reserved_bytes(&self) -> usize {
+            self.0.reserved_bytes()
+        }
+    }
+
+    /// Install the gateway-local retained-response-capacity refusal exactly as
+    /// the buffered normalize / transform phases do when the aggregate budget
+    /// refuses a replacement allocation (`GHSA-pwcm-6rh8-f2gh`).
+    pub fn install_response_buffer_capacity_refusal_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut std::collections::HashMap<String, String>,
+        response_body: &mut bytes::Bytes,
+    ) {
+        crate::plugins::install_response_buffer_capacity_refusal(
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+        );
+    }
+
+    /// Whether ANY active buffering plugin will let the shared retry refinement
+    /// consider releasing this response.
+    ///
+    /// Retry-enabled dispatch buffers by default; this is the gate that decides
+    /// whether the header-time release path is entered at all. A `false` here
+    /// means every response stays fully buffered under retries, no matter what
+    /// the per-response confirmation hook would have said
+    /// (`GHSA-pwcm-6rh8-f2gh`).
+    pub fn plugins_may_release_response_body_under_retries_for_test(
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        crate::proxy::plugins_may_release_response_body_under_retries(plugins, ctx)
+    }
+
+    /// The prospective retained length a collector computes ONCE and reuses for
+    /// its ceiling check, its budget charge, and its allocation. Saturating, so
+    /// a hostile length cannot wrap past a finite ceiling or panic a debug
+    /// build (`GHSA-pwcm-6rh8-f2gh`).
+    pub fn prospective_retained_len_for_test(current: usize, added: usize) -> usize {
+        crate::proxy::response_buffer_budget::prospective_retained_len(current, added)
     }
 
     /// Canonical declared `Content-Length` from a raw header map, honoring

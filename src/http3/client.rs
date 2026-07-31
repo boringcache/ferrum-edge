@@ -376,12 +376,16 @@ pub(crate) async fn drain_h3_response_body(
         match recv_result {
             Ok(Some(chunk)) => {
                 let chunk = chunk.chunk();
-                if body.len().saturating_add(chunk.len()) > max_response_body_size_bytes {
+                // One prospective length, reused by the ceiling check and the
+                // budget charge (GHSA-pwcm-6rh8-f2gh).
+                let prospective =
+                    response_buffer_budget::prospective_retained_len(body.len(), chunk.len());
+                if prospective > max_response_body_size_bytes {
                     return Err(H3BodyDrainError::ResponseTooLarge {
                         limit: max_response_body_size_bytes,
                     });
                 }
-                if !reservation.reserve(body.len().saturating_add(chunk.len())) {
+                if !reservation.reserve(prospective) {
                     return Err(H3BodyDrainError::BufferBudgetExhausted);
                 }
                 body.extend_from_slice(chunk);

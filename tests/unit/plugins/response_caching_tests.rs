@@ -6494,3 +6494,249 @@ async fn ordinary_cacheable_response_still_buffers_and_stores() {
         .await;
     assert_eq!(response_caching_cache_keys_for_test(&plugin).len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// GHSA-pwcm-6rh8-f2gh (r2) — release must be exactly equivalent to running the
+// store path, and must also be reachable under retries.
+// ---------------------------------------------------------------------------
+
+/// `Set-Cookie` is refused by the store path only AFTER the invalidating
+/// branches. Releasing it while one of those branches applies would skip an
+/// eviction the response demands, so the invalidation requirement wins.
+#[tokio::test]
+async fn set_cookie_with_an_invalidating_directive_stays_buffered() {
+    let plugin = default_plugin();
+    let mut ctx = make_ctx("GET", "/api/resource");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    for directive in ["no-store", "private", "no-cache", "max-age=0"] {
+        let response_headers = response_headers_from(&[
+            ("content-type", "application/json"),
+            ("set-cookie", "session=abc"),
+            ("cache-control", directive),
+        ]);
+        assert!(
+            plugin.should_buffer_response_body_for_content_type(
+                &ctx,
+                Some("application/json"),
+                200,
+                &response_headers,
+            ),
+            "`{directive}` beside Set-Cookie must still reach the eviction in \
+             on_final_response_body"
+        );
+    }
+
+    // An unusable `Vary` is the third invalidating branch.
+    let unusable_vary = response_headers_from(&[
+        ("content-type", "application/json"),
+        ("set-cookie", "session=abc"),
+        ("cache-control", "public, max-age=60"),
+        ("vary", "*"),
+    ]);
+    assert!(
+        plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/json"),
+            200,
+            &unusable_vary,
+        ),
+        "`Vary: *` beside Set-Cookie must still reach the eviction"
+    );
+}
+
+/// Same conflict for an origin-selected event stream: streaming it is the
+/// better outcome, but not at the cost of leaving a superseded entry servable.
+#[tokio::test]
+async fn origin_selected_sse_with_an_invalidating_directive_stays_buffered() {
+    let plugin = default_plugin();
+    let mut ctx = make_ctx("GET", "/api/events");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    for response_headers in [
+        response_headers_from(&[
+            ("content-type", "text/event-stream"),
+            ("cache-control", "no-store"),
+        ]),
+        response_headers_from(&[
+            ("content-type", "text/event-stream"),
+            ("cache-control", "private, max-age=60"),
+        ]),
+        response_headers_from(&[
+            ("content-type", "text/event-stream"),
+            ("cache-control", "max-age=0"),
+        ]),
+        response_headers_from(&[
+            ("content-type", "text/event-stream"),
+            ("cache-control", "public, max-age=60"),
+            ("vary", "*"),
+        ]),
+    ] {
+        assert!(
+            plugin.should_buffer_response_body_for_content_type(
+                &ctx,
+                Some("text/event-stream"),
+                200,
+                &response_headers,
+            ),
+            "an invalidating event stream must still reach on_final_response_body"
+        );
+    }
+}
+
+/// A status refused BEFORE the invalidating branches is released even when an
+/// invalidating directive is present, because the store path provably returns
+/// before reaching them. This is the asymmetry the ordering encodes.
+#[tokio::test]
+async fn a_pre_invalidation_refusal_releases_even_with_an_invalidating_directive() {
+    let plugin = default_plugin();
+    let mut ctx = make_ctx("GET", "/api/resource");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let response_headers = response_headers_from(&[
+        ("content-type", "application/json"),
+        ("cache-control", "no-store"),
+    ]);
+    assert!(
+        !plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/json"),
+            500,
+            &response_headers,
+        ),
+        "an uncacheable status short-circuits the store path before any eviction"
+    );
+
+    let ranged = response_headers_from(&[
+        ("content-type", "application/json"),
+        ("content-range", "bytes 0-9/100"),
+        ("cache-control", "no-store"),
+    ]);
+    assert!(
+        !plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/json"),
+            200,
+            &ranged,
+        ),
+        "a Content-Range answer short-circuits the store path before any eviction"
+    );
+}
+
+/// A configured `ttl_seconds: 0` makes EVERY response take the zero-freshness
+/// invalidation branch, so nothing may be released on the header refinement.
+#[tokio::test]
+async fn a_zero_ttl_instance_never_releases_a_cacheable_response() {
+    let plugin = plugin_with_config(json!({"ttl_seconds": 0}));
+    let mut ctx = make_ctx("GET", "/api/events");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let response_headers = response_headers_from(&[("content-type", "text/event-stream")]);
+    assert!(
+        plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("text/event-stream"),
+            200,
+            &response_headers,
+        ),
+        "with ttl_seconds = 0 every cacheable-status response invalidates"
+    );
+}
+
+/// Finding 4: with `response_caching` as the ONLY buffering plugin, retries
+/// must still be able to reach the header-time release. Before this, the
+/// instance overrode neither retry hook, so the shared gate was false and an
+/// origin-selected event stream stayed fully buffered under retries.
+#[tokio::test]
+async fn response_caching_alone_enables_retry_time_release() {
+    let plugin: Arc<ResponseCaching> = Arc::new(default_plugin());
+    let mut ctx = make_ctx("GET", "/api/events");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_status(&plugin, &ctx, "MISS");
+
+    // The SAME instance the gate is evaluated over, so the release marker this
+    // request carries is the one the vote reads.
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    assert!(
+        plugin.may_release_response_body_under_retries(&ctx),
+        "the instance must opt into the retry release path while it is buffering"
+    );
+    assert!(
+        ferrum_edge::_test_support::plugins_may_release_response_body_under_retries_for_test(
+            &plugins, &ctx
+        ),
+        "response_caching alone must open the retry release gate"
+    );
+
+    // Cache-irrelevant representations are released...
+    let sse = response_headers_from(&[
+        ("content-type", "text/event-stream"),
+        ("cache-control", "public, max-age=60"),
+    ]);
+    assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &sse));
+
+    let uncacheable_status = response_headers_from(&[("content-type", "application/json")]);
+    assert!(plugin.should_release_response_body_under_retries(&ctx, 500, &uncacheable_status));
+
+    // ...and a storable or invalidating one is not.
+    let storable = response_headers_from(&[
+        ("content-type", "application/json"),
+        ("cache-control", "public, max-age=60"),
+    ]);
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &storable));
+
+    let invalidating_sse = response_headers_from(&[
+        ("content-type", "text/event-stream"),
+        ("cache-control", "no-store"),
+    ]);
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &invalidating_sse));
+}
+
+/// An instance that is not buffering this request neither opens the retry gate
+/// nor votes to release — the vote belongs to the plugins that are the reason
+/// for buffering.
+#[tokio::test]
+async fn a_released_instance_does_not_open_the_retry_gate() {
+    let plugin: Arc<ResponseCaching> = Arc::new(default_plugin());
+    let mut ctx = make_ctx("POST", "/api/orders");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(!plugin.should_buffer_response_body(&ctx));
+
+    assert!(!plugin.may_release_response_body_under_retries(&ctx));
+    let sse = response_headers_from(&[("content-type", "text/event-stream")]);
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &sse));
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    assert!(
+        !ferrum_edge::_test_support::plugins_may_release_response_body_under_retries_for_test(
+            &plugins, &ctx
+        )
+    );
+}
+
+/// Finding 1: the entry body is charged for its own lifetime, so an entry the
+/// aggregate budget cannot admit is simply not stored — the client still gets
+/// its response and nothing uncharged is retained.
+#[tokio::test]
+async fn a_cacheable_response_is_still_stored_under_a_healthy_budget() {
+    let plugin = default_plugin();
+    let mut ctx = make_ctx("GET", "/api/widgets");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let response_headers = public_response_headers();
+    plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, b"{\"ok\":true}")
+        .await;
+    assert_eq!(
+        response_caching_cache_keys_for_test(&plugin).len(),
+        1,
+        "the entry copy acquires its own charge and the store proceeds"
+    );
+}
