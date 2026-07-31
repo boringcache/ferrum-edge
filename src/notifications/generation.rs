@@ -16,11 +16,19 @@
 //! Every non-outcome exit carries a precise, compiled-in
 //! [`AbandonReason`], and the metrics layer keeps two disjoint families:
 //!
-//! - **Pre-attempt rejections** (`GenerationClosed`, `RegistryRejected`) —
+//! - **Pre-body rejections** (`GenerationClosed`, `RegistryRejected`) —
 //!   counted in `rejected_total{reason}`. No `attempted`, no `in_flight`.
-//! - **Post-attempt abandonment** (`GenerationRetired`, `ShutdownDeadline`,
+//! - **Post-body abandonment** (`GenerationRetired`, `ShutdownDeadline`,
 //!   `TaskDropped`) — counted in `abandoned_total{reason}`, releasing the
-//!   `in_flight` reservation the attempt took.
+//!   `in_flight` reservation the body start took.
+//!
+//! `attempted` / `in_flight` advance when the registry-owned delivery **body
+//! starts** (first statement of the task future), not when the first channel
+//! transport call is polled. That boundary is load-bearing for hard-deadline
+//! drop classification: a task the registry never ran must stay a rejection,
+//! while a body that started and is later hard-aborted must land on
+//! `ShutdownDeadline`. An admit-then-cancel race can therefore increment
+//! `attempted` with no channel call; that is the documented contract.
 //!
 //! Only `ShutdownDeadline` advances `abandoned_at_deadline_total`, so that
 //! metric is a true hard-deadline signal rather than a catch-all.
@@ -196,15 +204,47 @@ impl DispatchGeneration {
     ///
     /// Every rejection path settles exactly once with a precise, compiled-in
     /// [`AbandonReason`], so the producer callback always runs and the
-    /// operator can tell a pre-attempt admission rejection apart from a
-    /// genuine hard abort at the shutdown deadline. A path that never ran a
-    /// transport attempt records a `rejected_total{reason}` increment and does
+    /// operator can tell a pre-body admission rejection apart from a
+    /// genuine hard abort at the shutdown deadline. A path that never started
+    /// the delivery body records a `rejected_total{reason}` increment and does
     /// **not** inflate `attempted`.
     pub fn spawn<F>(
         self: &Arc<Self>,
         channel_type: &'static str,
         on_settle: Option<DeliveryCallback>,
         future: F,
+    ) -> bool
+    where
+        F: Future<Output = DispatchSettle> + Send + 'static,
+    {
+        self.spawn_impl(channel_type, on_settle, future, None)
+    }
+
+    /// Spawn through an owned [`crate::observability_delivery::DeliverySlot`]
+    /// instead of the process-global registry.
+    ///
+    /// External tests use this seam so a hard process-shutdown deadline can
+    /// abort an admitted notification without closing global delivery admission
+    /// out from under concurrent suites. Production callers use [`Self::spawn`].
+    pub fn spawn_with_delivery_slot<F>(
+        self: &Arc<Self>,
+        channel_type: &'static str,
+        on_settle: Option<DeliveryCallback>,
+        slot: &crate::observability_delivery::DeliverySlot,
+        future: F,
+    ) -> bool
+    where
+        F: Future<Output = DispatchSettle> + Send + 'static,
+    {
+        self.spawn_impl(channel_type, on_settle, future, Some(slot))
+    }
+
+    fn spawn_impl<F>(
+        self: &Arc<Self>,
+        channel_type: &'static str,
+        on_settle: Option<DeliveryCallback>,
+        future: F,
+        slot: Option<&crate::observability_delivery::DeliverySlot>,
     ) -> bool
     where
         F: Future<Output = DispatchSettle> + Send + 'static,
@@ -217,8 +257,8 @@ impl DispatchGeneration {
             // Pre-`begin_task` admission rejection. Historically this path
             // invoked the producer callback and incremented nothing at all,
             // leaving reload-time rejections completely invisible. It is now
-            // counted under its own bounded reason without pretending a
-            // transport attempt was made.
+            // counted under its own bounded reason without pretending the
+            // delivery body started.
             self.metrics
                 .record_rejected(channel_type, AbandonReason::GenerationClosed);
             if let Some(callback) = on_settle {
@@ -233,8 +273,8 @@ impl DispatchGeneration {
         let generation = Arc::clone(self);
         let _task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
 
-        // Reserve local drain accounting before asking the global registry so a
-        // successful handoff cannot race a zero in-flight read on Drop. The
+        // Reserve local drain accounting before asking the delivery registry so
+        // a successful handoff cannot race a zero in-flight read on Drop. The
         // `attempted` metric is deliberately NOT reserved here: it is recorded
         // by the task body, so a task the registry never runs stays a
         // rejection rather than a phantom attempt.
@@ -255,20 +295,26 @@ impl DispatchGeneration {
         let guard = DeliveryTaskGuard {
             settlement: Arc::clone(&settlement),
         };
-        let admitted = crate::observability_delivery::spawn_terminal_with_context({
+        let factory = {
             let generation = Arc::clone(&generation);
             let settlement = Arc::clone(&settlement);
-            move |ctx| {
+            move |ctx: crate::observability_delivery::DeliveryTaskContext| {
                 // Bind classification to the exact lifecycle this spawn admits
                 // against. A later slot replacement must not reclassify A's
                 // hard abort using B's non-cancelling current generation.
                 let _ = settlement.delivery_context.set(ctx);
                 async move {
                     // First statement of the task body: the registry actually ran
-                    // us. This is what makes the drop classification deterministic
-                    // rather than a race against the spawning thread — a task the
-                    // registry rejected can never reach this line, so an unsettled
-                    // drop before it is unambiguously a registry rejection.
+                    // us. This is the attempt-accounting boundary — body start,
+                    // not the first channel transport poll. Keeping the marker
+                    // here (before any `.await`) preserves hard-deadline drop
+                    // classification: a task the registry rejected can never
+                    // reach this line, so an unsettled drop before it is
+                    // unambiguously a registry rejection, while a body that
+                    // started and is later hard-aborted lands on
+                    // `ShutdownDeadline`. Admit-then-cancel may therefore
+                    // advance `attempted` with no channel call; that is the
+                    // documented contract.
                     settlement.mark_attempt_started();
                     let settle = if generation.is_cancelled() {
                         DispatchSettle::Abandoned(AbandonReason::GenerationRetired)
@@ -278,7 +324,11 @@ impl DispatchGeneration {
                     guard.settle(settle);
                 }
             }
-        });
+        };
+        let admitted = match slot {
+            Some(slot) => slot.spawn_terminal_with_context(factory),
+            None => crate::observability_delivery::spawn_terminal_with_context(factory),
+        };
 
         if !admitted {
             // The registry may drop/abort its future asynchronously. Settle
@@ -334,9 +384,12 @@ struct DeliveryTaskSettlement {
     channel_type: &'static str,
     on_settle: Option<DeliveryCallback>,
     settled: AtomicBool,
-    /// Set by the first statement of the task body. `false` means the registry
-    /// never ran the task, so `attempted`/`in_flight` were never reserved and
-    /// an unsettled drop is a rejection rather than an abandoned attempt.
+    /// Set by the first statement of the task body (registry-owned body start).
+    /// `false` means the registry never ran the task, so `attempted`/`in_flight`
+    /// were never reserved and an unsettled drop is a rejection rather than an
+    /// abandoned attempt. This is intentionally *not* "first channel transport
+    /// poll": delaying the marker past an `.await` would misclassify hard
+    /// shutdown aborts as `RegistryRejected`.
     attempt_started: AtomicBool,
     /// Exact observability lifecycle this task was admitted against. Populated
     /// by the context-bearing spawn factory; absent only when that factory
@@ -345,9 +398,10 @@ struct DeliveryTaskSettlement {
 }
 
 impl DeliveryTaskSettlement {
-    /// Publish that the registry actually started this task, and reserve the
-    /// attempt in metrics. Called exactly once, before the transport future is
-    /// polled.
+    /// Publish that the registry actually started this task body, and reserve
+    /// the attempt in metrics. Called exactly once as the first statement of
+    /// the task body — before any `.await` and before the first channel
+    /// transport poll — so hard-deadline drop classification stays race-free.
     fn mark_attempt_started(&self) {
         self.attempt_started.store(true, Ordering::Release);
         self.generation.metrics.record_attempted(self.channel_type);
@@ -396,14 +450,16 @@ impl DeliveryTaskSettlement {
             }
             DispatchSettle::Abandoned(reason) => {
                 if self.attempt_started.load(Ordering::Acquire) {
-                    // An attempt ran: release the `in_flight` reservation and
-                    // count it under the post-attempt taxonomy.
+                    // The delivery body started: release the `in_flight`
+                    // reservation and count it under the post-body taxonomy.
+                    // Transport may or may not have been polled.
                     self.generation
                         .metrics
                         .record_abandoned(self.channel_type, reason);
                 } else {
-                    // No attempt ever ran: never inflate `attempted`, and never
-                    // decrement an `in_flight` reservation that was not taken.
+                    // The body never started: never inflate `attempted`, and
+                    // never decrement an `in_flight` reservation that was not
+                    // taken.
                     self.generation
                         .metrics
                         .record_rejected(self.channel_type, reason);

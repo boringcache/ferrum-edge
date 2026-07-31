@@ -59,17 +59,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Abandonment is now reported under a fixed, compiled-in reason taxonomy
   instead of one catch-all counter. New
   `ferrum_notification_delivery_rejected_total{channel_type,reason}`
-  (`generation_closed`, `registry_rejected`) covers drops with no transport
-  attempt — including the pre-`begin_task` generation rejection that
-  previously incremented nothing at all — and new
+  (`generation_closed`, `registry_rejected`) covers drops where the
+  registry-owned delivery body never started — including the pre-`begin_task`
+  generation rejection that previously incremented nothing at all — and new
   `ferrum_notification_delivery_abandoned_total{channel_type,reason}`
-  (`generation_retired`, `shutdown_deadline`, `task_dropped`) covers attempts
-  that ran without a committed outcome.
-  `ferrum_notification_delivery_abandoned_at_deadline_total` now increments
+  (`generation_retired`, `shutdown_deadline`, `task_dropped`) covers bodies
+  that started without a committed outcome (channel transport may or may not
+  have been polled). `ferrum_notification_delivery_attempted_total` advances at
+  that body-start boundary (not the first channel call) so hard-deadline drop
+  classification and the accounting identity stay race-free; an admit-then-cancel
+  race can therefore increment `attempted` with no bytes on the wire.
+  `ferrum_notification_delivery_abandoned_at_deadline_total` increments
   **only** for the true hard abort at the global shutdown drain deadline; a
-  rejected or reload-retired send no longer inflates it, and neither inflates
-  `attempted`. Every rejection path still runs the producer settle callback
-  exactly once (#2448).
+  rejected or reload-retired send no longer inflates it, and a pre-body
+  rejection never inflates `attempted`. Every rejection path still runs the
+  producer settle callback exactly once (#2448).
 - `proxy_alerts` re-breach during an externally in-flight Resolve no longer
   silently suppresses the follow-up alert. The incident parks in
   `ResolveInFlightRebreached` (no notification that could overtake the Resolve

@@ -186,13 +186,13 @@ Authenticated `/metrics` exports these families, labeled only by the fixed `chan
 
 | Metric | Type | Meaning |
 |--------|------|---------|
-| `ferrum_notification_delivery_attempted_total` | counter | Tasks whose registry-owned delivery body actually started (one count per delivery task, not per retry) |
+| `ferrum_notification_delivery_attempted_total` | counter | Tasks whose registry-owned delivery body started executing (one count per delivery task, not per retry). Advances at body start — before any channel transport call — so an admit-then-cancel race can increment it with no bytes on the wire. |
 | `ferrum_notification_delivery_succeeded_total` | counter | Final success (after retries) |
 | `ferrum_notification_delivery_failed_transient_total` | counter | Exhausted retries on transient failures |
 | `ferrum_notification_delivery_failed_permanent_total` | counter | Permanent failures |
-| `ferrum_notification_delivery_backpressure_dropped_total` | counter | Semaphore exhaustion drops (no transport attempt) |
-| `ferrum_notification_delivery_rejected_total` | counter | Rejected before any transport attempt, by `reason` |
-| `ferrum_notification_delivery_abandoned_total` | counter | Attempt ran but settled with no committed outcome, by `reason` |
+| `ferrum_notification_delivery_backpressure_dropped_total` | counter | Semaphore exhaustion drops (delivery body never started) |
+| `ferrum_notification_delivery_rejected_total` | counter | Rejected before the delivery body started, by `reason` |
+| `ferrum_notification_delivery_abandoned_total` | counter | Delivery body started but settled with no committed outcome, by `reason` (transport may or may not have been polled) |
 | `ferrum_notification_delivery_abandoned_at_deadline_total` | counter | Hard-aborted at the global shutdown drain deadline |
 | `ferrum_notification_delivery_in_flight` | gauge | Currently executing sends (including backoff) |
 
@@ -202,7 +202,7 @@ Two families carry a second label, `reason`. Its values are compiled-in discrimi
 |--------|----------|---------|
 | `rejected_total` | `generation_closed` | The producer stopped admitting (reload / plugin `Drop`) before the dispatch task was created. |
 | `rejected_total` | `registry_rejected` | The process delivery registry refused the task (shutting down, or `FERRUM_LOG_DELIVERY_MAX_TASKS` exhausted). |
-| `abandoned_total` | `generation_retired` | Reload / `Drop` cancelled an attempt that was already in flight. |
+| `abandoned_total` | `generation_retired` | Reload / `Drop` cancelled a delivery after its body started (before, during, or between transport calls). |
 | `abandoned_total` | `shutdown_deadline` | Hard-aborted when the global observability drain deadline expired. |
 | `abandoned_total` | `task_dropped` | The dispatch task was dropped without settling for any other reason. |
 
@@ -215,7 +215,9 @@ attempted == succeeded + failed_transient + failed_permanent
            + sum(abandoned_total) + in_flight
 ```
 
-`backpressure_dropped_total` and `rejected_total` sit deliberately outside it: no transport attempt ran, so counting them as attempts would understate the delivery success ratio. Every one of those paths still invokes the producer's settle callback exactly once, so reserved cooldown / pending incident state is always rolled back.
+`backpressure_dropped_total` and `rejected_total` sit deliberately outside it: the delivery body never started, so counting them as attempts would understate the delivery success ratio. Every one of those paths still invokes the producer's settle callback exactly once, so reserved cooldown / pending incident state is always rolled back.
+
+`attempted` is deliberately a **body-start** counter, not a transport-start counter. Moving the marker to the first channel call would open a window where a hard shutdown abort could drop a running task before `attempted` advanced and misclassify it as `registry_rejected`. The body-start boundary keeps hard-deadline classification, the accounting identity, and pre-body rejection visibility coherent.
 
 ### Best-effort delivery can produce zero, one, or multiple copies
 

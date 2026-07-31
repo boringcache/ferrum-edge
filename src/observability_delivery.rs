@@ -261,7 +261,10 @@ impl DeliverySlot {
     /// The factory receives a [`DeliveryTaskContext`] bound to the same
     /// generation `Arc` that performs admission — one snapshot, not a context
     /// sample followed by a second load that could observe a replacement.
-    pub(crate) fn spawn_terminal_with_context<F, Fut>(&self, factory: F) -> bool
+    ///
+    /// Notification dispatch and its external shutdown-deadline regressions use
+    /// this so hard-abort classification stays bound to the admitted lifecycle.
+    pub fn spawn_terminal_with_context<F, Fut>(&self, factory: F) -> bool
     where
         F: FnOnce(DeliveryTaskContext) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
@@ -383,7 +386,7 @@ fn clamp_max_tasks(max_tasks: usize) -> usize {
 /// current generation, so a draining lifecycle that is replaced mid-drain still
 /// classifies its own hard aborts correctly.
 #[derive(Clone)]
-pub(crate) struct DeliveryTaskContext {
+pub struct DeliveryTaskContext {
     lifecycle: Arc<DeliveryLifecycle>,
 }
 
@@ -391,7 +394,7 @@ impl DeliveryTaskContext {
     /// Whether this exact lifecycle has begun hard-aborting admitted tasks
     /// because its shutdown drain deadline expired.
     #[inline]
-    pub(crate) fn is_aborting_at_deadline(&self) -> bool {
+    pub fn is_aborting_at_deadline(&self) -> bool {
         self.lifecycle.cancelling_tasks.load(Ordering::Acquire)
     }
 }

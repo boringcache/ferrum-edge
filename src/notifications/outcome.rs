@@ -29,12 +29,15 @@ pub const CHANNEL_TYPES: &[&str] = &["slack", "teams", "discord", "webhook", "em
 /// The taxonomy separates two operationally different things that the first
 /// implementation of #2448 collapsed into one counter:
 ///
-/// - **Pre-attempt rejections** ([`AbandonReason::Backpressure`],
+/// - **Pre-body rejections** ([`AbandonReason::Backpressure`],
 ///   [`AbandonReason::GenerationClosed`], [`AbandonReason::RegistryRejected`]):
-///   the notification never reached the transport. No `attempted` is recorded.
-/// - **Post-attempt abandonment** ([`AbandonReason::GenerationRetired`],
-///   [`AbandonReason::ShutdownDeadline`], [`AbandonReason::TaskDropped`]): a
-///   transport attempt ran but produced no committed success/failure.
+///   the registry-owned delivery body never started. No `attempted` is recorded.
+/// - **Post-body abandonment** ([`AbandonReason::GenerationRetired`],
+///   [`AbandonReason::ShutdownDeadline`], [`AbandonReason::TaskDropped`]): the
+///   delivery body started executing but produced no committed success/failure.
+///   Channel transport may or may not have been polled — an admit-then-cancel
+///   race can abandon after `attempted` advances and before the first channel
+///   call.
 ///
 /// Only [`AbandonReason::ShutdownDeadline`] increments
 /// `ferrum_notification_delivery_abandoned_at_deadline_total`, so that signal
@@ -51,8 +54,9 @@ pub enum AbandonReason {
     /// (shutdown in progress, or the aggregate task budget is exhausted).
     /// The task body never ran, so no attempt.
     RegistryRejected,
-    /// The generation was retired (reload / plugin `Drop`) while a transport
-    /// attempt or its backoff was in flight.
+    /// The generation was retired (reload / plugin `Drop`) after the delivery
+    /// body started — including before the first channel transport call, during
+    /// an in-flight send, or during bounded retry backoff.
     GenerationRetired,
     /// The task was hard-aborted because the global observability shutdown
     /// drain deadline expired.
@@ -88,7 +92,7 @@ impl AbandonReason {
     }
 
     /// Index into [`REJECT_REASONS`], or `None` when this reason is not a
-    /// pre-attempt rejection. `Backpressure` is deliberately `None`: it keeps
+    /// pre-body rejection. `Backpressure` is deliberately `None`: it keeps
     /// its own dedicated `backpressure_dropped_total` family so no drop is
     /// counted twice.
     pub const fn reject_index(self) -> Option<usize> {
@@ -100,7 +104,7 @@ impl AbandonReason {
     }
 
     /// Index into [`ABANDON_REASONS`], or `None` when this reason cannot
-    /// describe an attempt that actually ran.
+    /// describe a delivery body that actually started.
     pub const fn abandon_index(self) -> Option<usize> {
         match self {
             Self::GenerationRetired => Some(0),

@@ -40,9 +40,12 @@ fn channel_index(channel_type: &str) -> usize {
 ///            + sum(abandoned[*]) + in_flight
 /// ```
 ///
-/// Pre-attempt drops (`backpressure_dropped`, `rejected[*]`) are deliberately
-/// outside that identity: no transport attempt ran, so inflating `attempted`
-/// for them would make the success ratio operationally false.
+/// `attempted` advances when the registry-owned delivery **body starts**, not
+/// when the first channel transport call is polled. An admit-then-cancel race
+/// can therefore increment `attempted` with no bytes on the wire; that is the
+/// documented contract, not a hole. Pre-body drops (`backpressure_dropped`,
+/// `rejected[*]`) stay outside the identity so the success ratio is not
+/// understated by admission refusals.
 #[derive(Debug)]
 pub struct DeliveryMetrics {
     attempted: [AtomicU64; 5],
@@ -51,10 +54,10 @@ pub struct DeliveryMetrics {
     failed_permanent: [AtomicU64; 5],
     backpressure_dropped: [AtomicU64; 5],
     /// `[reject_reason_index][channel_index]` — admitted past the semaphore but
-    /// no transport attempt ran.
+    /// the registry-owned delivery body never started.
     rejected: [[AtomicU64; 5]; 2],
-    /// `[abandon_reason_index][channel_index]` — an attempt ran but produced no
-    /// committed outcome.
+    /// `[abandon_reason_index][channel_index]` — the delivery body started but
+    /// produced no committed outcome (transport may or may not have run).
     abandoned: [[AtomicU64; 5]; 3],
     /// The `shutdown_deadline` slice of `abandoned`, kept as its own family
     /// because #2448 requires that exact signal.
@@ -112,9 +115,9 @@ impl DeliveryMetrics {
         self.backpressure_dropped[i].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a *pre-attempt* rejection: admitted past the semaphore but no
-    /// transport attempt ever ran, so neither `attempted` nor `in_flight` was
-    /// ever reserved and neither is touched here.
+    /// Record a *pre-body* rejection: admitted past the semaphore but the
+    /// registry-owned delivery body never started, so neither `attempted` nor
+    /// `in_flight` was ever reserved and neither is touched here.
     ///
     /// [`AbandonReason::Backpressure`] is a no-op: semaphore exhaustion keeps
     /// its own `backpressure_dropped_total` family so no drop is double
@@ -126,9 +129,10 @@ impl DeliveryMetrics {
         self.rejected[r][channel_index(channel_type)].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a *post-attempt* abandonment: a transport attempt ran and settled
+    /// Record a *post-body* abandonment: the delivery body started and settled
     /// without a committed success/failure, so it releases the `in_flight`
-    /// reservation `record_attempted` took.
+    /// reservation `record_attempted` took. Channel transport may or may not
+    /// have been polled (admit-then-cancel can abandon before the first call).
     ///
     /// `abandoned_at_deadline` advances only for the true hard shutdown
     /// deadline abort; reload retirement, registry-side cancellation and task
@@ -185,9 +189,9 @@ pub struct ChannelMetricsSnapshot {
     pub failed_transient: u64,
     pub failed_permanent: u64,
     pub backpressure_dropped: u64,
-    /// Pre-attempt rejections, indexed by [`REJECT_REASONS`].
+    /// Pre-body rejections, indexed by [`REJECT_REASONS`].
     pub rejected: [u64; 2],
-    /// Post-attempt abandonment, indexed by [`ABANDON_REASONS`].
+    /// Post-body abandonment, indexed by [`ABANDON_REASONS`].
     pub abandoned: [u64; 3],
     /// The `shutdown_deadline` slice of [`Self::abandoned`].
     pub abandoned_at_deadline: u64,
@@ -195,13 +199,13 @@ pub struct ChannelMetricsSnapshot {
 }
 
 impl ChannelMetricsSnapshot {
-    /// Pre-attempt rejections for one fixed reason (0 for a reason that is not
-    /// a rejection, including `Backpressure`).
+    /// Pre-body rejections for one fixed reason (0 for a reason that is not a
+    /// rejection, including `Backpressure`).
     pub fn rejected_for(&self, reason: AbandonReason) -> u64 {
         reason.reject_index().map_or(0, |r| self.rejected[r])
     }
 
-    /// Post-attempt abandonment for one fixed reason.
+    /// Post-body abandonment for one fixed reason.
     pub fn abandoned_for(&self, reason: AbandonReason) -> u64 {
         reason.abandon_index().map_or(0, |r| self.abandoned[r])
     }
@@ -234,7 +238,7 @@ impl DeliveryMetricsSnapshot {
         self.by_channel.iter().map(|c| c.backpressure_dropped).sum()
     }
 
-    /// Every post-attempt abandonment, across all reasons.
+    /// Every post-body abandonment, across all reasons.
     pub fn total_abandoned(&self) -> u64 {
         self.by_channel.iter().map(|c| c.total_abandoned()).sum()
     }
@@ -247,7 +251,7 @@ impl DeliveryMetricsSnapshot {
             .sum()
     }
 
-    /// Every pre-attempt admission/registry rejection (excluding backpressure,
+    /// Every pre-body admission/registry rejection (excluding backpressure,
     /// which has its own counter).
     pub fn total_rejected(&self) -> u64 {
         self.by_channel.iter().map(|c| c.total_rejected()).sum()
@@ -271,7 +275,7 @@ pub fn render_prometheus() -> String {
     render_counter_family(
         &mut out,
         "ferrum_notification_delivery_attempted_total",
-        "Notification delivery tasks that started a transport attempt (counted once per admitted task, not once per bounded retry).",
+        "Notification delivery tasks whose registry-owned delivery body started executing (counted once per admitted task, not once per bounded retry; may advance before any channel transport call).",
         &m.attempted,
     );
     render_counter_family(
@@ -301,14 +305,14 @@ pub fn render_prometheus() -> String {
     render_reason_family(
         &mut out,
         "ferrum_notification_delivery_rejected_total",
-        "Notification deliveries rejected before any transport attempt ran, by fixed reason (generation_closed = producer reload/Drop closed admission, registry_rejected = process delivery registry refused the task).",
+        "Notification deliveries rejected before the registry-owned delivery body started, by fixed reason (generation_closed = producer reload/Drop closed admission, registry_rejected = process delivery registry refused the task).",
         REJECT_REASONS,
         &m.rejected,
     );
     render_reason_family(
         &mut out,
         "ferrum_notification_delivery_abandoned_total",
-        "Notification delivery attempts that ran but settled without a committed outcome, by fixed reason (generation_retired = producer reload/Drop, shutdown_deadline = hard abort at the global drain deadline, task_dropped = dispatch task dropped without settling).",
+        "Notification delivery tasks whose body started executing but settled without a committed outcome, by fixed reason (generation_retired = producer reload/Drop, shutdown_deadline = hard abort at the global drain deadline, task_dropped = dispatch task dropped without settling).",
         ABANDON_REASONS,
         &m.abandoned,
     );

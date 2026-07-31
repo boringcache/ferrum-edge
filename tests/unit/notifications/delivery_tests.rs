@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use ferrum_edge::notifications::channels::email::{SmtpFailure, SmtpPhase};
 use ferrum_edge::notifications::channels::{NotificationChannel, parse_channels};
-use ferrum_edge::notifications::dispatch::{DeliveryRetryPolicy, dispatch_one};
+use ferrum_edge::notifications::dispatch::{
+    DeliveryRetryPolicy, dispatch_one, dispatch_one_with_delivery_slot,
+};
 use ferrum_edge::notifications::generation::{DispatchGeneration, DispatchSettle};
 use ferrum_edge::notifications::metrics::DeliveryMetrics;
 use ferrum_edge::notifications::outcome::{
@@ -17,6 +19,7 @@ use ferrum_edge::notifications::outcome::{
     classify_smtp_failure,
 };
 use ferrum_edge::notifications::{EventAction, Notification, NotificationField, Severity};
+use ferrum_edge::observability_delivery::DeliverySlot;
 use ferrum_edge::plugins::proxy_alerts::ProxyAlerts;
 use ferrum_edge::plugins::proxy_alerts::cooldown::{LifecycleOutcome, RecoveryGate, RuleState};
 use ferrum_edge::plugins::proxy_alerts::windows::monotonic_now_ms;
@@ -278,10 +281,20 @@ fn prometheus_contract_emits_fixed_channel_type_series() {
     }
     assert!(text.contains("# HELP ferrum_notification_delivery_abandoned_at_deadline_total"));
     assert!(text.contains("# HELP ferrum_notification_delivery_backpressure_dropped_total"));
+    assert!(
+        text.contains(
+            "# HELP ferrum_notification_delivery_attempted_total Notification delivery tasks whose registry-owned delivery body started executing"
+        ),
+        "attempted HELP must describe body-start, not an unguaranteed transport-start claim"
+    );
+    assert!(
+        text.contains("may advance before any channel transport call"),
+        "attempted HELP must admit the admit-then-cancel/no-transport case"
+    );
     assert!(!text.contains("channel_name="));
 
     // The reason taxonomy is fixed and fully materialized from the first
-    // scrape, and the two families are disjoint: a pre-attempt rejection reason
+    // scrape, and the two families are disjoint: a pre-body rejection reason
     // must never appear on the abandoned family and vice versa.
     for kind in ["slack", "teams", "discord", "webhook", "email"] {
         for reason in REJECT_REASONS {
@@ -296,7 +309,7 @@ fn prometheus_contract_emits_fixed_channel_type_series() {
                 !text.contains(&format!(
                     "ferrum_notification_delivery_abandoned_total{{channel_type=\"{kind}\",reason=\"{reason}\"}}"
                 )),
-                "pre-attempt reason {reason} must not appear on the abandoned family"
+                "pre-body reason {reason} must not appear on the abandoned family"
             );
         }
         for reason in ABANDON_REASONS {
@@ -311,7 +324,7 @@ fn prometheus_contract_emits_fixed_channel_type_series() {
                 !text.contains(&format!(
                     "ferrum_notification_delivery_rejected_total{{channel_type=\"{kind}\",reason=\"{reason}\"}}"
                 )),
-                "post-attempt reason {reason} must not appear on the rejected family"
+                "post-body reason {reason} must not appear on the rejected family"
             );
         }
     }
@@ -398,7 +411,7 @@ async fn semaphore_exhaustion_increments_backpressure_and_skips_send() {
     assert!(!admitted);
     let snap = metrics.channel_snapshot("webhook");
     assert_eq!(snap.backpressure_dropped, 1);
-    // Backpressure is a *pre-attempt* drop: it must not inflate `attempted`,
+    // Backpressure is a *pre-body* drop: it must not inflate `attempted`,
     // must not move the in-flight gauge, must not be double counted into the
     // rejection taxonomy, and above all must not charge the shutdown-deadline
     // counter.
@@ -423,7 +436,7 @@ async fn semaphore_exhaustion_increments_backpressure_and_skips_send() {
 /// That path historically incremented nothing at all — no attempt, no
 /// backpressure, no failure, no abandonment — so a reload that raced a breach
 /// was completely invisible. It must now be visible under its own bounded
-/// reason, without inventing a transport attempt that never happened.
+/// reason, without inventing a delivery-body start that never happened.
 #[tokio::test]
 async fn pre_task_generation_rejection_is_visible_without_inflating_attempted() {
     let metrics = Arc::new(DeliveryMetrics::new());
@@ -957,6 +970,209 @@ async fn generation_cancelled_future_resolves_without_polling_cadence() {
     timeout(Duration::from_millis(500), generation.cancelled())
         .await
         .expect("an already-cancelled generation must resolve immediately");
+}
+
+/// `attempted` advances at registry-owned body start, not at the first channel
+/// transport poll. An admit-then-cancel race that parks the body before any
+/// channel call must therefore still increment `attempted`, settle exactly once
+/// as `Abandoned(GenerationRetired)`, and leave the endpoint untouched.
+#[tokio::test]
+async fn admit_then_cancel_before_transport_counts_attempted_under_body_start_contract() {
+    let metrics = Arc::new(DeliveryMetrics::new());
+    let generation = DispatchGeneration::with_metrics(77, Arc::clone(&metrics));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let settles = SettleLog::new();
+
+    let body_entered = Arc::new(Notify::new());
+    let body_entered_flag = Arc::new(AtomicUsize::new(0));
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let body_entered_signal = Arc::clone(&body_entered);
+    let body_entered_flag_set = Arc::clone(&body_entered_flag);
+    let cancel_watch = Arc::clone(&generation);
+
+    assert!(
+        generation.spawn(
+            "webhook",
+            Some(settles.callback()),
+            async move {
+                // Reaching this future proves the pre-future cancel check passed
+                // after `mark_attempt_started`, so `attempted` already advanced
+                // with no channel call yet.
+                body_entered_flag_set.store(1, Ordering::Release);
+                body_entered_signal.notify_waiters();
+                let _ = release_rx.await;
+                assert!(
+                    cancel_watch.is_cancelled(),
+                    "fixture must observe retirement before any channel call"
+                );
+                DispatchSettle::Abandoned(AbandonReason::GenerationRetired)
+            }
+        ),
+        "open generation must admit the body"
+    );
+
+    wait_until(
+        &body_entered,
+        || body_entered_flag.load(Ordering::Acquire) == 1,
+        "delivery body future entered after attempt mark",
+    )
+    .await;
+
+    let mid = metrics.channel_snapshot("webhook");
+    assert_eq!(mid.attempted, 1, "body start reserves attempted");
+    assert_eq!(mid.in_flight, 1, "body start reserves in_flight");
+    assert_eq!(mid.total_abandoned(), 0);
+    assert_eq!(mid.total_rejected(), 0);
+    match listener.accept().now_or_never() {
+        None => {}
+        other => panic!("body must not reach the endpoint before release: {other:?}"),
+    }
+
+    generation.cancel();
+    release_tx
+        .send(())
+        .expect("parked body must still own the release oneshot");
+
+    assert_eq!(
+        settles.wait_for_settles(1).await,
+        vec![DispatchSettle::Abandoned(AbandonReason::GenerationRetired)]
+    );
+    assert!(generation.wait_drain(Duration::from_secs(5)).await);
+
+    let snap = metrics.channel_snapshot("webhook");
+    assert_eq!(
+        snap.attempted, 1,
+        "admit-then-cancel/no-transport still counts under the body-start contract"
+    );
+    assert_eq!(snap.abandoned_for(AbandonReason::GenerationRetired), 1);
+    assert_eq!(snap.abandoned_at_deadline, 0);
+    assert_eq!(snap.abandoned_for(AbandonReason::ShutdownDeadline), 0);
+    assert_eq!(snap.abandoned_for(AbandonReason::TaskDropped), 0);
+    assert_eq!(snap.total_rejected(), 0);
+    assert_eq!(snap.succeeded, 0);
+    assert_eq!(snap.failed_transient, 0);
+    assert_eq!(snap.failed_permanent, 0);
+    assert_eq!(snap.in_flight, 0);
+    assert_eq!(generation.in_flight(), 0);
+    match listener.accept().now_or_never() {
+        None => {}
+        other => panic!("cancelled body must never open a channel connection: {other:?}"),
+    }
+}
+
+/// A hard process-shutdown deadline must abort an admitted notification and
+/// compose exactly: one `Abandoned(ShutdownDeadline)` callback, one
+/// `abandoned_total{reason="shutdown_deadline"}`, one `abandoned_at_deadline`,
+/// zero success/transient/permanent outcomes, and zero leaked generation /
+/// metric in-flight. Reload retirement stays disjoint, and classification must
+/// read the exact admitted lifecycle even if a replacement generation is
+/// installed mid-drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_shutdown_deadline_aborts_admitted_notification_exactly_once() {
+    let slot = Arc::new(DeliverySlot::new(0));
+    let lifecycle_a_generation = slot.begin_cycle();
+    let metrics = Arc::new(DeliveryMetrics::new());
+    let generation = DispatchGeneration::with_metrics(88, Arc::clone(&metrics));
+    let mut endpoint = spawn_stalled_endpoint(Vec::new()).await;
+    let settles = SettleLog::new();
+    let addr = endpoint.addr;
+
+    assert!(dispatch_one_with_delivery_slot(
+        Arc::new(fixed_notification()),
+        Arc::new(Default::default()),
+        webhook_channel_to(format!("http://{addr}/shutdown-deadline")),
+        Arc::new(Semaphore::new(1)),
+        PluginHttpClient::default(),
+        Arc::clone(&generation),
+        DeliveryRetryPolicy {
+            max_retries: 0,
+            ..DeliveryRetryPolicy::DEFAULT
+        },
+        "test",
+        Some(settles.callback()),
+        &slot,
+    ));
+
+    timeout(
+        Duration::from_secs(5),
+        &mut endpoint.stalled_request_started,
+    )
+    .await
+    .expect("server must observe the live transport before the deadline abort")
+    .expect("stall barrier sender must not be dropped");
+    assert_eq!(generation.in_flight(), 1);
+    assert_eq!(metrics.channel_snapshot("webhook").in_flight, 1);
+    assert!(!generation.is_cancelled(), "reload retirement must stay disjoint");
+
+    let drain_slot = Arc::clone(&slot);
+    let drain = tokio::spawn(async move {
+        // Near-zero budget forces the hard abort path once the stalled send
+        // cannot finish. Causal: the endpoint has already accepted.
+        drain_slot.shutdown(Duration::from_millis(1)).await
+    });
+
+    // Wait until the draining generation rejects new external work so the
+    // replacement cycle below genuinely starts mid-drain.
+    while slot.spawn_terminal(async {}) {
+        tokio::task::yield_now().await;
+    }
+    let lifecycle_b_generation = slot.begin_cycle();
+    assert_ne!(
+        lifecycle_b_generation, lifecycle_a_generation,
+        "mid-drain begin_cycle must install a fresh non-cancelling lifecycle"
+    );
+    assert!(
+        slot.spawn_terminal(async {}),
+        "replacement lifecycle B must admit work while A hard-aborts"
+    );
+
+    assert_eq!(
+        settles.wait_for_settles(1).await,
+        vec![DispatchSettle::Abandoned(AbandonReason::ShutdownDeadline)],
+        "hard abort must settle ShutdownDeadline, not TaskDropped/GenerationRetired"
+    );
+    assert!(
+        generation.wait_drain(Duration::from_secs(5)).await,
+        "generation task accounting must clear after the hard abort"
+    );
+    assert!(
+        !generation.is_cancelled(),
+        "shutdown-deadline abort must not retire the producer generation"
+    );
+
+    let report = drain.await.expect("drain task must join");
+    assert!(
+        !report.complete(),
+        "stalled send must force the shutdown budget to expire"
+    );
+
+    timeout(
+        Duration::from_secs(5),
+        &mut endpoint.stalled_connection_closed,
+    )
+    .await
+    .expect("hard abort must drop the in-flight transport future")
+    .expect("close witness sender must not be dropped");
+
+    let snap = metrics.channel_snapshot("webhook");
+    assert_eq!(snap.attempted, 1);
+    assert_eq!(snap.abandoned_for(AbandonReason::ShutdownDeadline), 1);
+    assert_eq!(snap.abandoned_at_deadline, 1);
+    assert_eq!(snap.abandoned_for(AbandonReason::GenerationRetired), 0);
+    assert_eq!(snap.abandoned_for(AbandonReason::TaskDropped), 0);
+    assert_eq!(snap.total_rejected(), 0);
+    assert_eq!(snap.succeeded, 0);
+    assert_eq!(snap.failed_transient, 0);
+    assert_eq!(snap.failed_permanent, 0);
+    assert_eq!(snap.in_flight, 0);
+    assert_eq!(generation.in_flight(), 0);
+    assert_eq!(
+        endpoint.requests.load(Ordering::SeqCst),
+        1,
+        "hard abort must not schedule a retry"
+    );
+    assert_eq!(settles.snapshot().len(), 1, "exactly-once settle callback");
+    endpoint.server.abort();
 }
 
 /// Dropping the plugin — the reload boundary — must retire the *old*
