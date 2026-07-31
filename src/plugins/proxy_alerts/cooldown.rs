@@ -574,6 +574,63 @@ impl RecoveryGate {
         );
     }
 
+    /// Roll back a Trigger/Resolve reservation that `observe` committed on a
+    /// path that never admitted delivery (non-event evaluate → commit).
+    ///
+    /// The evaluate/permit/observe split can race: a non-event snapshot (e.g.
+    /// `PendingResolve` + breach → [`LifecycleOutcome::Reactivate`]) may see
+    /// its outstanding resolve settle to `Healthy` before the matching
+    /// `observe` runs, so the commit installs `PendingTrigger`/`PendingResolve`
+    /// instead. Leaving that seat without a dispatch permit orphans it forever.
+    ///
+    /// `reserved_at_ms` must be the `now_ms` passed to the `observe` that
+    /// produced `committed`. Only event-reserving outcomes are rolled back, and
+    /// only via the token-matched failure settlers so a newer reservation
+    /// cannot be damaged. [`LifecycleOutcome::StillActive`] and other
+    /// non-reserving outcomes are no-ops.
+    pub fn rollback_unadmitted_reservation(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+        committed: LifecycleOutcome,
+        reserved_at_ms: u64,
+    ) {
+        match committed {
+            LifecycleOutcome::Trigger => {
+                self.settle_trigger_failure(
+                    rule_id,
+                    proxy_id,
+                    ownership_generation,
+                    reserved_at_ms,
+                );
+            }
+            LifecycleOutcome::Resolve => {
+                let Some(RuleState::PendingResolve {
+                    left_threshold_at_ms,
+                    reserved_at_ms: current,
+                }) = self.current_state(rule_id, proxy_id, ownership_generation)
+                else {
+                    return;
+                };
+                if current != reserved_at_ms {
+                    return;
+                }
+                self.settle_resolve_failure(
+                    rule_id,
+                    proxy_id,
+                    ownership_generation,
+                    left_threshold_at_ms,
+                    reserved_at_ms,
+                );
+            }
+            LifecycleOutcome::StillActive
+            | LifecycleOutcome::EnteringRecovery
+            | LifecycleOutcome::Reactivate
+            | LifecycleOutcome::Quiet => {}
+        }
+    }
+
     /// Commit a successful Resolve delivery: PendingResolve → Healthy.
     ///
     /// If the incident re-breached while this Resolve was in flight

@@ -1331,3 +1331,147 @@ fn unraced_resolve_settles_keep_their_original_semantics() {
         Some(RuleState::Healthy)
     );
 }
+
+/// Non-event evaluate → observe can race a concurrent resolve settle into an
+/// unadmitted `PendingTrigger`. Without rollback that seat is orphaned: the
+/// outer path reserved no dispatch, so nothing can ever settle it.
+///
+/// Interleaving owned entirely by the test (no sleeps):
+/// 1. `PendingResolve` + breach: `evaluate` returns `Reactivate` (non-event).
+/// 2. Concurrent resolve success settles the old reservation to `Healthy`.
+/// 3. Non-event commit `observe(breach)` returns `Trigger` / installs
+///    `PendingTrigger`.
+/// 4. `rollback_unadmitted_reservation` clears that exact seat.
+/// 5. A later legitimate `observe(breach)` can admit a fresh `Trigger`.
+#[test]
+fn non_event_commit_racing_resolve_settle_does_not_orphan_pending_trigger() {
+    let gate = RecoveryGate::new();
+
+    assert_eq!(
+        gate.observe(RACE_RULE, RACE_PROXY, true, RECOVERY_MS, 1_000, RACE_GEN),
+        LifecycleOutcome::Trigger
+    );
+    gate.settle_trigger_success(RACE_RULE, RACE_PROXY, RACE_GEN, 1_000, 1_000);
+    assert_eq!(
+        gate.observe(RACE_RULE, RACE_PROXY, false, RECOVERY_MS, 2_000, RACE_GEN),
+        LifecycleOutcome::EnteringRecovery
+    );
+    assert_eq!(
+        gate.observe(RACE_RULE, RACE_PROXY, false, RECOVERY_MS, 8_000, RACE_GEN),
+        LifecycleOutcome::Resolve
+    );
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::PendingResolve {
+            left_threshold_at_ms: 2_000,
+            reserved_at_ms: 8_000,
+        })
+    );
+
+    // Phase 1: non-event snapshot — Reactivate, state not yet committed.
+    assert_eq!(
+        gate.evaluate(RACE_RULE, RACE_PROXY, true, RECOVERY_MS, 9_000, RACE_GEN),
+        LifecycleOutcome::Reactivate
+    );
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::PendingResolve {
+            left_threshold_at_ms: 2_000,
+            reserved_at_ms: 8_000,
+        }),
+        "evaluate must not commit; the Resolve seat is still outstanding"
+    );
+
+    // Phase 2: the in-flight Resolve settles successfully before the non-event
+    // commit runs — the exact race `process_observation` can hit.
+    gate.settle_resolve_success(RACE_RULE, RACE_PROXY, RACE_GEN, 8_000);
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::Healthy)
+    );
+
+    // Phase 3: non-event observe commits against Healthy + breach → Trigger.
+    let committed = gate.observe(RACE_RULE, RACE_PROXY, true, RECOVERY_MS, 9_000, RACE_GEN);
+    assert_eq!(
+        committed,
+        LifecycleOutcome::Trigger,
+        "the raced commit must actually reserve a Trigger seat"
+    );
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::PendingTrigger {
+            reserved_at_ms: 9_000
+        })
+    );
+
+    // Phase 4: roll back the unadmitted reservation (non-event path has no
+    // dispatch permits/callbacks to settle it).
+    gate.rollback_unadmitted_reservation(
+        RACE_RULE,
+        RACE_PROXY,
+        RACE_GEN,
+        committed,
+        9_000,
+    );
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::Healthy),
+        "the raced PendingTrigger must not remain orphaned"
+    );
+
+    // Non-reserving outcomes must be harmless no-ops (same helper, adjacent
+    // non-event class).
+    gate.rollback_unadmitted_reservation(
+        RACE_RULE,
+        RACE_PROXY,
+        RACE_GEN,
+        LifecycleOutcome::Reactivate,
+        9_000,
+    );
+    gate.rollback_unadmitted_reservation(
+        RACE_RULE,
+        RACE_PROXY,
+        RACE_GEN,
+        LifecycleOutcome::StillActive,
+        9_000,
+    );
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::Healthy)
+    );
+
+    // Phase 5: a subsequent legitimate breach can still reserve a Trigger.
+    assert_eq!(
+        gate.observe(RACE_RULE, RACE_PROXY, true, RECOVERY_MS, 10_000, RACE_GEN),
+        LifecycleOutcome::Trigger,
+        "after rollback the gate must admit a fresh Trigger"
+    );
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::PendingTrigger {
+            reserved_at_ms: 10_000
+        })
+    );
+
+    // A stale unadmitted-rollback token must not clear the newer seat.
+    gate.rollback_unadmitted_reservation(
+        RACE_RULE,
+        RACE_PROXY,
+        RACE_GEN,
+        LifecycleOutcome::Trigger,
+        9_000,
+    );
+    assert_eq!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::PendingTrigger {
+            reserved_at_ms: 10_000
+        }),
+        "token mismatch must leave the newer PendingTrigger intact"
+    );
+
+    gate.settle_trigger_success(RACE_RULE, RACE_PROXY, RACE_GEN, 10_000, 10_000);
+    assert!(matches!(
+        gate.current_state(RACE_RULE, RACE_PROXY, RACE_GEN),
+        Some(RuleState::Active { .. })
+    ));
+}

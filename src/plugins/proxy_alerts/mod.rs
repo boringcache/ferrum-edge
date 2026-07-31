@@ -475,13 +475,23 @@ impl ProxyAlerts {
         );
         let Some(event_action) = lifecycle_event_action(outcome) else {
             if non_event_outcome_needs_commit(outcome, previous_state, recovery_ms) {
-                self.recovery.observe(
+                // Commit the non-event transition, but if evaluate→observe
+                // raced into an event-reserving seat (no dispatch was admitted
+                // on this path), roll that exact reservation back immediately.
+                let committed = self.recovery.observe(
                     rule.id(),
                     proxy_id,
                     observation.breach,
                     recovery_ms,
                     now_ms,
                     ownership_generation,
+                );
+                self.recovery.rollback_unadmitted_reservation(
+                    rule.id(),
+                    proxy_id,
+                    ownership_generation,
+                    committed,
+                    now_ms,
                 );
             }
             return;
@@ -521,13 +531,22 @@ impl ProxyAlerts {
         }
         let Some(dispatches) = dispatches else {
             if cooldown_suppressed && matches!(outcome, LifecycleOutcome::StillActive) {
-                self.recovery.observe(
+                // Same class of race as the non-event commit path: observe may
+                // reserve Trigger/Resolve without an admitted delivery.
+                let committed = self.recovery.observe(
                     rule.id(),
                     proxy_id,
                     observation.breach,
                     recovery_ms,
                     now_ms,
                     ownership_generation,
+                );
+                self.recovery.rollback_unadmitted_reservation(
+                    rule.id(),
+                    proxy_id,
+                    ownership_generation,
+                    committed,
+                    now_ms,
                 );
             }
             return;
