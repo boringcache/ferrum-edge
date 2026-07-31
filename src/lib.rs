@@ -6089,6 +6089,92 @@ pub mod _test_support {
         pub fn charge_retained_copy(&self, data: &[u8]) -> Option<bytes::Bytes> {
             self.0.charge_retained_copy(data)
         }
+
+        /// Drive the shared representation gate — the PRODUCTION
+        /// `evaluate_response_body_policy_posture` plus the production
+        /// `install_decoded_response_body` — with this isolated budget bound
+        /// where the proxy binds the process-global one.
+        ///
+        /// This is the only way to observe the decode's aggregate accounting
+        /// deterministically: the process-global semaphore is shared by every
+        /// other test in a parallel binary, so an assertion about admission or
+        /// release against it would be a race rather than a proof.
+        ///
+        /// On [`BufferedRepresentationOutcome::Decoded`] the decoded identity
+        /// bytes have been installed into `response_body` and `response_headers`
+        /// exactly as the proxy installs them, carrying the charge that is
+        /// released when the last clone of those bytes drops.
+        pub fn admit_buffered_representation(
+            &self,
+            plugins: &[Arc<dyn Plugin>],
+            ctx: &mut crate::plugins::RequestContext,
+            backend_origin: bool,
+            response_status: u16,
+            response_headers: &mut HashMap<String, String>,
+            response_body: &mut bytes::Bytes,
+        ) -> BufferedRepresentationOutcome {
+            use crate::plugins::response_representation::{
+                RepresentationOrigin, ResponseBodyPolicyPosture,
+                evaluate_response_body_policy_posture, install_decoded_response_body,
+            };
+
+            let origin = if backend_origin {
+                RepresentationOrigin::Backend
+            } else {
+                RepresentationOrigin::GatewayGenerated
+            };
+            let posture = evaluate_response_body_policy_posture(
+                plugins,
+                ctx,
+                origin,
+                response_status,
+                response_headers,
+                response_body,
+                self.0.handle(),
+            );
+            match posture {
+                ResponseBodyPolicyPosture::Unprotected => {
+                    BufferedRepresentationOutcome::Unprotected
+                }
+                ResponseBodyPolicyPosture::CapacityRefused => {
+                    BufferedRepresentationOutcome::CapacityRefused
+                }
+                ResponseBodyPolicyPosture::Reject(rejection) => {
+                    BufferedRepresentationOutcome::Rejected(rejection.reason())
+                }
+                ResponseBodyPolicyPosture::Enforce { decoded } => match decoded {
+                    None => BufferedRepresentationOutcome::EnforcedWithoutDecode,
+                    Some(bytes) => {
+                        install_decoded_response_body(ctx, response_headers, response_body, bytes);
+                        BufferedRepresentationOutcome::Decoded
+                    }
+                },
+            }
+        }
+    }
+
+    /// What the shared representation gate decided for one buffered response,
+    /// projected so external tests can assert on it without reaching into the
+    /// crate-private posture.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BufferedRepresentationOutcome {
+        /// No configured body policy claims these bytes — including the
+        /// claim-WITHDRAWN case, where a decode ran, its plaintext proved the
+        /// policy cannot act on it, and every byte and block the decode took was
+        /// released again.
+        Unprotected,
+        /// Claimed and inspectable with no decode owed.
+        EnforcedWithoutDecode,
+        /// Claimed, decoded, and the identity bytes were installed as the
+        /// client-visible body together with their aggregate-budget charge.
+        Decoded,
+        /// The aggregate retained-response budget could not admit the decode.
+        /// The proxy answers this with the gateway-local transient-capacity
+        /// terminal, never a backend representation error.
+        CapacityRefused,
+        /// Claimed and uninspectable, carrying the gate's low-cardinality
+        /// reason.
+        Rejected(&'static str),
     }
 
     impl ResponseBufferChargeProbe {

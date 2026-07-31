@@ -18714,6 +18714,26 @@ pub(crate) fn replace_buffered_response_with_capacity_refusal(
     response_body: &mut Bytes,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) {
+    replace_buffered_response_with_capacity_refusal_with_policy_source(
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+        InitialResponseHeaderPolicySource::Prefiltered(initial_response_header_policy_plugins),
+    );
+}
+
+/// [`replace_buffered_response_with_capacity_refusal`] for a caller that holds
+/// the unfiltered protocol plugin list rather than the precomputed
+/// initial-response policy slice — the shared representation gate, which is
+/// reached from paths with either shape.
+fn replace_buffered_response_with_capacity_refusal_with_policy_source(
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
+) {
     use crate::proxy::response_buffer_budget as budget;
 
     let owned_grpc_web_response_content_type =
@@ -18737,9 +18757,9 @@ pub(crate) fn replace_buffered_response_with_capacity_refusal(
             budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
         );
         response.headers.extend(response_headers.drain());
-        finalize_grpc_web_error_response_headers(
+        finalize_grpc_web_error_response_headers_with_policy_source(
             &mut response,
-            initial_response_header_policy_plugins,
+            initial_response_header_policy_source,
             None,
         );
         *response_headers = response.headers;
@@ -18753,11 +18773,15 @@ pub(crate) fn replace_buffered_response_with_capacity_refusal(
         );
     } else if native_grpc_request {
         ctx.retain_deadline_response_gateway_headers(response_headers);
+        // Same two-step the representation-error terminal uses: apply the
+        // initial-response policy from whichever source this caller has, then
+        // finalize with an empty slice so the policy is applied exactly once.
+        initial_response_header_policy_source.apply(response_headers);
         grpc_proxy::finalize_grpc_error_response_headers(
             response_headers,
             budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
             budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
-            initial_response_header_policy_plugins,
+            &[],
         );
         *response_body = Bytes::new();
         *response_status = StatusCode::OK.as_u16();
@@ -19023,9 +19047,15 @@ async fn replace_buffered_response_with_representation_error(
 /// through — H1/H2, buffered gRPC, native H3, both H3 cross-protocol bridges,
 /// and the synthetic/replay short-circuit — so the same bytes under the same
 /// configuration cannot be treated differently by frontend protocol. On
-/// `Enforce` with decoded bytes it installs the identity-coded body first, so
-/// every transform in the phase sees exactly the representation the gate proved
-/// inspectable.
+/// `Enforce` with decoded bytes it installs the identity-coded body first — with
+/// the aggregate-budget charge those bytes carry — so every transform in the
+/// phase sees exactly the representation the gate proved inspectable.
+///
+/// The gate has two distinct fail-closed outcomes and they must not be merged.
+/// A representation rejection is about the BYTES (`502` / gRPC `INTERNAL`); a
+/// capacity refusal is about the GATEWAY's own retained-memory budget and takes
+/// the health-neutral, non-retryable transient-capacity terminal instead
+/// (GHSA-pwcm-6rh8-f2gh).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn admit_buffered_response_body_transforms(
     plugins: &[Arc<dyn Plugin>],
@@ -19063,11 +19093,32 @@ pub(crate) async fn admit_buffered_response_body_transforms(
         *response_status,
         response_headers,
         response_body,
+        response_buffer_budget::BudgetRef::global(),
     ) {
         ResponseBodyPolicyPosture::Unprotected => BufferedTransformAdmission::Proceed {
             rewrite_allowed: crate::plugins::response_body_rewrite_allowed(*response_status),
             representation_rewritten: false,
         },
+        ResponseBodyPolicyPosture::CapacityRefused => {
+            // Not a representation fault: the backend answered correctly and the
+            // decode is bounded and legitimate — the GATEWAY is out of retained
+            // memory right now. So this fails closed through the shared
+            // gateway-local capacity terminal (`503` with the fixed
+            // redaction-safe body, `RESOURCE_EXHAUSTED` in the client's gRPC
+            // flavor), which is non-retryable and neutral to circuit breaker,
+            // passive health, and adaptive concurrency, rather than the `502`
+            // representation error that would blame the upstream
+            // (GHSA-pwcm-6rh8-f2gh).
+            warn!("Response representation decode refused: retained-response budget exhausted");
+            replace_buffered_response_with_capacity_refusal_with_policy_source(
+                ctx,
+                response_status,
+                response_headers,
+                response_body,
+                initial_response_header_policy_source,
+            );
+            BufferedTransformAdmission::Rejected
+        }
         ResponseBodyPolicyPosture::Enforce { decoded } => {
             let representation_rewritten = decoded.is_some();
             if let Some(decoded) = decoded {

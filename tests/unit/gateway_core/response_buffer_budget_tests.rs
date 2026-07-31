@@ -13,12 +13,20 @@
 //! implementation of the rules, and they do not race the process-global budget
 //! under a parallel test binary.
 
+use std::collections::HashMap;
+use std::io::Write;
+use std::sync::Arc;
+
+use ferrum_edge::HttpFlavor;
 use ferrum_edge::_test_support::{
-    RESPONSE_BUFFER_OVERLOAD_BODY, RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS,
-    RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS, RESPONSE_BUFFER_OVERLOAD_STATUS,
-    RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT, ResponseBufferBudgetProbe,
-    error_class_is_backend_failure_for_test, error_class_is_health_neutral_for_test,
+    BufferedRepresentationOutcome, RESPONSE_BUFFER_OVERLOAD_BODY,
+    RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS, RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+    RESPONSE_BUFFER_OVERLOAD_STATUS, RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT,
+    ResponseBufferBudgetProbe, error_class_is_backend_failure_for_test,
+    error_class_is_health_neutral_for_test, install_response_buffer_capacity_refusal_for_test,
+    set_request_http_flavor_for_test, stamp_original_response_metadata_for_test,
 };
+use ferrum_edge::plugins::{Plugin, RequestContext, response_transformer::ResponseTransformer};
 use ferrum_edge::retry::ErrorClass;
 
 /// 8 blocks of budget, with a 1-block fallback ceiling so the floor does not
@@ -822,6 +830,16 @@ fn every_capacity_refusal_uses_the_shared_gateway_terminal() {
         "one definition plus the body-transform call site; the normalize call \
          site lives in src/plugins/mod.rs"
     );
+    assert_eq!(
+        proxy
+            .matches("replace_buffered_response_with_capacity_refusal_with_policy_source(")
+            .count(),
+        3,
+        "one definition, the prefiltered delegation, and the representation \
+         gate's decode refusal — the gate is reached from callers holding the \
+         unfiltered protocol plugin list, so it cannot use the prefiltered \
+         wrapper"
+    );
     assert!(
         plugins.contains("replace_buffered_response_with_capacity_refusal("),
         "the normalize phase must use the same shared terminal"
@@ -893,4 +911,418 @@ fn no_collector_adds_lengths_without_saturating() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The representation gate's decode: the allocation that becomes the retained,
+// client-visible body, and the working set that produces it.
+//
+// This is the residual the first round of the advisory fix left open. The gate
+// decodes a protected encoded response and installs the identity bytes as the
+// body the client receives; a small compressed response can inflate to the
+// decode ceiling, so an uncharged decode let concurrent requests amplify past
+// the process aggregate even while their small encoded bodies were charged.
+//
+// Every test below drives the PRODUCTION gate
+// (`evaluate_response_body_policy_posture` + `install_decoded_response_body`)
+// with an isolated semaphore bound where the proxy binds the process-global
+// one, so admission and release are observable without racing a parallel test
+// binary.
+// ---------------------------------------------------------------------------
+
+/// A `response_transformer` whose only job is to strip a secret field — the
+/// configuration whose bypass the advisory describes, and therefore a policy
+/// that genuinely claims the response.
+fn redacting_plugins() -> Vec<Arc<dyn Plugin>> {
+    vec![Arc::new(
+        ResponseTransformer::new(&serde_json::json!({
+            "rules": [
+                {"operation": "remove", "target": "body", "key": "secret"}
+            ]
+        }))
+        .expect("redacting response_transformer config must be valid"),
+    )]
+}
+
+fn make_ctx() -> RequestContext {
+    RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/test".to_string(),
+    )
+}
+
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).expect("gzip write must succeed");
+    encoder.finish().expect("gzip finish must succeed")
+}
+
+/// A JSON document of exactly `payload_bytes` of high-entropy payload.
+///
+/// The point is not that gzip achieves nothing on it — a 64-symbol alphabet
+/// still compresses to roughly three quarters — but that the DECODED size is
+/// fixed by construction, so the decoder's working set is predictable instead of
+/// being at the mercy of the compressor. Deterministic (a fixed LCG), because a
+/// flaky budget assertion is worse than no budget assertion.
+fn incompressible_json(payload_bytes: usize) -> Vec<u8> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut payload = Vec::with_capacity(payload_bytes);
+    for _ in 0..payload_bytes {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        payload.push(ALPHABET[((state >> 33) % 64) as usize]);
+    }
+    let mut document = br#"{"secret":"hunter2","filler":""#.to_vec();
+    document.extend_from_slice(&payload);
+    document.extend_from_slice(br#""}"#);
+    document
+}
+
+/// Drive the production gate over a backend response, stamping the pristine
+/// pre-`after_proxy` snapshot exactly as every buffered path does.
+fn admit_backend_representation(
+    budget: &ResponseBufferBudgetProbe,
+    headers: &mut HashMap<String, String>,
+    body: &mut bytes::Bytes,
+) -> BufferedRepresentationOutcome {
+    let plugins = redacting_plugins();
+    let mut ctx = make_ctx();
+    stamp_original_response_metadata_for_test(&mut ctx, 200, headers);
+    budget.admit_buffered_representation(&plugins, &mut ctx, true, 200, headers, body)
+}
+
+fn gzip_json_response(payload_bytes: usize) -> (Vec<u8>, HashMap<String, String>, bytes::Bytes) {
+    let plain = incompressible_json(payload_bytes);
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+        ("etag".to_string(), "\"v1\"".to_string()),
+    ]);
+    let body = bytes::Bytes::from(gzip(&plain));
+    (plain, headers, body)
+}
+
+/// The core residual: the decoded allocation becomes the client-visible body
+/// even when NO transform rewrites it afterwards, so it must own an aggregate
+/// charge for its whole lifetime — and give it back only when the last clone of
+/// those bytes drops.
+#[test]
+fn decoded_identity_bytes_are_charged_until_their_last_clone_drops() {
+    let budget = probe(64);
+    let total = budget.available_bytes();
+    let (plain, mut headers, mut body) = gzip_json_response(192 * 1024);
+
+    assert!(
+        body.len() < plain.len(),
+        "the residual is about amplification: the decoded bytes are larger than \
+         the encoded ones the collector charged"
+    );
+
+    let outcome = admit_backend_representation(&budget, &mut headers, &mut body);
+    assert_eq!(outcome, BufferedRepresentationOutcome::Decoded);
+    assert_eq!(
+        body.as_ref(),
+        plain.as_slice(),
+        "the identity bytes are what the client will receive"
+    );
+
+    let charged = total - budget.available_bytes();
+    assert!(
+        charged >= plain.len(),
+        "the retained decoded allocation must be charged for at least its own \
+         length; charged {charged}, decoded {}",
+        plain.len()
+    );
+
+    // A cheap clone shares the one owner. If a clone minted its own charge —
+    // or if the charge had been request-scoped — this would move.
+    let replica = body.clone();
+    assert_eq!(
+        budget.available_bytes(),
+        total - charged,
+        "a clone shares the single charge"
+    );
+
+    drop(body);
+    assert_eq!(
+        budget.available_bytes(),
+        total - charged,
+        "the charge is owned by the allocation, and a clone is still holding it"
+    );
+    drop(replica);
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "the last clone dropping returns the whole charge"
+    );
+}
+
+/// The no-op-transform path is the one that made this exploitable: the gate
+/// installs identity bytes, no configured rule matches them, and they stay
+/// client-visible and resident for the rest of the response lifetime. They must
+/// arrive charged, with the representation metadata the decode invalidated
+/// already refreshed.
+#[test]
+fn a_decode_no_later_transform_rewrites_is_still_charged_and_reheadered() {
+    let budget = probe(64);
+    let total = budget.available_bytes();
+    // No `secret` key, so every configured body rule is a no-op over these
+    // bytes and nothing after the gate will replace the allocation.
+    let plain = br#"{"public":"value"}"#.to_vec();
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+        ("etag".to_string(), "\"v1\"".to_string()),
+        ("content-length".to_string(), "999".to_string()),
+    ]);
+    let mut body = bytes::Bytes::from(gzip(&plain));
+
+    let outcome = admit_backend_representation(&budget, &mut headers, &mut body);
+
+    assert_eq!(outcome, BufferedRepresentationOutcome::Decoded);
+    assert_eq!(body.as_ref(), plain.as_slice());
+    assert!(
+        budget.available_bytes() < total,
+        "identity bytes nothing rewrites are still retained, so they are still \
+         charged"
+    );
+    assert!(
+        !headers.contains_key("content-encoding"),
+        "the stale coding must not describe identity bytes"
+    );
+    assert!(
+        !headers.contains_key("etag"),
+        "a validator for the encoded representation must be invalidated"
+    );
+    assert_eq!(
+        headers.get("content-length"),
+        Some(&plain.len().to_string()),
+        "the refreshed length must describe the installed bytes"
+    );
+
+    drop(body);
+    assert_eq!(budget.available_bytes(), total);
+}
+
+/// A stacked `Content-Encoding` holds one pass's input and the next pass's
+/// output at the same time. Charging only the final decoded body would let that
+/// window escape the aggregate bound.
+///
+/// The pair is self-calibrating: the SAME plaintext under the SAME budget is
+/// admitted when it arrives under one coding and refused when it arrives under
+/// two, so the refusal can only come from the concurrent working set.
+#[test]
+fn a_stacked_decode_charges_its_input_and_output_concurrently() {
+    // 300 KiB of payload: the decoded buffer lands in the (256 KiB, 512 KiB]
+    // growth step (8 blocks) and the intermediate in (128 KiB, 256 KiB]
+    // (4 blocks), with room on both sides for the compressor's exact ratio.
+    let plain = incompressible_json(300 * 1024);
+    let once = gzip(&plain);
+    let twice = gzip(&once);
+    let headers = || {
+        HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("content-encoding".to_string(), "gzip, gzip".to_string()),
+        ])
+    };
+
+    // Sized between "one decoded copy fits" (8 blocks for this plaintext) and
+    // "the intermediate and the final buffer fit at once" (12).
+    let budget = probe(10);
+    let total = budget.available_bytes();
+
+    let mut single_headers = headers();
+    single_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let mut single_body = bytes::Bytes::from(once.clone());
+    assert_eq!(
+        admit_backend_representation(&budget, &mut single_headers, &mut single_body),
+        BufferedRepresentationOutcome::Decoded,
+        "one decoded copy of this plaintext fits in the budget"
+    );
+    drop(single_body);
+    assert_eq!(budget.available_bytes(), total);
+
+    let mut stacked_headers = headers();
+    let mut stacked_body = bytes::Bytes::from(twice);
+    assert_eq!(
+        admit_backend_representation(&budget, &mut stacked_headers, &mut stacked_body),
+        BufferedRepresentationOutcome::CapacityRefused,
+        "the intermediate and the final buffer are resident at once, so the \
+         same plaintext no longer fits"
+    );
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "a refused decode releases every block it had already taken"
+    );
+}
+
+/// Refusal is a statement about the GATEWAY, not the representation, so it takes
+/// the transient-capacity terminal: `503` with the fixed redaction-safe body,
+/// `RESOURCE_EXHAUSTED` for gRPC, health-neutral and never retried. A `502`
+/// representation error here would blame a backend that answered correctly and
+/// poison breaker/passive-health accounting.
+#[test]
+fn a_refused_decode_fails_closed_as_gateway_capacity_not_a_backend_error() {
+    let budget = probe(2);
+    let total = budget.available_bytes();
+    let (_, mut headers, mut body) = gzip_json_response(1024 * 1024);
+    let encoded = body.clone();
+
+    let outcome = admit_backend_representation(&budget, &mut headers, &mut body);
+
+    assert_eq!(
+        outcome,
+        BufferedRepresentationOutcome::CapacityRefused,
+        "an admissible decode the gateway has no memory for is a capacity \
+         refusal, not a representation fault"
+    );
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "the refused decode leaks nothing"
+    );
+    assert_eq!(
+        body, encoded,
+        "nothing is installed on the refusal path; the caller replaces the \
+         response with the capacity terminal"
+    );
+
+    // The terminal the proxy installs for exactly this outcome.
+    let mut ctx = make_ctx();
+    let mut status = 200u16;
+    install_response_buffer_capacity_refusal_for_test(
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    );
+    assert_eq!(status, RESPONSE_BUFFER_OVERLOAD_STATUS);
+    assert_eq!(body.as_ref(), RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
+    assert!(error_class_is_health_neutral_for_test(
+        RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS
+    ));
+    assert!(!error_class_is_backend_failure_for_test(
+        RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS
+    ));
+}
+
+/// The important claim-withdrawal behavior must survive the accounting: a decode
+/// whose plaintext proves the policy cannot act on it forwards the ORIGINAL
+/// encoded bytes untouched — and gives every block the decode took back, since
+/// nothing it produced is retained.
+#[test]
+fn a_withdrawn_claim_forwards_the_encoded_bytes_and_releases_all_decode_capacity() {
+    let budget = probe(64);
+    let total = budget.available_bytes();
+
+    // The untyped-gRPC shape: the wire bytes are not frames, so a decode is
+    // owed; the plaintext IS a complete frame sequence, so the JSON policy
+    // withdraws over it.
+    let mut framed = vec![0u8];
+    framed.extend_from_slice(&2u32.to_be_bytes());
+    framed.extend_from_slice(b"\x08\x01");
+    let encoded = gzip(&framed);
+
+    let plugins = redacting_plugins();
+    let mut ctx = make_ctx();
+    set_request_http_flavor_for_test(&mut ctx, HttpFlavor::Grpc);
+    let mut headers = HashMap::from([("content-encoding".to_string(), "gzip".to_string())]);
+    let mut body = bytes::Bytes::from(encoded.clone());
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &headers);
+
+    let outcome = budget.admit_buffered_representation(
+        &plugins,
+        &mut ctx,
+        true,
+        200,
+        &mut headers,
+        &mut body,
+    );
+
+    assert_eq!(
+        outcome,
+        BufferedRepresentationOutcome::Unprotected,
+        "a valid RPC reply must not become an error"
+    );
+    assert_eq!(
+        body.as_ref(),
+        encoded.as_slice(),
+        "the claim was withdrawn, so the original encoded bytes are forwarded"
+    );
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip"),
+        "nothing was installed, so the representation is unchanged"
+    );
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "the temporary decode capacity is released with the dropped plaintext"
+    );
+}
+
+/// A rejection after the decode (here: the client refuses identity coding) must
+/// release the decode's capacity too. Every non-install exit from the gate is a
+/// drop, which is what makes them uniformly leak-free.
+#[test]
+fn a_rejection_after_the_decode_releases_its_capacity() {
+    let budget = probe(64);
+    let total = budget.available_bytes();
+    let (_, mut headers, mut body) = gzip_json_response(128 * 1024);
+
+    let plugins = redacting_plugins();
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "accept-encoding".to_string(),
+        "gzip, identity;q=0".to_string(),
+    );
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &headers);
+
+    let outcome = budget.admit_buffered_representation(
+        &plugins,
+        &mut ctx,
+        true,
+        200,
+        &mut headers,
+        &mut body,
+    );
+
+    assert_eq!(
+        outcome,
+        BufferedRepresentationOutcome::Rejected("identity_coding_unacceptable")
+    );
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "a rejected representation retains nothing, so it must be charged \
+         nothing"
+    );
+}
+
+/// The decoded body must never reach the client uncharged. This pins the one
+/// line that publishes it: a plain `Bytes::from(decoded)` is exactly the
+/// residual this round repairs.
+#[test]
+fn the_decoded_body_is_published_through_the_charged_owner() {
+    let representation = include_str!("../../../src/plugins/response_representation.rs");
+    assert!(
+        representation.contains("*response_body = decoded.into_charged_bytes();")
+            && representation.contains("charged_bytes(self.data, self.reservation)"),
+        "the decoded allocation must be published together with the permit that \
+         paid for it (GHSA-pwcm-6rh8-f2gh)"
+    );
+    assert!(
+        !representation.contains("*response_body = Bytes::from(decoded);"),
+        "an uncharged decoded body must not be reintroduced: it stays \
+         client-visible through the no-op-transform path with no permit at all"
+    );
+    assert!(
+        !representation.contains("let mut current = body.to_vec();"),
+        "the first decode pass must read the collector-charged wire bytes \
+         directly rather than making an uncharged copy of them"
+    );
 }

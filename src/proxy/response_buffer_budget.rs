@@ -76,6 +76,30 @@
 //! concurrency). Growth afterwards is charged as a delta against the same
 //! reservation, so a preallocated response is never charged twice.
 //!
+//! # Decompression working set
+//!
+//! The representation gate
+//! ([`crate::plugins::response_representation`]) may DECODE a protected
+//! response before any transform runs, and a few kilobytes of `gzip` can
+//! inflate to the decode ceiling. Those bytes are attacker-amplified and
+//! client-visible, so they are charged like any other retained allocation, with
+//! two additional properties:
+//!
+//! * the charge is taken **before** each growth of the output buffer, in whole
+//!   chunks, so a refusal happens instead of the allocation rather than after
+//!   it. What is charged is the buffer's CAPACITY, not just the bytes written
+//!   into it, because capacity is what is resident;
+//! * a stacked `Content-Encoding` holds one pass's input and the next pass's
+//!   output at the same time, so the reservation tracks the PEAK of
+//!   input + output across passes. A reservation only ever grows, so holding
+//!   the peak is automatic; [`ResponseBufferReservation::release_above`] then
+//!   hands the surplus back when the surviving allocation is published.
+//!
+//! The first pass decodes straight from the collector-charged wire bytes, so no
+//! copy of them is made or charged. The bound is on the gateway's own decode
+//! allocations; it is not a claim that the allocator returns exactly the
+//! requested capacity.
+//!
 //! # Admission
 //!
 //! Acquisition is non-blocking (`try_acquire_many_owned`): a collector that
@@ -145,6 +169,30 @@ struct Budget {
 }
 
 static BUDGET: OnceLock<Budget> = OnceLock::new();
+
+/// Which aggregate budget one charge is taken against.
+///
+/// Production always resolves to the process-global budget, so this costs a
+/// null check and nothing else. External tests bind an [`IsolatedBudget`]
+/// instead ([`IsolatedBudget::handle`]), which is what lets a parallel test
+/// binary observe admission and release deterministically without mutating the
+/// process-global semaphore under its neighbors.
+#[derive(Clone, Copy)]
+pub(crate) struct BudgetRef<'a>(Option<&'a Budget>);
+
+impl<'a> BudgetRef<'a> {
+    /// The process-global budget every production path charges.
+    pub(crate) const fn global() -> Self {
+        Self(None)
+    }
+
+    fn resolve(self) -> &'a Budget {
+        match self.0 {
+            Some(budget) => budget,
+            None => budget(),
+        }
+    }
+}
 
 fn budget() -> &'static Budget {
     BUDGET.get_or_init(|| {
@@ -267,6 +315,52 @@ impl ResponseBufferReservation {
                 true
             }
             Err(_) => false,
+        }
+    }
+
+    /// Charge `retained_bytes` against an explicitly chosen budget.
+    ///
+    /// Same reservation path as [`Self::reserve`]; only the semaphore differs.
+    /// Production passes [`BudgetRef::global`].
+    pub(crate) fn reserve_in(&mut self, budget: BudgetRef<'_>, retained_bytes: usize) -> bool {
+        self.reserve_against(budget.resolve(), retained_bytes)
+    }
+
+    /// Return every block beyond what `retained_bytes` needs, keeping the rest
+    /// of the charge — and its identity — intact.
+    ///
+    /// This exists for one shape: a working reservation that had to cover a
+    /// transient PEAK (a stacked decode holds its input and its output at once)
+    /// and is then handed to [`charged_bytes`] together with only the surviving
+    /// allocation. Without it the peak would stay charged for the whole response
+    /// lifetime, which is safe but needlessly shrinks the budget other responses
+    /// can use.
+    ///
+    /// Shrinking only ever RELEASES permits, so it cannot fail and cannot
+    /// under-charge: the retained blocks still cover `retained_bytes` rounded up.
+    pub(crate) fn release_above(&mut self, retained_bytes: usize) {
+        let wanted =
+            u32::try_from(retained_bytes.div_ceil(RESERVATION_UNIT_BYTES)).unwrap_or(u32::MAX);
+        if wanted >= self.blocks {
+            return;
+        }
+        if wanted == 0 {
+            // Dropping the whole permit is the same release, without
+            // constructing a zero-permit handle.
+            self.permit = None;
+            self.blocks = 0;
+            return;
+        }
+        let surplus = self.blocks - wanted;
+        if let Some(held) = self.permit.as_mut() {
+            // `split` returns `None` only when the permit holds fewer than
+            // `surplus` blocks, which cannot happen: the permit holds exactly
+            // `self.blocks` and `surplus < self.blocks`. Treating a `None` as
+            // "keep the whole charge" keeps even that impossible case
+            // conservative rather than under-charged.
+            if held.split(surplus as usize).is_some() {
+                self.blocks = wanted;
+            }
         }
     }
 
@@ -446,6 +540,13 @@ impl IsolatedBudget {
     /// Currently unreserved capacity, in bytes.
     pub(crate) fn available_bytes(&self) -> usize {
         self.0.permits.available_permits() * RESERVATION_UNIT_BYTES
+    }
+
+    /// Bind this budget where production binds [`BudgetRef::global`], so a test
+    /// drives the *same* admission code against an isolated semaphore.
+    #[allow(dead_code)]
+    pub(crate) fn handle(&self) -> BudgetRef<'_> {
+        BudgetRef(Some(&self.0))
     }
 
     pub(crate) fn buffered_response_body_ceiling(&self, effective_limit: usize) -> usize {

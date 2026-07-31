@@ -52,6 +52,17 @@
 //!   bound is not something enabling a body policy can buy. See
 //!   [`decoded_inspection_limit`].
 //!
+//! A third bound is not about the representation at all, so it does not reject:
+//! decoding materializes attacker-amplified bytes that the client then receives
+//! and the gateway retains, so both the decoder's working allocations and the
+//! decoded body are charged against the process-wide retained-response budget
+//! ([`crate::proxy::response_buffer_budget`], `GHSA-pwcm-6rh8-f2gh`). A small
+//! compressed body can inflate to the decode ceiling, so a per-response ceiling
+//! alone would still multiply by concurrency. When the aggregate budget cannot
+//! admit the decode, the answer is the GATEWAY's own transient-capacity
+//! terminal ([`ResponseBodyPolicyPosture::CapacityRefused`]) rather than a
+//! representation error, because the backend did nothing wrong.
+//!
 //! Rejection — not relabeling — is the answer for partial and delta
 //! representations. The gateway does not fetch the remaining ranges or apply
 //! the delta, so it cannot produce the complete resource; presenting a rewritten
@@ -156,6 +167,9 @@ use std::sync::Arc;
 use super::Plugin;
 use super::RequestContext;
 use super::utils::body_transform::{is_framed_grpc_content_type, is_json_content_type};
+use crate::proxy::response_buffer_budget::{
+    BudgetRef, ResponseBufferReservation, charged_bytes, prospective_retained_len,
+};
 
 /// Hard ceiling on the decoded size of one buffered response body inspected on
 /// behalf of a configured body policy.
@@ -284,10 +298,23 @@ pub(crate) enum ResponseBodyPolicyPosture {
     /// `decoded` is `Some`, the caller must install those identity-coded bytes
     /// (and drop the stale `Content-Encoding`) before running transforms, so
     /// every transform sees the representation the policy was evaluated against.
-    Enforce { decoded: Option<Vec<u8>> },
+    /// Those bytes already carry their own aggregate-budget charge; installing
+    /// them is what transfers it to the client-visible body.
+    Enforce { decoded: Option<ChargedDecodedBody> },
     /// A body policy claims these bytes and they are not inspectable. The caller
     /// must replace the response; forwarding the original bytes is the bypass.
     Reject(RepresentationRejection),
+    /// A body policy claims these bytes, but the aggregate retained-response
+    /// budget could not admit the decode that would make them inspectable.
+    ///
+    /// Distinct from [`Self::Reject`] on purpose: nothing is wrong with the
+    /// backend or its representation, so the caller must install the
+    /// GATEWAY-LOCAL transient-capacity terminal
+    /// ([`crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS`]
+    /// / `RESOURCE_EXHAUSTED`), which is non-retryable and neutral to circuit
+    /// breaker, passive health, and adaptive concurrency — never a backend
+    /// `502`.
+    CapacityRefused,
 }
 
 /// Whether any active plugin's configured body policy claims this response.
@@ -458,36 +485,152 @@ fn is_partial_representation(
     }
 }
 
-/// Decode one supported content coding, bounded by `limit`.
+/// Read granularity of a bounded decode, and the size of the fixed stack
+/// scratch buffer one decode pass uses.
 ///
-/// Reads one byte past the limit so an output that lands exactly on the ceiling
-/// is distinguishable from one that was truncated by it.
+/// Small enough that the aggregate charge tracks the output allocation closely,
+/// large enough that the per-chunk semaphore check is never the dominant cost of
+/// a decode. The scratch buffer itself is a fixed per-pass cost that the
+/// aggregate budget deliberately does not charge — it does not scale with the
+/// attacker-chosen decoded size, which is what the budget exists to bound.
+const DECODE_CHUNK_BYTES: usize = 16 * 1024;
+
+/// Why a decode did not produce inspectable identity bytes.
+///
+/// Split from [`RepresentationRejection`] because the two failures have
+/// different client-visible terminals: a rejection is a statement about the
+/// REPRESENTATION (the policy cannot be enforced over these bytes, `502` /
+/// gRPC `INTERNAL`), while a capacity refusal is a statement about the GATEWAY
+/// (transient local memory, `503` / gRPC `RESOURCE_EXHAUSTED`, health-neutral
+/// and non-retryable). Collapsing them would blame a correct backend for the
+/// gateway's own budget.
+enum DecodeFailure {
+    Rejected(RepresentationRejection),
+    CapacityRefused,
+}
+
+/// Read a bounded decoder's output, charging the aggregate retained-response
+/// budget BEFORE every growth of the output allocation.
+///
+/// `concurrent_bytes` is what the caller is holding resident alongside this
+/// output for the duration of the pass — the previous pass's decoded buffer on a
+/// stacked `Content-Encoding`, and zero on the first pass, which reads straight
+/// from the collector-charged wire bytes. Charging `concurrent_bytes + capacity`
+/// is what keeps a stacked decode from escaping the aggregate bound in the
+/// window where both allocations exist.
+///
+/// The charge is against the buffer's CAPACITY rather than its length, because
+/// capacity is what is resident. Growth is geometric so a large body still costs
+/// `O(log n)` reallocations rather than one per chunk.
+fn read_decoded_bounded(
+    mut reader: impl Read,
+    limit: usize,
+    concurrent_bytes: usize,
+    reservation: &mut ResponseBufferReservation,
+    budget: BudgetRef<'_>,
+) -> Result<Vec<u8>, DecodeFailure> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; DECODE_CHUNK_BYTES];
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .map_err(|_| DecodeFailure::Rejected(RepresentationRejection::MalformedCoding))?;
+        if read == 0 {
+            break;
+        }
+        let filled = prospective_retained_len(out.len(), read);
+        if filled > limit {
+            return Err(DecodeFailure::Rejected(
+                RepresentationRejection::DecodedBodyTooLarge,
+            ));
+        }
+        if filled > out.capacity() {
+            let grown = out
+                .capacity()
+                .saturating_mul(2)
+                .max(DECODE_CHUNK_BYTES)
+                .min(limit)
+                .max(filled);
+            if !reservation.reserve_in(budget, prospective_retained_len(concurrent_bytes, grown)) {
+                return Err(DecodeFailure::CapacityRefused);
+            }
+            out.reserve_exact(grown - out.len());
+        }
+        out.extend_from_slice(&chunk[..read]);
+    }
+    Ok(out)
+}
+
+/// Decode one supported content coding, bounded by `limit` and by the aggregate
+/// retained-response budget.
+///
+/// The reader is capped one byte past the limit so an output that lands exactly
+/// on the ceiling is distinguishable from one that was truncated by it.
 fn decode_one_coding(
     coding: &str,
     data: &[u8],
     limit: usize,
-) -> Result<Vec<u8>, RepresentationRejection> {
-    let mut out = Vec::new();
+    concurrent_bytes: usize,
+    reservation: &mut ResponseBufferReservation,
+    budget: BudgetRef<'_>,
+) -> Result<Vec<u8>, DecodeFailure> {
     let take = limit as u64 + 1;
     match coding {
-        "gzip" | "x-gzip" => {
-            let mut reader = flate2::read::MultiGzDecoder::new(data).take(take);
-            reader
-                .read_to_end(&mut out)
-                .map_err(|_| RepresentationRejection::MalformedCoding)?;
-        }
-        "br" => {
-            let mut reader = brotli::Decompressor::new(data, 4096).take(take);
-            reader
-                .read_to_end(&mut out)
-                .map_err(|_| RepresentationRejection::MalformedCoding)?;
-        }
-        _ => return Err(RepresentationRejection::UnsupportedCoding),
+        "gzip" | "x-gzip" => read_decoded_bounded(
+            flate2::read::MultiGzDecoder::new(data).take(take),
+            limit,
+            concurrent_bytes,
+            reservation,
+            budget,
+        ),
+        "br" => read_decoded_bounded(
+            brotli::Decompressor::new(data, 4096).take(take),
+            limit,
+            concurrent_bytes,
+            reservation,
+            budget,
+        ),
+        _ => Err(DecodeFailure::Rejected(
+            RepresentationRejection::UnsupportedCoding,
+        )),
     }
-    if out.len() > limit {
-        return Err(RepresentationRejection::DecodedBodyTooLarge);
+}
+
+/// Decoded identity bytes together with the aggregate-budget charge that paid
+/// for them.
+///
+/// The charge travels WITH the allocation rather than with the request, which is
+/// what makes every disposal path leak-free by construction and requires no
+/// caller to remember anything:
+///
+/// * published as the client-visible body — [`install_decoded_response_body`]
+///   moves both into one [`bytes::Bytes`] owner, so the permit is returned when
+///   the last clone of those bytes drops, wherever they were copied or stored;
+/// * claim withdrawn, or the representation rejected after the decode, or the
+///   request cancelled — the value is simply dropped, and the whole reservation
+///   goes back with it.
+pub(crate) struct ChargedDecodedBody {
+    data: Vec<u8>,
+    /// Covers the PEAK working set of the decode (see
+    /// [`crate::proxy::response_buffer_budget`]), narrowed to the surviving
+    /// allocation when the bytes are published.
+    reservation: ResponseBufferReservation,
+}
+
+impl ChargedDecodedBody {
+    /// The decoded identity bytes, for the gate's own re-inspection.
+    fn bytes(&self) -> &[u8] {
+        &self.data
     }
-    Ok(out)
+
+    /// Publish the decoded allocation and its permit as one cheaply cloneable
+    /// [`Bytes`] owner, handing back the decode's transient peak surplus first
+    /// so the long-lived charge is the retained capacity rather than the working
+    /// set. `O(1)`: the buffer is moved, never copied.
+    fn into_charged_bytes(mut self) -> Bytes {
+        self.reservation.release_above(self.data.capacity());
+        charged_bytes(self.data, self.reservation)
+    }
 }
 
 /// Decode a possibly stacked `Content-Encoding` down to identity bytes.
@@ -499,12 +642,20 @@ fn decode_one_coding(
 /// field reduced to identity-only tokens and no client-visible bytes changed.
 ///
 /// `limit` bounds every intermediate pass, not just the final output, so a
-/// stacked encoding cannot exceed the caller's ceiling partway through.
+/// stacked encoding cannot exceed the caller's ceiling partway through. The
+/// aggregate budget bounds the same passes across CONCURRENT responses: a
+/// per-response ceiling alone still multiplies by concurrency, which is exactly
+/// how a small compressed body could otherwise amplify past the process
+/// aggregate (`GHSA-pwcm-6rh8-f2gh`).
+///
+/// The wire bytes are never copied: the first pass decodes straight out of
+/// `body`, whose allocation the collector already charged.
 fn decode_response_body(
     encoding: &str,
     body: &[u8],
     limit: usize,
-) -> Result<Option<Vec<u8>>, RepresentationRejection> {
+    budget: BudgetRef<'_>,
+) -> Result<Option<ChargedDecodedBody>, DecodeFailure> {
     let codings: Vec<&str> = encoding
         .split(',')
         .map(str::trim)
@@ -514,18 +665,40 @@ fn decode_response_body(
         return Ok(None);
     }
     if codings.len() > MAX_STACKED_RESPONSE_CODINGS {
-        return Err(RepresentationRejection::DecodedBodyTooLarge);
+        return Err(DecodeFailure::Rejected(
+            RepresentationRejection::DecodedBodyTooLarge,
+        ));
     }
     if codings.iter().any(|token| token.is_empty()) {
-        return Err(RepresentationRejection::MalformedCoding);
+        return Err(DecodeFailure::Rejected(
+            RepresentationRejection::MalformedCoding,
+        ));
     }
 
-    let mut current = body.to_vec();
+    let mut reservation = ResponseBufferReservation::new();
+    let mut current: Option<Vec<u8>> = None;
     for coding in codings.into_iter().rev() {
         let lowered = coding.to_ascii_lowercase();
-        current = decode_one_coding(&lowered, &current, limit)?;
+        // The previous pass's buffer is the input and stays resident for the
+        // whole of this pass, so it is charged concurrently with this pass's
+        // output. A reservation only grows, so what is held after the loop is
+        // the peak across passes.
+        let (input, concurrent) = match current.as_ref() {
+            Some(previous) => (previous.as_slice(), previous.capacity()),
+            None => (body, 0),
+        };
+        let decoded =
+            decode_one_coding(&lowered, input, limit, concurrent, &mut reservation, budget)?;
+        current = Some(decoded);
     }
-    Ok(Some(current))
+    match current {
+        // Unreachable: the coding list is non-empty and every pass assigns.
+        // Answering "nothing was decoded" is the fail-safe direction anyway —
+        // it forwards the original bytes rather than publishing an unproven
+        // representation.
+        None => Ok(None),
+        Some(data) => Ok(Some(ChargedDecodedBody { data, reservation })),
+    }
 }
 
 /// Resolve the media type the gate — and every claim predicate it consults — may
@@ -613,6 +786,11 @@ fn document_is_parseable(content_type: Option<&str>, body: &[u8]) -> bool {
 /// Every buffered publication path calls exactly this function, so a frontend
 /// protocol, a bridge, or a synthetic short-circuit cannot reach a different
 /// conclusion about the same bytes and the same configuration.
+///
+/// `budget` is the aggregate retained-response budget the decode charges
+/// against. Production passes [`BudgetRef::global`]; it is a parameter only so
+/// external tests can bind an isolated semaphore rather than mutating the
+/// process-global one from a parallel test binary.
 pub(crate) fn evaluate_response_body_policy_posture(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
@@ -620,6 +798,7 @@ pub(crate) fn evaluate_response_body_policy_posture(
     response_status: u16,
     response_headers: &HashMap<String, String>,
     response_body: &[u8],
+    budget: BudgetRef<'_>,
 ) -> ResponseBodyPolicyPosture {
     // Resolve the live header before anything reads it. A framed gRPC label that
     // neither the pristine snapshot nor a total frame parse supports describes
@@ -652,13 +831,23 @@ pub(crate) fn evaluate_response_body_policy_posture(
     let limit = decoded_inspection_limit(ctx);
     let decoded = match origin_content_encoding(ctx, origin, response_headers) {
         None => None,
-        Some(encoding) => match decode_response_body(encoding, response_body, limit) {
+        Some(encoding) => match decode_response_body(encoding, response_body, limit, budget) {
             Ok(decoded) => decoded,
-            Err(rejection) => return ResponseBodyPolicyPosture::Reject(rejection),
+            Err(DecodeFailure::Rejected(rejection)) => {
+                return ResponseBodyPolicyPosture::Reject(rejection);
+            }
+            // Every block the refused decode had already taken is released with
+            // the reservation that `decode_response_body` dropped on its way
+            // out, so a refusal costs the budget nothing.
+            Err(DecodeFailure::CapacityRefused) => {
+                return ResponseBodyPolicyPosture::CapacityRefused;
+            }
         },
     };
 
-    let inspected = decoded.as_deref().unwrap_or(response_body);
+    let inspected = decoded
+        .as_ref()
+        .map_or(response_body, ChargedDecodedBody::bytes);
     // Re-resolve the label over the decoded bytes for the same reason the claim
     // is re-asked below: the frame parse that can prove a framed label is a
     // statement about the representation the client actually receives, and after
@@ -683,7 +872,9 @@ pub(crate) fn evaluate_response_body_policy_posture(
     // with this posture, so nothing is installed and the client still receives
     // the encoded representation the origin produced. No redaction is lost,
     // because a claim predicate only withdraws over bytes it has proven its
-    // field rules cannot act on.
+    // field rules cannot act on. Dropping it also returns the decode's entire
+    // aggregate-budget charge, so a withdrawn claim leaves the budget exactly
+    // where it found it — as do the three rejections below, for the same reason.
     if decoded.is_some() && !body_policy_claimed(plugins, ctx, content_type, inspected) {
         return ResponseBodyPolicyPosture::Unprotected;
     }
@@ -800,13 +991,26 @@ pub(crate) fn evaluate_response_body_policy_posture(
 /// are rewritten, and only when a backend snapshot exists to rewrite. Gateway-
 /// generated bytes have no snapshot and must keep none: their readers correctly
 /// fall back to the live headers this function just set.
+///
+/// # Owning the charge
+///
+/// The decoded allocation is client-visible and attacker-amplified, and it
+/// survives the transform phase even when NO configured rule matches — the
+/// no-op-transform path installs identity bytes and then leaves them alone. It
+/// therefore has to own an aggregate retained-response charge for its whole
+/// lifetime, not merely for the decode
+/// (`GHSA-pwcm-6rh8-f2gh`). [`ChargedDecodedBody::into_charged_bytes`] moves the
+/// buffer and its permit into one [`bytes::Bytes`] owner, so the permit is
+/// returned exactly when the last clone drops — success, replacement by a later
+/// transform, a cache-entry copy outliving the request, deadline expiry, client
+/// disconnect, and cancellation are all just drops.
 pub(crate) fn install_decoded_response_body(
     ctx: &mut RequestContext,
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Bytes,
-    decoded: Vec<u8>,
+    decoded: ChargedDecodedBody,
 ) {
-    *response_body = Bytes::from(decoded);
+    *response_body = decoded.into_charged_bytes();
     response_headers.retain(|name, _| !name.eq_ignore_ascii_case("content-encoding"));
     super::invalidate_content_bound_response_headers(response_headers);
     let length = response_body.len().to_string();
