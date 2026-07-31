@@ -19275,8 +19275,13 @@ components:
         applies, an empty, absent, or non-UTF-8 representation fails closed
         (400 request, 502 response) instead of being skipped, and native gRPC
         always runs frame validation. The only exemptions are protocol-defined:
-        gRPC Trailers-Only replies, and responses that carry no content by
-        status/method semantics (1xx, 204, 205, 304, and responses to HEAD).
+        gRPC Trailers-Only error replies (a single valid non-zero grpc-status),
+        and responses that carry no content by status/method semantics (1xx,
+        204, 205, 304, and responses to HEAD). Early before_proxy inspection
+        prefers a rewritten UTF-8 request_body metadata view when present,
+        falls back to raw buffered bytes when no text view exists, then the
+        transport-proven-empty witness, and otherwise fails closed; the final
+        request-body hook validates the exact backend-visible bytes.
         Fail-closed diagnostics are fixed strings and never echo body bytes.
       properties:
         json_schema:

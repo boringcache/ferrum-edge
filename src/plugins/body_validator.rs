@@ -18,7 +18,8 @@
 //! applies, an unusual method, an empty body, an uninspectable (non-UTF-8) body,
 //! or a missing buffered representation is a rejection — never a silent
 //! `Continue`. The only exemptions are the ones the protocol itself defines:
-//! gRPC Trailers-Only replies, and HTTP responses that carry no content by
+//! gRPC Trailers-Only *error* replies (a single valid non-zero `grpc-status` in
+//! the initial HEADERS block), and HTTP responses that carry no content by
 //! status/method semantics (1xx, 204, 205, 304, and responses to `HEAD`).
 //!
 //! Every configuration surface is fail-closed: unknown top-level keys, unknown keys
@@ -2570,14 +2571,29 @@ fn response_has_no_content_by_protocol(method: &str, status: u16) -> bool {
         || matches!(status, 204 | 205 | 304)
 }
 
-/// `true` when a gRPC reply is a Trailers-Only response: the complete terminal
-/// metadata rides in the initial HEADERS block and no message frame is sent.
+/// `true` when a gRPC reply is a legitimate Trailers-Only *error* response:
+/// the complete terminal metadata rides in the initial HEADERS block and no
+/// message frame is sent.
 ///
-/// This is the one legitimate empty native-gRPC response body. A reply whose
-/// headers do not already carry `grpc-status` promised a message-bearing
-/// response, so an empty transport body there still fails frame validation.
+/// A successful unary response (`grpc-status: 0`), including
+/// `google.protobuf.Empty`, still requires a real five-byte gRPC frame, so OK
+/// must not create an empty-body exemption. Malformed, CR/LF-joined duplicate,
+/// or otherwise unparsable `grpc-status` values also must not — only one valid
+/// non-zero standard gRPC status (`1..=16`) legitimizes an empty error body.
 fn grpc_response_is_trailers_only(response_headers: &HashMap<String, String>) -> bool {
-    response_headers.contains_key("grpc-status")
+    let Some(raw) = response_headers.get("grpc-status") else {
+        return false;
+    };
+    // Buffered collection may LF-join duplicate occurrences. Preferring any
+    // occurrence would let a hostile/ambiguous field look like a Trailers-Only
+    // error; refuse the exemption unless the field is a single clean value.
+    if raw.contains('\n') || raw.contains('\r') {
+        return false;
+    }
+    let Ok(code) = raw.trim().parse::<u32>() else {
+        return false;
+    };
+    (1..=16).contains(&code)
 }
 
 /// Helper to build a rejection `PluginResult` for protobuf validation failures.
@@ -2633,10 +2649,11 @@ impl Plugin for BodyValidator {
         self.has_request_validation
     }
 
-    /// The UTF-8 metadata copy is no longer this plugin's request-body view.
-    /// The proxy deliberately removes that copy when the collected bytes are not
-    /// valid UTF-8, which would turn an uninspectable body into "no body" and
-    /// silently skip the policy (`GHSA-2vmr-ww8r-mww3`).
+    /// Keep the raw buffer available so a body-validator-only chain retains
+    /// binary bytes when the proxy removes the UTF-8 metadata copy
+    /// (`GHSA-2vmr-ww8r-mww3`). Early JSON/XML validation prefers a downstream
+    /// metadata text view when one exists (composition with `ai_prompt_shield`)
+    /// and falls back to these bytes only when that text view is absent.
     fn needs_request_body_bytes(&self) -> bool {
         self.has_pre_proxy_request_validation
     }
@@ -2720,22 +2737,23 @@ impl Plugin for BodyValidator {
         // body digests, so restoring it preserves every verdict.
         let mut json_scan_memo = std::mem::take(&mut ctx.json_scan_memo);
 
-        // Resolve the exact client representation this hook must decide over.
+        // Resolve the early-hook request representation.
         //
-        // `ctx.request_body_bytes` is authoritative: this plugin declares
-        // `needs_request_body_bytes()`, so the raw buffer exists for every
-        // request the gateway buffered on its behalf — including bodies that are
-        // not valid UTF-8, for which the proxy removes the shared string copy.
-        // `replay_request_body_empty_proven()` is the transport's own proof that
-        // the client sent nothing at all, which is the one case where the proxy
-        // legitimately materializes no buffer. The UTF-8 metadata copy is a
-        // fixture-only fallback and, when present, is by construction a faithful
-        // representation of a valid-UTF-8 body.
+        // Prefer `ctx.metadata["request_body"]` when present: earlier
+        // `before_proxy` plugins such as `ai_prompt_shield` deliberately rewrite
+        // that UTF-8 view so downstream admission evaluates the shielded /
+        // redacted representation. Fall back to `ctx.request_body_bytes` when no
+        // text view exists — this plugin declares `needs_request_body_bytes()`,
+        // so the raw buffer is retained for non-UTF-8 bodies the proxy strips
+        // from metadata. `replay_request_body_empty_proven()` is the transport's
+        // own proof that the client sent nothing at all. Anything else is a
+        // missing representation and fails closed. The final request-body hook
+        // still validates the exact backend-visible bytes independently.
         const TRANSPORT_PROVEN_EMPTY: &[u8] = &[];
-        let resolved: Option<&[u8]> = if let Some(bytes) = ctx.request_body_bytes.as_deref() {
-            Some(bytes)
-        } else if let Some(text) = ctx.metadata.get("request_body") {
+        let resolved: Option<&[u8]> = if let Some(text) = ctx.metadata.get("request_body") {
             Some(text.as_bytes())
+        } else if let Some(bytes) = ctx.request_body_bytes.as_deref() {
+            Some(bytes)
         } else if ctx.replay_request_body_empty_proven() {
             Some(TRANSPORT_PROVEN_EMPTY)
         } else {
@@ -2918,10 +2936,10 @@ impl Plugin for BodyValidator {
             if !self.has_protobuf_response_validation {
                 return PluginResult::Continue;
             }
-            // A Trailers-Only reply carries its complete terminal metadata in
-            // the initial HEADERS block and legitimately sends no message. Any
-            // other empty gRPC body promised a message and still fails frame
-            // validation below.
+            // A Trailers-Only *error* reply carries a single valid non-zero
+            // `grpc-status` in the initial HEADERS block and legitimately sends
+            // no message. `grpc-status: 0` and malformed/duplicate status values
+            // still require a five-byte frame and fail validation below.
             if body.is_empty() && grpc_response_is_trailers_only(response_headers) {
                 return PluginResult::Continue;
             }
