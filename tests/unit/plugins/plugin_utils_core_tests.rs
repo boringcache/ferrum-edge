@@ -79,8 +79,20 @@ fn query_duplicate_check_detects_percent_encoded_key_collision() {
 }
 
 #[test]
+fn query_duplicate_check_detects_plus_and_percent_space_key_collision() {
+    assert!(has_conflicting_duplicate_query_key("a+b=1&a%20b=2"));
+}
+
+#[test]
 fn query_duplicate_check_allows_percent_encoded_keys_with_same_value() {
     assert!(!has_conflicting_duplicate_query_key("a%20b=1&a%20b=1"));
+}
+
+#[test]
+fn query_duplicate_check_normalizes_plus_in_values() {
+    assert!(!has_conflicting_duplicate_query_key(
+        "a=hello+world&a=hello%20world"
+    ));
 }
 
 #[test]

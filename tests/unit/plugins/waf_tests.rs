@@ -2716,6 +2716,29 @@ async fn rule_override_fp_filter_suppresses_special_hpp_rule() {
 }
 
 #[tokio::test]
+async fn hpp_rule_blocks_plus_and_percent_space_key_aliases() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce"
+    }))
+    .unwrap();
+
+    let mut request = ctx("GET", "/search");
+    request.set_raw_query_string("tenant+id=victim&tenant%20id=admin".into());
+    assert!(matches!(
+        plugin.authorize(&mut request).await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        request
+            .metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-HPP-001")
+    );
+}
+
+#[tokio::test]
 async fn rule_override_scopes_built_in_rule_to_paths() {
     let plugin = Waf::new(&json!({
         "mode": "enforce",
