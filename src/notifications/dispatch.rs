@@ -9,6 +9,15 @@
 //! Transient transport/HTTP failures retry inside the same task with a bounded,
 //! jittered backoff while holding the semaphore permit — retries never enqueue
 //! additional work and never block the caller's request-hook thread.
+//!
+//! Every attempt — the transport call itself and the backoff between attempts —
+//! is raced against the owning generation's cancellation. Retirement therefore
+//! drops an in-flight send promptly instead of waiting out the transport
+//! timeout. Cancellation is a *commit* boundary, not an undo: bytes already
+//! written to the endpoint may still be delivered and acted on, but a retired
+//! generation never commits success/failure, never retries, and never runs a
+//! completion path after cancellation. The retired attempt settles exactly once
+//! as [`DispatchSettle::Abandoned`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -208,12 +217,28 @@ pub(crate) async fn run_with_retries(
             return DispatchSettle::Abandoned;
         }
         attempt = attempt.saturating_add(1);
-        let outcome = channel
-            .dispatch_classified(&notification, &extras, &http)
-            .await;
-        // Reload retirement can race an already-running network attempt. The
-        // bytes cannot be unsent, but the retired generation must not commit
-        // success/failure into incident state or start another retry.
+        // Reload retirement can race an already-running network attempt, so the
+        // attempt itself is raced against cancellation rather than only being
+        // checked around it: an endpoint that accepts the connection and then
+        // stalls must not pin a retired generation until the 60s transport
+        // timeout. `biased` makes the priority explicit — cancellation is
+        // polled first on every wakeup, so a generation retired while both
+        // branches are ready settles as abandoned deterministically instead of
+        // depending on `select!`'s random branch order.
+        //
+        // Losing the race drops the in-flight transport future here. That
+        // cannot unsend bytes already on the wire (the endpoint may still
+        // observe, and act on, a delivery this generation will report as
+        // abandoned); it only guarantees the retired generation never commits
+        // success/failure into producer state, never schedules another retry,
+        // and never invokes a completion path after cancellation.
+        let outcome = tokio::select! {
+            biased;
+            () = cancel_wait(generation) => return DispatchSettle::Abandoned,
+            outcome = channel.dispatch_classified(&notification, &extras, &http) => outcome,
+        };
+        // A cancel that lands between the transport returning and this check
+        // must still be honored: same commit boundary, no retry.
         if generation.is_cancelled() {
             return DispatchSettle::Abandoned;
         }
@@ -232,11 +257,14 @@ pub(crate) async fn run_with_retries(
                         "notification dispatch transient failure; retrying"
                     );
                     let delay = retry.backoff_delay(attempt);
+                    // Same deliberate priority: a cancel that lands while the
+                    // backoff timer is also ready abandons instead of retrying.
                     tokio::select! {
-                        _ = tokio::time::sleep(delay) => {}
-                        _ = cancel_wait(generation) => {
+                        biased;
+                        () = cancel_wait(generation) => {
                             return DispatchSettle::Abandoned;
                         }
+                        _ = tokio::time::sleep(delay) => {}
                     }
                     continue;
                 }
@@ -258,8 +286,9 @@ pub(crate) async fn run_with_retries(
     }
 }
 
+/// Resolve when `generation` is retired. Edge-triggered on the generation's
+/// cancel signal — no polling cadence, so retirement latency is a task wakeup
+/// rather than a sleep interval.
 async fn cancel_wait(generation: &DispatchGeneration) {
-    while !generation.is_cancelled() {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    generation.cancelled().await;
 }

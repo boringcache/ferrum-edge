@@ -1,6 +1,7 @@
 //! Deterministic delivery-lifecycle tests for notification dispatch +
 //! proxy_alerts pending-state / generation retirement contracts (#2448).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,7 +24,7 @@ use ferrum_edge::plugins::{Plugin, TransactionSummary};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, Semaphore, oneshot};
 use tokio::time::timeout;
 
 fn fixed_notification() -> Notification {
@@ -406,37 +407,103 @@ async fn proxy_alerts_successful_trigger_commits_active_and_cooldown() {
     );
 }
 
-#[tokio::test]
-async fn reload_retirement_drain_times_out_then_settles_abandoned_once() {
+/// An endpoint that answers `preface` statuses and then accepts one more
+/// request which it never answers, deliberately stalling the dispatch future
+/// inside `transport.dispatch`.
+struct StalledEndpoint {
+    addr: SocketAddr,
+    /// Fires once the stalled request's headers have been read server-side —
+    /// the barrier proving the dispatch future was actually polled and put
+    /// bytes on the wire before the test cancels.
+    stalled_request_started: oneshot::Receiver<()>,
+    /// Fires when the stalled connection reaches EOF. An unanswered request
+    /// can never be pooled or reused, so the only way this socket closes is
+    /// the in-flight transport future being dropped: a deterministic drop
+    /// witness that does not depend on any timeout.
+    stalled_connection_closed: oneshot::Receiver<()>,
+    requests: Arc<AtomicUsize>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+async fn spawn_stalled_endpoint(preface: Vec<u16>) -> StalledEndpoint {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    // Accept but never respond — keep the dispatch in-flight.
-    let request_started = Arc::new(Notify::new());
-    let request_started_on_server = Arc::clone(&request_started);
-    let blocker = tokio::spawn(async move {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let server_requests = Arc::clone(&requests);
+    let (started_tx, stalled_request_started) = oneshot::channel();
+    let (closed_tx, stalled_connection_closed) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        for status in preface {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request_headers(&mut socket).await;
+            server_requests.fetch_add(1, Ordering::SeqCst);
+            let response =
+                format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
         let (mut socket, _) = listener.accept().await.unwrap();
         read_request_headers(&mut socket).await;
-        request_started_on_server.notify_one();
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        server_requests.fetch_add(1, Ordering::SeqCst);
+        let _ = started_tx.send(());
+        // Never respond. Drain until the peer hangs up.
+        let mut buf = [0u8; 256];
+        loop {
+            match socket.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        let _ = closed_tx.send(());
+        // Keep serving so a post-cancellation retry is observable as an extra
+        // counted request rather than a silent connection refusal.
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request_headers(&mut socket).await;
+            server_requests.fetch_add(1, Ordering::SeqCst);
+        }
     });
 
+    StalledEndpoint {
+        addr,
+        stalled_request_started,
+        stalled_connection_closed,
+        requests,
+        server,
+    }
+}
+
+/// Cancelling a generation must abandon an attempt that is stalled *inside*
+/// the transport call, not merely one sitting between attempts. The endpoint
+/// never responds, so before the fix the task stayed alive until the 60s
+/// `PluginHttpClient` request timeout; every bound below is orders of
+/// magnitude under that, so passing proves preemption rather than expiry.
+#[tokio::test]
+async fn reload_retirement_cancels_stalled_in_flight_dispatch_and_settles_abandoned_once() {
+    let mut endpoint = spawn_stalled_endpoint(Vec::new()).await;
     let metrics = Arc::new(DeliveryMetrics::new());
     let generation = DispatchGeneration::with_metrics(99, Arc::clone(&metrics));
     let sem = Arc::new(Semaphore::new(1));
+    let addr = endpoint.addr;
     let channel = webhook_channel_to(format!("http://{addr}/slow"));
     let settles = Arc::new(std::sync::Mutex::new(Vec::new()));
     let callback_settles = Arc::clone(&settles);
+    let notification = Arc::new(fixed_notification());
+    let extras: Arc<HashMap<String, String>> = Arc::new(HashMap::new());
 
     assert!(dispatch_one(
-        Arc::new(fixed_notification()),
-        Arc::new(Default::default()),
+        Arc::clone(&notification),
+        Arc::clone(&extras),
         channel,
         sem,
         PluginHttpClient::default(),
         Arc::clone(&generation),
+        // A retry budget is configured on purpose: cancellation must also
+        // suppress the retry this transient stall would otherwise earn.
         DeliveryRetryPolicy {
-            max_retries: 0,
-            ..DeliveryRetryPolicy::DEFAULT
+            max_retries: 3,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(20),
         },
         "test",
         Some(Arc::new(move |settle| {
@@ -447,16 +514,27 @@ async fn reload_retirement_drain_times_out_then_settles_abandoned_once() {
         })),
     ));
 
-    timeout(Duration::from_secs(2), request_started.notified())
+    timeout(Duration::from_secs(5), &mut endpoint.stalled_request_started)
         .await
-        .expect("server must observe the live transport attempt before retirement");
+        .expect("server must observe the live transport attempt before retirement")
+        .expect("stall barrier sender must not be dropped");
+    assert_eq!(generation.in_flight(), 1, "the attempt must be accounted");
+    assert_eq!(metrics.channel_snapshot("webhook").in_flight, 1);
 
     generation.cancel();
     assert!(!generation.is_admitting());
     assert!(
-        !generation.wait_drain(Duration::from_millis(25)).await,
-        "a live transport attempt must report a bounded drain timeout"
+        generation.wait_drain(Duration::from_secs(5)).await,
+        "retirement must abandon a stalled attempt promptly, not wait out the transport timeout"
     );
+    timeout(
+        Duration::from_secs(5),
+        &mut endpoint.stalled_connection_closed,
+    )
+    .await
+    .expect("the cancelled dispatch future must be dropped, closing the stalled connection")
+    .expect("close witness sender must not be dropped");
+
     let rejected = dispatch_one(
         Arc::new(fixed_notification()),
         Arc::new(Default::default()),
@@ -469,14 +547,20 @@ async fn reload_retirement_drain_times_out_then_settles_abandoned_once() {
         None,
     );
     assert!(!rejected, "retired generation must not admit new work");
-    blocker.abort();
-    assert!(
-        generation.wait_drain(Duration::from_secs(2)).await,
-        "closing the in-flight transport must complete generation drain"
+    assert_eq!(
+        endpoint.requests.load(Ordering::SeqCst),
+        1,
+        "a cancelled attempt must not be retried"
     );
+
     let snapshot = metrics.channel_snapshot("webhook");
+    assert_eq!(snapshot.attempted, 1);
     assert_eq!(snapshot.abandoned_at_deadline, 1);
+    assert_eq!(snapshot.succeeded, 0);
+    assert_eq!(snapshot.failed_transient, 0);
+    assert_eq!(snapshot.failed_permanent, 0);
     assert_eq!(snapshot.in_flight, 0);
+    assert_eq!(generation.in_flight(), 0);
     assert_eq!(
         *settles
             .lock()
@@ -484,6 +568,121 @@ async fn reload_retirement_drain_times_out_then_settles_abandoned_once() {
         vec![DispatchSettle::Abandoned],
         "retirement must roll producer state back exactly once"
     );
+    // A drained generation means the dispatch future itself is gone, not just
+    // that the transport returned: nothing still holds its captured payload.
+    assert_eq!(Arc::strong_count(&notification), 1);
+    assert_eq!(Arc::strong_count(&extras), 1);
+    endpoint.server.abort();
+}
+
+/// The same preemption must hold for a *retried* attempt, so cancellation
+/// cannot be escaped by a transient failure re-entering the transport.
+#[tokio::test]
+async fn retirement_cancels_stalled_retry_attempt_after_transient_failure() {
+    let mut endpoint = spawn_stalled_endpoint(vec![503]).await;
+    let metrics = Arc::new(DeliveryMetrics::new());
+    let generation = DispatchGeneration::with_metrics(101, Arc::clone(&metrics));
+    let settles = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let callback_settles = Arc::clone(&settles);
+    let addr = endpoint.addr;
+
+    assert!(dispatch_one(
+        Arc::new(fixed_notification()),
+        Arc::new(Default::default()),
+        webhook_channel_to(format!("http://{addr}/retry-then-stall")),
+        Arc::new(Semaphore::new(1)),
+        PluginHttpClient::default(),
+        Arc::clone(&generation),
+        DeliveryRetryPolicy {
+            max_retries: 5,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+        },
+        "test",
+        Some(Arc::new(move |settle| {
+            callback_settles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(settle);
+        })),
+    ));
+
+    timeout(Duration::from_secs(5), &mut endpoint.stalled_request_started)
+        .await
+        .expect("the retry attempt must reach the endpoint before retirement")
+        .expect("stall barrier sender must not be dropped");
+    assert_eq!(
+        endpoint.requests.load(Ordering::SeqCst),
+        2,
+        "the transient 503 must have been retried before the stall"
+    );
+
+    generation.cancel();
+    assert!(
+        generation.wait_drain(Duration::from_secs(5)).await,
+        "retirement must abandon a stalled retry attempt promptly"
+    );
+    timeout(
+        Duration::from_secs(5),
+        &mut endpoint.stalled_connection_closed,
+    )
+    .await
+    .expect("the cancelled retry future must be dropped, closing the stalled connection")
+    .expect("close witness sender must not be dropped");
+
+    assert_eq!(
+        endpoint.requests.load(Ordering::SeqCst),
+        2,
+        "cancellation must not schedule a further retry"
+    );
+    let snapshot = metrics.channel_snapshot("webhook");
+    assert_eq!(snapshot.attempted, 1, "retries share one admitted task");
+    assert_eq!(snapshot.abandoned_at_deadline, 1);
+    assert_eq!(snapshot.failed_transient, 0);
+    assert_eq!(snapshot.succeeded, 0);
+    assert_eq!(snapshot.in_flight, 0);
+    assert_eq!(
+        *settles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        vec![DispatchSettle::Abandoned],
+        "a cancelled retry must settle exactly once"
+    );
+    endpoint.server.abort();
+}
+
+/// The cancel signal is edge-triggered, so an in-flight attempt observes
+/// retirement on a task wakeup rather than a polling cadence. Registration
+/// happens before the flag re-read, so a cancel racing the waiter is not lost.
+#[tokio::test]
+async fn generation_cancelled_future_resolves_without_polling_cadence() {
+    let generation = DispatchGeneration::new(5);
+    let waiter = Arc::clone(&generation);
+    let observed = tokio::spawn(async move {
+        waiter.cancelled().await;
+        waiter.is_cancelled()
+    });
+
+    // Not cancelled: the future must stay pending.
+    assert!(
+        timeout(Duration::from_millis(50), generation.cancelled())
+            .await
+            .is_err(),
+        "a live generation must never resolve its cancel future"
+    );
+
+    generation.cancel();
+    assert!(
+        timeout(Duration::from_secs(2), observed)
+            .await
+            .expect("cancel must wake a registered waiter")
+            .expect("waiter task must not panic"),
+        "a woken waiter must observe the published cancel flag"
+    );
+    // Already cancelled: resolves immediately on the first poll.
+    timeout(Duration::from_millis(500), generation.cancelled())
+        .await
+        .expect("an already-cancelled generation must resolve immediately");
 }
 
 #[tokio::test]

@@ -4,7 +4,9 @@
 //! the generation is admitting, new work may be spawned through the process
 //! observability delivery registry. On reload/`Drop` the generation stops
 //! admitting and cooperatively cancels in-flight work; tasks that observe the
-//! cancel flag settle as [`DispatchSettle::Abandoned`]. Process shutdown
+//! cancel flag settle as [`DispatchSettle::Abandoned`]. In-flight transport
+//! attempts race [`DispatchGeneration::cancelled`] and are dropped on
+//! retirement rather than held until the transport timeout. Process shutdown
 //! drains the same tasks under the global observability budget and aborts
 //! whatever remains when the deadline expires — those aborts also settle as
 //! abandoned via [`DeliveryTaskGuard`].
@@ -38,6 +40,9 @@ pub struct DispatchGeneration {
     active_spawns: AtomicUsize,
     in_flight: AtomicUsize,
     drained: Notify,
+    /// Woken once when `cancelled` flips, so in-flight attempts observe
+    /// retirement immediately instead of on a polling cadence.
+    cancel_signal: Notify,
     metrics: Arc<DeliveryMetrics>,
     next_task_id: AtomicU64,
 }
@@ -55,6 +60,7 @@ impl DispatchGeneration {
             active_spawns: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
             drained: Notify::new(),
+            cancel_signal: Notify::new(),
             metrics,
             next_task_id: AtomicU64::new(1),
         })
@@ -86,9 +92,34 @@ impl DispatchGeneration {
     }
 
     /// Stop admitting and signal cooperative cancel to every in-flight task.
+    ///
+    /// The flag is published before the wakeup so a waiter that registered but
+    /// has not re-read the flag still observes `cancelled == true` when it runs.
     pub fn cancel(&self) {
         self.admitting.store(false, Ordering::Release);
         self.cancelled.store(true, Ordering::Release);
+        self.cancel_signal.notify_waiters();
+    }
+
+    /// Resolve as soon as this generation is cancelled.
+    ///
+    /// Cancellation is one-way, so this never completes for a live generation.
+    /// The waiter is registered (via `Notified::enable`) *before* the flag is
+    /// re-read, so a [`Self::cancel`] landing in that window cannot be missed —
+    /// `notify_waiters` retains no permit for a not-yet-registered waiter.
+    ///
+    /// This future holds no lock and allocates nothing on the steady-state
+    /// path; it is safe to re-create it on every retry iteration.
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.cancel_signal.notified();
+            tokio::pin!(notified);
+            let _ = notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.as_mut().await;
+        }
     }
 
     fn begin_task(&self) {

@@ -178,6 +178,8 @@ dispatch(
 
 Transient transport/HTTP failures (408/429/5xx, connect/timeout) retry inside the same task with a bounded, jittered backoff while holding the permit. Permanent failures (other 4xx, egress denials) fail immediately. Process shutdown drains in-flight sends under the shared observability budget; abandoned sends increment `ferrum_notification_delivery_abandoned_at_deadline_total{channel_type=…}`.
 
+Retiring a generation (reload / `Drop`) cancels its sends promptly: the in-flight transport call and the backoff between attempts are both raced against the cancel signal, with cancellation deliberately given priority, so an endpoint that accepts a connection and then stalls cannot pin a retired generation until the 60s HTTP client timeout. Cancellation is a **commit boundary, not an undo** — bytes already written may still reach and be acted on by the endpoint, and Ferrum reports that send as abandoned regardless. What it does guarantee is that a retired generation never commits success or failure into producer state, never schedules another retry, and never invokes a completion callback after cancellation; the attempt settles exactly once as abandoned.
+
 ### Delivery metrics (bounded cardinality)
 
 Authenticated `/metrics` exports these families, labeled only by the fixed `channel_type` set (`slack` / `teams` / `discord` / `webhook` / `email`) — never by operator channel name:
