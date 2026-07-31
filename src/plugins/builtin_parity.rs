@@ -369,7 +369,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "openapi_validator",
         classification: BuiltinPluginClassification::Public,
         priority: 2960,
-        active_phases: "before_proxy, on_final_request_body, after_proxy, on_final_response_body",
+        active_phases: "validate_client_request_body_contract, before_proxy, on_final_request_body, after_proxy, on_final_response_body",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "Validates bodies against generated OpenAPI operation schemas",
     },
