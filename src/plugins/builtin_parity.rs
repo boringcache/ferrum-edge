@@ -529,7 +529,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "ai_federation",
         classification: BuiltinPluginClassification::Public,
         priority: 4060,
-        active_phases: "final request body (HTTP only)",
+        active_phases: "finalized request egress (HTTP only)",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "HTTP-only; routes final OpenAI JSON bodies to providers and normalizes bounded responses",
     },
