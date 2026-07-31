@@ -9,6 +9,7 @@
 
 use crate::common::{TestGateway, TestGatewayBuilder};
 use crate::scaffolding::clients::{GetOptions, Http3Client};
+use crate::scaffolding::reserve_colocated_tcp_udp;
 
 use bytes::Bytes;
 use http::{Method, StatusCode};
@@ -201,21 +202,7 @@ async fn body_validator_request_representation_fails_closed_http2() {
 #[tokio::test]
 async fn body_validator_request_representation_fails_closed_http3() {
     let (backend_port, backend_hits, backend_task) = spawn_counting_backend().await;
-    let https_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("reserve https port");
-    let https_port = https_listener.local_addr().expect("https addr").port();
-    drop(https_listener);
-
-    let mut gateway = request_validator_gateway_builder(backend_port)
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
-        .env("FERRUM_TLS_NO_VERIFY", "true")
-        .spawn()
-        .await
-        .expect("start H3 body_validator request gateway");
+    let (mut gateway, https_port) = spawn_h3_request_validator_gateway(backend_port).await;
     gateway
         .wait_for_proxy_port(Duration::from_secs(5))
         .await
@@ -291,6 +278,46 @@ fn request_validator_gateway_builder(backend_port: u16) -> TestGatewayBuilder {
         .mode_file(request_validator_config(backend_port))
         .log_level("warn")
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+}
+
+async fn spawn_h3_request_validator_gateway(backend_port: u16) -> (TestGateway, u16) {
+    const MAX_ATTEMPTS: usize = 5;
+    let mut last_error = String::new();
+
+    // The subprocess must bind the configured HTTPS port itself, so releasing
+    // the reservation creates an unavoidable short ownership window. Reserve
+    // both TCP and UDP on the same port, give that fixed-port spawn one attempt,
+    // and retry with a fresh pair if another parallel test wins the window
+    // (issue #3428). Retrying the same stolen port inside the harness cannot
+    // recover.
+    for _ in 0..MAX_ATTEMPTS {
+        let (https_tcp, https_udp) = reserve_colocated_tcp_udp()
+            .await
+            .expect("reserve colocated H3 port");
+        let https_port = https_tcp.port;
+        assert_eq!(https_port, https_udp.port);
+        drop(https_tcp);
+        drop(https_udp);
+
+        let result = request_validator_gateway_builder(backend_port)
+            .max_attempts(1)
+            .env("FERRUM_ENABLE_HTTP3", "true")
+            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+            .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+            .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+            .env("FERRUM_TLS_NO_VERIFY", "true")
+            .spawn()
+            .await;
+        match result {
+            Ok(gateway) => return (gateway, https_port),
+            Err(error) => last_error = error.to_string(),
+        }
+    }
+
+    panic!(
+        "failed to spawn H3 body-validator gateway after {MAX_ATTEMPTS} fresh-port attempts: \
+         {last_error}"
+    );
 }
 
 fn request_validator_config(backend_port: u16) -> String {
