@@ -306,6 +306,24 @@ impl DeliverySlot {
         let lifecycle = self.snapshot();
         lifecycle.shutdown(timeout).await
     }
+
+    /// Shut down the captured lifecycle and signal once admission is closed
+    /// and its absolute drain deadline has been established.
+    ///
+    /// Hidden test seam only: external paused-time regressions use the signal
+    /// as a causal barrier instead of polling admission or relying on scheduler
+    /// order. Production callers use [`Self::shutdown`].
+    #[doc(hidden)]
+    pub async fn shutdown_with_admission_closed_for_test(
+        &self,
+        timeout: Duration,
+        admission_closed_tx: tokio::sync::oneshot::Sender<()>,
+    ) -> DeliveryDrainReport {
+        let lifecycle = self.snapshot();
+        lifecycle
+            .shutdown_with_admission_closed_signal(timeout, Some(admission_closed_tx))
+            .await
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -793,8 +811,20 @@ impl DeliveryLifecycle {
     }
 
     async fn shutdown(&self, timeout: Duration) -> DeliveryDrainReport {
+        self.shutdown_with_admission_closed_signal(timeout, None)
+            .await
+    }
+
+    async fn shutdown_with_admission_closed_signal(
+        &self,
+        timeout: Duration,
+        admission_closed_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> DeliveryDrainReport {
         let mut cached_report = self.shutdown_report.lock().await;
         if let Some(report) = *cached_report {
+            if let Some(tx) = admission_closed_tx {
+                let _ = tx.send(());
+            }
             return report;
         }
 
@@ -805,6 +835,9 @@ impl DeliveryLifecycle {
         self.accepting_external_tasks
             .store(false, Ordering::Release);
         let deadline = Instant::now() + timeout;
+        if let Some(tx) = admission_closed_tx {
+            let _ = tx.send(());
+        }
 
         let tasks_drained = self.wait_for_tasks(deadline).await;
         self.accepting_internal_tasks

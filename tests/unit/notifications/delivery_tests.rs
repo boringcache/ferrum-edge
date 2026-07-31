@@ -1065,8 +1065,9 @@ async fn admit_then_cancel_before_transport_counts_attempted_under_body_start_co
 /// The delivery body is a deterministic never-completing future admitted
 /// through the owned-slot test seam: ordinary channel/transport completion
 /// cannot race `FailedTransient` (or any other settle) ahead of the hard
-/// abort. One-shot oneshot barriers prove body entry after attempt start and
-/// pending-body drop on hard abort — no polling loops or scheduler luck.
+/// abort. One-shot barriers prove body entry after attempt start, shutdown
+/// admission closure after the deadline is fixed, and pending-body drop on hard
+/// abort — no polling loops or scheduler luck.
 ///
 /// Ordering is driven with Tokio paused virtual time so replacement-before-abort
 /// is causal: A begins shutdown under a long virtual budget, B is installed and
@@ -1096,8 +1097,9 @@ async fn hard_shutdown_deadline_aborts_admitted_notification_exactly_once() {
     );
 
     // Causal: the admitted body must be live-and-pending before drain starts.
-    body_entered_rx
+    timeout(Duration::from_secs(1), body_entered_rx)
         .await
+        .expect("timed out waiting for admitted delivery body entry")
         .expect("admitted delivery body must signal entry after attempt start");
     assert_eq!(generation.in_flight(), 1);
     assert_eq!(metrics.channel_snapshot("webhook").in_flight, 1);
@@ -1110,12 +1112,20 @@ async fn hard_shutdown_deadline_aborts_admitted_notification_exactly_once() {
     // advances paused time past this deadline.
     let drain_budget = Duration::from_secs(5);
     let drain_slot = Arc::clone(&slot);
-    let drain = tokio::spawn(async move { drain_slot.shutdown(drain_budget).await });
-
-    // Wait until draining A rejects new external work so replacement is mid-drain.
-    while slot.spawn_terminal(async {}) {
-        tokio::task::yield_now().await;
-    }
+    let (admission_closed_tx, admission_closed_rx) = oneshot::channel::<()>();
+    let drain = tokio::spawn(async move {
+        drain_slot
+            .shutdown_with_admission_closed_for_test(drain_budget, admission_closed_tx)
+            .await
+    });
+    timeout(Duration::from_secs(1), admission_closed_rx)
+        .await
+        .expect("timed out waiting for A shutdown admission closure")
+        .expect("A shutdown must signal after fixing its drain deadline");
+    assert!(
+        !slot.spawn_terminal(async {}),
+        "draining A must reject new external work before B replaces it"
+    );
 
     // A is admission-closed but must still be draining — not hard-aborting —
     // because virtual time has not crossed the budget.
@@ -1181,8 +1191,9 @@ async fn hard_shutdown_deadline_aborts_admitted_notification_exactly_once() {
         "pending send must force the shutdown budget to expire"
     );
 
-    dropped_rx
+    timeout(Duration::from_secs(1), dropped_rx)
         .await
+        .expect("timed out waiting for the hard abort to drop the pending body")
         .expect("hard abort must drop the in-flight pending delivery future");
 
     let snap = metrics.channel_snapshot("webhook");
