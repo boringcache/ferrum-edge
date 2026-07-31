@@ -881,10 +881,7 @@ fn test_terminate_mode() {
     .unwrap();
 
     // terminate mode doesn't modify headers — it short-circuits via RejectBinary
-    assert!(
-        plugin.modifies_request_headers(),
-        "pre_proxy must advertise its finalized backend-header overlay to replay/cache ordering"
-    );
+    assert!(!plugin.modifies_request_headers());
 }
 
 #[test]
@@ -899,7 +896,10 @@ fn test_pre_proxy_mode_uses_finalized_header_overlay() {
     )
     .unwrap();
 
-    assert!(!plugin.modifies_request_headers());
+    assert!(
+        plugin.modifies_request_headers(),
+        "pre_proxy must advertise its finalized backend-header overlay to replay/cache ordering"
+    );
     assert!(plugin.dispatches_finalized_request_egress());
 }
 
