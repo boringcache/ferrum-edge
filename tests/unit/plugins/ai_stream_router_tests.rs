@@ -4563,3 +4563,774 @@ fn response_caching_needs_no_added_final_header_policy_rule() {
         "unexpected composition diagnostic: {error}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Final provider-visible QUERY (GHSA-xhp5-hqj8-3mwg)
+//
+// `request_transformer` (3000) runs after the claim (2984) and its query rules
+// can add/update/rename/remove pairs. The committed query is frozen at claim
+// time and replayed at the single capture funnel every dispatcher and every
+// retry attempt reads.
+// ---------------------------------------------------------------------------
+
+/// The value the H1/H2 and native-H3 ladders actually capture once per request.
+fn captured_backend_query(ctx: &RequestContext, raw_query: &str) -> String {
+    let with_raw =
+        ferrum_edge::_test_support::effective_backend_query_string_with_raw_for_test(ctx, raw_query);
+    // Both funnels must agree; the `_with_raw` form is what the ladders use and
+    // the plain form is what the policy/replay consumers use.
+    assert_eq!(
+        with_raw,
+        ferrum_edge::_test_support::effective_backend_query_string_for_test(ctx),
+        "the two backend-query funnels disagree"
+    );
+    with_raw
+}
+
+fn post_ctx_with_query(body: &Value, raw_query: &str) -> RequestContext {
+    let mut ctx = post_ctx(body);
+    ctx.set_raw_query_string(raw_query.to_string());
+    ctx
+}
+
+/// Claim `model` through `plugins` with `raw_query` on the wire, then return the
+/// context plus the captured backend-visible query.
+async fn claimed_backend_query(
+    plugins: &[Arc<dyn Plugin>],
+    model: &str,
+    raw_query: &str,
+) -> (RequestContext, String) {
+    let body = streaming_request(model);
+    let mut ctx = post_ctx_with_query(&body, raw_query);
+    let mut headers = json_headers();
+    assert!(matches!(
+        run_before_proxy_chain(plugins, &mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_stream_router.claimed")
+            .map(String::as_str),
+        Some("true"),
+        "fixture must actually be claimed by the router"
+    );
+    let captured = captured_backend_query(&ctx, raw_query);
+    (ctx, captured)
+}
+
+fn azure_style_config() -> Value {
+    json!({
+        "enabled": true,
+        "providers": [
+            {
+                "name": "azure",
+                "provider_type": "openai_compatible",
+                "endpoint": "https://azure.example.com/openai/chat/completions?api-version=2024-06-01",
+                "api_key": "sk-azure-secret",
+                "model_patterns": ["gpt-*"],
+                "priority": 1
+            }
+        ]
+    })
+}
+
+fn router_config_then_transformer(
+    router_config: Value,
+    transformer_rules: Value,
+) -> Vec<Arc<dyn Plugin>> {
+    let router = build(router_config);
+    let later = transformer(transformer_rules);
+    assert!(
+        router.priority() < later.priority(),
+        "the composition under test requires the transformer to run AFTER the router"
+    );
+    vec![Arc::new(router), Arc::new(later)]
+}
+
+#[tokio::test]
+async fn final_query_discards_a_later_query_add() {
+    let plugins = router_then_transformer(json!([
+        {"operation": "add", "target": "query", "key": "backend_token",
+         "value": "INTERNAL-BACKEND-SECRET"}
+    ]));
+    let (_ctx, query) = claimed_backend_query(&plugins, "gpt-4o", "temperature=0").await;
+
+    assert_eq!(query, "temperature=0");
+    assert!(
+        !query.contains("INTERNAL-BACKEND-SECRET"),
+        "a later query rule must not append a normal-backend secret to the provider URL"
+    );
+}
+
+#[tokio::test]
+async fn final_query_discards_later_update_rename_and_remove_rules() {
+    for rules in [
+        json!([{"operation": "update", "target": "query", "key": "temperature",
+                "value": "INTERNAL-BACKEND-SECRET"}]),
+        json!([{"operation": "rename", "target": "query", "key": "temperature",
+                "new_key": "backend_token"}]),
+        json!([{"operation": "remove", "target": "query", "key": "temperature"}]),
+    ] {
+        let plugins = router_then_transformer(rules.clone());
+        let (_ctx, query) = claimed_backend_query(&plugins, "gpt-4o", "temperature=0").await;
+        assert_eq!(
+            query, "temperature=0",
+            "later query rule {rules} must not reach the provider target"
+        );
+    }
+}
+
+#[tokio::test]
+async fn final_query_preserves_a_safe_unchanged_client_query() {
+    // No later query rule at all: the already-safe client query continues.
+    let plugins = router_then_transformer(json!([
+        {"operation": "add", "target": "header", "key": "X-Request-Source", "value": "edge"}
+    ]));
+    let (_ctx, query) = claimed_backend_query(&plugins, "gpt-4o", "a=1&b=2").await;
+    assert_eq!(query, "a=1&b=2");
+}
+
+#[tokio::test]
+async fn final_query_is_empty_when_an_endpoint_query_is_folded_into_the_path() {
+    let plugins = router_config_then_transformer(
+        azure_style_config(),
+        json!([{"operation": "add", "target": "query", "key": "backend_token",
+                "value": "INTERNAL-BACKEND-SECRET"}]),
+    );
+    let (ctx, query) = claimed_backend_query(&plugins, "gpt-4o", "a=1").await;
+
+    // The endpoint query and the client query are both folded into the absolute
+    // override path, so nothing may be appended separately — a second `?` would
+    // otherwise be produced, and the later rule must not sneak a pair in here.
+    assert_eq!(query, "");
+    let path = ctx.route_override_path.as_deref().expect("committed path");
+    assert!(
+        path.contains("api-version=2024-06-01") && path.contains("a=1"),
+        "endpoint + client query must be folded into the committed path: {path}"
+    );
+}
+
+#[tokio::test]
+async fn final_query_honors_authentication_strip_markers_at_claim_time() {
+    let plugins = router_then_transformer(json!([
+        {"operation": "add", "target": "query", "key": "late", "value": "x"}
+    ]));
+    let body = streaming_request("gpt-4o");
+    let mut ctx = post_ctx_with_query(&body, "api_key=CLIENT-CREDENTIAL&keep=1");
+    // Authentication-owned strip marker, exactly as a credential-consuming auth
+    // plugin publishes it before `before_proxy` (`auth.strip_query_param.<name>`).
+    ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+    let mut headers = json_headers();
+    assert!(matches!(
+        run_before_proxy_chain(&plugins, &mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let query = captured_backend_query(&ctx, "api_key=CLIENT-CREDENTIAL&keep=1");
+    assert_eq!(query, "keep=1");
+    assert!(!query.contains("CLIENT-CREDENTIAL"));
+}
+
+#[tokio::test]
+async fn final_query_replays_identically_for_every_retry_attempt() {
+    let plugins = router_then_transformer(json!([
+        {"operation": "add", "target": "query", "key": "backend_token", "value": "leak"}
+    ]));
+    let (ctx, first) = claimed_backend_query(&plugins, "gpt-4o", "a=1").await;
+    // A retry recomputes/reuses the same capture; it must be byte-identical.
+    for _ in 0..3 {
+        assert_eq!(captured_backend_query(&ctx, "a=1"), first);
+    }
+    assert_eq!(first, "a=1");
+}
+
+#[tokio::test]
+async fn final_query_is_untouched_for_an_unclaimed_request() {
+    let plugins = router_then_transformer(json!([
+        {"operation": "add", "target": "query", "key": "added", "value": "1"}
+    ]));
+    // Non-streaming: never claimed, so ordinary transformer semantics apply.
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let mut ctx = post_ctx_with_query(&body, "a=1");
+    let mut headers = json_headers();
+    assert!(matches!(
+        run_before_proxy_chain(&plugins, &mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(!ctx.metadata.contains_key("ai_stream_router.claimed"));
+    let query = captured_backend_query(&ctx, "a=1");
+    assert!(
+        query.contains("a=1") && query.contains("added=1"),
+        "an unclaimed request keeps ordinary transformer query semantics: {query}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Committed destination witness: upstream identity, backend TLS, DNS
+// ---------------------------------------------------------------------------
+
+/// Claim a request with a single router instance and hand back the context and
+/// the raw body, ready for a mutation + final-body revalidation.
+async fn claimed_ctx(plugin: &AiStreamRouter, model: &str) -> (RequestContext, Vec<u8>) {
+    let body = streaming_request(model);
+    let raw = serde_json::to_vec(&body).unwrap();
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    (ctx, raw)
+}
+
+#[tokio::test]
+async fn claim_clears_any_earlier_upstream_id_override() {
+    let plugin = build(openai_and_anthropic_config());
+    let body = streaming_request("gpt-4o");
+    let mut ctx = post_ctx(&body);
+    ctx.route_override_upstream_id = Some("internal-pool".to_string());
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.route_override_upstream_id, None,
+        "a direct provider claim must not leave load-balancer target selection in play"
+    );
+}
+
+#[tokio::test]
+async fn final_body_rejects_a_later_upstream_id_replacement() {
+    let plugin = build(openai_and_anthropic_config());
+    let (mut ctx, raw) = claimed_ctx(&plugin, "gpt-4o").await;
+    // Same visible host/port/path — only the routing identity changed.
+    ctx.route_override_upstream_id = Some("attacker-pool".to_string());
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), &raw)
+        .await;
+    assert_eq!(reject_status(&result), Some(500));
+}
+
+#[tokio::test]
+async fn claim_commits_default_public_verification_for_an_https_provider() {
+    let plugin = build(openai_and_anthropic_config());
+    let (ctx, _raw) = claimed_ctx(&plugin, "gpt-4o").await;
+    assert_eq!(
+        ctx.route_override_resolved_tls,
+        Some(BackendTlsConfig::default_verify())
+    );
+}
+
+#[tokio::test]
+async fn final_body_rejects_later_backend_tls_weakening_clearing_and_retargeting() {
+    let plugin = build(openai_and_anthropic_config());
+    let mutations: Vec<fn(&mut RequestContext)> = vec![
+        // Verification disabled while the visible host stays identical.
+        |ctx| {
+            let mut tls = BackendTlsConfig::default_verify();
+            tls.verify_server_cert = false;
+            ctx.route_override_resolved_tls = Some(tls);
+        },
+        // SNI retargeted.
+        |ctx| {
+            let mut tls = BackendTlsConfig::default_verify();
+            tls.sni = Some("evil.example.com".to_string());
+            ctx.route_override_resolved_tls = Some(tls);
+        },
+        // A different trust anchor.
+        |ctx| {
+            let mut tls = BackendTlsConfig::default_verify();
+            tls.server_ca_cert_path = Some("/tmp/attacker-ca.pem".to_string());
+            ctx.route_override_resolved_tls = Some(tls);
+        },
+        // Ferrum's own backend mTLS identity attached to a third party.
+        |ctx| {
+            let mut tls = BackendTlsConfig::default_verify();
+            tls.client_cert_path = Some("/tmp/gateway.pem".to_string());
+            tls.client_key_path = Some("/tmp/gateway.key".to_string());
+            ctx.route_override_resolved_tls = Some(tls);
+        },
+        // Cleared entirely, which would fall back to the proxy's own resolution.
+        |ctx| ctx.route_override_resolved_tls = None,
+    ];
+    for mutate in mutations {
+        let (mut ctx, raw) = claimed_ctx(&plugin, "gpt-4o").await;
+        mutate(&mut ctx);
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), &raw)
+            .await;
+        assert_eq!(
+            reject_status(&result),
+            Some(500),
+            "a mutated backend TLS resolution must fail closed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn inherit_backend_tls_commits_the_proxy_resolution_and_rejects_later_mutation() {
+    let plugin = build(json!({
+        "enabled": true,
+        "providers": [{
+            "name": "internal",
+            "provider_type": "openai_compatible",
+            "endpoint": "https://llm.internal.example.com/v1/chat/completions",
+            "api_key": "sk-internal-secret",
+            "model_patterns": ["gpt-*"],
+            "inherit_backend_tls": true
+        }]
+    }));
+
+    let mut proxy = create_test_proxy();
+    proxy.resolved_tls = BackendTlsConfig {
+        client_cert_path: Some("/tmp/client.pem".to_string()),
+        client_key_path: Some("/tmp/client.key".to_string()),
+        server_ca_cert_path: Some("/tmp/private-ca.pem".to_string()),
+        verify_server_cert: true,
+        sni: Some("llm.internal.example.com".to_string()),
+        san_allow_list: vec!["spiffe://internal/llm".to_string()],
+        san_allow_list_key_digest: None,
+    };
+    let inherited = proxy.resolved_tls.clone();
+
+    let body = streaming_request("gpt-4o");
+    let raw = serde_json::to_vec(&body).unwrap();
+    let mut ctx = post_ctx(&body);
+    ctx.matched_proxy = Some(Arc::new(proxy));
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(ctx.route_override_resolved_tls, Some(inherited.clone()));
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &raw)
+            .await,
+        PluginResult::Continue
+    ));
+
+    // Now weaken exactly one field of the inherited configuration.
+    let mut weakened = inherited;
+    weakened.verify_server_cert = false;
+    ctx.route_override_resolved_tls = Some(weakened);
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &raw)
+        .await;
+    assert_eq!(reject_status(&result), Some(500));
+}
+
+#[tokio::test]
+async fn provider_claim_clears_a_same_host_dns_override() {
+    // The operator's proxy is already configured with the provider's hostname
+    // and a pinned address. Host TEXT is unchanged by the claim, so only the
+    // explicit DNS decision can revoke the pin.
+    let plugin = build(openai_and_anthropic_config());
+    let mut proxy = create_test_proxy();
+    proxy.backend_host = "api.openai.com".to_string();
+    proxy.dns_override = Some("10.0.0.9".to_string());
+    let proxy = Arc::new(proxy);
+
+    let body = streaming_request("gpt-4o");
+    let mut ctx = post_ctx(&body);
+    ctx.matched_proxy = Some(Arc::clone(&proxy));
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let effective = ctx.apply_route_overrides(Arc::clone(&proxy));
+    assert_eq!(
+        effective.dns_override, None,
+        "a same-host provider claim must not inherit the proxy's pinned address"
+    );
+    assert_eq!(effective.backend_host, "api.openai.com");
+}
+
+#[tokio::test]
+async fn provider_claim_clears_a_different_host_dns_override() {
+    let plugin = build(openai_and_anthropic_config());
+    let mut proxy = create_test_proxy();
+    proxy.backend_host = "backend.internal".to_string();
+    proxy.dns_override = Some("10.0.0.9".to_string());
+    let proxy = Arc::new(proxy);
+
+    let body = streaming_request("gpt-4o");
+    let mut ctx = post_ctx(&body);
+    ctx.matched_proxy = Some(Arc::clone(&proxy));
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let effective = ctx.apply_route_overrides(Arc::clone(&proxy));
+    assert_eq!(effective.dns_override, None);
+    assert_eq!(effective.backend_host, "api.openai.com");
+}
+
+#[test]
+fn a_non_router_same_host_route_override_keeps_the_proxy_dns_override() {
+    // Guards the narrowness of the mechanism: an ordinary route rewriter that
+    // does not opt in keeps the historical same-host semantics.
+    let mut proxy = create_test_proxy();
+    proxy.backend_host = "backend.internal".to_string();
+    proxy.dns_override = Some("10.0.0.9".to_string());
+    let proxy = Arc::new(proxy);
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx.route_override_backend_host = Some("backend.internal".to_string());
+    ctx.route_override_backend_port = Some(9443);
+
+    let effective = ctx.apply_route_overrides(Arc::clone(&proxy));
+    assert_eq!(
+        effective.dns_override,
+        Some("10.0.0.9".to_string()),
+        "an unrelated same-host route override must keep its pinned address"
+    );
+    assert_eq!(effective.backend_port, 9443);
+}
+
+// ---------------------------------------------------------------------------
+// Multiple instances: exactly one owner (GHSA-xhp5-hqj8-3mwg)
+// ---------------------------------------------------------------------------
+
+/// Two enabled instances whose providers share the SAME name but differ in
+/// endpoint, key, provider type, patterns, and normalization setting.
+fn two_same_named_instances() -> Vec<Arc<dyn Plugin>> {
+    let first = build(json!({
+        "enabled": true,
+        "normalize_response_stream": true,
+        "providers": [{
+            "name": "shared",
+            "provider_type": "openai",
+            "endpoint": "https://first.example.com/v1/chat/completions",
+            "api_key": "sk-first-secret",
+            "model_patterns": ["gpt-*"]
+        }]
+    }));
+    let second = build(json!({
+        "enabled": true,
+        "normalize_response_stream": true,
+        "providers": [{
+            "name": "shared",
+            "provider_type": "anthropic",
+            "endpoint": "https://second.example.com/v1/messages",
+            "api_key": "sk-second-secret",
+            "model_patterns": ["gpt-*", "claude-*"]
+        }]
+    }));
+    vec![Arc::new(first), Arc::new(second)]
+}
+
+#[tokio::test]
+async fn two_same_named_instances_yield_exactly_one_owner_and_one_credential() {
+    let plugins = two_same_named_instances();
+    let (ctx, headers) = claimed_final_headers(&plugins, "gpt-4o", json_headers()).await;
+
+    // The FIRST instance claimed: its endpoint, its key, its OpenAI (untranslated)
+    // contract. The second instance must not have overwritten any of it, even
+    // though it also matches `gpt-*` and publishes the same provider NAME.
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer sk-first-secret")
+    );
+    assert!(
+        !headers.contains_key("x-api-key"),
+        "the losing Anthropic instance must not install its own credential header"
+    );
+    assert!(!headers.contains_key("anthropic-version"));
+    assert_no_value_anywhere(&headers, "sk-second-secret");
+
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("first.example.com")
+    );
+    assert_eq!(
+        headers.get("host").map(String::as_str),
+        Some("first.example.com")
+    );
+    assert_eq!(
+        ctx.route_override_path.as_deref(),
+        Some("/v1/chat/completions")
+    );
+}
+
+#[tokio::test]
+async fn only_the_owning_instance_transforms_the_request_body_and_revalidates() {
+    let plugins = two_same_named_instances();
+    let (final_body, result) = claimed_body_stage(&plugins, "gpt-4o").await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    // The winner is the OpenAI instance, so the body must stay OpenAI-shaped.
+    // A second (Anthropic) transform would have produced `max_tokens` + an
+    // Anthropic message shape, and the loser's revalidation would then have
+    // failed the request.
+    let parsed: Value = serde_json::from_slice(&final_body).unwrap();
+    assert_eq!(parsed["model"], json!("gpt-4o"));
+    assert!(
+        parsed.get("max_tokens").is_none(),
+        "the losing Anthropic instance must not translate an already-claimed body"
+    );
+    assert_eq!(parsed["messages"][0]["role"], json!("user"));
+}
+
+#[tokio::test]
+async fn only_the_owning_instance_selects_a_response_normalizer() {
+    // BOTH instances are Anthropic and both would normalize, so
+    // `response_stream_hooks` is true on each and ownership is the only thing
+    // that can decide between them. A second normalizer would re-parse the
+    // already OpenAI-shaped SSE the first one emits.
+    let first = build(json!({
+        "enabled": true,
+        "providers": [{
+            "name": "shared",
+            "provider_type": "anthropic",
+            "endpoint": "https://first.example.com/v1/messages",
+            "api_key": "sk-first-secret",
+            "model_patterns": ["claude-*"]
+        }]
+    }));
+    let second = build(json!({
+        "enabled": true,
+        "providers": [{
+            "name": "shared",
+            "provider_type": "anthropic",
+            "endpoint": "https://second.example.com/v1/messages",
+            "api_key": "sk-second-secret",
+            "model_patterns": ["claude-*"]
+        }]
+    }));
+    assert!(first.requires_response_stream_hooks() && second.requires_response_stream_hooks());
+
+    let body = streaming_request("claude-3-5-sonnet");
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    for plugin in [&first as &dyn Plugin, &second as &dyn Plugin] {
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+
+    assert!(
+        first
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .is_some(),
+        "the owning instance must install the normalizer"
+    );
+    assert!(
+        second
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .is_none(),
+        "a losing instance must not install a second normalizer"
+    );
+    assert!(first.forces_reqwest_dispatch(&ctx));
+    assert!(!second.forces_reqwest_dispatch(&ctx));
+
+    // The response-header repair boundary is owned too: only the winner may
+    // classify/repair the provider representation.
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    response_headers.insert("content-length".to_string(), "42".to_string());
+    assert!(matches!(
+        second.after_proxy(&mut ctx, 200, &mut response_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        response_headers.get("content-length").map(String::as_str),
+        Some("42"),
+        "a losing instance must not repair the normalized representation headers"
+    );
+    assert!(matches!(
+        first.after_proxy(&mut ctx, 200, &mut response_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        !response_headers.contains_key("content-length"),
+        "the owning instance repairs the representation headers"
+    );
+}
+
+#[tokio::test]
+async fn distinct_provider_names_still_yield_exactly_one_owner() {
+    let first = build(json!({
+        "enabled": true,
+        "providers": [{
+            "name": "alpha",
+            "provider_type": "openai",
+            "endpoint": "https://alpha.example.com/v1/chat/completions",
+            "api_key": "sk-alpha-secret",
+            "model_patterns": ["gpt-*"]
+        }]
+    }));
+    let second = build(json!({
+        "enabled": true,
+        "providers": [{
+            "name": "beta",
+            "provider_type": "openai",
+            "endpoint": "https://beta.example.com/v1/chat/completions",
+            "api_key": "sk-beta-secret",
+            "model_patterns": ["gpt-*"]
+        }]
+    }));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(first), Arc::new(second)];
+    let (ctx, headers) = claimed_final_headers(&plugins, "gpt-4o", json_headers()).await;
+
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer sk-alpha-secret")
+    );
+    assert_no_value_anywhere(&headers, "sk-beta-secret");
+    assert_eq!(
+        ctx.metadata
+            .get("ai_stream_router.provider")
+            .map(String::as_str),
+        Some("alpha")
+    );
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("alpha.example.com")
+    );
+}
+
+#[tokio::test]
+async fn a_disabled_first_instance_lets_the_second_instance_claim() {
+    let disabled = build(json!({
+        "enabled": false,
+        "providers": [{
+            "name": "shared",
+            "provider_type": "openai",
+            "endpoint": "https://first.example.com/v1/chat/completions",
+            "api_key": "sk-first-secret",
+            "model_patterns": ["gpt-*"]
+        }]
+    }));
+    let enabled = build(json!({
+        "enabled": true,
+        "providers": [{
+            "name": "shared",
+            "provider_type": "openai",
+            "endpoint": "https://second.example.com/v1/chat/completions",
+            "api_key": "sk-second-secret",
+            "model_patterns": ["gpt-*"]
+        }]
+    }));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(disabled), Arc::new(enabled)];
+    let (ctx, headers) = claimed_final_headers(&plugins, "gpt-4o", json_headers()).await;
+
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer sk-second-secret")
+    );
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("second.example.com")
+    );
+}
+
+#[tokio::test]
+async fn a_nonmatching_first_instance_lets_the_second_instance_claim() {
+    let nonmatching = build(json!({
+        "enabled": true,
+        "fail_on_no_matching_provider": false,
+        "providers": [{
+            "name": "shared",
+            "provider_type": "openai",
+            "endpoint": "https://first.example.com/v1/chat/completions",
+            "api_key": "sk-first-secret",
+            "model_patterns": ["llama-*"]
+        }]
+    }));
+    let matching = build(json!({
+        "enabled": true,
+        "providers": [{
+            "name": "shared",
+            "provider_type": "openai",
+            "endpoint": "https://second.example.com/v1/chat/completions",
+            "api_key": "sk-second-secret",
+            "model_patterns": ["gpt-*"]
+        }]
+    }));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(nonmatching), Arc::new(matching)];
+    let (ctx, headers) = claimed_final_headers(&plugins, "gpt-4o", json_headers()).await;
+
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer sk-second-secret")
+    );
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("second.example.com")
+    );
+}
+
+#[tokio::test]
+async fn an_unclaimed_request_still_fails_on_no_matching_provider_in_plugin_order() {
+    // Ownership begins only on a successful claim: with nothing claimed, the
+    // first instance's fail-closed policy still decides the request.
+    let strict = build(json!({
+        "enabled": true,
+        "providers": [{
+            "name": "shared",
+            "provider_type": "openai",
+            "endpoint": "https://first.example.com/v1/chat/completions",
+            "api_key": "sk-first-secret",
+            "model_patterns": ["llama-*"]
+        }]
+    }));
+    let permissive = build(json!({
+        "enabled": true,
+        "providers": [{
+            "name": "other",
+            "provider_type": "openai",
+            "endpoint": "https://second.example.com/v1/chat/completions",
+            "api_key": "sk-second-secret",
+            "model_patterns": ["gpt-*"]
+        }]
+    }));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(strict), Arc::new(permissive)];
+
+    let body = streaming_request("gpt-4o");
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    let result = run_before_proxy_chain(&plugins, &mut ctx, &mut headers).await;
+    assert_eq!(
+        reject_status(&result),
+        Some(404),
+        "an unclaimed request keeps normal plugin-order fail-closed behavior"
+    );
+    assert!(ctx.route_override_backend_host.is_none());
+}
+
+#[test]
+fn shared_lifecycle_captures_the_backend_query_through_one_funnel() {
+    // The committed-query re-assertion lives inside
+    // `effective_backend_query_string*`, so it is only complete while both
+    // dispatch ladders capture their outbound query there and nowhere else.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let h1h2 = std::fs::read_to_string(root.join("src/proxy/mod.rs")).expect("read proxy/mod.rs");
+    let h3 =
+        std::fs::read_to_string(root.join("src/http3/server.rs")).expect("read http3/server.rs");
+
+    assert!(
+        h1h2.contains("effective_backend_query_string_with_raw(&ctx, &query_string)"),
+        "the H1/H2 ladder must capture its backend query through the shared funnel"
+    );
+    assert!(
+        h3.contains("effective_backend_query_string_with_raw(&ctx, &query_string)"),
+        "the native HTTP/3 ladder must capture its backend query through the shared funnel"
+    );
+}

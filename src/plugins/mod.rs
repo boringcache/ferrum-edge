@@ -1877,6 +1877,31 @@ pub(crate) struct ServerlessGrpcTerminateFrame {
     pub(crate) trailers: HashMap<String, String>,
 }
 
+/// What a direct-backend route override intends for the selected proxy's
+/// inherited `Proxy.dns_override` pin.
+///
+/// Narrow and reusable: any plugin that repoints a request at an endpoint it
+/// resolved itself (rather than at the operator's configured backend) can state
+/// `ClearInherited` so the pin cannot follow the request to a destination the
+/// operator never pinned. Default behavior is unchanged
+/// (`InheritProxy`), so ordinary same-host route rewrites keep their semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum RouteOverrideDnsPolicy {
+    /// Keep the proxy's `dns_override` unless the override changed the backend
+    /// host text. The historical behavior and the default for every route
+    /// rewriter that stays inside the operator's own backend.
+    #[default]
+    InheritProxy,
+    /// Drop the proxy's `dns_override` for this request even when the override
+    /// host text is byte-identical to the configured `backend_host`.
+    ///
+    /// Only meaningful alongside a DIRECT backend override (host / scheme /
+    /// port), which is the only shape that repoints the request away from the
+    /// operator's configured backend. On its own it is a no-op, so setting it
+    /// never changes an upstream-id route or a plain path/authority rewrite.
+    ClearInherited,
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -2683,6 +2708,32 @@ pub struct RequestContext {
     /// rewrites the forwarded `host` header to this value after `before_proxy`.
     /// `None` preserves the request's own authority.
     pub route_override_authority: Option<String>,
+    /// Whether a direct-backend route override also revokes the selected
+    /// proxy's inherited `Proxy.dns_override` pin.
+    ///
+    /// Host-text equality is not destination equality: an operator can pin a
+    /// proxy's `backend_host` to a fixed address with `dns_override`, and a
+    /// plugin that repoints the request at a THIRD-PARTY endpoint whose
+    /// hostname happens to equal that same text would otherwise keep dialing
+    /// the operator's pinned address while carrying the third party's
+    /// credential (`GHSA-xhp5-hqj8-3mwg`). A direct provider claim therefore
+    /// states its DNS intent explicitly instead of relying on host text having
+    /// changed.
+    ///
+    /// Kept `pub(crate)` and typed rather than published through metadata: it is
+    /// a routing decision, not observability, and no custom plugin should be
+    /// able to forge it.
+    pub(crate) route_override_dns_policy: RouteOverrideDnsPolicy,
+    /// Private, typed provider claim published by the winning `ai_stream_router`
+    /// instance (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// Holds the opaque owner identity plus the exact destination, TLS, DNS, and
+    /// backend-visible query this request was committed to at claim time. It is
+    /// deliberately NOT metadata: it carries a query string (which can contain
+    /// client secrets a transform relocated) and an ownership token that must
+    /// never be forgeable from configuration, logs, or a response. Its lifetime
+    /// is exactly this request context.
+    pub(crate) ai_stream_router_claim: Option<Box<ai_stream_router::AiStreamRouterClaim>>,
     /// In node-waypoint mesh topology, the Kubernetes pod UID resolved from
     /// the eBPF socket-cookie record at accept time. Set by the connection
     /// admit path alongside `peer_spiffe_id`; `None` for non-mesh
@@ -2903,6 +2954,8 @@ impl RequestContext {
             authorized_backend_path: None,
             route_override_path_is_absolute: false,
             route_override_authority: None,
+            route_override_dns_policy: RouteOverrideDnsPolicy::InheritProxy,
+            ai_stream_router_claim: None,
             node_waypoint_pod_uid: None,
             node_waypoint_policy_scope: None,
             mesh_direction: None,
@@ -3859,6 +3912,13 @@ impl RequestContext {
             authorized_backend_path: self.authorized_backend_path.clone(),
             route_override_path_is_absolute: self.route_override_path_is_absolute,
             route_override_authority: self.route_override_authority.clone(),
+            route_override_dns_policy: self.route_override_dns_policy,
+            // Carried, not dropped: `on_final_request_body` runs on this
+            // compatibility context and is where the provider claim's
+            // destination/TLS/DNS/query witness is verified and where instance
+            // ownership is decided (`GHSA-xhp5-hqj8-3mwg`). A dropped claim
+            // would silently skip the whole revalidation.
+            ai_stream_router_claim: self.ai_stream_router_claim.clone(),
             node_waypoint_pod_uid: self.node_waypoint_pod_uid,
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
             mesh_direction: self.mesh_direction,
@@ -4197,8 +4257,17 @@ impl RequestContext {
         let backend_port_changed = self
             .route_override_backend_port
             .is_some_and(|port| proxy.backend_port != port);
-        let dns_override_changed =
-            direct_backend_override && backend_host_changed && proxy.dns_override.is_some();
+        // A direct-backend override drops the proxy's pinned address when it
+        // moved the host text, and ALSO when the override explicitly revoked the
+        // pin. The explicit form is what keeps a same-host provider claim from
+        // dialing the operator's pinned address with a third-party credential
+        // (`GHSA-xhp5-hqj8-3mwg`); without it, `backend_host_changed` is `false`
+        // precisely in the case where the destination identity changed but the
+        // host text did not.
+        let dns_override_changed = direct_backend_override
+            && proxy.dns_override.is_some()
+            && (backend_host_changed
+                || self.route_override_dns_policy == RouteOverrideDnsPolicy::ClearInherited);
 
         let upstream_tls_override = if upstream_id_changed {
             self.route_override_upstream_id
@@ -4536,6 +4605,24 @@ impl RequestContext {
     #[inline]
     pub fn outbound_query_string(&self) -> Option<&str> {
         self.outbound_query_string.as_deref()
+    }
+
+    /// The exact backend-visible query a provider claim froze at claim time,
+    /// when this request is claimed (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// `Some("")` means "append nothing" — the committed target already carries
+    /// every query pair (an endpoint query folded into the absolute override
+    /// path), so a later generic query transform must not be able to append a
+    /// normal-backend secret to the third-party provider URL. `None` is the
+    /// ordinary unclaimed hot path: one `Option` test, no allocation.
+    ///
+    /// Never log this value. It is a query string, so a transform could have
+    /// relocated a credential into it.
+    #[inline]
+    pub(crate) fn committed_provider_query(&self) -> Option<&str> {
+        self.ai_stream_router_claim
+            .as_deref()
+            .map(ai_stream_router::AiStreamRouterClaim::committed_query)
     }
 
     /// Publish the transport's proof that the complete request body is empty.

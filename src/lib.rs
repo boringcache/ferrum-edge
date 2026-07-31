@@ -4316,6 +4316,18 @@ pub mod _test_support {
         crate::proxy::effective_backend_query_string(ctx).into_owned()
     }
 
+    /// The caller-held-raw-query variant the H1/H2 (`proxy/mod.rs`) and native
+    /// HTTP/3 (`http3/server.rs`) ladders actually capture once per request and
+    /// reuse for every retry attempt. Exposed so composition tests can assert
+    /// both funnels agree, including the provider-claim re-assertion
+    /// (`GHSA-xhp5-hqj8-3mwg`).
+    pub fn effective_backend_query_string_with_raw_for_test(
+        ctx: &crate::plugins::RequestContext,
+        raw_query: &str,
+    ) -> String {
+        crate::proxy::effective_backend_query_string_with_raw(ctx, raw_query).into_owned()
+    }
+
     pub fn collect_forwardable_websocket_headers_for_test(
         raw_headers: &hyper::HeaderMap,
         proxy_headers: &HashMap<String, String>,

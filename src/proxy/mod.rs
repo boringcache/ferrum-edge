@@ -32653,7 +32653,19 @@ pub(crate) fn query_string_after_plugin_strips<'a>(
 /// defense in depth for the no-transform path and any residual marked names.
 /// Ordinary no-transform / no-strip requests borrow the raw string with no
 /// allocation.
+///
+/// A provider claim (`ai_stream_router`, `GHSA-xhp5-hqj8-3mwg`) short-circuits
+/// both of these: it froze the exact safe backend-visible query at claim time,
+/// and every later generic query transform — which runs at a HIGHER priority
+/// than the claim and could otherwise append a normal-backend secret to the
+/// third-party provider URL — is discarded here. This is the single funnel
+/// through which the backend-visible query reaches H1/H2 dispatch, native H3
+/// dispatch, retry replay, and the replay/cache partition builders, so the
+/// re-assertion cannot be bypassed by adding a call site.
 pub(crate) fn effective_backend_query_string<'a>(ctx: &'a RequestContext) -> Cow<'a, str> {
+    if let Some(committed) = ctx.committed_provider_query() {
+        return Cow::Borrowed(committed);
+    }
     let base = match ctx.outbound_query_string() {
         Some(q) => q,
         None => ctx.raw_query_string().unwrap_or(""),
@@ -32671,6 +32683,9 @@ pub(crate) fn effective_backend_query_string_with_raw<'a>(
     ctx: &RequestContext,
     raw_query: &'a str,
 ) -> Cow<'a, str> {
+    if let Some(committed) = ctx.committed_provider_query() {
+        return Cow::Owned(committed.to_string());
+    }
     match ctx.outbound_query_string() {
         Some(query) => Cow::Owned(query_string_after_plugin_strips(ctx, query).into_owned()),
         None => query_string_after_plugin_strips(ctx, raw_query),

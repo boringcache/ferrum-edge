@@ -101,13 +101,34 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     (3000), so re-asserting here is what actually keeps a client or
     normal-backend credential off the third-party provider. Its matching
     fail-closed decision (final provider-visible `model` must still equal the
-    committed model AND match the selected provider's `model_patterns`; committed
-    `route_override_*` must still target the claimed provider) lives in
+    committed model AND match the selected provider's `model_patterns`; the
+    committed destination witness must be intact) lives in
     `on_final_request_body`, which has rejection plumbing on every dispatcher.
     A plugin declaring this capability may not be composed with
     `request_deduplication` (a before_proxy fingerprint cannot witness a later
     mutation). `response_caching` needs no added rule: it already refuses any
     deferred request-body transformer, which `ai_stream_router` is.
+    Headers are not the whole boundary. `ai_stream_router` records a PRIVATE
+    typed claim (`RequestContext::ai_stream_router_claim`) — never metadata,
+    never logged — carrying an opaque owning-instance identity plus the exact
+    committed destination, resolved backend TLS, DNS decision, and
+    backend-visible query. The committed query is replayed at
+    `crate::proxy::effective_backend_query_string*`, the single capture funnel
+    for H1/H2, native H3, and retry replay, so later `request_transformer` query
+    rules cannot append a normal-backend secret to a third-party URL. The
+    destination witness includes `route_override_upstream_id` (cleared at claim,
+    required to stay clear) and exact `route_override_resolved_tls` equality, not
+    just scheme/host/port/authority/path. A direct provider claim also sets
+    `RouteOverrideDnsPolicy::ClearInherited` so
+    `RequestContext::apply_route_overrides*` drops an inherited `dns_override`
+    even when the host TEXT is unchanged; the default `InheritProxy` keeps
+    ordinary same-host route semantics. Multiple same-type instances are allowed
+    and may share a provider NAME, so ownership — not the
+    `ai_stream_router.provider` metadata key — gates request transformation,
+    final header/query enforcement, final body revalidation, response-header
+    handling, and response stream inspector/normalizer selection. First matching
+    instance claims; `fail_on_missing_model` / `fail_on_no_matching_provider`
+    still decide an UNCLAIMED request in normal plugin order.
 6. `on_final_request_body`: body validator, gRPC-Web validation, WAF body rules, OpenAPI request schema (backend-final fallback), post-transform request-size ceiling, `ai_prompt_compressor` staged marker-sanitization rejection (4055), and `ai_semantic_cache` exact/semantic lookup (4057). `ai_semantic_cache` looks up here — not in `before_proxy` — so its replay partition binds the finalized outbound headers/query/destination and fully transformed request body, and a hit cannot bypass fail-closed final-body policy.
 6b. `dispatch_finalized_request_egress`: irreversible outbound request egress
     (`request_mirror`, `serverless_function`, `ai_federation`) over the immutable

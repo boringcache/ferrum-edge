@@ -95,11 +95,54 @@
 //!   after every `transform_request_body` hook and fails closed unless the
 //!   provider-visible `model` is still exactly the model that selected this
 //!   provider and still matches that provider's `model_patterns`. It also
-//!   re-checks that the committed route override still points at the claimed
-//!   provider, so the credential and the destination cannot drift apart.
+//!   re-checks the committed destination witness, so the credential and the
+//!   destination cannot drift apart.
 //!
 //! Both fail closed. Neither logs header values, credentials, or body bytes,
 //! and neither echoes the offending value into the client error envelope.
+//!
+//! ### What the claim actually commits
+//!
+//! The credential boundary is not just a header set. A claim commits, and the
+//! final boundary re-asserts or re-checks, ALL of:
+//!
+//! - **Headers** — the owned credential / gateway-identity / provider-protocol
+//!   set listed on [`apply_provider_boundary_headers`]. Headers OUTSIDE that
+//!   fixed set are deliberately untouched, so intended operator transforms still
+//!   reach the provider. Ferrum does not attempt to classify an arbitrary
+//!   unknown custom header as a credential; an operator who routes a bespoke
+//!   secret header to a normal backend must not also configure that rule on a
+//!   proxy that routes to a third-party provider.
+//! - **Query** — the exact backend-visible query, frozen at claim time and
+//!   replayed from private request state at
+//!   `crate::proxy::effective_backend_query_string*`, the single funnel every
+//!   dispatcher and retry attempt reads. `request_transformer` query rules run
+//!   later (3000) and could otherwise append a normal-backend static secret to
+//!   the provider URL.
+//! - **Destination** — scheme, host, port, authority, absolute path, AND the
+//!   routing identity: `route_override_upstream_id` is cleared at claim time and
+//!   must still be clear, so no load balancer can pick the dial target.
+//! - **Transport security** — the exact `route_override_resolved_tls` committed
+//!   at claim time, compared for equality (verification flag, SNI, CA, and mTLS
+//!   client materials). `None` means plaintext HTTP and is a distinct committed
+//!   state.
+//! - **DNS** — the claim revokes any inherited `Proxy.dns_override` through the
+//!   typed `RouteOverrideDnsPolicy::ClearInherited` route override, because a
+//!   same-host pin would otherwise send the provider credential to an operator
+//!   address instead of provider DNS.
+//! - **Instance ownership** — an opaque per-instance identity recorded in
+//!   private request state. Multiple `ai_stream_router` instances are allowed and
+//!   two of them may share a provider NAME while differing in endpoint, key,
+//!   provider type, patterns, and normalization. Exactly one instance claims;
+//!   every claim-dependent request and response hook (request transform, final
+//!   header policy, final body revalidation, response header handling, and
+//!   response stream inspector / normalizer selection) verifies ownership before
+//!   acting. Fail-on-missing-model / fail-on-no-matching-provider still decide an
+//!   UNCLAIMED request in normal plugin order; ownership begins only on a
+//!   successful claim.
+//!
+//! None of the claim state is metadata, and none of it is logged, serialized, or
+//! exported: it holds a query string and an ownership token.
 //!
 //! A second provider needs a different endpoint/authority, different
 //! credentials, a different backend TLS resolution, a different translated
@@ -118,6 +161,7 @@ use chrono::Utc;
 use percent_encoding::percent_decode_str;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 use url::{Host, Url};
 
@@ -208,11 +252,11 @@ const META_PROVIDER: &str = "ai_stream_router.provider";
 const META_PROVIDER_TYPE: &str = "ai_stream_router.provider_type";
 const META_MODEL: &str = "ai_stream_router.model";
 const META_NORMALIZED: &str = "ai_stream_router.normalized_response_stream";
-/// Backend path (including any folded endpoint query) the router committed for
-/// the claimed provider. Compared against the live `route_override_path` at the
-/// final request-body boundary so a later plugin cannot silently repoint the
-/// request while the provider credential stays installed (`GHSA-xhp5-hqj8-3mwg`).
-const META_ROUTE_PATH: &str = "ai_stream_router.committed_backend_path";
+// NOTE (`GHSA-xhp5-hqj8-3mwg`): the committed destination, TLS, DNS decision,
+// backend-visible query, and owning instance are deliberately NOT metadata keys.
+// They live in the private, typed `RequestContext::ai_stream_router_claim`, so a
+// later plugin cannot forge them, and a query string (which may hold a relocated
+// credential) never reaches a transaction log.
 const META_REQUEST_TRANSLATED: &str = "ai_stream_router.request_translated";
 /// Set when the translated Anthropic request carries `tool_choice: {"type":"none"}`.
 /// Request-local only: the response normalizer fails closed if the provider
@@ -347,6 +391,78 @@ pub struct AiStreamRouter {
     /// Precomputed config-time flag: does any provider need response-stream
     /// normalization (and is normalization enabled)?
     response_stream_hooks: bool,
+    /// Opaque per-INSTANCE owner identity (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// Multiple `ai_stream_router` instances may be effective on one proxy, and
+    /// two of them may legitimately carry the same `provider.name` while
+    /// pointing at different endpoints with different keys, different
+    /// `provider_type`s, and a different normalization decision. Public
+    /// metadata identifies only a provider NAME, so it cannot decide which
+    /// instance owns a claim. Every claim-dependent hook therefore matches this
+    /// value against the winner recorded in private request state instead.
+    ///
+    /// Never rendered into metadata, logs, configuration, OpenAPI, or a
+    /// response: it exists only to make ownership decidable inside the process.
+    owner_id: u64,
+}
+
+/// Source of [`AiStreamRouter::owner_id`] values. Monotonic and process-local;
+/// the value is opaque and never leaves the process.
+static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The private, typed provider claim recorded on [`RequestContext`] by the
+/// winning `ai_stream_router` instance (`GHSA-xhp5-hqj8-3mwg`).
+///
+/// This is the complete witness of what the credential was committed TO. The
+/// public `ai_stream_router.*` metadata keys stay what they always were —
+/// observability and cross-plugin coordination — and are deliberately not
+/// load-bearing here: a later plugin can write metadata, but it cannot reach
+/// this struct.
+///
+/// Nothing in it is ever logged, serialized, echoed, or exported. It holds a
+/// backend-visible query string, which a transform could have moved a
+/// credential into.
+#[derive(Clone)]
+pub(crate) struct AiStreamRouterClaim {
+    /// Which instance won the claim. Compared against
+    /// [`AiStreamRouter::owner_id`] by every claim-dependent hook.
+    owner: u64,
+    /// Index into the winning instance's own `providers`. An index rather than
+    /// a name so a later plugin rewriting `ai_stream_router.provider` metadata
+    /// cannot redirect credential injection or revalidation.
+    provider_index: usize,
+    /// Backend-visible destination committed at claim time.
+    scheme: BackendScheme,
+    host: String,
+    port: u16,
+    /// Absolute backend path, including any folded endpoint query.
+    path: String,
+    authority: String,
+    /// Exactly the `route_override_resolved_tls` this claim committed. `None`
+    /// is unambiguous: the committed destination is plaintext HTTP, which is
+    /// also pinned by `scheme`, so a later plugin cannot satisfy the witness by
+    /// clearing a committed HTTPS configuration.
+    resolved_tls: Option<BackendTlsConfig>,
+    /// The exact backend-visible query the dispatch layer may append. Empty
+    /// when the committed `path` already carries every pair.
+    committed_query: String,
+}
+
+impl AiStreamRouterClaim {
+    #[inline]
+    pub(crate) fn committed_query(&self) -> &str {
+        &self.committed_query
+    }
+}
+
+/// Deliberately opaque: `RequestContext` derives `Debug`, and a derived
+/// implementation here would print the committed backend-visible query (which a
+/// transform may have relocated a credential into) and the ownership token into
+/// any diagnostic that formats a request context.
+impl std::fmt::Debug for AiStreamRouterClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AiStreamRouterClaim(<redacted>)")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -499,16 +615,57 @@ impl AiStreamRouter {
             normalize_response_stream,
             providers,
             response_stream_hooks,
+            owner_id: NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 
-    /// First provider (in priority order) whose patterns match `model`.
-    fn select_provider(&self, model: &str) -> Option<&StreamProvider> {
-        self.providers.iter().find(|p| p.matches_model(model))
+    /// First provider (in priority order) whose patterns match `model`, with its
+    /// index for the private claim witness.
+    fn select_provider(&self, model: &str) -> Option<(usize, &StreamProvider)> {
+        self.providers
+            .iter()
+            .enumerate()
+            .find(|(_, p)| p.matches_model(model))
     }
 
-    fn provider_by_name(&self, name: &str) -> Option<&StreamProvider> {
-        self.providers.iter().find(|p| p.name == name)
+    /// The claim and provider THIS instance owns for `ctx`, or `None`.
+    ///
+    /// `None` covers three distinct cases that all mean "do nothing here":
+    /// the request was never claimed, another `ai_stream_router` instance won
+    /// the claim (it runs the identical enforcement from the same phase), or
+    /// this instance is disabled. Every claim-dependent request and response
+    /// hook goes through this one gate (`GHSA-xhp5-hqj8-3mwg`), so a second
+    /// instance can never re-inject its own credential, re-transform the body,
+    /// revalidate against its own model policy, or install a second response
+    /// normalizer.
+    fn owned_claim<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+    ) -> Option<(&'a AiStreamRouterClaim, &'a StreamProvider)> {
+        if !self.enabled {
+            return None;
+        }
+        let claim = ctx.ai_stream_router_claim.as_deref()?;
+        if claim.owner != self.owner_id {
+            return None;
+        }
+        // `provider_index` was recorded by this same instance, so the lookup
+        // cannot miss; `get` keeps it total rather than indexing.
+        let provider = self.providers.get(claim.provider_index)?;
+        Some((claim, provider))
+    }
+
+    /// Whether THIS instance owns the claim AND its selected provider's response
+    /// SSE must be normalized.
+    ///
+    /// Every response-side hook gates on this rather than on the public
+    /// `ai_stream_router.normalized_response_stream` marker, so a losing
+    /// instance cannot install a second normalizer over an already-normalized
+    /// stream (`GHSA-xhp5-hqj8-3mwg`).
+    fn normalizes_owned_response(&self, ctx: &RequestContext) -> bool {
+        self.owned_claim(ctx).is_some_and(|(_, provider)| {
+            provider.normalizes_response(self.normalize_response_stream)
+        })
     }
 }
 
@@ -1657,21 +1814,34 @@ fn openai_error_response(
     }
 }
 
-/// Whether the committed route override still points at the claimed provider.
+/// Whether the live route override is still byte-for-byte the destination the
+/// claim committed (`GHSA-xhp5-hqj8-3mwg`).
 ///
-/// The router writes every one of these fields when it claims a request, so a
-/// mismatch means another plugin rewrote the destination while this plugin's
-/// credential stayed installed. Only the destination identity is compared —
-/// the client query string is appended by the dispatch layer and is not part of
-/// the credential boundary.
-fn route_override_still_targets(ctx: &RequestContext, provider: &StreamProvider) -> bool {
-    ctx.route_override_backend_scheme == Some(provider.scheme)
-        && ctx.route_override_backend_port == Some(provider.port)
+/// A visible host/port match is NOT sufficient. Three things decide where the
+/// provider credential actually goes, and all three are compared here:
+///
+/// * the visible destination (scheme / host / port / authority / absolute path),
+/// * the routing identity — `route_override_upstream_id` must still be clear,
+///   because an upstream override hands target selection to a load balancer
+///   that can dial an address this claim never approved,
+/// * the resolved backend TLS — exact equality over verification, SNI, CA, and
+///   the mTLS client identity, so a later plugin cannot keep the same visible
+///   host while disabling verification, retargeting SNI, or attaching Ferrum's
+///   own client certificate to a third-party connection. `None` (plaintext) is a
+///   distinct committed state, not "unset".
+///
+/// The claim is a private typed struct, not serialized metadata, so none of
+/// these values can be forged by a plugin that can only write metadata.
+fn route_override_still_targets(ctx: &RequestContext, claim: &AiStreamRouterClaim) -> bool {
+    ctx.route_override_upstream_id.is_none()
+        && ctx.route_override_backend_scheme == Some(claim.scheme)
+        && ctx.route_override_backend_port == Some(claim.port)
         && ctx.route_override_path_is_absolute
-        && ctx.route_override_backend_host.as_deref() == Some(provider.host.as_str())
-        && ctx.route_override_authority.as_deref() == Some(provider.authority.as_str())
-        && ctx.route_override_path.as_deref()
-            == ctx.metadata.get(META_ROUTE_PATH).map(String::as_str)
+        && ctx.route_override_dns_policy == super::RouteOverrideDnsPolicy::ClearInherited
+        && ctx.route_override_backend_host.as_deref() == Some(claim.host.as_str())
+        && ctx.route_override_authority.as_deref() == Some(claim.authority.as_str())
+        && ctx.route_override_path.as_deref() == Some(claim.path.as_str())
+        && ctx.route_override_resolved_tls == claim.resolved_tls
 }
 
 /// Fail-closed envelope for a broken provider-boundary invariant. Fixed
@@ -1767,6 +1937,18 @@ impl Plugin for AiStreamRouter {
         if !self.enabled || ctx.method != "POST" {
             return PluginResult::Continue;
         }
+        // First claim wins (`GHSA-xhp5-hqj8-3mwg`). Multiple same-type instances
+        // are allowed, and two of them can match the same request. A second
+        // claim would reapply a different credential, repoint the destination
+        // under the first instance's already-installed key, translate the body
+        // twice, and install a second response normalizer. Yielding silently
+        // (rather than rejecting) also keeps `fail_on_missing_model` /
+        // `fail_on_no_matching_provider` meaningful: those decide an UNCLAIMED
+        // request in normal plugin order, and ownership only begins once some
+        // instance has actually claimed.
+        if ctx.ai_stream_router_claim.is_some() {
+            return PluginResult::Continue;
+        }
         let content_type = headers
             .get("content-type")
             .map(String::as_str)
@@ -1814,7 +1996,7 @@ impl Plugin for AiStreamRouter {
         };
 
         // Select a provider by model pattern + priority.
-        let Some(provider) = self.select_provider(&model) else {
+        let Some((provider_index, provider)) = self.select_provider(&model) else {
             if self.fail_on_no_matching_provider {
                 return openai_error_response(
                     404,
@@ -1880,6 +2062,26 @@ impl Plugin for AiStreamRouter {
         // every client parameter for strip — otherwise the forwarded URL would
         // contain a second `?`. Endpoints without a query keep the normal
         // client-query forwarding untouched.
+        // The exact backend-visible query the dispatch layer may append to the
+        // committed target, frozen HERE and re-asserted at every later capture
+        // point (`GHSA-xhp5-hqj8-3mwg`). `request_transformer` runs at 3000 —
+        // after this claim — and its query rules could otherwise append a
+        // normal-backend static secret to the third-party provider URL.
+        //
+        // Two cases, both preserving the pre-existing semantics:
+        //  * an endpoint query is folded into the absolute override path below,
+        //    and every client pair is marked consumed, so the separately
+        //    appended query is committed EMPTY;
+        //  * otherwise the already-safe client query continues — the canonical
+        //    backend-visible query as of this moment, which is the raw wire
+        //    query (or an earlier plugin's published outbound query) after the
+        //    authentication-owned strip markers.
+        let committed_query = if provider.endpoint_query.is_some() {
+            String::new()
+        } else {
+            crate::proxy::effective_backend_query_string(ctx).into_owned()
+        };
+
         if let Some(endpoint_query) = provider.endpoint_query.as_deref() {
             let endpoint_query = if provider.path_has_model_placeholder {
                 endpoint_query.replace("{model}", &model)
@@ -1913,6 +2115,19 @@ impl Plugin for AiStreamRouter {
         ctx.route_override_path = Some(backend_path.clone());
         ctx.route_override_path_is_absolute = true;
         ctx.route_override_authority = Some(provider.authority.clone());
+        // This claim commits a DIRECT provider endpoint, never an upstream /
+        // load-balancer identity. Clear any upstream override an earlier plugin
+        // set: leaving one in place would let a load balancer choose the actual
+        // dial target while this plugin's provider credential is installed, and
+        // the final boundary requires it to still be clear
+        // (`GHSA-xhp5-hqj8-3mwg`).
+        ctx.route_override_upstream_id = None;
+        // The provider host must resolve through provider DNS. A `dns_override`
+        // on the selected proxy pins a fixed address, and the generic
+        // "host text changed" rule does not clear it when the configured proxy
+        // host happens to equal the provider host — exactly the case where the
+        // destination identity changed but the text did not.
+        ctx.route_override_dns_policy = super::RouteOverrideDnsPolicy::ClearInherited;
         // Default: public providers verify against the system trust store.
         // `inherit_backend_tls: true` carries the current proxy's resolved
         // backend TLS (custom CA / SNI policy / backend mTLS client cert) to
@@ -1926,6 +2141,12 @@ impl Plugin for AiStreamRouter {
             } else {
                 Some(BackendTlsConfig::default_verify())
             };
+        } else {
+            // Plaintext HTTP provider: no committed TLS configuration at all.
+            // Pinned explicitly so the witness below cannot be satisfied by a
+            // later plugin ADDING one (which would change SNI/verification for
+            // a destination this claim never negotiated TLS with).
+            ctx.route_override_resolved_tls = None;
         }
 
         // --- Rewrite headers: strip client credentials, insert provider auth. ---
@@ -1935,6 +2156,26 @@ impl Plugin for AiStreamRouter {
         // later generic header transform (`GHSA-xhp5-hqj8-3mwg`).
         let normalizes = provider.normalizes_response(self.normalize_response_stream);
         apply_provider_boundary_headers(provider, normalizes, headers);
+
+        // --- Private claim: the complete witness of what was committed. ---
+        // Everything the credential boundary depends on lives here, in typed
+        // request-private state, and nowhere in public metadata: the owning
+        // instance, the provider it selected, the destination identity, the
+        // resolved backend TLS, and the backend-visible query
+        // (`GHSA-xhp5-hqj8-3mwg`). `on_final_request_body_with_context` requires
+        // every one of them to be unchanged before the request is dispatched.
+        let committed_tls = ctx.route_override_resolved_tls.clone();
+        ctx.ai_stream_router_claim = Some(Box::new(AiStreamRouterClaim {
+            owner: self.owner_id,
+            provider_index,
+            scheme: provider.scheme,
+            host: provider.host.clone(),
+            port: provider.port,
+            path: backend_path,
+            authority: provider.authority.clone(),
+            resolved_tls: committed_tls,
+            committed_query,
+        }));
 
         // --- Metadata (observability + downstream-hook coordination). ---
         ctx.metadata
@@ -1965,11 +2206,6 @@ impl Plugin for AiStreamRouter {
             provider.provider_type.as_str().to_string(),
         );
         ctx.metadata.insert(META_MODEL.to_string(), model);
-        // Witness for the final boundary: the exact backend path this claim
-        // committed, so a later plugin cannot repoint the request inside the
-        // provider's credential boundary without being detected.
-        ctx.metadata
-            .insert(META_ROUTE_PATH.to_string(), backend_path);
         ctx.metadata
             .insert(META_NORMALIZED.to_string(), normalizes.to_string());
         // No `ai_stream_router.fallback_attempts` key: this plugin never
@@ -1993,14 +2229,14 @@ impl Plugin for AiStreamRouter {
         _content_type: Option<&str>,
         _request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        if !self.enabled || ctx.metadata.get(META_CLAIMED).map(String::as_str) != Some("true") {
-            return None;
-        }
-        let provider_name = ctx.metadata.get(META_PROVIDER)?;
-        let provider = self.provider_by_name(provider_name)?;
+        // Only the instance that won the claim transforms the body. A second
+        // instance running this hook would translate an already-translated
+        // representation, or re-inject usage options into another provider's
+        // body (`GHSA-xhp5-hqj8-3mwg`).
+        let provider_type = self.owned_claim(ctx)?.1.provider_type;
         let model = ctx.metadata.get(META_MODEL)?.clone();
 
-        match provider.provider_type {
+        match provider_type {
             ProviderType::Anthropic => {
                 let openai_body: Value = serde_json::from_slice(body).ok()?;
                 let translated = translate_to_anthropic(&openai_body, &model).ok()?;
@@ -2039,23 +2275,17 @@ impl Plugin for AiStreamRouter {
     /// credential afterwards. The gateway calls this at every point where the
     /// outbound header map is complete, so the last word is always this policy
     /// rather than whichever plugin happened to run last.
+    ///
+    /// Ownership is decided by the private claim, never by the public
+    /// `ai_stream_router.provider` metadata key: two instances may carry the
+    /// same provider NAME with different endpoints and different keys, so a
+    /// name match would let the losing instance install the wrong credential.
     fn enforce_final_backend_header_policy(
         &self,
         ctx: &RequestContext,
         headers: &mut HashMap<String, String>,
     ) {
-        if !self.enabled || ctx.metadata.get(META_CLAIMED).map(String::as_str) != Some("true") {
-            return;
-        }
-        let provider = ctx
-            .metadata
-            .get(META_PROVIDER)
-            .and_then(|name| self.provider_by_name(name));
-        let Some(provider) = provider else {
-            // The claim names a provider this instance does not own, so a
-            // second effective `ai_stream_router` instance made it and will
-            // enforce its own boundary from this same pass. Re-applying THIS
-            // instance's credential here would install the wrong key.
+        let Some((_, provider)) = self.owned_claim(ctx) else {
             return;
         };
         let normalizes = provider.normalizes_response(self.normalize_response_stream);
@@ -2076,21 +2306,24 @@ impl Plugin for AiStreamRouter {
         _headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.enabled || ctx.metadata.get(META_CLAIMED).map(String::as_str) != Some("true") {
-            return PluginResult::Continue;
-        }
-
-        let provider = ctx
-            .metadata
-            .get(META_PROVIDER)
-            .and_then(|name| self.provider_by_name(name));
-        let Some(provider) = provider else {
-            // Not this instance's claim — a second effective `ai_stream_router`
-            // owns it and runs the identical revalidation from this same phase.
-            return PluginResult::Continue;
+        // Ownership and the destination witness both come from the private
+        // claim. Read them in one scope so the shared duplicate-key memo below
+        // can still take the context mutably.
+        let (provider_index, provider_is_anthropic, destination_intact) = {
+            // Not this instance's claim — either the request was never claimed,
+            // or a second effective `ai_stream_router` owns it and runs the
+            // identical revalidation from this same phase.
+            let Some((claim, provider)) = self.owned_claim(ctx) else {
+                return PluginResult::Continue;
+            };
+            (
+                claim.provider_index,
+                provider.provider_type == ProviderType::Anthropic,
+                route_override_still_targets(ctx, claim),
+            )
         };
 
-        if provider.provider_type == ProviderType::Anthropic
+        if provider_is_anthropic
             && ctx
                 .metadata
                 .get(META_REQUEST_TRANSLATED)
@@ -2107,8 +2340,14 @@ impl Plugin for AiStreamRouter {
         }
 
         // The credential installed at the boundary is only safe if it is still
-        // going to the destination that claimed it.
-        if !route_override_still_targets(ctx, provider) {
+        // going to the destination that claimed it — same visible endpoint, no
+        // upstream/load-balancer identity, byte-identical backend TLS, and the
+        // provider-DNS decision intact. The backend-visible QUERY needs no check
+        // here: it is not read from the context at dispatch but re-asserted from
+        // the claim at the single capture funnel
+        // (`crate::proxy::effective_backend_query_string*`), which every
+        // dispatcher and every retry attempt goes through.
+        if !destination_intact {
             return provider_policy_violation(
                 "The routed AI provider destination changed after provider selection",
             );
@@ -2125,9 +2364,16 @@ impl Plugin for AiStreamRouter {
             );
         }
 
-        let Some(committed_model) = ctx.metadata.get(META_MODEL) else {
+        let Some(committed_model) = ctx.metadata.get(META_MODEL).cloned() else {
             return provider_policy_violation(
                 "The routed AI model could not be revalidated before dispatch",
+            );
+        };
+        // Recorded by this same instance at claim time, so the lookup cannot
+        // miss; fail closed rather than indexing.
+        let Some(provider) = self.providers.get(provider_index) else {
+            return provider_policy_violation(
+                "The routed AI provider could not be revalidated before dispatch",
             );
         };
 
@@ -2150,7 +2396,7 @@ impl Plugin for AiStreamRouter {
         // `{model}` endpoints) baked into the backend URL; the pattern re-check
         // proves the surviving value is still inside this provider's configured
         // policy rather than merely unchanged.
-        if final_model != committed_model.as_str() || !provider.matches_model(final_model) {
+        if final_model != committed_model || !provider.matches_model(final_model) {
             return model_policy_violation(
                 "The final AI provider request model does not match the routed model policy",
             );
@@ -2160,11 +2406,11 @@ impl Plugin for AiStreamRouter {
     }
 
     fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
-        // Force the reqwest streaming path only for claimed requests whose SSE
-        // will be normalized, so the response-stream inspector is guaranteed to
-        // be wired. Requests we pass through unchanged stay on the fast path.
-        self.response_stream_hooks
-            && ctx.metadata.get(META_NORMALIZED).map(String::as_str) == Some("true")
+        // Force the reqwest streaming path only for requests THIS instance
+        // claimed and whose SSE it will normalize, so the response-stream
+        // inspector is guaranteed to be wired. Requests we pass through
+        // unchanged stay on the fast path.
+        self.response_stream_hooks && self.normalizes_owned_response(ctx)
     }
 
     fn response_stream_inspector(
@@ -2176,7 +2422,12 @@ impl Plugin for AiStreamRouter {
         if !self.response_stream_hooks {
             return None;
         }
-        if ctx.metadata.get(META_NORMALIZED).map(String::as_str) != Some("true") {
+        // Ownership, not the public `normalized_response_stream` marker: two
+        // instances can disagree on `normalize_response_stream` and on provider
+        // type, and only the winner's decision may install a normalizer
+        // (`GHSA-xhp5-hqj8-3mwg`). Double normalization would re-parse already
+        // OpenAI-shaped SSE as if it were provider-native.
+        if !self.normalizes_owned_response(ctx) {
             return None;
         }
         // Only normalize a successful event stream; a non-2xx/non-SSE body is an
@@ -2213,7 +2464,7 @@ impl Plugin for AiStreamRouter {
         if !self.response_stream_hooks {
             return None;
         }
-        if ctx.metadata.get(META_NORMALIZED).map(String::as_str) != Some("true") {
+        if !self.normalizes_owned_response(ctx) {
             return None;
         }
         // Match the streaming normalizer: provider error envelopes reach the
@@ -2277,7 +2528,7 @@ impl Plugin for AiStreamRouter {
         response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.enabled || ctx.metadata.get(META_NORMALIZED).map(String::as_str) != Some("true") {
+        if !self.normalizes_owned_response(ctx) {
             return PluginResult::Continue;
         }
         if !(200..300).contains(&response_status) {
@@ -2360,10 +2611,19 @@ fn strip_gateway_identity_assertions(headers: &mut HashMap<String, String>) {
 /// (`enforce_final_backend_header_policy`) after every later generic header
 /// transform. It is idempotent, allocation-light, and never logs a value.
 ///
-/// Everything a client or a normal-backend rule could use to authenticate is
-/// removed first, so no credential other than the selected provider's own key
-/// can survive to egress. Headers outside this owned set are left untouched —
-/// intended, non-credential operator transforms still reach the provider.
+/// The owned set is FIXED and closed: the standard client/proxy credential and
+/// session headers ([`strip_client_credentials`]), the gateway's own consumer /
+/// geo assertions ([`strip_gateway_identity_assertions`]), and the provider
+/// protocol headers installed below (`host`, `content-type`, `accept`, the
+/// provider credential header, `anthropic-version`, and `accept-encoding` when
+/// normalizing).
+///
+/// Headers outside that set are left untouched, so intended non-credential
+/// operator transforms still reach the provider. This is a deliberate limit, not
+/// an omission: Ferrum cannot decide that an arbitrary unknown custom header
+/// carries a secret, so a bespoke normal-backend credential header configured on
+/// the same proxy WILL still be forwarded. Do not configure such a rule on a
+/// proxy that routes to a third-party provider.
 fn apply_provider_boundary_headers(
     provider: &StreamProvider,
     normalizes_response: bool,

@@ -312,6 +312,39 @@ already refused by its deferred-request-body-transformer rule, and its lookup
 population (GET/HEAD with a transport-proven empty upload) cannot overlap a POST
 JSON claim.
 
+### The rest of the provider boundary
+
+Headers are only one of the things a later plugin can move. `ai_stream_router`
+therefore records a private, typed claim on the request context — never metadata
+— holding an opaque owning-instance identity plus the exact destination,
+resolved backend TLS, DNS decision, and backend-visible query it committed:
+
+- The committed **query** is replayed at
+  `crate::proxy::effective_backend_query_string*`, the single funnel every
+  dispatcher and every retry attempt reads, so a later generic query transform
+  cannot append a normal-backend secret to the third-party URL.
+- The committed **destination** witness includes `route_override_upstream_id`
+  (cleared at claim, required to stay clear) and `route_override_resolved_tls`
+  (exact equality), not just scheme/host/port/authority/path — otherwise a later
+  plugin could keep the visible host while changing load-balancer identity or
+  weakening server verification, SNI, or mTLS.
+- A direct provider claim sets `RouteOverrideDnsPolicy::ClearInherited`, a narrow
+  typed route-override knob honored by
+  `RequestContext::apply_route_overrides*`. The generic rule only drops a
+  proxy's `dns_override` when the override changed the backend host *text*,
+  which is `false` exactly when the configured proxy host already equals the
+  selected provider host. Ordinary same-host route rewrites are unaffected: the
+  default policy is `InheritProxy`.
+- **Instance ownership** makes multiple same-type instances safe. Two instances
+  may share a provider name while differing in endpoint, key, provider type,
+  patterns, and normalization, so a name in public metadata cannot decide who
+  owns a claim. The first matching instance claims; later instances leave the
+  route, credential, and body claim alone; and every claim-dependent request and
+  response hook checks the private owner before acting.
+
+`on_final_request_body` fails closed on any drift in that witness with a
+fixed-cardinality envelope that echoes no offending value.
+
 ## Finalized Request Egress
 
 Irreversible outbound request egress is its own phase (advisory
