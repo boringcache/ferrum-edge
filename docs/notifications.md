@@ -186,7 +186,7 @@ Authenticated `/metrics` exports these families, labeled only by the fixed `chan
 
 | Metric | Type | Meaning |
 |--------|------|---------|
-| `ferrum_notification_delivery_attempted_total` | counter | Tasks admitted past the semaphore |
+| `ferrum_notification_delivery_attempted_total` | counter | Tasks whose registry-owned delivery body actually started (one count per delivery task, not per retry) |
 | `ferrum_notification_delivery_succeeded_total` | counter | Final success (after retries) |
 | `ferrum_notification_delivery_failed_transient_total` | counter | Exhausted retries on transient failures |
 | `ferrum_notification_delivery_failed_permanent_total` | counter | Permanent failures |

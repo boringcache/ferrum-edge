@@ -30,8 +30,8 @@
 //! always rolled back.
 
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use tokio::sync::Notify;
 
@@ -172,14 +172,17 @@ impl DispatchGeneration {
         }
         let wait = async {
             loop {
-                // Construct the notification future before checking the
-                // counters so a zero transition cannot land between the check
-                // and waiter registration.
+                // Register the waiter (via `Notified::enable`) *before*
+                // re-reading drain state so a zero transition cannot be lost —
+                // `notify_waiters` retains no permit for a future that has only
+                // been constructed but not yet registered.
                 let notified = self.drained.notified();
+                tokio::pin!(notified);
+                let _ = notified.as_mut().enable();
                 if self.is_drained() {
                     return true;
                 }
-                notified.await;
+                notified.as_mut().await;
             }
         };
         matches!(tokio::time::timeout(timeout, wait).await, Ok(true))
@@ -247,26 +250,33 @@ impl DispatchGeneration {
             on_settle,
             settled: AtomicBool::new(false),
             attempt_started: AtomicBool::new(false),
+            delivery_context: OnceLock::new(),
         });
         let guard = DeliveryTaskGuard {
             settlement: Arc::clone(&settlement),
         };
-        let admitted = crate::observability_delivery::spawn_terminal({
+        let admitted = crate::observability_delivery::spawn_terminal_with_context({
             let generation = Arc::clone(&generation);
             let settlement = Arc::clone(&settlement);
-            async move {
-                // First statement of the task body: the registry actually ran
-                // us. This is what makes the drop classification deterministic
-                // rather than a race against the spawning thread — a task the
-                // registry rejected can never reach this line, so an unsettled
-                // drop before it is unambiguously a registry rejection.
-                settlement.mark_attempt_started();
-                let settle = if generation.is_cancelled() {
-                    DispatchSettle::Abandoned(AbandonReason::GenerationRetired)
-                } else {
-                    future.await
-                };
-                guard.settle(settle);
+            move |ctx| {
+                // Bind classification to the exact lifecycle this spawn admits
+                // against. A later slot replacement must not reclassify A's
+                // hard abort using B's non-cancelling current generation.
+                let _ = settlement.delivery_context.set(ctx);
+                async move {
+                    // First statement of the task body: the registry actually ran
+                    // us. This is what makes the drop classification deterministic
+                    // rather than a race against the spawning thread — a task the
+                    // registry rejected can never reach this line, so an unsettled
+                    // drop before it is unambiguously a registry rejection.
+                    settlement.mark_attempt_started();
+                    let settle = if generation.is_cancelled() {
+                        DispatchSettle::Abandoned(AbandonReason::GenerationRetired)
+                    } else {
+                        future.await
+                    };
+                    guard.settle(settle);
+                }
             }
         });
 
@@ -328,6 +338,10 @@ struct DeliveryTaskSettlement {
     /// never ran the task, so `attempted`/`in_flight` were never reserved and
     /// an unsettled drop is a rejection rather than an abandoned attempt.
     attempt_started: AtomicBool,
+    /// Exact observability lifecycle this task was admitted against. Populated
+    /// by the context-bearing spawn factory; absent only when that factory
+    /// never ran (should not happen for the notification spawn path).
+    delivery_context: OnceLock<crate::observability_delivery::DeliveryTaskContext>,
 }
 
 impl DeliveryTaskSettlement {
@@ -344,8 +358,14 @@ impl DeliveryTaskSettlement {
     fn drop_reason(&self) -> AbandonReason {
         if !self.attempt_started.load(Ordering::Acquire) {
             // The registry refused or aborted the task before its body ran.
+            // Pre-attempt rejection wins even if the captured lifecycle is
+            // already cancelling at its deadline.
             AbandonReason::RegistryRejected
-        } else if crate::observability_delivery::is_aborting_at_deadline() {
+        } else if self
+            .delivery_context
+            .get()
+            .is_some_and(|ctx| ctx.is_aborting_at_deadline())
+        {
             AbandonReason::ShutdownDeadline
         } else {
             AbandonReason::TaskDropped
@@ -430,9 +450,8 @@ impl Drop for DeliveryTaskGuard {
     fn drop(&mut self) {
         // Unsettled drop: classify precisely instead of blanket-charging the
         // shutdown-deadline counter. `drop_reason` distinguishes a registry
-        // rejection (task body never ran), a hard abort while the process
-        // delivery registry is cancelling at its drain deadline, and any other
-        // dropped task.
+        // rejection (task body never ran), a hard abort on the exact lifecycle
+        // this task was admitted against, and any other dropped task.
         let reason = self.settlement.drop_reason();
         self.settlement.settle(DispatchSettle::Abandoned(reason));
     }
