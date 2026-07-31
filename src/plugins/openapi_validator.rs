@@ -1115,9 +1115,14 @@ impl Plugin for OpenapiValidator {
         super::priority::OPENAPI_VALIDATOR
     }
 
-    /// This plugin's enforcement decision is taken in the final request-body
-    /// phase, over the exact backend-visible representation. Composition
-    /// admission refuses to pair it with a plugin that egresses the request
+    /// The request contract is normally decided in
+    /// `validate_client_request_body_contract`, over the original client
+    /// representation (`GHSA-896v-jx23-9g6p`). This declaration is about the
+    /// phase that remains: `on_final_request_body` is still a backend-contract
+    /// fallback that can reject the exact backend-visible representation when
+    /// this instance did not decide in the client phase, and the response side
+    /// always decides over the final body. Composition admission therefore
+    /// still refuses to pair this plugin with one that egresses the request
     /// before finalization (GHSA-4vr5-4wm3-x5xv).
     fn enforces_finalized_request_policy(&self) -> bool {
         true
