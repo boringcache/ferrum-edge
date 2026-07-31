@@ -3278,8 +3278,9 @@ pub(crate) const CLIENT_REQUEST_CONTRACT_PHASE: &str = "validate_client_request_
 /// not decide again there (`GHSA-896v-jx23-9g6p`).
 ///
 /// `headers`/`body` are passed immutably: this phase admits or rejects, it never
-/// rewrites. Callers reach it only when the body was actually prebuffered, so a
-/// streaming request pays nothing.
+/// rewrites. Callers pass either an owned prebuffered body or explicit `&[]`
+/// after transport end-of-stream plus method/framing proof; arbitrary unread
+/// streaming bodies still never enter this phase or pay collection cost.
 pub(crate) async fn apply_client_request_contract_validation(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,

@@ -162,10 +162,13 @@ async fn openapi_client_contract_rejects_empty_bodyless_methods_on_h1_h2_h3() {
                 "{protocol} {method}: an empty body must fail the declared request_required \
                  contract; 200 means the request was forwarded unvalidated"
             );
-            // The declared schema requires exactly the property the configured
-            // `request_transformer` body rule injects. Reaching the transformer
-            // first would therefore admit the request, so a 400 also proves the
-            // client contract is decided before any body-transform hook.
+            // The client did not send `x-post-client-contract-bypass`. If H1/H2
+            // skipped the client phase, `before_proxy` would add that header and
+            // the later backend-final decision would bypass and forward 200. The
+            // empty body itself is not transformed (`apply_body_rules` returns
+            // `None` for an empty body), so the asserted 400 plus no backend
+            // request proves the client contract ran before `before_proxy` and,
+            // transitively, before any final body transform.
             assert!(
                 harness
                     .no_backend_request_for("/audits", Duration::from_millis(300))
@@ -463,6 +466,7 @@ fn contract_config(backend_port: u16) -> String {
                     "schema_draft": "draft7",
                     "validate_response": false,
                     "fail_on_unknown_operation": false,
+                    "bypass": {"header_present": {"x-post-client-contract-bypass": null}},
                     "operations": [
                         {
                             "method": "POST",
@@ -484,10 +488,10 @@ fn contract_config(backend_port: u16) -> String {
                             }
                         },
                         // Body-less methods that the imported document declares a
-                        // required request body for. The schema requires exactly
-                        // the property the configured transformer injects, so an
-                        // enforcement point placed after body transforms would
-                        // admit these requests instead of rejecting them.
+                        // required request body for. The configured transformer
+                        // adds `x-post-client-contract-bypass` in `before_proxy`;
+                        // if the client phase were skipped, that header would make
+                        // the backend-final validator bypass and forward 200.
                         {
                             "method": "GET",
                             "path_template": "/audits",
@@ -549,12 +553,20 @@ fn contract_config(backend_port: u16) -> String {
                 "proxy_id": "openapi-client-contract",
                 "enabled": true,
                 "config": {
-                    "rules": [{
-                        "target": "body",
-                        "operation": "add",
-                        "key": "client_attestation",
-                        "value": "gateway-synthesized"
-                    }]
+                    "rules": [
+                        {
+                            "operation": "add",
+                            "target": "header",
+                            "key": "x-post-client-contract-bypass",
+                            "value": "bypass"
+                        },
+                        {
+                            "target": "body",
+                            "operation": "add",
+                            "key": "client_attestation",
+                            "value": "gateway-synthesized"
+                        }
+                    ]
                 }
             }
         ]
