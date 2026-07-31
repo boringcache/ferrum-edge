@@ -48,12 +48,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ai_rate_limiter` pre-dispatch prompt reservation no longer under-counts billed
   prompt text when a recognized field is present (GHSA-2r5g-438w-85hr). The
   estimator walks the already-parsed request JSON once and sums billable string
-  values together with visited object member names (including nested tool /
-  function JSON Schema property names), so sibling instructions and schema keys
-  cannot be omitted from the reservation. Token-cap fields, multimodal binary /
-  `source` / data-URL payloads (and member names under those skipped subtrees),
-  and configured request-token budgets retain their prior exclusions. The walk
-  remains a conservative `chars/4` heuristic, not provider tokenizer parity.
+  values, visited object member names (including nested tool / function JSON
+  Schema property names), and JSON scalar literals (`null` / booleans / numbers
+  at serialized width), so sibling instructions, schema keys, and schema scalars
+  cannot be omitted from the reservation. Exclusions are shape/value aware —
+  numeric token-cap controls, structurally recognized multimodal binary /
+  Anthropic `source` (`type` `base64`/`url`/`file`) / data-URL payloads (and
+  member names under those skipped subtrees), not arbitrary member-name matches —
+  so a tool-schema property that merely reuses a reserved spelling still
+  contributes. The walk remains a conservative `chars/4` heuristic, not provider
+  tokenizer parity.
 - Irreversible request egress no longer precedes request-body transformation or
   final request policy (GHSA-4vr5-4wm3-x5xv). `request_mirror` and
   `serverless_function` previously ran their external dispatch in

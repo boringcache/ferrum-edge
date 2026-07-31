@@ -1272,46 +1272,55 @@ fn estimate_prompt_tokens(json: &Value) -> u64 {
 /// # Estimator contract
 ///
 /// Walks the already-parsed request JSON once via [`prompt_json_character_count`],
-/// counting every billable string value **and** every visited object member name
-/// exactly once. Providers tokenize tool/function JSON Schema property names and
-/// nested schema keys as prompt input, so omitting member names under-reserves.
-/// The single pass covers known billed shapes and unknown provider-native
-/// textual siblings alike — a present recognized field never suppresses an
-/// unknown sibling, and distinct alias keys over-reserve rather than omit.
-/// Token-cap fields, multimodal binary/base64 subtrees, binary Anthropic
-/// `source` blocks, and well-formed `data:` URLs remain excluded (member names
-/// inside skipped subtrees are not counted). This is a conservative chars/4
-/// estimate, not provider tokenizer parity.
+/// counting every billable string value, every visited object member name, and
+/// JSON scalar literals (`null` / `true` / `false` / numbers) at their serialized
+/// widths. Providers tokenize tool/function JSON Schema property names, nested
+/// schema keys, and schema scalar keywords as prompt input, so omitting them
+/// under-reserves. The single pass covers known billed shapes and unknown
+/// provider-native textual siblings alike — a present recognized field never
+/// suppresses an unknown sibling, and distinct alias keys over-reserve rather
+/// than omit.
+///
+/// Exclusions are **shape/value aware**, not name-only: numeric provider
+/// token-cap controls, structurally recognized multimodal binary payloads
+/// (OpenAI image/audio/file parts, Gemini inline data, well-formed `data:` URLs,
+/// Anthropic `source` with `type` `base64`/`url`/`file`), and member names inside
+/// those skipped subtrees stay excluded. A coincidental schema property named
+/// `max_tokens`, `image_url`, `source`, etc. whose value is not a recognized
+/// control/binary shape is counted fail-closed (name + billed descendants).
+/// This is a conservative chars/4 estimate, not provider tokenizer parity.
 ///
 /// The hot path is allocation-light: no cloning, locks, or per-request key sets;
 /// recursion follows the `Value` tree the caller already parsed (bounded by the
-/// gateway's request-body limits).
+/// gateway's request-body limits). Non-integer JSON numbers may format once via
+/// `Number::to_string` (bounded by the already-parsed token).
 fn prompt_character_count(json: &Value) -> u64 {
     prompt_json_character_count(json)
 }
 
-/// Object keys whose values carry binary/non-text payloads (base64 image,
+/// Object keys whose values *may* carry binary/non-text payloads (base64 image,
 /// audio, file, or document bytes) in the common multimodal request shapes.
 /// Counting those bytes as prompt characters wildly inflates the estimate — a
 /// 1 MB image is ~1.37 M base64 chars (~340k "tokens" at chars/4), which would
 /// deny a vision request with a `429` *before* it is ever proxied, and a
 /// pre-proxy reject never reconciles, so the bogus estimate is never corrected.
 /// Image/audio inputs actually cost a small fixed number of tokens, not
-/// `bytes/4`, so we skip these subtrees entirely (including nested member names)
-/// and rely on the text-bearing parts plus the requested output cap for the
-/// estimate.
+/// `bytes/4`, so recognized binary *payload shapes* under these keys are skipped
+/// entirely (including nested member names). The key spelling alone is never
+/// enough: a tool-schema property that reuses one of these names must still have
+/// its name and textual descendants counted.
 ///
-/// Covered shapes:
+/// Recognized payload shapes (see [`value_is_binary_content_payload`]):
 /// - OpenAI vision part: `{"type":"image_url","image_url":{"url":"data:..."}}`
+///   or `image_url` as a data/http(s) URL string
 /// - OpenAI audio part: `{"type":"input_audio","input_audio":{"data":"..."}}`
 /// - OpenAI file part: `{"type":"file","file":{"file_data":"..."}}`
 /// - Google inline data: `{"inline_data":{"data":"..."}}` / `inlineData`
 ///
-/// Anthropic's `source` block is handled separately (see `source_is_text_document`)
-/// because it is binary for image/PDF documents but carries prose for a *text*
-/// document (`source:{type:"text",media_type:"text/plain",data:"<prose>"}`); that
-/// prose is real prompt input and must be counted, so `source` is not a blanket
-/// skip key.
+/// Anthropic's `source` block is handled separately (see
+/// [`source_is_recognized_binary_document`]): binary `type` values
+/// (`base64`/`url`/`file`) are skipped; `type:"text"` text documents and any
+/// unrecognized/schema-shaped object are counted fail-closed.
 const BINARY_CONTENT_KEYS: &[&str] = &[
     "image_url",
     "input_audio",
@@ -1320,11 +1329,11 @@ const BINARY_CONTENT_KEYS: &[&str] = &[
     "file_data",
 ];
 
-/// Output-cap / token-control object keys excluded from the prompt walk at any
-/// depth. Their values are numeric control knobs (also used by
-/// [`requested_completion_tokens`]), not billed prompt prose; skipping the
-/// member entirely keeps the key name out of the estimate once member names are
-/// counted.
+/// Output-cap / token-control object key spellings. A member is excluded only
+/// when its value is a JSON **number** (the provider request-control shape also
+/// read by [`requested_completion_tokens`]). Object/array/string values under the
+/// same spelling — e.g. a billed tool-schema property named `max_tokens` — are
+/// counted fail-closed so a coincidental name cannot hide prose.
 const TOKEN_CAP_KEYS: &[&str] = &[
     "max_tokens",
     "max_completion_tokens",
@@ -1336,31 +1345,129 @@ const TOKEN_CAP_KEYS: &[&str] = &[
     "maxTokenCount",
 ];
 
-/// Whether an Anthropic-style `source` block carries TEXT prose to count toward
-/// the estimate, rather than a binary blob to skip. Only an explicit
-/// `type:"text"` source (the Anthropic text-document shape
-/// `source:{type:"text",media_type:"text/plain",data:"<prose>"}`) qualifies. We
-/// deliberately do NOT key off `media_type` alone: a base64 source can declare
-/// `media_type:"text/plain"` (`type:"base64"`) while its `data` is encoded bytes,
-/// and counting those would charge the ~33%-inflated base64 payload as prompt
-/// text — the exact over-count `BINARY_CONTENT_KEYS` exists to prevent. Every
-/// non-`text` shape (`base64`, `url`, `file`, …) is treated as binary and skipped.
-fn source_is_text_document(value: &Value) -> bool {
+/// Anthropic multimodal `source` types whose whole subtree is binary/non-text
+/// and must be skipped (including nested member names). Explicit `type:"text"`
+/// text-document sources and any other shape (JSON Schema objects, unknown
+/// types) are **not** listed here and are counted fail-closed.
+const BINARY_SOURCE_TYPES: &[&str] = &["base64", "url", "file"];
+
+/// Minimum length before an alphabet-only string under a binary key is treated
+/// as a base64 payload. Shorter labels/enums stay counted fail-closed.
+const MIN_BASE64_PAYLOAD_LEN: usize = 48;
+
+/// Whether an Anthropic-style `source` value is a recognized binary document
+/// (`type` ∈ [`BINARY_SOURCE_TYPES`]). Only those shapes skip the subtree;
+/// `type:"text"` prose and schema-like objects (e.g. `type:"string"`) count.
+fn source_is_recognized_binary_document(value: &Value) -> bool {
     value
         .as_object()
         .and_then(|obj| obj.get("type"))
         .and_then(Value::as_str)
-        == Some("text")
+        .is_some_and(|ty| BINARY_SOURCE_TYPES.contains(&ty))
+}
+
+/// Whether `value` under a [`BINARY_CONTENT_KEYS`] member is a recognized
+/// multimodal binary payload (skip name + subtree) rather than ordinary schema
+/// / prose that merely reused the key spelling (count fail-closed).
+fn value_is_binary_content_payload(value: &Value) -> bool {
+    match value {
+        Value::String(s) => {
+            is_data_url(s) || is_remote_fetch_url(s) || is_likely_base64_payload(s)
+        }
+        Value::Object(obj) => {
+            // OpenAI `image_url` object: string `url` that is a data or http(s) URL.
+            if let Some(url) = obj.get("url").and_then(Value::as_str) {
+                if is_data_url(url) || is_remote_fetch_url(url) {
+                    return true;
+                }
+            }
+            // Gemini inline_data / OpenAI input_audio: string `data` with a media
+            // discriminator, or a data-URL / long base64 `data` payload.
+            let has_media_meta = obj.contains_key("mime_type")
+                || obj.contains_key("mimeType")
+                || obj.contains_key("format")
+                || obj.contains_key("media_type");
+            if let Some(data) = obj.get("data").and_then(Value::as_str) {
+                return has_media_meta
+                    || is_data_url(data)
+                    || is_likely_base64_payload(data);
+            }
+            false
+        }
+        // Numbers/bools/arrays/null under these keys are not recognized binary
+        // payloads — recurse/count fail-closed so a magic key cannot hide them.
+        _ => false,
+    }
+}
+
+fn is_remote_fetch_url(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (bytes.len() >= 8 && bytes[..7].eq_ignore_ascii_case(b"http://"))
+        || (bytes.len() >= 9 && bytes[..8].eq_ignore_ascii_case(b"https://"))
+}
+
+fn is_likely_base64_payload(value: &str) -> bool {
+    if value.len() < MIN_BASE64_PAYLOAD_LEN {
+        return false;
+    }
+    value.bytes().all(|b| {
+        matches!(
+            b,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'=' | b'-' | b'_'
+        )
+    })
 }
 
 fn member_name_character_count(key: &str) -> u64 {
     key.chars().count() as u64
 }
 
-/// Fail-closed prompt character walk: billable string values plus every visited
-/// object member name, excluding token-cap members and binary payload subtrees.
+fn count_member_and_value(acc: u64, key: &str, value: &Value) -> u64 {
+    acc.saturating_add(member_name_character_count(key))
+        .saturating_add(prompt_json_character_count(value))
+}
+
+fn u64_decimal_character_count(mut value: u64) -> u64 {
+    if value == 0 {
+        return 1;
+    }
+    let mut len = 0_u64;
+    while value > 0 {
+        len = len.saturating_add(1);
+        value /= 10;
+    }
+    len
+}
+
+/// Serialized width of a JSON number literal (digits / sign / fraction / exponent).
+/// Integers use digit counting; non-integers format once (bounded by the parsed token).
+fn json_number_literal_character_count(n: &serde_json::Number) -> u64 {
+    if let Some(u) = n.as_u64() {
+        return u64_decimal_character_count(u);
+    }
+    if let Some(i) = n.as_i64() {
+        return if i < 0 {
+            1u64.saturating_add(u64_decimal_character_count(i.unsigned_abs()))
+        } else {
+            u64_decimal_character_count(i as u64)
+        };
+    }
+    n.to_string().len() as u64
+}
+
+/// Fail-closed prompt character walk: billable strings, member names, and JSON
+/// scalar literals, with shape/value-aware token-cap and binary exclusions.
 fn prompt_json_character_count(value: &Value) -> u64 {
     match value {
+        // JSON Schema and provider bodies include numeric/boolean/`null` keywords
+        // (`minimum`, `default`, `additionalProperties`, …) that appear in the
+        // serialized prompt. Count each at its JSON literal width so large schemas
+        // cannot omit scalars at scale. Token-cap **controls** remain excluded at
+        // the member level when the value is a number; binary subtrees stay skipped.
+        Value::Null => 4,
+        Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Number(n) => json_number_literal_character_count(n),
         // A data URL (`data:<mime>;base64,<payload>`) is an inline binary blob,
         // not prose — count it as zero so a base64 image embedded directly in a
         // text field (rather than under a known binary key) still can't inflate
@@ -1377,31 +1484,32 @@ fn prompt_json_character_count(value: &Value) -> u64 {
         }),
         Value::Object(values) => values.iter().fold(0_u64, |acc, (key, value)| {
             if TOKEN_CAP_KEYS.contains(&key.as_str()) {
-                return acc;
+                // Numeric provider caps only — schema-shaped values count.
+                if matches!(value, Value::Number(_)) {
+                    return acc;
+                }
+                return count_member_and_value(acc, key, value);
             }
-            // `source` is binary for image/PDF documents (skip key + subtree) but
-            // prose for a text document (`source:{type:"text",...,data:"<prose>"}`)
-            // — that prose is sent to the model and billed as input, so count the
-            // member name and recurse. Only a genuinely binary source is skipped.
             if key == "source" {
-                return if source_is_text_document(value) {
-                    acc.saturating_add(member_name_character_count(key))
-                        .saturating_add(prompt_json_character_count(value))
-                } else {
-                    acc
-                };
+                // Recognized Anthropic binary sources skip; text documents and
+                // unknown/schema objects (e.g. type:"string") count fail-closed.
+                if source_is_recognized_binary_document(value) {
+                    return acc;
+                }
+                return count_member_and_value(acc, key, value);
             }
             if BINARY_CONTENT_KEYS.contains(&key.as_str()) {
-                // Skip the binary member name and its entire subtree so attacker-
-                // controlled keys nested under image/audio/file payloads cannot
-                // manufacture prompt overcharge.
-                acc
-            } else {
-                acc.saturating_add(member_name_character_count(key))
-                    .saturating_add(prompt_json_character_count(value))
+                if value_is_binary_content_payload(value) {
+                    // Skip the binary member name and its entire subtree so
+                    // attacker-controlled keys nested under image/audio/file
+                    // payloads cannot manufacture prompt overcharge.
+                    return acc;
+                }
+                // Coincidental schema/property reuse of the spelling: count.
+                return count_member_and_value(acc, key, value);
             }
+            count_member_and_value(acc, key, value)
         }),
-        _ => 0,
     }
 }
 

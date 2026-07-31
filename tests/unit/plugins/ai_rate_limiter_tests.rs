@@ -2936,12 +2936,15 @@ async fn prose_starting_with_data_prefix_is_counted_not_treated_as_data_url() {
 
 // ─── Fail-closed whole-body prompt reservation (GHSA-2r5g-438w-85hr) ──────────
 //
-// Pre-dispatch estimation walks billable string values and visited object member
-// names once so a present recognized field cannot suppress unknown (or known)
-// billed siblings, and tool/function schema property names cannot be omitted.
-// Exact token deltas isolate value or member-name text by keeping the compared
-// key structure identical in the baseline (empty string / empty property name).
-// These tests drive the public `before_proxy` surface in `prompt_tokens` mode.
+// Pre-dispatch estimation walks billable string values, visited object member
+// names, and JSON scalar literals once so a present recognized field cannot
+// suppress unknown (or known) billed siblings, tool/function schema property
+// names cannot be omitted, and coincidental reserved spellings (`max_tokens`,
+// `image_url`, `source`, …) cannot hide schema prose. Exclusions are shape/
+// value aware. Exact token deltas isolate value or member-name text by keeping
+// the compared key structure identical in the baseline (empty string / empty
+// property name). These tests drive the public `before_proxy` surface in
+// `prompt_tokens` mode.
 
 /// Reserved prompt-token estimate for `body` under an isolated
 /// `prompt_tokens`-mode limiter with a budget far above any test request.
@@ -3428,6 +3431,406 @@ async fn prompt_estimate_excludes_token_cap_member_names() {
     assert_eq!(
         with_caps, base,
         "token-cap member names must not change the prompt reservation"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_tool_schema_property_named_max_tokens() {
+    // Root review: name-only TOKEN_CAP_KEYS skips hid billed schema subtrees
+    // under `parameters.properties.max_tokens`. A schema-shaped object must
+    // reserve its description; a numeric top-level cap must still be excluded.
+    let empty_desc = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": 999999,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "max_tokens": {
+                            "type": "integer",
+                            "description": ""
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+    let with_desc = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": 999999,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "max_tokens": {
+                            "type": "integer",
+                            "description": PROMPT_DELTA_32
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+
+    assert_eq!(
+        with_desc - empty_desc,
+        8,
+        "schema property max_tokens description must reserve ceil(32/4)=8; \
+         name-only skips yield delta 0"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_tool_schema_properties_named_binary_reserved_keys() {
+    // Root review: name-only BINARY_CONTENT_KEYS skips hid schema properties
+    // named `image_url` / `input_audio`. Schema-shaped objects must reserve
+    // their descriptions; real multimodal payloads must stay excluded.
+    let empty_desc = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "image_url": {
+                            "type": "string",
+                            "description": ""
+                        },
+                        "input_audio": {
+                            "type": "string",
+                            "description": ""
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+    let with_desc = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "image_url": {
+                            "type": "string",
+                            "description": PROMPT_DELTA_32
+                        },
+                        "input_audio": {
+                            "type": "string",
+                            "description": PROMPT_DELTA_32
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+
+    assert_eq!(
+        with_desc - empty_desc,
+        16,
+        "schema properties image_url+input_audio descriptions must reserve \
+         ceil(64/4)=16; name-only skips yield delta 0"
+    );
+
+    // Real vision payload under the same spelling must remain excluded.
+    let huge_b64 = "A".repeat(200_000);
+    let with_real_image = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd"},
+            {"type": "image_url", "image_url": {
+                "url": format!("data:image/png;base64,{huge_b64}")
+            }}
+        ]}]
+    }))
+    .await;
+    assert!(
+        with_real_image < 80,
+        "real image_url data-URL payload must stay excluded; got {with_real_image}"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_schema_shaped_source_with_type_string() {
+    // Root review: treating every non-`type:"text"` `source` as binary discarded
+    // ordinary schema objects such as `{"type":"string","description":"..."}`.
+    let empty_desc = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": ""
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+    let with_desc = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": PROMPT_DELTA_32
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+
+    assert_eq!(
+        with_desc - empty_desc,
+        8,
+        "schema source type:string description must reserve ceil(32/4)=8; \
+         blanket non-text source skips yield delta 0"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_schema_scalar_literals_without_token_cap_overcharge() {
+    // Schema numbers/bools/`null` appear in the serialized prompt; omitting them
+    // at scale under-reserves. Count JSON literal widths, but keep numeric
+    // token-cap controls excluded.
+    //
+    // Eight enum integers: `0` (1 digit) vs `10000` (5 digits) → +4 chars each
+    // → +32 chars total → exactly ceil(32/4)=8 tokens regardless of baseline
+    // remainder. Name-only / scalar-ignoring walks yield delta 0.
+    let short_enum = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": 999999,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "n": {
+                            "type": "integer",
+                            "enum": [0, 0, 0, 0, 0, 0, 0, 0]
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }]
+    }))
+    .await;
+    let long_enum = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": 999999,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "n": {
+                            "type": "integer",
+                            "enum": [10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000]
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }]
+    }))
+    .await;
+
+    assert_eq!(
+        long_enum - short_enum,
+        8,
+        "schema numeric enum literal width must reserve ceil(32/4)=8; \
+         ignored scalars yield delta 0"
+    );
+
+    // Bool literals: `false` (5) vs `true` (4) across eight defaults → +8 chars
+    // → exactly 2 tokens.
+    let all_true = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": 42,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "boolean", "default": true},
+                        "b": {"type": "boolean", "default": true},
+                        "c": {"type": "boolean", "default": true},
+                        "d": {"type": "boolean", "default": true},
+                        "e": {"type": "boolean", "default": true},
+                        "f": {"type": "boolean", "default": true},
+                        "g": {"type": "boolean", "default": true},
+                        "h": {"type": "boolean", "default": true}
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+    let all_false = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": 42,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "boolean", "default": false},
+                        "b": {"type": "boolean", "default": false},
+                        "c": {"type": "boolean", "default": false},
+                        "d": {"type": "boolean", "default": false},
+                        "e": {"type": "boolean", "default": false},
+                        "f": {"type": "boolean", "default": false},
+                        "g": {"type": "boolean", "default": false},
+                        "h": {"type": "boolean", "default": false}
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+
+    assert_eq!(
+        all_false - all_true,
+        2,
+        "eight false vs true defaults must reserve ceil(8/4)=2 from literal width"
+    );
+
+    // Numeric top-level caps in the bodies above must stay excluded (finite
+    // estimates; unbounded cap digits would dominate if counted).
+    assert!(
+        long_enum < 200,
+        "scalar counting must not reintroduce token-cap overcharge; got {long_enum}"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_reserved_name_schema_requests_cannot_oversubscribe() {
+    // Long descriptions under schema properties that reuse reserved spellings
+    // (`max_tokens`, `image_url`, `source`) must reserve enough that concurrent
+    // twins cannot both fit — name-only exclusion would admit both.
+    let desc = "D".repeat(600); // 600 chars -> 150 tokens from one description alone
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 200,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 999999,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "max_tokens": {
+                            "type": "integer",
+                            "description": desc.clone()
+                        },
+                        "image_url": {
+                            "type": "string",
+                            "description": "x"
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "y"
+                        }
+                    }
+                }
+            }
+        }]
+    });
+
+    let make_ctx = || {
+        let mut ctx = create_test_context();
+        ctx.method = "POST".to_string();
+        ctx.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            serde_json::to_string(&body).unwrap(),
+        );
+        ctx
+    };
+
+    let mut ctx_a = make_ctx();
+    let mut ctx_b = make_ctx();
+    let mut headers_a = HashMap::new();
+    let mut headers_b = HashMap::new();
+
+    let (result_a, result_b) = tokio::join!(
+        plugin.before_proxy(&mut ctx_a, &mut headers_a),
+        plugin.before_proxy(&mut ctx_b, &mut headers_b)
+    );
+
+    let allowed = u8::from(matches!(&result_a, PluginResult::Continue))
+        + u8::from(matches!(&result_b, PluginResult::Continue));
+    let rejected = u8::from(matches!(&result_a, PluginResult::Reject { .. }))
+        + u8::from(matches!(&result_b, PluginResult::Reject { .. }));
+
+    assert_eq!(
+        allowed, 1,
+        "only one reserved-name schema-heavy reservation should fit"
+    );
+    assert_eq!(
+        rejected, 1,
+        "the second reserved-name schema-heavy request must be rejected"
     );
 }
 
