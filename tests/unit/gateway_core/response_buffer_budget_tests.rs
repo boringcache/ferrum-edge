@@ -1331,6 +1331,51 @@ fn a_brotli_decode_that_can_afford_its_working_set_is_admitted_and_gives_it_back
     assert_eq!(budget.available_bytes(), total);
 }
 
+/// Large Window Brotli uses the `0x11` window-bits marker; a non-strict decoder
+/// then reads six LWB bits and can allocate a ring buffer far beyond any fixed
+/// scratch ceiling. `new_strict` must reject the marker as a format-window-bits
+/// error before that allocation — and must not be mistaken for a gateway
+/// capacity refusal when the budget can afford the ordinary `br` scratch.
+#[test]
+fn a_large_window_brotli_marker_is_rejected_before_lwb_ring_allocation() {
+    const LWB_MARKER_BODY: [u8; 8] = [0x11, 0x1e, 0, 0, 0, 0, 0, 0];
+    let scratch_blocks = blocks(RESPONSE_DECODE_BROTLI_SCRATCH_BYTES);
+    let budget = probe(scratch_blocks + 4);
+    let total = budget.available_bytes();
+    assert!(
+        blocks(total) >= scratch_blocks,
+        "the budget must afford the ordinary `br` codec scratch"
+    );
+
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-encoding".to_string(), "br".to_string()),
+    ]);
+    let encoded = bytes::Bytes::from_static(&LWB_MARKER_BODY);
+    let mut body = encoded.clone();
+
+    assert_eq!(
+        admit_backend_representation(&budget, &mut headers, &mut body),
+        BufferedRepresentationOutcome::Rejected("malformed_content_coding"),
+        "the LWB extension marker must be a format error, not a capacity refusal"
+    );
+    assert_eq!(
+        body, encoded,
+        "nothing is installed on the rejection path; the encoded bytes stay \
+         untouched until the caller replaces the response"
+    );
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("br"),
+        "the representation the rejection describes is still the encoded one"
+    );
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "every permit the failed decode took is released"
+    );
+}
+
 /// Refusal is a statement about the GATEWAY, not the representation, so it takes
 /// the transient-capacity terminal: `503` with the fixed redaction-safe body,
 /// `RESOURCE_EXHAUSTED` for gRPC, health-neutral and never retried. A `502`
