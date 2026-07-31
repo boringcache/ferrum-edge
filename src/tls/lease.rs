@@ -62,7 +62,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -455,10 +455,12 @@ pub struct RenewalLeaseLost;
 /// * [`Self::ensure_owned`] re-reads authoritative state without extending
 ///   anything, for the check immediately after a fenced commit and before the
 ///   next stretch of external work;
-/// * [`Self::guarded_cleanup`] is [`Self::guarded`] preceded by that
-///   authoritative check, because a retraction hook that is ready to run
+/// * [`Self::guarded_cleanup`] is [`Self::guarded`] preceded by an
+///   authoritative *refresh*, because a retraction hook that is ready to run
 ///   immediately would otherwise slip through the gap between a takeover
-///   landing and the next beat observing it.
+///   landing and the next beat observing it — and a claim confirmed with
+///   almost no lifetime left could expire and be taken over between the
+///   confirmation and the hook's first poll.
 ///
 /// A crashed process runs no heartbeat, so its claim expires and the
 /// certificate becomes reclaimable exactly as before.
@@ -468,6 +470,9 @@ pub struct RenewalLeaseKeeper {
     store: Arc<TlsLeaseStore>,
     name: String,
     fence: u64,
+    /// The claim's TTL, retained so a preflight can re-establish a full
+    /// protected interval rather than merely confirming whatever is left.
+    ttl: Duration,
     lost_tx: Arc<watch::Sender<bool>>,
     lost_rx: watch::Receiver<bool>,
     stop_tx: watch::Sender<bool>,
@@ -483,9 +488,15 @@ pub struct RenewalLeaseKeeper {
 /// condition [`RenewalLeaseKeeper::finish`] must clear before it releases the
 /// claim — see [`RenewalLeaseKeeper::stop_heartbeat`].
 ///
-/// Two counters updated once per heartbeat interval (never faster than
-/// [`MIN_HEARTBEAT_INTERVAL`], and in production a third of a >= 60s TTL).
-/// Nothing on the request path reads or writes them.
+/// `stop_requested` is the other half of that state: it is set as
+/// [`RenewalLeaseKeeper::stop_heartbeat`] enters, *before* it awaits the loop,
+/// so "shutdown has asked the loop to stop and an extension is still in flight"
+/// is a directly observable conjunction rather than something inferred from how
+/// long a shutdown has failed to complete.
+///
+/// Two counters and a flag, updated once per heartbeat interval (never faster
+/// than [`MIN_HEARTBEAT_INTERVAL`], and in production a third of a >= 60s TTL)
+/// and once per shutdown. Nothing on the request path reads or writes them.
 #[derive(Debug, Clone, Default)]
 pub struct HeartbeatProgress(Arc<HeartbeatCounters>);
 
@@ -493,6 +504,7 @@ pub struct HeartbeatProgress(Arc<HeartbeatCounters>);
 struct HeartbeatCounters {
     started: AtomicU64,
     settled: AtomicU64,
+    stop_requested: AtomicBool,
 }
 
 impl HeartbeatProgress {
@@ -514,12 +526,23 @@ impl HeartbeatProgress {
         self.started() > self.settled()
     }
 
+    /// Whether shutdown has already asked the heartbeat loop to stop. Set
+    /// before the join is awaited, so it is true for the whole settling window.
+    #[allow(dead_code)]
+    pub fn stop_requested(&self) -> bool {
+        self.0.stop_requested.load(Ordering::SeqCst)
+    }
+
     fn start(&self) {
         self.0.started.fetch_add(1, Ordering::SeqCst);
     }
 
     fn settle(&self) {
         self.0.settled.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn request_stop(&self) {
+        self.0.stop_requested.store(true, Ordering::SeqCst);
     }
 }
 
@@ -547,6 +570,7 @@ impl RenewalLeaseKeeper {
             store,
             name,
             fence,
+            ttl,
             lost_tx,
             lost_rx,
             stop_tx,
@@ -596,7 +620,7 @@ impl RenewalLeaseKeeper {
     }
 
     /// Run a best-effort cleanup step inside the claim's cancellation scope,
-    /// after confirming authoritatively that the claim is still held.
+    /// after atomically re-establishing the claim's protected interval.
     ///
     /// Cleanup is a side effect like any other: a DNS-01 provider hook that
     /// retracts `_acme-challenge` records must not run once the claim has moved
@@ -611,16 +635,28 @@ impl RenewalLeaseKeeper {
     /// that is ready to run immediately would be polled to completion in the
     /// gap between the takeover landing in the lease table and the next beat
     /// noticing it — retracting the new owner's records before this instance
-    /// had any reason to believe it had lost anything. So the check is
-    /// authoritative and up front: [`Self::ensure_owned`] re-reads the lease
-    /// table (and fails closed on a store error, marking the keeper lost) and
-    /// the cleanup future is **not polled at all** unless it succeeds. The
-    /// cancellation scope then still covers a claim lost *during* a slow hook.
+    /// had any reason to believe it had lost anything. So the preflight is
+    /// authoritative and up front, and the cleanup future is **not polled at
+    /// all** unless it succeeds. The cancellation scope then still covers a
+    /// claim lost *during* a slow hook.
+    ///
+    /// # Why it refreshes rather than merely confirms
+    ///
+    /// A read-only ownership check answers "is this claim live *right now*",
+    /// which can be true with microseconds of TTL left. The claim may then
+    /// legally expire and be taken over between that read and the hook's very
+    /// first poll, putting the retraction back in exactly the window the check
+    /// exists to close. [`Self::refresh_claim`] instead extends the claim under
+    /// the lease store's exclusive lock — the same fenced read-modify-write a
+    /// heartbeat uses, so a superseded fence cannot extend anything — and a
+    /// successful preflight therefore hands the hook a full TTL rather than a
+    /// remainder. Failure of any kind (taken over, expired, store error,
+    /// unjoinable task) is fail-closed loss and marks the keeper lost.
     pub async fn guarded_cleanup<F, T, E>(&self, cleanup: F) -> GuardedCleanup<T, E>
     where
         F: Future<Output = Result<T, E>>,
     {
-        if self.ensure_owned().await.is_err() {
+        if self.refresh_claim().await.is_err() {
             return GuardedCleanup::Lost;
         }
         match self.guarded(cleanup).await {
@@ -730,6 +766,60 @@ impl RenewalLeaseKeeper {
         }
     }
 
+    /// Re-establish a full protected interval for this claim, or lose it.
+    ///
+    /// This is [`Self::ensure_owned`]'s answer plus a guarantee about the
+    /// *future*: the extension and the ownership test are one fenced
+    /// read-modify-write under the lease store's exclusive lock
+    /// ([`TlsLeaseStore::renew_claim`]), so there is no ownership logic
+    /// duplicated here and a claim whose holder or fence has moved on cannot
+    /// extend anything. On success the caller is entitled to a whole TTL, not
+    /// to whatever was left when it asked.
+    ///
+    /// Fail-closed exactly like the heartbeat: takeover, expiry, store error,
+    /// and an unjoinable task are all loss, and all mark the keeper lost so
+    /// concurrently [`guarded`](Self::guarded) work is cancelled too.
+    async fn refresh_claim(&self) -> Result<(), RenewalLeaseLost> {
+        if self.is_lost() {
+            return Err(RenewalLeaseLost);
+        }
+        let store = Arc::clone(&self.store);
+        let name = self.name.clone();
+        let fence = self.fence;
+        let ttl = self.ttl;
+        let refreshed =
+            tokio::task::spawn_blocking(move || store.renew_claim(&name, fence, ttl)).await;
+        match refreshed {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) => {
+                tracing::warn!(
+                    lease = %self.name,
+                    "the shared TLS renewal claim is no longer held by this instance"
+                );
+                self.mark_lost();
+                Err(RenewalLeaseLost)
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    lease = %self.name,
+                    error = %error,
+                    "could not refresh the shared TLS renewal claim"
+                );
+                self.mark_lost();
+                Err(RenewalLeaseLost)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    lease = %self.name,
+                    error = %error,
+                    "TLS renewal claim refresh could not be joined"
+                );
+                self.mark_lost();
+                Err(RenewalLeaseLost)
+            }
+        }
+    }
+
     fn mark_lost(&self) {
         let _ = self.lost_tx.send(true);
     }
@@ -761,7 +851,12 @@ impl RenewalLeaseKeeper {
     /// nobody is driving. Waiting for the loop to return is what makes
     /// "settled" true, because the loop itself awaits its in-flight extension
     /// before observing the stop signal.
+    ///
+    /// The stop request is published on [`HeartbeatProgress`] first, so the
+    /// settling window — stop asked for, extension still in flight, loop not
+    /// yet returned — is observable state rather than an elapsed interval.
     async fn stop_heartbeat(&mut self) {
+        self.progress.request_stop();
         let _ = self.stop_tx.send(true);
         let Some(handle) = self.heartbeat.take() else {
             return;
@@ -792,6 +887,7 @@ impl Drop for RenewalLeaseKeeper {
         // extension additionally requires the record to be *live*. So a beat
         // that lands first is overwritten by the release, and one that lands
         // after it sees an already-elapsed `expires_at` and declines.
+        self.progress.request_stop();
         let _ = self.stop_tx.send(true);
         if let Some(handle) = self.heartbeat.take() {
             handle.abort();
@@ -807,10 +903,10 @@ pub enum GuardedCleanup<T, E> {
     /// The cleanup ran and failed on its own terms. The claim is still held, so
     /// the caller may log this and continue.
     Failed(E),
-    /// The claim was already gone when the cleanup was asked for — so it never
-    /// ran — or it was lost while the cleanup was in flight and the cleanup was
-    /// cancelled. Either way the caller must abandon without publishing
-    /// anything further.
+    /// The claim could not be re-established when the cleanup was asked for —
+    /// so it never ran — or it was lost while the cleanup was in flight and the
+    /// cleanup was cancelled. Either way the caller must abandon without
+    /// publishing anything further.
     Lost,
 }
 

@@ -2047,10 +2047,12 @@ async fn renew_certificate_once(
     };
     // Cleanup is a side effect like any other: a claim lost right after
     // completion must not let this instance retract `_acme-challenge` records
-    // the new owner still needs. `guarded_cleanup` re-reads the lease table
-    // before the hook starts — a takeover is authoritative the moment it lands,
-    // whether or not a beat has observed it yet — and keeps the cancellation
-    // scope over a claim lost while a slow hook is in flight. A hook that merely
+    // the new owner still needs. `guarded_cleanup` refreshes the claim under the
+    // lease store's own lock before the hook starts — a takeover is
+    // authoritative the moment it lands, whether or not a beat has observed it
+    // yet, and a claim with a sliver of TTL left could otherwise expire between
+    // the check and the hook's first poll — and keeps the cancellation scope
+    // over a claim lost while a slow hook is in flight. A hook that merely
     // *fails* is logged and processing continues, because the claim is still
     // held.
     if config.challenge_type == AcmeRenewalChallengeType::Dns01

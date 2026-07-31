@@ -17,6 +17,7 @@
 //! it and a superseded owner can never land a stale write beside the new
 //! owner's.
 
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,12 +33,6 @@ use ferrum_edge::tls::lease::{
 /// never a schedule: a slow or paused runner spends longer here rather than
 /// turning correct behaviour red.
 const SETTLE_BUDGET: Duration = Duration::from_secs(30);
-
-/// Window held open to observe that something must *not* happen yet. These
-/// assertions are conservative in the only direction that matters — the wait
-/// can fail only by observing the forbidden event, so slowness never makes a
-/// correct run fail.
-const BLOCKED_WINDOW: Duration = Duration::from_millis(500);
 
 /// One replica's view of the shared lease table.
 fn instance(dir: &Path, holder: &str) -> Arc<TlsLeaseStore> {
@@ -86,19 +81,28 @@ async fn wait_until_async(budget: Duration, mut ready: impl FnMut() -> bool) -> 
 /// The acquisition retries rather than asserting on the first attempt: a
 /// heartbeat may legitimately be holding the lock at that instant, and the test
 /// wants the lock, not a verdict on who had it first.
-fn hold_store_lock(dir: &Path) -> std::fs::File {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(dir.join(".tls-leases.json.lock"))
-        .expect("open the lease store's lock file");
+fn hold_store_lock(dir: &Path) -> File {
+    let file = open_store_lock_file(dir);
     assert!(
         wait_until(SETTLE_BUDGET, || file.try_lock().is_ok()),
         "the test must be able to take the lease store's lock"
     );
     file
+}
+
+/// A fresh open file description on the lease store's sidecar lock, unlocked.
+///
+/// Separate from [`hold_store_lock`] so a test can also *probe* the lock —
+/// `try_lock` answers immediately either way, which makes "somebody else holds
+/// this right now" a state to read rather than a window to wait out.
+fn open_store_lock_file(dir: &Path) -> File {
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(".tls-leases.json.lock"))
+        .expect("open the lease store's lock file")
 }
 
 /// Poll the persisted record until a heartbeat has advanced `expires_at` past
@@ -678,14 +682,15 @@ async fn a_missing_claim_refuses_the_commit() {
 /// lock. Once the commit has finished, the newly expired claim is acquirable
 /// and the stale owner cannot commit a second time.
 ///
-/// Every step is an explicit event, not an interval. The commit closure
-/// announces that it is running *inside* the lease lock and then blocks until
-/// this test releases it, so the window is opened and closed deliberately.
-/// Expiry is read back from the persisted record against wall-clock time. The
-/// exclusion itself is proved twice over: the takeover thread must not produce
-/// a result while the commit is held (a wait that can fail only by observing
-/// the forbidden grant), and the value it samples at the instant its
-/// acquisition returns must show the commit already complete.
+/// Every step is an explicit event or an observed state, never an interval.
+/// The commit closure announces that it is running *inside* the lease lock and
+/// then blocks until this test releases it, so the window is opened and closed
+/// deliberately. Expiry is read back from the persisted record against
+/// wall-clock time. The exclusion is then read directly off the primitive that
+/// enforces it — a second open file description on the store's own sidecar lock
+/// is refused *immediately* — rather than inferred from a takeover failing to
+/// happen inside some chosen window. A takeover has nothing else to block on:
+/// `try_acquire` reaches this same lock before it can look at any record.
 #[test]
 fn a_takeover_cannot_cross_a_fenced_commit() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -732,59 +737,33 @@ fn a_takeover_cannot_cross_a_fenced_commit() {
     // the persisted record and compared against wall-clock time, so this is an
     // observed state rather than a slept-through duration. `peek` never takes
     // the writer lock, so it answers while the commit holds it.
-    let expiry = instance_a.peek(&name).expect("read").expect("present").expires_at;
+    let claim = instance_a.peek(&name).expect("read").expect("present");
+    let expiry = claim.expires_at;
     assert!(
         wait_until(SETTLE_BUDGET, || Utc::now() > expiry),
         "the claim's nominal TTL must elapse while the commit is in flight"
     );
 
-    // The takeover runs on its own thread and reports the moment its
-    // acquisition returns, together with what it saw of the commit right then.
-    let (attempting_tx, attempting_rx) = std::sync::mpsc::channel::<()>();
-    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel::<bool>();
-    let acquiring = Arc::clone(&instance_b);
-    let acquire_name = name.clone();
-    let observed = Arc::clone(&finished);
-    let takeover = std::thread::spawn(move || {
-        attempting_tx.send(()).expect("the test observes the attempt");
-        let taken = acquiring.try_acquire(&acquire_name, ttl).expect("B attempts");
-        acquired_tx
-            .send(observed.load(Ordering::SeqCst))
-            .expect("the test observes the acquisition");
-        taken
-    });
-    attempting_rx
-        .recv_timeout(SETTLE_BUDGET)
-        .expect("B must reach its acquisition");
-
-    // No takeover may be granted while the commit holds the lease lock. This
-    // wait fails only by *receiving* a grant, so a slow machine lengthens it
-    // rather than reddening it.
-    let premature = acquired_rx.recv_timeout(BLOCKED_WINDOW);
-    assert_eq!(
-        premature,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
-        "a takeover must not be granted while a fenced commit holds the lease lock"
-    );
+    // The exclusion, read off the lock itself. `try_acquire` takes exactly this
+    // sidecar lock before it can read, decide, or write anything, so a lock that
+    // is refused here is a takeover that cannot proceed. `try_lock` returns at
+    // once, so this is an immediate state read and cannot pass by being slow.
+    let probe = open_store_lock_file(dir.path());
+    match probe.try_lock() {
+        Err(TryLockError::WouldBlock) => {}
+        Ok(()) => panic!(
+            "the lease store's lock was free while a fenced commit was in flight; \
+             a takeover could have crossed the commit"
+        ),
+        Err(TryLockError::Error(error)) => panic!("lease lock probe failed: {error}"),
+    }
+    std::mem::drop(probe);
     assert!(
         !finished.load(Ordering::SeqCst),
         "the commit must still be in flight"
     );
 
     release_tx.send(()).expect("release the fenced commit");
-
-    let observed_finished = acquired_rx
-        .recv_timeout(SETTLE_BUDGET)
-        .expect("B's acquisition must be answered once the lock is free");
-    assert!(
-        observed_finished,
-        "the fenced commit must have completed before the takeover was granted"
-    );
-    let taken = takeover
-        .join()
-        .expect("takeover thread")
-        .expect("once the commit released the lock, the expired claim is acquirable");
-    assert_eq!(taken.holder(), "replica-b");
 
     let outcome = commit
         .join()
@@ -795,6 +774,18 @@ fn a_takeover_cannot_cross_a_fenced_commit() {
         FencedCommit::Committed("published"),
         "a commit that started under a live claim finishes under it"
     );
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "the commit ran its mutation to completion"
+    );
+
+    // Only now — with the lock released and the claim already expired — is the
+    // takeover answerable, and it is granted.
+    let taken = instance_b
+        .try_acquire(&name, ttl)
+        .expect("B attempts")
+        .expect("once the commit released the lock, the expired claim is acquirable");
+    assert_eq!(taken.holder(), "replica-b");
 
     let second = Arc::new(AtomicBool::new(false));
     let second_flag = Arc::clone(&second);
@@ -863,13 +854,17 @@ fn a_target_store_error_propagates_without_disturbing_the_claim() {
 /// retracting them would break the new owner's validation — and nothing later
 /// in the renewal may publish either.
 ///
-/// The check has to be *authoritative and up front*, not merely a cancellation
-/// scope over the published loss signal: the takeover lands in the lease table
-/// before any heartbeat has had a reason to observe it, and a retraction hook is
-/// perfectly capable of completing inside that gap. The TTL here is deliberately
-/// long enough that **no beat can run during the test**, and the cleanup future
-/// retracts on its very first poll — so `Lost` can only come from a check made
-/// before the future was polled at all.
+/// The preflight has to be *authoritative and up front*, not merely a
+/// cancellation scope over the published loss signal: the takeover lands in the
+/// lease table before any heartbeat has had a reason to observe it, and a
+/// retraction hook is perfectly capable of completing inside that gap. The TTL
+/// here is deliberately long enough that **no beat can run during the test**,
+/// and the cleanup future retracts on its very first poll — so `Lost` can only
+/// come from a preflight made before the future was polled at all.
+///
+/// The preflight is a *refresh*, so this also pins that it cannot extend
+/// anything on a superseded fence: the new owner's record must come back out
+/// exactly as it went in.
 #[tokio::test]
 async fn losing_the_claim_cancels_dns_cleanup() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -912,8 +907,17 @@ async fn losing_the_claim_cancels_dns_cleanup() {
     );
     assert!(
         keeper.is_lost(),
-        "the authoritative check must also mark the keeper lost, so concurrent \
-         guarded work is cancelled too"
+        "the authoritative preflight must also mark the keeper lost, so \
+         concurrent guarded work is cancelled too"
+    );
+    let owner = instance_a.peek(&name).expect("read").expect("present");
+    assert_eq!(
+        owner.holder, "replica-b",
+        "the takeover stands; the preflight must not have rewritten it"
+    );
+    assert_eq!(
+        owner.fence, 9999,
+        "a superseded fence must not be able to extend the new owner's claim"
     );
 
     let published = Arc::new(AtomicBool::new(false));
@@ -960,6 +964,75 @@ async fn an_ordinary_cleanup_failure_keeps_the_claim() {
     assert!(published.load(Ordering::SeqCst));
 }
 
+/// The cleanup preflight *refreshes* the claim rather than merely confirming
+/// it, and does so before the hook is polled.
+///
+/// Confirming is not enough on its own: a claim can be authoritatively live
+/// with a sliver of TTL left, expire, and be taken over between the check
+/// returning and the hook's first poll — which is the same retraction-after-
+/// takeover the check exists to prevent, just moved a few microseconds later.
+/// A refresh under the lease store's own lock hands the hook a whole TTL
+/// instead.
+///
+/// The evidence is taken from inside the future: the hook reads the persisted
+/// record on its very first poll, so an `expires_at` already past the one the
+/// acquisition wrote can only have been advanced *before* the hook ran. The TTL
+/// is long enough that no heartbeat can beat during the test, so the preflight
+/// is the only thing that could have advanced it.
+#[tokio::test]
+async fn the_cleanup_preflight_refreshes_the_claim_before_the_hook_runs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let instance_a = instance(dir.path(), "replica-a");
+    let name = acme_renewal_lease_name("edge-cert");
+    // Beats every 20s: the heartbeat cannot be what advances the claim.
+    let ttl = Duration::from_secs(60);
+
+    let held = instance_a.try_acquire(&name, ttl).expect("A claims");
+    let keeper = RenewalLeaseKeeper::start(held.expect("A wins"), ttl);
+    let before = instance_a.peek(&name).expect("read").expect("present");
+
+    // `expires_at` is `now + ttl`, so a refresh advances it exactly when the
+    // refresh happens strictly later than the acquisition. Observed, not
+    // assumed: the assertion below would otherwise rest on the clock having
+    // ticked between two adjacent writes.
+    assert!(
+        wait_until(SETTLE_BUDGET, || Utc::now() > before.acquired_at),
+        "the clock must advance past the acquisition"
+    );
+
+    let sampling = Arc::clone(&instance_a);
+    let sample_name = name.clone();
+    // Stands in for a DNS-01 cleanup hook that is ready to go: it samples the
+    // authoritative record the instant it is polled, with no await in front.
+    let cleanup = async move {
+        let sampled = sampling.peek(&sample_name).expect("read").expect("present");
+        Ok::<DateTime<Utc>, String>(sampled.expires_at)
+    };
+    let at_first_poll = match keeper.guarded_cleanup(cleanup).await {
+        GuardedCleanup::Completed(expires_at) => expires_at,
+        other => panic!("the cleanup must run under the refreshed claim: {other:?}"),
+    };
+    assert!(
+        at_first_poll > before.expires_at,
+        "the preflight must have extended the claim before the hook was polled"
+    );
+
+    let after = instance_a.peek(&name).expect("read").expect("present");
+    assert_eq!(
+        after.expires_at, at_first_poll,
+        "nothing after the preflight may rewrite the claim"
+    );
+    assert_eq!(
+        after.holder, before.holder,
+        "a refresh must not change the holder"
+    );
+    assert_eq!(
+        after.fence, before.fence,
+        "a refresh extends the claim; it must not bump the fence"
+    );
+    assert!(!keeper.is_lost(), "the claim is still held");
+}
+
 // ---------------------------------------------------------------------------
 // Heartbeat shutdown.
 // ---------------------------------------------------------------------------
@@ -974,12 +1047,15 @@ async fn an_ordinary_cleanup_failure_keeps_the_claim() {
 ///
 /// So the extension is put — and held — in flight for real, by taking the
 /// store's own advisory lock from a second open file the way another instance
-/// would. `HeartbeatProgress` makes that a state the test can wait for rather
-/// than an interval it has to guess: `started > settled` means the loop has
-/// handed an extension to the blocking pool and not yet awaited it back. The
-/// discriminating evidence is the final `settled == started`, which is reached
-/// only on the loop's own path *after* the extension's join handle resolves; a
-/// loop cancelled at that await never increments it.
+/// would. `HeartbeatProgress` makes every step a state the test waits *for*,
+/// never an interval it waits *out*: `started > settled` means the loop has
+/// handed an extension to the blocking pool and not yet awaited it back, and
+/// `stop_requested` means shutdown has already asked the loop to stop. Their
+/// conjunction is the settling window, and `JoinHandle::is_finished()` is then
+/// read directly rather than timed. The discriminating evidence is the final
+/// `settled == started`, which is reached only on the loop's own path *after*
+/// the extension's join handle resolves; a loop cancelled at that await never
+/// increments it.
 #[tokio::test]
 async fn finish_settles_an_in_flight_heartbeat_before_release() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1006,13 +1082,27 @@ async fn finish_settles_an_in_flight_heartbeat_before_release() {
         "an extension must be in flight while the store lock is held against it"
     );
 
-    let mut finishing = tokio::spawn(keeper.finish());
+    let finishing = tokio::spawn(keeper.finish());
 
-    // `finish()` may not complete while the extension it has to settle is
-    // blocked. Bounded and conservative: only an early completion fails here.
-    let early = tokio::time::timeout(BLOCKED_WINDOW, &mut finishing).await;
+    // Wait *positively* for the state that makes the next assertion meaningful:
+    // shutdown has asked the loop to stop, and the extension it must settle is
+    // still in flight. `stop_requested` is set as `finish()` enters, before it
+    // awaits the loop, so this cannot be reached by `finish()` having already
+    // returned. The blocked extension keeps `extension_in_flight()` true for as
+    // long as this test holds the store lock, so the conjunction is stable
+    // rather than a race the poll might miss.
+    let settling = || progress.stop_requested() && progress.extension_in_flight();
     assert!(
-        early.is_err(),
+        wait_until_async(SETTLE_BUDGET, settling).await,
+        "finish() must reach the point of settling a heartbeat extension"
+    );
+
+    // Read directly: the loop cannot have returned while its extension is still
+    // in the blocking pool, so `finish()` — which awaits that loop rather than
+    // aborting it — cannot have completed. No interval is waited out and no
+    // forbidden event is timed.
+    assert!(
+        !finishing.is_finished(),
         "finish() must not complete while a heartbeat extension is in flight"
     );
 
