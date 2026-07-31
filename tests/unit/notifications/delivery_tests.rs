@@ -514,10 +514,13 @@ async fn reload_retirement_cancels_stalled_in_flight_dispatch_and_settles_abando
         })),
     ));
 
-    timeout(Duration::from_secs(5), &mut endpoint.stalled_request_started)
-        .await
-        .expect("server must observe the live transport attempt before retirement")
-        .expect("stall barrier sender must not be dropped");
+    timeout(
+        Duration::from_secs(5),
+        &mut endpoint.stalled_request_started,
+    )
+    .await
+    .expect("server must observe the live transport attempt before retirement")
+    .expect("stall barrier sender must not be dropped");
     assert_eq!(generation.in_flight(), 1, "the attempt must be accounted");
     assert_eq!(metrics.channel_snapshot("webhook").in_flight, 1);
 
@@ -607,10 +610,13 @@ async fn retirement_cancels_stalled_retry_attempt_after_transient_failure() {
         })),
     ));
 
-    timeout(Duration::from_secs(5), &mut endpoint.stalled_request_started)
-        .await
-        .expect("the retry attempt must reach the endpoint before retirement")
-        .expect("stall barrier sender must not be dropped");
+    timeout(
+        Duration::from_secs(5),
+        &mut endpoint.stalled_request_started,
+    )
+    .await
+    .expect("the retry attempt must reach the endpoint before retirement")
+    .expect("stall barrier sender must not be dropped");
     assert_eq!(
         endpoint.requests.load(Ordering::SeqCst),
         2,
