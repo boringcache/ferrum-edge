@@ -1327,6 +1327,24 @@ pub mod _test_support {
         plugin.compact_excluded_by_emission_lock_for_tests(hold)
     }
 
+    // ── plugins/load_testing ─────────────────────────────────────────────────
+    /// Construct through the identity-aware production path so a test can
+    /// simulate a plugin-cache reload generation for one stable policy
+    /// identity (`namespace` + plugin-config id).
+    pub fn load_testing_with_policy_identity_for_test(
+        config: &serde_json::Value,
+        http_client: crate::plugins::PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<crate::plugins::load_testing::LoadTesting, String> {
+        crate::plugins::load_testing::LoadTesting::new_with_instance_id(
+            config,
+            http_client,
+            namespace,
+            config_id,
+        )
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_with_instance_id_for_test(
         config: &serde_json::Value,
@@ -1337,6 +1355,23 @@ pub mod _test_support {
             config,
             http_client,
             instance_id,
+        )
+    }
+
+    /// Construct through the identity-aware production path so a test can
+    /// simulate a plugin-cache reload generation for one stable policy
+    /// identity (`namespace` + plugin-config id).
+    pub fn request_deduplication_with_policy_identity_for_test(
+        config: &serde_json::Value,
+        http_client: crate::plugins::PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<crate::plugins::request_deduplication::RequestDeduplication, String> {
+        crate::plugins::request_deduplication::RequestDeduplication::new_with_policy_identity(
+            config,
+            http_client,
+            namespace,
+            config_id,
         )
     }
 

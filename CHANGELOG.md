@@ -45,6 +45,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Stateful plugin protections are no longer owned by an individual plugin
+  instance, so a qualifying configuration reload can no longer reset them
+  (GHSA-wmqm-6mxj-gm9p). `request_deduplication` in local mode now owns its
+  active idempotency leases, retained completed responses, execution barriers,
+  and their accounting through a **stable policy identity** (`namespace` +
+  plugin-config id) rather than through the instance the plugin cache happened
+  to construct. Previously a routine incremental rebuild handed a replacement
+  instance an empty map while the original request was still executing, so an
+  immediate retry of the same idempotency key re-dispatched a side-effecting
+  operation — a duplicate payment or write during ordinary dynamic
+  configuration change — and a completed entry retained only by the retired
+  instance was likewise forgotten. A compatible reload now inherits the live
+  state; changing `header_name`, switching between `local` and `redis`, or
+  changing `on_redis_unavailable` is a semantic change that isolates onto fresh
+  state, so a retired generation's late completion lands on the state it took
+  its lease from and cannot corrupt the replacement policy. Capacity and TTL
+  changes are compatible and are applied against already-retained state.
+  Retention is bounded to currently configured policies plus whatever in-flight
+  work still holds a reference.
+- `load_testing` now admits at most **one** effective instance per proxy after
+  global/proxy/proxy_group merge, rejected at plugin-cache construction
+  (GHSA-wmqm-6mxj-gm9p). Two same-name effective instances each held their own
+  run-admission flag and could start overlapping high-cost cohorts against one
+  gateway with no reload at all, multiplying thousands of loopback requests per
+  instance. Cross-generation admission for one policy identity was already
+  shared; this closes the duplicate-instance half.
 - Irreversible request egress no longer precedes request-body transformation or
   final request policy (GHSA-4vr5-4wm3-x5xv). `request_mirror` and
   `serverless_function` previously ran their external dispatch in
