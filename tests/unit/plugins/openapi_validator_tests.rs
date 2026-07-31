@@ -8546,6 +8546,78 @@ async fn sibling_instances_decide_independently() {
 }
 
 #[tokio::test]
+async fn response_only_sibling_keeps_its_backend_final_fallback_after_route_rewrite() {
+    let selected = Arc::new(OpenapiValidator::new(&attestation_config("block")).unwrap());
+    let fallback = Arc::new(
+        OpenapiValidator::new(&json!({
+            "enforcement_mode": "block",
+            "schema_draft": "draft7",
+            "operations": [
+                {
+                    "method": "POST",
+                    "path_template": "/orders",
+                    "path_regex": "^/orders$",
+                    "responses": {
+                        "200": {
+                            "content": {
+                                "application/json": {"type": "object"}
+                            }
+                        }
+                    }
+                },
+                {
+                    "method": "POST",
+                    "path_template": "/rewritten",
+                    "path_regex": "^/rewritten$",
+                    "request_required": true,
+                    "request_body": {
+                        "content": {
+                            "application/json": {
+                                "type": "object",
+                                "required": ["rewritten_contract"]
+                            }
+                        }
+                    }
+                }
+            ]
+        }))
+        .unwrap(),
+    );
+    let plugins: Vec<Arc<dyn Plugin>> = vec![selected, fallback.clone()];
+    let mut ctx = orders_ctx();
+    let headers = json_headers();
+
+    assert_continue(
+        apply_client_request_contract_validation_for_test(
+            &plugins,
+            &mut ctx,
+            &headers,
+            br#"{"id":"a","client_attestation":"real"}"#,
+        )
+        .await,
+    );
+
+    // The second instance matched a response-only operation above, so it did
+    // not decide a client request contract. A later before_proxy route rewrite
+    // can still select one of its request-contract operations, and the final
+    // fallback must enforce that new match.
+    ctx.path = "/rewritten".to_string();
+    let mut rewritten_headers = headers.clone();
+    assert_continue(fallback.before_proxy(&mut ctx, &mut rewritten_headers).await);
+    assert_reject(
+        fallback
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &rewritten_headers,
+                br#"{"wrong":"shape"}"#,
+            )
+            .await,
+        Some(400),
+    );
+    assert_eq!(contract_phase(&ctx), Some("backend_final"));
+}
+
+#[tokio::test]
 async fn log_only_records_the_client_decision_without_blocking() {
     let plugin = OpenapiValidator::new(&attestation_config("log_only")).unwrap();
     let mut ctx = orders_ctx();

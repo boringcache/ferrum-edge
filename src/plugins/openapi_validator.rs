@@ -1033,6 +1033,15 @@ impl OpenapiValidator {
             self.mark_skip(ctx, "no_match");
             return PluginResult::Continue;
         };
+        // The shared runner is activated when at least one effective plugin
+        // instance selected the client-contract phase. A sibling instance can
+        // still match a response-only operation on this request. That sibling
+        // has taken no request-contract decision and must remain eligible for
+        // the backend-final fallback if a later before_proxy rewrite selects
+        // one of its request-contract operations.
+        if !Self::operation_has_request_contract(operation) {
+            return PluginResult::Continue;
+        }
         self.mark_decided(ctx, phase);
         self.mark_operation_entry(ctx, operation);
         ctx.metadata
