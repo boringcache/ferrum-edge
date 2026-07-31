@@ -78,8 +78,8 @@ async fn start_grpc_echo_backend() -> (u16, tokio::task::JoinHandle<()>) {
 }
 
 /// Same as [`start_grpc_echo_backend`], plus non-vacuous per-method hit counters.
-async fn start_grpc_echo_backend_with_hits()
--> (u16, Arc<GrpcEchoHits>, tokio::task::JoinHandle<()>) {
+async fn start_grpc_echo_backend_with_hits() -> (u16, Arc<GrpcEchoHits>, tokio::task::JoinHandle<()>)
+{
     let reservation = reserve_port()
         .await
         .expect("Failed to reserve gRPC echo backend port");
@@ -345,13 +345,8 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
                 }
             };
 
-        match wait_for_owned_gateway(
-            &mut child,
-            admin_port,
-            &observability_token,
-            gateway_port,
-        )
-        .await
+        match wait_for_owned_gateway(&mut child, admin_port, &observability_token, gateway_port)
+            .await
         {
             Ok(()) => return (child, gateway_port, admin_port),
             Err(e) => {
