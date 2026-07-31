@@ -45,6 +45,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Matched VirtualService route-level request/response header transforms remain
+  authoritative under multiple same-type transformer instances
+  (GHSA-3xxr-xhhj-9962). Previously each enabled `request_transformer` /
+  `response_transformer` applied its static rules and then consumed the shared
+  route-override list, so a later instance could re-add, rename into, or
+  overwrite a backend- or client-bound field the matched route had removed or
+  set. Enabled instances now apply only static header rules; proxy core applies
+  each matched route list exactly once after the last eligible instance on the
+  request and response chains (ordinary H1/H2/H3, synthetic/rejection,
+  header-capability simulation, and deadline provenance paths). Disabled RTDS
+  instances stay complete no-ops and do not suppress route overrides. Query and
+  body transform ordering is unchanged.
+
 - Irreversible request egress no longer precedes request-body transformation or
   final request policy (GHSA-4vr5-4wm3-x5xv). `request_mirror` and
   `serverless_function` previously ran their external dispatch in
