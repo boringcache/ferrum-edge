@@ -442,10 +442,8 @@ fn harness_capture_diagnostics_scrub_secrets_and_bound_output() {
         "startup failed redis_url=redis://user:s3cret@127.0.0.1:6379/0 \
          jwt={jwt_secret} token={observability} hmac={short_hmac}"
     );
-    let scrubbed_sensitive = scrub_gateway_capture_for_diagnostics(
-        &sensitive,
-        &[jwt_secret, observability, short_hmac],
-    );
+    let scrubbed_sensitive =
+        scrub_gateway_capture_for_diagnostics(&sensitive, &[jwt_secret, observability, short_hmac]);
 
     assert!(
         !scrubbed_sensitive.contains(jwt_secret),
@@ -469,10 +467,8 @@ fn harness_capture_diagnostics_scrub_secrets_and_bound_output() {
     );
 
     let oversized = format!("{}{}", "x".repeat(20_000), sensitive);
-    let scrubbed_oversized = scrub_gateway_capture_for_diagnostics(
-        &oversized,
-        &[jwt_secret, observability, short_hmac],
-    );
+    let scrubbed_oversized =
+        scrub_gateway_capture_for_diagnostics(&oversized, &[jwt_secret, observability, short_hmac]);
     assert!(
         scrubbed_oversized.starts_with("…[truncated]…\n"),
         "oversized capture must be truncated from the front: {}",
