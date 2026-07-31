@@ -110,7 +110,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   header is rejected, while a well-formed frame carrying an empty proto3
   message is validated normally. Response-side no-body exemptions are now
   explicit and protocol-correct (`1xx`, `204`, `205`, `304`, `HEAD` responses,
-  and gRPC Trailers-Only *error* replies with a single valid non-zero
+  and empty terminal gRPC *error* replies with a single valid non-zero
   `grpc-status`); an ordinary body-bearing success such as `200` with an empty
   body, or an empty `grpc-status: 0` unary reply, is no longer exempt. All
   fail-closed diagnostics are fixed strings that never log or echo body bytes.

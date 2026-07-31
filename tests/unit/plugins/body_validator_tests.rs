@@ -2641,8 +2641,8 @@ async fn test_protobuf_empty_response_transport_body_fails_closed() {
         );
     }
 
-    // Trailers-Only error: a single valid non-zero terminal status and no
-    // message frame is the legitimate empty native-gRPC response body.
+    // Terminal error: a single valid non-zero status and no message frame is
+    // the legitimate empty native-gRPC response body.
     let mut trailers_only = headers.clone();
     trailers_only.insert("grpc-status".to_string(), "5".to_string());
     assert_continue(

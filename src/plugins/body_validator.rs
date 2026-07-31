@@ -18,9 +18,10 @@
 //! applies, an unusual method, an empty body, an uninspectable (non-UTF-8) body,
 //! or a missing buffered representation is a rejection — never a silent
 //! `Continue`. The only exemptions are the ones the protocol itself defines:
-//! gRPC Trailers-Only *error* replies (a single valid non-zero `grpc-status` in
-//! the initial HEADERS block), and HTTP responses that carry no content by
-//! status/method semantics (1xx, 204, 205, 304, and responses to `HEAD`).
+//! empty native-gRPC error replies (a single valid non-zero terminal
+//! `grpc-status` in the hook-visible metadata), and HTTP responses that carry no
+//! content by status/method semantics (1xx, 204, 205, 304, and responses to
+//! `HEAD`).
 //!
 //! Every configuration surface is fail-closed: unknown top-level keys, unknown keys
 //! inside a `protobuf_method_messages` entry, malformed schemas, unsupported drafts
@@ -2571,21 +2572,21 @@ fn response_has_no_content_by_protocol(method: &str, status: u16) -> bool {
         || matches!(status, 204 | 205 | 304)
 }
 
-/// `true` when a gRPC reply is a legitimate Trailers-Only *error* response:
-/// the complete terminal metadata rides in the initial HEADERS block and no
-/// message frame is sent.
+/// `true` when an empty gRPC reply is a legitimate terminal error response:
+/// the hook-visible header map carries one unambiguous non-zero terminal status
+/// and no message frame is sent.
 ///
 /// A successful unary response (`grpc-status: 0`), including
 /// `google.protobuf.Empty`, still requires a real five-byte gRPC frame, so OK
 /// must not create an empty-body exemption. Malformed, CR/LF-joined duplicate,
 /// or otherwise unparsable `grpc-status` values also must not — only one valid
 /// non-zero standard gRPC status (`1..=16`) legitimizes an empty error body.
-fn grpc_response_is_trailers_only(response_headers: &HashMap<String, String>) -> bool {
+fn grpc_empty_response_is_terminal_error(response_headers: &HashMap<String, String>) -> bool {
     let Some(raw) = response_headers.get("grpc-status") else {
         return false;
     };
     // Buffered collection may LF-join duplicate occurrences. Preferring any
-    // occurrence would let a hostile/ambiguous field look like a Trailers-Only
+    // occurrence would let a hostile/ambiguous field look like a terminal
     // error; refuse the exemption unless the field is a single clean value.
     if raw.contains('\n') || raw.contains('\r') {
         return false;
@@ -2936,11 +2937,12 @@ impl Plugin for BodyValidator {
             if !self.has_protobuf_response_validation {
                 return PluginResult::Continue;
             }
-            // A Trailers-Only *error* reply carries a single valid non-zero
-            // `grpc-status` in the initial HEADERS block and legitimately sends
-            // no message. `grpc-status: 0` and malformed/duplicate status values
-            // still require a five-byte frame and fail validation below.
-            if body.is_empty() && grpc_response_is_trailers_only(response_headers) {
+            // An empty terminal *error* reply carries a single valid non-zero
+            // `grpc-status` in the hook-visible merged header/trailer view and
+            // legitimately sends no message. `grpc-status: 0` and
+            // malformed/duplicate status values still require a five-byte frame
+            // and fail validation below.
+            if body.is_empty() && grpc_empty_response_is_terminal_error(response_headers) {
                 return PluginResult::Continue;
             }
             // Resolve the gRPC method path from the request, NOT response headers.

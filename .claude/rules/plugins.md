@@ -188,7 +188,7 @@ on a native-gRPC request.
   transport's own empty proof, and fails closed otherwise. The final
   request-body hook still validates the exact backend-visible bytes. Native
   gRPC always runs `parse_grpc_frame`. The only exemptions are protocol-defined:
-  gRPC Trailers-Only *error* replies (a single valid non-zero `grpc-status`),
+  empty terminal gRPC *error* replies (a single valid non-zero `grpc-status`),
   and responses with no content by status/method semantics (1xx, 204, 205, 304,
   `HEAD`). Fail-closed diagnostics are fixed strings and never echo body bytes.
 - A configured finalized-egress plugin forces buffered request-body

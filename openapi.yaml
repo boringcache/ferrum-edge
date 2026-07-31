@@ -19275,7 +19275,7 @@ components:
         applies, an empty, absent, or non-UTF-8 representation fails closed
         (400 request, 502 response) instead of being skipped, and native gRPC
         always runs frame validation. The only exemptions are protocol-defined:
-        gRPC Trailers-Only error replies (a single valid non-zero grpc-status),
+        empty terminal gRPC error replies (a single valid non-zero grpc-status),
         and responses that carry no content by status/method semantics (1xx,
         204, 205, 304, and responses to HEAD). Early before_proxy inspection
         prefers a rewritten UTF-8 request_body metadata view when present,
