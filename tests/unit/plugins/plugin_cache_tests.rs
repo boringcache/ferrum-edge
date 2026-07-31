@@ -3779,12 +3779,10 @@ fn candidate_and_runtime_agree_on_early_egress_with_stream_enabled_waf() {
         vec![make_proxy("p1", "/api", vec!["early-egress", "waf"])],
         vec![tcp_egress, stream_waf()],
     );
-    validate_plugin_composition_candidate_with_real_ip_header_for_test(&tcp_safe, None).expect(
-        "candidate admission must admit TCP-only early egress with stream-enabled WAF",
-    );
-    PluginCache::new(&tcp_safe).expect(
-        "runtime PluginCache must admit TCP-only early egress with stream-enabled WAF",
-    );
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&tcp_safe, None)
+        .expect("candidate admission must admit TCP-only early egress with stream-enabled WAF");
+    PluginCache::new(&tcp_safe)
+        .expect("runtime PluginCache must admit TCP-only early egress with stream-enabled WAF");
 
     let http_egress = make_plugin_config_with_json(
         "early-egress",
