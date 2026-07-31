@@ -961,6 +961,7 @@ independently attributable without logging request credentials.
 - `read_write_timeout` — backend read or write exceeded the configured watermark
 - `protocol_error` — HTTP/2 or HTTP/3 protocol-level error after a stream is opened (RST_STREAM, GOAWAY, RFC 6455 WS protocol violation)
 - `response_body_too_large` / `request_body_too_large` — body exceeded the configured maximum
+- `gateway_buffer_capacity` — the gateway's aggregate budget for retained (buffered) response bodies refused this response; gateway-local transient capacity, health-neutral, surfaced as `503` / gRPC `RESOURCE_EXHAUSTED`
 - `connection_pool_error` — could not acquire/create an HTTP client from the pool
 - `port_exhaustion` — EADDRNOTAVAIL — all ephemeral ports in use
 - `client_disconnect` — client gave up before the gateway could complete the response

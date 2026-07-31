@@ -922,16 +922,19 @@ fn reqwest_error_response_for_cross_protocol(
 /// here means "unlimited", which is a streaming policy the retained path cannot
 /// honor, so it is folded to the fail-closed fallback ceiling
 /// (GHSA-pwcm-6rh8-f2gh). Retained bytes are charged against the process-wide
-/// aggregate budget as they accumulate; the reservation is released on every
-/// exit, including the caller dropping this future.
+/// aggregate budget as they accumulate. On success the charge is MOVED into the
+/// returned `Bytes`, so it is released when the payload is dropped rather than
+/// when this function returns; on every failure path (including the caller
+/// dropping this future) the reservation drops and the blocks return.
 ///
 /// The failure arm carries the client-visible status because the two refusals
-/// are not the same fault: an oversized body is the origin's (`502`), while an
-/// exhausted retention budget is transient gateway capacity (`503`).
+/// are not the same fault: an oversized body is the origin's (`502`,
+/// `ResponseBodyTooLarge`), while an exhausted retention budget is transient
+/// gateway capacity (`503`, the health-neutral `GatewayBufferCapacity`).
 async fn collect_reqwest_response_body_with_limit(
     mut response: reqwest::Response,
     max_response_body_size_bytes: usize,
-) -> Result<Vec<u8>, (u16, Vec<u8>, Option<ErrorClass>)> {
+) -> Result<bytes::Bytes, (u16, Vec<u8>, Option<ErrorClass>)> {
     use crate::proxy::response_buffer_budget;
 
     let max_response_body_size_bytes =
@@ -960,12 +963,16 @@ async fn collect_reqwest_response_body_with_limit(
                         response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY
                             .as_bytes()
                             .to_vec(),
-                        Some(ErrorClass::ResponseBodyTooLarge),
+                        Some(response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS),
                     ));
                 }
                 body.extend_from_slice(&chunk);
             }
-            Ok(None) => return Ok(body),
+            Ok(None) => {
+                // Hand the charge to the retained allocation so it outlives
+                // this collector.
+                return Ok(response_buffer_budget::charged_bytes(body, reservation));
+            }
             Err(error) => {
                 warn!("cross-protocol H3→HTTP: failed to read buffered response body: {error}");
                 return Err((
@@ -5299,8 +5306,12 @@ where
                         http_status,
                     );
                 let synced_len = owned_body.len();
-                crate::retry::ResponseBody::store_buffered_vec(&mut response_body, owned_body);
-                if synced {
+                let stored = crate::proxy::store_charged_grpc_web_reframed_body(
+                    &mut response_body,
+                    &mut plugin_response_headers,
+                    owned_body,
+                );
+                if stored && synced {
                     plugin_response_headers
                         .insert("content-length".to_string(), synced_len.to_string());
                 }
@@ -5688,6 +5699,13 @@ where
                 grpc_proxy::GrpcProxyError::ResponseTooLarge(_) => (
                     grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                     "Response payload exceeded limit",
+                ),
+                // Gateway-local retention capacity, not an oversized payload:
+                // same resource/capacity status, distinct fixed message, and a
+                // health-neutral error class (GHSA-pwcm-6rh8-f2gh).
+                grpc_proxy::GrpcProxyError::ResponseBufferCapacity(_) => (
+                    crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+                    crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
                 ),
                 grpc_proxy::GrpcProxyError::Internal(_) => {
                     (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")
@@ -6099,6 +6117,13 @@ pub(crate) async fn dispatch_grpc_streaming(
                 grpc_proxy::GrpcProxyError::ResponseTooLarge(_) => (
                     grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                     "Response payload exceeded limit",
+                ),
+                // Gateway-local retention capacity, not an oversized payload:
+                // same resource/capacity status, distinct fixed message, and a
+                // health-neutral error class (GHSA-pwcm-6rh8-f2gh).
+                grpc_proxy::GrpcProxyError::ResponseBufferCapacity(_) => (
+                    crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+                    crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
                 ),
                 grpc_proxy::GrpcProxyError::Internal(_) => {
                     (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")

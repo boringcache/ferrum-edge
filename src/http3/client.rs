@@ -274,7 +274,11 @@ impl From<h3::error::StreamError> for H3BodyDrainError {
 #[derive(Debug)]
 pub struct H3BufferedResponse {
     pub status: u16,
-    pub body: Vec<u8>,
+    /// The drained payload, published as cheaply cloneable [`bytes::Bytes`]
+    /// whose owner also holds the retained-response budget permit that paid for
+    /// it (GHSA-pwcm-6rh8-f2gh). Cloning shares the one charge; the budget is
+    /// returned when the last handle drops.
+    pub body: bytes::Bytes,
     pub headers: HashMap<String, String>,
     pub trailers: Option<http::HeaderMap>,
 }
@@ -312,26 +316,43 @@ pub(crate) async fn drain_h3_response_body(
     content_length: Option<u64>,
     max_response_body_size_bytes: usize,
     backend_read_timeout_ms: u64,
-) -> Result<(Vec<u8>, Option<http::HeaderMap>), H3BodyDrainError> {
+) -> Result<(bytes::Bytes, Option<http::HeaderMap>), H3BodyDrainError> {
+    use crate::proxy::response_buffer_budget;
+
     // This helper only ever RETAINS the body, so the documented streaming
     // `0 = unlimited` cannot apply here: it is folded to the fail-closed
     // fallback ceiling, and retained bytes are additionally charged against the
-    // process-wide aggregate budget (GHSA-pwcm-6rh8-f2gh). The reservation is
-    // released when it drops — success, refusal, timeout, stream error, or the
-    // caller dropping this future.
+    // process-wide aggregate budget (GHSA-pwcm-6rh8-f2gh). On success the charge
+    // is handed to the returned `Bytes`, so it lives exactly as long as the
+    // payload does; on every other exit — refusal, timeout, stream error, or the
+    // caller dropping this future — the reservation drops and the blocks return.
     let max_response_body_size_bytes =
-        crate::proxy::response_buffer_budget::buffered_response_body_ceiling(
-            max_response_body_size_bytes,
-        );
-    let mut reservation = crate::proxy::response_buffer_budget::ResponseBufferReservation::new();
+        response_buffer_budget::buffered_response_body_ceiling(max_response_body_size_bytes);
+    let mut reservation = response_buffer_budget::ResponseBufferReservation::new();
     if content_length.is_some_and(|len| len > max_response_body_size_bytes as u64) {
         return Err(H3BodyDrainError::ResponseTooLarge {
             limit: max_response_body_size_bytes,
         });
     }
 
+    // Preallocation is resident the instant it is requested, so it is charged
+    // BEFORE `Vec::with_capacity`. Without this a flood of responses that
+    // advertise a large `content-length` and then send nothing (or stall) could
+    // each hold up to `H3_BODY_PREALLOC_CAP_BYTES` outside the budget. Later
+    // growth is charged as a delta against this same reservation, so a
+    // preallocated response is never charged twice.
     let mut body = match content_length {
-        Some(cl) => Vec::with_capacity(cl.min(H3_BODY_PREALLOC_CAP_BYTES) as usize),
+        // A declared zero length allocates nothing, so it is deliberately not
+        // charged: charging the one-block rounding for every empty response
+        // would let bodyless traffic consume the budget it never occupies.
+        Some(cl) if cl > 0 => {
+            let prealloc = cl.min(H3_BODY_PREALLOC_CAP_BYTES) as usize;
+            if !reservation.reserve(prealloc) {
+                return Err(H3BodyDrainError::BufferBudgetExhausted);
+            }
+            Vec::with_capacity(prealloc)
+        }
+        Some(_) => Vec::new(),
         None => Vec::new(),
     };
     loop {
@@ -428,7 +449,14 @@ pub(crate) async fn drain_h3_response_body(
             return Err(e.into());
         }
     };
-    Ok((body, trailers))
+    // Hand the charge to the retained allocation: from here the permit belongs
+    // to the returned `Bytes` (and to every cheap clone of it, exactly once),
+    // so it is returned when the payload is dropped rather than when this
+    // function returns.
+    Ok((
+        response_buffer_budget::charged_bytes(body, reservation),
+        trailers,
+    ))
 }
 
 /// Read backend response trailers, bounded by `backend_read_timeout_ms`.
@@ -3243,7 +3271,11 @@ impl Http3Client {
         let (response_body, _trailers) =
             drain_h3_response_body(&mut stream, method, status, content_length, 0, 0).await?;
 
-        Ok((status, response_body, response_headers))
+        // This helper's callers want an owned `Vec`; the shared drain helper
+        // returns budget-charged `Bytes`, so copy out here and let the charge
+        // release with the temporary. This is a diagnostic/integration client,
+        // not a proxy path.
+        Ok((status, response_body.to_vec(), response_headers))
     }
 }
 

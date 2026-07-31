@@ -1698,6 +1698,44 @@ impl HeldResponseBufferPermit {
     }
 }
 
+/// Aggregate-budget charge for plugin-authored REPLACEMENTS of the retained
+/// response body (GHSA-pwcm-6rh8-f2gh).
+///
+/// A collected body carries its own charge inside its `Bytes` owner, so it is
+/// accounted for its whole residency. A plugin phase that installs a *different*
+/// allocation (a normalizer's reshaped representation, a
+/// `transform_response_body` rewrite, a decoded representation) escapes that
+/// charge: the old `Bytes` drops and returns its permit while the new bytes are
+/// uncharged. This holds the charge for those replacements.
+///
+/// It is a single MONOTONIC reservation for the request rather than one per
+/// replacement: successive rewrites in one request charge only the high-water
+/// mark, which is conservative (the peak is never under-charged) and cannot
+/// double-count a rewrite chain. It is released when the request context drops,
+/// which is when the last request-scoped view of the replacement body is gone.
+///
+/// Clones are empty for the same reason [`HeldResponseBufferPermit`]'s are: a
+/// compatibility clone must not mint a second charge, and the original still
+/// holds it.
+#[derive(Default)]
+struct HeldResponseBodyReplacementCharge(
+    crate::proxy::response_buffer_budget::ResponseBufferReservation,
+);
+
+impl std::fmt::Debug for HeldResponseBodyReplacementCharge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("HeldResponseBodyReplacementCharge")
+            .field(&self.0.reserved_bytes())
+            .finish()
+    }
+}
+
+impl Clone for HeldResponseBodyReplacementCharge {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
 /// Complete provenance of the response-side presentation policy a finalized
 /// replay (`RequestContext::finalized_response_replay`) intentionally skips.
 ///
@@ -2362,6 +2400,10 @@ pub struct RequestContext {
     /// releases this slot on cancellation; clones do not duplicate the
     /// exclusive permit.
     compression_response_buffer_permit: HeldResponseBufferPermit,
+    /// Aggregate retained-response-budget charge covering plugin-authored
+    /// REPLACEMENTS of the buffered response body (GHSA-pwcm-6rh8-f2gh). See
+    /// [`HeldResponseBodyReplacementCharge`].
+    response_body_replacement_charge: HeldResponseBodyReplacementCharge,
     /// Validated plaintext staged by the rare buffered request-decode fallback
     /// (headers stripped in `before_proxy` without a mutable body view). The
     /// owning transform must emit these bytes so the backend never sees a
@@ -2852,6 +2894,7 @@ impl RequestContext {
             compression_response_admission_owner: None,
             compression_response_admission_declined: false,
             compression_response_buffer_permit: HeldResponseBufferPermit::default(),
+            response_body_replacement_charge: HeldResponseBodyReplacementCharge::default(),
             compression_staged_request_plaintext: None,
             compression_response_encode_aborted: false,
             response_stream_id: None,
@@ -3204,6 +3247,25 @@ impl RequestContext {
         &mut self,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
         self.compression_response_buffer_permit.take()
+    }
+
+    /// Charge `replacement_len` retained bytes for a plugin-authored
+    /// replacement of the buffered response body, against the process-wide
+    /// retained-response budget (GHSA-pwcm-6rh8-f2gh).
+    ///
+    /// Returns `false` when the budget cannot admit the growth; the caller MUST
+    /// fail closed and must not install the replacement. Non-blocking: it never
+    /// queues behind other buffers.
+    ///
+    /// Monotonic for the request: a rewrite chain is charged at its high-water
+    /// mark rather than cumulatively, and a shrinking rewrite keeps the peak
+    /// (conservative — the budget is never under-charged while a request is
+    /// still able to grow the body again). The charge is released when this
+    /// context drops.
+    pub(crate) fn charge_replacement_response_body(&mut self, replacement_len: usize) -> bool {
+        self.response_body_replacement_charge
+            .0
+            .reserve(replacement_len)
     }
 
     pub(crate) fn set_compression_staged_request_plaintext(&mut self, plaintext: Vec<u8>) {
@@ -3793,6 +3855,7 @@ impl RequestContext {
             // (only `metadata`/WAF/AI state is copied back), releasing admission
             // while the live context still owns the response encode.
             compression_response_buffer_permit: HeldResponseBufferPermit::default(),
+            response_body_replacement_charge: HeldResponseBodyReplacementCharge::default(),
             compression_staged_request_plaintext: std::mem::take(
                 &mut self.compression_staged_request_plaintext,
             ),
@@ -5298,6 +5361,32 @@ pub async fn normalize_response_body_for_inspection(
             }
         };
         if let Some(body) = body {
+            // A normalizer installs a DIFFERENT allocation than the one the
+            // collector charged, so the replacement is charged before it is
+            // retained. Refusal fails closed: the oversized replacement is
+            // dropped unread and the fixed, redaction-safe overload payload is
+            // installed instead (GHSA-pwcm-6rh8-f2gh).
+            //
+            // Residual: this hook has no mutable status, so the HTTP status the
+            // backend chose is preserved on that refusal (a gRPC-flavored
+            // response still terminates correctly through its terminal
+            // metadata, which the caller reconciles from the header map). The
+            // memory bound holds either way — the refused bytes are never
+            // retained.
+            if !ctx.charge_replacement_response_body(body.len()) {
+                warn!(
+                    plugin = plugin.name(),
+                    "Response normalization refused: aggregate retained-response budget exhausted"
+                );
+                let refusal =
+                    crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes();
+                response_headers.insert("content-length".to_string(), refusal.len().to_string());
+                *response_body = bytes::Bytes::from_static(
+                    crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes(),
+                );
+                ctx.record_deadline_response_header_mutations(response_headers);
+                return true;
+            }
             response_headers.insert("content-length".to_string(), body.len().to_string());
             *response_body = bytes::Bytes::from(body);
             normalized = true;

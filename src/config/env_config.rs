@@ -1678,10 +1678,18 @@ pub struct EnvConfig {
     /// Aggregate ceiling (bytes) on everything concurrent buffered responses
     /// retain at once. A finite per-response ceiling still multiplies by
     /// concurrency, so this is the bound that actually caps gateway memory under
-    /// a flood of buffered responses. A response that cannot reserve capacity is
-    /// refused with `503` instead of being collected. Clamped up to at least one
-    /// per-response ceiling so the gateway always admits one buffered response.
-    /// Default: 268435456 (256 MiB).
+    /// a flood of buffered responses. The charge travels with the retained bytes
+    /// and is returned only when they are dropped, so this bounds *resident*
+    /// memory rather than collection time. A response that cannot reserve
+    /// capacity is refused with `503` / gRPC `RESOURCE_EXHAUSTED` instead of
+    /// being collected.
+    ///
+    /// Clamped up to at least the FALLBACK per-response ceiling
+    /// ([`Self::response_buffer_fallback_max_bytes`]) and nothing else: one
+    /// fallback-sized response is always admissible, but an arbitrarily larger
+    /// configured or route-effective per-response ceiling is NOT — widening the
+    /// aggregate cap to fit one huge response would hand the memory bound back
+    /// to whoever picks the response. Default: 268435456 (256 MiB).
     pub response_buffer_max_total_bytes: usize,
     /// Cutoff (bytes) below which response bodies with a known Content-Length
     /// are eagerly buffered into a single allocation instead of streamed

@@ -18955,6 +18955,29 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
             }
         };
         if let Some(transformed) = transformed {
+            // The transform installs a DIFFERENT allocation than the one the
+            // collector charged (and a decode can be far larger than its
+            // input), so the replacement is charged before it is retained.
+            // Refusal fails closed with the neutral gateway-capacity terminal
+            // rather than retaining uncharged bytes (GHSA-pwcm-6rh8-f2gh).
+            if !ctx.charge_replacement_response_body(transformed.len()) {
+                warn!(
+                    plugin = plugin.name(),
+                    "Response body transform refused: aggregate retained-response budget exhausted"
+                );
+                *response_status = response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS;
+                *response_body = Bytes::from_static(
+                    response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes(),
+                );
+                response_headers.insert("content-type".to_string(), "application/json".to_string());
+                response_headers
+                    .insert("content-length".to_string(), response_body.len().to_string());
+                // The gateway authored these bytes, so a backend-declared
+                // encoding no longer describes them.
+                response_headers.retain(|name, _| !name.eq_ignore_ascii_case("content-encoding"));
+                ctx.record_deadline_response_header_mutations(response_headers);
+                return (true, true);
+            }
             response_headers.insert("content-length".to_string(), transformed.len().to_string());
             *response_body = Bytes::from(transformed);
             crate::plugins::finalize_response_body_transformation(
@@ -25027,10 +25050,15 @@ async fn handle_proxy_request_inner(
                 // ClientDisconnect -> record_neutral. An oversized BACKEND
                 // response is GrpcProxyError::ResponseTooLarge (NOT
                 // ResourceExhausted) and falls to the failure arm below, matching
-                // the HTTP path's ResponseBodyTooLarge -> 502.
+                // the HTTP path's ResponseBodyTooLarge -> 502. An exhausted
+                // GATEWAY retention budget (ResponseBufferCapacity) is neutral
+                // here for the opposite reason: the backend answered correctly
+                // and within every configured ceiling, so a process-global
+                // memory bound must not trip its breaker (GHSA-pwcm-6rh8-f2gh).
                 Err(
                     GrpcProxyError::ClientDeadlineExceeded(_)
                     | GrpcProxyError::ResourceExhausted(_)
+                    | GrpcProxyError::ResponseBufferCapacity(_)
                     | GrpcProxyError::Internal(_),
                 ) => {
                     grpc_probe_guard.disarm();
@@ -26211,8 +26239,12 @@ async fn handle_proxy_request_inner(
                             http_status,
                         );
                         let synced_len = owned_body.len();
-                        ResponseBody::store_buffered_vec(&mut response_body, owned_body);
-                        if synced {
+                        let stored = store_charged_grpc_web_reframed_body(
+                            &mut response_body,
+                            &mut plugin_response_headers,
+                            owned_body,
+                        );
+                        if stored && synced {
                             plugin_response_headers
                                 .insert("content-length".to_string(), synced_len.to_string());
                         }
@@ -26502,6 +26534,9 @@ async fn handle_proxy_request_inner(
                     &e,
                     GrpcProxyError::ClientDeadlineExceeded(_)
                         | GrpcProxyError::ResourceExhausted(_)
+                        // Gateway-local retention capacity: the backend did
+                        // nothing wrong, so it trains no backend accounting.
+                        | GrpcProxyError::ResponseBufferCapacity(_)
                         | GrpcProxyError::Internal(_)
                 ) && let Some(permits) = backend_admission_permits.take()
                 {
@@ -26517,6 +26552,7 @@ async fn handle_proxy_request_inner(
                         &e,
                         GrpcProxyError::ClientDeadlineExceeded(_)
                             | GrpcProxyError::ResourceExhausted(_)
+                            | GrpcProxyError::ResponseBufferCapacity(_)
                             | GrpcProxyError::Internal(_)
                     )
                 {
@@ -26550,12 +26586,20 @@ async fn handle_proxy_request_inner(
                     GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::ResponseTooLarge(_) => {
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED
                     }
+                    GrpcProxyError::ResponseBufferCapacity(_) => {
+                        response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS
+                    }
                     GrpcProxyError::Internal(_) => grpc_proxy::grpc_status::UNAVAILABLE,
                 };
                 // Use a generic client-facing message to avoid leaking
                 // internal backend details (hostnames, DNS errors, etc.).
                 let msg = match &e {
                     GrpcProxyError::ClientDeadlineExceeded(_) => GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                    // Fixed, redaction-safe, and deliberately distinguishable
+                    // from the backend's own "payload too large" refusal.
+                    GrpcProxyError::ResponseBufferCapacity(_) => {
+                        response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE
+                    }
                     _ if grpc_code == grpc_proxy::grpc_status::DEADLINE_EXCEEDED => {
                         "Backend deadline exceeded"
                     }
@@ -28111,8 +28155,16 @@ async fn handle_proxy_request_inner(
                 http_status,
             );
             let synced_len = owned_body.len();
-            ResponseBody::store_buffered_vec(data, owned_body);
-            if synced {
+            // `take_buffered_vec` copied out of the charged owner and dropped
+            // its permit, so the rewritten frame is a fresh allocation that has
+            // to be charged before it is retained. The rewrite only reframes an
+            // already-admitted body (it appends a trailer frame), so a refusal
+            // here means the budget is genuinely exhausted; fail closed with the
+            // neutral gRPC capacity terminal rather than retaining uncharged
+            // bytes (GHSA-pwcm-6rh8-f2gh).
+            let stored =
+                store_charged_grpc_web_reframed_body(data, &mut response_headers, owned_body);
+            if stored && synced {
                 response_headers.insert("content-length".to_string(), synced_len.to_string());
                 // Mirror H1/H2/H3: after body-framing trailers, retire
                 // trailer-only application metadata from initial headers while
@@ -28122,6 +28174,11 @@ async fn handle_proxy_request_inner(
                     &mut trailers,
                     &shadowed_keys,
                 );
+            }
+            if !stored {
+                // The neutral gRPC capacity terminal replaced the body, so no
+                // later final-body validator may overwrite it.
+                response_body_rejected = true;
             }
         } else {
             let _ = ctx.take_buffered_initial_response_header_policy();
@@ -32472,17 +32529,18 @@ impl BufferedCollectFailure {
         }
     }
 
-    /// Aggregate buffered-response budget exhausted. Reuses
-    /// `ResponseBodyTooLarge` as the retry/telemetry class — both mean "this
-    /// body will not be retained", and neither is retryable against another
-    /// upstream — while carrying the distinct `503` to the client.
+    /// Aggregate buffered-response budget exhausted. Carries the neutral
+    /// gateway-capacity class, NOT `ResponseBodyTooLarge`: the backend behaved
+    /// correctly and stayed within every configured per-response ceiling, so
+    /// this refusal must not ding its passive health, trip its circuit breaker,
+    /// or shrink its adaptive-concurrency permit.
     fn budget_exhausted() -> Self {
         Self {
             status_code: response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS,
             body: response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY
                 .as_bytes()
                 .to_vec(),
-            error_class: retry::ErrorClass::ResponseBodyTooLarge,
+            error_class: response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS,
         }
     }
 }
@@ -32493,12 +32551,18 @@ impl BufferedCollectFailure {
 /// ([`response_buffer_budget::buffered_response_body_ceiling`]), never the raw
 /// `0 = unlimited` value: retaining an unbounded body is not a policy this path
 /// can honor. Retained bytes are additionally charged against the process-wide
-/// budget as they accumulate, and the reservation is released on every exit —
-/// success, size rejection, read error, or the future being dropped.
+/// budget as they accumulate.
+///
+/// On success the charge is MOVED into the returned [`Bytes`], whose owner
+/// holds the permit: every cheap clone shares that one charge and the budget is
+/// returned only when the last handle drops. That is what makes the aggregate
+/// cap a bound on *resident* bytes rather than on collection time. On every
+/// failure path — size rejection, read error, or the future being dropped — the
+/// reservation drops and the blocks return immediately.
 async fn collect_response_with_limit(
     response: reqwest::Response,
     max_size: usize,
-) -> Result<(Vec<u8>, usize), BufferedCollectFailure> {
+) -> Result<(Bytes, usize), BufferedCollectFailure> {
     use futures_util::StreamExt as _;
     let mut body = Vec::new();
     let mut reservation = response_buffer_budget::ResponseBufferReservation::new();
@@ -32528,7 +32592,10 @@ async fn collect_response_with_limit(
         }
     }
     let len = body.len();
-    Ok((body, len))
+    Ok((
+        response_buffer_budget::charged_bytes(body, reservation),
+        len,
+    ))
 }
 
 /// Build a `Set-Cookie` header value for sticky session cookie injection.
@@ -33261,12 +33328,16 @@ fn hbone_hyper_error_response(
 }
 
 enum HyperBodyCollectError {
-    /// Either the per-response ceiling or the process-wide aggregate retention
-    /// budget refused these bytes. Both are "this body will not be retained",
-    /// and the direct-H2 / HBONE / mesh-mTLS arms surface them identically as
-    /// the existing `502` too-large refusal; only the reqwest and H3 collectors
-    /// distinguish the aggregate case with a `503` (GHSA-pwcm-6rh8-f2gh).
+    /// The backend's response exceeded the configured per-response ceiling —
+    /// an origin-attributed `502` / `ResponseBodyTooLarge`.
     TooLarge,
+    /// The gateway's process-wide budget for retained response bodies could not
+    /// admit this one. The origin behaved correctly and stayed within every
+    /// configured ceiling, so the direct-H2 / HBONE / mesh-mTLS arms surface
+    /// this as a neutral transient overload refusal rather than a backend fault
+    /// (GHSA-pwcm-6rh8-f2gh) — the same classification the reqwest, H3, and
+    /// gRPC collectors use.
+    BudgetExhausted,
     Read(hyper::Error),
     ReadTimeout { timeout_ms: u64 },
 }
@@ -33275,7 +33346,7 @@ async fn collect_hyper_body_with_limit(
     body: Incoming,
     max_size: usize,
     backend_read_timeout_ms: u64,
-) -> Result<Vec<u8>, HyperBodyCollectError> {
+) -> Result<Bytes, HyperBodyCollectError> {
     collect_hyper_body_and_trailers_with_limit(body, max_size, backend_read_timeout_ms)
         .await
         .map(|(body_bytes, _trailers)| body_bytes)
@@ -33291,12 +33362,14 @@ async fn collect_hyper_body_and_trailers_with_limit(
     mut body: Incoming,
     max_size: usize,
     backend_read_timeout_ms: u64,
-) -> Result<(Vec<u8>, Option<hyper::HeaderMap>), HyperBodyCollectError> {
+) -> Result<(Bytes, Option<hyper::HeaderMap>), HyperBodyCollectError> {
     // This helper only ever RETAINS, so the streaming `0 = unlimited` policy is
     // folded to the fail-closed fallback ceiling and the retained bytes are
-    // charged against the process-wide aggregate budget. The reservation is
-    // released on every exit, including the caller dropping this future
-    // (GHSA-pwcm-6rh8-f2gh).
+    // charged against the process-wide aggregate budget. On success the charge
+    // is MOVED into the returned `Bytes`, so it is released when the payload is
+    // dropped rather than when this function returns; on every failure path
+    // (including the caller dropping this future) the reservation drops and the
+    // blocks return immediately (GHSA-pwcm-6rh8-f2gh).
     let max_size = response_buffer_budget::buffered_response_body_ceiling(max_size);
     let mut reservation = response_buffer_budget::ResponseBufferReservation::new();
     let mut body_bytes = Vec::new();
@@ -33325,10 +33398,8 @@ async fn collect_hyper_body_and_trailers_with_limit(
                 return Err(HyperBodyCollectError::TooLarge);
             }
             if !reservation.reserve(body_bytes.len().saturating_add(data.len())) {
-                warn!(
-                    "Response buffering refused: aggregate retained-response budget exhausted"
-                );
-                return Err(HyperBodyCollectError::TooLarge);
+                warn!("Response buffering refused: aggregate retained-response budget exhausted");
+                return Err(HyperBodyCollectError::BudgetExhausted);
             }
             body_bytes.extend_from_slice(data);
         } else if let Ok(trailer_map) = frame.into_trailers() {
@@ -33340,7 +33411,128 @@ async fn collect_hyper_body_and_trailers_with_limit(
             }
         }
     }
-    Ok((body_bytes, trailers))
+    Ok((
+        response_buffer_budget::charged_bytes(body_bytes, reservation),
+        trailers,
+    ))
+}
+
+/// The gateway's aggregate budget for RETAINED response bodies refused this
+/// response.
+///
+/// One builder for every plain-HTTP transport that retains a body (direct H2,
+/// HBONE, mesh-mTLS non-gRPC, and — via
+/// [`BufferedCollectFailure::budget_exhausted`] and the H3 arms — reqwest and
+/// HTTP/3), so the classification cannot drift per protocol:
+///
+/// * `503`, not `502`. The origin answered correctly and within every
+///   configured per-response ceiling; only the gateway's own retention capacity
+///   was short. A `502` would attribute a gateway-local memory bound to the
+///   backend.
+/// * A fixed, redaction-safe body naming no route, header, credential, or
+///   response content.
+/// * The health-neutral [`retry::ErrorClass::GatewayBufferCapacity`], so this
+///   refusal trips no circuit breaker, dings no passive health, and shrinks no
+///   adaptive-concurrency permit — the budget is process-global, so counting it
+///   against backends would eject every healthy target at once.
+///
+/// True per-response overflow keeps its own `502` / `ResponseBodyTooLarge`
+/// builders, and backend read/protocol failures keep theirs (GHSA-pwcm-6rh8-f2gh).
+fn response_buffer_capacity_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    transport: &'static str,
+) -> retry::BackendResponse {
+    warn!(
+        proxy_id = %proxy.id,
+        transport = transport,
+        "Response buffering refused: aggregate retained-response budget exhausted"
+    );
+    retry::BackendResponse {
+        status_code: response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS,
+        body: ResponseBody::buffered(
+            response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY
+                .as_bytes()
+                .to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS),
+    }
+}
+
+/// gRPC-flavored counterpart of [`response_buffer_capacity_response`].
+///
+/// Same neutral classification, expressed in the gRPC status mapping:
+/// `RESOURCE_EXHAUSTED` (a resource/capacity condition) rather than
+/// `UNAVAILABLE` (which would claim the backend is down) or `INTERNAL` (which
+/// would claim a gateway defect), riding HTTP 200 like every other gRPC error.
+fn mesh_grpc_response_buffer_capacity_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    warn!(
+        proxy_id = %proxy.id,
+        transport = "mesh-mtls-grpc",
+        "gRPC response buffering refused: aggregate retained-response budget exhausted"
+    );
+    let mut headers = HashMap::with_capacity(3);
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(
+        "grpc-status".to_string(),
+        response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS.to_string(),
+    );
+    headers.insert(
+        "grpc-message".to_string(),
+        response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE.to_string(),
+    );
+    retry::BackendResponse {
+        status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
+        body: ResponseBody::buffered(Vec::new()),
+        headers,
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS),
+    }
+}
+
+/// Re-store a gRPC-Web-reframed buffered body under the retained-response
+/// budget.
+///
+/// `ResponseBody::take_buffered_vec` copies out of the charged owner and drops
+/// its permit, so the reframed buffer is a fresh, uncharged allocation. It is
+/// charged before being retained (GHSA-pwcm-6rh8-f2gh). Returns `true` when the
+/// reframed body was stored; on `false` the budget refused it, `response_body`
+/// holds an empty payload, and `response_headers` carries the neutral gRPC
+/// capacity terminal — failing closed rather than retaining uncharged bytes.
+pub(crate) fn store_charged_grpc_web_reframed_body(
+    response_body: &mut Bytes,
+    response_headers: &mut HashMap<String, String>,
+    reframed: Vec<u8>,
+) -> bool {
+    match response_buffer_budget::charge_replacement_body(reframed) {
+        Some(charged) => {
+            *response_body = charged;
+            true
+        }
+        None => {
+            warn!(
+                "gRPC-Web trailer reframing refused: aggregate retained-response budget exhausted"
+            );
+            *response_body = Bytes::new();
+            response_headers.insert(
+                "grpc-status".to_string(),
+                response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS.to_string(),
+            );
+            response_headers.insert(
+                "grpc-message".to_string(),
+                response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE.to_string(),
+            );
+            response_headers.insert("content-length".to_string(), "0".to_string());
+            false
+        }
+    }
 }
 
 fn hbone_response_body_too_large_response(
@@ -34304,6 +34496,13 @@ async fn proxy_to_backend_hbone(
                         None,
                         effective_max_response_body_size_bytes,
                     ),
+                    None,
+                    None,
+                );
+            }
+            Err(HyperBodyCollectError::BudgetExhausted) => {
+                return (
+                    response_buffer_capacity_response(proxy, resolved_ip, "hbone"),
                     None,
                     None,
                 );
@@ -35380,6 +35579,17 @@ async fn proxy_to_backend_mesh_mtls(
                     None,
                 );
             }
+            Err(HyperBodyCollectError::BudgetExhausted) => {
+                return (
+                    if is_grpc_flavored {
+                        mesh_grpc_response_buffer_capacity_response(proxy, resolved_ip)
+                    } else {
+                        response_buffer_capacity_response(proxy, resolved_ip, "mesh-mtls")
+                    },
+                    None,
+                    None,
+                );
+            }
             Err(HyperBodyCollectError::Read(err)) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return (
@@ -36096,6 +36306,12 @@ async fn proxy_to_backend_http2(
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
                     },
+                    None,
+                );
+            }
+            Err(HyperBodyCollectError::BudgetExhausted) => {
+                return (
+                    response_buffer_capacity_response(proxy, resolved_ip, "direct-h2"),
                     None,
                 );
             }
@@ -37131,23 +37347,11 @@ async fn drain_h3_streaming_response_to_buffered(
             }
         }
         Err(crate::http3::client::H3BodyDrainError::BufferBudgetExhausted) => {
-            warn!(
-                proxy_id = %proxy.id,
+            debug!(
                 backend_url = %strip_query_params(backend_url),
-                "HTTP/3 response buffering refused: aggregate retained-response budget exhausted"
+                "HTTP/3 response buffering refused by the aggregate retained-response budget"
             );
-            retry::BackendResponse {
-                status_code: response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS,
-                body: ResponseBody::buffered(
-                    response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY
-                        .as_bytes()
-                        .to_vec(),
-                ),
-                headers: HashMap::new(),
-                connection_error: false,
-                backend_resolved_ip: resolved_ip,
-                error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
-            }
+            response_buffer_capacity_response(proxy, resolved_ip, "http3")
         }
         Err(crate::http3::client::H3BodyDrainError::ReadTimeout { timeout_ms }) => {
             warn!(

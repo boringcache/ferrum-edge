@@ -5986,6 +5986,93 @@ pub mod _test_support {
     pub const RESPONSE_BUFFER_RESERVATION_UNIT_BYTES: usize =
         crate::proxy::response_buffer_budget::RESERVATION_UNIT_BYTES;
 
+    /// Client-visible HTTP status for an aggregate-capacity refusal.
+    pub const RESPONSE_BUFFER_OVERLOAD_STATUS: u16 =
+        crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS;
+
+    /// gRPC status for the same refusal.
+    pub const RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS: u32 =
+        crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS;
+
+    /// Fixed, redaction-safe client body for the same refusal.
+    pub const RESPONSE_BUFFER_OVERLOAD_BODY: &str =
+        crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY;
+
+    /// Telemetry/retry class every transport uses for the same refusal.
+    pub const RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS: crate::retry::ErrorClass =
+        crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS;
+
+    /// Whether an error class is neutral to circuit-breaker, passive-health, and
+    /// adaptive-concurrency accounting.
+    pub fn error_class_is_health_neutral_for_test(class: crate::retry::ErrorClass) -> bool {
+        crate::proxy::backend_dispatch::client_side_no_backend_signal(Some(class))
+    }
+
+    /// Whether an error class is treated as a post-wire BACKEND failure (which
+    /// shrinks adaptive concurrency and trips the breaker).
+    pub fn error_class_is_backend_failure_for_test(class: crate::retry::ErrorClass) -> bool {
+        crate::proxy::backend_dispatch::error_class_is_post_wire_backend_failure(Some(class))
+    }
+
+    /// An isolated aggregate retained-response budget built from the SAME
+    /// [`crate::proxy::response_buffer_budget`] code the process-global one uses
+    /// — same clamping, same non-blocking admission, same charge attachment —
+    /// but with its own semaphore, so external tests can observe admission and
+    /// release deterministically under a parallel test binary
+    /// (`GHSA-pwcm-6rh8-f2gh`).
+    pub struct ResponseBufferBudgetProbe(crate::proxy::response_buffer_budget::IsolatedBudget);
+
+    /// A growing claim on a [`ResponseBufferBudgetProbe`], mirroring what a
+    /// collector holds while it accumulates a retained body.
+    pub struct ResponseBufferChargeProbe(
+        crate::proxy::response_buffer_budget::ResponseBufferReservation,
+    );
+
+    impl ResponseBufferBudgetProbe {
+        pub fn new(fallback_per_response_bytes: usize, total_bytes: usize) -> Self {
+            Self(crate::proxy::response_buffer_budget::IsolatedBudget::new(
+                fallback_per_response_bytes,
+                total_bytes,
+            ))
+        }
+
+        /// Currently unreserved capacity, in bytes.
+        pub fn available_bytes(&self) -> usize {
+            self.0.available_bytes()
+        }
+
+        /// Retained-path ceiling for an effective per-response limit (`0` folds
+        /// to the fail-closed fallback).
+        pub fn buffered_response_body_ceiling(&self, effective_limit: usize) -> usize {
+            self.0.buffered_response_body_ceiling(effective_limit)
+        }
+
+        /// Charge `bytes` BEFORE allocating them — what the native-H3 and gRPC
+        /// preallocation sites do. `None` when the budget refuses.
+        pub fn try_reserve(&self, bytes: usize) -> Option<ResponseBufferChargeProbe> {
+            self.0.try_reserve(bytes).map(ResponseBufferChargeProbe)
+        }
+
+        /// Grow an existing claim, as a collector does per chunk.
+        pub fn grow(&self, charge: &mut ResponseBufferChargeProbe, bytes: usize) -> bool {
+            self.0.grow(&mut charge.0, bytes)
+        }
+
+        /// Publish a retained body whose charge is attached to the returned
+        /// `Bytes` — the production success path. `None` when the budget
+        /// refuses. Every clone of the result shares the single charge, and the
+        /// budget is returned only when the last clone drops.
+        pub fn charge_retained_body(&self, data: Vec<u8>) -> Option<bytes::Bytes> {
+            self.0.charge_retained_body(data)
+        }
+
+        /// Hand an existing claim to `data`, exactly as the collectors do on
+        /// return.
+        pub fn attach(&self, data: Vec<u8>, charge: ResponseBufferChargeProbe) -> bytes::Bytes {
+            crate::proxy::response_buffer_budget::charged_bytes(data, charge.0)
+        }
+    }
+
     /// Canonical declared `Content-Length` from a raw header map, honoring
     /// standards-valid repeated identical values and refusing ambiguity.
     pub fn canonical_header_content_length_for_test(headers: &http::HeaderMap) -> Option<u64> {
