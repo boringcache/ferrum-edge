@@ -10068,6 +10068,11 @@ fn is_websocket_transport_managed_response_header(name: &str) -> bool {
 pub(crate) fn strip_websocket_transport_managed_response_header_map(
     response_headers: &mut HashMap<String, String>,
 ) {
+    // Parse and remove Connection-nominated extensions while the Connection
+    // value is still present. Removing the static WebSocket fields first would
+    // erase the only witness that an otherwise ordinary extension is
+    // hop-by-hop and let it cross the successful/reject handshake boundary.
+    headers_mod::strip_client_response_hop_by_hop_headers(response_headers);
     response_headers.retain(|name, _| !is_websocket_transport_managed_response_header(name));
 }
 
@@ -10117,13 +10122,27 @@ fn build_websocket_error_response(
 ) -> Response<ProxyBody> {
     let mut response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    // Strips WebSocket negotiation / hop-by-hop fields *and* any policy-authored
+    // `Content-Length` so the authoritative length below is the only one.
     finalize_websocket_response_headers(
         initial_response_header_policy_plugins,
         &mut response_headers,
     );
-    headers_mod::apply_response_headers(Response::builder().status(status), &response_headers)
-        .body(ProxyBody::from_string(body))
-        .unwrap_or_else(|_| build_websocket_error_fallback_response(status))
+    // A failed handshake is an ordinary HTTP response (RFC 6455 §4.2.2): it keeps
+    // the negotiated HTTP version and an authoritative `Content-Length` derived
+    // from the error body. Only the transport-owned negotiation fields above are
+    // forbidden. Forcing HTTP/1.0 here would make the reject unreadable to RFC
+    // 6455 clients, which require a 1.1-or-newer handshake response.
+    headers_mod::apply_sanitized_response_headers(
+        Response::builder().status(status),
+        &mut response_headers,
+        headers_mod::ClientResponseFraming::ExactBody {
+            status: status.as_u16(),
+            len: body.len() as u64,
+        },
+    )
+    .body(ProxyBody::from_string(body))
+    .unwrap_or_else(|_| build_websocket_error_fallback_response(status))
 }
 
 fn build_websocket_error_fallback_response(status: StatusCode) -> Response<ProxyBody> {
@@ -17369,6 +17388,20 @@ pub(crate) struct NormalizedRejectResponse {
     pub(crate) body: Bytes,
     pub(crate) grpc_status: Option<u32>,
     pub(crate) grpc_message: Option<String>,
+    /// Typed failed-WebSocket handshake boundary. Set from the request-context
+    /// flavor stamp (or an equivalent protocol-owned path), never inferred from
+    /// attacker/plugin-controlled response headers. When true, the response
+    /// builder re-strips transport-owned negotiation fields (and any
+    /// plugin-authored `Content-Length`) before framing repair, so only the
+    /// gateway-derived body length reaches the wire. The response stays a valid
+    /// HTTP/1.1-or-newer non-upgrade response.
+    pub(crate) failed_websocket_handshake: bool,
+    /// Trusted body-omission signal, derived from the request method and the
+    /// final status via the shared synthetic-response wire contract — never from
+    /// response headers. `WireBody` (the default) makes the final body slice
+    /// authoritative, so an ordinary empty reject publishes `Content-Length: 0`
+    /// instead of preserving a plugin-authored length.
+    pub(crate) body_disposition: headers_mod::RejectBodyDisposition,
     /// When non-empty together with a non-empty `body`, these are emitted as
     /// HTTP trailers after the unary DATA frame (serverless native-gRPC
     /// terminate). Ordinary trailers-only rejects leave this empty and keep
@@ -17432,6 +17465,10 @@ fn finalize_synthesized_reject_headers(
             initial_response_header_policy_plugins,
             &mut reject.headers,
         );
+        // Early strip protects intermediate observers; the builder still needs
+        // the typed signal so a later hook cannot reintroduce transport-owned
+        // negotiation fields immediately before the wire response is built.
+        reject.failed_websocket_handshake = true;
     } else {
         finalize_plain_gateway_error_response_headers(
             initial_response_header_policy_plugins,
@@ -17801,6 +17838,8 @@ pub(crate) fn normalize_reject_response_with_provenance(
             body,
             grpc_status: None,
             grpc_message: None,
+            failed_websocket_handshake: false,
+            body_disposition: headers_mod::RejectBodyDisposition::default(),
             grpc_trailers: HashMap::new(),
         };
     }
@@ -17906,6 +17945,10 @@ pub(crate) fn normalize_reject_response_with_provenance(
         body: Bytes::new(),
         grpc_status: Some(grpc_status),
         grpc_message,
+        failed_websocket_handshake: false,
+        // Trailers-only gRPC keeps streaming/trailer semantics through
+        // `grpc_status`; the disposition is unused on that branch.
+        body_disposition: headers_mod::RejectBodyDisposition::default(),
         grpc_trailers: HashMap::new(),
     }
 }
@@ -17986,6 +18029,11 @@ fn build_framed_grpc_unary_reject(
         body,
         grpc_status: Some(grpc_status),
         grpc_message,
+        // A native gRPC framed-unary terminate is never a WebSocket handshake,
+        // and its DATA frame is written under trailers-only gRPC framing, so no
+        // `Content-Length` is derived from the disposition here.
+        failed_websocket_handshake: false,
+        body_disposition: headers_mod::RejectBodyDisposition::default(),
         grpc_trailers: trailers,
     }
 }
@@ -18117,21 +18165,53 @@ pub(crate) async fn normalize_grpc_plugin_rejection_with_after_proxy_hooks(
     normalized
 }
 
-fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Response<ProxyBody> {
+pub(crate) fn build_response_from_normalized_reject(
+    reject: NormalizedRejectResponse,
+) -> Response<ProxyBody> {
     let is_grpc_error = reject.grpc_status.is_some();
-    let builder = headers_mod::apply_response_headers(
-        Response::builder().status(reject.http_status),
-        &reject.headers,
-    );
+    let failed_websocket_handshake = reject.failed_websocket_handshake;
+    let status = reject.http_status.as_u16();
+    let is_framed_unary_reject = framed_unary_reject_parts(&reject).is_some();
+    let mut headers = reject.headers;
+    // A failed WebSocket handshake is still an ordinary HTTP response (RFC 6455
+    // §4.2.2), so it keeps its negotiated HTTP version and an authoritative
+    // body length. What it must never carry is transport-owned negotiation
+    // metadata (`Upgrade`, `Connection`, `Sec-WebSocket-*`) or a plugin-authored
+    // `Content-Length`. Strip those *before* the framing sanitizer so the
+    // derived length below is the only one that can reach the wire.
+    if failed_websocket_handshake {
+        strip_websocket_transport_managed_response_header_map(&mut headers);
+    }
+    // Final protocol-aware boundary after reject after_proxy hooks: strip
+    // hop-by-hop / Connection-listed fields and derive Content-Length from the
+    // synthetic body. Emptiness alone is NOT the discriminator — an ordinary
+    // empty HTTP reject has an authoritative length of exactly zero and must
+    // replace any plugin-authored value. Only the trusted `body_disposition`
+    // signal (HEAD representation length from `prepare_synthetic_response_wire`,
+    // or a no-body status) selects `Head` framing. A native gRPC error is
+    // trailers-only: gRPC never frames with Content-Length, so the field is
+    // removed rather than invented as `0` or preserved from a plugin.
+    let framing = if is_grpc_error {
+        headers_mod::ClientResponseFraming::TrailersOnly
+    } else {
+        headers_mod::ClientResponseFraming::for_final_reject(
+            status,
+            reject.body.len(),
+            reject.body_disposition,
+        )
+    };
+    headers_mod::sanitize_client_response_headers_for_wire(&mut headers, framing);
+    let reject_builder = Response::builder().status(reject.http_status);
+    let builder = headers_mod::apply_response_headers(reject_builder, &headers);
 
-    let body = if framed_unary_reject_parts(&reject).is_some() {
+    let body = if is_framed_unary_reject {
         let trailers = grpc_proxy::buffered_grpc_trailers_to_header_map(&reject.grpc_trailers);
         ProxyBody::buffered_grpc_with_trailers(reject.body, trailers)
     } else if reject.body.is_empty() {
         // Status-aware empty body: 205 must not advertise Content-Length on H1
         // (Hyper would otherwise synthesize `Content-Length: 0` for ordinary
         // empty Full bodies; 204/304 are already special-cased upstream).
-        ProxyBody::empty_for_response_status(reject.http_status.as_u16())
+        ProxyBody::empty_for_response_status(status)
     } else {
         ProxyBody::full(reject.body)
     };
@@ -18290,6 +18370,12 @@ fn finalize_grpc_web_error_response_headers_with_policy_source(
         initial_response_header_policy_source.apply(&mut response.headers);
     }
 
+    // Consume Connection nominations before the fixed managed-field retain
+    // below removes `Connection` itself. Otherwise a policy could leave the
+    // nominated extension behind on this generated-error path even though
+    // ordinary responses run the shared final wire sanitizer.
+    headers_mod::strip_client_response_hop_by_hop_headers(&mut response.headers);
+
     let expose_headers = merge_grpc_web_expose_headers(
         Some(crate::plugins::grpc_web::BASE_EXPOSE_HEADERS_VALUE),
         &response.headers,
@@ -18330,9 +18416,12 @@ fn finalize_grpc_web_error_response_headers_with_policy_source(
             .headers
             .insert("access-control-expose-headers".to_string(), expose_headers);
     }
-    response.headers.insert(
-        "content-length".to_string(),
-        response.body.len().to_string(),
+    headers_mod::sanitize_client_response_headers_for_wire(
+        &mut response.headers,
+        headers_mod::ClientResponseFraming::ExactBody {
+            status: StatusCode::OK.as_u16(),
+            len: response.body.len() as u64,
+        },
     );
 }
 
@@ -18816,7 +18905,13 @@ pub(crate) fn strip_content_length_for_streaming_grpc_deadline(
     grpc_deadline_at: Option<tokio::time::Instant>,
 ) {
     if grpc_deadline_at.is_some() {
-        response_headers.remove("content-length");
+        // Case-insensitive, and load-bearing beyond the wire: ordinary
+        // Streaming framing removes `Content-Length` from the response the
+        // client sees, but the gateway's own declared-length captures
+        // (`preserved_response_content_length`, `content_length_header_value`)
+        // read this map first, and a length the deadline is about to invalidate
+        // must not inform truncation or coalescing decisions either.
+        headers_mod::remove_content_length_header(response_headers);
     }
 }
 
@@ -19258,13 +19353,31 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
         std::sync::atomic::Ordering::Relaxed,
     );
     let status = StatusCode::from_u16(response_status).unwrap_or(status);
-    normalize_reject_response_with_provenance(
+    // `response_body` is moved (not copied) into the normalizer: the reject
+    // payload keeps the shared allocation the synthetic-body hooks produced.
+    // The framed-unary provenance is read from the request context so an
+    // authorized `serverless_function` native-gRPC terminate keeps its DATA
+    // frame and terminal trailers, and every unauthorized body still falls
+    // through to trailers-only.
+    let mut normalized = normalize_reject_response_with_provenance(
         status,
         response_body,
         &headers,
         is_grpc_request,
         FramedGrpcUnaryProvenance::from_context(ctx),
-    )
+    );
+    // Carry the request-context WebSocket boundary into the normalized reject
+    // so the response builder can strip transport-managed fields after
+    // ExactBody length repair. Do not infer this from response header names.
+    normalized.failed_websocket_handshake = ctx.has_websocket_response_boundary();
+    // Carry the same body-omission decision the shared synthetic-response wire
+    // contract just applied inside `apply_reject_after_proxy_and_synthetic_body_hooks`
+    // (same trusted method + final status inputs), so the builder can tell a
+    // HEAD / no-body response apart from an ordinary empty reject without
+    // reading plugin-controlled headers.
+    normalized.body_disposition =
+        headers_mod::RejectBodyDisposition::for_request(&ctx.method, status.as_u16());
+    normalized
 }
 
 /// Finalize a terminal request-body read failure before any external operation
@@ -25268,12 +25381,30 @@ async fn handle_proxy_request_inner(
                     });
                 if grpc_web_streaming_content_type.is_some() {
                     // Incremental translation changes the representation size
-                    // and carries terminal metadata in a final DATA frame.
-                    response_headers.remove("content-length");
+                    // and carries terminal metadata in a final DATA frame, so
+                    // the backend length describes nothing that will be written.
+                    // Defense in depth: the Streaming boundary below removes
+                    // every case variant anyway.
+                    headers_mod::remove_content_length_header(&mut response_headers);
                 }
-                let cl = response_headers
-                    .get("content-length")
-                    .and_then(|v| v.parse::<u64>().ok());
+                // Native gRPC never frames with `Content-Length`, and the wire
+                // boundary below removes the field. Hyper reconstructs
+                // `Content-Length` from an exact `Body::size_hint()` when the
+                // header is absent, so the streaming body must not advertise a
+                // declared length either — otherwise the H2 writer would undo
+                // the strip.
+                let advertised_content_length: Option<u64> = None;
+
+                // Final protocol-aware boundary before the H2 gRPC streaming
+                // builder. Trailer frames are filtered separately by
+                // StripHopByHopTrailers.
+                // Native gRPC streaming: no HEAD exists on this dispatch and
+                // gRPC never frames with Content-Length, so ordinary Streaming
+                // framing (which removes it outright) is the whole contract.
+                headers_mod::sanitize_client_response_headers_for_wire(
+                    &mut response_headers,
+                    headers_mod::ClientResponseFraming::Streaming,
+                );
 
                 // Build the response with the live Incoming body — hyper will forward
                 // DATA frames and TRAILERS to the downstream client as they arrive.
@@ -25342,7 +25473,7 @@ async fn handle_proxy_request_inner(
                 {
                     crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
-                        cl,
+                        advertised_content_length,
                         grpc_read_timeout_ms,
                         grpc_total_deadline,
                         grpc_streaming_trailer_governor.take(),
@@ -25351,7 +25482,7 @@ async fn handle_proxy_request_inner(
                     crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
                         effective_max_response_body_size_bytes,
-                        cl,
+                        advertised_content_length,
                         state.h2_coalesce_target_bytes,
                         grpc_read_timeout_ms,
                         grpc_total_deadline,
@@ -25360,7 +25491,7 @@ async fn handle_proxy_request_inner(
                 } else {
                     crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
-                        cl,
+                        advertised_content_length,
                         state.h2_coalesce_target_bytes,
                         grpc_read_timeout_ms,
                         grpc_total_deadline,
@@ -26169,6 +26300,36 @@ async fn handle_proxy_request_inner(
 
                 // Build gRPC response with headers and trailers (splitting any
                 // newline-joined Set-Cookie into separate header lines).
+                //
+                // This path is fully buffered: `response_body` below IS the wire
+                // body, so framing is derived from it rather than from which
+                // plugin phase produced the response. An `after_proxy` reject is
+                // not the only way a plugin's header map reaches this builder —
+                // an `on_response_body` or `on_final_response_body` reject also
+                // replaces `response_headers` with `normalize_reject_response`
+                // output, which copies every plugin-supplied field except
+                // content-type / grpc-status / grpc-message. Keying on
+                // `after_proxy_rejected` therefore left those two arms on
+                // buffered framing that would publish a length for a
+                // trailers-only gRPC response carrying no DATA frames at all.
+                //
+                //   - empty body: no DATA frames (native trailers-only, or a
+                //     plugin-replaced gRPC error). gRPC never frames with
+                //     Content-Length, so remove it outright — never invent `0`,
+                //     never keep a plugin-authored length.
+                //   - non-empty body: the buffered representation is
+                //     authoritative, so publish its exact length. Every rewrite
+                //     site already resyncs `content-length` to the new body, so
+                //     this agrees with them and overrides them only when they
+                //     have drifted.
+                let grpc_framing = headers_mod::ClientResponseFraming::for_buffered_grpc(
+                    response_status,
+                    response_body.len(),
+                );
+                headers_mod::sanitize_client_response_headers_for_wire(
+                    &mut response_headers,
+                    grpc_framing,
+                );
                 let resp_builder = headers_mod::apply_response_headers(
                     Response::builder()
                         .status(StatusCode::from_u16(response_status).unwrap_or(StatusCode::OK)),
@@ -28021,8 +28182,18 @@ async fn handle_proxy_request_inner(
         None
     };
     if response_inspector.is_some() {
-        response_headers.remove("content-length");
+        // Inspector transforms the body, so the backend's declared length no
+        // longer describes anything. Omit case-insensitively BEFORE the
+        // `preserved_response_content_length` capture below: Streaming framing
+        // already removes the wire field, but the H3 graceful-close
+        // completeness gate would otherwise judge the transformed body against
+        // the untransformed length.
+        headers_mod::remove_content_length_header(&mut response_headers);
     }
+    // Capture this before `method` is moved into the optional transaction
+    // summary below. Response framing still needs the request-method semantic,
+    // but the hot path does not need to clone the method string.
+    let is_head = method.eq_ignore_ascii_case("HEAD");
     let needs_transaction_summary =
         !plugins.is_empty() || body_will_stream || backend_error_class.is_some();
     let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =
@@ -28133,7 +28304,11 @@ async fn handle_proxy_request_inner(
             already_ended,
             pristine_streaming_grpc_web_terminal_names.as_ref(),
         );
-        response_headers.remove("content-length");
+        // Omit case-insensitively before the declared-length capture below:
+        // gRPC-Web translation reframes the body, so the backend length must
+        // not reach the wire (Streaming framing removes it) nor the gateway's
+        // own truncation/coalescing decisions.
+        headers_mod::remove_content_length_header(&mut response_headers);
         Some((content_type.to_string(), terminal))
     } else {
         None
@@ -28143,9 +28318,58 @@ async fn handle_proxy_request_inner(
     let mut resp_builder = Response::builder()
         .status(StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY));
 
-    // Apply backend/plugin response headers, splitting newline-joined Set-Cookie
-    // into separate header lines (RFC 6265).
-    resp_builder = headers_mod::apply_response_headers(resp_builder, &response_headers);
+    // Final protocol-aware response-header boundary after every mutable hook
+    // and before the H1/H2 builder: strip hop-by-hop / Connection-listed fields
+    // and derive or repair Content-Length from the actual body/status/method.
+    // Gateway-owned Connection: close (drain/overload) is applied below.
+    // The arms below apply the same rules as
+    // `ClientResponseFraming::for_buffered_response` /
+    // `for_streaming_response`, spelled out here because `method` has already
+    // moved into the transaction summary and only the precomputed `is_head`
+    // flag remains. Keep the three buffered writers (this one, native H3, and
+    // the H3 bridge) in agreement.
+    //
+    // Streaming bodies capture their declared length for internal accounting
+    // FIRST: ordinary Streaming framing removes `Content-Length` from the wire
+    // map (a hook-authored value cannot be verified against bytes not yet
+    // written), while the H3 graceful-close classifier and the direct-H2
+    // large-response coalescer bypass still need the length the boundary would
+    // have accepted.
+    let declared_streaming_content_length =
+        headers_mod::preserved_response_content_length(&response_headers, response_status);
+    // What the WIRE may advertise, as opposed to what the gateway keeps for its
+    // own accounting. Hyper reconstructs `Content-Length` from an exact
+    // `Body::size_hint()` whenever the header is absent (the same mechanism
+    // `EmptyUnknownLengthBody` exists to defeat on 205), so stripping the header
+    // alone would leave a hook-authored length reaching H1/H2 clients through
+    // the streaming body's hint. Only `Head` framing may advertise one, and
+    // there it matches the representation length the boundary preserved.
+    let advertised_streaming_content_length = if is_head {
+        declared_streaming_content_length
+    } else {
+        None
+    };
+    let framing = if is_head {
+        // HEAD keeps a valid backend representation length whether the body was
+        // buffered or streamed: the wire body is empty by protocol, so the field
+        // cannot contradict the bytes sent. Do not invent Content-Length: 0 from
+        // the empty wire body either.
+        headers_mod::ClientResponseFraming::Head {
+            status: response_status,
+        }
+    } else {
+        match &response_body {
+            ResponseBody::Buffered(data) => headers_mod::ClientResponseFraming::ExactBody {
+                status: response_status,
+                len: data.len() as u64,
+            },
+            ResponseBody::Streaming { .. }
+            | ResponseBody::StreamingH2(_)
+            | ResponseBody::StreamingH3(_) => headers_mod::ClientResponseFraming::Streaming,
+        }
+    };
+    resp_builder =
+        headers_mod::apply_sanitized_response_headers(resp_builder, &mut response_headers, framing);
 
     // Add gateway error categorization headers so clients and ops teams
     // can distinguish different failure modes:
@@ -28336,9 +28560,12 @@ async fn handle_proxy_request_inner(
                 }
                 inspected
             } else {
-                let cl = response_headers
-                    .get("content-length")
-                    .and_then(|v| v.parse::<u64>().ok());
+                // `cl` drives the gateway's own construction choices only;
+                // `advertised_cl` is what the body may report as an exact size
+                // hint, and hence what hyper may turn back into a wire
+                // `Content-Length`.
+                let cl = declared_streaming_content_length;
+                let advertised_cl = advertised_streaming_content_length;
                 // Build the base body from the shared protocol-agnostic builders
                 // first, THEN optionally wrap it in latency tracking via
                 // `into_tracked`. This guarantees the tracked path inherits the
@@ -28352,17 +28579,17 @@ async fn handle_proxy_request_inner(
                 let base = if state.response_buffer_cutoff_bytes == 0
                     && effective_max_response_body_size_bytes == 0
                 {
-                    crate::proxy::body::direct_streaming_body(response, cl)
+                    crate::proxy::body::direct_streaming_body(response, advertised_cl)
                 } else if effective_max_response_body_size_bytes > 0 && cl.is_none() {
                     // No Content-Length — enforce size limit while streaming instead
                     // of buffering the entire body into memory.
                     crate::proxy::body::size_limited_streaming_body(
                         response,
                         effective_max_response_body_size_bytes,
-                        cl,
+                        advertised_cl,
                     )
                 } else {
-                    crate::proxy::body::coalescing_body(response, cl)
+                    crate::proxy::body::coalescing_body(response, advertised_cl)
                 };
                 let base = if let Some(guard) = reqwest_backend_guard {
                     base.with_reqwest_backend_guard(guard)
@@ -28430,9 +28657,12 @@ async fn handle_proxy_request_inner(
             }
         }
         ResponseBody::StreamingH2(resp) => {
-            let cl = response_headers
-                .get("content-length")
-                .and_then(|v| v.parse::<u64>().ok());
+            // `cl` is the gateway's internal size decision input (the
+            // large-response coalescer bypass); `advertised_cl` is the only one
+            // the body may expose as an exact size hint, which hyper would
+            // otherwise re-emit as a wire `Content-Length`.
+            let cl = declared_streaming_content_length;
+            let advertised_cl = advertised_streaming_content_length;
             // Plain-HTTPS direct-H2 large-response fast path.
             //
             // The backend's H2 writer already emits `http2_max_frame_size`
@@ -28486,7 +28716,7 @@ async fn handle_proxy_request_inner(
             {
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
-                    cl,
+                    advertised_cl,
                     h2_read_timeout_ms,
                     None,
                     streaming_trailer_governor.take(),
@@ -28498,7 +28728,7 @@ async fn handle_proxy_request_inner(
                 crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     effective_max_response_body_size_bytes,
-                    cl,
+                    advertised_cl,
                     state.h2_coalesce_target_bytes,
                     h2_read_timeout_ms,
                     None,
@@ -28512,7 +28742,7 @@ async fn handle_proxy_request_inner(
                 // bypass kicks in at body.rs:~1184.
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
-                    cl,
+                    advertised_cl,
                     h2_read_timeout_ms,
                     None,
                     streaming_trailer_governor.take(),
@@ -28520,7 +28750,7 @@ async fn handle_proxy_request_inner(
             } else {
                 crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
-                    cl,
+                    advertised_cl,
                     state.h2_coalesce_target_bytes,
                     h2_read_timeout_ms,
                     None,
@@ -28619,9 +28849,13 @@ async fn handle_proxy_request_inner(
             body
         }
         ResponseBody::StreamingH3(h3_resp) => {
-            let client_content_length = response_headers
-                .get("content-length")
-                .and_then(|v| v.parse::<u64>().ok());
+            // The length describing the CLIENT-facing representation (as
+            // opposed to `backend_content_length`, the backend's own
+            // pre-transform declaration). Captured before the final wire
+            // boundary removed the field: it is no longer advertised to the
+            // client, but the graceful-close success gate must still distinguish
+            // a complete body from a truncated one.
+            let client_content_length = declared_streaming_content_length;
             let success_on_drop_after_bytes =
                 h3_success_on_drop_after_response_bytes(inbound_version, client_content_length);
             let backend_content_length = streaming_h3_backend_content_length;
@@ -28653,6 +28887,7 @@ async fn handle_proxy_request_inner(
                     h3_method,
                     response_status,
                     backend_content_length,
+                    advertised_streaming_content_length,
                     h3_read_timeout_ms,
                     streaming_trailer_governor.take(),
                 )
@@ -28663,6 +28898,7 @@ async fn handle_proxy_request_inner(
                     h3_method,
                     response_status,
                     backend_content_length,
+                    advertised_streaming_content_length,
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
@@ -28675,6 +28911,7 @@ async fn handle_proxy_request_inner(
                     h3_method,
                     response_status,
                     backend_content_length,
+                    advertised_streaming_content_length,
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),

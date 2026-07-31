@@ -1062,6 +1062,7 @@ jobs:
               functional_policy_path_canonicalization_test
               functional_response_mock_grpc_exclusion_test
               functional_response_mock_semantics_test
+              functional_response_protocol_managed_headers_test
               functional_websocket_limits_test
           - shard: data-plane
             # Serialized because DP functional tests bind exclusive ports and

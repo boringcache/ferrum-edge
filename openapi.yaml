@@ -16078,6 +16078,16 @@ components:
                   `http[].headers.response.{set,add,remove}`). Same shape as
                   `request_transform` but applied on the response path via
                   the `response_transformer` plugin.
+
+                  Because this publishes onto the `response_transformer`
+                  write surface, it shares that plugin's closed destination
+                  set: add/update of a protocol-managed hop-by-hop or
+                  framing name (`connection`, `content-length`,
+                  `keep-alive`, `proxy-authenticate`, `proxy-connection`,
+                  `te`, `trailer`, `transfer-encoding`, `upgrade`,
+                  case-insensitive) is rejected at construction. Remove of
+                  those names remains allowed. `request_transform` keeps its
+                  existing contract.
                 items:
                   type: object
                   additionalProperties: false
@@ -17379,7 +17389,14 @@ components:
           additionalProperties:
             type: string
           default: {}
-          description: Headers added to the policy-denial response.
+          description: >-
+            Headers added to the policy-denial response. Names and values are
+            validated at config load. Protocol-managed hop-by-hop and framing
+            destinations (`connection`, `content-length`, `keep-alive`,
+            `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
+            `transfer-encoding`, `upgrade`, case-insensitive) are rejected: the
+            gateway derives Content-Length from the reject body and strips
+            connection/framing fields at the final H1/H2/H3 response boundary.
         fail_closed_status:
           type: integer
           format: uint16
@@ -17398,7 +17415,10 @@ components:
           additionalProperties:
             type: string
           default: {}
-          description: Headers added to fail-closed OPA error responses.
+          description: >-
+            Headers added to fail-closed OPA error responses. Same name/value
+            validation and protocol-managed hop-by-hop / framing destination
+            rejection as deny_headers.
         decision_pointer:
           type: array
           items:
@@ -18109,13 +18129,21 @@ components:
         unknown per-rule keys are rejected at plugin load time. Header
         rules enforce operation-exact fields (only add/update accept
         `value`; only rename accepts `new_key`; remove accepts neither).
-        Every configured header `value` must be a valid HTTP `HeaderValue`
-        (same complete syntax accepted at emission), including rejection of
-        non-CR/LF forbidden control bytes. Unknown operations / targets and
-        missing required fields are also rejected. Every rule must set an
-        explicit `target` (`header` or `body`); there is no default. Valid
-        targets are `header` and `body` only — unlike request_transformer,
-        there is no `query` target.
+        Protocol-managed hop-by-hop and framing destinations are rejected
+        for add/update and as rename destinations (`Connection`,
+        `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`,
+        `Trailer`, `Transfer-Encoding`, `Upgrade`, `Content-Length`,
+        case-insensitive); remove of those names remains allowed. The
+        gateway derives Content-Length and strips connection/framing
+        fields at the final H1/H2/H3 response boundary after every
+        mutable hook. Every configured header `value` must be a valid
+        HTTP `HeaderValue` (same complete syntax accepted at emission),
+        including rejection of non-CR/LF forbidden control bytes. Unknown
+        operations / targets and missing required fields are also
+        rejected. Every rule must set an explicit `target` (`header` or
+        `body`); there is no default. Valid targets are `header` and
+        `body` only — unlike request_transformer, there is no `query`
+        target.
 
         When `apply_route_overrides: true`, the plugin consumes per-rule
         header transforms published by `mesh_route_dispatch` onto
@@ -18185,7 +18213,12 @@ components:
           const: header
         key:
           type: string
-          description: HTTP header name.
+          description: |
+            HTTP header name. For add/update, must not be a protocol-managed
+            hop-by-hop or framing destination (`connection`, `content-length`,
+            `keep-alive`, `proxy-authenticate`, `proxy-connection`, `te`,
+            `trailer`, `transfer-encoding`, `upgrade`). Remove may target
+            those names.
         value:
           type: string
           description: |
@@ -18197,6 +18230,10 @@ components:
           type: string
           description: |
             Required for rename; must not be set for add/update/remove.
+            Must not be a protocol-managed hop-by-hop or framing destination
+            (`connection`, `content-length`, `keep-alive`,
+            `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
+            `transfer-encoding`, `upgrade`).
 
     ResponseTransformerBodyRule:
       type: object
@@ -18237,7 +18274,7 @@ components:
     SecurityHeadersConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: security_headers — Injects validated response security headers (secure defaults) and strips fingerprinting headers at the client-visible initial-header boundary, including buffered gRPC/gRPC-Web and WebSocket handshakes. Unknown configuration keys are rejected."
+      description: "Plugin: security_headers — Injects validated response security headers (secure defaults) and strips fingerprinting headers at the client-visible initial-header boundary, including buffered gRPC/gRPC-Web and WebSocket handshakes. Unknown configuration keys are rejected, and `set` rejects protocol-managed hop-by-hop / framing destinations (`remove` of those names remains allowed)."
       properties:
         content_type_options:
           oneOf:
@@ -18301,7 +18338,7 @@ components:
           additionalProperties:
             type: string
             pattern: '^[\u0009\u0020-\u007E]*$'
-          description: "Arbitrary response headers to set (name -> value). Names accept the complete HTTP field-name token grammar, are limited to 65,535 ASCII bytes, and are canonicalized to lowercase. Values must satisfy the HTTP HeaderValue builder rules: only HTAB and printable ASCII are accepted."
+          description: "Arbitrary response headers to set (name -> value). Names accept the complete HTTP field-name token grammar, are limited to 65,535 ASCII bytes, and are canonicalized to lowercase, EXCEPT protocol-managed hop-by-hop and framing destinations (`connection`, `content-length`, `keep-alive`, `proxy-authenticate`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`, case-insensitive), which are rejected at construction — the gateway owns those fields at the final H1/H2/H3 response boundary, where it derives Content-Length from the final body, preserves a valid representation length only for HEAD, and removes it on ordinary streamed responses. Use remove for those names instead. Values must satisfy the HTTP HeaderValue builder rules: only HTAB and printable ASCII are accepted."
         remove:
           type: [array, "null"]
           items:
@@ -19967,15 +20004,20 @@ components:
         (`application/grpc` on H2/H3) is unsupported — the plugin is not
         selected for that protocol because Reject results normalize to
         trailers-only gRPC errors that discard configured bodies. Unknown
-        top-level and per-rule keys are rejected; the free-form headers map
-        remains open for string-valued response headers. Status codes must be
-        final (200–599) or 101 for a synthetic WebSocket handshake; other
-        informational statuses are rejected. A configured 101 fails closed
-        with 500 when the matching request is not an actual WebSocket
-        handshake. HEAD omits content bytes while keeping representation
-        Content-Length; 204/205/304 omit body and Content-Length on every
-        frontend (H1/H2/H3). Runtime construction and request-flavor
-        enforcement are the authoritative final boundaries.
+        top-level and per-rule keys are rejected. The free-form headers map
+        accepts string-valued response headers but rejects protocol-managed
+        hop-by-hop and framing names (`Connection`, `Keep-Alive`,
+        `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`,
+        `Transfer-Encoding`, `Upgrade`, `Content-Length`, including case
+        variants); the gateway derives Content-Length from the mock
+        body/status/method and strips connection/framing fields at the final
+        H1/H2/H3 response boundary. Status codes must be final (200–599) or
+        101 for a synthetic WebSocket handshake; other informational statuses
+        are rejected. A configured 101 fails closed with 500 when the matching
+        request is not an actual WebSocket handshake. HEAD omits content bytes
+        while keeping representation Content-Length; 204/205/304 omit body and
+        Content-Length on every frontend (H1/H2/H3). Runtime construction and
+        request-flavor enforcement are the authoritative final boundaries.
       required:
         - rules
       properties:
@@ -20025,7 +20067,12 @@ components:
                 type: object
                 additionalProperties:
                   type: string
-                description: Response headers (default content-type application/json)
+                description: >-
+                  Response headers (default content-type application/json).
+                  Protocol-managed hop-by-hop and framing names (`connection`,
+                  `content-length`, `keep-alive`, `proxy-authenticate`,
+                  `proxy-connection`, `te`, `trailer`, `transfer-encoding`,
+                  `upgrade`) are rejected at construction.
               body:
                 type: string
                 description: >-
@@ -23374,7 +23421,14 @@ components:
             downstream_session_header:
               type: string
               default: mcp-session-id
-              description: Must be a valid HTTP header name; rejected at config validation otherwise.
+              description: >-
+                Must be a valid HTTP header name; rejected at config validation
+                otherwise. This name is stamped onto the client response, so
+                protocol-managed hop-by-hop and framing destinations
+                (`connection`, `content-length`, `keep-alive`,
+                `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
+                `transfer-encoding`, `upgrade`, case-insensitive) are also
+                rejected.
             upstream_session_header:
               type: string
               default: mcp-session-id
