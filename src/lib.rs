@@ -279,6 +279,16 @@ pub mod _test_support {
         )
     }
 
+    /// The exact effective-chain security-composition validator every plugin
+    /// cache construction and every admin candidate admission runs. Exposed so
+    /// tests can drive it with a synthetic capability plugin that no built-in
+    /// can express.
+    pub fn validate_plugin_security_composition_for_test(
+        plugins: &[Arc<dyn Plugin>],
+    ) -> Result<(), String> {
+        crate::plugin_cache::validate_plugin_security_composition(plugins)
+    }
+
     pub fn validate_correlation_id_composition_for_test(
         plugins: &[Arc<dyn Plugin>],
     ) -> Result<(), String> {
@@ -4243,6 +4253,12 @@ pub mod _test_support {
         );
     }
 
+    pub fn strip_websocket_transport_managed_response_headers(
+        headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::strip_websocket_transport_managed_response_header_map(headers);
+    }
+
     pub async fn run_h3_reject_response_committed_hooks(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
@@ -4300,6 +4316,7 @@ pub mod _test_support {
         pub body: bytes::Bytes,
         pub grpc_status: Option<u32>,
         pub grpc_message: Option<String>,
+        pub failed_websocket_handshake: bool,
         pub grpc_trailers: HashMap<String, String>,
     }
 
@@ -4388,6 +4405,7 @@ pub mod _test_support {
                 .get("grpc_status")
                 .and_then(|value| value.parse().ok()),
             grpc_message: ctx.metadata.get("grpc_message").cloned(),
+            failed_websocket_handshake: false,
             grpc_trailers: HashMap::new(),
         }
     }
@@ -4424,6 +4442,7 @@ pub mod _test_support {
                 .get("grpc_status")
                 .and_then(|value| value.parse().ok()),
             grpc_message: ctx.metadata.get("grpc_message").cloned(),
+            failed_websocket_handshake: false,
             grpc_trailers: HashMap::new(),
         }
     }
@@ -4675,6 +4694,25 @@ pub mod _test_support {
         );
     }
 
+    /// Run reject-path `after_proxy` hooks (including chain-level response
+    /// route-header finalization) over an already-built rejection map.
+    pub async fn apply_replaceable_after_proxy_hooks_to_rejection_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        status_code: &mut u16,
+        response_body: &mut bytes::Bytes,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
+            plugins,
+            ctx,
+            status_code,
+            response_body,
+            response_headers,
+        )
+        .await;
+    }
+
     pub async fn run_after_proxy_hooks_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
@@ -4684,6 +4722,23 @@ pub mod _test_support {
         crate::proxy::run_after_proxy_hooks(plugins, ctx, response_status, response_headers)
             .await
             .is_some()
+    }
+
+    /// Run the production `before_proxy` chain including the chain-level
+    /// request route-header finalization phase (GHSA-3xxr-xhhj-9962).
+    pub async fn run_before_proxy_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> crate::plugins::PluginResult {
+        crate::proxy::run_before_proxy_hooks_for_backend_path_policy(
+            plugins,
+            ctx,
+            headers,
+            false,
+            crate::proxy::BackendPathBeforeProxyPass::Initial,
+        )
+        .await
     }
 
     /// Like [`run_after_proxy_hooks_for_test`] but surfaces the terminal
@@ -4866,6 +4921,7 @@ pub mod _test_support {
                 body: normalized.body,
                 grpc_status: normalized.grpc_status,
                 grpc_message: normalized.grpc_message,
+                failed_websocket_handshake: normalized.failed_websocket_handshake,
                 grpc_trailers: normalized.grpc_trailers,
             },
             grpc_web_error,
@@ -5003,6 +5059,27 @@ pub mod _test_support {
         .await
     }
 
+    /// Drive the client-request-contract phase exactly as both protocol
+    /// handlers do, so external tests can compose it with real transformers
+    /// instead of re-deriving the ordering.
+    pub async fn apply_client_request_contract_validation_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        body: &[u8],
+    ) -> crate::plugins::PluginResult {
+        crate::proxy::apply_client_request_contract_validation(plugins, ctx, body).await
+    }
+
+    /// `true` when the pre-`before_proxy` requirements this request computes
+    /// include a client-contract decision.
+    pub fn client_request_contract_phase_selected_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        crate::proxy::request_body_requirements_before_before_proxy(plugins, ctx)
+            .validates_client_contract
+    }
+
     pub fn extract_grpc_reject_message(body: &[u8]) -> Option<String> {
         crate::proxy::extract_grpc_reject_message(body)
     }
@@ -5029,8 +5106,125 @@ pub mod _test_support {
             body: normalized.body,
             grpc_status: normalized.grpc_status,
             grpc_message: normalized.grpc_message,
+            failed_websocket_handshake: normalized.failed_websocket_handshake,
             grpc_trailers: normalized.grpc_trailers,
         }
+    }
+
+    /// Build the wire response parts for a normalized reject through the
+    /// production H1/H2 builder. Used to prove that ExactBody length repair
+    /// publishes an authoritative `Content-Length` on both ordinary HTTP rejects
+    /// and failed WebSocket handshakes, and that the failed handshake stays a
+    /// valid HTTP/1.1-or-newer non-upgrade response.
+    pub fn build_normalized_reject_wire_parts_for_test(
+        status: StatusCode,
+        body: &[u8],
+        headers: HashMap<String, String>,
+        failed_websocket_handshake: bool,
+    ) -> http::response::Parts {
+        build_normalized_reject_wire_parts_with_method_for_test(
+            "GET",
+            status,
+            body,
+            headers,
+            failed_websocket_handshake,
+        )
+    }
+
+    /// Same builder, with the trusted request method that drives the
+    /// [`crate::proxy::headers::RejectBodyDisposition`] signal. `HEAD` keeps the
+    /// representation length established by the synthetic-response preparation
+    /// contract; every other method makes the final body slice authoritative.
+    pub fn build_normalized_reject_wire_parts_with_method_for_test(
+        method: &str,
+        status: StatusCode,
+        body: &[u8],
+        headers: HashMap<String, String>,
+        failed_websocket_handshake: bool,
+    ) -> http::response::Parts {
+        let reject = crate::proxy::NormalizedRejectResponse {
+            http_status: status,
+            headers,
+            body: bytes::Bytes::copy_from_slice(body),
+            grpc_status: None,
+            grpc_message: None,
+            failed_websocket_handshake,
+            body_disposition: crate::proxy::headers::RejectBodyDisposition::for_request(
+                method,
+                status.as_u16(),
+            ),
+            grpc_trailers: HashMap::new(),
+        };
+        crate::proxy::build_response_from_normalized_reject(reject)
+            .into_parts()
+            .0
+    }
+
+    /// Normalize a reject for a native gRPC request and build the wire parts
+    /// through the production H1/H2 builder, so the trailers-only branch is the
+    /// one under test (not the plain-HTTP branch).
+    pub fn build_grpc_trailers_only_reject_wire_parts_for_test(
+        status: StatusCode,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+    ) -> http::response::Parts {
+        let reject = crate::proxy::normalize_reject_response(
+            status,
+            bytes::Bytes::copy_from_slice(body),
+            headers,
+            true,
+        );
+        crate::proxy::build_response_from_normalized_reject(reject)
+            .into_parts()
+            .0
+    }
+
+    /// Drive the production reject wire path with an already-shared `Bytes`
+    /// payload, returning the wire parts alongside the body pointer the
+    /// normalizer produced. Lets a test pin the two guarantees that meet on a
+    /// cached synthetic reject: the retained allocation is handed onward without
+    /// a per-hit copy, *and* the gateway still derives an authoritative
+    /// `Content-Length` instead of trusting a plugin-authored one.
+    pub fn build_reject_wire_parts_from_shared_bytes_for_test(
+        method: &str,
+        status: StatusCode,
+        body: bytes::Bytes,
+        headers: &HashMap<String, String>,
+    ) -> (http::response::Parts, usize) {
+        let mut normalized = crate::proxy::normalize_reject_response(status, body, headers, false);
+        normalized.body_disposition =
+            crate::proxy::headers::RejectBodyDisposition::for_request(method, status.as_u16());
+        let observed_body_ptr = normalized.body.as_ptr() as usize;
+        (
+            crate::proxy::build_response_from_normalized_reject(normalized)
+                .into_parts()
+                .0,
+            observed_body_ptr,
+        )
+    }
+
+    /// Run the shared synthetic-response wire preparation contract exactly as
+    /// the reject finalizer does, then build the wire parts. Proves the two
+    /// halves agree: preparation establishes the `HEAD` representation length
+    /// and empties the body; the builder preserves only that length.
+    pub fn prepare_and_build_normalized_reject_wire_parts_for_test(
+        method: &str,
+        status: StatusCode,
+        body: &[u8],
+        mut headers: HashMap<String, String>,
+    ) -> http::response::Parts {
+        let mut body = body.to_vec();
+        if crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
+            method,
+            status.as_u16(),
+            &mut headers,
+            body.len(),
+        ) {
+            body = Vec::new();
+        }
+        build_normalized_reject_wire_parts_with_method_for_test(
+            method, status, &body, headers, false,
+        )
     }
 
     /// Stamp the request-scoped provenance that `serverless_function` sets when
@@ -5141,6 +5335,7 @@ pub mod _test_support {
             body: normalized.body,
             grpc_status: normalized.grpc_status,
             grpc_message: normalized.grpc_message,
+            failed_websocket_handshake: normalized.failed_websocket_handshake,
             grpc_trailers: normalized.grpc_trailers,
         }
     }
@@ -5219,6 +5414,8 @@ pub mod _test_support {
             body: normalized.body.clone(),
             grpc_status: normalized.grpc_status,
             grpc_message: normalized.grpc_message.clone(),
+            failed_websocket_handshake: normalized.failed_websocket_handshake,
+            body_disposition: crate::proxy::headers::RejectBodyDisposition::default(),
             grpc_trailers: normalized.grpc_trailers.clone(),
         };
         crate::proxy::framed_unary_reject_parts(&production).map(|(_, t)| t.clone())
@@ -5895,9 +6092,10 @@ pub mod _test_support {
     };
 
     /// Test-only view of the crate-private shared status-object generation
-    /// helper.
+    /// helper. Takes ownership of the reconcile `Vec` and moves it into one
+    /// shared `Arc<[K8sObject]>` when a writer is present (no element clone).
     pub fn shared_status_objects_snapshot(
-        objects: &[crate::config_sources::k8s::K8sObject],
+        objects: Vec<crate::config_sources::k8s::K8sObject>,
         gateway_writer_present: bool,
         istio_writer_present: bool,
     ) -> Option<std::sync::Arc<[crate::config_sources::k8s::K8sObject]>> {
@@ -5966,6 +6164,188 @@ pub mod _test_support {
     /// making the task set a production-public field.
     pub fn k8s_controller_registry_for_test() -> K8sControllerRegistryForTest {
         K8sControllerRegistryForTest(crate::k8s_controller::ControllerTaskRegistry::new())
+    }
+
+    /// One watch scope driven by the production watcher task
+    /// ([`crate::k8s_controller::watcher::run_watcher_generations`]) over
+    /// scripted reflector generations instead of a live Kubernetes API server.
+    ///
+    /// Each generation gets its own event channel, so a test can hold a
+    /// replacement generation mid-initial-list and observe exactly what the
+    /// reconciler would see at that moment — which is what the make-before-break
+    /// relist contract is about.
+    pub struct K8sWatchScopeForTest {
+        store_set: std::sync::Arc<
+            tokio::sync::Mutex<crate::k8s_controller::resource_store::ResourceStoreSet>,
+        >,
+        senders: Vec<
+            tokio::sync::mpsc::UnboundedSender<
+                kube::runtime::watcher::Event<kube::api::DynamicObject>,
+            >,
+        >,
+        resource: kube::api::ApiResource,
+    }
+
+    impl K8sWatchScopeForTest {
+        /// A `DynamicObject` in this scope's namespace, shaped like one the
+        /// reflector would receive.
+        pub fn object(&self, namespace: &str, name: &str) -> kube::api::DynamicObject {
+            kube::api::DynamicObject::new(name, &self.resource)
+                .within(namespace)
+                .data(serde_json::json!({ "spec": {} }))
+        }
+
+        /// Deliver one watch event on `generation`'s stream. Panics if that
+        /// generation was never scripted.
+        pub fn emit(
+            &self,
+            generation: usize,
+            event: kube::runtime::watcher::Event<kube::api::DynamicObject>,
+        ) {
+            self.senders[generation]
+                .send(event)
+                .expect("scripted watch generation stream was dropped");
+        }
+
+        /// Object names the reconciler would see right now, sorted. This reads
+        /// the same `snapshot_all` the reconciler reads.
+        pub async fn visible_names(&self) -> Vec<String> {
+            let mut names: Vec<String> = self
+                .store_set
+                .lock()
+                .await
+                .snapshot_all()
+                .into_iter()
+                .map(|object| object.metadata.name)
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    /// The bounded per-scope idle-relist offset for one watch scope, in
+    /// milliseconds.
+    ///
+    /// Exposed so tests can assert its BOUNDS and its stability within one
+    /// process. The offset carries a per-process random seed (so control-plane
+    /// replicas do not relist the same scope in the same instant), so no test
+    /// may assert a particular value.
+    pub fn k8s_watch_idle_relist_jitter_millis(
+        api_version: &str,
+        kind: &str,
+        scope: &str,
+        idle_relist_secs: u64,
+    ) -> u64 {
+        use crate::k8s_controller::watcher::{RelistPolicy, idle_relist_jitter};
+
+        let window = RelistPolicy::from_idle_secs(idle_relist_secs).idle_window;
+        idle_relist_jitter(api_version, kind, scope, window).as_millis() as u64
+    }
+
+    /// Build a watch scope with `generations` scripted reflector generations and
+    /// return it alongside the production watcher task future.
+    ///
+    /// Generation 0's store is pre-registered exactly as `start_crd_watchers`
+    /// registers it. Streams past `generations` never yield and never end, so a
+    /// test cannot accidentally trip the stream-end deregistration path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn k8s_watch_scope_for_test(
+        group: &str,
+        version: &str,
+        kind: &str,
+        plural: &str,
+        scope: &str,
+        idle_relist_secs: u64,
+        generations: usize,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> (K8sWatchScopeForTest, impl std::future::Future<Output = ()>) {
+        use crate::k8s_controller::resource_store::{CrdResourceStore, ResourceStoreSet};
+        use crate::k8s_controller::watcher::{RelistPolicy, WatchTarget, run_watcher_generations};
+        use futures_util::{Stream, StreamExt};
+        use kube::api::{ApiResource, DynamicObject};
+        use kube::runtime::{reflector, watcher};
+
+        let api_version = if group.is_empty() {
+            version.to_string()
+        } else {
+            format!("{group}/{version}")
+        };
+        let resource = ApiResource {
+            group: group.to_string(),
+            version: version.to_string(),
+            api_version: api_version.clone(),
+            kind: kind.to_string(),
+            plural: plural.to_string(),
+        };
+
+        let mut senders = Vec::with_capacity(generations);
+        let mut receivers = std::collections::VecDeque::with_capacity(generations);
+        for _ in 0..generations {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            senders.push(tx);
+            receivers.push_back(rx);
+        }
+
+        let initial_writer = reflector::store::Writer::new(resource.clone());
+        let mut set = ResourceStoreSet::new();
+        set.add_store(std::sync::Arc::new(CrdResourceStore::new_scoped(
+            api_version.clone(),
+            kind.to_string(),
+            scope.to_string(),
+            initial_writer.as_reader(),
+        )));
+        let change_notifier = set.change_notifier();
+        let store_set = std::sync::Arc::new(tokio::sync::Mutex::new(set));
+
+        let target = WatchTarget {
+            api_version,
+            kind: kind.to_string(),
+            scope: scope.to_string(),
+            resource: resource.clone(),
+            watcher_label: "CRD watcher",
+        };
+
+        type ScriptedStream = std::pin::Pin<
+            Box<
+                dyn Stream<Item = Result<watcher::Event<DynamicObject>, watcher::Error>>
+                    + Send
+                    + 'static,
+            >,
+        >;
+        let make_stream = move |writer: reflector::store::Writer<DynamicObject>| -> ScriptedStream {
+            match receivers.pop_front() {
+                Some(rx) => Box::pin(reflector::reflector(
+                    writer,
+                    tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
+                        .map(Ok::<_, watcher::Error>),
+                )),
+                // Unscripted generations stay silent forever rather than ending,
+                // so they never look like a watch that closed.
+                None => Box::pin(futures_util::stream::pending::<
+                    Result<watcher::Event<DynamicObject>, watcher::Error>,
+                >()),
+            }
+        };
+
+        let task = run_watcher_generations(
+            target,
+            initial_writer,
+            store_set.clone(),
+            change_notifier,
+            RelistPolicy::from_idle_secs(idle_relist_secs),
+            std::sync::Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new()),
+            shutdown,
+            make_stream,
+        );
+
+        (
+            K8sWatchScopeForTest {
+                store_set,
+                senders,
+                resource,
+            },
+            task,
+        )
     }
 
     /// Thin wrapper over the production CP full-reload publication so external

@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Kubernetes controller watch scopes now rebuild their reflector from an
+  authoritative list when they go idle past `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`
+  (default `300`, `0` disables, clamped to `0`–`86400`). kube-rs raises an
+  error only when a watch *fails*, so a watch that stops delivering without
+  failing leaves the task alive while its reflector serves a permanently stale
+  object set and every later Gateway API / Istio resource stays invisible to
+  reconciles; `FERRUM_K8S_FULL_SYNC_INTERVAL_SECS` cannot recover it because it
+  re-reconciles that same store. A Gateway API conformance run captured that
+  signature — the TCPRoute `v1alpha2` scope initialized, four TCPRoutes existed
+  in the cluster, the sibling ReferenceGrant watcher kept receiving events, the
+  controller stayed alive and kept reconciling, and the TCPRoute store stayed
+  frozen with no watcher error, restart, or status write for 120s. That is
+  consistent with a silently stalled or black-holed watch; the artifact carries
+  no transport-level evidence of where the event stream was lost, so the
+  recovery is deliberately cause-agnostic and bounds any no-event stall. The
+  replacement generation is swapped in make-before-break — the previous store
+  keeps serving until the replacement reports `InitDone` — so a relist never
+  looks like a mass deletion, and a replacement that never finishes listing is
+  itself abandoned and retried without blanking the scope. Because bookmarks
+  are consumed inside kube-rs, a healthy quiet scope is indistinguishable from
+  a stalled one and relists on every window, so the window doubles as the
+  per-scope full-list rate against the API server; each scope's deadline
+  carries a bounded offset seeded per process, so neither the scopes on one
+  replica nor the replicas of one scope list in lockstep. Watcher task
+  ownership, the stream-end deregistration contract, and the CRD reprobe loop
+  are unchanged.
+
 - API-spec YAML ingestion now expands anchors and aliases through a bounded
   libyaml event graph (node, depth, alias-reference, expanded-byte, and work
   budgets) with cycle / undefined-alias / duplicate-anchor /
@@ -43,8 +70,182 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/dependency-policy.md`, `docs/vendored-patch-lifecycle.json`, and
   `docs/upstream-*-patches/` off the lightweight documentation path.
 
+### Changed
+
+- Gateway API and Istio status planning now build immutable per-reconcile
+  indexes and reuse one primary translation/materialization (plus skip errors)
+  instead of retranslating a filtered snapshot once per status object, and
+  borrow included `K8sObject` values rather than deep-cloning `spec`/`status`
+  JSON (#2397). Both paths share that translation/index snapshot; only Gateway
+  API status planning applies the fair deterministic 256-candidate rotating
+  work budget *before* expensive per-object status work so the cap bounds CPU
+  as well as API writes. Istio status planning remains unlimited
+  (`StatusPlanBudget::unlimited(0)`). Fail-closed validation and status parity
+  for every supported Istio/Gateway resource are preserved.
+- Shared `BatchingLogger` flush/retry/fallback now Arc-shares one immutable
+  batch payload (`Arc<Vec<T>>`) across every delivery attempt and the optional
+  failed-batch hook instead of deep-cloning owned records on each non-final
+  attempt (#3029). Sink flush closures borrow or Arc-clone that handle; byte
+  leases stay charged for the shared records' lifetime and release when the
+  last Arc drops after success, terminal discard, or fallback ownership
+  transfer.
+- `proxy_alerts` / notification delivery now expose bounded-cardinality
+  Prometheus delivery metrics (`attempted` / `succeeded` /
+  `failed_transient` / `failed_permanent` / `backpressure_dropped` /
+  `abandoned_at_deadline` / `in_flight`, labeled only by fixed
+  `channel_type`), classify transport/HTTP outcomes into permanent vs
+  transient failures with a bounded jittered retry budget, track dispatch
+  tasks per plugin generation (reload stops admission and cooperatively
+  cancels; process shutdown drains via the shared observability delivery
+  budget), and commit Trigger/Resolve cooldown + incident state only after
+  a defined delivery settle (`PendingTrigger` / `PendingResolve`). See
+  `docs/proxy_alerts.md` and `docs/notifications.md` (#2448).
+- Abandonment is now reported under a fixed, compiled-in reason taxonomy
+  instead of one catch-all counter. New
+  `ferrum_notification_delivery_rejected_total{channel_type,reason}`
+  (`generation_closed`, `registry_rejected`) covers drops where the
+  registry-owned delivery body never started — including the pre-`begin_task`
+  generation rejection that previously incremented nothing at all — and new
+  `ferrum_notification_delivery_abandoned_total{channel_type,reason}`
+  (`generation_retired`, `shutdown_deadline`, `task_dropped`) covers bodies
+  that started without a committed outcome (channel transport may or may not
+  have been polled). `ferrum_notification_delivery_attempted_total` advances at
+  that body-start boundary (not the first channel call) so hard-deadline drop
+  classification and the accounting identity stay race-free; an admit-then-cancel
+  race can therefore increment `attempted` with no bytes on the wire.
+  `ferrum_notification_delivery_abandoned_at_deadline_total` increments
+  **only** for the true hard abort at the global shutdown drain deadline; a
+  rejected or reload-retired send no longer inflates it, and a pre-body
+  rejection never inflates `attempted`. Every rejection path still runs the
+  producer settle callback exactly once (#2448).
+- `proxy_alerts` re-breach during an externally in-flight Resolve no longer
+  silently suppresses the follow-up alert. The incident parks in
+  `ResolveInFlightRebreached` (no notification that could overtake the Resolve
+  on the wire), and the Resolve's settle — success, failure, or abandonment
+  alike, because none of those proves the endpoint did not act — converges to
+  `CompensatingTrigger`, so the next breaching sample re-alerts through the
+  ordinary cooldown gate. A rule that recovered again in the meantime returns
+  to `Healthy` with no phantom alert (#2448).
+- Documented the best-effort endpoint delivery contract: bounded
+  backpressure/failure paths can produce zero copies, while transport timeouts,
+  connection errors after the request was written, and cancellation after bytes
+  left the process can duplicate a delivery on retry or report an abandoned
+  outcome despite endpoint action. Retries preserve `fired_at`, but later
+  re-admission does not; Ferrum supplies no cross-admission idempotency key.
+  Webhook/email consumers must be idempotent or duplicate-tolerant (#2448).
+
 ### Security
 
+- `body_validator` and `openapi_validator` validation diagnostics no longer
+  disclose the rejected representation (GHSA-5p2h-fq6q-gwh9). Both plugins used
+  to format the offending instance value — or a payload-chosen JSON, XML, form,
+  or multipart member name — into the string returned in the client-visible
+  reject / problem body and stored in `openapi_validator.request_error` /
+  `openapi_validator.response_error`, which every configured logging plugin
+  exports. On the response side that republished exactly the upstream
+  representation validation exists to withhold, letting a client that can
+  trigger an invalid backend response read back a token, credential, or PII
+  field; on the request side it copied caller credentials into gateway
+  telemetry and every downstream sink. Diagnostics are now assembled under a
+  centralized construction contract
+  (`plugins::utils::validation_diagnostics`): a compiled-in failure category, an
+  allowlisted JSON Schema keyword, and — request side only — a bounded instance
+  location. Numeric JSON Pointer segments render as a fixed `#` marker (pointer
+  text alone does not prove array shape); an object member name survives only
+  when the *configured schema declares it as a JSON property*, and every other
+  segment renders as `~`, so a hostile member name is replaced rather than
+  sanitized after the fact. Segment count, segment length, and total diagnostic
+  length are capped by compiled-in constants. Raw schema paths (including
+  `$defs` / reference names), configured XML names and namespaces, and hostile
+  `Content-Encoding` coding tokens are never formatted into diagnostics. No
+  production path formats a rejected value, an expected `enum` / `const`
+  constant, a raw `jsonschema` / `roxmltree` / `prost` rendering, a backend
+  `Content-Type`, or the request target, so there is nothing left for truncation
+  to protect and no raw-detail escape hatch in configuration or tracing.
+  Response-side conversion and decode failures collapse further, to a single
+  fixed sentence, because even the class of failure describes an upstream
+  representation the client was never entitled to observe.
+  `error_truncate_chars` is retained as a size bound and now only narrows
+  (`min(configured, 256)`). JSON, XML, form, multipart, protobuf, and gRPC
+  validation decisions, statuses, and fail-closed behavior are unchanged;
+  `openapi_validator`'s unknown-operation detail no longer interpolates the
+  request method and target.
+
+- Matched VirtualService route-level request/response header transforms remain
+  authoritative under multiple same-type transformer instances
+  (GHSA-3xxr-xhhj-9962). Previously each enabled `request_transformer` /
+  `response_transformer` applied its static rules and then consumed the shared
+  route-override list, so a later instance could re-add, rename into, or
+  overwrite a backend- or client-bound field the matched route had removed or
+  set. Enabled instances now apply only static header rules; proxy core applies
+  each matched route list exactly once after the last eligible instance on the
+  request and response chains (ordinary H1/H2/H3, synthetic/rejection,
+  header-capability simulation, and deadline provenance paths). Disabled RTDS
+  instances stay complete no-ops and do not suppress route overrides. Query and
+  body transform ordering is unchanged.
+
+- Updated the transitive `event-listener` dependency from 5.4.1 to 5.4.2,
+  removing the `StackSlot` cross-thread unsoundness reported as
+  RUSTSEC-2026-0221.
+
+- `ai_rate_limiter` pre-dispatch prompt reservation no longer under-counts billed
+  prompt text when a recognized field is present (GHSA-2r5g-438w-85hr). The
+  estimator walks the already-parsed request JSON once and sums billable string
+  values, visited object member names (including nested tool / function JSON
+  Schema property names), and JSON scalar literals (`null` / booleans / numbers
+  at serialized width), so sibling instructions, schema keys, and schema scalars
+  cannot be omitted from the reservation. Exclusions are path/context aware —
+  unsigned numeric output caps only at the exact paths also read for
+  completion-budget reservation (negative/fractional values count fail-closed),
+  and multimodal URL/base64/file leaves only inside matching provider
+  content-part family and part `type` (member names and unrelated textual
+  siblings still count; wrong-family / malformed parts count fail-closed).
+  Ordinary strings, including well-formed `data:` URLs in `instructions` or
+  schemas, always count; collision-shaped reserved spellings outside those
+  contexts count fail-closed. The walk remains a conservative `chars/4`
+  heuristic, not provider tokenizer parity.
+- Irreversible request egress no longer precedes request-body transformation or
+  final request policy (GHSA-4vr5-4wm3-x5xv). `request_mirror` and
+  `serverless_function` previously ran their external dispatch in
+  `before_proxy`, consuming the *pre-transform* metadata body: a mirror, a
+  serverless function, or a pre-proxy authorization function could receive a
+  field `request_transformer` was configured to remove or redact, and could be
+  handed a request that WAF body rules, OpenAPI request-schema validation,
+  request-body validation, or the post-transform `request_size_limiting`
+  ceiling went on to reject — a disclosure or billable side effect that no
+  later local rejection could retract. Both plugins now have no `before_proxy`
+  hook at all and instead run in a new **finalized-request-egress** phase that
+  the gateway reaches only after request-body collection, canonical
+  `transform_request_body` rewrites, and every `on_final_request_body` policy
+  hook have accepted the exact backend-visible representation. The phase hands
+  plugins an immutable header/body snapshot; a `pre_proxy` `serverless_function`
+  publishes its header injections through a backend header overlay that the
+  proxy merges only after re-establishing gateway-owned assertions and the
+  egress baggage policy. `ai_federation` also dispatches from this boundary
+  rather than from inside the ordered final-body hook pass, so
+  `priority_override` cannot move provider I/O ahead of a final request policy.
+  The phase is wired on H1/H2 (HTTP, WebSocket handshakes, and native gRPC) and
+  HTTP/3, runs at most once per request, and is therefore not repeated by
+  retries, which replay the already-finalized body.
+
+  Consequences worth reading before upgrading:
+  - A body-forwarding `serverless_function` may now share a proxy with
+    `request_transformer`; that composition was previously refused outright
+    because the function saw different bytes than the backend. The refusal is
+    retained — and widened to cover final request-body policy plugins — for
+    registered custom plugins that still declare
+    `egresses_request_body_before_finalization()`.
+  - A buffered request on a proxy with an egress plugin now finalizes its body
+    *before* the backend circuit-breaker gate rather than inside backend
+    dispatch, so an open breaker is reported after the upload is read.
+  - A mirrored body is now the transformed body and is metered against
+    `max_mirrored_request_body_bytes` at its post-transform length; a transform
+    that inflates the body past that ceiling drops the mirror instead of
+    replaying a truncated payload.
+  - Rejections produced by these plugins report
+    `rejection_phase = "finalized_request_egress"` instead of `"before_proxy"`.
+  - Egress plugins no longer run for HBONE `CONNECT` tunnels, which
+    short-circuit the dispatch ladder before the phase boundary.
 - Retained-response replay now follows one fail-closed partition contract across
   `response_caching`, `request_deduplication`, and `ai_semantic_cache`
   (GHSA-w27g-65rf-h7xm, GHSA-v4g3-2r4f-f6pc, GHSA-37gg-v9m4-8445). A new shared

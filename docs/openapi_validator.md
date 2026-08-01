@@ -170,6 +170,7 @@ The generated plugin config has this shape:
   "error_response": {
     "request_status_code": 400,
     "response_status_code": 502,
+    "unsupported_media_type_status_code": 415,
     "content_type": "application/problem+json"
   }
 }
@@ -191,8 +192,9 @@ The generated plugin config has this shape:
 | `bypass.methods` | `[]` | HTTP methods that skip validation. |
 | `bypass.consumers` | `[]` | Authenticated identities or mapped consumer usernames that skip validation. |
 | `bypass.header_present` | `{}` | Header-name map. `null` means any value; a string requires an exact value match. Case-equivalent duplicate keys are rejected at construction. |
-| `error_response.request_status_code` | `400` | Status for blocked request validation errors. |
+| `error_response.request_status_code` | `400` | Status for blocked request validation errors, including a missing or empty `request_required` body. |
 | `error_response.response_status_code` | `502` | Status for blocked response validation errors. |
+| `error_response.unsupported_media_type_status_code` | `415` | Status for a nonempty request body that no media entry declared for the matched operation covers, including a body sent with no `Content-Type`. Separate from `request_status_code` so remapping schema failures does not also remap media-type refusals. |
 | `error_response.content_type` | `application/problem+json` | Content type for generated error bodies. |
 
 ### Strict config admission
@@ -212,7 +214,12 @@ Removed aliases: `json_schema_draft` (use `schema_draft`) and `operations[].requ
 ## Runtime Behavior
 
 - Only plain HTTP proxy traffic is in scope. WebSocket frames, raw TCP/UDP, and gRPC protobuf validation are not handled by this plugin.
-- Request validation buffers only body-capable methods with a matching operation and request schema. Optional bodies require an in-scope content type; a required body is buffered regardless of Content-Type so an absent body cannot evade the presence check.
+- The imported document's **request** contract is a *client* contract, decided in a dedicated lifecycle phase — `validate_client_request_body_contract` — that the proxy runs on the buffered original client body after gateway-owned normalization (bounded `Content-Encoding` decoding) and **before any `before_proxy` hook or `transform_request_body` transformer**. A configured transform can therefore no longer inject a schema-required property, coerce an invalid type, rename a field, or remove an `additionalProperties: false` violation and have the reshaped body accepted as though the caller had sent it (`GHSA-896v-jx23-9g6p`). The phase is read-only: it admits or rejects and never rewrites the body or headers.
+- Only plain HTTP request bodies are in scope for this contract. An HBONE CONNECT tunnel carries opaque tunnel bytes, not an HTTP request body: the proxy skips request-body buffering for HBONE and short-circuits into the HBONE relay immediately after `before_proxy`, before any final-request-body hook, so neither contract phase runs on tunnel bytes at all.
+- `on_final_request_body` stays the **backend** contract phase. It is retained as the fallback when this validator did not select over the pristine client view but does select over the effective backend-visible view — an operation match or bypass state that only materializes after a `before_proxy` route override or request header/target rewrite. Unknown-operation admission (`fail_on_unknown_operation`) is rejected in `before_proxy` rather than deferred to this fallback; the client phase deliberately leaves unmatched operations undecided so that rejection is not reordered ahead of unrelated `before_proxy` hooks. An instance that already decided in the client phase does not validate, reject, or log the same request again there. Which representation a decision was taken over is published as `openapi_validator.request_contract_phase` (`client` or `backend_final`). Multiple `openapi_validator` instances on one proxy each stage their own decision under a process-unique instance ID and can never consume each other's. Behavior is identical on HTTP/1.1, HTTP/2, and HTTP/3, including an empty `GET`/`HEAD`/`OPTIONS` against an operation that declares `request_required`: HTTP/1.1 and HTTP/2 keep that transport-proven-empty request zero-copy and still decide the contract against an empty body, exactly as HTTP/3 does.
+- Request validation buffers every matched operation that declares a request schema or `request_required`. Selection uses the matched operation alone — **not** the received `Content-Type` and **not** a method allowlist — so omitting, misspelling, or mismatching a representation hint cannot vote the validator out of the request and make declared constraints inert (`GHSA-6p78-6x8c-9g9x`). Whatever the imported document declares for an operation is enforced for that operation, including body-bearing `DELETE` and a `GET` whose document declares a `requestBody`. Retained bytes remain bounded by Ferrum's global and route request-body ceilings.
+- In `block` mode the request contract fails closed twice over: a missing or empty body for a `request_required` operation returns `error_response.request_status_code` (400 by default), and a **nonempty** body that no declared media entry of the operation covers — including a body sent with no `Content-Type` at all — returns `error_response.unsupported_media_type_status_code` (415 by default). Neither diagnostic echoes the received `Content-Type` or any byte of the rejected body. This holds even when the body was buffered because a *different* plugin voted for it, so another plugin's buffering vote can no longer make an unrecognized representation continue silently. `log_only` records the same decisions in metadata and continues; `disabled` skips the phase entirely.
+- A media type the document *does* declare but the operator excluded from `request_content_types` is an explicit inspection opt-out, not a client-selectable bypass: it records `skip_reason = content_type_out_of_scope` and continues.
 - Response validation buffers matching operations with response schemas, and also matching operations governed by `fail_on_missing_response_schema` even when their declared response maps contain no schema. Request `Accept` and internal streaming markers do not waive the contract. A pristine backend `text/event-stream` response is treated as uninspectable before header commit: `block` returns the configured response error (502 by default), while `log_only` records the response mismatch and permits the stream. Missing, ambiguous, or later-relabeled types remain on the ordinary validation path.
 - JSON and `+json` bodies are parsed as JSON. Before the schema sees the parsed instance, the raw (decoded) bytes are screened for **duplicate object member names** at any nesting depth, including inside arrays, inside a `multipart/form-data` part declared with a JSON content type, and inside an Encoding Object Header Object `content` value declared with a JSON media type. `serde_json` collapses duplicate members to the *last* value while many backends and clients keep the *first*, so a body that satisfies the schema after collapsing can still deliver a schema-forbidden earlier value to the peer that reads it (advisory `GHSA-c78j-5w9p-cpq6`). Ambiguity is rejected rather than canonicalized, because this plugin forwards the original bytes: `block` returns the configured request/response error and `log_only` records the mismatch and continues. Member names are compared *after* decoding JSON escapes, so a literal name and a `\uXXXX`-escaped spelling of the same code point collide. The screen is non-recursive and runs under explicit depth, token, member-count, member-name, and body-size budgets; exhausting any budget fails closed without an unbounded confirmation pass. Bytes that are not valid JSON at all keep their existing `Invalid JSON body` handling. Rejection details use a fixed set of reasons and never echo any byte of the inspected body.
 - XML and `+xml` bodies are parsed into schema-shaped objects. OpenAPI XML Object fields `xml.name`, `xml.namespace`, `xml.prefix`, `xml.attribute`, and `xml.wrapped` are honored when mapping elements and attributes. Matching uses expanded names (`namespace URI` + local name): a declared `xml.namespace` must match the document URI exactly (prefix text is serialization metadata only and is not trusted). A member that collides with a modeled property, attribute, array wrapper, or array item (by JSON key or local name) but does not match its modeled XML construct or namespace is rejected fail-closed during conversion: an attribute where an element is modeled (or vice versa) and a non-matching namespace URI both qualify, and such a member is neither dropped nor rematerialized as an additional member, so it cannot fill an unfilled modeled slot and pass validation the backend would reject. Undeclared XML attributes and elements that do not collide with reserved expanded names are preserved for JSON Schema evaluation (`additionalProperties`, `maxProperties`, `patternProperties`, `propertyNames`, and related keywords). Leaf elements that carry attributes materialize as objects (attributes plus optional `#text`) rather than discarding attributes. Repeated elements are accepted only for array schemas; scalar properties and wrapped-array wrappers reject duplicates fail-closed.
@@ -223,7 +230,17 @@ Removed aliases: `json_schema_draft` (use `schema_draft`) and `operations[].requ
 - Request and response bodies may carry a complete HTTP `Content-Encoding` list (`gzip`, `br`, and `identity`). Supported coding chains such as `gzip, br` and `br, gzip` are decoded in reverse application order before schema validation. Empty, malformed, parameterized, or unsupported list members fail validation. `max_body_bytes` bounds the raw body and every decoded layer so chained expansion fails closed.
 - Response selection is **status-first**. The exact status wins; otherwise the narrowest matching OpenAPI wildcard range such as `4XX`; otherwise `default`. The selected response object is final: a media-type miss inside it never falls through to a range or `default` object, because those cover status codes that are *not otherwise declared*. Media entries are matched most-specific-first (exact media type, then Ferrum's `+json` / `+xml` / `text/*` family fallback, then a declared `type/*` range, then `*/*`). The importer emits declared statuses even when they carry no schema-bearing content, so an empty media map means "this status is declared to carry no body".
 - An empty response body is **not** an automatic pass, including for gateway-generated synthetic responses. Except for statuses and methods with no body semantics (HEAD, 1xx, 204, 205, 304, which are skipped with `skip_reason = no_body_expected`), a zero-byte body is fed to the media parser for the selected schema, so an empty payload under `Content-Type: application/json` fails JSON parsing instead of silently continuing.
-- Response validation errors are redacted. Schema failures retain only a fixed generic message plus the operator/schema-controlled schema location (JSON Pointer object-key segments in the instance path are backend-derived and are never emitted); response conversion failures use a generic message; missing-schema errors report only whether Content-Type was present. Backend body values, backend JSON property names, and raw backend Content-Type values therefore do not cross the client boundary or land in transaction logs. Request validation errors keep the full message because the instance is the caller's own submitted body.
+- Response validation errors are redacted. Schema failures retain only a fixed
+  generic message plus an allowlisted JSON Schema keyword (raw schema paths,
+  including `$defs` / reference names, are never emitted; JSON Pointer
+  object-key segments in the instance path are backend-derived and are never
+  emitted either); response conversion failures use a generic message;
+  missing-schema errors report only whether Content-Type was present. Backend
+  body values, backend JSON property names, configured XML names/namespaces,
+  and raw backend Content-Type values therefore do not cross the client
+  boundary or land in transaction logs. Request validation errors keep a
+  payload-free category, allowlisted keyword, and bounded instance location
+  (declared JSON property names and a fixed numeric-segment marker only).
 - Path templates are generated as full-match regexes. Path parameter constraints are not interpreted; `{id}` becomes `[^/]+`.
 - Operation matching runs on the [canonical policy path](request_path_canonicalization.md), which is derived once at the frontend boundary and is the same value routing, WAF, and the backend request line use. Two consequences matter for operation selection: a client cannot pick a spelling that lands on a different operation than the backend dispatches (`/%61dmin` selects the `/admin` operation, not `/{slug}`), and an encoded separator can never hide inside a `[^/]+` parameter segment — such a target is rejected with `400` before the plugin runs, as are dot segments and backslashes in either spelling (`/a/../b`, `/a/%2e%2e/b`, `/a\b`, `/a%5Cb`), which a URL parser would otherwise resolve into a different operation than the one matched. Within a method, operations are ordered by literal-segment count, so a concrete path template always wins over an overlapping templated one regardless of document order.
 
@@ -235,10 +252,49 @@ Validation outcomes are written to transaction metadata for all logging plugins:
 |---|---|
 | `openapi_validator.mode` | `block`, `log_only`, or `disabled` |
 | `openapi_validator.matched_operation` | Example: `POST /orders/{id}` |
-| `openapi_validator.skip_reason` | `no_match`, `bypass_path`, `bypass_consumer`, `bypass_header`, `bypass_method`, `content_type`, `no_schema`, `no_response_content`, or `no_body_expected` |
-| `openapi_validator.request_error` | Truncated request validation error |
-| `openapi_validator.response_error` | Truncated response validation error |
+| `openapi_validator.skip_reason` | `no_match`, `bypass_path`, `bypass_consumer`, `bypass_header`, `bypass_method`, `content_type`, `content_type_out_of_scope`, `no_schema`, `no_response_content`, or `no_body_expected` |
+| `openapi_validator.request_contract_phase` | `client` (decided pre-transform over the original client body) or `backend_final` (fallback over the final backend-visible body) |
+| `openapi_validator.request_error` | Bounded, payload-free request validation diagnostic |
+| `openapi_validator.response_error` | Bounded, payload-free response validation diagnostic |
 | `openapi_validator.action` | `rejected_request`, `rejected_response`, `logged_request_mismatch`, or `logged_response_mismatch` |
+
+## Diagnostic confidentiality
+
+Both metadata entries above and the client-visible problem `detail` carry the
+*same* string, and every configured logging plugin exports the metadata. That
+string is therefore assembled from a fixed vocabulary and never from payload
+bytes (advisory `GHSA-5p2h-fq6q-gwh9`):
+
+- a compiled-in failure category (`request body does not satisfy the request
+  schema`, `Invalid integer value`, `Malformed multipart part: ...`,
+  `Content-Encoding could not be decoded`, `XML root element does not match the
+  configured schema`, and the rest of the fixed set);
+- an allowlisted JSON Schema keyword (`pattern`, `type`, …). Tokens outside the
+  compiled vocabulary — including custom keywords and `$defs` / reference map
+  keys — collapse to `UNKNOWN_KEYWORD`. Raw `schema_path()` text is never
+  copied into the diagnostic;
+- request side only, a bounded instance location such as `/rows/#/count`.
+  Numeric pointer segments render as `#` because JSON Pointer alone does not
+  prove array shape. An object member name survives only when the configured
+  schema declares it as a JSON property; any other member name — a hostile JSON
+  key, an XML local name, a form or multipart field name — is rendered as `~`.
+  Segment count, segment length, and total location length are all capped, and a
+  location cut short ends in `/...`.
+
+Nothing else is rendered. In particular the plugin never emits the rejected
+instance value, an `enum` / `const` constant the schema expects, a raw
+`jsonschema` message, a raw `roxmltree` parse token, a configured `xml.name` /
+`xml.namespace`, a hostile content-coding token, a backend `Content-Type`, or
+the request target. Response-side diagnostics are coarser still: a conversion
+or decode failure collapses to a single fixed sentence, because even the
+*class* of failure describes an upstream representation the client was never
+entitled to observe.
+
+`error_truncate_chars` remains accepted, but it is only a size bound and it can
+only narrow: the effective cap is `min(error_truncate_chars, 256)`. Raising it
+cannot widen a disclosure, because there is no payload content left for it to
+reveal. There is no raw-diagnostic escape hatch, in configuration or in
+tracing.
 
 ## Overrides
 
