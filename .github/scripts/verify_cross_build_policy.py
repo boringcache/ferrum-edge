@@ -88,7 +88,10 @@ WORKFLOW_CONTRACTS = (
         "build-arm64-cross",
         "87163fa690e89218de8ae00db15d0512c0687a836e0fd32e061e35380c9e0023",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
-        "d775752cb399db3b0660e26e0d9bdb32d7d72cf4ed47694066ccbf629e87e80f",
+        # Pins the top-level `on:` mapping that schedules CI, including
+        # unconditional `merge_group: checks_requested` alongside push,
+        # pull_request, and workflow_dispatch.
+        "2e80c4efd07fae17c1a813c4e7cd9b54a592ea53d88f73e2933bdc8f9ba34e56",
     ),
     (
         "release workflow",
@@ -1498,6 +1501,7 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
         run: |
           set -euo pipefail
 
@@ -1541,6 +1545,31 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
             fi
             # Pin the moving tip exactly once; nothing below re-resolves a ref.
             trusted_sha="$(git rev-parse --verify --quiet refs/ferrum/trusted-base^{commit} || true)"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            # Merge queues synthesize a combined SHA. Use the event's base_sha
+            # as the trusted filter source and the change-set base so a missing
+            # pull_request payload cannot force-skip or check only main.
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              fetched=false
+              for attempt in 1 2 3; do
+                if git fetch --no-tags --no-recurse-submodules origin \
+                  "${MERGE_BASE_SHA}"; then
+                  fetched=true
+                  break
+                fi
+                echo "git fetch of merge_group base failed (attempt ${attempt}/3); retrying" >&2
+                sleep $(( attempt * 10 ))
+              done
+              if [ "$fetched" != true ]; then
+                echo "::error::git fetch of merge_group base_sha failed after 3 attempts" >&2
+                exit 1
+              fi
+            fi
+            trusted_sha="$MERGE_BASE_SHA"
           else
             # A push to the default branch and a manual dispatch already run
             # trusted code, so the checked-out commit IS the trusted base.
@@ -1588,7 +1617,7 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
           fi
           git cat-file blob "$entry_object" > "$trusted_filter"
 
-          if [ "$EVENT_NAME" = "pull_request" ]; then
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
             git diff --name-only --no-renames "${trusted_sha}...HEAD" \
               | sort > "$changed_files"
           fi
@@ -1668,7 +1697,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     # list, add a step, or redirect this job at a repository-supplied script.
     name: Fuzz Smoke
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -13392,9 +13421,13 @@ def validate_ci_planner_isolation(contents: str, source: str) -> list[str]:
         for line in block.splitlines()
         if re.match(r"^\s*planner_dir\s*=", line)
     ]
+    # Self-test and plan steps each bootstrap once, then extract under
+    # RUNNER_TEMP for both pull_request and merge_group event arms.
     expected_planner_dirs = [
         "planner_dir=.github/scripts",
         'planner_dir=".github/scripts"',
+        'planner_dir="$trusted_dir"',
+        'planner_dir="$trusted_dir"',
         'planner_dir="$trusted_dir"',
         'planner_dir="$trusted_dir"',
     ]
@@ -13411,6 +13444,8 @@ def validate_ci_planner_isolation(contents: str, source: str) -> list[str]:
     if sorted(trusted_dir_assignments) != sorted(
         [
             'trusted_dir="$RUNNER_TEMP/pr-ci-plan"',
+            'trusted_dir="$RUNNER_TEMP/pr-ci-plan"',
+            'trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"',
             'trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"',
         ]
     ):
@@ -19667,9 +19702,13 @@ pre_build = []
         "          planner_dir=.github/scripts\n"
         '          trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"\n'
         '          planner_dir="$trusted_dir"\n'
+        '          trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"\n'
+        '          planner_dir="$trusted_dir"\n'
         f"          {ISOLATED_PLANNER_LAUNCHER} --self-test\n"
         "      - run: |\n"
         '          planner_dir=".github/scripts"\n'
+        '          trusted_dir="$RUNNER_TEMP/pr-ci-plan"\n'
+        '          planner_dir="$trusted_dir"\n'
         '          trusted_dir="$RUNNER_TEMP/pr-ci-plan"\n'
         '          planner_dir="$trusted_dir"\n'
         f"          plan=\"$({ISOLATED_PLANNER_LAUNCHER} \\\n"
@@ -22112,6 +22151,10 @@ pre_build = []
         'python3 -I "$trusted_filter" --self-test',
         "+refs/heads/${BASE_REF}:refs/ferrum/trusted-base",
         "^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$",
+        'elif [ "$EVENT_NAME" = "merge_group" ]; then',
+        'MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}',
+        'merge_group base_sha missing or malformed',
+        '[ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]',
         "            true|false) ;;",
     ):
         if required_token not in rendered_relevance:
@@ -22504,8 +22547,12 @@ pre_build = []
         "          planner_dir=.github/scripts\n"
         '          trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"\n'
         '          planner_dir="$trusted_dir"\n'
+        '          trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"\n'
+        '          planner_dir="$trusted_dir"\n'
         f"          {ISOLATED_PLANNER_LAUNCHER} --self-test\n"
         '          planner_dir=".github/scripts"\n'
+        '          trusted_dir="$RUNNER_TEMP/pr-ci-plan"\n'
+        '          planner_dir="$trusted_dir"\n'
         '          trusted_dir="$RUNNER_TEMP/pr-ci-plan"\n'
         '          planner_dir="$trusted_dir"\n'
         f"          {ISOLATED_PLANNER_LAUNCHER} --event-name pull_request\n"
