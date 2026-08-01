@@ -7808,8 +7808,13 @@ fn sink_constructor_accepts_and_rejects_schemas_at_construction() {
 #[test]
 fn spool_usage_counters_track_write_evict_and_reconcile_lifecycle() {
     let temp = tempfile::tempdir().unwrap();
-    let event = sample_event("usage-lifecycle");
+    let event = sample_event("usage-lifecycle-1");
     let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    assert_eq!(
+        encoded_len,
+        encoded_event_len(&sample_event("usage-lifecycle-2"), SpoolCompression::None),
+        "fixture event ids must encode to equal sizes"
+    );
     let settings = SpoolSettings {
         enabled: true,
         dir: temp.path().to_path_buf(),
