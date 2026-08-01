@@ -4431,7 +4431,7 @@ async fn exact_boundary_clean_request_body_is_not_truncated() {
     let headers = ctx.headers.clone();
 
     let result = plugin
-        .on_final_request_body_with_context(&mut ctx, &headers, &vec![b'a'; SCAN_CAP])
+        .on_final_request_body_with_context(&mut ctx, &headers, &[b'a'; SCAN_CAP])
         .await;
 
     assert!(matches!(result, PluginResult::Continue));
@@ -4458,7 +4458,7 @@ async fn one_byte_over_boundary_request_body_fails_closed() {
     let headers = ctx.headers.clone();
 
     let result = plugin
-        .on_final_request_body_with_context(&mut ctx, &headers, &vec![b'a'; SCAN_CAP + 1])
+        .on_final_request_body_with_context(&mut ctx, &headers, &[b'a'; SCAN_CAP + 1])
         .await;
 
     // The configured rejection shape is preserved, so the reject stays
