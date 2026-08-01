@@ -3912,6 +3912,7 @@ pub mod _test_support {
         reconciled_trailers: &HashMap<String, String>,
         http_status: Option<u16>,
         ceiling: usize,
+        admit_replacement: bool,
     ) -> Result<Option<Vec<u8>>, bool> {
         use crate::plugins::grpc_web::SyncTranslatedTrailerOutcome;
         match crate::plugins::grpc_web::sync_translated_body_trailer_frame_into(
@@ -3920,7 +3921,7 @@ pub mod _test_support {
             reconciled_trailers,
             http_status,
             ceiling,
-            || true,
+            move || admit_replacement,
         ) {
             SyncTranslatedTrailerOutcome::Unchanged => Ok(None),
             SyncTranslatedTrailerOutcome::Replaced(bytes) => Ok(Some(bytes)),

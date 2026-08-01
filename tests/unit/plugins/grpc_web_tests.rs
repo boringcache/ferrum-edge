@@ -2516,6 +2516,7 @@ fn final_trailer_reconciliation_is_bounded_for_binary_and_text() {
         &mutated,
         Some(200),
         binary.len() + 64,
+        true,
     )
     .expect("in-ceiling binary rebuild")
     .expect("must rebuild when trailers changed");
@@ -2530,6 +2531,7 @@ fn final_trailer_reconciliation_is_bounded_for_binary_and_text() {
         &mutated,
         Some(200),
         one_byte_short,
+        true,
     )
     .expect_err("over-ceiling binary rebuild must overflow");
     assert!(err, "overflow is distinct from malformed");
@@ -2543,6 +2545,7 @@ fn final_trailer_reconciliation_is_bounded_for_binary_and_text() {
         &mutated,
         Some(200),
         4096,
+        true,
     )
     .expect_err("malformed draft must refuse");
     assert!(!malformed_err, "malformed is not an overflow");
@@ -2555,6 +2558,7 @@ fn final_trailer_reconciliation_is_bounded_for_binary_and_text() {
         &mutated,
         Some(200),
         text.len() + 128,
+        true,
     )
     .expect("in-ceiling text rebuild")
     .expect("must rebuild when trailers changed");
@@ -2572,6 +2576,7 @@ fn final_trailer_reconciliation_is_bounded_for_binary_and_text() {
             &original_trailers,
             Some(200),
             text.len(),
+            false,
         )
         .expect("identical text suffix")
         .is_none(),
@@ -2585,9 +2590,21 @@ fn final_trailer_reconciliation_is_bounded_for_binary_and_text() {
         &mutated,
         Some(200),
         64,
+        false,
     )
     .expect_err("corrupt text armouring must refuse");
     assert!(!corrupt_err);
+
+    let admission_err = sync_translated_body_trailer_frame_into_for_test(
+        &binary,
+        Some("application/grpc-web"),
+        &mutated,
+        Some(200),
+        binary.len() + 64,
+        false,
+    )
+    .expect_err("a required replacement must fail when no covering window is admitted");
+    assert!(admission_err, "replacement admission is a capacity refusal");
 
     // Publication seam: body already above the retained ceiling installs the
     // neutral, body-framed gRPC-Web capacity terminal and releases the
