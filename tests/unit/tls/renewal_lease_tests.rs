@@ -392,8 +392,7 @@ fn an_invalid_instance_id_error_does_not_echo_the_value() {
     let dir = tempfile::tempdir().expect("tempdir");
     let rejected = "pod-a/secret-looking-value";
     let error = TlsLeaseStore::open_with_holder(dir.path(), rejected.to_string())
-        .err()
-        .expect("must be rejected");
+        .expect_err("must be rejected");
     assert!(
         !error.to_string().contains(rejected),
         "the diagnostic must not echo the configured identity"
