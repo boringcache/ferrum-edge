@@ -112,6 +112,17 @@ jobs:
           validate_review_threads_page() {
             local threads_response="$1"
 
+            if ! jq -e '
+              if has("errors") then
+                .errors == null
+                or ((.errors | type) == "array")
+                or ((.errors | type) == "object")
+              else true
+              end
+            ' >/dev/null <<<"${threads_response}"; then
+              refuse "GraphQL errors field has an invalid schema"
+            fi
+
             if jq -e '(.errors | type) == "array" and (.errors | length) > 0' >/dev/null <<<"${threads_response}"; then
               echo "GraphQL errors while fetching review threads:" >&2
               jq '.errors' >&2 <<<"${threads_response}"
