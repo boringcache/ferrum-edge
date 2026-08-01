@@ -2543,6 +2543,26 @@ fn the_root_review_repairs_are_pinned_in_source() {
         "eligible trailer values must not be cloned into an owned vector before \
          the bounded sink applies"
     );
+    assert!(
+        grpc_web.contains("fn resolve_trailer_frame_value<'a>(")
+            && grpc_web.contains(") -> Option<&'a str>"),
+        "resolved trailer values must borrow from immutable inputs, not clone \
+         upstream-controlled payload segments"
+    );
+    let resolve_start = grpc_web
+        .find("fn resolve_trailer_frame_value")
+        .expect("resolve_trailer_frame_value must exist");
+    let resolve_body = grpc_web[resolve_start..]
+        .split("fn ")
+        .next()
+        .expect("resolve_trailer_frame_value body");
+    assert!(
+        !resolve_body.contains("trailer_value.clone()")
+            && !resolve_body.contains("view_value.to_string()")
+            && !resolve_body.contains("pre_policy_value.to_string()"),
+        "resolve_trailer_frame_value must not clone a complete resolved trailer \
+         value before the counting/final sink sees it"
+    );
 
     let stream_router = include_str!("../../../src/plugins/ai_stream_router.rs");
     assert!(

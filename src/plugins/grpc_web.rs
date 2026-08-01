@@ -2502,12 +2502,17 @@ pub(crate) fn build_trailer_frame_with_provenance(
 /// (reserved terminal metadata stays trailer-authoritative), and a later
 /// genuine rewrite/removal (no remaining policy outcome) follows the live
 /// merged view — including shadowed-name restoration while untouched.
-fn resolve_trailer_frame_value(
+///
+/// The returned slice borrows from `view_value`, `shadowed_trailers`, or
+/// `policy_state` — never a cloned upstream-controlled value — so the
+/// two-pass trailer writer can emit each field straight through without
+/// materialising a complete would-be payload segment beside the sink.
+fn resolve_trailer_frame_value<'a>(
     name: &str,
-    view_value: Option<&str>,
-    shadowed_trailers: Option<&HashMap<String, [String; 2]>>,
-    policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
-) -> Option<String> {
+    view_value: Option<&'a str>,
+    shadowed_trailers: Option<&'a HashMap<String, [String; 2]>>,
+    policy_state: Option<&'a BufferedInitialResponseHeaderPolicyState>,
+) -> Option<&'a str> {
     if let Some((pre_policy_value, final_policy_value_present)) = policy_state
         .and_then(|state| state.application_trailer_initial_response_policy_outcome(name))
     {
@@ -2521,10 +2526,10 @@ fn resolve_trailer_frame_value(
                 // Same-name collision: when the pre-policy outcome is the
                 // genuine initial header, keep the true backend trailer.
                 if initial_value.as_str() == pre_policy_value {
-                    return Some(trailer_value.clone());
+                    return Some(trailer_value.as_str());
                 }
             }
-            return Some(pre_policy_value.to_string());
+            return Some(pre_policy_value);
         }
         return None;
     }
@@ -2533,13 +2538,13 @@ fn resolve_trailer_frame_value(
     // supplied the same name in HEADERS and TRAILERS. Use the true trailer
     // value only while that view is untouched. A hook-rewritten value wins,
     // and a removed name stays removed.
-    Some(
-        shadowed_trailers
-            .and_then(|shadowed| shadowed.get(name))
-            .filter(|[initial_value, _]| initial_value.as_str() == view_value)
-            .map(|[_, trailer_value]| trailer_value.clone())
-            .unwrap_or_else(|| view_value.to_string()),
-    )
+    if let Some([initial_value, trailer_value]) = shadowed_trailers
+        .and_then(|shadowed| shadowed.get(name))
+        .filter(|[initial_value, _]| initial_value.as_str() == view_value)
+    {
+        return Some(trailer_value.as_str());
+    }
+    Some(view_value)
 }
 
 /// Replace any trailing gRPC-Web trailer frame(s) in a buffered body with a
@@ -2773,17 +2778,18 @@ fn build_trailer_frame_with_full_provenance(
 /// Nothing eligible is RETAINED here: names are sorted up front (a stable sort
 /// over names alone reproduces exactly what a stable sort over `(name, value)`
 /// pairs produced, because every occurrence a candidate contributes carries that
-/// candidate's name), and each field's value is resolved, emitted, and dropped
-/// before the next one is resolved. That is what lets the bounded producer path
-/// run this writer against a counter and then against the final sink without
-/// ever holding a complete trailer payload (GHSA-pwcm-6rh8-f2gh).
-fn write_trailer_frame_payload<S: TrailerPayloadSink>(
+/// candidate's name), and each field's value is borrowed from the immutable
+/// inputs, emitted straight through, and dropped before the next one is
+/// resolved. That is what lets the bounded producer path run this writer against
+/// a counter and then against the final sink without ever holding a complete
+/// trailer payload or a cloned upstream-controlled value (GHSA-pwcm-6rh8-f2gh).
+fn write_trailer_frame_payload<'a, S: TrailerPayloadSink>(
     payload: &mut S,
-    response_headers: &HashMap<String, String>,
+    response_headers: &'a HashMap<String, String>,
     http_status: Option<u16>,
     trailer_name_allowlist: Option<&HashSet<String>>,
-    shadowed_trailers: Option<&HashMap<String, [String; 2]>>,
-    policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
+    shadowed_trailers: Option<&'a HashMap<String, [String; 2]>>,
+    policy_state: Option<&'a BufferedInitialResponseHeaderPolicyState>,
 ) -> bool {
     let connection_listed = parse_connection_listed_from_str_map(response_headers);
     // Candidate names are the live view plus any allowlisted trailer that a
