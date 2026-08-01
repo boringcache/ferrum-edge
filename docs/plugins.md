@@ -4211,7 +4211,7 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `inspect_multipart` | bool | `false` | Inspect `multipart/*` bodies. |
 | `inspect_binary_body` | bool | `false` | Inspect bodies whose content type is not in `body_content_types`. |
 | `max_scan_bytes` | usize | `1048576` | Maximum bytes scanned from each body. Must be greater than zero. |
-| `on_body_too_large` | string | `scan_truncated` | `scan_truncated` scans the first `max_scan_bytes`; `skip` skips known-oversized bodies; `block` fail-closes oversized bodies in enforce mode. |
+| `on_body_too_large` | string | `fail_closed` | `fail_closed` rejects an oversize governed body when that direction has an enforcing body rule or anomaly scoring, and otherwise scans the first `max_scan_bytes` and records truncation; `scan_truncated` is the explicit compatibility opt-out that always scans only the prefix and forwards the complete body; `skip` skips known-oversized bodies; `block` rejects every oversize governed body in enforce mode. |
 | `scan_budget_ms` | u64 | `50` | Post-hoc deadline for metadata/header and body scans. `0` disables the timeout wrapper. The synchronous scan cannot be cancelled mid-regex; over-budget scans are reported after the scan returns. |
 | `on_scan_timeout` | string | `log_and_allow` | Action when a body scan times out: `allow`, `block`, or `log_and_allow`. |
 | `disallowed_methods` | string[] | `[]` | Methods that should trigger the built-in `FE-METHOD-001` rule when that rule is active. |
@@ -4228,14 +4228,53 @@ response lifecycle. Metadata uses `waf.instances.<id>.score` plus deterministic
 `waf.instance_scores` when more than one instance contributes; `waf.score` is
 emitted only for single-instance scoring. See [waf.md](waf.md#anomaly-scoring).
 
+**Oversize bodies never silently bypass an enforcing body rule:** a body larger
+than `max_scan_bytes` cannot be completely inspected, and prefix-only inspection
+is not a body control — a client (or a compromised backend) can pad
+`max_scan_bytes` of benign bytes and place the blocked content in the unscanned
+suffix. The default `on_body_too_large: fail_closed` therefore rejects such a
+body whenever that direction actually carries an enforcing body policy: global
+`mode: enforce` plus either anomaly `scoring` with an applicable body rule or at
+least one applicable `action: enforce` rule reading `body_text` /
+`body_json_path` (request) or `response_body` (response), including the
+body-scoped `FE-ENCODING-001` / `FE-ENCODING-002` specials, which read both
+directions. A rule is applicable only when its path, method, header, and consumer
+conditions match the current request, and a request-wide
+`global_exemptions.header_present` match suppresses the fail-closed decision as
+well as rule hits. The request and response paths use the same decision, so H1,
+H2, and H3 behave identically. A body whose length is *exactly*
+`max_scan_bytes` is fully scanned and never treated as oversize.
+
+Monitor-only operation is unchanged: with `mode: monitor`, or with every body
+rule left at the built-in monitor default, an oversize body is prefix-scanned and
+recorded, never blocked. With `log_to_metadata: true`, oversize bodies handled by
+`fail_closed`, `scan_truncated`, or `block` set the fixed-cardinality
+`waf.body_too_large=true` and `waf.body_too_large_target` (`request_body` or
+`response_body`); a blocked one adds `waf.action=blocked` and
+`waf.block_reason=body_too_large`, and a prefix-scanned one adds
+`waf.scan_truncated=true`. No body bytes are logged. The explicit `skip` mode
+records none of these fields because it may avoid buffering a known-oversize
+request entirely.
+
+Set `on_body_too_large: scan_truncated` to keep the previous prefix-only
+behavior. That is an explicit acceptance of the suffix bypass and should be
+paired with a compensating control. For high-assurance routes prefer raising
+`max_scan_bytes` to at least the effective request/response body ceiling
+(`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` / `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`,
+default 10 MiB each, plus any route-scoped ceiling) so no admitted body is
+oversize in the first place; `fail_closed` only rejects bodies WAF cannot scan.
+
 **Unbounded SSE responses:** Request-controlled `Accept: text/event-stream` and
 internal streaming markers never bypass response-body policy. When the pristine
 backend response is `text/event-stream` and response-body inspection is active,
 WAF decides before headers are committed. `on_body_too_large: skip` explicitly
-allows the stream uninspected; `block` rejects in global enforce mode; and the
-default `scan_truncated` rejects when an enforcing response-body rule or anomaly
-scoring policy would otherwise claim inspection, while monitor-only policy
-records and permits the stream. With `log_to_metadata: true`, the decision sets
+allows the stream uninspected; `block` rejects in global enforce mode; and both
+the default `fail_closed` and the `scan_truncated` opt-out reject when an
+enforcing response-body rule or anomaly scoring policy would otherwise claim
+inspection, while monitor-only policy records and permits the stream. The
+prefix-only opt-out does not reach an unbounded stream: it concedes the suffix
+of a *bounded* body, and an SSE stream has no scanned prefix at all. With
+`log_to_metadata: true`, the decision sets
 `waf.response_stream_uninspectable=true`; allowed streams use
 `waf.action=stream_uninspected`, and blocked streams use `waf.action=blocked`
 with `waf.block_reason=unbounded_response_stream`. `on_scan_timeout` governs a
@@ -4561,7 +4600,11 @@ streaming ceiling is not silently substituted for the configured route limit.
 
 ### `response_caching`
 
-Caches final client-visible HTTP responses in gateway memory. The cache key binds the effective destination, the complete backend-visible request target (including the effective outbound query), mandatory caller-authorization context, and the complete `Vary` tuple.
+Caches final client-visible HTTP responses in gateway memory. The cache key
+binds the effective destination, the complete backend-visible request target
+(including the effective outbound query), every origin-visible request header
+except the narrow implemented entry-operation set described below, mandatory
+caller-authorization context, and the complete `Vary` tuple.
 
 **Priority:** 3500
 **Protocol:** HTTP only
@@ -4578,8 +4621,8 @@ Configuration must be a top-level object. The only accepted keys are `ttl_second
 | `cacheable_methods` | String[] | `["GET","HEAD"]` | Methods eligible for caching. Must contain at least one entry, and every entry must be a valid HTTP method token that is also a **bodyless retrieval method** — only `GET` and `HEAD` are accepted. Body-bearing methods are refused at admission because lookup runs in `before_proxy`, ahead of `on_final_request_body`, so the exact backend-visible request body does not exist yet and cannot be bound into the key |
 | `cacheable_status_codes` | u16[] | `[200,301,404]` | Response status codes eligible for caching. Must contain at least one entry, and every entry must be a final status between 200 and 599 whose caching semantics the plugin implements. `1xx`, `206`, and `304` are rejected at admission |
 | `respect_cache_control` | bool | `true` | Honor backend `Cache-Control` directives such as `no-store`, `private`, `max-age`, and `s-maxage`, including the qualified field-name forms `private="x-account"` and `no-cache="x-secret"` |
-| `respect_no_cache` | bool | `true` | Bypass cache lookup when the client sends `Cache-Control: no-cache` or `no-store` |
-| `vary_by_headers` | String[] | `[]` | Additional request headers to include in the cache key even when the backend does not send `Vary`. Every entry must be a valid HTTP header-name token |
+| `respect_no_cache` | bool | `true` | Bypass cache lookup when the client sends `Cache-Control: no-cache` or `no-store`. A header containing only bare, argument-free refresh members addresses the existing entry partition; argument-bearing directives and mixed refresh plus arbitrary/unimplemented directives stay bound as origin-visible context. When disabled, the entire request `Cache-Control` value stays bound because it is not an honored cache operation |
+| `vary_by_headers` | String[] | `[]` | Request headers to promote into the additional `Vary` tuple and downstream `Vary` contract even when the backend does not nominate them. The conservative base partition already binds every origin-visible request header. Every entry must be a valid HTTP header-name token |
 | `cache_key_include_query` | bool | `true` | Legacy keyspace toggle. The backend-effective query is now always bound because an origin may vary on it; this flag remains in the digest so changing it rotates the keyspace but can no longer authorize cross-query replay |
 | `cache_key_include_consumer` | bool | `false` | Legacy key-partition toggle. Caller isolation no longer depends on it: every key binds a mandatory caller-authorization partition (see below). The flag is still bound into the key digest so flipping it yields a disjoint keyspace. It does not authorize storage of a response to an `Authorization`-bearing request; the response still requires `public`, `must-revalidate`, or `s-maxage`. |
 | `anonymous_caller_scope` | String | `"caller_address"` | How **anonymous** callers are partitioned. `caller_address` binds the gateway-resolved canonical peer address (which the origin observes through Ferrum's regenerated `X-Forwarded-For`); a request whose canonical address cannot be parsed bypasses the cache rather than being keyed incompletely. `shared` is an explicit operator attestation that the origin does not vary by caller address on this route — it re-opens cross-caller replay for address-sensitive origins and must only be set when that is known-safe. It does not apply to authenticated callers, which always bind their canonical address. |
@@ -4596,7 +4639,7 @@ Behavior:
 - When a store would exceed `max_total_size_bytes`, expired entries are reclaimed in expiration order under the accounting lock; the new entry is skipped only if it still does not fit, and a *fresh* retained representation is never dropped to make room for a new one. Expired entries therefore cannot trap the byte budget even when a later-inserted short-lived response expires behind an older long-lived one or `max_entries` was never exceeded. Byte-cap reclaim uses an ordered live-expiry index, while entry-count eviction uses an insertion-ordered queue; each path is bounded by the entries it actually retires rather than by cache size.
 - Conditional requests are served from cache. Matching `If-None-Match` or `If-Modified-Since` requests return `304 Not Modified` directly from the edge cache when a fresh cached validator exists, including a current `Age` header.
 - **Cache keys are opaque, canonically framed digests.** A key is `sha256(base partition)`, optionally followed by `.` and `sha256(complete Vary tuple)`. Every component is written as a typed, length-framed field, so no attacker-supplied header, path, or query byte can forge a field boundary and collide two structurally different requests onto one key. Keys are never logged.
-- **The base partition binds every stable backend-visible dimension**: the effective *post-routing* destination (proxy id/namespace, listen path, upstream id or direct host/port/scheme, route authority, rewritten path — `response_caching` runs after every route-dispatch plugin, so this is the destination that will serve a miss), the original authority, `Host`, method, path, and effective outbound query, and the caller-authorization partition below. The request-header dimension is the complete `Vary` tuple appended to the base partition (see below), not the raw header view: a shared cache selects a stored representation by target + `Vary` (RFC 9111 §4.1), and an `If-None-Match` revalidation, a client `Cache-Control: no-cache` refresh, and a `Content-Length: 0` framing header are addressed *to* an entry rather than selecting a different one. Origin-visible headers the backend does not nominate in `Vary` are keyed by adding them to `vary_by_headers`; credential and session headers are auto-keyed as hashed `Vary` dimensions; cross-caller isolation is the mandatory caller partition, not header identity.
+- **The base partition binds every stable backend-visible dimension**: the effective *post-routing* destination (proxy id/namespace, listen path, upstream id or direct host/port/scheme, route authority, rewritten path — `response_caching` runs after every route-dispatch plugin, so this is the destination that will serve a miss), the original authority, `Host`, method, path, effective outbound query, every origin-visible request header, and the caller-authorization partition below. Only entry-operation headers whose semantics this cache actually implements are omitted from the raw-header dimension: `If-None-Match` / `If-Modified-Since`, zero-length `Content-Length`, and a request `Cache-Control` value consisting entirely of bare, argument-free `no-cache` / `no-store` refresh members while `respect_no_cache` is enabled. `Range` remains bound because this cache does not implement range selection; it refuses `206` / `Content-Range` responses instead. Argument-bearing directives and mixed refresh plus arbitrary/unimplemented directives remain fully bound, as does every `Cache-Control` value when `respect_no_cache` is disabled. The complete backend-nominated and operator-configured `Vary` tuple is appended as an additional digest (see below), credential/session values remain hashed, and cross-caller isolation is the mandatory caller partition. An origin therefore cannot cause cross-tenant replay merely by omitting a selector from `Vary`.
 - **Caller authorization, not a display subject.** Authenticated callers bind the authentication mechanism, the resolved identity and consumer, the peer SPIFFE identity, and SHA-256 digests of every credential header presented (`Authorization`, `Proxy-Authorization`, `Cookie`, `X-API-Key`, `API-Key`, `APIKey`, `X-Goog-Api-Key`, `X-Forwarded-Authorization`, `X-Amz-Security-Token`, `X-Auth-Token`, `X-Access-Token`). Two tokens that resolve to the same `sub` with different scopes, audiences, or tenancy claims therefore land in different partitions. Digests are taken over **both** the pristine inbound wire headers and the live backend-visible headers, under separate provenance labels: `response_caching` runs after `ai_stream_router`, which strips the client credential and injects the provider's, so binding only the live view would collapse two distinct client tokens onto one entry. **Every** caller — authenticated or not — also binds its canonical peer address, because the origin receives Ferrum's regenerated `X-Forwarded-For` for authenticated callers too; only an anonymous caller's address binding can be relaxed via `anonymous_caller_scope: shared`, and a caller whose canonical address cannot be derived bypasses the cache. This is unconditional — `cache_key_include_consumer` cannot disable it.
 - **The complete Vary tuple is digested**, including each dimension's name, a framed presence flag (an absent header is distinct from an empty one), and its value — not only the subset classified as sensitive. `Authorization`, `Proxy-Authorization`, and `Cookie` are mandatory dimensions on every entry, including anonymous entries: their present values are hashed, and the retained response always nominates the same names in `Vary` so a downstream shared cache that cannot see Ferrum's private caller partition cannot replay an anonymous representation to a credentialed or session-bearing request. Credential and operator-redacted values are still reduced to `sha256-…` before entering the digest.
 - **Only transport-proven empty request bodies may look up or store.** A shared cache selects a stored representation before final request-body hooks, so the H1/H2/H3 proxy first observes the complete GET/HEAD upload and publishes a private empty-body proof. A method/header heuristic is insufficient: H2/H3 can carry DATA on GET/HEAD without `Content-Length`. A non-empty upload, an unavailable proof, any `Transfer-Encoding`, or a non-zero/unparsable `Content-Length` yields `X-Cache-Status: BYPASS` for both lookup and storage. Configuration admission also rejects deferred request-body transformers that could synthesize bytes after lookup and priority overrides that place a request header/query/destination mutation at or after `response_caching`; exact pre-`before_proxy` normalizers remain compatible.

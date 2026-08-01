@@ -96,5 +96,6 @@ mod websocket_frame_delivery_tests;
 mod websocket_frame_plugin_composition_tests;
 mod websocket_relay_join_tests;
 mod websocket_retry_circuit_tests;
+mod websocket_selected_target_policy_tests;
 mod websocket_tunnel_disconnect_tests;
 mod xds_tests;
