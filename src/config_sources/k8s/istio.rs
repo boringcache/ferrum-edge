@@ -490,9 +490,10 @@ fn operation_ports(
         match admit_request_match_port_pattern(&port) {
             PortPatternAdmission::Admissible => {
                 port_patterns.push(port);
-                continue;
             }
             PortPatternAdmission::Inadmissible => {
+                // Field-specific, no-echo: never surface the operator-supplied
+                // pattern (may be hostile) in AuthorizationPolicy diagnostics.
                 return Err(invalid_resource(
                     object,
                     format!(
@@ -502,13 +503,30 @@ fn operation_ports(
                     ),
                 ));
             }
-            PortPatternAdmission::NotAPattern => {}
+            PortPatternAdmission::NotAPattern => {
+                // Literal numeric ports stay representable; every other value
+                // (mid-string stars, named ports, empty, out-of-range) fails
+                // closed with the same no-echo field-specific diagnostic.
+                // Deliberately avoids `port_from_string`, which echoes `{raw}`
+                // for non-AuthorizationPolicy callers that still want that.
+                match port.parse::<u64>() {
+                    Ok(raw) if (1..=u64::from(u16::MAX)).contains(&raw) => {
+                        ports.push(raw as u16);
+                    }
+                    _ => {
+                        return Err(invalid_resource(
+                            object,
+                            format!(
+                                "rules[].to[].operation.{field} must be a numeric port in \
+                                 1..=65535 or an admissible port pattern (expected '*', \
+                                 '<digits>*', or '*<digits>' that can match a \
+                                 destination/listener port in 1..=65535)"
+                            ),
+                        ));
+                    }
+                }
+            }
         }
-        ports.push(port_from_string(
-            object,
-            &port,
-            &format!("rules[].to[].operation.{field}"),
-        )?);
     }
     Ok((ports, port_patterns))
 }
@@ -5557,8 +5575,16 @@ mod tests {
         )
         .expect_err("invalid AuthorizationPolicy port must fail closed");
 
-        assert!(err.to_string().contains("rules[].to[].operation.ports"));
-        assert!(err.to_string().contains("70000"));
+        let message = err.to_string();
+        assert!(message.contains("rules[].to[].operation.ports"));
+        assert!(
+            message.contains("must be a numeric port in 1..=65535 or an admissible port pattern"),
+            "ports out-of-range diagnostic must use the field-specific no-echo wording: {message}"
+        );
+        assert!(
+            !message.contains("70000"),
+            "ports out-of-range diagnostic must not echo the operator-supplied value: {message}"
+        );
     }
 
     #[test]
@@ -5710,8 +5736,16 @@ mod tests {
         )
         .expect_err("mid-string AuthorizationPolicy port pattern is unsupported");
 
-        assert!(err.to_string().contains("rules[].to[].operation.ports"));
-        assert!(err.to_string().contains("8*9"));
+        let message = err.to_string();
+        assert!(message.contains("rules[].to[].operation.ports"));
+        assert!(
+            message.contains("must be a numeric port in 1..=65535 or an admissible port pattern"),
+            "ports mid-string diagnostic must use the field-specific no-echo wording: {message}"
+        );
+        assert!(
+            !message.contains("8*9"),
+            "ports mid-string diagnostic must not echo the operator-supplied value: {message}"
+        );
     }
 
     #[test]
@@ -5730,8 +5764,16 @@ mod tests {
         )
         .expect_err("named AuthorizationPolicy port is not representable");
 
-        assert!(err.to_string().contains("rules[].to[].operation.ports"));
-        assert!(err.to_string().contains("http"));
+        let message = err.to_string();
+        assert!(message.contains("rules[].to[].operation.ports"));
+        assert!(
+            message.contains("must be a numeric port in 1..=65535 or an admissible port pattern"),
+            "ports named-value diagnostic must use the field-specific no-echo wording: {message}"
+        );
+        assert!(
+            !message.contains("http"),
+            "ports named-value diagnostic must not echo the operator-supplied value: {message}"
+        );
     }
 
     #[test]
@@ -5753,8 +5795,16 @@ mod tests {
         )
         .expect_err("later invalid AuthorizationPolicy port must still fail closed");
 
-        assert!(err.to_string().contains("rules[].to[].operation.ports"));
-        assert!(err.to_string().contains("70000"));
+        let message = err.to_string();
+        assert!(message.contains("rules[].to[].operation.ports"));
+        assert!(
+            message.contains("must be a numeric port in 1..=65535 or an admissible port pattern"),
+            "later ports diagnostic must use the field-specific no-echo wording: {message}"
+        );
+        assert!(
+            !message.contains("70000"),
+            "later ports diagnostic must not echo the operator-supplied value: {message}"
+        );
     }
 
     #[test]
@@ -5963,8 +6013,16 @@ mod tests {
         )
         .expect_err("mid-string notPorts patterns must fail closed");
 
-        assert!(err.to_string().contains("rules[].to[].operation.notPorts"));
-        assert!(err.to_string().contains("8*9"));
+        let message = err.to_string();
+        assert!(message.contains("rules[].to[].operation.notPorts"));
+        assert!(
+            message.contains("must be a numeric port in 1..=65535 or an admissible port pattern"),
+            "notPorts mid-string diagnostic must use the field-specific no-echo wording: {message}"
+        );
+        assert!(
+            !message.contains("8*9"),
+            "notPorts mid-string diagnostic must not echo the operator-supplied value: {message}"
+        );
     }
 
     #[test]
@@ -5983,8 +6041,16 @@ mod tests {
         )
         .expect_err("named notPorts must fail closed");
 
-        assert!(err.to_string().contains("rules[].to[].operation.notPorts"));
-        assert!(err.to_string().contains("http"));
+        let message = err.to_string();
+        assert!(message.contains("rules[].to[].operation.notPorts"));
+        assert!(
+            message.contains("must be a numeric port in 1..=65535 or an admissible port pattern"),
+            "notPorts named-value diagnostic must use the field-specific no-echo wording: {message}"
+        );
+        assert!(
+            !message.contains("http"),
+            "notPorts named-value diagnostic must not echo the operator-supplied value: {message}"
+        );
     }
 
     #[test]
@@ -6003,8 +6069,16 @@ mod tests {
         )
         .expect_err("invalid notPorts must fail closed");
 
-        assert!(err.to_string().contains("rules[].to[].operation.notPorts"));
-        assert!(err.to_string().contains("70000"));
+        let message = err.to_string();
+        assert!(message.contains("rules[].to[].operation.notPorts"));
+        assert!(
+            message.contains("must be a numeric port in 1..=65535 or an admissible port pattern"),
+            "notPorts out-of-range diagnostic must use the field-specific no-echo wording: {message}"
+        );
+        assert!(
+            !message.contains("70000"),
+            "notPorts out-of-range diagnostic must not echo the operator-supplied value: {message}"
+        );
     }
 
     #[test]

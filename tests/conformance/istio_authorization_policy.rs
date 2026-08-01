@@ -404,7 +404,8 @@ fn authz_rejects_malformed_not_ports_wildcard_patterns() {
         category = CATEGORY,
         feature = "RequestMatch.notPorts rejects mid-string / named / out-of-range forms",
         status = Status::Supported,
-        notes = "Malformed notPorts values fail closed with a field-specific diagnostic.",
+        notes = "Malformed notPorts values fail closed with a field-specific diagnostic \
+                 that does not echo the operator-supplied value.",
     );
     let err = translate_k8s_objects(
         &[authz_policy(json!({
@@ -416,6 +417,14 @@ fn authz_rejects_malformed_not_ports_wildcard_patterns() {
         options(),
     )
     .expect_err("mid-string notPorts must fail closed");
-    assert!(err.to_string().contains("rules[].to[].operation.notPorts"));
-    assert!(err.to_string().contains("8*9"));
+    let message = err.to_string();
+    assert!(message.contains("rules[].to[].operation.notPorts"));
+    assert!(
+        message.contains("must be a numeric port in 1..=65535 or an admissible port pattern"),
+        "notPorts diagnostic must use the field-specific no-echo wording: {message}"
+    );
+    assert!(
+        !message.contains("8*9"),
+        "notPorts diagnostic must not echo the operator-supplied value: {message}"
+    );
 }
