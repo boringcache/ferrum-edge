@@ -606,7 +606,6 @@ async fn base_cache_key_keeps_supported_entry_operation_headers_reachable() {
         ("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
         ("cache-control", "no-cache"),
         ("cache-control", "no-store"),
-        ("range", "bytes=0-3"),
         ("content-length", "0"),
     ];
     for (name, value) in supported {
@@ -621,7 +620,7 @@ async fn base_cache_key_keeps_supported_entry_operation_headers_reachable() {
 }
 
 #[tokio::test]
-async fn base_cache_key_binds_unsupported_precondition_and_pragma_dimensions() {
+async fn base_cache_key_binds_unsupported_precondition_range_and_pragma_dimensions() {
     let plugin = default_plugin();
     let path = "/unsupported-preconditions";
     let baseline = staged_base_cache_key(&plugin, path, &[])
@@ -632,6 +631,7 @@ async fn base_cache_key_binds_unsupported_precondition_and_pragma_dimensions() {
         ("if-match", r#""etag-1""#),
         ("if-unmodified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
         ("if-range", r#""etag-1""#),
+        ("range", "bytes=0-3"),
         ("pragma", "no-cache"),
     ];
     for (name, value) in unsupported {
@@ -6273,14 +6273,9 @@ async fn replay_partition_isolates_query_and_path_delimiters() {
 }
 
 /// An origin-visible request header the backend never nominates in `Vary` is
-/// keyed through `vary_by_headers`, which is the operator-facing control for
-/// exactly this case.
-///
-/// The raw header view is deliberately not a base-key dimension: RFC 9111 §4.1
-/// selection is target + `Vary`, and keying every header would make the `Vary`
-/// index unreachable and put a conditional revalidation or a client `no-cache`
-/// refresh in a different partition from the entry it names. Cross-caller
-/// isolation is the mandatory caller partition, which is unconditional.
+/// already bound by the conservative base partition. `vary_by_headers` remains
+/// an additional operator-declared `Vary` dimension, including its explicit
+/// absent-versus-present behavior, and must continue to agree at lookup/store.
 #[tokio::test]
 async fn replay_partition_binds_vary_by_headers_the_backend_never_nominates() {
     let _policy_guard = response_cache_replay_policy_guard();

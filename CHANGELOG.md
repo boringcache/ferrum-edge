@@ -292,19 +292,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `response_caching` now binds the same complete backend-visible request
     *target* unconditionally: the effective outbound query is a key dimension
     even when `cache_key_include_query` is `false`, which is retained only as a
-    legacy keyspace toggle. Its request-header dimension stays the complete
-    `Vary` tuple (backend-nominated dimensions, `vary_by_headers`, and the
-    mandatory credential/session auto-Vary) rather than the raw header view.
+    legacy keyspace toggle. Its base partition also binds every origin-visible
+    request header, including tenant, policy, tracing, correlation, unsupported
+    precondition, `Range`, and arbitrary request `Cache-Control` dimensions,
+    even when the origin omits them from `Vary`. Only operations this cache
+    actually implements stay addressable under the original entry partition:
+    `If-None-Match` / `If-Modified-Since`, zero-length `Content-Length`, and a
+    pure bare, argument-free `no-cache` / `no-store` refresh when
+    `respect_no_cache` is enabled. The complete `Vary` tuple remains an
+    additional backend-nominated and operator-configured digest.
     `Authorization`, `Proxy-Authorization`, and `Cookie` are now present as
     dimensions on every retained response, including anonymous responses, so
     the emitted `Vary` contract also protects downstream shared caches that
     cannot see Ferrum's private caller partition. Authorization storage
     admission checks both the pristine inbound and live backend-visible views,
     so a request transformer cannot erase the origin opt-in requirement.
-    This tuple is used
-    because RFC 9111 §4.1 selection is target + `Vary` and a conditional
-    revalidation, a client `no-cache` refresh, and `Content-Length: 0` are
-    addressed to a stored entry rather than selecting a different one.
+    Conditional revalidation, a pure client no-cache/no-store refresh, and
+    `Content-Length: 0` are addressed to a stored entry rather than selecting a
+    different one; mixed, argument-bearing, disabled, or unimplemented request
+    directives stay bound.
   - **`ai_semantic_cache` lookup moved to the final-request-body stage**
     (priority `2996` → `4057`). It previously looked up in `before_proxy`,
     ahead of `request_transformer` (3000) and every `transform_request_body`

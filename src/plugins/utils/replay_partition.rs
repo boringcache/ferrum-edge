@@ -39,7 +39,7 @@
 //!   operation headers whose semantics `response_caching` actually implements
 //!   (`If-None-Match`, `If-Modified-Since`, pure honored request
 //!   `Cache-Control: no-cache` / `no-store` refreshes with no arguments when
-//!   `respect_no_cache` is enabled, `Range`, and `Content-Length`) while
+//!   `respect_no_cache` is enabled, and `Content-Length`) while
 //!   conservatively binding every other representation and policy dimension,
 //!   including headers absent from `Vary`. Mixed Cache-Control members and
 //!   Cache-Control under `respect_no_cache: false` stay bound.
@@ -643,11 +643,11 @@ fn append_route_override_partition(hasher: &mut PartitionHasher, ctx: &RequestCo
 /// Append the backend-visible request *target* dimension: original client
 /// authority, `Host`, method, path, and the effective outbound query.
 ///
-/// This is the half of [`append_request_context_partition`] that every replay
-/// plugin needs. It is also the whole request-side target contract for a shared
-/// HTTP cache, whose request-header dimension is the complete `Vary` tuple
-/// rather than the raw header view — see
-/// [`crate::plugins::response_caching`].
+/// This is the target half every replay plugin needs. The shared HTTP cache
+/// calls it through [`append_response_cache_request_partition`], which also
+/// binds every origin-visible request header except the narrow entry-operation
+/// set that cache actually implements; its complete `Vary` tuple is an
+/// additional dimension — see [`crate::plugins::response_caching`].
 ///
 /// `request_headers` must be the finalized backend-visible header view — the
 /// map the proxy will send — not `ctx.headers`.
@@ -726,11 +726,10 @@ pub fn append_request_context_partition(
 ///   directives with no arguments, and only when every meaningful member is
 ///   such a refresh) — when `respect_no_cache` is enabled, bypass + store the
 ///   replacement under the same partition as the entry being refreshed
-/// * `Range` — lookup may still address the stored full representation
 /// * `Content-Length` — zero-length framing on an otherwise empty GET/HEAD
 ///
 /// Unsupported precondition / cache-directive dimensions (`If-Match`,
-/// `If-Unmodified-Since`, `If-Range`, `Pragma`, mixed / arbitrary /
+/// `If-Unmodified-Since`, `If-Range`, `Range`, `Pragma`, mixed / arbitrary /
 /// unrecognized `Cache-Control` content, and any `Cache-Control` when
 /// `respect_no_cache` is false) stay bound so they cannot share a replay key
 /// with a request that did not carry them. Labeling unimplemented semantics
@@ -749,7 +748,7 @@ pub fn append_response_cache_request_partition(
 /// Whether `name`/`value` is an entry-operation header this response cache
 /// safely omits from the request-header partition.
 ///
-/// Name-only exemptions are limited to validators, range, and framing this
+/// Name-only exemptions are limited to validators and framing this
 /// plugin handles. `Cache-Control` is value-aware and gated by
 /// `respect_no_cache`: only a pure honored bare `no-cache` / `no-store` refresh
 /// (every meaningful member is such a refresh and has no argument) is omitted
@@ -764,7 +763,6 @@ fn is_response_cache_entry_operation_header(
 ) -> bool {
     if name.eq_ignore_ascii_case("if-none-match")
         || name.eq_ignore_ascii_case("if-modified-since")
-        || name.eq_ignore_ascii_case("range")
         || name.eq_ignore_ascii_case("content-length")
     {
         return true;

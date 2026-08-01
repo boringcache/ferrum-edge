@@ -320,20 +320,26 @@ one fail-closed replay-partition contract
   were previously sharing one completion will now miss. Only transport/hop-by-hop
   framing fields Ferrum provably regenerates for the backend hop are excluded;
   `Host`/authority is bound as its own field.
-- **`response_caching` now binds the complete request target too.** The
-  backend-effective query is a mandatory key dimension.
+- **`response_caching` now binds the complete request context too.** The
+  backend-effective query and every origin-visible request header are mandatory
+  base-key dimensions, even when the origin omits a header from `Vary`.
   `cache_key_include_query: false` remains accepted only to rotate/partition
   legacy keyspaces; it no longer allows responses to be shared across
-  origin-visible query values. Its request-header dimension is unchanged — the
-  complete `Vary` tuple (backend-nominated dimensions, `vary_by_headers`, and
-  the mandatory credential/session auto-Vary) — because RFC 9111 §4.1 selection
-  is target + `Vary` and a conditional revalidation, a client `no-cache`
-  refresh, and `Content-Length: 0` are addressed to a stored entry rather than
-  selecting a different one. Header/query priority overrides that run at or
-  after `response_caching` and deferred request-body transformers now fail
-  configuration admission. `Authorization`, `Proxy-Authorization`, and
-  `Cookie` are mandatory Vary dimensions even when absent, so anonymous cache
-  HITs now include those names in `Vary`; present values remain hashed.
+  origin-visible query values. The only header exemptions are operations this
+  cache actually implements: `If-None-Match` / `If-Modified-Since`, zero-length
+  `Content-Length`, and a pure bare, argument-free `no-cache` / `no-store`
+  refresh while `respect_no_cache` is enabled. `Range`, unsupported
+  preconditions, `Pragma`, mixed/arbitrary/argument-bearing request
+  `Cache-Control`, and all request `Cache-Control` when `respect_no_cache` is
+  disabled remain bound. The complete `Vary` tuple (backend-nominated
+  dimensions, `vary_by_headers`, and mandatory credential/session auto-Vary)
+  is an additional digest. Header/query priority overrides that run at or after
+  `response_caching` and deferred request-body transformers now fail
+  configuration admission. Expect a one-time key rotation and more conservative
+  misses for requests whose headers previously shared one Vary-only partition.
+  `Authorization`, `Proxy-Authorization`, and `Cookie` are mandatory Vary
+  dimensions even when absent, so anonymous cache HITs now include those names
+  in `Vary`; present values remain hashed.
   Authorization storage admission also checks both the pristine inbound and
   live backend-visible header views, so a transformer that removes or adds the
   field cannot bypass the origin shared-cache opt-in requirement.
