@@ -818,6 +818,9 @@ pub fn append_local_fallback_event(dir: &Path, event: &AuditEvent) -> Result<(),
 ///
 /// Uses the same non-blocking process and cross-process lock acquisition as
 /// [`append_local_fallback_event`]; contention fails closed immediately.
+// This public library surface is exercised by integration tests but is unused
+// when the same module is compiled directly into the `ferrum-edge` binary.
+#[allow(dead_code)]
 pub fn list_local_fallback_events(dir: &Path) -> Result<Vec<AuditEvent>, anyhow::Error> {
     let _process_guard = acquire_local_fallback_process_lock()?;
     prepare_existing_fallback_directory(dir)?;
@@ -843,6 +846,9 @@ fn acquire_local_fallback_process_lock() -> Result<MutexGuard<'static, ()>, anyh
 }
 
 /// Test seam: hold the in-process fallback mutex without waiting.
+// The library test harness calls this through `src/lib.rs`; the binary target
+// compiles the shared module without that harness.
+#[allow(dead_code)]
 pub(crate) fn hold_local_fallback_process_lock_for_test()
 -> Result<MutexGuard<'static, ()>, anyhow::Error> {
     acquire_local_fallback_process_lock()

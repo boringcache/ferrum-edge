@@ -552,7 +552,7 @@ fn hostile_backup_event(outcome: audit::AuditOutcome) -> AuditEvent {
     AuditEvent::new(
         &actor,
         "backup",
-        &format!("gateway_config:{PAYLOAD_FRAGMENT_CANARY}"),
+        format!("gateway_config:{PAYLOAD_FRAGMENT_CANARY}"),
         RESOURCES_CANARY,
         RESOURCES_CANARY,
         diff,
