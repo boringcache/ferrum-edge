@@ -2695,6 +2695,49 @@ fn durable_async_insert_pins_persistence_wait_when_omitted() {
     );
 }
 
+#[test]
+fn durable_request_pins_wait_when_profile_may_enable_async_insert() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = valid_config(temp.path());
+    let config: ApiChargebackSinkConfig = serde_json::from_value(config).unwrap();
+    let url = url::Url::parse(&clickhouse_insert_url_for_tests(&config).unwrap()).unwrap();
+    let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+
+    assert!(
+        !params.contains_key("async_insert"),
+        "fixture must omit async_insert so profile defaults are the only source"
+    );
+    assert_eq!(
+        params.get("wait_for_async_insert").map(String::as_str),
+        Some("1"),
+        "durable requests must pin wait_for_async_insert even when Ferrum omits async_insert"
+    );
+}
+
+#[test]
+fn durable_request_does_not_duplicate_wait_for_async_insert_query_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["insert_query_params"] = json!({
+        "async_insert": "1",
+        "wait_for_async_insert": "1"
+    });
+    let config: ApiChargebackSinkConfig = serde_json::from_value(config).unwrap();
+    let insert_url = clickhouse_insert_url_for_tests(&config).unwrap();
+    let url = url::Url::parse(&insert_url).unwrap();
+    let wait_values: Vec<_> = url
+        .query_pairs()
+        .filter(|(key, _)| key == "wait_for_async_insert")
+        .map(|(_, value)| value.into_owned())
+        .collect();
+
+    assert_eq!(
+        wait_values,
+        vec!["1"],
+        "explicit wait_for_async_insert must not be duplicated in the INSERT URL: {insert_url}"
+    );
+}
+
 fn test_spool(temp: &tempfile::TempDir) -> SpoolManager {
     let settings = SpoolSettings {
         enabled: true,

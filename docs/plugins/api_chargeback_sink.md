@@ -18,9 +18,10 @@ Recommended async-insert settings wait for persistence:
 "insert_query_params": { "async_insert": "1", "wait_for_async_insert": "1" }
 ```
 
-When `async_insert` is enabled and `wait_for_async_insert` is omitted, the sink
-pins `wait_for_async_insert=1` on the request instead of inheriting a potentially
-lossy ClickHouse user/profile default.
+When `wait_for_async_insert` is omitted from `insert_query_params`, the sink
+pins `wait_for_async_insert=1` on every durable request instead of inheriting a
+potentially lossy ClickHouse user/profile default (including profiles that
+enable `async_insert` while disabling the persistence wait).
 
 ### Credentials and `insert_query_params`
 

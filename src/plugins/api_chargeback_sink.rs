@@ -7,7 +7,9 @@
 //! Delivery is persistence-aware by default: HTTP 200/204 alone is not success.
 //! The sink requires a complete empty acknowledgement without ClickHouse
 //! exception markers/headers before counting an export or deleting spool data.
-//! `wait_for_async_insert=0` is rejected unless
+//! Omitted `wait_for_async_insert` is pinned to `1` on every durable request
+//! so a ClickHouse user/profile default cannot enable fire-and-forget async
+//! inserts. Explicit `wait_for_async_insert=0` is rejected unless
 //! `clickhouse.allow_lossy_async_insert` is explicitly enabled.
 //!
 //! Construction (`new`) is runtime-free shape validation: it does not create
@@ -5213,13 +5215,8 @@ fn build_insert_url(base: &Url, cfg: &ClickHouseConfig) -> String {
     let mut url = base.clone();
     url.set_query(None);
     url.set_fragment(None);
-    let pins_durable_async_ack = cfg
-        .insert_query_params
-        .get("async_insert")
-        .is_some_and(|value| !is_falsy_clickhouse_setting(value))
-        && !cfg
-            .insert_query_params
-            .contains_key(WAIT_FOR_ASYNC_INSERT_PARAM);
+    let pins_durable_async_ack =
+        !cfg.insert_query_params.contains_key(WAIT_FOR_ASYNC_INSERT_PARAM);
     {
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("database", &cfg.database);
@@ -5231,8 +5228,10 @@ fn build_insert_url(base: &Url, cfg: &ClickHouseConfig) -> String {
             pairs.append_pair(key, value);
         }
         if pins_durable_async_ack {
-            // Do not inherit a ClickHouse user/profile default that may be
-            // fire-and-forget. An explicit falsy value remains available only
+            // Pin persistence-aware async-insert acknowledgement on every
+            // durable request. ClickHouse user/profile defaults may enable
+            // async_insert with wait_for_async_insert=0 even when Ferrum omits
+            // both settings. An explicit falsy value remains available only
             // through the separately validated lossy opt-in.
             pairs.append_pair(WAIT_FOR_ASYNC_INSERT_PARAM, "1");
         }

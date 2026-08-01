@@ -1882,8 +1882,10 @@ at least one nonempty pricing dimension (`pricing_tiers`, `bandwidth_pricing`,
 or `stream_connection_pricing` with `PricingConfig::has_any_pricing`
 semantics). Durable delivery requires a complete empty ClickHouse
 acknowledgement (HTTP 200/204 alone is insufficient); `wait_for_async_insert=0`
-needs explicit `clickhouse.allow_lossy_async_insert=true`, and enabling
-`async_insert` without a wait setting pins `wait_for_async_insert=1`. It
+needs explicit `clickhouse.allow_lossy_async_insert=true`, and omitted
+`wait_for_async_insert` pins `wait_for_async_insert=1` on every durable
+request so ClickHouse user/profile defaults cannot enable fire-and-forget async
+inserts. It
 supports per-event mode for transaction-level provenance, snapshot mode for
 lower ingest volume (requires `spool.enabled=true`), an on-disk spool for
 ClickHouse outages, `GET /charges/sink/status` (multi-instance accepted-generation
