@@ -1,0 +1,201 @@
+name: Root Merge Gate Attestation
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to attest
+        required: true
+        type: string
+      expected_head_sha:
+        description: Exact 40-character lowercase hex head SHA independently reviewed
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: root-merge-gate-attestation-${{ github.event.inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  attest:
+    name: Root merge-gate attestation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Attest reviewed pull request head
+        env:
+          PR_NUMBER_INPUT: ${{ github.event.inputs.pr_number }}
+          EXPECTED_SHA_INPUT: ${{ github.event.inputs.expected_head_sha }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          refuse() {
+            echo "Refusal: $1" >&2
+            exit 1
+          }
+
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            refuse "workflow must execute from refs/heads/main (got ${GITHUB_REF})"
+          fi
+
+          if [[ "${GITHUB_REPOSITORY}" != "ferrum-edge/ferrum-edge" ]]; then
+            refuse "unexpected repository ${GITHUB_REPOSITORY}"
+          fi
+
+          if [[ "${GITHUB_ACTOR}" != "jeremyjpj0916" ]]; then
+            refuse "unauthorized actor ${GITHUB_ACTOR}"
+          fi
+
+          if [[ "${TRIGGERING_ACTOR}" != "jeremyjpj0916" ]]; then
+            refuse "unauthorized triggering actor ${TRIGGERING_ACTOR}"
+          fi
+
+          pr_number="${PR_NUMBER_INPUT}"
+          expected_sha="${EXPECTED_SHA_INPUT}"
+
+          if ! [[ "${pr_number}" =~ ^[1-9][0-9]*$ ]]; then
+            refuse "invalid pr_number: must be a positive integer"
+          fi
+
+          if ! [[ "${expected_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            refuse "invalid expected_head_sha: must be exactly 40 lowercase hexadecimal characters"
+          fi
+
+          repo_owner="${GITHUB_REPOSITORY%%/*}"
+          repo_name="${GITHUB_REPOSITORY#*/}"
+
+          pr_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}")" || refuse "failed to fetch pull request metadata"
+
+          pr_state="$(jq -er '.state // empty' <<<"${pr_json}")" || refuse "pull request metadata missing state"
+          pr_draft="$(jq -er '.draft // empty' <<<"${pr_json}")" || refuse "pull request metadata missing draft flag"
+          pr_base_ref="$(jq -er '.base.ref // empty' <<<"${pr_json}")" || refuse "pull request metadata missing base ref"
+          pr_head_repo="$(jq -er '.head.repo.full_name // empty' <<<"${pr_json}")" || refuse "pull request metadata missing head repository"
+          pr_head_sha="$(jq -er '.head.sha // empty' <<<"${pr_json}")" || refuse "pull request metadata missing head sha"
+
+          if [[ "${pr_state}" != "open" ]]; then
+            refuse "pull request #${pr_number} is not open (state=${pr_state})"
+          fi
+
+          if [[ "${pr_draft}" == "true" ]]; then
+            refuse "pull request #${pr_number} is a draft"
+          fi
+
+          if [[ "${pr_base_ref}" != "main" ]]; then
+            refuse "pull request #${pr_number} does not target main (base=${pr_base_ref})"
+          fi
+
+          if [[ "${pr_head_repo}" != "${GITHUB_REPOSITORY}" ]]; then
+            refuse "pull request #${pr_number} head is not from ${GITHUB_REPOSITORY} (head repo=${pr_head_repo})"
+          fi
+
+          if [[ "${pr_head_sha}" != "${expected_sha}" ]]; then
+            refuse "pull request #${pr_number} head sha ${pr_head_sha} does not match expected ${expected_sha}"
+          fi
+
+          review_threads_query='
+          query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+            repository(owner: $owner, name: $repo) {
+              pullRequest(number: $number) {
+                reviewThreads(first: 100, after: $after) {
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
+                  nodes {
+                    isResolved
+                  }
+                }
+              }
+            }
+          }'
+
+          cursor=""
+          unresolved_count=0
+
+          while true; do
+            if [[ -z "${cursor}" ]]; then
+              threads_response="$(gh api graphql \
+                -f query="${review_threads_query}" \
+                -f owner="${repo_owner}" \
+                -f repo="${repo_name}" \
+                -F number="${pr_number}")" || refuse "review thread GraphQL request failed"
+            else
+              threads_response="$(gh api graphql \
+                -f query="${review_threads_query}" \
+                -f owner="${repo_owner}" \
+                -f repo="${repo_name}" \
+                -F number="${pr_number}" \
+                -f after="${cursor}")" || refuse "review thread GraphQL pagination failed"
+            fi
+
+            if jq -e '.errors' >/dev/null <<<"${threads_response}"; then
+              echo "GraphQL errors while fetching review threads:" >&2
+              jq '.errors' >&2 <<<"${threads_response}"
+              exit 1
+            fi
+
+            pull_request_node="$(jq -er '.data.repository.pullRequest // empty' <<<"${threads_response}")" || refuse "review thread response missing pullRequest"
+            if [[ -z "${pull_request_node}" || "${pull_request_node}" == "null" ]]; then
+              refuse "review thread response pullRequest is null"
+            fi
+
+            review_threads_node="$(jq -er '.data.repository.pullRequest.reviewThreads // empty' <<<"${threads_response}")" || refuse "review thread response missing reviewThreads"
+            if [[ -z "${review_threads_node}" || "${review_threads_node}" == "null" ]]; then
+              refuse "review thread response reviewThreads is null"
+            fi
+
+            page_unresolved="$(jq -er '[.data.repository.pullRequest.reviewThreads.nodes[]? | select(.isResolved == false)] | length' <<<"${threads_response}")" || refuse "review thread response missing nodes"
+            unresolved_count=$((unresolved_count + page_unresolved))
+
+            has_next="$(jq -er '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // empty' <<<"${threads_response}")" || refuse "review thread response missing pageInfo.hasNextPage"
+            if [[ "${has_next}" == "true" ]]; then
+              cursor="$(jq -er '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty' <<<"${threads_response}")" || refuse "review thread response missing pageInfo.endCursor"
+              if [[ -z "${cursor}" || "${cursor}" == "null" ]]; then
+                refuse "review thread pagination reported hasNextPage without endCursor"
+              fi
+              continue
+            fi
+            break
+          done
+
+          if [[ "${unresolved_count}" -gt 0 ]]; then
+            refuse "pull request #${pr_number} has ${unresolved_count} unresolved review thread(s)"
+          fi
+
+          pr_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}")" || refuse "failed to re-fetch pull request metadata before approval"
+          pr_head_sha="$(jq -er '.head.sha // empty' <<<"${pr_json}")" || refuse "re-fetched pull request metadata missing head sha"
+          if [[ "${pr_head_sha}" != "${expected_sha}" ]]; then
+            refuse "pull request head changed before approval (expected ${expected_sha}, now ${pr_head_sha})"
+          fi
+
+          review_payload="$(jq -n \
+            --arg commit_id "${expected_sha}" \
+            --arg event "APPROVE" \
+            --arg sha "${expected_sha}" \
+            --arg actor "${GITHUB_ACTOR}" \
+            --arg run_url "${WORKFLOW_RUN_URL}" \
+            '{
+              commit_id: $commit_id,
+              event: $event,
+              body: (
+                "Root merge-gate attestation\n\n"
+                + "This approval is explicitly bound to commit `" + $sha + "`.\n"
+                + "Authorizing actor: " + $actor + "\n"
+                + "Workflow run: " + $run_url
+              )
+            }')"
+
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}/reviews" \
+            --method POST \
+            --input - <<<"${review_payload}" || refuse "failed to submit APPROVE review"
+
+          echo "Submitted root merge-gate APPROVE review for pull request #${pr_number} at commit ${expected_sha}"
