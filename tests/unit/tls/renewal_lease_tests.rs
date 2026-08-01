@@ -587,21 +587,31 @@ async fn an_abandoned_keeper_stops_heartbeating() {
     let held = instance_a.try_acquire(&name, ttl).expect("A claims");
     let keeper = RenewalLeaseKeeper::start(held.expect("A wins"), ttl);
     assert!(!keeper.is_lost());
+    let progress = keeper.heartbeat_progress();
+    let started_before_drop = progress.started();
     // Dropped without `finish()`.
     std::mem::drop(keeper);
 
-    let after_drop = instance_a.peek(&name).expect("read").expect("present");
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    let later = instance_a.peek(&name).expect("read").expect("present");
-    assert_eq!(
-        after_drop.expires_at, later.expires_at,
-        "a dropped keeper must not keep extending its claim"
-    );
-
-    let taken = instance_b.try_acquire(&name, ttl).expect("B retries");
+    // Drop cannot await an extension already running on the blocking pool. It
+    // may therefore land one final beat before the best-effort release, but the
+    // stopped loop must never start another and the claim must become
+    // reclaimable. Polling the actual takeover is scheduler-independent; a
+    // fixed sleep raced a saturated blocking pool and mistook that one allowed
+    // in-flight beat for a continuing heartbeat loop.
+    let mut taken = None;
     assert!(
-        taken.is_some(),
+        wait_until_async(SETTLE_BUDGET, || {
+            if taken.is_none() {
+                taken = instance_b.try_acquire(&name, ttl).expect("B retries");
+            }
+            taken.is_some()
+        })
+        .await,
         "the certificate must become reclaimable again"
+    );
+    assert!(
+        progress.started() <= started_before_drop.saturating_add(1),
+        "dropping the keeper may settle one in-flight beat but must not start another"
     );
 }
 
