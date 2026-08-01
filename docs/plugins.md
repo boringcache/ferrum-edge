@@ -4173,6 +4173,22 @@ inspection and cannot be proven safe. Native gRPC's reserved terminal fields
 Global monitor mode and monitor-action-only response header rules preserve
 trailers. Anomaly scoring counts as enforcing when it can block.
 
+WebSocket support is not handshake-only. On an upgraded session (HTTP/1.1
+upgrade and HTTP/2 / HTTP/3 Extended CONNECT alike) the same body rule sets
+apply to complete application messages: client→backend messages run the request
+body rules, backend→client messages run the response body rules. Text and
+Binary are both inspected — the HTTP media-type selectors (`body_methods`,
+`body_content_types`, `inspect_multipart`, `inspect_binary_body`) do not apply
+because a WebSocket message carries no `Content-Type`. Control frames
+(Ping/Pong/Close) are never scanned as application payload, messages arrive
+reassembled and uncompressed (`permessage-deflate` is never negotiated end to
+end), and `max_scan_bytes` / `on_body_too_large` / `on_scan_timeout` fail closed
+by closing the connection with RFC 6455 code 1008 and a fixed reason that never
+echoes message bytes. Anomaly scoring is evaluated per complete message rather
+than accumulated across a session, and message findings are emitted as `waf`
+log events rather than `waf.*` transaction metadata. See
+[waf.md](waf.md#websocket-message-inspection).
+
 That drop is decided **per request**, not per configuration. A request matched
 by `global_exemptions` (path, method, IP, or consumer) never reaches a WAF
 response-header scan, so it keeps its backend trailers exactly as it would with

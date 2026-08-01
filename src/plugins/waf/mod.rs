@@ -19,6 +19,7 @@ mod normalize;
 mod rules;
 mod scan;
 mod stream;
+mod websocket;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -42,7 +43,7 @@ use super::utils::sse::{is_text_event_stream_media_type, original_response_is_ev
 use super::{
     ALL_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext,
     ResponseTrailerPolicy, StreamBytesKind, StreamConnectionContext, UdpDatagramContext,
-    UdpDatagramDirection, UdpDatagramVerdict,
+    UdpDatagramDirection, UdpDatagramVerdict, WebSocketFrameDirection,
 };
 use crate::config::types::BackendScheme;
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -922,6 +923,16 @@ impl Waf {
         );
     }
 
+    /// Whether this instance governs WebSocket application messages at all.
+    ///
+    /// Exactly the body-inspection posture it already applies to HTTP bodies:
+    /// a WAF with no body rule set (or with body inspection disabled in both
+    /// directions) keeps the pre-existing handshake-only behavior and never
+    /// forces the parsed relay.
+    fn websocket_message_inspection_active(&self) -> bool {
+        self.requires_request_body_buffering() || self.requires_response_body_buffering()
+    }
+
     fn response_body_eligible_for_scan(&self, content_type: Option<&str>) -> bool {
         // Response bodies with missing or malformed content-type are still
         // eligible when binary inspection is explicit; request bodies are
@@ -1192,6 +1203,53 @@ impl Plugin for Waf {
         } else {
             UdpDatagramVerdict::Forward
         }
+    }
+
+    /// Opt into the parsed WebSocket relay whenever this instance governs
+    /// application messages, so an upgraded session is never tunnelled past
+    /// inspection as raw bytes (`GHSA-6j3m-vf5h-pgcx`).
+    fn requires_ws_frame_hooks(&self) -> bool {
+        self.active && self.websocket_message_inspection_active()
+    }
+
+    /// Resolve every request-scoped predicate once, at upgrade admission, and
+    /// hand the relay a session-bound instance. See `waf::websocket`.
+    fn bind_ws_session(self: Arc<Self>, ctx: &RequestContext) -> Option<Arc<dyn Plugin>> {
+        if !self.active {
+            return None;
+        }
+        websocket::WafWsSession::bind(self, ctx)
+    }
+
+    /// Unbound fallback. Reaching this means a relay path collected frame
+    /// hooks without running `bind_ws_session`, so this instance has no
+    /// admission-time policy snapshot and cannot evaluate rule conditions or
+    /// exemptions. Application messages fail closed rather than forwarding
+    /// unscanned; control frames keep their protocol semantics.
+    async fn on_ws_frame(
+        &self,
+        proxy_id: &str,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        message: &tokio_tungstenite::tungstenite::Message,
+    ) -> Option<tokio_tungstenite::tungstenite::Message> {
+        use tokio_tungstenite::tungstenite::Message;
+        let is_control = matches!(
+            message,
+            Message::Ping(_) | Message::Pong(_) | Message::Close(_)
+        );
+        if is_control || !self.requires_ws_frame_hooks() {
+            return None;
+        }
+        warn!(
+            target: "waf",
+            plugin = "waf",
+            proxy = %proxy_id,
+            connection_id,
+            direction = ?direction,
+            "WAF WebSocket message policy is unbound for this session; closing"
+        );
+        Some(websocket::unbound_policy_close())
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {

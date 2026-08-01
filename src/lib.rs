@@ -2356,13 +2356,32 @@ pub mod _test_support {
         outgoing
     }
 
+    /// Run the production per-session plugin-collection step, including
+    /// `Plugin::bind_ws_session` substitution, and return the parser-policy and
+    /// post-reassembly hook lists a real upgrade would relay with.
+    pub fn collect_websocket_relay_plugins_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        requires_websocket_framing: bool,
+        upgrade_ctx: &crate::plugins::RequestContext,
+    ) -> (Vec<Arc<dyn crate::plugins::Plugin>>, Vec<Arc<dyn crate::plugins::Plugin>>) {
+        crate::proxy::collect_websocket_relay_plugins(
+            plugins,
+            requires_websocket_framing,
+            upgrade_ctx,
+        )
+    }
+
     /// Report the production parser-policy and post-reassembly hook lists.
     pub fn websocket_relay_plugin_names_for_test(
         plugins: &[Arc<dyn crate::plugins::Plugin>],
         requires_websocket_framing: bool,
+        upgrade_ctx: &crate::plugins::RequestContext,
     ) -> (Vec<String>, Vec<String>) {
-        let (framing_plugins, frame_plugins) =
-            crate::proxy::collect_websocket_relay_plugins(plugins, requires_websocket_framing);
+        let (framing_plugins, frame_plugins) = crate::proxy::collect_websocket_relay_plugins(
+            plugins,
+            requires_websocket_framing,
+            upgrade_ctx,
+        );
         (
             framing_plugins
                 .iter()
