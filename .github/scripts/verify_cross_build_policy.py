@@ -88,7 +88,10 @@ WORKFLOW_CONTRACTS = (
         "build-arm64-cross",
         "87163fa690e89218de8ae00db15d0512c0687a836e0fd32e061e35380c9e0023",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
-        "d775752cb399db3b0660e26e0d9bdb32d7d72cf4ed47694066ccbf629e87e80f",
+        # Pins the top-level `on:` mapping that schedules CI, including
+        # unconditional `merge_group: checks_requested` alongside push,
+        # pull_request, and workflow_dispatch.
+        "2e80c4efd07fae17c1a813c4e7cd9b54a592ea53d88f73e2933bdc8f9ba34e56",
     ),
     (
         "release workflow",
@@ -13418,9 +13421,13 @@ def validate_ci_planner_isolation(contents: str, source: str) -> list[str]:
         for line in block.splitlines()
         if re.match(r"^\s*planner_dir\s*=", line)
     ]
+    # Self-test and plan steps each bootstrap once, then extract under
+    # RUNNER_TEMP for both pull_request and merge_group event arms.
     expected_planner_dirs = [
         "planner_dir=.github/scripts",
         'planner_dir=".github/scripts"',
+        'planner_dir="$trusted_dir"',
+        'planner_dir="$trusted_dir"',
         'planner_dir="$trusted_dir"',
         'planner_dir="$trusted_dir"',
     ]
@@ -13437,6 +13444,8 @@ def validate_ci_planner_isolation(contents: str, source: str) -> list[str]:
     if sorted(trusted_dir_assignments) != sorted(
         [
             'trusted_dir="$RUNNER_TEMP/pr-ci-plan"',
+            'trusted_dir="$RUNNER_TEMP/pr-ci-plan"',
+            'trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"',
             'trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"',
         ]
     ):
@@ -19693,9 +19702,13 @@ pre_build = []
         "          planner_dir=.github/scripts\n"
         '          trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"\n'
         '          planner_dir="$trusted_dir"\n'
+        '          trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"\n'
+        '          planner_dir="$trusted_dir"\n'
         f"          {ISOLATED_PLANNER_LAUNCHER} --self-test\n"
         "      - run: |\n"
         '          planner_dir=".github/scripts"\n'
+        '          trusted_dir="$RUNNER_TEMP/pr-ci-plan"\n'
+        '          planner_dir="$trusted_dir"\n'
         '          trusted_dir="$RUNNER_TEMP/pr-ci-plan"\n'
         '          planner_dir="$trusted_dir"\n'
         f"          plan=\"$({ISOLATED_PLANNER_LAUNCHER} \\\n"
@@ -22534,8 +22547,12 @@ pre_build = []
         "          planner_dir=.github/scripts\n"
         '          trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"\n'
         '          planner_dir="$trusted_dir"\n'
+        '          trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"\n'
+        '          planner_dir="$trusted_dir"\n'
         f"          {ISOLATED_PLANNER_LAUNCHER} --self-test\n"
         '          planner_dir=".github/scripts"\n'
+        '          trusted_dir="$RUNNER_TEMP/pr-ci-plan"\n'
+        '          planner_dir="$trusted_dir"\n'
         '          trusted_dir="$RUNNER_TEMP/pr-ci-plan"\n'
         '          planner_dir="$trusted_dir"\n'
         f"          {ISOLATED_PLANNER_LAUNCHER} --event-name pull_request\n"
