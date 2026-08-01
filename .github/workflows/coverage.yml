@@ -289,13 +289,13 @@ jobs:
         if: needs.coverage-plan.result == 'success' && !contains(fromJSON('["skip", "plugin", "full"]'), needs.coverage-plan.outputs.mode)
         run: exit 1
 
-      - name: Skip coverage for unrelated PR changes
+      - name: Skip coverage for unrelated changes
         if: needs.coverage-plan.outputs.mode == 'skip'
         run: |
           {
             echo "## Coverage Gate"
             echo ""
-            echo "No coverage-relevant files changed in this PR."
+            echo "No coverage-relevant files changed in this run."
             echo "Full coverage still runs on core source, proto/build-input, pushes to main, manual dispatch, and schedule."
           } >> "$GITHUB_STEP_SUMMARY"
 

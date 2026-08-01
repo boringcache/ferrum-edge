@@ -361,7 +361,7 @@ def merge_group_trigger_is_present(workflow_yml: str) -> bool:
     body = workflow_event_body(workflow_yml, "merge_group")
     if body is None:
         return False
-    if re.search(r"(?m)^    (?:branches-ignore|paths|paths-ignore):", body):
+    if re.search(r"(?m)^    (?:branches(?:-ignore)?|paths(?:-ignore)?):", body):
         return False
     return True
 
@@ -415,6 +415,11 @@ def merge_group_self_test() -> list[str]:
     )
     if merge_group_trigger_is_present(path_filtered):
         failures.append("path-filtered merge_group must be rejected")
+    branches_filtered = (
+        "on:\n  merge_group:\n    branches:\n      - main\n"
+    )
+    if merge_group_trigger_is_present(branches_filtered):
+        failures.append("branches-restricted merge_group must be rejected")
 
     # Fork-origin PR provenance still uses base_ref charset validation in the
     # frozen live-suite contract; merge_group uses payload base_sha instead.
