@@ -5553,7 +5553,7 @@ pub async fn normalize_response_body_for_inspection(
         match crate::proxy::response_buffer_budget::ResponseTransformWindow::open(ceiling) {
             Some(window) => Some(window),
             None => {
-                warn!(
+                tracing::warn!(
                     "Response normalization refused: aggregate retained-response budget exhausted"
                 );
                 crate::proxy::replace_buffered_response_with_capacity_refusal(
@@ -5583,7 +5583,7 @@ pub async fn normalize_response_body_for_inspection(
         if let Some(reason) =
             admit_response_body_producer(plugin.response_body_production(), window.as_mut())
         {
-            warn!(
+            tracing::warn!(
                 plugin = plugin.name(),
                 reason, "Response normalization refused before invoking the producer"
             );
@@ -5648,7 +5648,7 @@ pub async fn normalize_response_body_for_inspection(
             // rather than installing an uncharged allocation.
             let body_len = body.len();
             let Some(charged) = window.as_mut().and_then(|window| window.charge(body)) else {
-                warn!(
+                tracing::warn!(
                     plugin = plugin.name(),
                     replacement_bytes = body_len,
                     "Response normalization refused: replacement body is not covered by a \
