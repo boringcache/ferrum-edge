@@ -440,14 +440,6 @@ fn request_match(object: &K8sObject, operation: &Value) -> Result<RequestMatch, 
     validate_supported_operation_fields(object, operation)?;
     let (ports, port_patterns) = operation_ports(object, operation, "ports")?;
     let (not_ports, not_port_patterns) = operation_ports(object, operation, "notPorts")?;
-    if !not_port_patterns.is_empty() {
-        return Err(invalid_resource(
-            object,
-            "rules[].to[].operation.notPorts wildcard patterns are unsupported \
-             (use literal numeric ports)"
-                .to_string(),
-        ));
-    }
 
     Ok(RequestMatch {
         methods: string_array(operation, "methods"),
@@ -460,6 +452,7 @@ fn request_match(object: &K8sObject, operation: &Value) -> Result<RequestMatch, 
         not_paths: string_array(operation, "notPaths"),
         not_hosts: string_array(operation, "notHosts"),
         not_ports,
+        not_port_patterns,
     })
 }
 
@@ -531,6 +524,7 @@ fn request_match_is_unconstrained(request: &RequestMatch) -> bool {
         && request.not_paths.is_empty()
         && request.not_hosts.is_empty()
         && request.not_ports.is_empty()
+        && request.not_port_patterns.is_empty()
 }
 
 fn condition_match(
@@ -5839,8 +5833,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_authorization_policy_not_ports_wildcard_pattern() {
-        let err = translate_k8s_objects(
+    fn preserves_authorization_policy_not_ports_wildcard_pattern() {
+        let result = translate_k8s_objects(
             &[object(
                 "AuthorizationPolicy",
                 serde_json::json!({
@@ -5852,10 +5846,78 @@ mod tests {
             )],
             options(),
         )
-        .expect_err("wildcard notPorts patterns must fail closed");
+        .expect("wildcard notPorts patterns must translate");
 
-        assert!(err.to_string().contains("notPorts"));
-        assert!(err.to_string().contains("unsupported"));
+        let mesh = result.config.mesh.expect("mesh config");
+        let request = &mesh.mesh_policies[0].rules[0].to[0];
+        assert!(request.not_ports.is_empty());
+        assert_eq!(request.not_port_patterns, vec!["8*"]);
+    }
+
+    #[test]
+    fn preserves_authorization_policy_not_ports_suffix_and_literal_mix() {
+        let result = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "to": [{"operation": {
+                            "ports": ["9090"],
+                            "notPorts": ["8080", "*443", "*"]
+                        }}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("mixed literal/wildcard notPorts must translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let request = &mesh.mesh_policies[0].rules[0].to[0];
+        assert_eq!(request.ports, vec![9090]);
+        assert_eq!(request.not_ports, vec![8080]);
+        assert_eq!(request.not_port_patterns, vec!["*443", "*"]);
+    }
+
+    #[test]
+    fn rejects_authorization_policy_not_ports_mid_string_pattern() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "to": [{"operation": {"notPorts": ["8*9"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("mid-string notPorts patterns must fail closed");
+
+        assert!(err.to_string().contains("rules[].to[].operation.notPorts"));
+        assert!(err.to_string().contains("8*9"));
+    }
+
+    #[test]
+    fn rejects_authorization_policy_not_ports_named_port() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "to": [{"operation": {"notPorts": ["http"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("named notPorts must fail closed");
+
+        assert!(err.to_string().contains("rules[].to[].operation.notPorts"));
+        assert!(err.to_string().contains("http"));
     }
 
     #[test]

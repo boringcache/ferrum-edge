@@ -685,6 +685,64 @@ fn mesh_policy_rejects_named_port_pattern() {
 }
 
 #[test]
+fn mesh_policy_accepts_not_port_wildcard_patterns() {
+    let policy = policy_with_request_match(RequestMatch {
+        not_port_patterns: vec!["8*".into(), "*443".into(), "*".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    assert!(
+        errors.is_empty(),
+        "expected no errors for bounded notPorts patterns, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_rejects_mid_string_not_port_pattern() {
+    let policy = policy_with_request_match(RequestMatch {
+        not_port_patterns: vec!["8*9".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    assert!(
+        errors.iter().any(|e| e.contains("not_port_patterns")
+            && e.contains("not a valid port pattern")),
+        "expected not_port_patterns field-specific error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_rejects_named_not_port_pattern() {
+    let policy = policy_with_request_match(RequestMatch {
+        not_port_patterns: vec!["http".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    assert!(
+        errors.iter().any(|e| e.contains("not_port_patterns")
+            && e.contains("not a valid port pattern")),
+        "expected not_port_patterns field-specific error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_not_port_patterns_alone_are_constrained() {
+    let policy = policy_with_request_match(RequestMatch {
+        not_port_patterns: vec!["8*".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    assert!(
+        errors.is_empty(),
+        "a to[] arm with only not_port_patterns must remain a valid constraint, got: {:?}",
+        errors
+    );
+}
+
+#[test]
 fn peer_authentication_requires_namespace() {
     let pa = PeerAuthentication {
         name: "pa".into(),

@@ -418,7 +418,7 @@ fn request_match(
     {
         return false;
     }
-    if !match_.not_ports.is_empty() {
+    if !match_.not_ports.is_empty() || !match_.not_port_patterns.is_empty() {
         // Fail-closed on a missing port, matching `not_methods`/`not_paths`/
         // `not_hosts` above. A `notPorts` rule that silently passed
         // port-less traffic (e.g. a destination that never resolved a port)
@@ -426,7 +426,12 @@ fn request_match(
         let Some(port) = request.port else {
             return false;
         };
-        if match_.not_ports.contains(&port) {
+        if match_.not_ports.contains(&port)
+            || match_
+                .not_port_patterns
+                .iter()
+                .any(|pattern| port_pattern_matches(pattern, port))
+        {
             return false;
         }
     }
@@ -3536,6 +3541,112 @@ mod tests {
                 policy: "implicit-deny".to_string()
             },
             "Port 8080 in not_ports list → rule rejects → implicit deny"
+        );
+    }
+
+    #[test]
+    fn request_match_not_port_patterns_block_matching_ports() {
+        let slice = MeshSlice {
+            mesh_policies: vec![allow_policy_with_request_match(
+                "deny-8-prefix",
+                RequestMatch {
+                    not_port_patterns: vec!["8*".to_string()],
+                    ..RequestMatch::default()
+                },
+            )],
+            ..MeshSlice::default()
+        };
+
+        let port_9090 = MeshAuthzRequest {
+            port: Some(9090),
+            ..MeshAuthzRequest::default()
+        };
+        let port_8080 = MeshAuthzRequest {
+            port: Some(8080),
+            ..MeshAuthzRequest::default()
+        };
+        let port_8443 = MeshAuthzRequest {
+            port: Some(8443),
+            ..MeshAuthzRequest::default()
+        };
+        let missing_port = MeshAuthzRequest {
+            port: None,
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &port_9090),
+            MeshAuthzDecision::Allow,
+            "Port 9090 is outside notPorts prefix 8* → rule matches → allow"
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &port_8080),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            },
+            "Port 8080 matches notPorts prefix 8* → rule rejects → implicit deny"
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &port_8443),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            },
+            "Port 8443 matches notPorts prefix 8* → rule rejects → implicit deny"
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &missing_port),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            },
+            "Absent destination port must fail closed for notPorts patterns"
+        );
+    }
+
+    #[test]
+    fn request_match_ports_and_not_port_patterns_remain_conjunctive() {
+        let slice = MeshSlice {
+            mesh_policies: vec![allow_policy_with_request_match(
+                "allow-9-except-90-prefix",
+                RequestMatch {
+                    ports: vec![9090, 9080],
+                    not_port_patterns: vec!["90*".to_string()],
+                    ..RequestMatch::default()
+                },
+            )],
+            ..MeshSlice::default()
+        };
+
+        let allowed = MeshAuthzRequest {
+            port: Some(9080),
+            ..MeshAuthzRequest::default()
+        };
+        let excluded_by_negative = MeshAuthzRequest {
+            port: Some(9090),
+            ..MeshAuthzRequest::default()
+        };
+        let excluded_by_positive = MeshAuthzRequest {
+            port: Some(8080),
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &allowed),
+            MeshAuthzDecision::Allow,
+            "9080 is in ports and outside notPorts 90* → allow"
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &excluded_by_negative),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            },
+            "9090 is in ports but matches notPorts 90* → conjunctive fail → deny"
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &excluded_by_positive),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            },
+            "8080 is outside positive ports → deny even though notPorts does not match"
         );
     }
 

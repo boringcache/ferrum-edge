@@ -317,7 +317,7 @@ fn authz_translates_request_match_negative_arms() {
         category = CATEGORY,
         feature = "RequestMatch.notMethods / notPaths / notHosts / notPorts",
         status = Status::Supported,
-        notes = "Negative-match arms project into RequestMatch.not_methods/not_paths/not_hosts/not_ports.",
+        notes = "Negative-match arms project into RequestMatch.not_methods/not_paths/not_hosts/not_ports/not_port_patterns.",
     );
     let policy = translated(json!({
         "action": "DENY",
@@ -336,4 +336,86 @@ fn authz_translates_request_match_negative_arms() {
     assert_eq!(to.not_paths, vec!["/admin".to_string()]);
     assert_eq!(to.not_hosts, vec!["internal.example.com".to_string()]);
     assert_eq!(to.not_ports, vec![8443]);
+    assert!(to.not_port_patterns.is_empty());
+}
+
+/// Bounded Istio `notPorts` wildcards project into `not_port_patterns` and are
+/// evaluated conjunctively with positive fields without widening the allow set.
+#[test]
+fn authz_translates_and_enforces_not_ports_wildcard_patterns() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "RequestMatch.notPorts wildcard patterns (8*, *443, *)",
+        status = Status::Supported,
+        notes = "Wildcard notPorts compile into RequestMatch.not_port_patterns with the same \
+                 bounded grammar as positive ports; evaluation stays conjunctive and fail-closed \
+                 when the destination port is absent.",
+    );
+    let policy = translated(json!({
+        "action": "ALLOW",
+        "rules": [{
+            "to": [{"operation": {
+                "ports": ["9080", "9090"],
+                "notPorts": ["90*", "8080"]
+            }}]
+        }]
+    }));
+    assert_eq!(policy.rules.len(), 1);
+    let to = &policy.rules[0].to[0];
+    assert_eq!(to.ports, vec![9080, 9090]);
+    assert_eq!(to.not_ports, vec![8080]);
+    assert_eq!(to.not_port_patterns, vec!["90*".to_string()]);
+
+    let allowed = MeshAuthzRequest {
+        port: Some(9080),
+        ..MeshAuthzRequest::default()
+    };
+    assert_eq!(
+        evaluate_mesh_authorization_policies(std::slice::from_ref(&policy), &allowed),
+        MeshAuthzDecision::Allow
+    );
+
+    let excluded_by_pattern = MeshAuthzRequest {
+        port: Some(9090),
+        ..MeshAuthzRequest::default()
+    };
+    assert_eq!(
+        evaluate_mesh_authorization_policies(std::slice::from_ref(&policy), &excluded_by_pattern),
+        MeshAuthzDecision::Deny {
+            policy: "implicit-deny".to_string()
+        }
+    );
+
+    let missing_port = MeshAuthzRequest {
+        port: None,
+        ..MeshAuthzRequest::default()
+    };
+    assert_eq!(
+        evaluate_mesh_authorization_policies(std::slice::from_ref(&policy), &missing_port),
+        MeshAuthzDecision::Deny {
+            policy: "implicit-deny".to_string()
+        }
+    );
+}
+
+#[test]
+fn authz_rejects_malformed_not_ports_wildcard_patterns() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "RequestMatch.notPorts rejects mid-string / named / out-of-range forms",
+        status = Status::Supported,
+        notes = "Malformed notPorts values fail closed with a field-specific diagnostic.",
+    );
+    let err = translate_k8s_objects(
+        &[authz_policy(json!({
+            "action": "ALLOW",
+            "rules": [{
+                "to": [{"operation": {"notPorts": ["8*9"]}}]
+            }]
+        }))],
+        options(),
+    )
+    .expect_err("mid-string notPorts must fail closed");
+    assert!(err.to_string().contains("rules[].to[].operation.notPorts"));
+    assert!(err.to_string().contains("8*9"));
 }

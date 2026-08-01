@@ -592,6 +592,11 @@ pub struct RequestMatch {
     /// Istio `notPorts` — conjunctive negative-match for the request port.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_ports: Vec<u16>,
+    /// Glob port patterns for Istio string-match `notPorts` such as `"8*"`.
+    /// Compiled/normalized at config load; conjunctive with `not_ports` and
+    /// positive fields in the same rule (never split into a separate deny).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_port_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -3448,7 +3453,8 @@ fn validate_mesh_config_internal(
                 let any_not = !request.not_methods.is_empty()
                     || !request.not_paths.is_empty()
                     || !request.not_hosts.is_empty()
-                    || !request.not_ports.is_empty();
+                    || !request.not_ports.is_empty()
+                    || !request.not_port_patterns.is_empty();
                 if !(any_method || any_path || any_host || any_header || any_port || any_not) {
                     errors.push(format!(
                         "MeshPolicy '{}'.rules[{}].to[{}]: at least one of \
@@ -3483,6 +3489,16 @@ fn validate_mesh_config_internal(
                     if !is_valid_request_match_port_pattern(pattern) {
                         errors.push(format!(
                             "MeshPolicy '{}'.rules[{}].to[{}].port_patterns[{}] \
+                             '{}' is not a valid port pattern \
+                             (expected '*', '<digits>*', or '*<digits>')",
+                            policy.name, i, j, k, pattern
+                        ));
+                    }
+                }
+                for (k, pattern) in request.not_port_patterns.iter().enumerate() {
+                    if !is_valid_request_match_port_pattern(pattern) {
+                        errors.push(format!(
+                            "MeshPolicy '{}'.rules[{}].to[{}].not_port_patterns[{}] \
                              '{}' is not a valid port pattern \
                              (expected '*', '<digits>*', or '*<digits>')",
                             policy.name, i, j, k, pattern
@@ -4407,6 +4423,12 @@ fn normalize_mesh_policy_fields(policies: &mut [MeshPolicy]) {
                     *host = normalize_request_match_host_pattern(host);
                 }
                 for pattern in &mut request.port_patterns {
+                    let trimmed = pattern.trim();
+                    if trimmed.len() != pattern.len() {
+                        *pattern = trimmed.to_string();
+                    }
+                }
+                for pattern in &mut request.not_port_patterns {
                     let trimmed = pattern.trim();
                     if trimmed.len() != pattern.len() {
                         *pattern = trimmed.to_string();
