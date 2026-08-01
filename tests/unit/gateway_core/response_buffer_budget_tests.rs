@@ -447,35 +447,82 @@ fn an_unaffordable_cache_entry_copy_is_refused_rather_than_stored() {
     assert_eq!(budget.available_bytes(), 0, "a refused copy leaks no partial reservation");
 }
 
-/// The eager small-response path never copies: reqwest already owns the bytes
-/// as `Bytes`, so the charge is attached to that existing handle. The charge is
-/// still acquired BEFORE the read, which is what stops concurrency from
-/// multiplying the eager cutoff.
+/// The eager small-response path drives the PRODUCTION collector, with the
+/// declared `Content-Length` as its preallocation hint. The hint is charged
+/// BEFORE the buffer exists, and every growth is charged before it is
+/// allocated — a declared length is a backend claim, not an allocation-capacity
+/// proof, so the eager path may not await an opaque read and reconcile
+/// afterwards (GHSA-pwcm-6rh8-f2gh).
 #[test]
-fn eagerly_read_bytes_are_charged_in_place_before_the_read() {
-    let budget = probe(4);
+fn the_eager_path_charges_its_preallocation_before_it_allocates() {
+    let budget = probe(8);
     let total = budget.available_bytes();
 
-    // Declared Content-Length is reserved up front.
-    let mut charge = budget.try_reserve(UNIT).expect("declared length admits");
-    assert_eq!(budget.available_bytes(), total - UNIT);
-    assert_eq!(charge.reserved_bytes(), UNIT);
-
-    // The read completes; the charge is grown to the real length and attached
-    // to the transport's own allocation.
-    let read: bytes::Bytes = bytes::Bytes::from(vec![3u8; 2 * UNIT]);
-    assert!(budget.grow(&mut charge, read.len()), "growth admits");
-    let body = budget
-        .attach_shared(read, charge)
-        .expect("an exactly charged eager read publishes");
-
+    // Declared Content-Length becomes the preallocation hint, charged first.
+    let mut collector = budget
+        .collector_with_preallocation(4 * UNIT, UNIT)
+        .expect("the declared length admits");
     assert_eq!(
         budget.available_bytes(),
-        total - 2 * UNIT,
-        "the eagerly buffered body stays charged after the read frame returns"
+        total - UNIT,
+        "the preallocation is charged before the buffer is allocated"
+    );
+
+    collector.append(&[3u8; UNIT]).expect("the declared body fits its hint");
+    let body = collector
+        .into_charged_bytes()
+        .expect("the collected body publishes with its charge attached");
+    assert_eq!(body.len(), UNIT);
+    assert_eq!(
+        budget.available_bytes(),
+        total - UNIT,
+        "the eagerly collected body stays charged after collection returns"
     );
     drop(body);
     assert_eq!(budget.available_bytes(), total);
+}
+
+/// A backend that declares a small `Content-Length` and then sends more does
+/// NOT get to retain whatever it sends: the eager collector still enforces the
+/// folded per-response retained ceiling, and the overrun is a BACKEND-attributed
+/// size refusal rather than a gateway-capacity one.
+#[test]
+fn the_eager_path_refuses_a_body_that_outruns_its_declared_length() {
+    let budget = probe(64);
+    let total = budget.available_bytes();
+
+    let mut collector = budget
+        .collector_with_preallocation(2 * UNIT, UNIT)
+        .expect("the declared length admits");
+    assert_eq!(
+        collector.append(&[7u8; 3 * UNIT]),
+        Err(ResponseBufferRetainRejection::TooLarge),
+        "a body past the retained ceiling is a size-policy refusal, not an \
+         aggregate-capacity one"
+    );
+    drop(collector);
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "a refused eager collection releases everything it had charged"
+    );
+}
+
+/// The same collection under a spent budget refuses with the gateway-local
+/// capacity class instead, so telemetry and health accounting stay honest about
+/// which bound was hit.
+#[test]
+fn the_eager_path_distinguishes_capacity_from_size_policy() {
+    let budget = probe(2);
+    let held = budget.try_reserve(2 * UNIT).expect("fills the budget");
+    assert_eq!(budget.available_bytes(), 0);
+
+    assert_eq!(
+        budget.collector_with_preallocation(4 * UNIT, UNIT).err(),
+        Some(ResponseBufferRetainRejection::BudgetExhausted),
+        "an exhausted aggregate budget is gateway-local transient capacity"
+    );
+    drop(held);
 }
 
 /// Concurrency must not be able to multiply the eager cutoff: once the budget
@@ -742,30 +789,33 @@ fn a_refused_grpc_web_replacement_terminates_through_a_body_trailer_frame() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn every_eager_reqwest_buffer_reserves_before_it_reads() {
+fn every_eager_reqwest_buffer_collects_through_the_charged_collector() {
     let proxy = include_str!("../../../src/proxy/mod.rs");
 
+    // No eager path may await an opaque whole-body read: that allocation exists
+    // before anything can measure it (GHSA-pwcm-6rh8-f2gh).
+    assert!(
+        !proxy.contains("response.bytes(),"),
+        "an eager path must not await `Response::bytes()`; it materializes an \
+         allocation of opaque capacity before it can be charged"
+    );
+
     // Three eager small-response paths: the retry loop, the limited
-    // first-attempt arm, and the unlimited first-attempt arm.
+    // first-attempt arm, and the unlimited first-attempt arm — plus the
+    // definition.
     assert_eq!(
-        proxy.matches("response.bytes(),").count(),
-        3,
-        "the eager small-response optimization is expected on exactly three \
-         reqwest paths; a new one must be charged too"
+        proxy.matches("eager_collect_charged_backend_body(").count(),
+        4,
+        "every eager small-response path must collect through the shared \
+         charged collector, which charges each growth before allocating it"
     );
     assert_eq!(
         proxy
-            .matches("response_buffer_budget::try_reserve_retained(declared_len)")
+            .matches("buffered_backend_response_from_eager_collect(")
             .count(),
-        3,
-        "every eager path must reserve its declared Content-Length BEFORE the \
-         read, so concurrency cannot multiply the eager cutoff"
-    );
-    assert_eq!(
-        proxy.matches("buffered_backend_response_from_body_read(").count(),
         4,
-        "three call sites plus the definition; each call site must hand over a \
-         reservation"
+        "three call sites plus the definition; each must classify the retained \
+         refusals it can produce"
     );
 
     // The unbounded `0 = unlimited` retained arm must not exist anywhere: every
@@ -774,8 +824,9 @@ fn every_eager_reqwest_buffer_reserves_before_it_reads() {
         proxy
             .matches("response_buffer_budget::buffered_response_body_ceiling(")
             .count(),
-        4,
-        "each buffered reqwest collection folds `0` to the fail-closed ceiling"
+        7,
+        "each buffered and eager reqwest collection folds `0` to the \
+         fail-closed ceiling"
     );
 }
 
@@ -1851,7 +1902,9 @@ fn a_transform_window_is_refused_before_the_producer_allocates() {
 }
 
 /// Charging an output out of the window is a TRANSFER, not a second
-/// acquisition, and the window reopens for the next plugin in the chain.
+/// acquisition — and `charge` deliberately does NOT refill. The body being
+/// replaced is still alive when `charge` returns, so refilling there would hold
+/// the old body's blocks and a fresh full window at the same time.
 #[test]
 fn a_charged_replacement_transfers_blocks_out_of_the_window() {
     let budget = probe(16);
@@ -1870,10 +1923,24 @@ fn a_charged_replacement_transfers_blocks_out_of_the_window() {
     assert_eq!(replacement.len(), UNIT);
     assert_eq!(
         budget.available_bytes(),
-        total - 3 * UNIT,
-        "the published body holds its own block and the window reopens to full \
-         width for the next plugin in the chain"
+        total - 2 * UNIT,
+        "the published body carries blocks carved OUT of the window, so nothing \
+         new was acquired and the window is now short by exactly that much"
     );
+    assert_eq!(
+        window.available_bytes(),
+        UNIT,
+        "the window is short until it is explicitly refilled"
+    );
+
+    // Refill happens only once the caller has installed the replacement and the
+    // body it replaced has dropped its own charge.
+    assert!(
+        window.ensure_covering_window(),
+        "a full window is re-established before the next producer"
+    );
+    assert_eq!(window.available_bytes(), 2 * UNIT);
+    assert_eq!(budget.available_bytes(), total - 3 * UNIT);
 
     drop(window);
     assert_eq!(
@@ -1885,19 +1952,87 @@ fn a_charged_replacement_transfers_blocks_out_of_the_window() {
     assert_eq!(budget.available_bytes(), total);
 }
 
-/// An output larger than the window — i.e. larger than this response's retained
-/// ceiling — is refused, and nothing uncharged is published.
+/// The precondition finding: after a first replacement consumes part of the
+/// window, a second producer must not be invoked under a PARTIAL window. When
+/// the spare budget has been taken in the meantime, `ensure_covering_window`
+/// fails and the caller installs the neutral capacity terminal INSTEAD of
+/// calling the next producer — so no uncharged output can exist
+/// (GHSA-pwcm-6rh8-f2gh).
 #[test]
-fn an_output_larger_than_the_window_is_refused() {
+fn a_second_producer_is_never_invoked_under_a_partial_window() {
+    // Exactly two blocks of headroom beyond the window itself.
+    let budget = probe(3);
+    let total = budget.available_bytes();
+
+    let mut window = budget.transform_window(UNIT).expect("the window admits");
+    assert_eq!(budget.available_bytes(), total - UNIT);
+
+    // First producer's output is charged out of the window.
+    let first = window
+        .charge(vec![1u8; UNIT])
+        .expect("the first replacement publishes");
+    assert_eq!(window.available_bytes(), 0, "the window is now empty");
+
+    // Something else takes the spare budget before the chain continues, and the
+    // first replacement is still resident (it is the current response body).
+    let competitor = budget
+        .try_reserve(2 * UNIT)
+        .expect("a concurrent response takes the remaining budget");
+    assert_eq!(budget.available_bytes(), 0);
+
+    assert!(
+        !window.ensure_covering_window(),
+        "a full covering window cannot be re-established, so the next producer \
+         must not be invoked at all"
+    );
+    assert_eq!(
+        window.available_bytes(),
+        0,
+        "a failed refill acquires nothing, so no partial window is presented to \
+         a producer"
+    );
+
+    drop(competitor);
+    drop(window);
+    assert_eq!(
+        budget.available_bytes(),
+        total - UNIT,
+        "only the published first replacement is still charged"
+    );
+    drop(first);
+    assert_eq!(budget.available_bytes(), total);
+}
+
+/// An output larger than the window is stopped DURING construction, not after a
+/// larger buffer is already resident.
+///
+/// A full-ceiling window only bounds what may be installed; on its own it does
+/// not stop a producer from materialising something bigger first. So the
+/// producer builds through the window's ceiling-bounded sink, which refuses the
+/// write that would carry the buffer past the bound and releases what it had
+/// (GHSA-pwcm-6rh8-f2gh).
+#[test]
+fn an_output_larger_than_the_window_is_refused_while_it_is_written() {
     let budget = probe(16);
     let total = budget.available_bytes();
 
     let mut window = budget.transform_window(UNIT).expect("the window admits");
+    let mut sink = window.sink();
+    assert_eq!(sink.ceiling(), UNIT, "the sink is sized to the window");
+
+    assert!(sink.push(&[5u8; UNIT]), "an in-ceiling write is accepted");
     assert!(
-        window.charge(vec![5u8; 2 * UNIT]).is_none(),
-        "a replacement above the per-response retained ceiling must be refused \
-         for the same reason a backend body that size would be"
+        !sink.push(&[5u8; 1]),
+        "the write that would exceed the retained ceiling is refused BEFORE the \
+         allocation it would need"
     );
+    assert!(sink.overflowed());
+    assert!(sink.is_empty(), "a refused sink releases what it had written");
+    assert!(
+        sink.finish().is_none(),
+        "an overflowed sink yields no replacement body at all"
+    );
+
     assert_eq!(
         budget.available_bytes(),
         total - UNIT,
@@ -1908,78 +2043,144 @@ fn an_output_larger_than_the_window_is_refused() {
     assert_eq!(budget.available_bytes(), total);
 }
 
-// ---------------------------------------------------------------------------
-// Eagerly read `Bytes`: a view is not an allocation.
-// ---------------------------------------------------------------------------
-
-/// A solely owned handle proves its own capacity, so it is charged exactly and
-/// published without a copy.
+/// The installation gate is still checked, so a mis-sized output that somehow
+/// reached `charge` is refused rather than installed uncharged.
 #[test]
-fn a_solely_owned_eager_handle_is_charged_exactly_and_not_copied() {
-    let budget = probe(8);
+fn an_output_the_window_cannot_cover_is_refused_at_installation() {
+    let budget = probe(16);
     let total = budget.available_bytes();
 
-    let read = bytes::Bytes::from(vec![3u8; 2 * UNIT]);
-    let source_ptr = read.as_ptr();
-    let charge = budget.try_reserve(2 * UNIT).expect("declared length admits");
-    let body = budget
-        .attach_shared(read, charge)
-        .expect("a solely owned handle publishes");
+    let mut window = budget.transform_window(UNIT).expect("the window admits");
+    assert!(
+        window.charge(vec![5u8; 2 * UNIT]).is_none(),
+        "a replacement above the per-response retained ceiling must be refused \
+         for the same reason a backend body that size would be"
+    );
+    assert_eq!(budget.available_bytes(), total - UNIT);
 
-    assert_eq!(
-        body.as_ptr(),
-        source_ptr,
-        "sole ownership makes the backing capacity knowable, so no copy is owed"
-    );
-    assert_eq!(
-        budget.available_bytes(),
-        total - 2 * UNIT,
-        "the eagerly buffered body stays charged after the read frame returns"
-    );
-    drop(body);
+    drop(window);
     assert_eq!(budget.available_bytes(), total);
 }
 
-/// A handle that only VIEWS a producer-owned allocation cannot report the size
-/// of what it would pin, so it is copied once into an allocation the gateway
-/// sizes and measures, and the opaque view is dropped.
+/// The JSON materialisation every JSON-producing response transform uses stops
+/// serialization at the ceiling instead of building the whole document first.
 #[test]
-fn an_opaque_eager_handle_is_copied_into_a_measured_allocation() {
-    let budget = probe(8);
+fn bounded_json_materialisation_refuses_an_amplified_document() {
+    use ferrum_edge::_test_support::bounded_json_response_body_for_test as bounded_json;
+
+    let small = serde_json::json!({"ok": true});
+    let encoded = bounded_json(&small, 64).expect("a small document fits");
+    assert_eq!(encoded, br#"{"ok":true}"#.to_vec());
+
+    let big = serde_json::json!({"blob": "x".repeat(4096)});
+    assert!(
+        bounded_json(&big, 128).is_none(),
+        "a document that would exceed the ceiling is refused while it is being \
+         serialized, not after a larger buffer exists"
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// The producer precondition, evaluated before every invocation.
+// ---------------------------------------------------------------------------
+
+/// The exact shape the root review called out: a chain of two producers where
+/// the first replacement consumed the window and the spare budget was taken in
+/// the meantime. The second producer must NOT be invoked, so no output of its
+/// can exist to be charged or refused after the fact
+/// (GHSA-pwcm-6rh8-f2gh).
+#[test]
+fn a_second_producer_is_not_invoked_when_the_window_cannot_be_refilled() {
+    use ferrum_edge::_test_support::{
+        PRODUCER_REFUSED_UNDECLARED_CONTRACT, PRODUCER_REFUSED_WINDOW_UNAVAILABLE,
+        admit_response_body_producer_for_test as admit,
+    };
+    use ferrum_edge::plugins::ResponseBodyProduction;
+
+    let budget = probe(3);
     let total = budget.available_bytes();
+    let mut window = budget.transform_window(UNIT).expect("the window admits");
 
-    // A large producer buffer with a small window handed to the gateway: the
-    // shape a hyper connection read buffer produces. Charging `len()` here
-    // would leave the rest of the producer's allocation pinned and unbudgeted.
-    let producer = bytes::Bytes::from(vec![4u8; 6 * UNIT]);
-    let view = producer.slice(0..UNIT);
-    let view_ptr = view.as_ptr();
-
-    let charge = budget.try_reserve(UNIT).expect("declared length admits");
-    let body = budget
-        .attach_shared(view, charge)
-        .expect("an opaque handle publishes through a measured copy");
-
-    assert_ne!(
-        body.as_ptr(),
-        view_ptr,
-        "an unmeasurable backing must not be retained: the payload is copied \
-         into an allocation this gateway sized (GHSA-pwcm-6rh8-f2gh)"
-    );
-    assert_eq!(body.len(), UNIT);
-    assert!(body.iter().all(|byte| *byte == 4u8), "the copy is faithful");
+    // First producer: admitted, because a full covering window exists.
     assert_eq!(
-        budget.available_bytes(),
-        total - UNIT,
-        "the measured copy is charged for exactly what it occupies"
+        admit(
+            ResponseBodyProduction::BoundedByRetainedCeiling,
+            Some(&mut window)
+        ),
+        None,
+        "the first producer runs inside a full covering window"
+    );
+    let first = window
+        .charge(vec![1u8; UNIT])
+        .expect("the first replacement publishes");
+
+    // The spare budget is consumed by a concurrent response before the chain
+    // reaches the second producer, and the first replacement is still resident.
+    let competitor = budget
+        .try_reserve(2 * UNIT)
+        .expect("a concurrent response takes the rest of the budget");
+    assert_eq!(budget.available_bytes(), 0);
+
+    assert_eq!(
+        admit(
+            ResponseBodyProduction::BoundedByRetainedCeiling,
+            Some(&mut window)
+        ),
+        Some(PRODUCER_REFUSED_WINDOW_UNAVAILABLE),
+        "without a full covering window the producer must not be invoked at all"
+    );
+    assert_eq!(
+        window.available_bytes(),
+        0,
+        "the refused refill acquired nothing, so no partial window exists"
     );
 
-    drop(producer);
+    // A non-producer is still invoked: nothing is reserved on its account.
     assert_eq!(
-        body.len(),
-        UNIT,
-        "the published body does not depend on the producer's buffer"
+        admit(ResponseBodyProduction::Never, Some(&mut window)),
+        None,
+        "a proven non-producer needs no window"
     );
-    drop(body);
+
+    // An out-of-tree plugin is refused even when the window is full, because
+    // the gateway cannot prove its output is bounded.
+    drop(competitor);
+    assert!(window.ensure_covering_window(), "the window can refill again");
+    assert_eq!(
+        admit(ResponseBodyProduction::Undeclared, Some(&mut window)),
+        Some(PRODUCER_REFUSED_UNDECLARED_CONTRACT),
+        "an undeclared replacement contract fails closed rather than being \
+         invoked under a window"
+    );
+
+    drop(window);
+    assert_eq!(budget.available_bytes(), total - UNIT);
+    drop(first);
     assert_eq!(budget.available_bytes(), total);
+}
+
+/// A chain that cannot produce reserves no window at all, so validators and
+/// header-only plugins do not halve the buffered-response concurrency the
+/// aggregate budget supports.
+#[test]
+fn a_non_producing_plugin_needs_no_window() {
+    use ferrum_edge::_test_support::admit_response_body_producer_for_test as admit;
+    use ferrum_edge::plugins::ResponseBodyProduction;
+
+    assert!(
+        !ResponseBodyProduction::Never.may_replace_response_body(),
+        "a proven non-producer must not force a window open"
+    );
+    assert!(
+        ResponseBodyProduction::Undeclared.may_replace_response_body(),
+        "an unknown plugin must be treated as potentially rewriting"
+    );
+    assert!(ResponseBodyProduction::BoundedByRetainedCeiling.may_replace_response_body());
+
+    assert_eq!(
+        admit(ResponseBodyProduction::Never, None),
+        None,
+        "with no window open at all, a non-producer still runs"
+    );
 }

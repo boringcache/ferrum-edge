@@ -19416,9 +19416,17 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     // influence. The window is this response's retained ceiling, and each
     // accepted output transfers its covering blocks out of it
     // (GHSA-pwcm-6rh8-f2gh).
-    let mut window = if plugins.is_empty() {
-        None
-    } else {
+    //
+    // Only a chain that can actually produce pays for a window: it is a whole
+    // per-response ceiling held for the length of the phase, and reserving one
+    // for validators/header-only plugins would halve the buffered-response
+    // concurrency the aggregate budget supports without bounding anything. The
+    // declaration is fail-closed — an undeclared plugin is refused below rather
+    // than trusted — so this cannot silently miss a rewriter.
+    let mut window = if plugins
+        .iter()
+        .any(|plugin| plugin.response_body_production().may_replace_response_body())
+    {
         let ceiling = ctx.effective_max_response_body_size_bytes();
         match response_buffer_budget::ResponseTransformWindow::open(ceiling) {
             Some(window) => Some(window),
@@ -19437,9 +19445,36 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
                 return (true, representation_rewritten);
             }
         }
+    } else {
+        None
     };
     let mut body_transformed = representation_rewritten;
     for plugin in plugins {
+        // Precondition for EVERY producer invocation: a full covering window
+        // must exist before the producer can allocate into it, and it is
+        // re-established only now — after any previous replacement was installed
+        // and the body it replaced dropped its charge — so the old body and a
+        // fresh full window are never both charged. An out-of-tree plugin that
+        // declares no bounded construction contract is refused instead of being
+        // invoked, because invoking it is what would let it allocate unbounded.
+        if let Some(reason) = crate::plugins::admit_response_body_producer(
+            plugin.response_body_production(),
+            window.as_mut(),
+        ) {
+            warn!(
+                plugin = plugin.name(),
+                reason,
+                "Response body transform refused before invoking the producer"
+            );
+            replace_buffered_response_with_capacity_refusal(
+                ctx,
+                response_status,
+                response_headers,
+                response_body,
+                initial_response_header_policy_plugins,
+            );
+            return (true, body_transformed);
+        }
         let transformed = match crate::plugins::await_grpc_deadline(
             ctx.grpc_deadline_at(),
             plugin.transform_response_body_with_context(
@@ -19479,11 +19514,17 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
             // rather than retaining uncharged bytes. An output larger than the
             // window is refused for the same reason a backend body that size
             // would be: it is above this response's retained ceiling.
+            //
+            // A `None` window here means a plugin declared as a non-producer
+            // returned bytes anyway: nothing was reserved for them, so they are
+            // refused rather than installed uncharged.
             let transformed_len = transformed.len();
             let Some(charged) = window.as_mut().and_then(|w| w.charge(transformed)) else {
                 warn!(
                     plugin = plugin.name(),
-                    "Response body transform refused: aggregate retained-response budget exhausted"
+                    replacement_bytes = transformed_len,
+                    "Response body transform refused: replacement body is not covered by a \
+                     reserved retained-response window"
                 );
                 replace_buffered_response_with_capacity_refusal(
                     ctx,
@@ -30685,24 +30726,24 @@ pub(crate) async fn proxy_to_backend_retry(
                     // Content-Length is within cutoff (and within max_response
                     // _body_size_bytes if set, checked above), so eager
                     // collection is bounded PER RESPONSE. Concurrency still
-                    // multiplies that cutoff, so the retained bytes are charged
-                    // against the aggregate budget before the read starts and the
-                    // charge is then handed to the payload
-                    // (GHSA-pwcm-6rh8-f2gh). Refusal is the neutral transient
-                    // capacity response, never a backend fault; the streaming
-                    // arm below is untouched and retains nothing.
-                    let Some(reservation) =
-                        response_buffer_budget::try_reserve_retained(declared_len)
-                    else {
-                        return response_buffer_capacity_response(
-                            proxy,
-                            resolved_ip.clone(),
-                            "reqwest-eager-retry",
+                    // multiplies that cutoff, so the bytes are collected through
+                    // the shared charged collector: every growth target is
+                    // charged before it is allocated and the charge is owned by
+                    // the published payload (GHSA-pwcm-6rh8-f2gh). An exhausted
+                    // aggregate budget is the neutral transient capacity
+                    // response, never a backend fault; the streaming arm below is
+                    // untouched and retains nothing.
+                    let retained_ceiling =
+                        response_buffer_budget::buffered_response_body_ceiling(
+                            effective_max_response_body_size_bytes,
                         );
-                    };
-                    let body_read = match crate::plugins::await_grpc_deadline(
+                    let collected = match crate::plugins::await_grpc_deadline(
                         request_ctx.grpc_deadline_at(),
-                        response.bytes(),
+                        eager_collect_charged_backend_body(
+                            response,
+                            retained_ceiling,
+                            declared_len,
+                        ),
                     )
                     .await
                     {
@@ -30715,14 +30756,14 @@ pub(crate) async fn proxy_to_backend_retry(
                             );
                         }
                     };
-                    buffered_backend_response_from_body_read(
-                        body_read,
+                    buffered_backend_response_from_eager_collect(
+                        collected,
                         status,
                         resp_headers,
                         resolved_ip.clone(),
-                        reservation,
                         proxy,
                         "reqwest-eager-retry",
+                        retained_ceiling,
                     )
                 } else {
                     // Streaming path — the downstream body builder applies
@@ -30938,7 +30979,70 @@ fn record_h2_pool_admission_failure(
     }
 }
 
-/// Build a buffered `BackendResponse` from a reqwest body-read result. A read
+/// Why an eager retained collection failed.
+///
+/// The eager path retains its body, so it uses the SAME
+/// [`response_buffer_budget::ChargedBodyCollector`] the buffered paths use
+/// (GHSA-pwcm-6rh8-f2gh). It deliberately does not await `Response::bytes()`:
+/// that call materialises an allocation of opaque capacity before anything can
+/// measure it, and a declared `Content-Length` is a backend claim rather than an
+/// allocation-capacity proof — so under concurrency many tasks could each hold
+/// such a buffer while only their declared lengths had been charged. Collecting
+/// through the shared collector charges every growth target BEFORE asking the
+/// allocator for it, and the finished charge is owned by the published `Bytes`
+/// for exactly as long as the payload exists.
+///
+/// The two refusals stay distinct because their attributions differ: a body past
+/// the per-response retained ceiling is a BACKEND fault
+/// (`ResponseBodyTooLarge`), while an exhausted aggregate budget is gateway-local
+/// transient capacity and must stay neutral to circuit breaker, passive health,
+/// and adaptive concurrency. A read failure keeps its existing classification
+/// untouched.
+enum EagerRetainFailure {
+    /// Mid-body transport failure after the response headers arrived.
+    Read(reqwest::Error),
+    /// The retained bounds refused the body.
+    Retain(response_buffer_budget::RetainRejection),
+}
+
+/// Eagerly collect a small backend response body under both retained bounds.
+///
+/// `ceiling` is this response's folded retained ceiling and `preallocation_hint`
+/// is the declared `Content-Length`, charged before the preallocation exists so a
+/// flood of responses that advertise a body and then stall cannot each hold
+/// uncharged capacity.
+async fn eager_collect_charged_backend_body(
+    response: reqwest::Response,
+    ceiling: usize,
+    preallocation_hint: usize,
+) -> Result<Bytes, EagerRetainFailure> {
+    use futures_util::StreamExt as _;
+    let mut collector = response_buffer_budget::ChargedBodyCollector::with_preallocation(
+        response_buffer_budget::BudgetRef::global(),
+        ceiling,
+        preallocation_hint,
+    )
+    .map_err(EagerRetainFailure::Retain)?;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                if let Err(rejection) = collector.append(&chunk) {
+                    return Err(EagerRetainFailure::Retain(rejection));
+                }
+            }
+            Err(e) => return Err(EagerRetainFailure::Read(e)),
+        }
+    }
+    match collector.into_charged_bytes() {
+        Some(charged) => Ok(charged),
+        None => Err(EagerRetainFailure::Retain(
+            response_buffer_budget::RetainRejection::BudgetExhausted,
+        )),
+    }
+}
+
+/// Build a buffered `BackendResponse` from an eager charged collection. A read
 /// failure AFTER the response headers arrived (backend reset/closed/timed out
 /// mid-body) is a backend fault, so it must surface as a 502 with
 /// an error class — NOT the backend's original status with a silently-emptied
@@ -30948,50 +31052,52 @@ fn record_h2_pool_admission_failure(
 /// admission (and passive health) record a mid-body backend failure as a healthy
 /// success and can grow the limit. Mirrors the size-limited buffered read paths
 /// that already classify this.
-///
-/// `reservation` is the aggregate retained-response charge the caller acquired
-/// for the declared `Content-Length` BEFORE the read started, so concurrency
-/// cannot multiply the eager cutoff into unbounded resident memory
-/// (GHSA-pwcm-6rh8-f2gh). It is grown to the actual body length and then MOVED
-/// into the returned `Bytes` (`charged_shared_bytes`, `O(1)` — reqwest's
-/// allocation is not copied), so the charge lives exactly as long as the
-/// payload. A body that turns out larger than its declared length and no longer
-/// fits the budget is refused with the same neutral gateway-capacity response
-/// every other retained path uses; a read failure keeps its existing
-/// classification untouched.
-fn buffered_backend_response_from_body_read(
-    result: Result<bytes::Bytes, reqwest::Error>,
+fn buffered_backend_response_from_eager_collect(
+    result: Result<Bytes, EagerRetainFailure>,
     status: u16,
     resp_headers: HashMap<String, String>,
     resolved_ip: Option<String>,
-    mut reservation: response_buffer_budget::ResponseBufferReservation,
     proxy: &Proxy,
     transport: &'static str,
+    ceiling: usize,
 ) -> retry::BackendResponse {
+    use response_buffer_budget::RetainRejection;
     match result {
-        Ok(b) => {
-            if !reservation.reserve(b.len()) {
-                return response_buffer_capacity_response(proxy, resolved_ip, transport);
-            }
-            // A `Bytes` is a view onto an allocation reqwest owns, so the charge
-            // is made exact rather than assumed: sole ownership is proven and the
-            // real capacity charged, or the payload is copied once into an
-            // allocation this gateway sizes and the opaque view dropped. A
-            // refusal is the neutral gateway-capacity response, never a backend
-            // fault (GHSA-pwcm-6rh8-f2gh).
-            let Some(charged) = response_buffer_budget::charged_shared_bytes(b, reservation) else {
-                return response_buffer_capacity_response(proxy, resolved_ip, transport);
-            };
+        Ok(charged) => retry::BackendResponse {
+            status_code: status,
+            body: ResponseBody::buffered(charged),
+            headers: resp_headers,
+            connection_error: false,
+            backend_resolved_ip: resolved_ip,
+            error_class: None,
+        },
+        Err(EagerRetainFailure::Retain(RetainRejection::BudgetExhausted)) => {
+            response_buffer_capacity_response(proxy, resolved_ip, transport)
+        }
+        Err(EagerRetainFailure::Retain(RetainRejection::TooLarge)) => {
+            // Size POLICY, not process capacity: the origin sent more than the
+            // operator allows to be retained. Kept separate from the aggregate
+            // refusal above so telemetry and health accounting stay honest.
+            warn!(
+                proxy_id = %proxy.id,
+                transport,
+                max_response_body_size_bytes = ceiling,
+                "Backend response body exceeded the retained response ceiling while buffering"
+            );
             retry::BackendResponse {
-                status_code: status,
-                body: ResponseBody::buffered(charged),
-                headers: resp_headers,
+                status_code: 502,
+                body: ResponseBody::buffered(
+                    r#"{"error":"Backend response body exceeds maximum size"}"#
+                        .as_bytes()
+                        .to_vec(),
+                ),
+                headers: HashMap::new(),
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
-                error_class: None,
+                error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
             }
         }
-        Err(e) => {
+        Err(EagerRetainFailure::Read(e)) => {
             let (status_code, error_class) =
                 eager_buffer_body_read_status_and_class(retry::classify_reqwest_error(&e));
             warn!(
@@ -32801,25 +32907,22 @@ async fn proxy_to_backend(
                         && let Some(declared_len) = content_length.filter(|cl| *cl <= cutoff)
                         && !is_streaming_content_type(&resp_headers)
                     {
-                        // Eagerly buffered, therefore RETAINED: charged against
-                        // the aggregate budget before the read so concurrency
-                        // cannot multiply the cutoff (GHSA-pwcm-6rh8-f2gh).
-                        let Some(reservation) =
-                            response_buffer_budget::try_reserve_retained(declared_len)
-                        else {
-                            return backend_dispatch_response(
-                                response_buffer_capacity_response(
-                                    proxy,
-                                    resolved_ip.clone(),
-                                    "reqwest-eager",
-                                ),
-                                retained_body,
-                                backend_admission_permits,
+                        // Eagerly buffered, therefore RETAINED: collected through
+                        // the shared charged collector so every byte of resident
+                        // capacity is charged before it is allocated and
+                        // concurrency cannot multiply the cutoff
+                        // (GHSA-pwcm-6rh8-f2gh).
+                        let retained_ceiling =
+                            response_buffer_budget::buffered_response_body_ceiling(
+                                effective_max_response_body_size_bytes,
                             );
-                        };
-                        let body_read = match crate::plugins::await_grpc_deadline(
+                        let collected = match crate::plugins::await_grpc_deadline(
                             request_ctx.grpc_deadline_at(),
-                            response.bytes(),
+                            eager_collect_charged_backend_body(
+                                response,
+                                retained_ceiling,
+                                declared_len,
+                            ),
                         )
                         .await
                         {
@@ -32837,14 +32940,14 @@ async fn proxy_to_backend(
                             }
                         };
                         return backend_dispatch_response(
-                            buffered_backend_response_from_body_read(
-                                body_read,
+                            buffered_backend_response_from_eager_collect(
+                                collected,
                                 status,
                                 resp_headers,
                                 resolved_ip.clone(),
-                                reservation,
                                 proxy,
                                 "reqwest-eager",
+                                retained_ceiling,
                             ),
                             retained_body,
                             backend_admission_permits,
@@ -32945,25 +33048,19 @@ async fn proxy_to_backend(
                     && !is_streaming_content_type(&resp_headers)
                 {
                     // Same eager retention as the limited arm above, and the same
-                    // aggregate charge: "no configured per-response ceiling"
-                    // never means "unbounded resident memory"
-                    // (GHSA-pwcm-6rh8-f2gh).
-                    let Some(reservation) =
-                        response_buffer_budget::try_reserve_retained(declared_len)
-                    else {
-                        return backend_dispatch_response(
-                            response_buffer_capacity_response(
-                                proxy,
-                                resolved_ip.clone(),
-                                "reqwest-eager-unlimited",
-                            ),
-                            retained_body,
-                            backend_admission_permits,
-                        );
-                    };
-                    let body_read = match crate::plugins::await_grpc_deadline(
+                    // charged collector: "no configured per-response ceiling" is
+                    // a STREAMING policy only, so a retained body still gets the
+                    // fail-closed fallback ceiling and never means "unbounded
+                    // resident memory" (GHSA-pwcm-6rh8-f2gh).
+                    let retained_ceiling =
+                        response_buffer_budget::buffered_response_body_ceiling(0);
+                    let collected = match crate::plugins::await_grpc_deadline(
                         request_ctx.grpc_deadline_at(),
-                        response.bytes(),
+                        eager_collect_charged_backend_body(
+                            response,
+                            retained_ceiling,
+                            declared_len,
+                        ),
                     )
                     .await
                     {
@@ -32980,14 +33077,14 @@ async fn proxy_to_backend(
                             );
                         }
                     };
-                    buffered_backend_response_from_body_read(
-                        body_read,
+                    buffered_backend_response_from_eager_collect(
+                        collected,
                         status,
                         resp_headers,
                         resolved_ip.clone(),
-                        reservation,
                         proxy,
                         "reqwest-eager-unlimited",
+                        retained_ceiling,
                     )
                 } else {
                     retry::BackendResponse {
@@ -34190,6 +34287,16 @@ pub(crate) fn store_charged_grpc_web_reframed_body(
     retained_ceiling: usize,
     reframe: impl FnOnce(&mut Vec<u8>) -> bool,
 ) -> Option<(usize, bool)> {
+    // Pre-allocation upper bound, checked rather than assumed: the copy is the
+    // already-charged body (collected under the same ceiling) and the reframe
+    // only APPENDS one terminal frame, whose size is bounded by the gRPC
+    // terminal-metadata budget. Refusing here when the body is already above the
+    // ceiling keeps that reasoning true even if an earlier phase installed a
+    // larger representation, and does it BEFORE the copy is taken.
+    if response_body.len() > retained_ceiling {
+        grpc_web_reframe_capacity_terminal(response_body, response_headers);
+        return None;
+    }
     let Some(mut window) = response_buffer_budget::ResponseTransformWindow::open(retained_ceiling)
     else {
         grpc_web_reframe_capacity_terminal(response_body, response_headers);
@@ -39860,6 +39967,11 @@ mod tests {
 
     #[async_trait]
     impl Plugin for SyntheticBodyTransformPlugin {
+        /// Test producer: declares the bounded-construction contract so the
+        /// buffered phases reserve a window for it (GHSA-pwcm-6rh8-f2gh).
+        fn response_body_production(&self) -> crate::plugins::ResponseBodyProduction {
+            crate::plugins::ResponseBodyProduction::BoundedByRetainedCeiling
+        }
         fn name(&self) -> &str {
             "synthetic_body_transform"
         }
@@ -39880,6 +39992,11 @@ mod tests {
 
     #[async_trait]
     impl Plugin for SyntheticNormalizationProbePlugin {
+        /// Test producer: declares the bounded-construction contract so the
+        /// buffered phases reserve a window for it (GHSA-pwcm-6rh8-f2gh).
+        fn response_body_production(&self) -> crate::plugins::ResponseBodyProduction {
+            crate::plugins::ResponseBodyProduction::BoundedByRetainedCeiling
+        }
         fn name(&self) -> &str {
             "synthetic_normalization_probe"
         }

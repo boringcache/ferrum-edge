@@ -4737,6 +4737,7 @@ impl Plugin for McpGateway {
         content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
+        let retained_ceiling = ctx.retained_response_body_ceiling();
         let original_metadata_stamped = ctx
             .metadata
             .contains_key(crate::proxy::ORIGINAL_RESPONSE_METADATA_STAMPED_KEY);
@@ -4838,7 +4839,11 @@ impl Plugin for McpGateway {
         if outcome != ResponseRewriteOutcome::Changed {
             return None;
         }
-        serde_json::to_vec(&value).ok()
+        // Serialized through a sink bounded by this response's retained ceiling
+        // — the same size as the window the transform phase reserved — so an
+        // amplifying rewrite is refused while it is written rather than after a
+        // larger buffer is resident (GHSA-pwcm-6rh8-f2gh).
+        crate::proxy::response_buffer_budget::bounded_json_vec(&value, retained_ceiling)
     }
 
     fn on_response_body_transformed(

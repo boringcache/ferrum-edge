@@ -2074,9 +2074,14 @@ impl Plugin for AiStreamRouter {
             .get(META_MODEL)
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
+        // Every replacement this normalizer produces is materialised inside a
+        // sink bounded by this response's retained ceiling — the same size as
+        // the window the phase reserved before invoking it
+        // (GHSA-pwcm-6rh8-f2gh).
+        let ceiling = ctx.retained_response_body_ceiling();
         let header_encoding = match content_encoding_value(response_headers) {
             Ok(encoding) => encoding,
-            Err(message) => return Some(upstream_sse_error_body(&message)),
+            Err(message) => return bounded_upstream_sse_error_body(&message, ceiling),
         };
         let encoding = ctx
             .metadata
@@ -2086,12 +2091,12 @@ impl Plugin for AiStreamRouter {
         let plaintext = match prepare_sse_bytes_for_normalization(body, encoding) {
             Ok(bytes) => bytes,
             Err(message) => {
-                return Some(upstream_sse_error_body(&message));
+                return bounded_upstream_sse_error_body(&message, ceiling);
             }
         };
         let tools_forbidden =
             ctx.metadata.get(META_TOOL_CHOICE_NONE).map(String::as_str) == Some("true");
-        normalize_anthropic_sse_buffered(model, &plaintext, tools_forbidden).await
+        normalize_anthropic_sse_buffered(model, &plaintext, tools_forbidden, ceiling).await
     }
 
     /// Bind every field normalized Anthropic SSE invalidates.
@@ -2325,6 +2330,19 @@ fn upstream_sse_error_body(message: &str) -> Vec<u8> {
         }
     });
     format!("data: {err}\n\ndata: [DONE]\n\n").into_bytes()
+}
+
+/// [`upstream_sse_error_body`] under the response's retained ceiling.
+///
+/// The envelope is fixed-shape and small, but it is still a replacement body, so
+/// it is materialised through the same bounded sink as every other producer
+/// output; `None` (leave the response alone) is the fail-closed answer if a
+/// pathologically small ceiling cannot hold it (GHSA-pwcm-6rh8-f2gh).
+fn bounded_upstream_sse_error_body(message: &str, ceiling: usize) -> Option<Vec<u8>> {
+    crate::proxy::response_buffer_budget::bounded_vec_from(
+        &upstream_sse_error_body(message),
+        ceiling,
+    )
 }
 
 fn wrap_anthropic_normalizer(
@@ -3280,29 +3298,43 @@ impl ResponseStreamInspector for ImmediateUpstreamErrorNormalizer {
     }
 }
 
+/// Buffered Anthropic→OpenAI SSE normalization, accumulated inside a
+/// `ceiling`-bounded sink so a normalized stream that would exceed this
+/// response's retained ceiling is refused while it is being written rather than
+/// after a larger buffer is resident (GHSA-pwcm-6rh8-f2gh).
 async fn normalize_anthropic_sse_buffered(
     model: String,
     body: &[u8],
     tools_forbidden: bool,
+    ceiling: usize,
 ) -> Option<Vec<u8>> {
     let mut normalizer = AnthropicSseNormalizer::new(model, tools_forbidden);
-    let mut out = Vec::new();
+    use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+    let mut out = BoundedResponseBodySink::with_ceiling(ceiling);
     match normalizer.on_chunk(body).await {
-        ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
-        ResponseStreamAction::Terminate(bytes) => {
-            if let Some(bytes) = bytes {
-                out.extend_from_slice(&bytes);
+        ResponseStreamAction::Forward(bytes) => {
+            if !out.push(&bytes) {
+                return None;
             }
-            return Some(out);
+        }
+        ResponseStreamAction::Terminate(bytes) => {
+            if let Some(bytes) = bytes
+                && !out.push(&bytes)
+            {
+                return None;
+            }
+            return out.finish();
         }
     }
     match normalizer.on_end().await {
         ResponseStreamAction::Forward(bytes) | ResponseStreamAction::Terminate(Some(bytes)) => {
-            out.extend_from_slice(&bytes)
+            if !out.push(&bytes) {
+                return None;
+            }
         }
         ResponseStreamAction::Terminate(None) => {}
     }
-    Some(out)
+    out.finish()
 }
 
 fn map_stop_reason(reason: Option<&str>) -> &'static str {

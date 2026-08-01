@@ -1191,6 +1191,13 @@ impl Plugin for PriorityOverridePlugin {
             .transform_response_body_with_context(ctx, body, content_type, response_headers)
             .await
     }
+    /// Must forward: this wrapper runs the inner plugin's producer hooks, so
+    /// falling back to the trait default would resolve the declaration against
+    /// the WRAPPER, not the plugin, and either deny a real producer its window
+    /// or reserve one for a plugin that cannot produce (GHSA-pwcm-6rh8-f2gh).
+    fn response_body_production(&self) -> crate::plugins::ResponseBodyProduction {
+        self.inner.response_body_production()
+    }
     fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
         self.inner.requires_replay_response_body_transform(ctx)
     }

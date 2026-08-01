@@ -8,8 +8,50 @@
 
 use super::{
     ALL_PROTOCOLS, GRPC_ONLY_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, HTTP_GRPC_PROTOCOLS,
-    HTTP_ONLY_PROTOCOLS, ProxyProtocol, TCP_ONLY_PROTOCOLS, UDP_ONLY_PROTOCOLS, WS_ONLY_PROTOCOLS,
+    HTTP_ONLY_PROTOCOLS, ProxyProtocol, ResponseBodyProduction, TCP_ONLY_PROTOCOLS,
+    UDP_ONLY_PROTOCOLS, WS_ONLY_PROTOCOLS,
 };
+
+/// Built-ins whose response normalize/transform hooks can return a replacement
+/// body (GHSA-pwcm-6rh8-f2gh).
+///
+/// Membership is a security declaration in both directions. A member reserves a
+/// retained-response window before it runs and must build its output through a
+/// ceiling-bounded materialisation; a non-member reserves nothing, so a plugin
+/// that produces without being listed here has its output refused rather than
+/// installed. Keep this in sync with the actual `Some`-returning implementations
+/// — `tests/unit/plugins/plugin_doc_parity_tests.rs` asserts the set.
+pub const BUILTIN_RESPONSE_BODY_PRODUCERS: &[&str] = &[
+    "ai_response_guard",
+    "ai_stream_router",
+    "ai_tool_governor",
+    "compression",
+    "grpc_web",
+    "mcp_gateway",
+    "response_transformer",
+    "sse",
+];
+
+/// The declared response-body production contract for a plugin name.
+///
+/// Unknown names — every out-of-tree plugin — resolve to
+/// [`ResponseBodyProduction::Undeclared`], which is the fail-closed answer: the
+/// gateway reserves a window for them and refuses to invoke them rather than
+/// letting an undeclared producer allocate a replacement without a bound. A
+/// custom plugin cannot take a built-in's name: `create_plugin_with_http_client`
+/// resolves built-in names before it ever reaches the custom registry.
+pub fn declared_response_body_production(name: &str) -> ResponseBodyProduction {
+    if BUILTIN_RESPONSE_BODY_PRODUCERS.contains(&name) {
+        ResponseBodyProduction::BoundedByRetainedCeiling
+    } else if BUILTIN_PLUGIN_PARITY_META
+        .iter()
+        .any(|meta| meta.name == name)
+    {
+        ResponseBodyProduction::Never
+    } else {
+        ResponseBodyProduction::Undeclared
+    }
+}
 
 /// How a built-in plugin appears in public inventories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

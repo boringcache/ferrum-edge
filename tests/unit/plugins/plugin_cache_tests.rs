@@ -149,6 +149,11 @@ struct StalledDeadlineResponseTransformer;
 
 #[async_trait::async_trait]
 impl Plugin for StalledDeadlineResponseTransformer {
+    /// Test producer: declares the bounded-construction contract so the
+    /// buffered phases reserve a window for it (GHSA-pwcm-6rh8-f2gh).
+    fn response_body_production(&self) -> ferrum_edge::plugins::ResponseBodyProduction {
+        ferrum_edge::plugins::ResponseBodyProduction::BoundedByRetainedCeiling
+    }
     fn name(&self) -> &str {
         "stalled_deadline_response_transformer"
     }

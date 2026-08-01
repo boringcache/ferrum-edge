@@ -1012,12 +1012,22 @@ impl GrpcWebPlugin {
         response_headers.insert("access-control-expose-headers".to_string(), combined);
     }
 
+    /// Frame a gRPC-Web response body inside a `ceiling`-bounded sink.
+    ///
+    /// The output is the input plus one trailer frame (and, in text mode, the
+    /// base64 armouring of both), so it has a finite bound derived from bytes
+    /// that are already charged — but the bound is ENFORCED rather than assumed:
+    /// every append goes through the sink, which refuses the write that would
+    /// carry the buffer past the retained ceiling instead of allocating it
+    /// (GHSA-pwcm-6rh8-f2gh). A refusal returns `None`, which the caller treats
+    /// as "no translation" and fails closed on.
     fn transform_grpc_web_response_body(
         &self,
         body: &[u8],
         _content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
         provenance: TrailerFrameProvenance,
+        ceiling: usize,
     ) -> Option<Vec<u8>> {
         // Only transform if response content-type is gRPC-Web (set by after_proxy)
         let ct = response_headers.get("content-type")?;
@@ -1030,10 +1040,19 @@ impl GrpcWebPlugin {
         // Build the gRPC-Web response:
         // 1. Keep existing data frames from the body
         // 2. Append a trailer frame with gRPC status metadata
-        let mut output = Vec::with_capacity(body.len() + 64);
+        //
+        // Text mode base64-expands by 4/3, so the binary buffer is built under
+        // the base64 PRE-image of the ceiling. That keeps the final armoured
+        // output inside the ceiling instead of discovering the overrun only
+        // after the expansion has already been allocated.
+        let binary_ceiling = if is_text { ceiling / 4 * 3 } else { ceiling };
+        use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+        let mut output = BoundedResponseBodySink::with_ceiling(binary_ceiling);
 
         // Copy the original response body (data frames)
-        output.extend_from_slice(body);
+        if !output.push(body) {
+            return None;
+        }
 
         // Build and append trailer frame from response headers. When the
         // backend omitted a valid grpc-status, synthesize from the stashed
@@ -1046,7 +1065,10 @@ impl GrpcWebPlugin {
             provenance.shadowed_trailers,
             provenance.policy_state,
         );
-        output.extend(trailer_frame);
+        if !output.push(&trailer_frame) {
+            return None;
+        }
+        let output = output.finish()?;
 
         // For text mode, base64-encode the entire output
         if is_text {
@@ -1058,7 +1080,7 @@ impl GrpcWebPlugin {
                 encoded_len = encoded.len(),
                 "Base64-encoded gRPC-Web text response body"
             );
-            Some(encoded.into_bytes())
+            crate::proxy::response_buffer_budget::bounded_vec_from(encoded.as_bytes(), ceiling)
         } else {
             debug!(
                 plugin = "grpc_web",
@@ -3320,6 +3342,7 @@ impl Plugin for GrpcWebPlugin {
                 shadowed_trailers: None,
                 policy_state: None,
             },
+            crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
         )
     }
 
@@ -3372,6 +3395,7 @@ impl Plugin for GrpcWebPlugin {
                 shadowed_trailers: shadowed_trailers.as_ref(),
                 policy_state: ctx.buffered_initial_response_header_policy(),
             },
+            ctx.retained_response_body_ceiling(),
         )?;
         ctx.metadata.insert(
             META_GRPC_WEB_RESPONSE_TRANSLATED.to_string(),

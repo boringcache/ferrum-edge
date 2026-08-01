@@ -60,6 +60,26 @@
 //! structure keeps its charge, and a request context that drops (or is cloned)
 //! neither releases nor duplicates it.
 //!
+//! The window is a *precondition*, not a best-effort convenience. A chain can
+//! contain several producers, and after the first replacement the window is
+//! short by whatever that replacement carried away. Refilling it while the body
+//! it replaced is still alive would double-count, so the window is refilled only
+//! AFTER the caller has installed the replacement (which drops the previous
+//! body's charge), and [`ResponseTransformWindow::ensure_covering_window`] must
+//! succeed BEFORE the next producer is invoked. When it cannot, the caller
+//! installs the neutral fail-closed capacity terminal instead of running the
+//! producer — a producer is never invoked under a partial window.
+//!
+//! A reserved window bounds what the gateway will RETAIN; on its own it does not
+//! bound what a producer may allocate before handing bytes over. So the producer
+//! boundary is bounded on the construction side too: a replacement body is built
+//! through [`BoundedResponseBodySink`], which refuses the write that would push
+//! the buffer past the per-response retained ceiling instead of allocating it and
+//! being rejected afterwards. Built-ins declare that contract
+//! ([`crate::plugins::ResponseBodyProduction`]); a plugin the gateway cannot
+//! prove declares it is treated as potentially unbounded and fails closed rather
+//! than being invoked.
+//!
 //! The same rule covers a body a plugin *copies out* into storage that outlives
 //! the request — `response_caching`'s entry copy is a distinct allocation from
 //! the collected body, so it acquires its own charge through
@@ -68,13 +88,16 @@
 //! (a cache miss, exactly like the `max_entry_size_bytes` refusal beside it)
 //! rather than retaining an uncharged entry.
 //!
-//! An eagerly read body that reqwest already owns as [`Bytes`] goes through
-//! [`charged_shared_bytes`]. A `Bytes` is a *view*: its length is the payload,
-//! but the allocation behind it belongs to its producer and can be far larger,
-//! so that function does not assume — it proves sole ownership with
-//! [`Bytes::try_into_mut`] and charges the real capacity with no copy, or, when
-//! the backing is shared or opaque, copies once into an allocation this module
-//! sizes and measures and drops the opaque view.
+//! There is deliberately no "attach a charge to a buffer somebody else already
+//! allocated" entry point for a request path. Awaiting an opaque read (reqwest's
+//! `Response::bytes()`) materialises an allocation of unknown capacity *before*
+//! anything can measure it, so many tasks could each be holding such a buffer
+//! while only one declared `Content-Length` had been charged — a declared length
+//! is a backend claim, not an allocation-capacity proof, and a top-up taken
+//! after the await is a charge taken after the allocation. The eager
+//! small-response paths therefore use the same [`ChargedBodyCollector`] the
+//! buffered paths use, driven over `Response::bytes_stream()`, so every byte of
+//! resident capacity on those paths is charged before it is asked for.
 //!
 //! # What is charged, and when
 //!
@@ -159,11 +182,28 @@
 //!
 //! It bounds every allocation described above: the collected wire body, its
 //! preallocation, the decode's output and codec working set, the cache-entry
-//! copy, the eagerly read body (measured, or copied so it can be), and a
-//! plugin-produced replacement, which cannot be produced at all until its window
-//! is reserved. It does not attempt to bound allocations that are not retained
-//! response representations — header maps, TLS records, connection read buffers
-//! — which have their own bounds elsewhere in the gateway.
+//! copy, the eagerly collected body, and a plugin-produced replacement, which
+//! cannot be produced at all until its window is reserved. It does not attempt
+//! to bound allocations that are not retained response representations — header
+//! maps, TLS records, connection read buffers — which have their own bounds
+//! elsewhere in the gateway.
+//!
+//! ## Peak accounting, stated exactly
+//!
+//! The aggregate cap bounds a PEAK, and the peak of a rewriting response is not
+//! one ceiling. While a producer runs, three things can be charged at once:
+//!
+//! * the body it is reading from, charged at up to one ceiling;
+//! * the covering window reserved for its output, one ceiling;
+//! * for a stacked decode, the decode's own transient input+output peak, which
+//!   [`ResponseBufferReservation::narrow_to_covered`] hands back at publication.
+//!
+//! So the worst case for a maximum-size response being rewritten is **two**
+//! ceilings, not one, and the concurrent-rewrite arithmetic an operator should
+//! use is `FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES / (2 × ceiling)` — not
+//! `total / ceiling`. Responses that are merely buffered (no plugin that can
+//! replace the body) cost one ceiling and no window at all, because a chain with
+//! no declared producer never opens one.
 //!
 //! # Admission
 //!
@@ -335,7 +375,7 @@ pub(crate) fn buffered_response_body_ceiling(effective_limit: usize) -> usize {
 
 /// A growing claim on the process-wide buffered-response budget.
 ///
-/// Construct one before collecting a response body, call [`Self::reserve`] with
+/// Construct one before collecting a response body, call [`Self::reserve_in`] with
 /// the running retained length (and with the preallocated capacity *before*
 /// allocating it), then hand it to [`charged_bytes`] together with the bytes it
 /// paid for so the charge outlives the collector. Dropping it without doing so
@@ -354,17 +394,13 @@ impl ResponseBufferReservation {
         Self::default()
     }
 
-    /// Charge `retained_bytes` against the process-wide budget, acquiring more
-    /// blocks when the collector has grown past what is already reserved.
+    /// Charge `retained_bytes`, acquiring more blocks when the collector has
+    /// grown past what is already reserved.
     ///
     /// Returns `false` when the aggregate budget cannot cover the growth; the
     /// caller must then abandon collection and surface
     /// [`RESPONSE_BUFFER_OVERLOAD_STATUS`]. Already-held blocks stay held until
     /// this value drops.
-    pub(crate) fn reserve(&mut self, retained_bytes: usize) -> bool {
-        self.reserve_against(budget(), retained_bytes)
-    }
-
     fn reserve_against(&mut self, budget: &Budget, retained_bytes: usize) -> bool {
         // Nothing retained, nothing charged. A zero-length body occupies no
         // memory, so rounding it up to a block would both over-charge the
@@ -393,7 +429,7 @@ impl ResponseBufferReservation {
 
     /// Charge `retained_bytes` against an explicitly chosen budget.
     ///
-    /// Same reservation path as [`Self::reserve`]; only the semaphore differs.
+    /// The reservation path every charge takes; only the semaphore differs.
     /// Production passes [`BudgetRef::global`].
     pub(crate) fn reserve_in(&mut self, budget: BudgetRef<'_>, retained_bytes: usize) -> bool {
         self.reserve_against(budget.resolve(), retained_bytes)
@@ -505,22 +541,6 @@ pub(crate) fn prospective_retained_len(current: usize, added: usize) -> usize {
     current.saturating_add(added)
 }
 
-/// Reserve `bytes` of retained capacity up front, before the allocation exists.
-///
-/// `None` means the aggregate budget refused; the caller must not retain the
-/// bytes. The returned reservation can be grown with
-/// [`ResponseBufferReservation::reserve`] and must be handed to
-/// [`charged_bytes`] / [`charged_shared_bytes`] so the charge outlives the
-/// collector.
-pub(crate) fn try_reserve_retained(bytes: usize) -> Option<ResponseBufferReservation> {
-    let mut reservation = ResponseBufferReservation::new();
-    if reservation.reserve_against(budget(), bytes) {
-        Some(reservation)
-    } else {
-        None
-    }
-}
-
 /// One retained buffered-response allocation and the budget permit that paid
 /// for it, owned together so neither can outlive the other.
 struct ChargedBuffer {
@@ -577,102 +597,6 @@ pub(crate) fn charged_bytes(
         data,
         _permit: reservation.into_permit(),
     }))
-}
-
-/// One retained buffered-response allocation that is already published as
-/// [`Bytes`] (reqwest's eager `bytes()` read), plus the permit that paid for it.
-///
-/// Same contract as [`ChargedBuffer`], expressed over a `Bytes` handle instead
-/// of a `Vec`: no copy is made, and the permit is returned when the last clone
-/// of the wrapper drops.
-struct ChargedShared {
-    data: Bytes,
-    /// Released on drop. `None` only for the degenerate empty case.
-    _permit: Option<OwnedSemaphorePermit>,
-}
-
-impl AsRef<[u8]> for ChargedShared {
-    #[inline]
-    fn as_ref(&self) -> &[u8] {
-        &self.data
-    }
-}
-
-/// Attach `reservation` to bytes the transport already owns as a [`Bytes`]
-/// handle, keeping the charge exact without copying when that is provable.
-///
-/// Used by the eager small-response paths, where reqwest hands back an owned
-/// `Bytes` rather than a `Vec`. A `Bytes` is a VIEW: `len()` is the payload, but
-/// the allocation behind it belongs to whoever produced it and may be much
-/// larger — a hyper connection read buffer that this handle would pin for the
-/// whole life of the response. Charging `len()` would therefore leave the
-/// difference resident and unbudgeted, which is precisely the accounting hole
-/// the aggregate cap exists to close.
-///
-/// So the capacity is made observable instead of assumed:
-///
-/// * [`Bytes::try_into_mut`] succeeds only when this handle is the SOLE owner of
-///   a promotable allocation. That proves both that nothing else is sharing the
-///   buffer and what its real capacity is, so the charge is topped up to that
-///   capacity and the bytes are published with no copy at all;
-/// * otherwise the backing allocation is shared with (or opaque to) its
-///   producer, and no finite upper bound on it can be derived from this handle.
-///   The bytes are copied ONCE into an allocation this module sizes and measures
-///   itself, charged for that allocation's capacity, and the opaque view is
-///   dropped — which both makes the charge exact and stops the response from
-///   pinning a producer buffer of unknown size. The copy is bounded by the
-///   caller's eager cutoff, which is what makes it affordable.
-///
-/// `None` means the budget refused the exact charge; the caller must fail closed
-/// with [`RESPONSE_BUFFER_OVERLOAD_STATUS`] rather than retain the handle.
-#[must_use]
-pub(crate) fn charged_shared_bytes(
-    data: Bytes,
-    reservation: ResponseBufferReservation,
-) -> Option<Bytes> {
-    charged_shared_bytes_against(budget(), data, reservation)
-}
-
-fn charged_shared_bytes_against(
-    budget: &Budget,
-    data: Bytes,
-    mut reservation: ResponseBufferReservation,
-) -> Option<Bytes> {
-    if data.is_empty() {
-        return Some(Bytes::new());
-    }
-    match data.try_into_mut() {
-        Ok(unique) => {
-            // Sole owner: the capacity is knowable and nothing else can be
-            // holding the buffer, so charge exactly it and keep the zero-copy
-            // publication. `freeze` is `O(1)` and keeps the same allocation.
-            if !reservation.reserve_against(budget, unique.capacity()) {
-                return None;
-            }
-            Some(Bytes::from_owner(ChargedShared {
-                data: unique.freeze(),
-                _permit: reservation.into_permit(),
-            }))
-        }
-        Err(shared) => {
-            // Shared or non-promotable backing. Reserve the copy's capacity
-            // BEFORE allocating it (the reservation already covers the declared
-            // length, so this is normally a no-op), take the copy, then drop the
-            // opaque view so only the measured allocation stays resident.
-            let len = shared.len();
-            let mut copy: Vec<u8> = Vec::new();
-            if !reservation.reserve_against(budget, len) {
-                return None;
-            }
-            copy.reserve_exact(len);
-            if !reservation.reserve_against(budget, copy.capacity()) {
-                return None;
-            }
-            copy.extend_from_slice(&shared);
-            drop(shared);
-            charged_bytes(copy, reservation)
-        }
-    }
 }
 
 /// Charge a COPY that will outlive the request which produced it — the
@@ -911,14 +835,24 @@ impl<'a> ChargedBodyCollector<'a> {
 /// acquisition). An output larger than the window is refused, which is the same
 /// answer the collector gives a backend body above the ceiling.
 ///
-/// The arithmetic is deliberately visible to operators: a response-body
-/// rewriting plugin holds one ceiling-sized window for the length of its phase,
-/// so the gateway admits about
-/// `FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES / FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`
-/// concurrent rewrites and refuses the rest with the neutral capacity terminal.
-/// Lowering the per-response ceiling or raising the aggregate budget widens
-/// that; there is no configuration in which the window is skipped, because
-/// skipping it is the resource gap.
+/// The arithmetic is deliberately visible to operators: while a producer runs,
+/// the body it is reading from is still charged AND a full ceiling-sized window
+/// is reserved, so a maximum-size response being rewritten peaks at TWO
+/// ceilings. The gateway therefore admits about
+/// `FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES / (2 × FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES)`
+/// concurrent maximum-size rewrites and refuses the rest with the neutral
+/// capacity terminal. Lowering the per-response ceiling or raising the aggregate
+/// budget widens that; there is no configuration in which the window is skipped
+/// for a chain that can produce, because skipping it is the resource gap. A
+/// chain with no declared producer opens no window at all and costs one ceiling.
+///
+/// The window is a PRECONDITION of every producer invocation, not a running
+/// balance. After a replacement is charged out of it the window is short, and it
+/// is refilled only once the caller has installed the replacement (dropping the
+/// previous body's charge). [`Self::ensure_covering_window`] is what the caller
+/// must succeed on before invoking the next producer; when it fails the caller
+/// installs the neutral capacity terminal instead of calling the producer, so no
+/// producer ever allocates under a partial window.
 pub(crate) struct ResponseTransformWindow<'a> {
     budget: BudgetRef<'a>,
     window_bytes: usize,
@@ -954,27 +888,51 @@ impl<'a> ResponseTransformWindow<'a> {
         })
     }
 
+    /// A bounded sink for the NEXT producer's output, sized to this window.
+    ///
+    /// Handing the producer a sink rather than letting it return an arbitrary
+    /// `Vec` is what makes an over-ceiling output impossible to *materialise*
+    /// rather than merely impossible to install: the sink refuses the write that
+    /// would carry the buffer past the ceiling, so the larger allocation is
+    /// never requested from the allocator in the first place.
+    pub(crate) fn sink(&self) -> BoundedResponseBodySink {
+        BoundedResponseBodySink::with_ceiling(self.window_bytes)
+    }
+
+    /// Re-establish a FULL covering window, and report whether it is now full.
+    ///
+    /// Callers must succeed on this immediately before every producer
+    /// invocation, and must only call it once the previously replaced body has
+    /// actually been installed/dropped — refilling while the old body is alive
+    /// would charge the same bytes twice and make the aggregate cap untrue in
+    /// the other direction. A `false` means the budget cannot currently cover a
+    /// full window, and the caller must install the neutral capacity terminal
+    /// instead of running the producer.
+    #[must_use]
+    pub(crate) fn ensure_covering_window(&mut self) -> bool {
+        let budget = self.budget;
+        self.reservation.reserve_in(budget, self.window_bytes)
+    }
+
     /// Transfer the blocks covering `data` out of the window and publish it.
     ///
     /// `None` when the finished allocation does not fit the window — the
     /// producer overran the per-response retained ceiling — or when its capacity
     /// is not covered at publication. Either way the caller must fail closed;
     /// `data` is dropped here rather than retained uncharged.
+    ///
+    /// This deliberately does NOT refill the window. The body being replaced is
+    /// still alive at this point (the caller installs the return value over it),
+    /// so a refill here would hold the old body's blocks and a fresh full window
+    /// at the same time. [`Self::ensure_covering_window`] is the refill, and it
+    /// runs after the install and before the next producer.
     #[must_use]
     pub(crate) fn charge(&mut self, data: Vec<u8>) -> Option<Bytes> {
         if data.is_empty() {
             return Some(Bytes::new());
         }
         let carved = self.reservation.split_charge(data.capacity())?;
-        let published = charged_bytes(data, carved)?;
-        // Reopen the window for the next producer in the chain. The body this
-        // one replaced has just dropped its own charge, so this is normally the
-        // same blocks coming straight back. A refusal is not fatal: the window
-        // simply stays narrower and a later oversized output is refused by the
-        // split above instead of being admitted uncharged.
-        let budget = self.budget;
-        let _ = self.reservation.reserve_in(budget, self.window_bytes);
-        Some(published)
+        charged_bytes(data, carved)
     }
 
     /// Bytes still available in the window. Diagnostics and external tests only.
@@ -982,6 +940,141 @@ impl<'a> ResponseTransformWindow<'a> {
     pub(crate) fn available_bytes(&self) -> usize {
         self.reservation.reserved_bytes()
     }
+
+    /// The full window size, i.e. this response's retained ceiling.
+    #[allow(dead_code)]
+    pub(crate) fn window_bytes(&self) -> usize {
+        self.window_bytes
+    }
+}
+
+/// A replacement-body buffer that cannot grow past a per-response ceiling.
+///
+/// Every retained allocation on the collector side is charged before it exists.
+/// A plugin-produced replacement cannot be charged that way — the plugin, not
+/// this module, decides how many bytes to write — so the bound is enforced on
+/// the construction side instead: the sink refuses the write that would take the
+/// buffer past `ceiling` and never asks the allocator for that capacity. A
+/// producer that overruns therefore fails DURING construction, with only the
+/// bytes it had already written resident, instead of materialising an oversized
+/// `Vec` that is rejected after the fact.
+///
+/// Growth reuses the collector's [`growth_target`], clamped to the ceiling, so
+/// the buffer stays amortised `O(n)` without doubling past the bound. The only
+/// residual slack is the allocator's right to return more than `reserve_exact`
+/// asked for, which is the same single-statement window documented for the
+/// collectors — and the window's [`ResponseTransformWindow::charge`] still
+/// refuses to install an allocation whose real capacity its blocks do not cover.
+pub(crate) struct BoundedResponseBodySink {
+    ceiling: usize,
+    data: Vec<u8>,
+    overflowed: bool,
+}
+
+impl BoundedResponseBodySink {
+    pub(crate) fn with_ceiling(ceiling: usize) -> Self {
+        Self {
+            ceiling,
+            data: Vec::new(),
+            overflowed: false,
+        }
+    }
+
+    pub(crate) fn ceiling(&self) -> usize {
+        self.ceiling
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Whether a write has already been refused. Once set, the buffer is
+    /// released and every later write is refused too, so a producer that ignores
+    /// a `false` cannot accumulate anything further.
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    /// Append `bytes`, or refuse. `false` means the ceiling would have been
+    /// exceeded and nothing was appended or allocated.
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> bool {
+        if self.overflowed {
+            return false;
+        }
+        if bytes.is_empty() {
+            return true;
+        }
+        let prospective = prospective_retained_len(self.data.len(), bytes.len());
+        if prospective > self.ceiling {
+            // Release what was written: the output is refused, so retaining a
+            // partial buffer would be resident bytes nobody will ever use.
+            self.overflowed = true;
+            self.data = Vec::new();
+            return false;
+        }
+        if prospective > self.data.capacity() {
+            let target = growth_target(self.data.capacity(), prospective, self.ceiling);
+            self.data.reserve_exact(target - self.data.len());
+        }
+        self.data.extend_from_slice(bytes);
+        true
+    }
+
+    /// The finished buffer, or `None` when any write was refused.
+    #[must_use]
+    pub(crate) fn finish(self) -> Option<Vec<u8>> {
+        if self.overflowed {
+            None
+        } else {
+            Some(self.data)
+        }
+    }
+}
+
+impl std::io::Write for BoundedResponseBodySink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.push(buf) {
+            Ok(buf.len())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "response body replacement exceeds the retained-response ceiling",
+            ))
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serialize `value` as JSON into a ceiling-bounded buffer.
+///
+/// The single materialisation helper for the JSON-producing response
+/// transforms. `serde_json::to_vec` would allocate the whole document first and
+/// only then be measured; writing THROUGH the sink stops serialization at the
+/// ceiling, so an amplifying rewrite is refused while it is being built.
+///
+/// `None` means the document did not fit (or did not serialize) and the caller
+/// must leave the response unchanged / fail closed per its own contract.
+#[must_use]
+pub(crate) fn bounded_json_vec<T>(value: &T, ceiling: usize) -> Option<Vec<u8>>
+where
+    T: serde::Serialize + ?Sized,
+{
+    let mut sink = BoundedResponseBodySink::with_ceiling(ceiling);
+    serde_json::to_writer(&mut sink, value).ok()?;
+    sink.finish()
+}
+
+/// Copy `bytes` into a ceiling-bounded buffer, or refuse.
+#[must_use]
+pub(crate) fn bounded_vec_from(bytes: &[u8], ceiling: usize) -> Option<Vec<u8>> {
+    let mut sink = BoundedResponseBodySink::with_ceiling(ceiling);
+    if !sink.push(bytes) {
+        return None;
+    }
+    sink.finish()
 }
 
 /// An isolated budget with the same construction, clamping, reservation, and
@@ -1068,17 +1161,6 @@ impl IsolatedBudget {
     /// `response_caching` entry store does.
     pub(crate) fn charge_retained_copy(&self, data: &[u8]) -> Option<Bytes> {
         charge_retained_copy_against(&self.0, data)
-    }
-
-    /// Attach a reservation to an already-owned `Bytes`, exactly as the eager
-    /// small-response paths do — including the measure-or-copy rule that keeps
-    /// the charge exact when the handle's backing capacity is not observable.
-    pub(crate) fn attach_shared(
-        &self,
-        data: Bytes,
-        reservation: ResponseBufferReservation,
-    ) -> Option<Bytes> {
-        charged_shared_bytes_against(&self.0, data, reservation)
     }
 }
 

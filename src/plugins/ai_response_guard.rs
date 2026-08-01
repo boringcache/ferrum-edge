@@ -897,7 +897,10 @@ impl AiResponseGuard {
         // The residual pass masks only preserved top-level structural scalar
         // spans, so duplicate keys and formatting remain visible and matches in
         // cross-event, key, numeric, or non-data content still fail closed.
-        let redacted = self.redact_sse_body(body);
+        let redacted = self.redact_sse_body(
+            body,
+            crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
+        );
         self.sse_body_has_residual(redacted.as_deref().unwrap_or(body))
     }
 
@@ -1491,7 +1494,7 @@ impl AiResponseGuard {
     /// is reserialized compactly by `serde_json::to_string`, which may alter
     /// whitespace within a frame — clients consuming SSE byte-for-byte should
     /// not depend on inner-frame formatting.
-    fn redact_sse_body(&self, body: &[u8]) -> Option<Vec<u8>> {
+    fn redact_sse_body(&self, body: &[u8], ceiling: usize) -> Option<Vec<u8>> {
         let body_str = std::str::from_utf8(body).ok()?;
 
         // Fast-skip the common "redact mode but no PII in the stream" case.
@@ -1517,7 +1520,7 @@ impl AiResponseGuard {
         let (output, modified) = rewrite_sse_events(body_str, |lines| self.redact_sse_event(lines));
 
         if modified {
-            Some(output.into_bytes())
+            crate::proxy::response_buffer_budget::bounded_vec_from(output.as_bytes(), ceiling)
         } else {
             None
         }
@@ -1677,7 +1680,12 @@ impl AiResponseGuard {
             // boundaries are matchable but not rewritable in any one scalar.
             let key_match = !self.detect_matches(&scan.map_keys).is_empty();
             let cross_boundary_only = self.grpc_match_only_across_boundaries(&scan);
-            let rewritten = self.redacted_grpc_body(ctx, response_headers, body);
+            let rewritten = self.redacted_grpc_body(
+                ctx,
+                response_headers,
+                body,
+                ctx.retained_response_body_ceiling(),
+            );
             if key_match || cross_boundary_only || rewritten.is_none() {
                 debug!(
                     "ai_response_guard: gRPC redaction leaves residual content \
@@ -1741,6 +1749,7 @@ impl AiResponseGuard {
         ctx: &RequestContext,
         response_headers: &HashMap<String, String>,
         body: &[u8],
+        ceiling: usize,
     ) -> Option<Vec<u8>> {
         let grpc = self.grpc.as_ref()?;
         let method = grpc.method(&Self::grpc_method_path(ctx))?;
@@ -1758,7 +1767,11 @@ impl AiResponseGuard {
         )
         .ok()?;
 
-        let mut rewritten = Vec::with_capacity(body.len());
+        // Frames accumulate into a ceiling-bounded sink, so a redaction that
+        // expands the wire representation past what the transform phase reserved
+        // is refused WHILE it is being built (GHSA-pwcm-6rh8-f2gh).
+        use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+        let mut rewritten = BoundedResponseBodySink::with_ceiling(ceiling);
         let mut changed = false;
         for frame in &frames {
             let payload = frame.payload.as_ref();
@@ -1774,11 +1787,14 @@ impl AiResponseGuard {
             if encoded.len() > max_bytes {
                 return None;
             }
-            rewritten.extend_from_slice(&encode_grpc_frame(&encoded, frame.compressed)?);
+            if !rewritten.push(&encode_grpc_frame(&encoded, frame.compressed)?) {
+                return None;
+            }
         }
         if !changed {
             return None;
         }
+        let rewritten = rewritten.finish()?;
 
         // Re-verify against the exact bytes the client would receive, using the
         // same selected-field surface and aggregate matching as inspection.
@@ -3264,8 +3280,14 @@ impl Plugin for AiResponseGuard {
     ) -> Option<Vec<u8>> {
         // Protobuf redaction needs the request's gRPC method to select the
         // message descriptor, which only the context carries.
+        // Every replacement this plugin produces is built inside a
+        // materialisation bounded by THIS response's retained ceiling — the same
+        // size as the window the transform phase reserved before invoking it —
+        // so an amplifying redaction is refused during construction rather than
+        // after a larger buffer is resident (GHSA-pwcm-6rh8-f2gh).
+        let ceiling = ctx.retained_response_body_ceiling();
         if self.grpc_transform_applies(ctx, content_type) {
-            return self.redacted_grpc_body(ctx, response_headers, body);
+            return self.redacted_grpc_body(ctx, response_headers, body, ceiling);
         }
         // A gRPC or gRPC-Web response body is length-prefixed protobuf framing
         // — or the base64 armoring of it — whatever the response `Content-Type`
@@ -3285,15 +3307,56 @@ impl Plugin for AiResponseGuard {
         if ctx.is_native_grpc_request() || response_is_grpc_framed(ctx, content_type, body) {
             return None;
         }
-        self.transform_response_body(body, content_type, response_headers)
-            .await
+        self.redacted_response_body(body, content_type, ceiling)
     }
 
+    /// Context-free entry point. Without a request context there is no
+    /// route-effective ceiling, so it falls back to the process fail-closed
+    /// retained ceiling — still finite, just looser than the per-response one
+    /// production uses through the hook above.
     async fn transform_response_body(
         &self,
         body: &[u8],
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        self.redacted_response_body(
+            body,
+            content_type,
+            crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
+        )
+    }
+
+    fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
+        ctx.ai_response_guard_replay_redactions
+            .contains(&self.instance_id)
+    }
+
+    fn on_response_body_transformed(
+        &self,
+        _ctx: &mut RequestContext,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        // These values describe the upstream representation and become stale
+        // whenever redaction changes the client-visible bytes. The proxy calls
+        // this hook only after a transform returns `Some`, so clean bodies keep
+        // their validators.
+        response_headers.retain(|key, _| {
+            !RESPONSE_VALIDATORS
+                .iter()
+                .any(|header| key.eq_ignore_ascii_case(header))
+        });
+    }
+}
+
+impl AiResponseGuard {
+    /// The single ceiling-bounded materialisation point for this plugin's
+    /// JSON / SSE / text replacement bodies.
+    fn redacted_response_body(
+        &self,
+        body: &[u8],
+        content_type: Option<&str>,
+        ceiling: usize,
     ) -> Option<Vec<u8>> {
         if !self.needs_body_transform {
             return None;
@@ -3315,7 +3378,7 @@ impl Plugin for AiResponseGuard {
 
         if let Some(ct) = content_type {
             if is_text_event_stream_media_type(ct) {
-                let redacted = self.redact_sse_body(body)?;
+                let redacted = self.redact_sse_body(body, ceiling)?;
                 return (!self.sse_body_has_residual(&redacted)).then_some(redacted);
             }
             if !is_json_content_type(ct) {
@@ -3324,7 +3387,13 @@ impl Plugin for AiResponseGuard {
                 }
                 let text = std::str::from_utf8(body).ok()?;
                 let redacted = self.redact_text(text);
-                return (redacted != text).then(|| redacted.into_bytes());
+                if redacted == text {
+                    return None;
+                }
+                return crate::proxy::response_buffer_budget::bounded_vec_from(
+                    redacted.as_bytes(),
+                    ceiling,
+                );
             }
         }
 
@@ -3333,7 +3402,13 @@ impl Plugin for AiResponseGuard {
             Err(_) if self.scan_mode == ScanMode::All => {
                 let text = std::str::from_utf8(body).ok()?;
                 let redacted = self.redact_text(text);
-                return (redacted != text).then(|| redacted.into_bytes());
+                if redacted == text {
+                    return None;
+                }
+                return crate::proxy::response_buffer_budget::bounded_vec_from(
+                    redacted.as_bytes(),
+                    ceiling,
+                );
             }
             Err(_) => return None,
         };
@@ -3365,28 +3440,7 @@ impl Plugin for AiResponseGuard {
             self.redact_response_json(&mut json);
         }
 
-        serde_json::to_vec(&json).ok()
-    }
-
-    fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
-        ctx.ai_response_guard_replay_redactions
-            .contains(&self.instance_id)
-    }
-
-    fn on_response_body_transformed(
-        &self,
-        _ctx: &mut RequestContext,
-        response_headers: &mut HashMap<String, String>,
-    ) {
-        // These values describe the upstream representation and become stale
-        // whenever redaction changes the client-visible bytes. The proxy calls
-        // this hook only after a transform returns `Some`, so clean bodies keep
-        // their validators.
-        response_headers.retain(|key, _| {
-            !RESPONSE_VALIDATORS
-                .iter()
-                .any(|header| key.eq_ignore_ascii_case(header))
-        });
+        crate::proxy::response_buffer_budget::bounded_json_vec(&json, ceiling)
     }
 }
 

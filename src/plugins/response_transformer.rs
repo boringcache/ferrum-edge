@@ -208,6 +208,37 @@ pub struct ResponseTransformer {
 const STATIC_POLICY_DIGEST_DOMAIN: &str = "ferrum.plugin.response_transformer.static.v1";
 
 impl ResponseTransformer {
+    /// Apply the configured JSON body rules, serializing the result through a
+    /// sink bounded by `ceiling`.
+    ///
+    /// This is the single materialisation point for this plugin's replacement
+    /// body. Both `Plugin` entry points reach it, so the ceiling-bounded
+    /// construction cannot be bypassed by calling the context-free hook
+    /// (GHSA-pwcm-6rh8-f2gh).
+    fn apply_response_body_rules(
+        &self,
+        body: &[u8],
+        content_type: Option<&str>,
+        ceiling: usize,
+    ) -> Option<Vec<u8>> {
+        if !self.rules_enabled {
+            return None;
+        }
+        // Framed gRPC is declined explicitly rather than left to fail inside
+        // `apply_body_rules`. Both routes return `None`, but only the explicit
+        // decline makes the media-type condition here symmetric with
+        // `enforces_response_body_policy` by construction, so the claim
+        // predicate and the enforcer cannot drift apart on the `+json` gRPC
+        // types that satisfy `is_json_content_type`.
+        if let Some(ct) = content_type
+            && (!body_transform::is_json_content_type(ct)
+                || body_transform::is_framed_grpc_content_type(ct))
+        {
+            return None;
+        }
+        body_transform::apply_body_rules_bounded(body, &self.body_rules, ceiling)
+    }
+
     fn static_rules_may_modify_content_type(&self) -> bool {
         self.header_rules.iter().any(|rule| match rule.operation {
             HeaderOp::Add | HeaderOp::Update | HeaderOp::Remove => rule.key == "content-type",
@@ -1322,36 +1353,33 @@ impl Plugin for ResponseTransformer {
         // document still returns `None` into the gate's fail-closed rejection
         // instead of being forwarded unredacted.
         let content_type = effective_response_media_type(ctx, content_type, body);
-        self.transform_response_body(body, content_type, response_headers)
-            .await
+        // The rewritten document is serialized through a sink bounded by THIS
+        // response's retained ceiling — the same size as the window the phase
+        // reserved before invoking this hook — so an amplifying rule set is
+        // refused while the output is written rather than after a larger buffer
+        // is already resident (GHSA-pwcm-6rh8-f2gh).
+        self.apply_response_body_rules(body, content_type, ctx.retained_response_body_ceiling())
     }
 
     /// The context-free transform. Every buffered call site reaches this through
     /// [`Plugin::transform_response_body_with_context`] above, which applies the
     /// `ctx`-dependent half of the claim symmetry first; this method carries the
     /// half that needs only the media type.
+    ///
+    /// Without a context there is no route-effective ceiling, so this falls back
+    /// to the process fail-closed retained ceiling — still finite, just looser
+    /// than the per-response one production uses.
     async fn transform_response_body(
         &self,
         body: &[u8],
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        if !self.rules_enabled {
-            return None;
-        }
-        // Framed gRPC is declined explicitly rather than left to fail inside
-        // `apply_body_rules`. Both routes return `None`, but only the explicit
-        // decline makes the media-type condition here symmetric with
-        // `enforces_response_body_policy` by construction, so the claim
-        // predicate and the enforcer cannot drift apart on the `+json` gRPC
-        // types that satisfy `is_json_content_type`.
-        if let Some(ct) = content_type
-            && (!body_transform::is_json_content_type(ct)
-                || body_transform::is_framed_grpc_content_type(ct))
-        {
-            return None;
-        }
-        body_transform::apply_body_rules(body, &self.body_rules)
+        self.apply_response_body_rules(
+            body,
+            content_type,
+            crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
+        )
     }
 
     fn on_response_body_transformed(

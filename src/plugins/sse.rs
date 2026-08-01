@@ -231,8 +231,14 @@ impl SsePlugin {
         is_text_event_stream_media_type(content_type.trim())
     }
 
-    /// Wrap normalized text into one SSE event, preserving terminal newlines.
-    fn wrap_body_as_sse_event(&self, body: &[u8]) -> Vec<u8> {
+    /// Wrap normalized text into one SSE event, preserving terminal newlines,
+    /// inside a ceiling-bounded sink.
+    ///
+    /// `None` means the framed event would not fit the retained-response ceiling
+    /// this response is being rewritten under; the refusal happens while the
+    /// event is being written, so the oversized buffer is never allocated
+    /// (GHSA-pwcm-6rh8-f2gh).
+    fn wrap_body_as_sse_event(&self, body: &[u8], ceiling: usize) -> Option<Vec<u8>> {
         // Per the WHATWG EventSource algorithm, each `data:` field appends its
         // value plus LF to the data buffer, then dispatch removes exactly one
         // trailing LF. A payload that itself ends in LF therefore requires an
@@ -244,23 +250,28 @@ impl SsePlugin {
         let body_str = String::from_utf8_lossy(body);
         let normalized = body_str.replace("\r\n", "\n").replace('\r', "\n");
         let ends_with_newline = normalized.ends_with('\n');
-        let mut output = Vec::with_capacity(normalized.len() + 64);
+        use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+        let mut output = BoundedResponseBodySink::with_ceiling(ceiling);
 
-        if let Some(retry_field) = &self.retry_field {
-            output.extend_from_slice(retry_field);
+        if let Some(retry_field) = &self.retry_field
+            && !output.push(retry_field)
+        {
+            return None;
         }
 
         for line in normalized.lines() {
-            output.extend_from_slice(b"data: ");
-            output.extend_from_slice(line.as_bytes());
-            output.push(b'\n');
+            if !output.push(b"data: ") || !output.push(line.as_bytes()) || !output.push(b"\n") {
+                return None;
+            }
         }
-        if ends_with_newline {
-            output.extend_from_slice(b"data: \n");
+        if ends_with_newline && !output.push(b"data: \n") {
+            return None;
         }
         // Blank line terminates the event.
-        output.push(b'\n');
-        output
+        if !output.push(b"\n") {
+            return None;
+        }
+        output.finish()
     }
 }
 
@@ -657,7 +668,11 @@ impl super::Plugin for SsePlugin {
             return None;
         }
 
-        let output = self.wrap_body_as_sse_event(body);
+        // Built inside a sink sized to this response's retained ceiling, so an
+        // event that would exceed it is refused during construction rather than
+        // allocated and rejected afterwards (GHSA-pwcm-6rh8-f2gh). A refusal
+        // leaves the original body in place.
+        let output = self.wrap_body_as_sse_event(body, ctx.retained_response_body_ceiling())?;
         debug!(
             plugin = "sse",
             original_bytes = body.len(),

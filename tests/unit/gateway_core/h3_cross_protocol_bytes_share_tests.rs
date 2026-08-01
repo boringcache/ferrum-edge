@@ -228,40 +228,51 @@ fn committed_hook_deadline_boundary_accepts_bytes_without_copy() {
 }
 
 #[test]
-fn buffered_backend_response_from_body_read_keeps_reqwest_bytes() {
+fn eager_backend_collection_publishes_charged_bytes_without_a_copy() {
     let proxy = include_str!("../../../src/proxy/mod.rs");
-    let reader = proxy
-        .split("fn buffered_backend_response_from_body_read(")
+    let collector = proxy
+        .split("async fn eager_collect_charged_backend_body(")
         .nth(1)
-        .expect("buffered backend body reader")
+        .expect("eager charged collector")
+        .split("fn buffered_backend_response_from_eager_collect(")
+        .next()
+        .expect("bounded eager charged collector");
+    assert!(
+        collector.contains("ChargedBodyCollector::with_preallocation("),
+        "the eager path must drive the SAME charged collector the buffered paths \
+         use, so every growth is charged before it is allocated instead of \
+         reconciling an opaque read afterwards (GHSA-pwcm-6rh8-f2gh)"
+    );
+    assert!(
+        collector.contains("response.bytes_stream()"),
+        "the eager path must consume the body as a chunk stream; awaiting \
+         `bytes()` materializes an allocation of opaque capacity first"
+    );
+    assert!(
+        collector.contains("into_charged_bytes()"),
+        "the collected body must publish with its charge attached, not with a \
+         collector-local reservation that drops"
+    );
+
+    let reader = proxy
+        .split("fn buffered_backend_response_from_eager_collect(")
+        .nth(1)
+        .expect("eager backend response builder")
         .split("fn eager_buffer_body_read_status_and_class(")
         .next()
-        .expect("bounded buffered backend body reader");
-    assert!(
-        reader.contains("Result<bytes::Bytes, reqwest::Error>"),
-        "successful reqwest body reads must stay as Bytes"
-    );
-    assert!(
-        reader.contains("charged_shared_bytes(b, reservation)"),
-        "the eagerly read Bytes must go through the shared charge helper, which \
-         attaches the aggregate retained-response permit to reqwest's own \
-         allocation when sole ownership proves its capacity, and otherwise \
-         copies once into an allocation the gateway measures rather than \
-         charging a view of an opaque buffer (GHSA-pwcm-6rh8-f2gh)"
-    );
+        .expect("bounded eager backend response builder");
     assert!(
         reader.contains("ResponseBody::buffered(charged)"),
         "buffered backend responses must store the charged Bytes directly"
     );
     assert!(
-        !reader.contains("b.to_vec()") && !reader.contains("copy_from_slice"),
-        "buffered backend responses must not force a Vec conversion or a copy"
+        !reader.contains("copy_from_slice"),
+        "buffered backend responses must not copy the collected body"
     );
     assert!(
-        reader.contains("reservation.reserve(b.len())"),
-        "the charge must be grown to the ACTUAL body length before it is \
-         attached, so a body larger than its declared Content-Length cannot be \
-         retained under-charged"
+        reader.contains("RetainRejection::TooLarge"),
+        "a body past the retained ceiling must keep its BACKEND attribution \
+         rather than being reported as aggregate exhaustion"
     );
     assert!(
         reader.contains("response_buffer_capacity_response(proxy, resolved_ip, transport)"),

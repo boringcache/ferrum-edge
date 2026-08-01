@@ -1174,6 +1174,41 @@ impl BufferedInitialResponseHeaderPolicyState {
     }
 }
 
+/// Whether a plugin can replace a buffered response body, and under what
+/// allocation contract (GHSA-pwcm-6rh8-f2gh).
+///
+/// A replacement body is allocated by the plugin, not by the gateway, so the
+/// buffered phases reserve a covering window before invoking a producer and the
+/// producer must build inside a ceiling-bounded sink. Both of those cost
+/// something — a window is a whole per-response ceiling held for the length of
+/// the phase — so a chain that cannot produce should pay neither. This is that
+/// declaration, and its default is fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseBodyProduction {
+    /// This plugin never returns `Some` from `normalize_response_body_with_context`
+    /// or `transform_response_body[_with_context]`. No window is reserved on its
+    /// account; if it nevertheless returns bytes, the phase fails closed rather
+    /// than installing an allocation nothing reserved for.
+    Never,
+    /// This plugin can replace the body and constructs every replacement through
+    /// a materialisation bounded by the per-response retained ceiling
+    /// (`BoundedResponseBodySink` / `bounded_json_vec`), so an over-ceiling
+    /// output is refused while it is being written.
+    BoundedByRetainedCeiling,
+    /// The gateway cannot prove either of the above — an out-of-tree plugin. It
+    /// is treated as potentially rewriting AND potentially unbounded: a window
+    /// is reserved for it, and the phase refuses to invoke it, because invoking
+    /// it is what would let it allocate without a bound.
+    Undeclared,
+}
+
+impl ResponseBodyProduction {
+    /// Whether a window must be reserved on this plugin's account.
+    pub fn may_replace_response_body(self) -> bool {
+        !matches!(self, Self::Never)
+    }
+}
+
 /// How far a plugin's response-header policy binds the response TRAILER
 /// section.
 ///
@@ -3648,6 +3683,20 @@ impl RequestContext {
         )
     }
 
+    /// The finite ceiling any RETAINED representation of this response must fit,
+    /// with `0 = unlimited` folded to the fail-closed fallback.
+    ///
+    /// This is the bound a response-body producer must construct inside: it is
+    /// exactly the size of the retained-response transform window the phase
+    /// reserved before invoking it, so an output built through a sink of this
+    /// size can never overrun the blocks the gateway already holds for it
+    /// (GHSA-pwcm-6rh8-f2gh).
+    pub fn retained_response_body_ceiling(&self) -> usize {
+        crate::proxy::response_buffer_budget::buffered_response_body_ceiling(
+            self.effective_max_response_body_size_bytes(),
+        )
+    }
+
     /// Build the lightweight compatibility context used by final request-body
     /// hooks when the active plugin needs request metadata after body
     /// transforms. The compressor's private staged representation and incoming
@@ -5277,6 +5326,47 @@ pub(crate) fn run_final_response_header_hooks(
     }
 }
 
+/// Decide whether a response-body producer may be invoked, and why not.
+///
+/// This is the shared precondition for BOTH buffered producer phases
+/// (`normalize_response_body_for_inspection` and
+/// `transform_buffered_response_body_with_deadline`), so the two cannot drift
+/// (GHSA-pwcm-6rh8-f2gh):
+///
+/// * a plugin that cannot produce is invoked with no window on its account;
+/// * a plugin that can produce is invoked ONLY once a full covering window has
+///   been re-established. The refill happens here, immediately before the
+///   invocation and after the previous replacement was installed (which dropped
+///   the body it replaced), so the old body and a fresh full window are never
+///   both charged;
+/// * a plugin whose replacement-allocation contract the gateway cannot prove is
+///   not invoked at all — invoking it is what would let it allocate without a
+///   bound.
+///
+/// `None` means invoke. `Some(reason)` is a fixed-cardinality refusal reason
+/// safe to log: it names no route, header, credential, or response content.
+pub(crate) fn admit_response_body_producer(
+    production: ResponseBodyProduction,
+    window: Option<&mut crate::proxy::response_buffer_budget::ResponseTransformWindow<'_>>,
+) -> Option<&'static str> {
+    match production {
+        ResponseBodyProduction::Never => None,
+        ResponseBodyProduction::BoundedByRetainedCeiling => match window {
+            Some(window) if window.ensure_covering_window() => None,
+            _ => Some(PRODUCER_REFUSED_WINDOW_UNAVAILABLE),
+        },
+        ResponseBodyProduction::Undeclared => Some(PRODUCER_REFUSED_UNDECLARED_CONTRACT),
+    }
+}
+
+/// A full covering retained-response window could not be re-established, so the
+/// producer was not invoked.
+pub(crate) const PRODUCER_REFUSED_WINDOW_UNAVAILABLE: &str = "retained_window_unavailable";
+
+/// The plugin declares no bounded replacement-allocation contract, so invoking
+/// it could allocate outside the aggregate cap.
+pub(crate) const PRODUCER_REFUSED_UNDECLARED_CONTRACT: &str = "undeclared_replacement_contract";
+
 /// Run buffered provider/protocol normalizers before response-body policy
 /// inspection. Returns whether any plugin replaced the bytes.
 ///
@@ -5310,9 +5400,17 @@ pub async fn normalize_response_body_for_inspection(
     // exist outside the aggregate cap. The window is sized to this response's
     // retained ceiling, and each accepted replacement transfers its covering
     // blocks out of it (GHSA-pwcm-6rh8-f2gh).
-    let mut window = if plugins.is_empty() {
-        None
-    } else {
+    //
+    // Only a chain that can actually produce pays for one. A window is a whole
+    // per-response ceiling held for the length of the phase, so opening one for
+    // a chain of validators/header-only plugins would halve the buffered
+    // concurrency the aggregate budget supports for no bound gained. A plugin
+    // that produces WITHOUT being declared has no window to charge out of and is
+    // refused below, so the optimisation is fail-closed rather than trusting.
+    let mut window = if plugins
+        .iter()
+        .any(|plugin| plugin.response_body_production().may_replace_response_body())
+    {
         let ceiling = ctx.effective_max_response_body_size_bytes();
         match crate::proxy::response_buffer_budget::ResponseTransformWindow::open(ceiling) {
             Some(window) => Some(window),
@@ -5330,9 +5428,37 @@ pub async fn normalize_response_body_for_inspection(
                 return true;
             }
         }
+    } else {
+        None
     };
     let mut normalized = false;
     for plugin in plugins {
+        // Precondition, checked immediately before every producer invocation and
+        // never after an allocation: an out-of-tree plugin that could rewrite
+        // the body without declaring a bounded construction contract is refused
+        // rather than invoked, and a producer is only invoked once a FULL
+        // covering window has been re-established over the body it will read
+        // from. `ensure_covering_window` runs here (not inside `charge`) because
+        // the previous replacement has by now been installed and the body it
+        // replaced has dropped its charge — refilling any earlier would hold
+        // both at once.
+        if let Some(reason) =
+            admit_response_body_producer(plugin.response_body_production(), window.as_mut())
+        {
+            warn!(
+                plugin = plugin.name(),
+                reason,
+                "Response normalization refused before invoking the producer"
+            );
+            crate::proxy::replace_buffered_response_with_capacity_refusal(
+                ctx,
+                response_status,
+                response_headers,
+                response_body,
+                initial_response_header_policy_plugins,
+            );
+            return true;
+        }
         let deadline = ctx.grpc_deadline_at();
         let body = match await_grpc_deadline(
             deadline,
@@ -5378,11 +5504,18 @@ pub async fn normalize_response_body_for_inspection(
             // machinery the deadline and representation-error replacements use,
             // so a gRPC-Web refusal is body-framed and no header describing the
             // discarded representation survives.
+            //
+            // A `None` window here means a plugin declared as a non-producer
+            // returned bytes anyway. The blocks that would pay for them were
+            // never reserved, so the fail-closed answer is the same refusal
+            // rather than installing an uncharged allocation.
             let body_len = body.len();
             let Some(charged) = window.as_mut().and_then(|window| window.charge(body)) else {
                 warn!(
                     plugin = plugin.name(),
-                    "Response normalization refused: aggregate retained-response budget exhausted"
+                    replacement_bytes = body_len,
+                    "Response normalization refused: replacement body is not covered by a \
+                     reserved retained-response window"
                 );
                 crate::proxy::replace_buffered_response_with_capacity_refusal(
                     ctx,
@@ -8234,6 +8367,34 @@ pub trait Plugin: Send + Sync {
     ) -> Option<Vec<u8>> {
         self.transform_response_body(body, content_type, response_headers)
             .await
+    }
+
+    /// What this plugin may allocate when it replaces a buffered response body.
+    ///
+    /// The buffered normalize/transform phases reserve a full retained-response
+    /// window before a producer runs, because a replacement body is an
+    /// allocation the gateway does not size (GHSA-pwcm-6rh8-f2gh). Two things
+    /// follow from that, and this declaration is what decides both:
+    ///
+    /// * a chain in which nothing can produce should not reserve a window at
+    ///   all — a header-only or validating plugin would otherwise pin a whole
+    ///   per-response ceiling and halve the buffered-response concurrency the
+    ///   aggregate budget can support;
+    /// * a producer must construct its output through
+    ///   [`crate::proxy::response_buffer_budget::BoundedResponseBodySink`] (or
+    ///   an equally ceiling-bounded materialisation), so an over-ceiling output
+    ///   is refused DURING construction instead of being allocated in full and
+    ///   rejected afterwards.
+    ///
+    /// The default is [`ResponseBodyProduction::Undeclared`] for anything the
+    /// built-in inventory does not name, which is the fail-closed direction: an
+    /// out-of-tree plugin that quietly overrides a producer hook is treated as
+    /// potentially unbounded and is refused rather than invoked. Built-in
+    /// declarations live in one table
+    /// ([`builtin_parity::declared_response_body_production`]) so the set cannot
+    /// drift per plugin file, and are covered by a parity test.
+    fn response_body_production(&self) -> ResponseBodyProduction {
+        builtin_parity::declared_response_body_production(self.name())
     }
 
     /// Whether this plugin has a configured body policy that claims authority

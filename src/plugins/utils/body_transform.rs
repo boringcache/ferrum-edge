@@ -627,6 +627,22 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
 ///
 /// Content-type is checked by the caller — this function assumes JSON input.
 pub fn apply_body_rules(body: &[u8], rules: &[BodyRule]) -> Option<Vec<u8>> {
+    apply_body_rules_bounded(body, rules, usize::MAX)
+}
+
+/// [`apply_body_rules`] with an explicit ceiling on the produced document.
+///
+/// The response side passes this response's retained ceiling so the rewritten
+/// JSON is serialized THROUGH a bounded sink: a rule set that amplifies a
+/// document past what the gateway reserved for it fails while the output is
+/// being written, instead of materialising a larger `Vec` that is only rejected
+/// afterwards (GHSA-pwcm-6rh8-f2gh). The request side keeps `usize::MAX`; its
+/// bounds live on the request-body ceilings.
+pub fn apply_body_rules_bounded(
+    body: &[u8],
+    rules: &[BodyRule],
+    ceiling: usize,
+) -> Option<Vec<u8>> {
     if rules.is_empty() || body.is_empty() {
         return None;
     }
@@ -685,13 +701,13 @@ pub fn apply_body_rules(body: &[u8], rules: &[BodyRule]) -> Option<Vec<u8>> {
     }
 
     if modified {
-        match serde_json::to_vec(&json) {
-            Ok(bytes) => Some(bytes),
-            Err(e) => {
-                debug!(
-                    "body_transform: failed to serialize transformed body: {}",
-                    e
-                );
+        match crate::proxy::response_buffer_budget::bounded_json_vec(&json, ceiling) {
+            Some(bytes) => Some(bytes),
+            None => {
+                // Either the document did not serialize or it would have grown
+                // past the ceiling. Both leave the body unchanged; neither logs
+                // body content.
+                debug!("body_transform: transformed body was not serialized within its ceiling");
                 None
             }
         }

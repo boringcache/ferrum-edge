@@ -6167,19 +6167,6 @@ pub mod _test_support {
             crate::proxy::response_buffer_budget::charged_bytes(data, charge.0)
         }
 
-        /// Hand an existing claim to bytes the transport already owns — the
-        /// eager reqwest small-response path
-        /// (`buffered_backend_response_from_body_read`). Zero-copy when sole
-        /// ownership proves the backing capacity, otherwise one measured copy;
-        /// `None` when the budget refuses the exact charge.
-        pub fn attach_shared(
-            &self,
-            data: bytes::Bytes,
-            charge: ResponseBufferChargeProbe,
-        ) -> Option<bytes::Bytes> {
-            self.0.attach_shared(data, charge.0)
-        }
-
         /// The PRODUCTION growing collector bound to this isolated budget —
         /// same ceiling folding, same charge-before-allocate growth, same
         /// capacity-gated publication.
@@ -6391,6 +6378,25 @@ pub mod _test_support {
             self.0.available_bytes()
         }
 
+        /// The full window size, i.e. this response's retained ceiling.
+        pub fn window_bytes(&self) -> usize {
+            self.0.window_bytes()
+        }
+
+        /// The PRODUCTION precondition every producer invocation must clear:
+        /// re-establish a full covering window after the previous replacement
+        /// was installed. `false` is the signal to install the neutral capacity
+        /// terminal INSTEAD of invoking the next producer.
+        pub fn ensure_covering_window(&mut self) -> bool {
+            self.0.ensure_covering_window()
+        }
+
+        /// The PRODUCTION bounded sink a producer builds its replacement
+        /// through, sized to this window.
+        pub fn sink(&self) -> BoundedResponseBodySinkProbe {
+            BoundedResponseBodySinkProbe(self.0.sink())
+        }
+
         /// Transfer the blocks covering `data` out of the window and publish it.
         /// `None` when the producer overran the window (i.e. the per-response
         /// retained ceiling), which is the fail-closed answer.
@@ -6398,6 +6404,76 @@ pub mod _test_support {
             self.0.charge(data)
         }
     }
+
+    /// The PRODUCTION ceiling-bounded replacement-body sink, so external tests
+    /// can prove an over-ceiling output is refused DURING construction rather
+    /// than allocated and rejected afterwards (`GHSA-pwcm-6rh8-f2gh`).
+    pub struct BoundedResponseBodySinkProbe(
+        crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+    );
+
+    impl BoundedResponseBodySinkProbe {
+        pub fn with_ceiling(ceiling: usize) -> Self {
+            use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+            Self(BoundedResponseBodySink::with_ceiling(ceiling))
+        }
+
+        pub fn ceiling(&self) -> usize {
+            self.0.ceiling()
+        }
+
+        pub fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.0.len() == 0
+        }
+
+        pub fn overflowed(&self) -> bool {
+            self.0.overflowed()
+        }
+
+        /// `false` means the write was refused and nothing was appended.
+        pub fn push(&mut self, bytes: &[u8]) -> bool {
+            self.0.push(bytes)
+        }
+
+        pub fn finish(self) -> Option<Vec<u8>> {
+            self.0.finish()
+        }
+    }
+
+    /// The PRODUCTION bounded JSON materialisation every JSON-producing response
+    /// transform goes through.
+    pub fn bounded_json_response_body_for_test(
+        value: &serde_json::Value,
+        ceiling: usize,
+    ) -> Option<Vec<u8>> {
+        crate::proxy::response_buffer_budget::bounded_json_vec(value, ceiling)
+    }
+
+    /// The PRODUCTION precondition both buffered producer phases evaluate
+    /// immediately before invoking a plugin's response-body producer hook.
+    ///
+    /// `None` means the hook is invoked. `Some(reason)` means it is NOT invoked
+    /// and the phase installs the neutral capacity terminal instead — which is
+    /// what makes "no producer ever allocates under a partial window" checkable
+    /// deterministically against an isolated budget (`GHSA-pwcm-6rh8-f2gh`).
+    pub fn admit_response_body_producer_for_test(
+        production: crate::plugins::ResponseBodyProduction,
+        window: Option<&mut ResponseBufferTransformWindowProbe<'_>>,
+    ) -> Option<&'static str> {
+        crate::plugins::admit_response_body_producer(production, window.map(|w| &mut w.0))
+    }
+
+    /// Refusal reason: a full covering window could not be re-established.
+    pub const PRODUCER_REFUSED_WINDOW_UNAVAILABLE: &str =
+        crate::plugins::PRODUCER_REFUSED_WINDOW_UNAVAILABLE;
+
+    /// Refusal reason: the plugin declares no bounded replacement contract.
+    pub const PRODUCER_REFUSED_UNDECLARED_CONTRACT: &str =
+        crate::plugins::PRODUCER_REFUSED_UNDECLARED_CONTRACT;
 
     /// Install the gateway-local retained-response-capacity refusal exactly as
     /// the buffered normalize / transform phases do when the aggregate budget
