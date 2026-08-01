@@ -4844,8 +4844,17 @@ impl Plugin for McpGateway {
         // Serialized through a sink bounded by this response's retained ceiling
         // — the same size as the window the transform phase reserved — so an
         // amplifying rewrite is refused while it is written rather than after a
-        // larger buffer is resident (GHSA-pwcm-6rh8-f2gh).
-        crate::proxy::response_buffer_budget::bounded_json_vec(&value, retained_ceiling)
+        // larger buffer is resident (GHSA-pwcm-6rh8-f2gh). A claimed rewrite
+        // that cannot fit marks the pending capacity-refusal signal so the
+        // shared transform loop installs the gateway terminal instead of
+        // forwarding the original upstream body.
+        match crate::proxy::response_buffer_budget::bounded_json_vec(&value, retained_ceiling) {
+            Some(rewritten) => Some(rewritten),
+            None => {
+                ctx.mark_pending_transform_capacity_refusal();
+                None
+            }
+        }
     }
 
     fn on_response_body_transformed(

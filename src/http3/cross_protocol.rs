@@ -2968,6 +2968,15 @@ where
                                 ctx,
                                 &mut response_headers,
                             );
+                        } else if crate::proxy::install_pending_transform_capacity_refusal(
+                            ctx,
+                            &mut response_status,
+                            &mut response_headers,
+                            &mut response_body,
+                            initial_response_header_policy_plugins,
+                        ) {
+                            response_body_rejected = true;
+                            break;
                         } else {
                             if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
                                 ctx,
@@ -5179,6 +5188,7 @@ where
                     {
                         Ok(transformed) => transformed,
                         Err(()) => {
+                            let _ = ctx.take_pending_transform_capacity_refusal();
                             replace_buffered_grpc_response_with_deadline(
                                 ctx,
                                 &mut response_status,
@@ -5199,6 +5209,16 @@ where
                             break;
                         }
                     };
+                    if crate::proxy::install_pending_transform_capacity_refusal(
+                        ctx,
+                        &mut response_status,
+                        &mut plugin_response_headers,
+                        &mut response_body,
+                        initial_response_header_policy_plugins,
+                    ) {
+                        response_body_rejected = true;
+                        break;
+                    }
                     if let Some(transformed) = transformed {
                         plugin_response_headers
                             .insert("content-length".to_string(), transformed.len().to_string());

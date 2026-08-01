@@ -912,21 +912,21 @@ fn every_capacity_refusal_uses_the_shared_gateway_terminal() {
         proxy
             .matches("replace_buffered_response_with_capacity_refusal(")
             .count(),
-        5,
-        "one definition, the transform window-open/admission/publication \
-         refusals, and final gRPC-Web reframe; the normalize call site lives in \
-         src/plugins/mod.rs"
+        6,
+        "one definition, the pending-transform install helper, the transform \
+         window-open/admission/publication refusals, and final gRPC-Web reframe; \
+         the normalize call site lives in src/plugins/mod.rs"
     );
     assert_eq!(
         proxy
             .matches("replace_buffered_response_with_capacity_refusal_with_policy_source(")
             .count(),
-        4,
-        "one definition, the prefiltered delegation, the representation gate's \
-         CapacityRefused decode path, and the install_decoded_response_body \
-         charge refusal — both gate sites are reached from callers holding the \
-         unfiltered protocol plugin list, so they cannot use the prefiltered \
-         wrapper"
+        5,
+        "one definition, the prefiltered delegation, the protocol-plugin pending \
+         install helper, the representation gate's CapacityRefused decode path, \
+         and the install_decoded_response_body charge refusal — both gate sites \
+         are reached from callers holding the unfiltered protocol plugin list, \
+         so they cannot use the prefiltered wrapper"
     );
     assert!(
         plugins.contains("replace_buffered_response_with_capacity_refusal("),

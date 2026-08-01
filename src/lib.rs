@@ -6681,6 +6681,14 @@ pub mod _test_support {
         );
     }
 
+    /// Consume the pending transform capacity-refusal signal exactly as the
+    /// shared buffered transform loops do after each plugin hook.
+    pub fn take_pending_transform_capacity_refusal_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.take_pending_transform_capacity_refusal()
+    }
+
     /// The exact metadata key that stamps a request as a translated/retained
     /// gRPC-Web exchange, so a test can drive the gRPC-Web terminal shape through
     /// the same provenance the proxy uses.

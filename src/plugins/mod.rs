@@ -1944,6 +1944,52 @@ pub(crate) enum RouteOverrideDnsPolicy {
     ClearInherited,
 }
 
+/// Outcome of a claimed, ceiling-bounded response-body construction.
+///
+/// Context-aware production hooks map this back to `Option<Vec<u8>>` while
+/// recording [`RequestContext::mark_pending_transform_capacity_refusal`] on
+/// [`BoundedResponseBodyConstruction::CapacityRefused`]. Ordinary unclaimed /
+/// ineligible / malformed / semantic no-op paths stay
+/// [`BoundedResponseBodyConstruction::Unchanged`] so the shared transform loop
+/// continues to treat them as no-ops.
+#[derive(Debug)]
+pub(crate) enum BoundedResponseBodyConstruction {
+    /// Replacement bytes constructed under the retained ceiling.
+    Replaced(Vec<u8>),
+    /// Ordinary no-op: not claimed, ineligible, malformed, or semantically
+    /// unchanged.
+    Unchanged,
+    /// The producer claimed a rewrite, but the ceiling-bounded sink refused.
+    CapacityRefused,
+}
+
+impl BoundedResponseBodyConstruction {
+    /// Map a private bounded-construction outcome onto the public
+    /// `Option<Vec<u8>>` Plugin surface, marking a pending capacity refusal
+    /// when construction was refused.
+    #[must_use]
+    pub(crate) fn into_transform_option(self, ctx: &mut RequestContext) -> Option<Vec<u8>> {
+        match self {
+            Self::Replaced(bytes) => Some(bytes),
+            Self::Unchanged => None,
+            Self::CapacityRefused => {
+                ctx.mark_pending_transform_capacity_refusal();
+                None
+            }
+        }
+    }
+
+    /// Context-free compatibility mapping: capacity refusals collapse to
+    /// `None` without a request-scoped signal (no `RequestContext` to mark).
+    #[must_use]
+    pub(crate) fn into_option(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Replaced(bytes) => Some(bytes),
+            Self::Unchanged | Self::CapacityRefused => None,
+        }
+    }
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -2455,6 +2501,13 @@ pub struct RequestContext {
     /// must restore an identity representation (or otherwise fail closed)
     /// instead of forwarding plaintext under a coded header.
     compression_response_encode_aborted: bool,
+    /// Set when a claimed buffered response-body transform refused its
+    /// ceiling-bounded construction. `Option::None` from
+    /// `transform_response_body_with_context` is otherwise an ordinary no-op, so
+    /// the shared transform loop must consume this signal immediately after the
+    /// awaited hook and install the gateway capacity terminal instead of
+    /// forwarding the original body (GHSA-pwcm-6rh8-f2gh).
+    pending_transform_capacity_refusal: bool,
     /// Process-unique id for an attached response-stream inspector chain.
     /// Assigned only after at least one configured plugin opts into streaming
     /// hooks for the response, and cleared again when every factory returns
@@ -2969,6 +3022,7 @@ impl RequestContext {
             compression_response_buffer_permit: HeldResponseBufferPermit::default(),
             compression_staged_request_plaintext: None,
             compression_response_encode_aborted: false,
+            pending_transform_capacity_refusal: false,
             response_stream_id: None,
             response_stream_completion: None,
             a2a_gateway_detected: false,
@@ -3337,6 +3391,19 @@ impl RequestContext {
 
     pub(crate) fn take_compression_response_encode_aborted(&mut self) -> bool {
         std::mem::take(&mut self.compression_response_encode_aborted)
+    }
+
+    /// Record that a claimed response-body transform refused its retained
+    /// ceiling. Only `grpc_web`, `response_transformer`, and `mcp_gateway` set
+    /// this after a real construction attempt fails the bound; ordinary
+    /// unclaimed / ineligible / semantic no-op paths must leave it clear.
+    pub(crate) fn mark_pending_transform_capacity_refusal(&mut self) {
+        self.pending_transform_capacity_refusal = true;
+    }
+
+    /// Consume the pending transform capacity-refusal signal exactly once.
+    pub(crate) fn take_pending_transform_capacity_refusal(&mut self) -> bool {
+        std::mem::take(&mut self.pending_transform_capacity_refusal)
     }
 
     pub(crate) fn clear_gateway_response_compression(&mut self) {
@@ -3931,6 +3998,11 @@ impl RequestContext {
             compression_response_encode_aborted: std::mem::take(
                 &mut self.compression_response_encode_aborted,
             ),
+            // Response-transform capacity refusals belong on the live response
+            // path. Final request-body hooks never produce response bodies, so
+            // this compatibility clone must not carry or clear a pending signal
+            // that a later response transform still needs to consume.
+            pending_transform_capacity_refusal: false,
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
             a2a_gateway_detected: self.a2a_gateway_detected,

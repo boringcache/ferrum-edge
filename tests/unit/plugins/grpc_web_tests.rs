@@ -3933,6 +3933,14 @@ async fn test_translation_is_refused_when_the_trailer_frame_cannot_fit_the_ceili
         "an over-ceiling translation must fail closed rather than materialise \
          the trailer block first"
     );
+    assert!(
+        ferrum_edge::_test_support::take_pending_transform_capacity_refusal_for_test(&mut ctx),
+        "a claimed over-ceiling translation must mark the pending capacity-refusal signal"
+    );
+    assert!(
+        !ferrum_edge::_test_support::take_pending_transform_capacity_refusal_for_test(&mut ctx),
+        "the pending capacity-refusal signal must be consumed exactly once"
+    );
 
     // Control: the same staged request with an ample ceiling DOES translate, so
     // the refusal above is the ceiling and not the ownership gate.
@@ -3948,6 +3956,10 @@ async fn test_translation_is_refused_when_the_trailer_frame_cannot_fit_the_ceili
         .await
         .expect("an in-ceiling translation must still be produced");
     assert!(ok.len() > body.len(), "the trailer frame was appended");
+    assert!(
+        !ferrum_edge::_test_support::take_pending_transform_capacity_refusal_for_test(&mut roomy),
+        "a successful translation must not mark a capacity refusal"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4079,5 +4091,73 @@ async fn test_large_trailer_block_is_refused_under_a_small_retained_ceiling() {
             "{content_type}: a trailer block above the retained ceiling must be \
              refused during the counting pass, never materialised first"
         );
+        assert!(
+            ferrum_edge::_test_support::take_pending_transform_capacity_refusal_for_test(&mut ctx),
+            "{content_type}: capacity refusal must mark the pending transform signal"
+        );
     }
+}
+
+#[tokio::test]
+async fn capacity_refused_grpc_web_transform_installs_body_framed_terminal() {
+    use ferrum_edge::_test_support::{
+        GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY, RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+        stamp_original_response_metadata_for_test,
+        transform_buffered_response_body_with_deadline_full_for_test,
+    };
+
+    let plugin = create_plugin_default();
+    let mut body = vec![0x00u8];
+    body.extend_from_slice(&5u32.to_be_bytes());
+    body.extend_from_slice(b"hello");
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+    response_headers.insert("grpc-status".to_string(), "0".to_string());
+    response_headers.insert("content-length".to_string(), body.len().to_string());
+
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+    ctx.max_response_body_size_bytes = body.len() + 2;
+    ctx.metadata.insert(
+        GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY.to_string(),
+        "application/grpc-web".to_string(),
+    );
+
+    let mut status = 200u16;
+    stamp_original_response_metadata_for_test(&mut ctx, status, &response_headers);
+    let mut body_buf = bytes::Bytes::from(body.clone());
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &[plugin],
+        &mut ctx,
+        &mut status,
+        &mut response_headers,
+        &mut body_buf,
+        Some("application/grpc-web"),
+        false,
+    )
+    .await;
+
+    assert!(
+        replaced,
+        "a claimed gRPC-Web capacity refusal must replace the buffered response"
+    );
+    assert_eq!(status, 200, "gRPC-Web capacity terminals keep HTTP 200");
+    assert_eq!(body_buf.first(), Some(&0x80));
+    let payload = trailing_grpc_web_trailer_payload(&body_buf);
+    assert!(
+        payload.contains(&format!("grpc-status: {RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS}")),
+        "capacity status must ride the gRPC-Web body trailer frame: {payload:?}"
+    );
+    assert!(
+        !response_headers.contains_key("grpc-status"),
+        "gRPC-Web capacity terminals must not leave grpc-status in headers"
+    );
+    assert!(
+        !ferrum_edge::_test_support::take_pending_transform_capacity_refusal_for_test(&mut ctx),
+        "the shared transform loop must consume the pending signal"
+    );
 }

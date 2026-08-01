@@ -17331,11 +17331,27 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
             {
                 Ok(transformed) => transformed,
                 Err(()) if mandatory_replay_transform => {
+                    let _ = ctx.take_pending_transform_capacity_refusal();
                     mandatory_replay_transform_failed = Some(plugin.name());
                     break;
                 }
-                Err(()) => break,
+                Err(()) => {
+                    let _ = ctx.take_pending_transform_capacity_refusal();
+                    break;
+                }
             };
+            // Claimed transform capacity refusal must install the shared
+            // terminal before later plugins, validators, or publication.
+            if install_pending_transform_capacity_refusal_from_protocol_plugins(
+                ctx,
+                response_status,
+                response_headers,
+                response_body,
+                plugins,
+            ) {
+                terminal_body_response_selected = true;
+                break;
+            }
             if let Some(transformed) = transformed {
                 response_headers
                     .insert("content-length".to_string(), transformed.len().to_string());
@@ -18977,7 +18993,7 @@ pub(crate) fn replace_buffered_response_with_capacity_refusal(
 /// the unfiltered protocol plugin list rather than the precomputed
 /// initial-response policy slice — the shared representation gate, which is
 /// reached from paths with either shape.
-fn replace_buffered_response_with_capacity_refusal_with_policy_source(
+pub(crate) fn replace_buffered_response_with_capacity_refusal_with_policy_source(
     ctx: &mut RequestContext,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
@@ -19069,6 +19085,51 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
         );
     }
     ctx.record_deadline_response_header_mutations(response_headers);
+}
+
+/// Consume a plugin-signaled bounded-transform capacity refusal and install the
+/// shared gateway capacity terminal. Returns `true` when a terminal was
+/// installed so callers can stop later transforms / validators / reframing.
+pub(crate) fn install_pending_transform_capacity_refusal(
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> bool {
+    if !ctx.take_pending_transform_capacity_refusal() {
+        return false;
+    }
+    replace_buffered_response_with_capacity_refusal(
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+        initial_response_header_policy_plugins,
+    );
+    true
+}
+
+/// [`install_pending_transform_capacity_refusal`] for callers that hold the
+/// unfiltered protocol plugin list (synthetic response lifecycle).
+pub(crate) fn install_pending_transform_capacity_refusal_from_protocol_plugins(
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    plugins: &[Arc<dyn Plugin>],
+) -> bool {
+    if !ctx.take_pending_transform_capacity_refusal() {
+        return false;
+    }
+    replace_buffered_response_with_capacity_refusal_with_policy_source(
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+        InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
+    );
+    true
 }
 
 /// Client-visible message when a configured response body policy could not be
@@ -19590,6 +19651,9 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
         {
             Ok(transformed) => transformed,
             Err(()) => {
+                // An elapsed authoritative deadline owns the outcome; discard any
+                // pending transform capacity signal so it cannot leak.
+                let _ = ctx.take_pending_transform_capacity_refusal();
                 *response_status = replace_buffered_grpc_response_with_deadline(
                     ctx,
                     grpc_web_response_content_type,
@@ -19601,6 +19665,18 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
                 return (true, body_transformed);
             }
         };
+        // A claimed transform that refused its ceiling marks a pending signal
+        // and returns ordinary `None`. Consume it before later plugins,
+        // encoding reconciliation, or treating the body as unchanged.
+        if install_pending_transform_capacity_refusal(
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            initial_response_header_policy_plugins,
+        ) {
+            return (true, body_transformed);
+        }
         if let Some(transformed) = transformed {
             // The transform installs a DIFFERENT allocation than the one the
             // collector charged (and a decode can be far larger than its
