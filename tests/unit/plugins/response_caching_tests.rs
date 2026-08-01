@@ -5411,6 +5411,7 @@ async fn test_request_declaring_a_body_bypasses_cache() {
     for (name, value) in [
         ("content-length", "7"),
         ("content-length", ""),
+        ("content-length", "+0"),
         ("content-length", "not-a-length"),
         ("content-length", "0, 0"),
         ("transfer-encoding", "chunked"),

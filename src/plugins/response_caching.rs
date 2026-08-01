@@ -73,6 +73,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+use crate::util::body_limit::{ContentLength, parse_content_length};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::utils::replay_partition::{self, AnonymousCallerScope, PartitionHasher};
@@ -320,12 +321,17 @@ fn request_declares_body(headers: &HashMap<String, String>) -> bool {
     let Some(content_length) = header_value(headers, "content-length") else {
         return false;
     };
-    let trimmed = content_length.trim();
-    if trimmed.is_empty() {
+    // Keep folded values on the fail-closed bypass path even when every member
+    // is the same zero. This cache does not need to normalize request framing,
+    // and a single authoritative field is the narrow proof its key exemption
+    // is designed around.
+    if content_length.contains(',') {
         return true;
     }
-    // An unparsable Content-Length is not proof of an empty body.
-    trimmed.parse::<u64>().map_or(true, |length| length > 0)
+    // `parse::<u64>()` accepts a leading `+`, which is not valid HTTP
+    // Content-Length syntax. Reuse the canonical 1*DIGIT parser so malformed,
+    // overflowing, and non-zero values are never evidence of an empty body.
+    !matches!(parse_content_length(content_length), ContentLength::Exact(0))
 }
 
 fn is_auto_sensitive_vary_header(header: &str) -> bool {

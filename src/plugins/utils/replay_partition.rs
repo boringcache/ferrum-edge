@@ -39,7 +39,8 @@
 //!   operation headers whose semantics `response_caching` actually implements
 //!   (`If-None-Match`, `If-Modified-Since`, pure honored request
 //!   `Cache-Control: no-cache` / `no-store` refreshes with no arguments when
-//!   `respect_no_cache` is enabled, and `Content-Length`) while
+//!   `respect_no_cache` is enabled, and single-field zero-length
+//!   `Content-Length`) while
 //!   conservatively binding every other representation and policy dimension,
 //!   including headers absent from `Vary`. Mixed Cache-Control members and
 //!   Cache-Control under `respect_no_cache: false` stay bound.
@@ -59,6 +60,7 @@ use std::net::IpAddr;
 use sha2::{Digest, Sha256};
 
 use crate::plugins::RequestContext;
+use crate::util::body_limit::{ContentLength, parse_content_length};
 
 /// Request headers that carry caller authorization context.
 ///
@@ -766,7 +768,8 @@ fn is_response_cache_entry_operation_header(
         return true;
     }
     if name.eq_ignore_ascii_case("content-length") {
-        return value.trim().parse::<u64>().is_ok_and(|length| length == 0);
+        return !value.contains(',')
+            && matches!(parse_content_length(value), ContentLength::Exact(0));
     }
     respect_no_cache
         && name.eq_ignore_ascii_case("cache-control")
