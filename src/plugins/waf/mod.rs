@@ -234,11 +234,7 @@ impl Waf {
     ///
     /// This is the predicate that decides whether an unscannable body is a
     /// protection-mechanism failure or merely a lost observation.
-    fn has_enforcing_body_policy(
-        &self,
-        direction: BodyDirection,
-        ctx: &RequestContext,
-    ) -> bool {
+    fn has_enforcing_body_policy(&self, direction: BodyDirection, ctx: &RequestContext) -> bool {
         if self.config.mode != GlobalMode::Enforce
             || self.exemptions.suppresses_rule_for_request(ctx)
         {

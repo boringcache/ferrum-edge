@@ -4592,9 +4592,7 @@ async fn scoped_scoring_body_rule_only_fails_closed_when_conditions_match() {
         .await;
     assert!(matches!(post_result, PluginResult::Continue));
     assert_eq!(
-        post.metadata
-            .get("waf.scan_truncated")
-            .map(String::as_str),
+        post.metadata.get("waf.scan_truncated").map(String::as_str),
         Some("true"),
         "scoring cannot block on a body rule whose conditions do not match"
     );
@@ -4607,9 +4605,7 @@ async fn scoped_scoring_body_rule_only_fails_closed_when_conditions_match() {
         .await;
     assert!(matches!(put_result, PluginResult::Reject { .. }));
     assert_eq!(
-        put.metadata
-            .get("waf.block_reason")
-            .map(String::as_str),
+        put.metadata.get("waf.block_reason").map(String::as_str),
         Some("body_too_large")
     );
 }
@@ -4636,9 +4632,7 @@ async fn request_wide_header_exemption_prevents_oversize_fail_closed_block() {
 
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(
-        ctx.metadata
-            .get("waf.scan_truncated")
-            .map(String::as_str),
+        ctx.metadata.get("waf.scan_truncated").map(String::as_str),
         Some("true"),
         "a request-wide rule exemption must not become an oversize block"
     );
