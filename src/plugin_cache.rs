@@ -263,6 +263,15 @@ impl Plugin for MeshRouteDispatchFinalizer {
         crate::plugins::HTTP_FAMILY_PROTOCOLS
     }
 
+    /// Cache-internal request-phase sentinel: never replaces a response body.
+    /// Declare `Never` explicitly — the internal name is absent from the public
+    /// built-in inventory, so the trait default would resolve to `Undeclared`
+    /// and the shared producer gate would refuse every buffered response
+    /// (GHSA-pwcm-6rh8-f2gh).
+    fn response_body_production(&self) -> crate::plugins::ResponseBodyProduction {
+        crate::plugins::ResponseBodyProduction::Never
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -1091,6 +1100,19 @@ impl Plugin for PriorityOverridePlugin {
                 response_headers,
             )
     }
+    fn should_release_response_body_for_simulated_final_headers(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        final_response_headers: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        self.inner
+            .should_release_response_body_for_simulated_final_headers(
+                ctx,
+                response_status,
+                final_response_headers,
+            )
+    }
     fn should_release_response_body_for_later_strong_etag(
         &self,
         ctx: &RequestContext,
@@ -1215,6 +1237,13 @@ impl Plugin for PriorityOverridePlugin {
         self.inner
             .transform_response_body_with_context(ctx, body, content_type, response_headers)
             .await
+    }
+    /// Must forward: this wrapper runs the inner plugin's producer hooks, so
+    /// falling back to the trait default would resolve the declaration against
+    /// the WRAPPER, not the plugin, and either deny a real producer its window
+    /// or reserve one for a plugin that cannot produce (GHSA-pwcm-6rh8-f2gh).
+    fn response_body_production(&self) -> crate::plugins::ResponseBodyProduction {
+        self.inner.response_body_production()
     }
     fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
         self.inner.requires_replay_response_body_transform(ctx)

@@ -1766,6 +1766,31 @@ pub struct EnvConfig {
     pub max_header_count: usize,
     pub max_request_body_size_bytes: usize,
     pub max_response_body_size_bytes: usize,
+    /// Fail-closed per-response ceiling applied when the effective response-body
+    /// limit resolves to `0` ("unlimited") *and* the response is being retained
+    /// in memory for a plugin rather than streamed. `0 = unlimited` remains a
+    /// valid streaming policy; it is not a valid buffering policy, because one
+    /// client-chosen response could then grow without bound
+    /// (GHSA-pwcm-6rh8-f2gh). Runtime clamps this fallback to one 64 KiB
+    /// reservation block at minimum and `usize::MAX / 2` at maximum. Default:
+    /// 10485760 (10 MiB).
+    pub response_buffer_fallback_max_bytes: usize,
+    /// Aggregate ceiling (bytes) on everything concurrent buffered responses
+    /// retain at once. A finite per-response ceiling still multiplies by
+    /// concurrency, so this is the bound that actually caps gateway memory under
+    /// a flood of buffered responses. The charge travels with the retained bytes
+    /// and is returned only when they are dropped, so this bounds *resident*
+    /// memory rather than collection time. A response that cannot reserve
+    /// capacity is refused with `503` / gRPC `RESOURCE_EXHAUSTED` instead of
+    /// being collected.
+    ///
+    /// Clamped up to at least the FALLBACK per-response ceiling
+    /// ([`Self::response_buffer_fallback_max_bytes`]) and nothing else: one
+    /// fallback-sized response is always admissible, but an arbitrarily larger
+    /// configured or route-effective per-response ceiling is NOT — widening the
+    /// aggregate cap to fit one huge response would hand the memory bound back
+    /// to whoever picks the response. Default: 268435456 (256 MiB).
+    pub response_buffer_max_total_bytes: usize,
     /// Cutoff (bytes) below which response bodies with a known Content-Length
     /// are eagerly buffered into a single allocation instead of streamed
     /// frame-by-frame. For small JSON API responses the single `bytes().await`
@@ -2753,6 +2778,10 @@ impl Default for EnvConfig {
             max_header_count: 100,
             max_request_body_size_bytes: 10_485_760,
             max_response_body_size_bytes: 10_485_760,
+            response_buffer_fallback_max_bytes:
+                crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_RESPONSE_FALLBACK_BYTES,
+            response_buffer_max_total_bytes:
+                crate::proxy::response_buffer_budget::DEFAULT_RESPONSE_BUFFER_TOTAL_BYTES,
             response_buffer_cutoff_bytes: 65_536,
             h2_coalesce_target_bytes: 131_072,
             max_url_length_bytes: 8_192,
@@ -3213,6 +3242,8 @@ impl EnvConfig {
             max_header_count: usize = "FERRUM_MAX_HEADER_COUNT" => 100usize;
             max_request_body_size_bytes: usize = "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES" => 10_485_760usize;
             max_response_body_size_bytes: usize = "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES" => 10_485_760usize;
+            response_buffer_fallback_max_bytes: usize = "FERRUM_RESPONSE_BUFFER_FALLBACK_MAX_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_RESPONSE_FALLBACK_BYTES;
+            response_buffer_max_total_bytes: usize = "FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_RESPONSE_BUFFER_TOTAL_BYTES;
             response_buffer_cutoff_bytes: usize = "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES" => 65_536usize;
             h2_coalesce_target_bytes: usize = "FERRUM_H2_COALESCE_TARGET_BYTES" => 131_072usize, clamp(16_384usize, 1_048_576usize);
             max_url_length_bytes: usize = "FERRUM_MAX_URL_LENGTH_BYTES" => 8_192usize;
@@ -3877,6 +3908,8 @@ impl EnvConfig {
             max_header_count,
             max_request_body_size_bytes,
             max_response_body_size_bytes,
+            response_buffer_fallback_max_bytes,
+            response_buffer_max_total_bytes,
             response_buffer_cutoff_bytes,
             h2_coalesce_target_bytes,
             max_url_length_bytes,

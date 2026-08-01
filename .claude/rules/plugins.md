@@ -205,9 +205,32 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
      `apply_websocket_handshake_response_headers` boundary in configured order.
      Transport-owned handshake/framing fields are stripped afterward and
      restored only by proxy core.
+7b. `on_final_response_headers`: header-only effects for the response the proxy
+    actually selected, run at the END of the `after_proxy` chain (so a later
+    hook's header rules are already applied) and on BOTH the streaming and
+    buffered paths. Non-rejecting. This is where work that must not depend on
+    collecting a body lives — `response_caching` completes its RFC 9111
+    invalidation and cacheability-predictor marking here, which is what lets it
+    release a response whose store path the headers already closed
+    (GHSA-pwcm-6rh8-f2gh). A plugin that also runs `on_final_response_body` must
+    stage this phase's outcome under its own instance-namespaced metadata key and
+    consume it there, so one semantic effect never happens twice.
 8. `normalize_response_body`: provider/protocol adapters produce the client-visible buffered representation
 9. `on_response_body`: AI response guard and token metrics inspect the normalized body
 10. `transform_response_body`: ordinary client-facing body rewrites
+    - Phases 8 and 10 are the RETAINED-ALLOCATION producer boundary
+      (GHSA-pwcm-6rh8-f2gh). A plugin declares
+      `Plugin::response_body_production()`; built-in declarations live in one
+      table (`builtin_parity::BUILTIN_RESPONSE_BODY_PRODUCERS`) and the default
+      for anything outside the built-in inventory is `Undeclared`, which is
+      REFUSED rather than invoked. A chain with no declared producer opens no
+      transform window. A declared producer is invoked only with a FULL covering
+      window, refilled after the previous replacement was installed — never
+      while the body it replaced is still alive — and must materialise its
+      output through `BoundedResponseBodySink` / `bounded_json_vec` so an
+      over-ceiling replacement is refused during construction. Adding a
+      `Some`-returning producer hook to a built-in means adding it to that table
+      and building through the bounded sink.
 11. `on_final_response_body`: dedup/cache store, size limiting, response cache predictor
 12. `log`: stdout/statsd/http/tcp/kafka/loki/udp/ws/tx_debug/prometheus/chargeback
 13. `on_ws_frame`: WS size, rate, and frame logging
