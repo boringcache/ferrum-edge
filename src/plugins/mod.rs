@@ -5489,8 +5489,14 @@ pub(crate) fn admit_response_body_producer(
     match production {
         ResponseBodyProduction::Never => None,
         ResponseBodyProduction::BoundedByRetainedCeiling => match window {
-            Some(window) if window.ensure_covering_window() => None,
-            _ => Some(PRODUCER_REFUSED_WINDOW_UNAVAILABLE),
+            Some(window) => {
+                if window.ensure_covering_window() {
+                    None
+                } else {
+                    Some(PRODUCER_REFUSED_WINDOW_UNAVAILABLE)
+                }
+            }
+            None => Some(PRODUCER_REFUSED_WINDOW_UNAVAILABLE),
         },
         ResponseBodyProduction::Undeclared => Some(PRODUCER_REFUSED_UNDECLARED_CONTRACT),
     }

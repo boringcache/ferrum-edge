@@ -26914,7 +26914,7 @@ async fn handle_proxy_request_inner(
                             content_type.as_deref(),
                             &response_trailers,
                             http_status,
-                            initial_response_header_policy_plugins,
+                            initial_response_header_policy_plugins.as_ref(),
                         );
                         if let Some((synced_len, true)) = stored {
                             plugin_response_headers

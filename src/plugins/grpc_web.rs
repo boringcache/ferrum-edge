@@ -2538,7 +2538,7 @@ fn resolve_trailer_frame_value<'a>(
     // supplied the same name in HEADERS and TRAILERS. Use the true trailer
     // value only while that view is untouched. A hook-rewritten value wins,
     // and a removed name stays removed.
-    if let Some([initial_value, trailer_value]) = shadowed_trailers
+    if let Some([_initial_value, trailer_value]) = shadowed_trailers
         .and_then(|shadowed| shadowed.get(name))
         .filter(|[initial_value, _]| initial_value.as_str() == view_value)
     {

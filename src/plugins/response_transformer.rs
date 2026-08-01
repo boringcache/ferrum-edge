@@ -1333,7 +1333,7 @@ impl Plugin for ResponseTransformer {
         ctx: &mut RequestContext,
         body: &[u8],
         content_type: Option<&str>,
-        response_headers: &HashMap<String, String>,
+        _response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         // Defense in depth: the shared synthetic path already skips ordinary
         // presentation transforms when `finalized_response_replay` is set.
