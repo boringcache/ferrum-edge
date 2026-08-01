@@ -34464,8 +34464,11 @@ pub(crate) fn store_charged_grpc_web_reframed_body(
     }
 }
 
-/// The neutral gRPC capacity terminal a refused reframe installs. Fixed
-/// cardinality: no route, header, credential, or response content.
+/// Install the shared, protocol-aware capacity terminal for a refused reframe.
+///
+/// The warning and client body are fixed and redaction-safe. The shared builder
+/// retains only response headers already proven gateway-authored, applies the
+/// initial-response policy, and carries gRPC-Web status in a body trailer frame.
 fn grpc_web_reframe_capacity_terminal(
     ctx: &mut RequestContext,
     response_status: &mut u16,
