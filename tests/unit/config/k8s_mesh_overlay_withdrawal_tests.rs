@@ -6,11 +6,11 @@
 //! read that same `None` as "Kubernetes has no mesh update, keep the active
 //! mesh". `GatewayConfig.k8s_mesh_overlay` now separates the two states:
 //!
-//!   * `NoAuthority`   — this source is not a mesh owner; leave other sources'
-//!                       mesh state alone.
-//!   * `Authoritative` — the published mesh is a retained non-Kubernetes
-//!                       `base_mesh` plus a Kubernetes overlay layered on top,
-//!                       and an EMPTY overlay is a withdrawal.
+//! * `NoAuthority` — this source is not a mesh owner; leave other sources'
+//!   mesh state alone.
+//! * `Authoritative` — the published mesh is a retained non-Kubernetes
+//!   `base_mesh` plus a Kubernetes overlay layered on top, and an EMPTY overlay
+//!   is a withdrawal.
 //!
 //! Ownership is keyed by OBJECT IDENTITY (collection + namespace + the
 //! resource's own key), never by namespace: a namespace routinely holds
