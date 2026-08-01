@@ -4551,7 +4551,11 @@ streaming ceiling is not silently substituted for the configured route limit.
 
 ### `response_caching`
 
-Caches final client-visible HTTP responses in gateway memory. The cache key binds the effective destination, the complete backend-visible request target (including the effective outbound query), mandatory caller-authorization context, and the complete `Vary` tuple.
+Caches final client-visible HTTP responses in gateway memory. The cache key
+binds the effective destination, the complete backend-visible request target
+(including the effective outbound query), every origin-visible request header
+except the narrow implemented entry-operation set described below, mandatory
+caller-authorization context, and the complete `Vary` tuple.
 
 **Priority:** 3500
 **Protocol:** HTTP only
