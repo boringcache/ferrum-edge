@@ -1269,15 +1269,90 @@ pub(crate) fn collect_service(
 
 fn collect_explicit_workload_service(acc: &mut K8sAccumulator, object: &K8sObject) {
     let service = string_field(&object.spec, "service").unwrap_or(&object.metadata.name);
-    if let Some(key) = service_key_from_host(
-        service,
-        &object.metadata.namespace,
-        &acc.options.cluster_domain,
-    )
-    .filter(|key| key.namespace == object.metadata.namespace)
-    {
+    // Only record services whose cross-namespace attachment would be accepted.
+    // A rejected WorkloadEntry must not suppress auto-derived Pod workloads.
+    if let Ok(Some(key)) = resolve_workload_entry_service_attachment(acc, object, service) {
         acc.record_explicit_workload_service(key);
     }
+}
+
+/// Resolve a WorkloadEntry `spec.service` host to an authoritative Service key.
+///
+/// - `Ok(None)` — host is not a Kubernetes Service DNS form (literal / ambiguous
+///   two-label DNS). Same-namespace behavior preserves the raw string as
+///   `service_name`.
+/// - `Ok(Some(key))` — same-namespace Service key, or an authorized
+///   cross-namespace key whose Service exists in the translated inventory.
+/// - `Err` — cross-namespace host that is unauthorized, missing, or otherwise
+///   fail-closed (never widens attachment).
+pub(crate) fn resolve_workload_entry_service_attachment(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+    service_raw: &str,
+) -> Result<Option<K8sServiceKey>, K8sTranslateError> {
+    let Some(key) = workload_entry_service_key_from_host(
+        service_raw,
+        &object.metadata.namespace,
+        &acc.options.cluster_domain,
+    ) else {
+        return Ok(None);
+    };
+
+    if key.namespace == object.metadata.namespace {
+        return Ok(Some(key));
+    }
+
+    // Cross-namespace associations require an explicit Gateway API ReferenceGrant
+    // in the *target* Service namespace permitting WorkloadEntry → Service, plus
+    // the Service itself in the translated inventory. Missing grant, missing
+    // Service, or malformed hosts fail closed and never attach.
+    let from_group = k8s_api_group(&object.api_version);
+    if !acc.reference_grant_allows(
+        &object.metadata.namespace,
+        from_group,
+        "WorkloadEntry",
+        &key.namespace,
+        "",
+        "Service",
+        Some(key.name.as_str()),
+    ) {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "WorkloadEntry.service '{service_raw}' references Service '{}/{}' across namespaces \
+                 (cross-namespace); a ReferenceGrant in namespace '{}' must permit from \
+                 WorkloadEntry in '{}' to Service '{}'",
+                key.namespace,
+                key.name,
+                key.namespace,
+                object.metadata.namespace,
+                key.name
+            ),
+        ));
+    }
+
+    if !acc.service_exists(&key.namespace, &key.name) {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "WorkloadEntry.service '{service_raw}' references Service '{}/{}' across namespaces \
+                 (cross-namespace) but that Service is not present in the translated inventory; \
+                 cross-namespace WorkloadEntry attachments require an authoritative target Service",
+                key.namespace, key.name
+            ),
+        ));
+    }
+
+    Ok(Some(key))
+}
+
+pub(crate) fn k8s_api_group(api_version: &str) -> &str {
+    // Core Kubernetes API versions such as "v1" have no slash; Gateway API
+    // represents that core group as the empty string in ReferenceGrant fields.
+    api_version
+        .split_once('/')
+        .map(|(group, _version)| group)
+        .unwrap_or_default()
 }
 
 fn collect_explicit_service_entry_keys(acc: &mut K8sAccumulator, object: &K8sObject) {

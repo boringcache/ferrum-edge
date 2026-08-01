@@ -2602,6 +2602,7 @@ mod tests {
             spiffe_id: SpiffeId::new(spiffe_id.to_string()).unwrap(),
             selector: WorkloadSelector::default(),
             service_name: "test-svc".to_string(),
+            service_namespace: None,
             addresses: addresses.into_iter().map(String::from).collect(),
             ports: vec![WorkloadPort {
                 port: 8080,

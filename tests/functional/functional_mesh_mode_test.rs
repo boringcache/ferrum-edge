@@ -317,6 +317,7 @@ fn east_west_service_slice(node_id: &str) -> MeshSlice {
             spiffe_id: spiffe_id.clone(),
             selector: WorkloadSelector::default(),
             service_name: "reviews".to_string(),
+            service_namespace: None,
             addresses: vec!["127.0.0.1".to_string()],
             ports: vec![WorkloadPort {
                 port: 18080,
@@ -2819,6 +2820,7 @@ fn inbound_authz_slice(
             namespace: Some("ferrum".to_string()),
         },
         service_name: "echo".to_string(),
+        service_namespace: None,
         addresses: vec!["127.0.0.1".to_string()],
         ports: vec![http_port],
         trust_domain: trust_domain.clone(),
@@ -3309,6 +3311,7 @@ fn egress_service_slice(node_id: &str, b_spiffe: &str, backend_port: u16) -> Mes
                 namespace: Some("ferrum".to_string()),
             },
             service_name: "svc-b".to_string(),
+            service_namespace: None,
             addresses: vec!["127.0.0.1".to_string()],
             ports: vec![WorkloadPort {
                 port: backend_port,
@@ -4611,6 +4614,7 @@ fn cross_cluster_dest_slice(
                 namespace: Some("ferrum".to_string()),
             },
             service_name: "svc-c".to_string(),
+            service_namespace: None,
             addresses: vec!["127.0.0.1".to_string()],
             ports: vec![WorkloadPort {
                 port: backend_port,
@@ -4696,6 +4700,7 @@ fn cross_cluster_east_west_slice(node_id: &str, c_spiffe: &str, c_inbound_port: 
             spiffe_id: c_id.clone(),
             selector: WorkloadSelector::default(),
             service_name: "svc-c".to_string(),
+            service_namespace: None,
             addresses: vec!["127.0.0.1".to_string()],
             ports: vec![WorkloadPort {
                 port: c_inbound_port,
@@ -4755,6 +4760,7 @@ fn cross_cluster_client_slice(
             spiffe_id: c_id.clone(),
             selector: WorkloadSelector::default(),
             service_name: "svc-c".to_string(),
+            service_namespace: None,
             addresses: vec!["10.244.7.7".to_string()],
             ports: vec![WorkloadPort {
                 port: service_port,
@@ -5755,6 +5761,7 @@ fn cross_cluster_ambient_dest_slice(
                 namespace: Some("ferrum".to_string()),
             },
             service_name: "svc-c".to_string(),
+            service_namespace: None,
             // Loopback + the backend port — the inner CONNECT authority the relay
             // dials. Loopback passes the open-relay guard as long as a workload
             // declares the port; dialing it reaches the echo backend.
@@ -5834,6 +5841,7 @@ fn cross_cluster_ambient_east_west_slice(
             spiffe_id: c_id.clone(),
             selector: WorkloadSelector::default(),
             service_name: "svc-c".to_string(),
+            service_namespace: None,
             addresses: vec!["127.0.0.1".to_string()],
             ports: vec![WorkloadPort {
                 port: c_hbone_port,
@@ -5894,6 +5902,7 @@ fn cross_cluster_ambient_client_slice(
             spiffe_id: c_id.clone(),
             selector: WorkloadSelector::default(),
             service_name: "svc-c".to_string(),
+            service_namespace: None,
             // The remote pod address. In production this is a real remote pod IP
             // (slice-declared on both sides); the test collapses it to loopback +
             // the backend port so the inner CONNECT authority is a loopback port
@@ -7863,6 +7872,7 @@ fn udp_dest_slice(node_id: &str, b_spiffe: &str, udp_port: u16) -> MeshSlice {
                 namespace: Some("ferrum".to_string()),
             },
             service_name: "svc-b".to_string(),
+            service_namespace: None,
             addresses: vec!["127.0.0.1".to_string()],
             ports: vec![WorkloadPort {
                 port: udp_port,
@@ -8697,6 +8707,7 @@ fn live_source_capture_slice(
                 namespace: Some("ferrum".to_string()),
             },
             service_name: "source-capture-echo".to_string(),
+            service_namespace: None,
             addresses: vec![workload_address.to_string()],
             ports: vec![WorkloadPort {
                 port: service_port,
@@ -9740,6 +9751,7 @@ fn live_xc_workload(address: String, remote: bool) -> Workload {
             namespace: Some("ferrum".to_string()),
         },
         service_name: "live-matrix".to_string(),
+        service_namespace: None,
         addresses: vec![address],
         ports: live_xc_ports(),
         trust_domain: TrustDomain::new(LIVE_XC_TD_B).expect("live B trust domain"),
@@ -9818,6 +9830,7 @@ fn live_xc_source_slice(
         spiffe_id: source_id,
         selector: WorkloadSelector::default(),
         service_name: "live-source".to_string(),
+        service_namespace: None,
         addresses: vec!["127.0.0.1".to_string()],
         ports: Vec::new(),
         trust_domain: TrustDomain::new(LIVE_XC_TD_A).expect("live A trust domain"),

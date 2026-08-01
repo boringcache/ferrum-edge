@@ -77,7 +77,7 @@ use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
     route_local_fault_delay_for_rule, service_entry_port_protocol_is_udp,
     sidecar_selector_from_istio, translate_k8s_objects_collecting_skips,
-    workload_selector_from_istio,
+    workload_entry_service_key_from_host, workload_selector_from_istio,
 };
 use crate::k8s_controller::status::StatusTranslationReuse;
 use crate::k8s_controller::status_plan::{
@@ -302,7 +302,7 @@ pub fn plan_istio_status_updates_budgeted(
             "RequestAuthentication" => {
                 request_authentication_status(object, result, &options.istio_root_namespace)
             }
-            "WorkloadEntry" => workload_entry_status(object, result),
+            "WorkloadEntry" => workload_entry_status(object, result, &options.cluster_domain),
             "Sidecar" => sidecar_status(
                 object,
                 result,
@@ -1135,6 +1135,7 @@ fn request_authentication_status(
 fn workload_entry_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
+    cluster_domain: &str,
 ) -> (Value, Option<Value>) {
     let service_account = object
         .spec
@@ -1149,21 +1150,55 @@ fn workload_entry_status(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let service_host = object
+        .spec
+        .get("service")
+        .and_then(Value::as_str)
+        .unwrap_or(object.metadata.name.as_str());
+    let service_key = workload_entry_service_key_from_host(
+        service_host,
+        &object.metadata.namespace,
+        cluster_domain,
+    );
+    let service_name = service_key
+        .as_ref()
+        .map(|key| key.name.as_str())
+        .unwrap_or(service_host);
+    let service_namespace = service_key
+        .as_ref()
+        .map(|key| key.namespace.as_str())
+        .unwrap_or(object.metadata.namespace.as_str());
+    let cross_namespace = service_namespace != object.metadata.namespace.as_str();
 
     match result {
         Ok(_translation) => {
-            let message = format!(
-                "Ferrum accepted this WorkloadEntry (service account: {service_account}; address: {})",
-                if address.is_empty() {
-                    "<none>"
-                } else {
-                    &address
-                }
-            );
+            let message = if cross_namespace {
+                format!(
+                    "Ferrum accepted this WorkloadEntry (service account: {service_account}; \
+                     address: {}; attached service: {service_namespace}/{service_name})",
+                    if address.is_empty() {
+                        "<none>"
+                    } else {
+                        &address
+                    }
+                )
+            } else {
+                format!(
+                    "Ferrum accepted this WorkloadEntry (service account: {service_account}; address: {})",
+                    if address.is_empty() {
+                        "<none>"
+                    } else {
+                        &address
+                    }
+                )
+            };
             let detail = json!({
                 "translation": {
                     "service_account": service_account,
                     "address": address,
+                    "service": service_name,
+                    "service_namespace": service_namespace,
+                    "cross_namespace_service": cross_namespace,
                 }
             });
             accepted_status(object, true, "Accepted", &message, Some(detail))
@@ -3226,8 +3261,8 @@ mod tests {
 
     #[test]
     fn workload_entry_cross_namespace_service_is_rejected() {
-        // A `service` host pointing at a different namespace is rejected by
-        // the translator; status must surface the rejection.
+        // Unauthorized cross-namespace `service` hosts fail closed; status must
+        // surface the ReferenceGrant requirement.
         let obj = object(
             "networking.istio.io/v1",
             "WorkloadEntry",
@@ -3245,6 +3280,69 @@ mod tests {
         );
         assert_eq!(c["status"].as_str(), Some("False"));
         assert_eq!(c["reason"].as_str(), Some("Invalid"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let error = detail["translation"]["error"].as_str().unwrap_or("");
+        assert!(
+            error.contains("ReferenceGrant"),
+            "status error should mention ReferenceGrant: {error}"
+        );
+    }
+
+    #[test]
+    fn workload_entry_cross_namespace_service_accepted_with_grant_reports_attachment() {
+        let service = object(
+            "v1",
+            "Service",
+            "payments",
+            json!({ "ports": [{ "port": 8080, "name": "http" }] }),
+        );
+        let mut service = service;
+        service.metadata.namespace = "other-ns".to_string();
+        let grant = object(
+            "gateway.networking.k8s.io/v1beta1",
+            "ReferenceGrant",
+            "allow-we",
+            json!({
+                "from": [{
+                    "group": "networking.istio.io",
+                    "kind": "WorkloadEntry",
+                    "namespace": "default"
+                }],
+                "to": [{ "group": "", "kind": "Service", "name": "payments" }]
+            }),
+        );
+        let mut grant = grant;
+        grant.metadata.namespace = "other-ns".to_string();
+        let we = object(
+            "networking.istio.io/v1",
+            "WorkloadEntry",
+            "vm-cross",
+            json!({
+                "address": "10.0.0.6",
+                "serviceAccount": "payments",
+                "service": "payments.other-ns.svc.cluster.local"
+            }),
+        );
+        let updates = plan_istio_status_updates(
+            &[service, grant, we],
+            options().with_source_namespaces(Vec::new()),
+        );
+        let update = updates
+            .iter()
+            .find(|update| update.kind == "WorkloadEntry")
+            .expect("WorkloadEntry status update");
+        let c = find_condition(update.status["conditions"].as_array().unwrap(), "FerrumAccepted");
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let detail = update.ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["service_namespace"].as_str(),
+            Some("other-ns")
+        );
+        assert_eq!(detail["translation"]["service"].as_str(), Some("payments"));
+        assert_eq!(
+            detail["translation"]["cross_namespace_service"].as_bool(),
+            Some(true)
+        );
     }
 
     // ── Sidecar ────────────────────────────────────────────────────────────

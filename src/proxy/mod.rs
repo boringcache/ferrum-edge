@@ -39663,6 +39663,7 @@ mod tests {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
             selector: WorkloadSelector::default(),
             service_name: "redis".to_string(),
+            service_namespace: None,
             addresses: vec!["10.0.0.7".to_string()],
             ports: vec![WorkloadPort {
                 port: 6380,
@@ -43929,6 +43930,7 @@ mod tests {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
             selector: WorkloadSelector::default(),
             service_name: "redis".to_string(),
+            service_namespace: None,
             addresses: vec!["10.0.0.7".to_string()],
             ports: vec![WorkloadPort {
                 port: 6380,
@@ -47577,6 +47579,7 @@ mod tests {
             spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
             selector: WorkloadSelector::default(),
             service_name: "app".to_string(),
+            service_namespace: None,
             addresses: vec!["10.1.2.3".to_string(), "fd00:10:244:1::4".to_string()],
             ports: vec![WorkloadPort {
                 port: 8080,
@@ -47677,6 +47680,7 @@ mod tests {
             spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
             selector: WorkloadSelector::default(),
             service_name: "app".to_string(),
+            service_namespace: None,
             addresses: vec!["fd00:10:244:1::4".to_string()],
             ports: vec![WorkloadPort {
                 port: 8080,
@@ -48749,6 +48753,7 @@ mod tests {
                     .unwrap(),
                 selector: WorkloadSelector::default(),
                 service_name: "reviews".to_string(),
+                service_namespace: None,
                 addresses: vec![addr.to_string()],
                 ports: vec![],
                 trust_domain: TrustDomain::new("remote.local").unwrap(),

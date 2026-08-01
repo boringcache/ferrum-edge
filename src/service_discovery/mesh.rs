@@ -121,7 +121,7 @@ impl MeshServiceDiscoverer {
         workload: &Workload,
         matching_service_spiffe_ids: &HashSet<&str>,
     ) -> bool {
-        if workload.namespace != service.namespace {
+        if workload.attached_service_namespace() != service.namespace {
             return false;
         }
 
@@ -551,7 +551,8 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
             .workloads
             .iter()
             .filter(|workload| {
-                workload.namespace == service.namespace && workload.service_name == service.name
+                workload.attached_service_namespace() == service.namespace
+                    && workload.service_name == service.name
             })
             .map(|workload| workload.spiffe_id.as_str())
             .collect();
@@ -889,6 +890,7 @@ mod tests {
             spiffe_id: spiffe(id),
             selector: WorkloadSelector::default(),
             service_name: service_name.to_string(),
+            service_namespace: None,
             addresses: addresses.into_iter().map(str::to_string).collect(),
             ports: ports
                 .into_iter()

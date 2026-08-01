@@ -429,6 +429,7 @@ fn workload_in_namespace(namespace: &str, spiffe: &str) -> Workload {
         spiffe_id: SpiffeId::new(spiffe).expect("valid spiffe"),
         selector: Default::default(),
         service_name: String::new(),
+        service_namespace: None,
         addresses: Vec::new(),
         ports: Vec::new(),
         trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),

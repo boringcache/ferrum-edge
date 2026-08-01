@@ -64,6 +64,18 @@ pub struct Workload {
     pub spiffe_id: SpiffeId,
     pub selector: WorkloadSelector,
     pub service_name: String,
+    /// Namespace of the [`MeshService`] this workload attaches to when it
+    /// differs from [`Self::namespace`].
+    ///
+    /// Same-namespace attachments leave this `None` and resolve through
+    /// [`Self::attached_service_namespace`]. Cross-namespace Istio
+    /// `WorkloadEntry.service` hosts set this to the authoritative target
+    /// Service namespace after ReferenceGrant + Service existence checks so
+    /// identity (`namespace` / SPIFFE) stays on the WorkloadEntry while
+    /// attachment matching / MeshService linking use the Service namespace.
+    /// Carried on native / xDS workloads carriers for CP↔DP parity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_namespace: Option<String>,
     /// Workload IPs or DNS names. Istio `WorkloadEntry.address` maps here;
     /// K8s pod IPs land here once the reconciler wires pod watching.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -124,6 +136,20 @@ pub struct Workload {
     /// ever set locally, after `fetch()`, by the remote-poll loop.
     #[serde(skip)]
     pub remote_provenance: bool,
+}
+
+impl Workload {
+    /// Namespace of the MeshService this workload participates in.
+    ///
+    /// Cross-namespace WorkloadEntry attachments stamp
+    /// [`Self::service_namespace`]; every other path (Pods, same-namespace
+    /// WorkloadEntry, native/xDS authors that omit the field) falls back to
+    /// [`Self::namespace`].
+    pub fn attached_service_namespace(&self) -> &str {
+        self.service_namespace
+            .as_deref()
+            .unwrap_or(self.namespace.as_str())
+    }
 }
 
 /// Destination NodeWaypoint transport endpoint for a workload.

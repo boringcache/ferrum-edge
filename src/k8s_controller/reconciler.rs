@@ -1870,6 +1870,7 @@ mod tests {
             .expect("test SPIFFE ID"),
             selector: WorkloadSelector::default(),
             service_name: "reviews".to_string(),
+            service_namespace: None,
             addresses: vec!["10.1.0.10".to_string()],
             ports: Vec::new(),
             trust_domain,

@@ -8730,6 +8730,7 @@ mod node_waypoint_stream_scope_tests {
                 namespace: Some("team-a".to_string()),
             },
             service_name: "api".to_string(),
+            service_namespace: None,
             addresses: Vec::new(),
             ports: Vec::new(),
             trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),

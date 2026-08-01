@@ -30,7 +30,7 @@ use super::{
     route_backends_require_node_waypoint_authz, route_local_fault_delay_for_rule,
     route_local_fault_value_for_rule, route_request_transformer_plugin_for_proxy,
     route_response_transformer_plugin_for_proxy, sidecar_selector_from_istio, string_array,
-    string_field, string_map, upstream_for_route, workload_entry_service_key_from_host,
+    resolve_workload_entry_service_attachment, string_field, string_map, upstream_for_route,
     workload_selector_from_istio,
 };
 use crate::config::types::{
@@ -2168,23 +2168,11 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         .get("service")
         .and_then(Value::as_str)
         .unwrap_or(&object.metadata.name);
-    let service_key = workload_entry_service_key_from_host(
-        service_raw,
-        &object.metadata.namespace,
-        &acc.options.cluster_domain,
-    );
-    match service_key.as_ref() {
-        Some(key) if key.namespace != object.metadata.namespace => {
-            return Err(invalid_resource(
-                object,
-                format!(
-                    "WorkloadEntry.service '{service_raw}' references Service namespace '{}' but WorkloadEntry namespace is '{}'; cross-namespace WorkloadEntry service hosts are not supported",
-                    key.namespace, object.metadata.namespace
-                ),
-            ));
-        }
-        _ => {}
-    }
+    let service_key =
+        resolve_workload_entry_service_attachment(acc, object, service_raw)?;
+    let service_namespace = service_key.as_ref().and_then(|key| {
+        (key.namespace != object.metadata.namespace).then(|| key.namespace.clone())
+    });
     let service_name = service_key
         .map(|key| key.name)
         .unwrap_or_else(|| service_raw.to_string());
@@ -2200,6 +2188,7 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
             namespace: Some(object.metadata.namespace.clone()),
         },
         service_name,
+        service_namespace,
         addresses: string_field(&object.spec, "address")
             .map(|address| vec![address.to_string()])
             .unwrap_or_default(),
@@ -6090,16 +6079,19 @@ mod tests {
     #[test]
     fn workload_entry_cross_namespace_service_host_fails_closed() {
         let err = translate_k8s_objects(
-            &[object(
+            &[object_with_metadata(
                 "WorkloadEntry",
+                "networking.istio.io/v1",
+                "vm-reviews",
+                "default",
                 serde_json::json!({
                     "address": "10.0.1.5",
                     "service": "reviews.prod.svc.cluster.local"
                 }),
             )],
-            options(),
+            options().with_source_namespaces(Vec::new()),
         )
-        .expect_err("cross-namespace WorkloadEntry service host must fail closed");
+        .expect_err("unauthorized cross-namespace WorkloadEntry service host must fail closed");
 
         let err = err.to_string();
         assert!(
@@ -6112,8 +6104,367 @@ mod tests {
         );
         assert!(
             err.contains("cross-namespace"),
-            "error should identify the unsupported cross-namespace reference: {err}"
+            "error should identify the cross-namespace reference: {err}"
         );
+        assert!(
+            err.contains("ReferenceGrant"),
+            "error should require a ReferenceGrant: {err}"
+        );
+    }
+
+    #[test]
+    fn workload_entry_cross_namespace_service_host_requires_authoritative_service() {
+        let grant = object_with_metadata(
+            "ReferenceGrant",
+            "gateway.networking.k8s.io/v1beta1",
+            "allow-we",
+            "prod",
+            serde_json::json!({
+                "from": [{
+                    "group": "networking.istio.io",
+                    "kind": "WorkloadEntry",
+                    "namespace": "default"
+                }],
+                "to": [{
+                    "group": "",
+                    "kind": "Service",
+                    "name": "reviews"
+                }]
+            }),
+        );
+        let err = translate_k8s_objects(
+            &[
+                grant,
+                object_with_metadata(
+                    "WorkloadEntry",
+                    "networking.istio.io/v1",
+                    "vm-reviews",
+                    "default",
+                    serde_json::json!({
+                        "address": "10.0.1.5",
+                        "serviceAccount": "reviews-vm",
+                        "service": "reviews.prod.svc.cluster.local"
+                    }),
+                ),
+            ],
+            options().with_source_namespaces(Vec::new()),
+        )
+        .expect_err("missing target Service must fail closed");
+
+        let err = err.to_string();
+        assert!(
+            err.contains("not present in the translated inventory"),
+            "error should mention missing Service inventory: {err}"
+        );
+    }
+
+    fn reference_grant_workload_entry_to_service(
+        grant_namespace: &str,
+        from_namespace: &str,
+        service_name: &str,
+    ) -> K8sObject {
+        object_with_metadata(
+            "ReferenceGrant",
+            "gateway.networking.k8s.io/v1beta1",
+            "allow-we",
+            grant_namespace,
+            serde_json::json!({
+                "from": [{
+                    "group": "networking.istio.io",
+                    "kind": "WorkloadEntry",
+                    "namespace": from_namespace
+                }],
+                "to": [{
+                    "group": "",
+                    "kind": "Service",
+                    "name": service_name
+                }]
+            }),
+        )
+    }
+
+    fn service_in_namespace(name: &str, namespace: &str, port: u16) -> K8sObject {
+        let mut service = object_with_metadata(
+            "Service",
+            "v1",
+            name,
+            namespace,
+            serde_json::json!({
+                "ports": [{"port": port, "name": "http", "targetPort": port}]
+            }),
+        );
+        service.metadata.name = name.to_string();
+        service.metadata.namespace = namespace.to_string();
+        service
+    }
+
+    #[test]
+    fn workload_entry_cross_namespace_service_attaches_when_authorized() {
+        let result = translate_k8s_objects(
+            &[
+                service_in_namespace("reviews", "prod", 9080),
+                reference_grant_workload_entry_to_service("prod", "vms", "reviews"),
+                object_with_metadata(
+                    "WorkloadEntry",
+                    "networking.istio.io/v1",
+                    "vm-reviews",
+                    "vms",
+                    serde_json::json!({
+                        "address": "10.9.0.5",
+                        "serviceAccount": "reviews-vm",
+                        "service": "reviews.prod.svc.cluster.local",
+                        "ports": {"http": 9080}
+                    }),
+                ),
+            ],
+            options()
+                .with_source_namespaces(Vec::new())
+                .with_pod_discovery_enabled(true),
+        )
+        .expect("authorized cross-namespace WorkloadEntry must translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let workload = mesh
+            .workloads
+            .iter()
+            .find(|workload| workload.addresses.iter().any(|a| a == "10.9.0.5"))
+            .expect("WorkloadEntry address must surface");
+        assert_eq!(workload.namespace, "vms");
+        assert_eq!(workload.service_name, "reviews");
+        assert_eq!(workload.service_namespace.as_deref(), Some("prod"));
+        assert_eq!(workload.attached_service_namespace(), "prod");
+        assert_eq!(
+            workload.spiffe_id.as_str(),
+            "spiffe://cluster.local/ns/vms/sa/reviews-vm"
+        );
+
+        let service = mesh
+            .services
+            .iter()
+            .find(|service| service.namespace == "prod" && service.name == "reviews")
+            .expect("target Service must materialize");
+        assert!(
+            service
+                .workloads
+                .iter()
+                .any(|reference| reference.spiffe_id == workload.spiffe_id),
+            "MeshService.workloads must reference the cross-namespace WorkloadEntry"
+        );
+
+        let matched = crate::modes::mesh::matched_local_service_workloads(service, &mesh.workloads, None);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].addresses, vec!["10.9.0.5".to_string()]);
+    }
+
+    #[test]
+    fn workload_entry_cross_namespace_wrong_grant_or_stale_target_fails_closed() {
+        let service = service_in_namespace("reviews", "prod", 9080);
+        let wrong_from = object_with_metadata(
+            "ReferenceGrant",
+            "gateway.networking.k8s.io/v1beta1",
+            "wrong-from",
+            "prod",
+            serde_json::json!({
+                "from": [{
+                    "group": "networking.istio.io",
+                    "kind": "WorkloadEntry",
+                    "namespace": "other-vms"
+                }],
+                "to": [{ "group": "", "kind": "Service", "name": "reviews" }]
+            }),
+        );
+        let err = translate_k8s_objects(
+            &[
+                service.clone(),
+                wrong_from,
+                object_with_metadata(
+                    "WorkloadEntry",
+                    "networking.istio.io/v1",
+                    "vm-reviews",
+                    "vms",
+                    serde_json::json!({
+                        "address": "10.9.0.5",
+                        "service": "reviews.prod.svc.cluster.local"
+                    }),
+                ),
+            ],
+            options().with_source_namespaces(Vec::new()),
+        )
+        .expect_err("ReferenceGrant from the wrong namespace must fail closed");
+        assert!(err.to_string().contains("ReferenceGrant"));
+
+        let wrong_to = object_with_metadata(
+            "ReferenceGrant",
+            "gateway.networking.k8s.io/v1beta1",
+            "wrong-to",
+            "prod",
+            serde_json::json!({
+                "from": [{
+                    "group": "networking.istio.io",
+                    "kind": "WorkloadEntry",
+                    "namespace": "vms"
+                }],
+                "to": [{ "group": "", "kind": "Service", "name": "other" }]
+            }),
+        );
+        let err = translate_k8s_objects(
+            &[
+                service,
+                wrong_to,
+                object_with_metadata(
+                    "WorkloadEntry",
+                    "networking.istio.io/v1",
+                    "vm-reviews",
+                    "vms",
+                    serde_json::json!({
+                        "address": "10.9.0.5",
+                        "service": "reviews.prod.svc.cluster.local"
+                    }),
+                ),
+            ],
+            options().with_source_namespaces(Vec::new()),
+        )
+        .expect_err("ReferenceGrant to the wrong Service name must fail closed");
+        assert!(err.to_string().contains("ReferenceGrant"));
+    }
+
+    #[test]
+    fn workload_entry_cross_namespace_update_retargets_and_delete_withdraws() {
+        let prod = service_in_namespace("reviews", "prod", 9080);
+        let staging = service_in_namespace("reviews", "staging", 9080);
+        let grant_prod = reference_grant_workload_entry_to_service("prod", "vms", "reviews");
+        let grant_staging = reference_grant_workload_entry_to_service("staging", "vms", "reviews");
+        let workload_prod = object_with_metadata(
+            "WorkloadEntry",
+            "networking.istio.io/v1",
+            "vm-reviews",
+            "vms",
+            serde_json::json!({
+                "address": "10.9.0.5",
+                "serviceAccount": "reviews-vm",
+                "service": "reviews.prod.svc.cluster.local"
+            }),
+        );
+        let opts = options()
+            .with_source_namespaces(Vec::new())
+            .with_pod_discovery_enabled(true);
+
+        let created = translate_k8s_objects(
+            &[prod.clone(), grant_prod.clone(), workload_prod.clone()],
+            opts.clone(),
+        )
+        .expect("create");
+        let mesh = created.config.mesh.as_ref().expect("mesh");
+        let prod_service = mesh
+            .services
+            .iter()
+            .find(|service| service.namespace == "prod" && service.name == "reviews")
+            .expect("prod service");
+        assert_eq!(prod_service.workloads.len(), 1);
+
+        let workload_staging = object_with_metadata(
+            "WorkloadEntry",
+            "networking.istio.io/v1",
+            "vm-reviews",
+            "vms",
+            serde_json::json!({
+                "address": "10.9.0.5",
+                "serviceAccount": "reviews-vm",
+                "service": "reviews.staging.svc.cluster.local"
+            }),
+        );
+        let updated = translate_k8s_objects(
+            &[
+                prod.clone(),
+                staging.clone(),
+                grant_prod.clone(),
+                grant_staging,
+                workload_staging,
+            ],
+            opts.clone(),
+        )
+        .expect("update retarget");
+        let mesh = updated.config.mesh.as_ref().expect("mesh");
+        let prod_service = mesh
+            .services
+            .iter()
+            .find(|service| service.namespace == "prod" && service.name == "reviews")
+            .expect("prod service");
+        let staging_service = mesh
+            .services
+            .iter()
+            .find(|service| service.namespace == "staging" && service.name == "reviews")
+            .expect("staging service");
+        assert!(
+            prod_service.workloads.is_empty(),
+            "update must withdraw the previous Service attachment"
+        );
+        assert_eq!(staging_service.workloads.len(), 1);
+        let workload = mesh
+            .workloads
+            .iter()
+            .find(|workload| workload.addresses.iter().any(|a| a == "10.9.0.5"))
+            .expect("workload");
+        assert_eq!(workload.service_namespace.as_deref(), Some("staging"));
+
+        let deleted = translate_k8s_objects(&[prod, staging, grant_prod], opts).expect("delete");
+        let mesh = deleted.config.mesh.as_ref().expect("mesh");
+        assert!(
+            mesh.workloads
+                .iter()
+                .all(|workload| !workload.addresses.iter().any(|a| a == "10.9.0.5")),
+            "deleting the WorkloadEntry must withdraw the workload"
+        );
+        assert!(
+            mesh.services
+                .iter()
+                .filter(|service| service.name == "reviews")
+                .all(|service| service.workloads.is_empty()),
+            "no Service may retain the withdrawn WorkloadEntry ref"
+        );
+    }
+
+    #[test]
+    fn workload_entry_cross_namespace_does_not_attach_unintended_same_name_service() {
+        let result = translate_k8s_objects(
+            &[
+                service_in_namespace("reviews", "prod", 9080),
+                service_in_namespace("reviews", "default", 9080),
+                reference_grant_workload_entry_to_service("prod", "vms", "reviews"),
+                object_with_metadata(
+                    "WorkloadEntry",
+                    "networking.istio.io/v1",
+                    "vm-reviews",
+                    "vms",
+                    serde_json::json!({
+                        "address": "10.9.0.5",
+                        "serviceAccount": "reviews-vm",
+                        "service": "reviews.prod.svc.cluster.local"
+                    }),
+                ),
+            ],
+            options()
+                .with_source_namespaces(Vec::new())
+                .with_pod_discovery_enabled(true),
+        )
+        .expect("authorized cross-namespace attachment");
+
+        let mesh = result.config.mesh.expect("mesh");
+        let default_service = mesh
+            .services
+            .iter()
+            .find(|service| service.namespace == "default" && service.name == "reviews")
+            .expect("same-name Service in WorkloadEntry namespace");
+        assert!(
+            default_service.workloads.is_empty(),
+            "must not widen attachment to an unintended same-name Service"
+        );
+        let prod_service = mesh
+            .services
+            .iter()
+            .find(|service| service.namespace == "prod" && service.name == "reviews")
+            .expect("intended Service");
+        assert_eq!(prod_service.workloads.len(), 1);
     }
 
     #[test]

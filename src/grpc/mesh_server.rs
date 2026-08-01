@@ -818,6 +818,7 @@ mod tests {
                 namespace: Some(namespace.to_string()),
             },
             service_name: service_name.to_string(),
+            service_namespace: None,
             addresses: vec![address.to_string()],
             ports: Vec::new(),
             trust_domain: TrustDomain::new("test.local")

@@ -1757,10 +1757,10 @@ fn narrow_workload_identities(
     workloads
         .into_iter()
         .filter(|workload| {
-            admitted_service_keys
-                .contains(&(workload.namespace.as_str(), workload.service_name.as_str()))
+            let service_ns = workload.attached_service_namespace();
+            admitted_service_keys.contains(&(service_ns, workload.service_name.as_str()))
                 && reachable_workloads.contains(&(
-                    workload.namespace.as_str(),
+                    service_ns,
                     workload.service_name.as_str(),
                     &workload.spiffe_id,
                 ))
@@ -3132,6 +3132,7 @@ mod tests {
                 namespace: Some(namespace.into()),
             },
             service_name: service.into(),
+            service_namespace: None,
             addresses: vec!["10.0.0.1".into()],
             ports: vec![WorkloadPort {
                 port: 8080,
@@ -5923,6 +5924,7 @@ mod tests {
                     namespace: Some("default".into()),
                 },
                 service_name: "v6".into(),
+                service_namespace: None,
                 addresses: vec!["2001:db8::10".into()],
                 ports: vec![WorkloadPort {
                     port: 8080,
@@ -5961,6 +5963,7 @@ mod tests {
                     namespace: Some("default".into()),
                 },
                 service_name: "v6".into(),
+                service_namespace: None,
                 addresses: vec!["[2001:0DB8::10]".into()],
                 ports: Vec::new(),
                 trust_domain,
