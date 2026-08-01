@@ -1092,10 +1092,13 @@ impl MeshSlice {
         // Host-scoping indexes for policy narrowing. Skipped entirely when no
         // Sidecar applies AND there is no host-targeting client policy to
         // scope — but a DestinationRule or VirtualService CORS policy now needs
-        // them unconditionally: resolving `reviews.beta` to its TARGET SERVICE
-        // namespace is what makes Istio's client → service → root lookup tiers
-        // (#2469) correct, and guessing the declaring namespace instead would
-        // silently mis-tier every namespaced short host.
+        // them unconditionally: these two indexes are the EVIDENCE that
+        // establishes who owns a policy's target host (`beta/reviews` in the
+        // service inventory, `api.example.com` in a visible ServiceEntry), and
+        // ownership is what makes Istio's client → service → root lookup tiers
+        // (#2469) a security boundary rather than a naming convention. Without
+        // them every host would fall back to "unowned", which is fail-closed
+        // but would drop legitimate service-tier policy.
         let (mesh_service_identities, service_entry_hosts) = if resolved_sidecar.is_some()
             || !mesh.destination_rules.is_empty()
             || !mesh.virtual_service_cors_policies.is_empty()
@@ -1105,7 +1108,7 @@ impl MeshSlice {
                 visible_service_entry_hosts(mesh, effective_namespace, &effective_labels),
             )
         } else {
-            (BTreeSet::new(), BTreeSet::new())
+            (BTreeSet::new(), BTreeMap::new())
         };
 
         let services: Vec<MeshService> = mesh
@@ -1365,24 +1368,34 @@ impl MeshSlice {
                 let Some(sidecar) = applicable_sidecar else {
                     return true;
                 };
-                let (resource_namespace, host_candidates) = policy_host_scope(
+                let host_scope = policy_host_scope(
                     &policy.host,
                     &policy.namespace,
                     &cluster_domain,
                     &mesh_service_identities,
                     &service_entry_hosts,
                 );
-                let policy_namespace = policy.namespace.as_str();
-                if policy_namespace != effective_namespace
-                    && policy_namespace != resource_namespace.as_str()
+                // Client-or-OWNER guard. The owner comes from
+                // `service_namespace` (evidence-backed), never from
+                // `scope_namespace` (which falls back to the policy's own
+                // namespace and would let any namespace vouch for itself):
+                // when ownership is unresolved or ambiguous only the client
+                // namespace's own CORS policy survives.
+                let policy_namespace = policy.namespace.trim();
+                if policy_namespace != effective_namespace.trim()
+                    && host_scope.service_namespace.as_deref() != Some(policy_namespace)
                 {
                     return false;
                 }
-                let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
+                let host_refs: Vec<&str> = host_scope
+                    .host_candidates
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
                 sidecar_egress_includes_service(
                     sidecar.namespace,
                     sidecar.egress,
-                    &resource_namespace,
+                    &host_scope.scope_namespace,
                     &host_refs,
                     None,
                 )
@@ -1885,7 +1898,7 @@ struct EgressScopeBuildContext<'a, L: WorkloadLabels + ?Sized> {
     workload_labels: &'a L,
     cluster_domain: &'a str,
     mesh_service_identities: &'a BTreeSet<(String, String)>,
-    service_entry_hosts: &'a BTreeSet<String>,
+    service_entry_hosts: &'a BTreeMap<String, ServiceEntryHostOwner>,
     sidecar_enforced: bool,
     dry_run: bool,
 }
@@ -2065,20 +2078,75 @@ fn mesh_service_identities(mesh: &MeshConfig) -> BTreeSet<(String, String)> {
     identities
 }
 
+/// Which namespace owns an external host declared by a visible ServiceEntry.
+///
+/// A ServiceEntry host has no Kubernetes `name.namespace` structure to read a
+/// namespace out of, so the DECLARING ServiceEntry is the only evidence of who
+/// owns it — and that ownership is what makes it the Istio service tier for
+/// DestinationRule lookup (issue #2469). Carrying the host without the owner
+/// (the pre-repair `BTreeSet<String>`) forced every rule for such a host to
+/// fall back to its OWN declaring namespace, which let a rule from an
+/// unrelated namespace nominate itself as the service tier for a host it does
+/// not own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ServiceEntryHostOwner {
+    /// Exactly one namespace declares this host across every visible
+    /// ServiceEntry.
+    Owned(String),
+    /// Two or more namespaces declare it. There is no single owner, so the
+    /// service tier is refused outright for this host — see
+    /// [`PolicyHostScope`].
+    Ambiguous,
+}
+
+/// Index the hosts of every ServiceEntry visible to this workload by their
+/// owning (declaring) namespace.
+///
+/// Duplicate declarations WITHIN one namespace are still a single owner —
+/// Istio merges those. Duplicates ACROSS namespaces are
+/// [`Ambiguous`](ServiceEntryHostOwner::Ambiguous): picking either owner would
+/// hand one of two mutually untrusting namespaces a policy tier over the
+/// other's clients, and picking by iteration order would make the winner
+/// depend on resource spelling — the exact defect #2469 exists to remove.
 fn visible_service_entry_hosts<L: WorkloadLabels + ?Sized>(
     mesh: &MeshConfig,
     workload_namespace: &str,
     workload_labels: &L,
-) -> BTreeSet<String> {
-    let mut hosts = BTreeSet::new();
+) -> BTreeMap<String, ServiceEntryHostOwner> {
+    let mut hosts: BTreeMap<String, ServiceEntryHostOwner> = BTreeMap::new();
     for entry in &mesh.service_entries {
         if !service_entry_applies_to_workload(entry, workload_namespace, workload_labels) {
             continue;
         }
+        let owner = entry
+            .namespace
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
         for host in &entry.hosts {
             let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-            if !host.is_empty() {
-                hosts.insert(host);
+            if host.is_empty() {
+                continue;
+            }
+            // A ServiceEntry with no declaring namespace cannot vouch for an
+            // owner, so it poisons the host rather than claiming it.
+            if owner.is_empty() {
+                hosts.insert(host, ServiceEntryHostOwner::Ambiguous);
+                continue;
+            }
+            match hosts.entry(host) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(ServiceEntryHostOwner::Owned(owner.clone()));
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    let same_owner = matches!(
+                        slot.get(),
+                        ServiceEntryHostOwner::Owned(existing) if *existing == owner
+                    );
+                    if !same_owner {
+                        slot.insert(ServiceEntryHostOwner::Ambiguous);
+                    }
+                }
             }
         }
     }
@@ -2119,8 +2187,18 @@ pub(crate) struct DestinationRuleScope<'a> {
     pub root_namespace: &'a str,
     pub cluster_domain: &'a str,
     pub mesh_service_identities: &'a BTreeSet<(String, String)>,
-    pub service_entry_hosts: &'a BTreeSet<String>,
+    pub service_entry_hosts: &'a BTreeMap<String, ServiceEntryHostOwner>,
 }
+
+/// Groups admitted DestinationRules by the destination they RESOLVE to, not by
+/// how they are spelled: the owning namespace (`None` when ownership could not
+/// be established) plus the canonical host.
+///
+/// Grouping on the resolved owner is what makes tier resolution meaningful —
+/// a client-namespace rule, the owning namespace's rule, and a root-namespace
+/// rule for one destination all land in the SAME group and are ranked, instead
+/// of each becoming its own single-member group that trivially "wins".
+type DestinationRuleGroupKey = (Option<String>, String);
 
 /// THE DestinationRule admission pass: export visibility, then Istio's
 /// client → service → root lookup tier, then the caller's own scope gate,
@@ -2132,18 +2210,29 @@ pub(crate) struct DestinationRuleScope<'a> {
 /// from re-opening #2465. A rule outside all three lookup namespaces is
 /// refused outright rather than kept as a low-priority extra.
 ///
-/// `extra_admits(rule, target_service_namespace, host_aliases)` carries the
+/// `extra_admits(rule, host_scope_namespace, host_aliases)` carries the
 /// caller-specific gate (Sidecar egress scope, service-waypoint namespace
 /// visibility). It runs after visibility so a hidden rule is never even
-/// offered to it.
+/// offered to it. Its namespace argument is
+/// `PolicyHostScope::scope_namespace` — a SCOPE input, deliberately distinct
+/// from the ownership claim tiering reads.
 ///
-/// Tier resolution groups by the RESOLVED destination — target service
-/// namespace plus canonical host — and keeps only the most specific tier
-/// present in each group. Ordering therefore comes from ownership, never from
-/// how `(namespace, name)` sorts, so renaming a namespace cannot flip which
-/// policy wins. Within one surviving tier every rule is same-namespace by
-/// construction (one owner), so those merge in the materializer's deterministic
-/// order; a group with more than one is reported once, bounded, with no
+/// The service tier is granted only on EVIDENCE of ownership (see
+/// `policy_target_service_ref`). A host whose owner cannot be established —
+/// an external host with no visible ServiceEntry, one claimed by ServiceEntries
+/// in two different namespaces, or an unqualified two-label host absent from
+/// the service inventory — has NO service tier, so only the client namespace
+/// and the configured root namespace may write policy for it. That is the
+/// fail-closed direction: it narrows admission, and an unrelated namespace can
+/// never nominate itself as the owner of a host it does not own.
+///
+/// Tier resolution groups by the RESOLVED destination — owning namespace plus
+/// canonical host — and keeps only the most specific tier present in each
+/// group. Ordering therefore comes from ownership, never from how
+/// `(namespace, name)` sorts, so renaming a namespace cannot flip which policy
+/// wins. Within one surviving tier every rule is same-namespace by construction
+/// (one owner), so those merge in the materializer's deterministic order; a
+/// group with more than one is reported once, bounded, with no
 /// operator-supplied host or value in the message.
 pub(crate) fn admit_destination_rules<'a, F>(
     candidates: impl Iterator<Item = &'a MeshDestinationRule>,
@@ -2154,13 +2243,16 @@ where
     F: FnMut(&MeshDestinationRule, &str, &[String]) -> bool,
 {
     // (group key, tier, rule)
-    let mut visible: Vec<((String, String), DestinationRuleLookupTier, &MeshDestinationRule)> =
-        Vec::new();
+    let mut visible: Vec<(
+        DestinationRuleGroupKey,
+        DestinationRuleLookupTier,
+        &MeshDestinationRule,
+    )> = Vec::new();
     for rule in candidates {
         if !destination_rule_exported_to_namespace(rule, scope.client_namespace) {
             continue;
         }
-        let (target_namespace, host_candidates) = destination_rule_host_scope(
+        let host_scope = destination_rule_host_scope(
             rule,
             scope.cluster_domain,
             scope.mesh_service_identities,
@@ -2169,20 +2261,29 @@ where
         let tier = destination_rule_lookup_tier(
             &rule.namespace,
             scope.client_namespace,
-            &target_namespace,
+            host_scope.service_namespace.as_deref(),
             scope.root_namespace,
         );
         if !tier.is_in_lookup_path() {
             continue;
         }
-        if !extra_admits(rule, &target_namespace, &host_candidates) {
+        if !extra_admits(
+            rule,
+            &host_scope.scope_namespace,
+            &host_scope.host_candidates,
+        ) {
             continue;
         }
-        let group_host = host_candidates.first().cloned().unwrap_or_default();
-        visible.push(((target_namespace, group_host), tier, rule));
+        let group_host = host_scope
+            .host_candidates
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        visible.push(((host_scope.service_namespace, group_host), tier, rule));
     }
 
-    let mut winning_tier: BTreeMap<&(String, String), DestinationRuleLookupTier> = BTreeMap::new();
+    let mut winning_tier: BTreeMap<&DestinationRuleGroupKey, DestinationRuleLookupTier> =
+        BTreeMap::new();
     for (key, tier, _) in &visible {
         let slot = winning_tier.entry(key).or_insert(*tier);
         if *tier < *slot {
@@ -2191,7 +2292,7 @@ where
     }
 
     let mut admitted: Vec<MeshDestinationRule> = Vec::new();
-    let mut per_group_kept: BTreeMap<&(String, String), usize> = BTreeMap::new();
+    let mut per_group_kept: BTreeMap<&DestinationRuleGroupKey, usize> = BTreeMap::new();
     for (key, tier, rule) in &visible {
         if winning_tier.get(key) != Some(tier) {
             continue;
@@ -2215,8 +2316,8 @@ fn destination_rule_host_scope(
     rule: &MeshDestinationRule,
     cluster_domain: &str,
     mesh_service_identities: &BTreeSet<(String, String)>,
-    service_entry_hosts: &BTreeSet<String>,
-) -> (String, Vec<String>) {
+    service_entry_hosts: &BTreeMap<String, ServiceEntryHostOwner>,
+) -> PolicyHostScope {
     policy_host_scope(
         &rule.host,
         &rule.namespace,
@@ -2226,17 +2327,49 @@ fn destination_rule_host_scope(
     )
 }
 
-/// Resolve a host-targeting policy's `(host, namespace)` pair to the target
-/// service's namespace plus the host alias set. Shared by DestinationRule
-/// narrowing and VirtualService-CORS narrowing so a policy host is scoped
-/// with ONE set of semantics.
+/// A host-targeting policy's resolved destination.
+///
+/// Splitting the two namespaces apart is the core of the #2469 repair. Before
+/// it, ONE namespace served as both "who owns the target service" (a
+/// SECURITY decision — it decides which third parties may write policy for
+/// this destination) and "which namespace the Sidecar egress patterns
+/// `./host` and `ns/host` resolve against" (a SCOPE decision). Collapsing them
+/// meant an unresolvable host silently promoted the POLICY'S OWN namespace to
+/// service owner.
+pub(crate) struct PolicyHostScope {
+    /// The namespace that owns the target service, when it is established by
+    /// evidence: the service inventory, the host's own `*.svc[.domain]`
+    /// structure, an unambiguously-declared visible ServiceEntry, or Istio
+    /// short-name resolution against the policy's own namespace.
+    ///
+    /// `None` means ownership is UNKNOWN or AMBIGUOUS, which disables the
+    /// service tier entirely — only the client namespace and the configured
+    /// root namespace may then write policy for this host. It is never
+    /// back-filled with the policy's own namespace: that is precisely how an
+    /// unrelated namespace used to invent a service tier for a host it does
+    /// not own.
+    pub service_namespace: Option<String>,
+    /// The namespace the CALLER's own host-scope gate resolves `.`/`ns`
+    /// Sidecar egress patterns against. Equals the resolved owner where one
+    /// exists (so a DestinationRule for a ServiceEntry host is egress-scoped
+    /// exactly like that ServiceEntry itself) and falls back to the policy's
+    /// declaring namespace otherwise. This is a scope gate, NOT a policy
+    /// ownership claim — the two must not be conflated again.
+    pub scope_namespace: String,
+    /// Host aliases matched against Sidecar egress patterns.
+    pub host_candidates: Vec<String>,
+}
+
+/// Resolve a host-targeting policy's `(host, namespace)` pair to its target
+/// destination. Shared by DestinationRule narrowing and VirtualService-CORS
+/// narrowing so a policy host is scoped with ONE set of semantics.
 fn policy_host_scope(
     policy_host: &str,
     policy_namespace: &str,
     cluster_domain: &str,
     mesh_service_identities: &BTreeSet<(String, String)>,
-    service_entry_hosts: &BTreeSet<String>,
-) -> (String, Vec<String>) {
+    service_entry_hosts: &BTreeMap<String, ServiceEntryHostOwner>,
+) -> PolicyHostScope {
     let host = policy_host
         .trim()
         .trim_end_matches('.')
@@ -2250,59 +2383,122 @@ fn policy_host_scope(
         .trim_end_matches('.')
         .to_ascii_lowercase();
 
-    destination_rule_service_ref_from_host(
+    match policy_target_service_ref(
         &host,
         &rule_namespace,
         &cluster_domain,
         mesh_service_identities,
         service_entry_hosts,
-    )
-    .map(|(service_name, service_namespace)| {
-        let candidates = service_host_aliases(&service_name, &service_namespace, &cluster_domain);
-        (service_namespace, candidates)
-    })
-    .unwrap_or_else(|| (rule_namespace, vec![host]))
+    ) {
+        PolicyTargetRef::ClusterService { name, namespace } => {
+            let host_candidates = service_host_aliases(&name, &namespace, &cluster_domain);
+            PolicyHostScope {
+                service_namespace: Some(namespace.clone()),
+                scope_namespace: namespace,
+                host_candidates,
+            }
+        }
+        // An external ServiceEntry host has no Kubernetes alias family — it is
+        // matched verbatim, and egress-scoped against its DECLARING namespace
+        // exactly like the ServiceEntry that owns it.
+        PolicyTargetRef::ExternalHost { namespace } => PolicyHostScope {
+            service_namespace: Some(namespace.clone()),
+            scope_namespace: namespace,
+            host_candidates: vec![host],
+        },
+        PolicyTargetRef::Unresolved => PolicyHostScope {
+            service_namespace: None,
+            scope_namespace: rule_namespace,
+            host_candidates: vec![host],
+        },
+    }
 }
 
-fn destination_rule_service_ref_from_host(
+/// What a policy host resolves to.
+enum PolicyTargetRef {
+    /// An in-cluster Kubernetes Service.
+    ClusterService { name: String, namespace: String },
+    /// An external host owned by a visible ServiceEntry.
+    ExternalHost { namespace: String },
+    /// No owning namespace could be established from evidence.
+    Unresolved,
+}
+
+/// Resolve a policy host to its owning namespace, in strict
+/// most-authoritative-evidence-first order. Every arm below either reads the
+/// namespace out of the host's own structure or proves it against an
+/// inventory; nothing here infers ownership from the POLICY's namespace except
+/// Istio's own short-name rule, which is definitionally self-scoped.
+fn policy_target_service_ref(
     host: &str,
     rule_namespace: &str,
     cluster_domain: &str,
     mesh_service_identities: &BTreeSet<(String, String)>,
-    service_entry_hosts: &BTreeSet<String>,
-) -> Option<(String, String)> {
+    service_entry_hosts: &BTreeMap<String, ServiceEntryHostOwner>,
+) -> PolicyTargetRef {
     if host.is_empty() || rule_namespace.is_empty() || host.contains('*') {
-        return None;
+        return PolicyTargetRef::Unresolved;
     }
-    if service_entry_hosts.contains(host) {
-        return None;
-    }
+
+    // 1. Istio short-name resolution: a bare `reviews` in namespace `beta`
+    //    IS `reviews.beta`. Self-scoped by definition, so it can only ever
+    //    make a namespace the owner of its OWN service.
     if !host.contains('.') {
-        return Some((host.to_string(), rule_namespace.to_string()));
+        return PolicyTargetRef::ClusterService {
+            name: host.to_string(),
+            namespace: rule_namespace.to_string(),
+        };
     }
 
-    if let Some((name, namespace)) = split_canonical_service_host(host)
-        && mesh_service_identity_exists(mesh_service_identities, namespace, name)
-    {
-        return Some((name.to_string(), namespace.to_string()));
-    }
-
+    // 2. Structurally-qualified Kubernetes references (`name.ns.svc`,
+    //    `name.ns.svc.<cluster domain>`). The namespace is pinned by the host
+    //    SYNTAX, so no inventory evidence is needed and no ServiceEntry can
+    //    claim ownership of one of these by declaring the same string.
     if let Some((name, namespace)) = host
         .strip_suffix(".svc")
         .and_then(split_canonical_service_host)
     {
-        return Some((name.to_string(), namespace.to_string()));
+        return PolicyTargetRef::ClusterService {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+        };
     }
-
     if !cluster_domain.is_empty()
         && let Some((name, namespace)) = host
             .strip_suffix(&format!(".svc.{cluster_domain}"))
             .and_then(split_canonical_service_host)
     {
-        return Some((name.to_string(), namespace.to_string()));
+        return PolicyTargetRef::ClusterService {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+        };
     }
 
-    None
+    // 3. Two-label `name.namespace` shorthand. This shape is syntactically
+    //    INDISTINGUISHABLE from a two-label external DNS name (`example.com`
+    //    would otherwise nominate a namespace `com`), so it is honored only
+    //    when the service inventory confirms the pair exists. A cluster
+    //    Service outranks any ServiceEntry declaring the same string.
+    if let Some((name, namespace)) = split_canonical_service_host(host)
+        && mesh_service_identity_exists(mesh_service_identities, namespace, name)
+    {
+        return PolicyTargetRef::ClusterService {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+        };
+    }
+
+    // 4. An external host declared by a ServiceEntry this workload can see.
+    //    Ambiguous ownership resolves to `Unresolved`, NOT to a guess: with no
+    //    single owner the service tier is refused for this host and only the
+    //    client and root tiers may write policy for it. Refusing narrows
+    //    admission; guessing would widen it.
+    match service_entry_hosts.get(host) {
+        Some(ServiceEntryHostOwner::Owned(namespace)) => PolicyTargetRef::ExternalHost {
+            namespace: namespace.clone(),
+        },
+        Some(ServiceEntryHostOwner::Ambiguous) | None => PolicyTargetRef::Unresolved,
+    }
 }
 
 fn mesh_service_identity_exists(

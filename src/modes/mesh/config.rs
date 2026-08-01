@@ -1271,19 +1271,30 @@ impl DestinationRuleLookupTier {
 /// the client's and the service's is `Client`), so tier assignment never
 /// depends on how `(namespace, name)` happens to sort.
 ///
-/// An empty `root_namespace` disables the root tier rather than matching every
-/// rule whose namespace is also empty.
+/// `service_namespace` is `None` when the caller could not establish, from
+/// evidence, which namespace owns the target service — an ambiguously owned
+/// external host, or a two-label short host with no matching entry in the
+/// service inventory. That DISABLES the service tier rather than guessing a
+/// namespace: guessing lets a rule from an unrelated namespace nominate itself
+/// as the owner of a host it does not own (issue #2469).
+///
+/// EVERY tier comparison is guarded against an empty namespace on the
+/// authoritative side. An empty `client_namespace`, `service_namespace`, or
+/// `root_namespace` disables that tier rather than matching every rule whose
+/// own namespace also trims to empty.
 pub fn destination_rule_lookup_tier(
     rule_namespace: &str,
     client_namespace: &str,
-    service_namespace: &str,
+    service_namespace: Option<&str>,
     root_namespace: &str,
 ) -> DestinationRuleLookupTier {
     let rule_namespace = rule_namespace.trim();
+    let client_namespace = client_namespace.trim();
+    let service_namespace = service_namespace.map(str::trim).filter(|ns| !ns.is_empty());
     let root_namespace = root_namespace.trim();
-    if rule_namespace == client_namespace.trim() {
+    if !client_namespace.is_empty() && rule_namespace == client_namespace {
         DestinationRuleLookupTier::Client
-    } else if rule_namespace == service_namespace.trim() {
+    } else if service_namespace == Some(rule_namespace) {
         DestinationRuleLookupTier::Service
     } else if !root_namespace.is_empty() && rule_namespace == root_namespace {
         DestinationRuleLookupTier::Root
@@ -2363,18 +2374,20 @@ pub struct MeshVirtualServiceCorsPolicy {
 /// Returns true when a VirtualService-derived CORS policy is visible to a
 /// workload namespace — the [`service_entry_exported_to_namespace`] rules
 /// applied to the carried `export_to` field.
+///
+/// Routes through the ONE shared evaluator `export_visibility_admits`, so
+/// ServiceEntry, DestinationRule, and VirtualService-derived CORS can never
+/// drift apart on what `.`, `*`, an explicit namespace, or an EMPTY list
+/// means. `validate_virtual_service_cors_policies` runs the same
+/// [`validate_mesh_export_to`] fail-closed boundary check DestinationRules
+/// get, so the shared helper's entry trimming can only ever canonicalize a
+/// value the resource's own author wrote — never reinterpret one validation
+/// would have rejected.
 pub fn virtual_service_cors_policy_exported_to_namespace(
     policy: &MeshVirtualServiceCorsPolicy,
     workload_namespace: &str,
 ) -> bool {
-    if policy.export_to.is_empty() {
-        return policy.namespace == workload_namespace;
-    }
-    policy.export_to.iter().any(|target| {
-        target == "*"
-            || target == workload_namespace
-            || (target == "." && policy.namespace == workload_namespace)
-    })
+    export_visibility_admits(&policy.export_to, &policy.namespace, workload_namespace)
 }
 
 /// The Istio `corsPolicy` fields Ferrum projects onto the `cors` plugin.
@@ -3247,6 +3260,12 @@ fn validate_virtual_service_cors_policies(
         validate_non_empty_string(format!("{context}.name"), &policy.name, errors);
         validate_non_empty_string(format!("{context}.namespace"), &policy.namespace, errors);
         validate_non_empty_string(format!("{context}.host"), &policy.host, errors);
+        // Same fail-closed export boundary DestinationRules get: this list is
+        // the ONLY thing standing between a namespace-local CORS policy and
+        // another tenant's outbound routes, and
+        // `virtual_service_cors_policy_exported_to_namespace` interprets it
+        // through the shared evaluator rather than re-validating it.
+        validate_mesh_export_to(&context, &policy.export_to, errors);
         if policy.cors.allowed_origins.is_empty() {
             errors.push(format!(
                 "{context}: cors.allowed_origins must declare at least one origin matcher"

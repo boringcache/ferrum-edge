@@ -2537,4 +2537,95 @@ mod virtual_service_cors {
             &p, "team-b"
         ));
     }
+
+    /// `export_visibility_admits` is documented as the ONE evaluator shared by
+    /// ServiceEntry, DestinationRule, and VirtualService-derived CORS. This
+    /// pins that VirtualService CORS really does route through it rather than
+    /// carrying a private copy that can drift: for every list shape, the
+    /// verdict must equal the ServiceEntry verdict for the same
+    /// `(export_to, declaring namespace)` pair.
+    #[test]
+    fn export_visibility_matches_the_shared_service_entry_evaluator_exactly() {
+        for export_to in [
+            Vec::new(),
+            vec![".".to_string()],
+            vec!["*".to_string()],
+            vec!["team-a".to_string()],
+            vec!["team-a".to_string(), "team-b".to_string()],
+        ] {
+            let mut cors = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+            cors.export_to = export_to.clone();
+            let entry = ferrum_edge::modes::mesh::config::ServiceEntry {
+                name: "se".into(),
+                namespace: cors.namespace.clone(),
+                hosts: vec!["api.example.com".into()],
+                endpoints: Vec::new(),
+                resolution: Default::default(),
+                location: Default::default(),
+                ports: Vec::new(),
+                export_to,
+                workload_selector: None,
+            };
+            for workload_namespace in ["default", "team-a", "team-b", "other"] {
+                assert_eq!(
+                    virtual_service_cors_policy_exported_to_namespace(&cors, workload_namespace),
+                    ferrum_edge::modes::mesh::config::service_entry_exported_to_namespace(
+                        &entry,
+                        workload_namespace
+                    ),
+                    "export_to {:?} / workload namespace {workload_namespace:?}: the CORS \
+                     evaluator must not diverge from the shared one",
+                    cors.export_to
+                );
+            }
+        }
+    }
+
+    /// Sharing the evaluator is only safe if this list gets the same
+    /// fail-closed boundary check `DestinationRule.exportTo` gets — otherwise
+    /// hostile values would reach the shared helper's lenient
+    /// entry-normalization instead of being refused.
+    #[test]
+    fn hostile_export_to_values_are_rejected_not_interpreted() {
+        for (label, export_to) in [
+            ("tilde", vec!["~".to_string()]),
+            ("empty entry", vec![String::new()]),
+            ("uppercase namespace", vec!["Team-A".to_string()]),
+            ("namespace with a slash", vec!["team-a/svc".to_string()]),
+            (
+                "wildcard mixed with an explicit namespace",
+                vec!["*".to_string(), "team-a".to_string()],
+            ),
+            (
+                "over-long list",
+                (0..65).map(|i| format!("ns-{i}")).collect(),
+            ),
+        ] {
+            let mut p = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+            p.export_to = export_to;
+            let errors = validate(vec![p]);
+            assert!(
+                errors.iter().any(|error| error.contains("exportTo")),
+                "{label}: must be rejected at validation, got {errors:?}"
+            );
+        }
+    }
+
+    /// And the hostile value itself never reaches the diagnostic.
+    #[test]
+    fn export_to_rejection_does_not_echo_the_hostile_value() {
+        let hostile = "Q".repeat(200);
+        let mut p = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+        p.export_to = vec![hostile.clone()];
+        let errors = validate(vec![p]);
+        assert!(
+            errors.iter().any(|error| error.contains("exportTo")),
+            "{errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|error| error.contains(&hostile)),
+            "the diagnostic must name the field and index, never echo the raw \
+             operator-supplied value; got {errors:?}"
+        );
+    }
 }

@@ -16,7 +16,8 @@ use ferrum_edge::config_sources::k8s::{
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshDestinationRule, MeshLoadBalancer, MeshService, MeshSidecar, MeshSidecarEgress,
-    MeshSimpleLb, MtlsMode, ServicePort, destination_rule_exported_to_namespace,
+    MeshSimpleLb, MtlsMode, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+    destination_rule_exported_to_namespace,
 };
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use serde_json::{Value, json};
@@ -692,7 +693,7 @@ fn dr_lookup_hierarchy_client_then_service_then_root() {
         feature = "DestinationRule lookup hierarchy (client → service → root namespace)",
         status = Status::Supported,
         maturity = Maturity::Ga,
-        notes = "Resolved in slice narrowing and re-applied per upstream at materialization. The configured istio_root_namespace is the final fallback tier. Composes with exportTo: a rule the subscriber cannot see is never a candidate for any tier.",
+        notes = "Resolved in slice narrowing and re-applied per upstream at materialization. The configured istio_root_namespace is the final fallback tier. Composes with exportTo: a rule the subscriber cannot see is never a candidate for any tier. The service tier is granted only on evidence of ownership — the service inventory, a .svc-qualified host, or the namespace of exactly one visible ServiceEntry for an external host; an unknown or contested owner disables the tier rather than defaulting to the rule's own namespace.",
     );
 
     let host = "reviews.beta.svc.cluster.local";
@@ -723,6 +724,77 @@ fn dr_lookup_hierarchy_client_then_service_then_root() {
         ),
         vec!["mesh-default".to_string()]
     );
+
+    // The same three tiers for an EXTERNAL host, whose service tier is the
+    // namespace of the ServiceEntry that declares it.
+    let external = "api.example.com";
+    let entries = vec![external_service_entry("beta", external)];
+    assert_eq!(
+        admitted_names_with_entries(
+            entries.clone(),
+            vec![
+                dr_named("istio-system", "mesh-default", external),
+                dr_named("beta", "service-default", external),
+                dr_named("alpha", "client-override", external),
+            ],
+            "alpha",
+        ),
+        vec!["client-override".to_string()]
+    );
+    assert_eq!(
+        admitted_names_with_entries(
+            entries.clone(),
+            vec![
+                dr_named("istio-system", "mesh-default", external),
+                dr_named("beta", "service-default", external),
+            ],
+            "alpha",
+        ),
+        vec!["service-default".to_string()],
+        "the declaring ServiceEntry's namespace is the service tier"
+    );
+    // A namespace that owns nothing here is not a tier, however it exports
+    // itself; and contested ownership disables the service tier rather than
+    // picking a claimant.
+    assert!(
+        admitted_names_with_entries(
+            entries,
+            vec![dr_named("evil", "hijack", external)],
+            "alpha",
+        )
+        .is_empty()
+    );
+    assert!(
+        admitted_names_with_entries(
+            vec![
+                external_service_entry("beta", external),
+                external_service_entry("gamma", external),
+            ],
+            vec![dr_named("beta", "service-default", external)],
+            "alpha",
+        )
+        .is_empty()
+    );
+}
+
+/// A mesh-external `ServiceEntry` exported mesh-wide.
+fn external_service_entry(namespace: &str, host: &str) -> ServiceEntry {
+    ServiceEntry {
+        name: format!("{namespace}-external"),
+        namespace: namespace.to_string(),
+        hosts: vec![host.to_string()],
+        endpoints: Vec::new(),
+        resolution: Resolution::Dns,
+        location: ServiceEntryLocation::MeshExternal,
+        ports: vec![ServicePort {
+            port: 443,
+            protocol: Default::default(),
+            name: Some("https".to_string()),
+            target_port: None,
+        }],
+        export_to: vec!["*".to_string()],
+        workload_selector: None,
+    }
 }
 
 fn dr_named(namespace: &str, name: &str, host: &str) -> MeshDestinationRule {
@@ -741,8 +813,17 @@ fn dr_named(namespace: &str, name: &str, host: &str) -> MeshDestinationRule {
 /// (cross-namespace lookup only arises inside an egress scope) and return the
 /// admitted rule names.
 fn admitted_names(destination_rules: Vec<MeshDestinationRule>, namespace: &str) -> Vec<String> {
+    admitted_names_with_entries(Vec::new(), destination_rules, namespace)
+}
+
+fn admitted_names_with_entries(
+    service_entries: Vec<ServiceEntry>,
+    destination_rules: Vec<MeshDestinationRule>,
+    namespace: &str,
+) -> Vec<String> {
     let mesh = MeshConfig {
         istio_root_namespace: "istio-system".to_string(),
+        service_entries,
         services: vec![MeshService {
             cluster_ips: Vec::new(),
             name: "reviews".to_string(),

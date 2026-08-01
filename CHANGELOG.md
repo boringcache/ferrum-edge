@@ -35,6 +35,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sidecar.destination_rule.export_to_namespace_visibility` and
   `sidecar.destination_rule.lookup_tier_client_wins`.
 
+  The target-service tier is granted only on evidence of ownership: an
+  in-cluster Service confirmed by the service inventory or pinned by a
+  `.svc`-qualified host, a short host resolved in the rule's own namespace per
+  Istio, or an external host declared by exactly one visible `ServiceEntry` —
+  in which case that ServiceEntry's namespace is the owner. When ownership
+  cannot be established — an external host with no visible ServiceEntry, a
+  wildcard host, an unconfirmed two-label host, or a host claimed by visible
+  ServiceEntries in two different namespaces — the service tier is disabled
+  for that host and only the client and root namespaces may write policy for
+  it. Ferrum never falls back to treating a rule's own declaring namespace as
+  the owner, which would let a public DestinationRule from an unrelated
+  namespace nominate itself as the service tier for an external host it does
+  not own and reach the subscriber's materialized upstreams.
+
+- `virtual_service_cors_policies[].export_to` is now validated with the same
+  fail-closed boundary check `DestinationRule.exportTo` and, like ServiceEntry
+  and DestinationRule visibility, is evaluated through the one shared
+  `export_visibility_admits` helper. Malformed lists (`~`, empty entries,
+  non-RFC-1123 namespace names, over-long lists, `*` mixed with an explicit
+  namespace) on a native/file/xDS source are now a config rejection instead of
+  being interpreted at evaluation time.
+
 - Kubernetes controller watch scopes now rebuild their reflector from an
   authoritative list when they go idle past `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`
   (default `300`, `0` disables, clamped to `0`–`86400`). kube-rs raises an

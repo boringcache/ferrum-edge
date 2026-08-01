@@ -7638,7 +7638,7 @@ fn materialization_destination_rule_tier(
     match destination_rule_lookup_tier(
         &dr.namespace,
         client_namespace,
-        &upstream.namespace,
+        Some(upstream.namespace.as_str()),
         // Root is resolved at slice build; see the doc comment.
         "",
     ) {

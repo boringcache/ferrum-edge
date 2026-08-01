@@ -2711,12 +2711,36 @@ fn virtual_service_routes(
         .and_then(|http| http.get("corsPolicy"))
         .and_then(mesh_cors_policy_from_value)
     {
+        // Same fail-closed boundary the DestinationRule path applies: this
+        // list is the only thing keeping a namespace-local CORS policy off
+        // another tenant's outbound routes, and
+        // `virtual_service_cors_policy_exported_to_namespace` interprets it
+        // through the shared `export_visibility_admits` evaluator rather than
+        // re-validating it. Rejecting HERE keeps a malformed VirtualService a
+        // per-resource `FerrumAccepted=False` instead of letting it reach the
+        // mesh-config backstop and refuse the whole config.
+        //
+        // `optional_string_array` (not the lossy `string_array`) for the same
+        // reason the DestinationRule path uses it: a non-array `exportTo`, or
+        // a non-string entry, would otherwise be silently dropped and the
+        // policy would default to Istio's PUBLIC `["*"]` — a fail-open on the
+        // one field that bounds the policy's blast radius.
         let export_to = {
-            let declared = string_array(&object.spec, "exportTo");
+            let declared = optional_string_array(
+                object,
+                &object.spec,
+                "exportTo",
+                "VirtualService spec.exportTo",
+            )?;
+            let mut errors = Vec::new();
+            validate_mesh_export_to("VirtualService spec", &declared, &mut errors);
+            if let Some(first) = errors.first() {
+                return Err(invalid_resource(object, first.clone()));
+            }
             if declared.is_empty() {
                 vec!["*".to_string()]
             } else {
-                declared
+                declared.iter().map(|entry| entry.trim().to_string()).collect()
             }
         };
         for host in &hosts {

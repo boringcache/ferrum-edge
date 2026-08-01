@@ -24,6 +24,11 @@
 //! * Carrier/native parity and reload/dedupe behaviour for a visibility-only
 //!   or root-namespace-only change.
 //! * Composition with Sidecar egress scope.
+//! * Target-service OWNERSHIP: a ServiceEntry's declaring namespace is the
+//!   service tier for its external host; an unrelated namespace cannot become
+//!   one by publishing a rule; contested ownership disables the tier instead
+//!   of guessing an owner; and the admission resolver never disagrees with
+//!   `destination_rule_host_matches` in a direction that invents a tier.
 
 use std::collections::HashMap;
 
@@ -35,8 +40,8 @@ use ferrum_edge::identity::SpiffeId;
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshDestinationRule, MeshLoadBalancer, MeshService, MeshSidecar, MeshSidecarEgress,
-    MeshSimpleLb, MeshTrafficPolicy, ServicePort, Workload, WorkloadRef,
-    destination_rule_exported_to_namespace,
+    MeshSimpleLb, MeshTrafficPolicy, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+    Workload, WorkloadRef, destination_rule_exported_to_namespace,
 };
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use ferrum_edge::modes::mesh::{MeshRuntimeConfig, prepare_gateway_config_for_mesh};
@@ -1051,5 +1056,451 @@ fn export_to_does_not_override_sidecar_egress_scope() {
         slice.destination_rules.is_empty(),
         "a publicly exported rule for a host outside the Sidecar egress scope \
          still must not be carried"
+    );
+}
+
+// ── Target-service ownership: who is allowed to BE the service tier ──────
+//
+// The service tier is a security boundary — it names the third-party namespace
+// that may write traffic policy for a destination. These cases pin that it is
+// granted only on evidence of ownership, and that an unresolvable or contested
+// owner DISABLES the tier rather than defaulting to the rule's own namespace
+// (which would let any namespace vouch for itself).
+
+const EXTERNAL_HOST: &str = "api.example.com";
+
+/// A `ServiceEntry` declaring an external host, visible to every namespace.
+fn external_service_entry(namespace: &str, name: &str, host: &str) -> ServiceEntry {
+    ServiceEntry {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        hosts: vec![host.to_string()],
+        endpoints: Vec::new(),
+        resolution: Resolution::Dns,
+        location: ServiceEntryLocation::MeshExternal,
+        ports: vec![ServicePort {
+            port: 443,
+            protocol: Default::default(),
+            name: Some("https".to_string()),
+            target_port: None,
+        }],
+        export_to: vec!["*".to_string()],
+        workload_selector: None,
+    }
+}
+
+/// Effective connect timeout on an operator upstream for an EXTERNAL host,
+/// end to end through slice narrowing AND `apply_destination_rules`.
+///
+/// `upstream_namespace` is the namespace the materialization pass reads as the
+/// upstream's owner; the admission pass independently resolves ownership from
+/// the visible ServiceEntry, so the two are supplied separately on purpose —
+/// a test can then observe them DISAGREEING rather than being told they agree.
+fn materialized_external_connect_timeout(
+    mesh: MeshConfig,
+    client_namespace: &str,
+    upstream_namespace: &str,
+) -> (u64, u64) {
+    let mut upstream = http_upstream("ext-u", EXTERNAL_HOST, 443);
+    upstream.namespace = upstream_namespace.to_string();
+    upstream.name = Some(EXTERNAL_HOST.to_string());
+    let mut proxy = http_proxy("ext-p", EXTERNAL_HOST, 443);
+    proxy.namespace = upstream_namespace.to_string();
+    proxy.upstream_id = Some("ext-u".to_string());
+    let baseline = proxy.backend_connect_timeout_ms;
+
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        upstreams: vec![upstream],
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+    let runtime = MeshRuntimeConfig {
+        namespace: client_namespace.to_string(),
+        sidecar_enforced: true,
+        ..default_mesh_runtime()
+    };
+    let prepared =
+        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+    let effective = prepared
+        .proxies
+        .iter()
+        .find(|p| p.id == "ext-p")
+        .expect("operator proxy survives mesh preparation")
+        .backend_connect_timeout_ms;
+    (effective, baseline)
+}
+
+/// A mesh with one `beta`-owned external host, an `alpha` client, and whatever
+/// DestinationRules the case under test supplies.
+fn external_host_mesh(entries: Vec<ServiceEntry>, rules: Vec<MeshDestinationRule>) -> MeshConfig {
+    MeshConfig {
+        istio_root_namespace: "istio-system".to_string(),
+        service_entries: entries,
+        workloads: vec![workload_in("alpha", "web")],
+        destination_rules: rules,
+        sidecars: vec![permissive_sidecar("alpha")],
+        ..MeshConfig::default()
+    }
+}
+
+#[test]
+fn a_service_entrys_declaring_namespace_is_the_service_tier_for_its_external_host() {
+    let mesh = external_host_mesh(
+        vec![external_service_entry("beta", "external-api", EXTERNAL_HOST)],
+        vec![rule("beta", "owner-policy", EXTERNAL_HOST, 2222, &["*"])],
+    );
+    assert_eq!(
+        admitted_rule_names(&mesh, "alpha"),
+        vec!["owner-policy".to_string()],
+        "the namespace that DECLARES the ServiceEntry owns its external host \
+         and is therefore the service tier for it"
+    );
+}
+
+/// The #2469 boundary at admission: an unrelated namespace cannot make itself
+/// the owner of an external host merely by publishing a rule for it.
+#[test]
+fn an_unrelated_namespace_rule_for_a_service_entry_host_is_refused() {
+    let mesh = external_host_mesh(
+        vec![external_service_entry("beta", "external-api", EXTERNAL_HOST)],
+        vec![rule("evil", "hijack", EXTERNAL_HOST, 6666, &["*"])],
+    );
+    assert!(
+        admitted_rule_names(&mesh, "alpha").is_empty(),
+        "`evil` is neither the client, the ServiceEntry's owning namespace, \
+         nor the configured root, so a self-granted public export must not \
+         make it a lookup tier for `beta`'s external host"
+    );
+}
+
+/// The same boundary where policy actually takes effect. Both shapes the root
+/// finding described are covered: the unrelated rule alone (it would otherwise
+/// be the sole match and simply apply) and the unrelated rule alongside the
+/// legitimate root-namespace fallback (where sharing the lowest bucket let
+/// lexical order overwrite the fallback — `evil` sorts after `istio-system`).
+#[test]
+fn an_unrelated_namespace_rule_cannot_alter_the_materialized_external_upstream() {
+    let entries = vec![external_service_entry("beta", "external-api", EXTERNAL_HOST)];
+
+    let (alone, baseline) = materialized_external_connect_timeout(
+        external_host_mesh(
+            entries.clone(),
+            vec![rule("evil", "hijack", EXTERNAL_HOST, 6666, &["*"])],
+        ),
+        "alpha",
+        "beta",
+    );
+    assert_eq!(
+        alone, baseline,
+        "an unrelated namespace's rule must not reach the client's upstream \
+         even when it is the only rule that matches the host"
+    );
+
+    let (with_root, _) = materialized_external_connect_timeout(
+        external_host_mesh(
+            entries,
+            vec![
+                rule("evil", "hijack", EXTERNAL_HOST, 6666, &["*"]),
+                rule("istio-system", "mesh-default", EXTERNAL_HOST, 3333, &["*"]),
+            ],
+        ),
+        "alpha",
+        "beta",
+    );
+    assert_eq!(
+        with_root, 3333,
+        "the configured root namespace's mesh-wide default is the fallback; \
+         `evil` must not overwrite it by sorting later"
+    );
+}
+
+/// Client → ServiceEntry-owning namespace → configured root, on ONE external
+/// host, peeled one tier at a time.
+#[test]
+fn client_then_service_entry_owner_then_root_resolve_in_order_for_an_external_host() {
+    let entries = vec![external_service_entry("beta", "external-api", EXTERNAL_HOST)];
+    let client = rule("alpha", "client-override", EXTERNAL_HOST, 1111, &["*"]);
+    let owner = rule("beta", "owner-policy", EXTERNAL_HOST, 2222, &["*"]);
+    let root = rule("istio-system", "mesh-default", EXTERNAL_HOST, 3333, &["*"]);
+
+    let all = external_host_mesh(entries.clone(), vec![root.clone(), owner.clone(), client]);
+    assert_eq!(
+        admitted_rule_names(&all, "alpha"),
+        vec!["client-override".to_string()],
+        "the client namespace wins outright over the owner and the root"
+    );
+    assert_eq!(
+        materialized_external_connect_timeout(all, "alpha", "beta").0,
+        1111
+    );
+
+    let without_client = external_host_mesh(entries.clone(), vec![root.clone(), owner.clone()]);
+    assert_eq!(
+        admitted_rule_names(&without_client, "alpha"),
+        vec!["owner-policy".to_string()],
+        "with no client rule, the ServiceEntry's owning namespace wins over \
+         the root — and `beta` sorts BEFORE `istio-system`, so a lexical \
+         last-writer would have produced the opposite result"
+    );
+    assert_eq!(
+        materialized_external_connect_timeout(without_client, "alpha", "beta").0,
+        2222
+    );
+
+    let root_only = external_host_mesh(entries, vec![root]);
+    assert_eq!(
+        admitted_rule_names(&root_only, "alpha"),
+        vec!["mesh-default".to_string()],
+        "the configured root namespace is the fallback tier"
+    );
+    assert_eq!(
+        materialized_external_connect_timeout(root_only, "alpha", "beta").0,
+        3333
+    );
+}
+
+/// Contested ownership is refused, not guessed.
+///
+/// Two visible ServiceEntries in DIFFERENT namespaces declare one host, so
+/// there is no single owner. The fail-closed contract is that the SERVICE TIER
+/// is disabled for that host: neither claimant may write policy for it, and
+/// only the client and root namespaces can. Picking either claimant would hand
+/// one of two mutually untrusting namespaces policy control over the other's
+/// clients; picking by iteration order would reintroduce exactly the
+/// spelling-dependent precedence #2469 removes.
+#[test]
+fn ambiguous_service_entry_ownership_does_not_widen_policy_admission() {
+    let entries = vec![
+        external_service_entry("beta", "external-api", EXTERNAL_HOST),
+        external_service_entry("gamma", "external-api", EXTERNAL_HOST),
+    ];
+
+    for claimant in ["beta", "gamma"] {
+        let mesh = external_host_mesh(
+            entries.clone(),
+            vec![rule(claimant, "claimant-policy", EXTERNAL_HOST, 2222, &["*"])],
+        );
+        assert!(
+            admitted_rule_names(&mesh, "alpha").is_empty(),
+            "{claimant}: with ownership contested, neither claimant is the \
+             service tier"
+        );
+        assert_eq!(
+            materialized_external_connect_timeout(mesh, "alpha", claimant).0,
+            materialized_external_connect_timeout(
+                external_host_mesh(entries.clone(), Vec::new()),
+                "alpha",
+                claimant,
+            )
+            .0,
+            "{claimant}: and nothing reaches the materialized upstream"
+        );
+    }
+
+    let client_and_root = external_host_mesh(
+        entries.clone(),
+        vec![
+            rule("alpha", "client-override", EXTERNAL_HOST, 1111, &["*"]),
+            rule("istio-system", "mesh-default", EXTERNAL_HOST, 3333, &["*"]),
+        ],
+    );
+    assert_eq!(
+        admitted_rule_names(&client_and_root, "alpha"),
+        vec!["client-override".to_string()],
+        "the client and root tiers are unaffected by contested ownership, and \
+         the client still outranks the root"
+    );
+
+    let root_only = external_host_mesh(
+        entries,
+        vec![rule("istio-system", "mesh-default", EXTERNAL_HOST, 3333, &["*"])],
+    );
+    assert_eq!(
+        admitted_rule_names(&root_only, "alpha"),
+        vec!["mesh-default".to_string()],
+        "and the root namespace remains the fallback"
+    );
+}
+
+/// Duplicates WITHIN one namespace are still a single owner — Istio merges
+/// those, so this must not be mistaken for contested ownership.
+#[test]
+fn duplicate_service_entries_in_one_namespace_are_still_a_single_owner() {
+    let mesh = external_host_mesh(
+        vec![
+            external_service_entry("beta", "external-api", EXTERNAL_HOST),
+            external_service_entry("beta", "external-api-dup", EXTERNAL_HOST),
+        ],
+        vec![rule("beta", "owner-policy", EXTERNAL_HOST, 2222, &["*"])],
+    );
+    assert_eq!(
+        admitted_rule_names(&mesh, "alpha"),
+        vec!["owner-policy".to_string()],
+        "two ServiceEntries in one namespace name one owner, not two"
+    );
+}
+
+/// A ServiceEntry the client cannot SEE cannot establish ownership for it
+/// either, so the service tier is disabled rather than silently granted.
+#[test]
+fn an_invisible_service_entry_grants_no_service_tier() {
+    let mut entry = external_service_entry("beta", "external-api", EXTERNAL_HOST);
+    entry.export_to = vec![".".to_string()];
+    let mesh = external_host_mesh(
+        vec![entry],
+        vec![rule("beta", "owner-policy", EXTERNAL_HOST, 2222, &["*"])],
+    );
+    assert!(
+        admitted_rule_names(&mesh, "alpha").is_empty(),
+        "`alpha` cannot see the ServiceEntry, so it has no evidence that \
+         `beta` owns the host"
+    );
+}
+
+// ── Qualified Kubernetes shorthand vs. the materialization host matcher ──
+
+/// `destination_rule_host_matches` treats a two-label rule host as Kubernetes
+/// shorthand and matches it against `reviews.beta.svc.*` upstreams. The
+/// admission resolver must not disagree by resolving that same host to the
+/// RULE's namespace, or an unrelated namespace becomes an invented service
+/// tier for a host the matcher will happily bind to `beta`'s upstream.
+///
+/// Both inventory states are covered, because the disagreement only appears
+/// when the service inventory cannot confirm the pair.
+#[test]
+fn a_two_label_host_never_makes_an_unrelated_namespace_the_service_tier() {
+    for (label, services) in [
+        ("service present in the inventory", vec![service_in("beta", "reviews")]),
+        ("service absent from the inventory", Vec::new()),
+    ] {
+        let mesh = MeshConfig {
+            istio_root_namespace: "istio-system".to_string(),
+            services,
+            workloads: vec![workload_in("alpha", "web")],
+            destination_rules: vec![rule("evil", "hijack", "reviews.beta", 6666, &["*"])],
+            sidecars: vec![permissive_sidecar("alpha")],
+            ..MeshConfig::default()
+        };
+        assert!(
+            admitted_rule_names(&mesh, "alpha").is_empty(),
+            "{label}: `evil` is not the client, not `beta`, and not the root"
+        );
+
+        let host = "reviews.beta.svc.cluster.local";
+        let mut upstream = http_upstream("reviews-u", host, 8080);
+        upstream.namespace = "beta".to_string();
+        upstream.name = Some(host.to_string());
+        let mut proxy = http_proxy("reviews-p", host, 8080);
+        proxy.namespace = "beta".to_string();
+        proxy.upstream_id = Some("reviews-u".to_string());
+        let baseline = proxy.backend_connect_timeout_ms;
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![upstream],
+            mesh: Some(Box::new(mesh)),
+            ..GatewayConfig::default()
+        };
+        let runtime = MeshRuntimeConfig {
+            namespace: "alpha".to_string(),
+            sidecar_enforced: true,
+            ..default_mesh_runtime()
+        };
+        let prepared =
+            prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        assert_eq!(
+            prepared
+                .proxies
+                .iter()
+                .find(|p| p.id == "reviews-p")
+                .expect("operator proxy survives mesh preparation")
+                .backend_connect_timeout_ms,
+            baseline,
+            "{label}: and it must not reach the upstream the matcher binds \
+             `reviews.beta` to"
+        );
+    }
+}
+
+/// The legitimate counterpart: with inventory evidence, the target service's
+/// own namespace IS the service tier for the same two-label host.
+#[test]
+fn a_two_label_host_confirmed_by_the_inventory_resolves_to_the_service_namespace() {
+    let mesh = MeshConfig {
+        istio_root_namespace: "istio-system".to_string(),
+        services: vec![service_in("beta", "reviews")],
+        workloads: vec![workload_in("beta", "reviews"), workload_in("alpha", "web")],
+        destination_rules: vec![rule("beta", "owner-policy", "reviews.beta", 2222, &["*"])],
+        sidecars: vec![permissive_sidecar("alpha")],
+        ..MeshConfig::default()
+    };
+    assert_eq!(
+        admitted_rule_names(&mesh, "alpha"),
+        vec!["owner-policy".to_string()],
+        "`beta/reviews` exists, so `reviews.beta` resolves to `beta` and its \
+         own namespace is the service tier"
+    );
+}
+
+/// A `.svc`-qualified host pins the namespace in its own SYNTAX, so it needs
+/// no inventory evidence and no ServiceEntry can claim it by declaring the
+/// same string.
+#[test]
+fn a_svc_qualified_host_is_owned_by_the_namespace_in_the_host_not_by_a_claimant() {
+    let mesh = MeshConfig {
+        istio_root_namespace: "istio-system".to_string(),
+        service_entries: vec![external_service_entry(
+            "evil",
+            "claim-reviews",
+            "reviews.beta.svc.cluster.local",
+        )],
+        workloads: vec![workload_in("alpha", "web")],
+        destination_rules: vec![
+            rule(
+                "evil",
+                "hijack",
+                "reviews.beta.svc.cluster.local",
+                6666,
+                &["*"],
+            ),
+            rule(
+                "beta",
+                "owner-policy",
+                "reviews.beta.svc.cluster.local",
+                2222,
+                &["*"],
+            ),
+        ],
+        sidecars: vec![permissive_sidecar("alpha")],
+        ..MeshConfig::default()
+    };
+    assert_eq!(
+        admitted_rule_names(&mesh, "alpha"),
+        vec!["owner-policy".to_string()],
+        "a ServiceEntry declaring a `.svc`-qualified Kubernetes host does not \
+         transfer ownership of it to the declaring namespace"
+    );
+}
+
+/// A wildcard host has no resolvable owner, so only the client and root tiers
+/// may write policy for it.
+#[test]
+fn a_wildcard_host_grants_no_service_tier() {
+    let rules = vec![
+        rule("evil", "hijack", "*.example.com", 6666, &["*"]),
+        rule("alpha", "client-override", "*.example.com", 1111, &["*"]),
+    ];
+    let mesh = MeshConfig {
+        istio_root_namespace: "istio-system".to_string(),
+        workloads: vec![workload_in("alpha", "web")],
+        destination_rules: rules,
+        sidecars: vec![permissive_sidecar("alpha")],
+        ..MeshConfig::default()
+    };
+    assert_eq!(
+        admitted_rule_names(&mesh, "alpha"),
+        vec!["client-override".to_string()],
+        "a wildcard host cannot be owned, so a third-party rule for it is \
+         refused and the client's own rule stands"
     );
 }
