@@ -603,15 +603,14 @@ pub(super) async fn handle_create_acme_order(
                 ));
             }
         };
-        let stored =
-            match offload_store_write("acme_order_upsert", move || {
-                store.upsert_order(record, overwrite)
-            })
-            .await
-            {
-                Ok(stored) => stored,
-                Err(response) => return Ok(*response),
-            };
+        let stored = match offload_store_write("acme_order_upsert", move || {
+            store.upsert_order(record, overwrite)
+        })
+        .await
+        {
+            Ok(stored) => stored,
+            Err(response) => return Ok(*response),
+        };
         match stored {
             Ok(record) => {
                 persist_acme_account_credentials(&record).await;
@@ -764,8 +763,12 @@ pub(super) async fn handle_finalize_acme_order(
         } {
             Ok(completed) => completed,
             Err(error) => {
-                persist_failed_acme_order(Arc::clone(&order_store), order.clone(), error.to_string())
-                    .await;
+                persist_failed_acme_order(
+                    Arc::clone(&order_store),
+                    order.clone(),
+                    error.to_string(),
+                )
+                .await;
                 return Ok(super::json_response(
                     StatusCode::BAD_GATEWAY,
                     &json!({"error": error.to_string()}),
@@ -1713,13 +1716,14 @@ async fn respond_managed_upsert(
     overwrite: bool,
     success: StatusCode,
 ) -> Response<Full<Bytes>> {
-    let outcome =
-        match offload_store_write("managed_tls_upsert", move || store.upsert(record, overwrite))
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(response) => return *response,
-        };
+    let outcome = match offload_store_write("managed_tls_upsert", move || {
+        store.upsert(record, overwrite)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(response) => return *response,
+    };
     match outcome {
         Ok(record) => {
             request_managed_source_reloads();

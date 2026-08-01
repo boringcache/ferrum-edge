@@ -1522,8 +1522,7 @@ fn admin_tls_store_backed_operations_document_internal_server_error() {
     for operation_id in admin_tls_store_backed_500_operation_ids() {
         let (method, path, operation) = openapi_operation_by_id(&spec, operation_id);
         assert_eq!(
-            operation["responses"]["500"]["$ref"],
-            "#/components/responses/InternalServerError",
+            operation["responses"]["500"]["$ref"], "#/components/responses/InternalServerError",
             "{method} {path} ({operation_id}) must document InternalServerError"
         );
     }

@@ -98,7 +98,11 @@ async fn a_dns01_hook_cannot_complete_after_the_renewal_claim_is_lost() {
     // it while it is still sleeping.
     let hook_command = hook.to_string_lossy().to_string();
     let challenge = challenge();
-    let guarded = keeper.guarded(run_dns01_hook_for_tests(&hook_command, "present", &challenge));
+    let guarded = keeper.guarded(run_dns01_hook_for_tests(
+        &hook_command,
+        "present",
+        &challenge,
+    ));
 
     break_the_lease_table(dir.path());
 

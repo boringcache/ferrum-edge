@@ -1092,9 +1092,7 @@ fn validate_instance_id(raw: &str) -> Result<String, String> {
         character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
     };
     if !raw.chars().all(permitted) {
-        return Err(
-            "must contain only ASCII letters, digits, '-', '_', '.', or ':'".to_string(),
-        );
+        return Err("must contain only ASCII letters, digits, '-', '_', '.', or ':'".to_string());
     }
     Ok(raw.to_string())
 }

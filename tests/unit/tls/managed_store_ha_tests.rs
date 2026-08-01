@@ -189,8 +189,7 @@ fn material_lookup_reflects_another_instances_rotation() {
         .expect("B loads the rotation");
     assert_eq!(rotated.bytes, b"v2");
     assert_ne!(
-        first.version,
-        rotated.version,
+        first.version, rotated.version,
         "the material version must change so source-set fingerprints rotate"
     );
 }
@@ -268,7 +267,9 @@ fn reads_do_not_wait_for_a_writer_holding_the_store_lock() {
 
     let reader = ManagedTlsStore::open(dir.path()).expect("open a second instance");
     let started = std::time::Instant::now();
-    let seen = reader.get("edge-ca").expect("read under a held writer lock");
+    let seen = reader
+        .get("edge-ca")
+        .expect("read under a held writer lock");
     let listed = ca_ids(&reader);
     let material = reader
         .material("ca-bundles/edge-ca", MaterialKind::CaBundle)

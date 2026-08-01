@@ -336,12 +336,16 @@ fn a_same_identity_restart_reclaims_only_after_expiry() {
     std::mem::forget(crashed);
 
     let restarted = instance(dir.path(), "replica-a");
-    let denied = restarted.try_acquire(&name, short).expect("restart attempts");
+    let denied = restarted
+        .try_acquire(&name, short)
+        .expect("restart attempts");
     assert!(denied.is_none(), "the claim is still live");
 
     std::thread::sleep(Duration::from_millis(400));
 
-    let taken = restarted.try_acquire(&name, short).expect("restart retries");
+    let taken = restarted
+        .try_acquire(&name, short)
+        .expect("restart retries");
     let lease = taken.expect("an expired claim must be reclaimable");
     assert_eq!(lease.holder(), "replica-a");
     assert!(
@@ -442,7 +446,11 @@ async fn a_long_operation_retains_exactly_one_owner_via_the_heartbeat() {
 
     let held = instance_a.try_acquire(&name, ttl).expect("A claims");
     let keeper = RenewalLeaseKeeper::start(held.expect("A wins"), ttl);
-    let original_expiry = instance_a.peek(&name).expect("read").expect("present").expires_at;
+    let original_expiry = instance_a
+        .peek(&name)
+        .expect("read")
+        .expect("present")
+        .expires_at;
 
     // Proof one: a beat actually reached the shared table. Without a heartbeat
     // this never happens and the test fails here.

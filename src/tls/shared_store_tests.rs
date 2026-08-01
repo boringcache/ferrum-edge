@@ -81,7 +81,10 @@ fn a_reader_never_waits_for_a_held_writer_lock() {
     let snapshot = store.snapshot().expect("read under a held writer lock");
     let elapsed = started.elapsed();
 
-    assert_eq!(snapshot.value, "bbbb", "the reader sees the complete document");
+    assert_eq!(
+        snapshot.value, "bbbb",
+        "the reader sees the complete document"
+    );
     assert!(
         elapsed < Duration::from_secs(1),
         "a reader must not wait on the writer lock; took {elapsed:?}"
@@ -155,7 +158,10 @@ fn an_identical_length_and_mtime_replacement_is_still_observed() {
     );
 
     assert_eq!(
-        store.snapshot().expect("read after an indistinguishable stamp").value,
+        store
+            .snapshot()
+            .expect("read after an indistinguishable stamp")
+            .value,
         "bbbb",
         "a replacement with identical length and mtime must still be observed"
     );
@@ -189,7 +195,10 @@ fn the_native_identity_fast_path_also_observes_an_indistinguishable_stamp() {
         .expect("force an identical mtime");
 
     assert_eq!(
-        store.snapshot().expect("read after an indistinguishable stamp").value,
+        store
+            .snapshot()
+            .expect("read after an indistinguishable stamp")
+            .value,
         "bbbb"
     );
 }
@@ -205,7 +214,9 @@ fn a_corrupt_document_is_an_error_not_an_empty_store() {
     assert_eq!(store.snapshot().expect("first read").value, "aaaa");
 
     let mut corrupt = tempfile::NamedTempFile::new_in(dir.path()).expect("temp");
-    corrupt.write_all(b"{ not json").expect("write corrupt bytes");
+    corrupt
+        .write_all(b"{ not json")
+        .expect("write corrupt bytes");
     corrupt.persist(&path).expect("replace with corruption");
 
     assert!(
