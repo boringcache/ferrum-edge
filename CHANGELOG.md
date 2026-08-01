@@ -178,6 +178,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- WAF no longer forwards the unscanned suffix of an oversize body past an
+  enforcing body rule (GHSA-7jh9-fjqf-jcvf). `max_scan_bytes` defaults to 1 MiB
+  while the gateway admits 10 MiB request and response bodies by default, and
+  the previous `on_body_too_large: scan_truncated` default scanned only that
+  first 1 MiB, recorded `waf.scan_truncated`, and then forwarded the complete
+  body even in global enforce mode. A client could pad an upload with 1 MiB of
+  benign bytes and place an enforced SQLi/XSS/traversal/SSRF/custom-rule payload
+  after the cap; a compromised backend could do the same with configured
+  disclosure/data-leak content in a response. `on_body_too_large` now defaults
+  to the new **`fail_closed`** value: a governed request or response body that
+  does not fit inside `max_scan_bytes` is rejected whenever that direction
+  actually carries an enforcing body policy — global `mode: enforce` plus either
+  anomaly `scoring` with an applicable body rule or at least one applicable
+  `action: enforce` rule reading `body_text` / `body_json_path` (request) or
+  `response_body` (response), including the body-scoped `FE-ENCODING-001` /
+  `FE-ENCODING-002` specials. Per-rule path, method, header, and consumer
+  conditions and request-wide `global_exemptions.header_present` suppression are
+  honored, so a scoped or exempted enforcing rule does not block an unrelated
+  request. Both directions share one decision on the finalized backend-visible
+  representation, so H1, H2, and H3 behave identically and a request transformer
+  that grows a body past the cap is still governed. A body of exactly
+  `max_scan_bytes` is scanned in full and is not oversize.
+
+  Monitor-only operation is deliberately unaffected: with `mode: monitor`, or
+  with every body rule left at the built-in monitor default, an oversize body is
+  still prefix-scanned and recorded rather than blocked. Oversize bodies handled
+  by `fail_closed`, `scan_truncated`, or `block` record fixed-cardinality
+  `waf.body_too_large=true` and `waf.body_too_large_target` (`request_body` /
+  `response_body`); blocks add `waf.action=blocked` with
+  `waf.block_reason=body_too_large`, and prefix scans keep
+  `waf.scan_truncated=true`. No body bytes are logged. The explicit `skip` mode
+  still avoids body inspection and may avoid buffering a known-oversize request,
+  so it emits none of this body-size metadata. Operators who deliberately accept
+  prefix-only inspection can opt out with the still-supported
+  `on_body_too_large: scan_truncated`; `skip` and `block` are otherwise
+  unchanged. The unbounded-SSE decision is also unchanged — the prefix-only
+  opt-out concedes the suffix of a bounded body and does not reach a stream with
+  no scanned prefix.
+
 - `body_validator` and `openapi_validator` validation diagnostics no longer
   disclose the rejected representation (GHSA-5p2h-fq6q-gwh9). Both plugins used
   to format the offending instance value — or a payload-chosen JSON, XML, form,

@@ -18749,12 +18749,19 @@ components:
           default: log_and_allow
         on_body_too_large:
           type: string
-          enum: [scan_truncated, skip, block]
-          default: scan_truncated
+          enum: [fail_closed, scan_truncated, skip, block]
+          default: fail_closed
           description: >-
-            Behavior when a body exceeds max_scan_bytes. scan_truncated scans
-            the prefix; skip scans nothing; block rejects (fail closed) when
-            mode is enforce, otherwise scans the prefix.
+            Behavior when a governed body exceeds max_scan_bytes. fail_closed
+            (default) rejects when that direction has an applicable enforcing
+            body rule or anomaly scoring with an applicable body rule, and
+            otherwise scans the prefix and records truncation, so monitor-only
+            or conditionally out-of-scope policy never starts blocking.
+            scan_truncated is the explicit compatibility opt-out that always
+            scans only the prefix and forwards the complete body — prefix-only
+            inspection lets a padded suffix carry blocked content past an
+            enforcing rule. skip scans nothing. block rejects every oversize
+            governed body while mode is enforce, otherwise scans the prefix.
         include_default_rules:
           type: boolean
           default: true
