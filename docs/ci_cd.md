@@ -1832,7 +1832,8 @@ exact root-reviewed head SHA**. All other protections still apply:
 | Input validation | `pr_number` must be a positive integer; `expected_head_sha` must be exactly 40 lowercase hex characters; inputs are never interpolated into shell syntax, paths, or API endpoints before validation |
 | PR eligibility | PR must be open, non-draft, target `main`, originate from this repository (not a fork), and its live head SHA must equal `expected_head_sha` |
 | Review threads | All review threads are fetched with GraphQL pagination; any unresolved thread, query error, or malformed/missing field fails closed |
-| Race safety | Approval is submitted with an explicit `commit_id`; head SHA is re-checked immediately before submission so a push between validation and approval cannot approve a newer head |
+| Race safety | Approval is submitted with an explicit `commit_id`; the full PR eligibility validation (open, non-draft, base `main`, same repository, exact head SHA) is re-run immediately before submission so a push or state change between validation and approval cannot approve a newer or ineligible head |
+| Actions approval setting | Repository setting `can_approve_pull_request_reviews` (“Allow GitHub Actions to create and approve pull requests”) must remain enabled and is audited before the no-bypass ruleset is activated. GitHub’s documented behavior counts enabled Actions reviews toward required approvals; this repository was independently verified as enabled. The live #3040 merge-queue exercise will prove that an attestation approval satisfies the actual ruleset |
 | Concurrency | `root-merge-gate-attestation-<pr_number>` with `cancel-in-progress: false` so overlapping dispatches do not cancel an in-flight attestation |
 
 ### Operator inputs

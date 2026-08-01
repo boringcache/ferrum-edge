@@ -1,5 +1,12 @@
 name: Root Merge Gate Attestation
 
+# Repository prerequisite: the "Allow GitHub Actions to create and approve pull
+# requests" setting (`can_approve_pull_request_reviews`) must remain enabled.
+# This repository was independently verified as enabled before the no-bypass
+# ruleset is activated. GitHub's documented behavior counts enabled Actions
+# reviews toward required approvals. The live #3040 merge-queue exercise will
+# prove that an attestation approval satisfies the actual ruleset.
+
 on:
   workflow_dispatch:
     inputs:
@@ -31,6 +38,7 @@ jobs:
     steps:
       - name: Attest reviewed pull request head
         env:
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER_INPUT: ${{ github.event.inputs.pr_number }}
           EXPECTED_SHA_INPUT: ${{ github.event.inputs.expected_head_sha }}
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
@@ -41,6 +49,129 @@ jobs:
           refuse() {
             echo "Refusal: $1" >&2
             exit 1
+          }
+
+          validate_pr_eligibility() {
+            local pr_json="$1"
+            local expected_sha="$2"
+            local pr_number="$3"
+            local context_label="${4:-}"
+
+            local validated
+            validated="$(jq -e '
+              def require_string($value; $name):
+                if ($value | type) != "string" or ($value | length) == 0 then
+                  error("\($name) must be a non-empty string")
+                else $value end;
+              def require_boolean($value; $name):
+                if ($value | type) != "boolean" then
+                  error("\($name) must be a boolean")
+                else $value end;
+
+              if (type) != "object" then
+                error("pull request response must be an object")
+              else .
+              end
+              | {
+                  state: require_string(.state; "state"),
+                  draft: require_boolean(.draft; "draft"),
+                  base_ref: require_string(.base.ref; "base.ref"),
+                  head_repo: require_string(.head.repo.full_name; "head.repo.full_name"),
+                  head_sha: require_string(.head.sha; "head.sha")
+                }
+            ' <<<"${pr_json}")" || refuse "pull request metadata failed schema validation${context_label:+ (${context_label})}"
+
+            local pr_state pr_draft pr_base_ref pr_head_repo pr_head_sha
+            pr_state="$(jq -r '.state' <<<"${validated}")"
+            pr_draft="$(jq -r '.draft' <<<"${validated}")"
+            pr_base_ref="$(jq -r '.base_ref' <<<"${validated}")"
+            pr_head_repo="$(jq -r '.head_repo' <<<"${validated}")"
+            pr_head_sha="$(jq -r '.head_sha' <<<"${validated}")"
+
+            if [[ "${pr_state}" != "open" ]]; then
+              refuse "pull request #${pr_number} is not open (state=${pr_state})${context_label:+ ${context_label}}"
+            fi
+
+            if [[ "${pr_draft}" == "true" ]]; then
+              refuse "pull request #${pr_number} is a draft${context_label:+ ${context_label}}"
+            fi
+
+            if [[ "${pr_base_ref}" != "main" ]]; then
+              refuse "pull request #${pr_number} does not target main (base=${pr_base_ref})${context_label:+ ${context_label}}"
+            fi
+
+            if [[ "${pr_head_repo}" != "${GITHUB_REPOSITORY}" ]]; then
+              refuse "pull request #${pr_number} head is not from ${GITHUB_REPOSITORY} (head repo=${pr_head_repo})${context_label:+ ${context_label}}"
+            fi
+
+            if [[ "${pr_head_sha}" != "${expected_sha}" ]]; then
+              refuse "pull request #${pr_number} head sha ${pr_head_sha} does not match expected ${expected_sha}${context_label:+ ${context_label}}"
+            fi
+          }
+
+          validate_review_threads_page() {
+            local threads_response="$1"
+
+            if jq -e '(.errors | type) == "array" and (.errors | length) > 0' >/dev/null <<<"${threads_response}"; then
+              echo "GraphQL errors while fetching review threads:" >&2
+              jq '.errors' >&2 <<<"${threads_response}"
+              exit 1
+            fi
+
+            if jq -e '(.errors | type) == "object" and (.errors | length) > 0' >/dev/null <<<"${threads_response}"; then
+              echo "GraphQL errors while fetching review threads:" >&2
+              jq '.errors' >&2 <<<"${threads_response}"
+              exit 1
+            fi
+
+            local page_result
+            page_result="$(jq -e '
+              def require_object($value; $name):
+                if ($value | type) != "object" then
+                  error("\($name) must be an object")
+                else $value end;
+              def require_array($value; $name):
+                if ($value | type) != "array" then
+                  error("\($name) must be an array")
+                else $value end;
+              def require_boolean($value; $name):
+                if ($value | type) != "boolean" then
+                  error("\($name) must be a boolean")
+                else $value end;
+
+              .data as $data
+              | if ($data | type) != "object" then error("data must be an object") else $data end
+              | .repository as $repo
+              | require_object($repo; "repository")
+              | $repo.pullRequest as $pr
+              | require_object($pr; "pullRequest")
+              | $pr.reviewThreads as $rt
+              | require_object($rt; "reviewThreads")
+              | require_array($rt.nodes; "reviewThreads.nodes")
+              | ($rt.nodes | map(
+                  if (type) != "object" then error("review thread node must be an object")
+                  elif (.isResolved | type) != "boolean" then error("review thread node isResolved must be a boolean")
+                  else .
+                  end
+                )) as $nodes
+              | $rt.pageInfo as $pi
+              | require_object($pi; "pageInfo")
+              | require_boolean($pi.hasNextPage; "pageInfo.hasNextPage") as $has_next
+              | (if $has_next then
+                  if ($pi.endCursor | type) != "string" or ($pi.endCursor | length) == 0 then
+                    error("pageInfo.endCursor must be a non-empty string when hasNextPage is true")
+                  else $pi.endCursor end
+                else "" end) as $end_cursor
+              | {
+                  unresolved_count: ($nodes | map(select(.isResolved == false)) | length),
+                  has_next_page: $has_next,
+                  end_cursor: $end_cursor
+                }
+            ' <<<"${threads_response}")" || refuse "review thread response failed schema validation"
+
+            THREADS_PAGE_UNRESOLVED="$(jq -r '.unresolved_count' <<<"${page_result}")"
+            THREADS_HAS_NEXT="$(jq -r 'if .has_next_page then "true" else "false" end' <<<"${page_result}")"
+            THREADS_END_CURSOR="$(jq -r '.end_cursor' <<<"${page_result}")"
           }
 
           if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
@@ -74,32 +205,7 @@ jobs:
           repo_name="${GITHUB_REPOSITORY#*/}"
 
           pr_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}")" || refuse "failed to fetch pull request metadata"
-
-          pr_state="$(jq -er '.state // empty' <<<"${pr_json}")" || refuse "pull request metadata missing state"
-          pr_draft="$(jq -er '.draft // empty' <<<"${pr_json}")" || refuse "pull request metadata missing draft flag"
-          pr_base_ref="$(jq -er '.base.ref // empty' <<<"${pr_json}")" || refuse "pull request metadata missing base ref"
-          pr_head_repo="$(jq -er '.head.repo.full_name // empty' <<<"${pr_json}")" || refuse "pull request metadata missing head repository"
-          pr_head_sha="$(jq -er '.head.sha // empty' <<<"${pr_json}")" || refuse "pull request metadata missing head sha"
-
-          if [[ "${pr_state}" != "open" ]]; then
-            refuse "pull request #${pr_number} is not open (state=${pr_state})"
-          fi
-
-          if [[ "${pr_draft}" == "true" ]]; then
-            refuse "pull request #${pr_number} is a draft"
-          fi
-
-          if [[ "${pr_base_ref}" != "main" ]]; then
-            refuse "pull request #${pr_number} does not target main (base=${pr_base_ref})"
-          fi
-
-          if [[ "${pr_head_repo}" != "${GITHUB_REPOSITORY}" ]]; then
-            refuse "pull request #${pr_number} head is not from ${GITHUB_REPOSITORY} (head repo=${pr_head_repo})"
-          fi
-
-          if [[ "${pr_head_sha}" != "${expected_sha}" ]]; then
-            refuse "pull request #${pr_number} head sha ${pr_head_sha} does not match expected ${expected_sha}"
-          fi
+          validate_pr_eligibility "${pr_json}" "${expected_sha}" "${pr_number}"
 
           review_threads_query='
           query($owner: String!, $repo: String!, $number: Int!, $after: String) {
@@ -137,31 +243,11 @@ jobs:
                 -f after="${cursor}")" || refuse "review thread GraphQL pagination failed"
             fi
 
-            if jq -e '.errors' >/dev/null <<<"${threads_response}"; then
-              echo "GraphQL errors while fetching review threads:" >&2
-              jq '.errors' >&2 <<<"${threads_response}"
-              exit 1
-            fi
+            validate_review_threads_page "${threads_response}"
+            unresolved_count=$((unresolved_count + THREADS_PAGE_UNRESOLVED))
 
-            pull_request_node="$(jq -er '.data.repository.pullRequest // empty' <<<"${threads_response}")" || refuse "review thread response missing pullRequest"
-            if [[ -z "${pull_request_node}" || "${pull_request_node}" == "null" ]]; then
-              refuse "review thread response pullRequest is null"
-            fi
-
-            review_threads_node="$(jq -er '.data.repository.pullRequest.reviewThreads // empty' <<<"${threads_response}")" || refuse "review thread response missing reviewThreads"
-            if [[ -z "${review_threads_node}" || "${review_threads_node}" == "null" ]]; then
-              refuse "review thread response reviewThreads is null"
-            fi
-
-            page_unresolved="$(jq -er '[.data.repository.pullRequest.reviewThreads.nodes[]? | select(.isResolved == false)] | length' <<<"${threads_response}")" || refuse "review thread response missing nodes"
-            unresolved_count=$((unresolved_count + page_unresolved))
-
-            has_next="$(jq -er '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // empty' <<<"${threads_response}")" || refuse "review thread response missing pageInfo.hasNextPage"
-            if [[ "${has_next}" == "true" ]]; then
-              cursor="$(jq -er '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty' <<<"${threads_response}")" || refuse "review thread response missing pageInfo.endCursor"
-              if [[ -z "${cursor}" || "${cursor}" == "null" ]]; then
-                refuse "review thread pagination reported hasNextPage without endCursor"
-              fi
+            if [[ "${THREADS_HAS_NEXT}" == "true" ]]; then
+              cursor="${THREADS_END_CURSOR}"
               continue
             fi
             break
@@ -172,10 +258,7 @@ jobs:
           fi
 
           pr_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}")" || refuse "failed to re-fetch pull request metadata before approval"
-          pr_head_sha="$(jq -er '.head.sha // empty' <<<"${pr_json}")" || refuse "re-fetched pull request metadata missing head sha"
-          if [[ "${pr_head_sha}" != "${expected_sha}" ]]; then
-            refuse "pull request head changed before approval (expected ${expected_sha}, now ${pr_head_sha})"
-          fi
+          validate_pr_eligibility "${pr_json}" "${expected_sha}" "${pr_number}" "immediately before approval"
 
           review_payload="$(jq -n \
             --arg commit_id "${expected_sha}" \
