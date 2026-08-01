@@ -3753,67 +3753,6 @@ fn blank_top_level_structural_scalars(value: &mut Value) {
     }
 }
 
-/// Parse and rewrite one complete SSE event's joined JSON `data:` payload,
-/// preserving non-data fields and the first data line's terminator.
-///
-/// Used by residual-scan masking, which already holds a covering transform
-/// window for its complete candidate. The producer path uses
-/// [`rewrite_sse_json_event_into`] so a would-be event is never materialised
-/// beside the covering sink.
-fn rewrite_sse_json_event(lines: &[&str], mutate: impl FnOnce(&mut Value)) -> Option<String> {
-    let mut data_lines = Vec::new();
-    let mut payloads = Vec::new();
-    for (idx, line) in lines.iter().enumerate() {
-        let content = line
-            .strip_suffix("\r\n")
-            .or_else(|| line.strip_suffix('\n'))
-            .unwrap_or(line);
-        if let Some(data) = content
-            .strip_prefix("data: ")
-            .or_else(|| content.strip_prefix("data:"))
-        {
-            data_lines.push(idx);
-            payloads.push(data);
-        }
-    }
-    if payloads.is_empty() {
-        return None;
-    }
-
-    let joined = payloads.join("\n");
-    let trimmed = joined.trim();
-    if trimmed.is_empty() || trimmed == "[DONE]" {
-        return None;
-    }
-    let mut json = serde_json::from_str::<Value>(trimmed).ok()?;
-    let original = json.clone();
-    mutate(&mut json);
-    if json == original {
-        return None;
-    }
-
-    let rewritten = serde_json::to_string(&json).ok()?;
-    let first_data_line = data_lines[0];
-    let mut output = String::new();
-    for (idx, line) in lines.iter().enumerate() {
-        if idx == first_data_line {
-            let ending = if line.ends_with("\r\n") {
-                "\r\n"
-            } else if line.ends_with('\n') {
-                "\n"
-            } else {
-                ""
-            };
-            output.push_str("data: ");
-            output.push_str(&rewritten);
-            output.push_str(ending);
-        } else if data_lines.binary_search(&idx).is_err() {
-            output.push_str(line);
-        }
-    }
-    Some(output)
-}
-
 /// Rewrite one SSE event's JSON `data:` payload straight into `output`.
 ///
 /// Returns:
@@ -3888,10 +3827,8 @@ fn rewrite_sse_json_event_into(
             if !ending.is_empty() && !output.push(ending) {
                 return None;
             }
-        } else if data_lines.binary_search(&idx).is_err() {
-            if !output.push(line.as_bytes()) {
-                return None;
-            }
+        } else if data_lines.binary_search(&idx).is_err() && !output.push(line.as_bytes()) {
+            return None;
         }
     }
     Some(true)

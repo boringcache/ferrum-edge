@@ -3258,10 +3258,7 @@ impl NormalizedSseOut {
     /// `Bytes`. An unbounded accumulator never refuses, so the `None` arm is a
     /// checked impossibility rather than an expected outcome.
     fn take_call_bytes(self) -> Vec<u8> {
-        match self.sink.finish() {
-            Some(bytes) => bytes,
-            None => Vec::new(),
-        }
+        self.sink.finish().unwrap_or_default()
     }
 
     /// The complete accumulated replacement, or `None` when a write was refused.

@@ -3933,6 +3933,7 @@ pub mod _test_support {
     /// Production final-reconciliation publisher: keeps the charged original
     /// alive, builds any replacement through the covering window's sink, and
     /// installs the neutral gRPC capacity terminal on refusal.
+    #[allow(clippy::too_many_arguments)] // mirrors the protocol helper's terminal/provenance args
     pub fn store_charged_grpc_web_reframed_body_for_test(
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,

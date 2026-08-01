@@ -26470,7 +26470,7 @@ async fn handle_proxy_request_inner(
                 let mut response_status = grpc_resp.status;
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
                 let mut response_trailers: HashMap<String, String> = grpc_resp.trailers;
-                let mut response_body = Bytes::from(grpc_resp.body);
+                let mut response_body = grpc_resp.body;
                 if let Some(grpc_status) =
                     grpc_proxy::grpc_status_from_maps(&response_trailers, &response_headers)
                 {
@@ -34398,6 +34398,7 @@ fn mesh_grpc_response_buffer_capacity_response(
 /// builder has replaced the discarded representation with a small, uncharged,
 /// body-framed gRPC-Web terminal — failing closed rather than retaining
 /// uncharged backend bytes.
+#[allow(clippy::too_many_arguments)] // threads protocol terminal state and policy provenance
 pub(crate) fn store_charged_grpc_web_reframed_body(
     ctx: &mut RequestContext,
     response_status: &mut u16,

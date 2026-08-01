@@ -430,6 +430,11 @@ impl Budget {
 /// any listener accepts traffic. Later calls are ignored: the semaphore backs
 /// live reservations, so resizing it under them is not expressible — changing
 /// these values requires a restart, like the other process-global limits.
+///
+/// `#[allow(dead_code)]`: the binary calls this from `main`, but the same
+/// module is separately compiled into the library crate where that binary-only
+/// call site is invisible.
+#[allow(dead_code)] // binary startup caller; dead in the separately compiled library unit
 pub(crate) fn init(fallback_per_response_bytes: usize, total_bytes: usize) {
     let _ = BUDGET.set(Budget::new(fallback_per_response_bytes, total_bytes));
 }

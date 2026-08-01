@@ -2793,7 +2793,7 @@ where
         )
         .await
         {
-            Ok(Ok(body)) => bytes::Bytes::from(body),
+            Ok(Ok(body)) => body,
             Ok(Err((reject_status, error_body, error_class))) => {
                 // `reject_status` distinguishes an origin-attributed refusal
                 // (`502`) from an exhausted gateway retention budget (`503`);
@@ -5013,7 +5013,7 @@ where
             // trailer-only backend `set-cookie` cannot divert it into the wire
             // trailers.
             let mut response_status = resp.status;
-            let mut response_body = bytes::Bytes::from(resp.body);
+            let mut response_body = resp.body;
             let mut response_trailers = resp.trailers;
             if normalize_response_body_for_inspection(
                 plugins,

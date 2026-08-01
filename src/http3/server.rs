@@ -11602,7 +11602,7 @@ async fn proxy_to_backend_h3(
 
             H3BufferedDispatchResult {
                 status,
-                body: Bytes::from(resp_body),
+                body: resp_body,
                 headers: resp_headers,
                 // Forward backend trailers verbatim; the buffered send path
                 // strips response-direction hop-by-hop names before emitting
