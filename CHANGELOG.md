@@ -178,6 +178,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `ai_stream_router` now enforces its provider credential and model policy
+  against the **final** backend-visible request instead of only at claim time
+  (GHSA-xhp5-hqj8-3mwg). The plugin selected a provider, stripped client
+  credentials, injected the provider key, and translated the body at priority
+  2984, while the generic `request_transformer` runs at 3000 — so a later header
+  rule could add, overwrite, or rename the credential (leaking a normal-backend
+  static secret to the third-party provider, or restoring a client-controlled
+  credential header), and a later body rule could replace the already-selected
+  `model` after `model_patterns` matched. Two shared lifecycle boundaries close
+  it, neither of which depends on relative priority: a new non-rejecting
+  `enforce_final_backend_header_policy` phase re-strips every credential and
+  gateway-identity header and re-installs only the selected provider's
+  credential over the finalized outbound header map — after every `before_proxy`
+  pass, after each deferred routing/remaining pass, and after a finalized-egress
+  header overlay, on the H1/H2 and native HTTP/3 ladders alike — and
+  `on_final_request_body` now fails closed unless the provider-visible `model` is
+  a non-empty string equal to the committed model that still matches the selected
+  provider's `model_patterns`, the final body is unambiguous JSON, and the
+  committed destination witness is intact. Model failures
+  return an OpenAI-shaped `400` (`model_policy_violation`); a broken
+  provider/route invariant returns `500` (`provider_policy_violation`). No model,
+  header, query, or body value is echoed or logged. Headers outside the plugin's
+  owned set are untouched, so intended non-credential transforms still apply —
+  Ferrum does not attempt to classify an arbitrary unknown custom header as a
+  credential, so a bespoke normal-backend secret header configured on the same
+  proxy is still forwarded. Because
+  the header re-assertion happens after every `before_proxy` hook, plugin-cache
+  admission now **rejects** `ai_stream_router` composed with
+  `request_deduplication` on the same proxy and protocol (`response_caching` was
+  already refused alongside it by the deferred-request-body-transformer rule).
+
+  The boundary now covers the rest of the provider-visible request as well,
+  through one private typed claim on the request context (never metadata, never
+  logged, holding the opaque owning-instance identity plus the exact committed
+  model, destination, resolved backend TLS, DNS decision, and backend-visible
+  query):
+
+  - **Model.** The model that selected the provider is authorization state, not
+    observability: it is committed to the private claim, and final body
+    enforcement plus the claim-owned response normalizers read it from there.
+    `ai_stream_router.model` remains published for logs and other plugins, but
+    is never read back — otherwise a later in-process plugin could change the
+    final body's `model` *and* republish that key as the same value, satisfying
+    an equality check while bypassing the selection that chose the provider, the
+    price, and (for `{model}` endpoints) the backend URL. Whether the owning
+    instance's own transform produced the Anthropic representation, and whether
+    the claim forbids tool use for this generation (the response normalizer's
+    fail-closed `tool_use` guard), are claim state for the same reason. The one
+    metadata value a claim-owned hook still reads is
+    `ai_stream_router.provider_content_encoding`, which comes from the
+    provider's own response headers and only selects a bounded decoder.
+  - **Query.** `request_transformer` can also add / update / rename / remove
+    query pairs after the claim, appending a normal-backend static secret to the
+    third-party provider target. The claim now freezes the exact safe
+    backend-visible query — after authentication strip markers and current
+    pre-router mutations — and the gateway replays it at
+    `effective_backend_query_string*`, the single capture funnel for H1/H2,
+    native HTTP/3, and retry replay. A folded endpoint query still means an
+    empty separately-appended query; otherwise the already-safe client query
+    continues unchanged.
+  - **Upstream identity and backend TLS.** The destination witness previously
+    checked only scheme/host/port/authority/path, so a later plugin could keep
+    the visible host while changing upstream / load-balancer identity or
+    weakening server verification, SNI, or mTLS. The claim now clears
+    `route_override_upstream_id` and requires it to stay clear, and pins
+    `route_override_resolved_tls` for exact equality (plaintext HTTP is a
+    distinct committed state). Both default public verification and
+    `inherit_backend_tls: true` are covered.
+  - **DNS.** A base proxy's `dns_override` was cleared only when the override
+    changed the backend host *text*, so a proxy already configured with the
+    provider's hostname kept its pinned address and could receive the provider
+    credential at an operator-chosen destination. A narrow typed route-override
+    knob (`RouteOverrideDnsPolicy::ClearInherited`, honored by
+    `RequestContext::apply_route_overrides*`) now lets a direct provider claim
+    revoke the inherited pin explicitly. Unrelated same-host route rewrites keep
+    their existing semantics.
+  - **Instance ownership.** Multiple `ai_stream_router` instances are allowed and
+    two of them may share a provider *name* while differing in endpoint, key,
+    provider type, patterns, and normalization — so the public
+    `ai_stream_router.provider` metadata key could not decide who owned a claim,
+    and both instances could reapply credentials, transform the body twice, or
+    normalize the response twice. Exactly one instance now claims (first match in
+    configured order), and request transformation, final header/query
+    enforcement, final body revalidation, response-header handling, and response
+    stream inspector / normalizer selection all verify the private owner.
+    `fail_on_missing_model` / `fail_on_no_matching_provider` still decide an
+    unclaimed request in normal plugin order.
+  - **Built-in coordination follows the private claim.** `ai_federation`,
+    `request_mirror`, `serverless_function`, `mcp_gateway`, and
+    `mesh_route_dispatch` decided whether to skip a claimed provider request
+    from the public `ai_stream_router_claimed` metadata string. Metadata is a
+    mutable map, so a later plugin deleting or rewriting that marker could make
+    those built-ins re-route, mirror, federate, or invoke a function over a
+    request whose third-party provider credential, model, destination, and query
+    were already committed. All five now decide from a crate-private
+    `RequestContext::has_ai_stream_router_claim()`, which exposes only the
+    claim's existence — never its owner, model, destination, TLS, DNS decision,
+    query, or credential. The marker is still published for logs and
+    third-party/custom plugins, and intentionally UNCLAIMED pass-through still
+    coordinates through `ai_stream_router_pass_through`.
 - Stateful plugin protections are no longer owned by an individual plugin
   instance, so a qualifying configuration reload can no longer reset them
   (GHSA-wmqm-6mxj-gm9p). `request_deduplication` in local mode now owns its

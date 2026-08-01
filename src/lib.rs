@@ -767,6 +767,19 @@ pub mod _test_support {
         (transformed, result)
     }
 
+    /// Run the shared final backend-header-policy pass exactly as every dispatch
+    /// ladder does: after all `before_proxy` header transforms, over the
+    /// finalized backend-visible header map (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// `plugins` must already be sorted by effective priority.
+    pub fn run_final_backend_header_policy_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::run_final_backend_header_policy_hooks(plugins, ctx, headers);
+    }
+
     pub async fn run_context_free_final_request_body_hooks_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
@@ -1226,6 +1239,19 @@ pub mod _test_support {
         plugin: &crate::plugins::request_mirror::RequestMirror,
     ) -> crate::plugins::request_mirror::MirrorMetricsSnapshot {
         plugin.mirror_metrics_snapshot_for_test()
+    }
+
+    // ── plugins/ai_stream_router ─────────────────────────────────────────────
+    /// Whether an `ai_stream_router` instance successfully claimed this request.
+    ///
+    /// Exposes only the EXISTENCE of the private claim, never its owner, model,
+    /// destination, TLS, DNS decision, query, or credential
+    /// (`GHSA-xhp5-hqj8-3mwg`). Tests use it to distinguish a real claim from
+    /// the public observability marker.
+    pub fn request_has_ai_stream_router_claim_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.has_ai_stream_router_claim()
     }
 
     // ── plugins/api_chargeback_sink ──────────────────────────────────────────
@@ -4365,6 +4391,18 @@ pub mod _test_support {
     /// Canonical backend-visible query (transformer outbound + auth strips).
     pub fn effective_backend_query_string_for_test(ctx: &crate::plugins::RequestContext) -> String {
         crate::proxy::effective_backend_query_string(ctx).into_owned()
+    }
+
+    /// The caller-held-raw-query variant the H1/H2 (`proxy/mod.rs`) and native
+    /// HTTP/3 (`http3/server.rs`) ladders actually capture once per request and
+    /// reuse for every retry attempt. Exposed so composition tests can assert
+    /// both funnels agree, including the provider-claim re-assertion
+    /// (`GHSA-xhp5-hqj8-3mwg`).
+    pub fn effective_backend_query_string_with_raw_for_test(
+        ctx: &crate::plugins::RequestContext,
+        raw_query: &str,
+    ) -> String {
+        crate::proxy::effective_backend_query_string_with_raw(ctx, raw_query).into_owned()
     }
 
     pub fn collect_forwardable_websocket_headers_for_test(
