@@ -741,9 +741,15 @@ impl TestGatewayBuilder {
 
         let binary = locate_binary(self.prefer_release)?;
 
-        let (mut env, mut db_url, config_path) =
-            build_env(self, &identity, &temp_dir, admin_port, proxy_port, &mut excluded_ports)
-                .await?;
+        let (mut env, mut db_url, config_path) = build_env(
+            self,
+            &identity,
+            &temp_dir,
+            admin_port,
+            proxy_port,
+            &mut excluded_ports,
+        )
+        .await?;
 
         // Caller overrides win — append after defaults so they replace keys.
         for (k, v) in &self.extra_env {
@@ -1287,9 +1293,7 @@ pub async fn ephemeral_port() -> Result<u16, std::io::Error> {
 /// Like [`ephemeral_port`], but never returns a port already present in
 /// `excluded`. On success, inserts the chosen port into `excluded` so later
 /// allocations in the same spawn attempt stay distinct.
-pub async fn ephemeral_port_excluding(
-    excluded: &mut HashSet<u16>,
-) -> Result<u16, std::io::Error> {
+pub async fn ephemeral_port_excluding(excluded: &mut HashSet<u16>) -> Result<u16, std::io::Error> {
     const MAX_ATTEMPTS: u32 = 50;
     for _ in 0..MAX_ATTEMPTS {
         let port = ephemeral_port().await?;
@@ -1696,10 +1700,7 @@ mod port_allocation_tests {
     #[test]
     fn collect_env_pinned_ports_reads_listener_overrides() {
         let extra_env = vec![
-            (
-                "FERRUM_PROXY_HTTPS_PORT".to_string(),
-                "3443".to_string(),
-            ),
+            ("FERRUM_PROXY_HTTPS_PORT".to_string(), "3443".to_string()),
             (
                 "FERRUM_CP_GRPC_LISTEN_ADDR".to_string(),
                 "127.0.0.1:9090".to_string(),
