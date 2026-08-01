@@ -7,12 +7,15 @@ on:
   pull_request:
     branches:
       - main
+  merge_group:
+    types:
+      - checks_requested
   workflow_dispatch:
   schedule:
     - cron: "0 6 * * 0"
 
 concurrency:
-  group: coverage-${{ github.ref }}
+  group: coverage-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -66,7 +69,16 @@ jobs:
 
           if [ "$EVENT_NAME" = "pull_request" ]; then
             base_ref="origin/${BASE_REF}"
-            git diff --name-only "${base_ref}...HEAD" > "$changed_files"
+            git diff --name-only --no-renames "${base_ref}...HEAD" > "$changed_files"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "${MERGE_BASE_SHA}"
+            fi
+            git diff --name-only --no-renames "${MERGE_BASE_SHA}...HEAD" > "$changed_files"
           fi
 
           plan="$(python3 .github/scripts/coverage_plan.py \
@@ -95,6 +107,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
 
   coverage-shard:
     name: Coverage Shard (${{ matrix.shard }})
@@ -276,13 +289,13 @@ jobs:
         if: needs.coverage-plan.result == 'success' && !contains(fromJSON('["skip", "plugin", "full"]'), needs.coverage-plan.outputs.mode)
         run: exit 1
 
-      - name: Skip coverage for unrelated PR changes
+      - name: Skip coverage for unrelated changes
         if: needs.coverage-plan.outputs.mode == 'skip'
         run: |
           {
             echo "## Coverage Gate"
             echo ""
-            echo "No coverage-relevant files changed in this PR."
+            echo "No coverage-relevant files changed in this run."
             echo "Full coverage still runs on core source, proto/build-input, pushes to main, manual dispatch, and schedule."
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -463,6 +476,15 @@ jobs:
           if [ "$EVENT_NAME" = "pull_request" ]; then
             base_ref="origin/${BASE_REF}"
             changed_base_args=(--changed-base "$base_ref")
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "${MERGE_BASE_SHA}"
+            fi
+            changed_base_args=(--changed-base "$MERGE_BASE_SHA")
           fi
 
           python3 scripts/check_coverage_thresholds.py \
@@ -474,6 +496,7 @@ jobs:
           COVERAGE_MODE: ${{ needs.coverage-plan.outputs.mode }}
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
 
       - name: Upload coverage report
         if: always() && needs.coverage-plan.outputs.mode != 'skip'
