@@ -30,5 +30,6 @@
 
 pub mod client;
 pub mod install;
+pub mod ownership;
 pub mod rpc;
 pub mod spec;
