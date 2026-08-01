@@ -55,17 +55,18 @@ paths:
   Deduplication runs at priority 3010, after route dispatch and
   `request_transformer` header/query rules but before terminate-mode
   `serverless_function`. Plugin-cache admission rejects every same-protocol
-  header/query/destination mutator at or after deduplication, including priority
-  overrides,
-  and rejects any deferred request-body transformer whose final bytes are not
-  exactly the body produced by the pre-`before_proxy` normalization phase.
+  header/query/destination mutator at or after deduplication, including
+  priority overrides, and rejects any deferred request-body transformer whose
+  final bytes are not exactly the body produced by the pre-`before_proxy`
+  normalization phase.
 - `response_caching` likewise requires the proxy's private proof that the
   complete GET/HEAD upload is empty before lookup, binds the complete
   backend-visible request target (including the effective outbound query),
-  rejects later header/query/destination mutation, and rejects deferred body transforms that
-  could synthesize bytes after lookup. Configured request decompression remains
-  compatible because its exact final body is published during pre-`before_proxy`
-  normalization. Its request-header dimension conservatively binds all
+  rejects later header/query/destination mutation, and rejects deferred body
+  transforms that could synthesize bytes after lookup. Configured request
+  decompression remains compatible because its exact final body is published
+  during pre-`before_proxy` normalization. Its request-header dimension
+  conservatively binds all
   backend-visible headers, in addition to the complete `Vary` tuple, except
   the entry-operation headers whose semantics this plugin actually implements:
   `If-None-Match` / `If-Modified-Since` revalidation, pure honored request
