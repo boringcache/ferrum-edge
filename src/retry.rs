@@ -563,8 +563,7 @@ fn classify_typed_chain(
 ///
 /// It is BOTH the emitted message and the classifier anchor below, so the two
 /// cannot drift. Carries no configured value — the SNI itself is never echoed.
-pub const WS_BACKEND_TLS_SNI_UNSUPPORTED: &str =
-    "WebSocket backend dial refused: backend TLS SNI override is not supported on the WebSocket \
+pub const WS_BACKEND_TLS_SNI_UNSUPPORTED: &str = "WebSocket backend dial refused: backend TLS SNI override is not supported on the WebSocket \
      transport";
 
 /// Tightened substring fallback for boxed/reqwest errors when the typed
