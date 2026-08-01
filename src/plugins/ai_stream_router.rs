@@ -15,13 +15,27 @@
 //! normalized to OpenAI `chat.completion.chunk` SSE on the fly via a
 //! [`ResponseStreamInspector`], never buffering the full response.
 //!
-//! ## Coordination with `ai_federation`
+//! ## Coordination with other built-ins
 //!
-//! `ai_stream_router` runs first and, when it claims a streaming request, sets
-//! `ctx.metadata["ai_stream_router_claimed"] = "true"`. `ai_federation` checks
-//! this at the top of its `before_proxy` and immediately `Continue`s, so the two
-//! plugins compose: `stream: true` is handled here, `stream: false` falls
-//! through to `ai_federation`.
+//! `ai_stream_router` runs first and, when it claims a streaming request,
+//! records the private typed [`AiStreamRouterClaim`] on the request context and
+//! also publishes `ctx.metadata["ai_stream_router_claimed"] = "true"` for
+//! observability and third-party/custom-plugin coordination. Every BUILT-IN
+//! that must stand down on a claimed provider request — `ai_federation`,
+//! `request_mirror`, `serverless_function`, `mcp_gateway`, and
+//! `mesh_route_dispatch` — decides from
+//! [`RequestContext::has_ai_stream_router_claim`], never from that metadata key
+//! (`GHSA-xhp5-hqj8-3mwg`): metadata is a mutable string map, so deleting or
+//! rewriting the marker after a real claim would otherwise let those plugins
+//! re-route, mirror, federate, or invoke a function over a request whose
+//! third-party provider credential, model, destination, and query are already
+//! committed. The two plugin families still compose the same way: `stream: true`
+//! is handled here, `stream: false` falls through to `ai_federation`.
+//!
+//! Intentional PASS-THROUGH is a different state — the request is genuinely
+//! unclaimed because the operator disabled fail-closed missing/unmatched-model
+//! behavior — and still coordinates through
+//! `ctx.metadata["ai_stream_router_pass_through"]`.
 //!
 //! ## MVP scope
 //!
@@ -267,7 +281,14 @@ pub const AI_STREAM_ROUTER_FALLBACK_REJECTION: &str = "ai_stream_router: unsuppo
 
 const META_ENABLED: &str = "ai_stream_router.enabled";
 const META_CLAIMED: &str = "ai_stream_router.claimed";
-/// Coordination key read by `ai_federation` to skip an already-claimed request.
+/// OBSERVABILITY / third-party coordination ONLY (`GHSA-xhp5-hqj8-3mwg`).
+///
+/// Published so logs and external/custom plugins can see that a claim happened.
+/// No BUILT-IN reads it back for a routing or egress decision: `ai_federation`,
+/// `request_mirror`, `serverless_function`, `mcp_gateway`, and
+/// `mesh_route_dispatch` all gate on the private typed claim through
+/// `RequestContext::has_ai_stream_router_claim()`, which a later plugin cannot
+/// erase or forge. Do not reintroduce a decision on this key.
 const META_CLAIMED_COORD: &str = "ai_stream_router_claimed";
 /// Coordination key for explicit router pass-through of streaming requests.
 const META_PASSTHROUGH_COORD: &str = "ai_stream_router_pass_through";
@@ -371,10 +392,19 @@ impl ProviderType {
 }
 
 /// How a provider API key is injected into the forwarded request.
+///
+/// Both variants carry the COMPLETE, ready-to-insert header value. The final
+/// provider-header policy re-runs on every backend-visible header map (each
+/// `before_proxy` pass, each deferred routing pass, each finalized-egress
+/// overlay, and each retry attempt), so the credential value is built once at
+/// construction and only cloned into the outbound map afterwards.
+///
+/// Deliberately no `Debug`: every field is a live provider credential.
 #[derive(Clone)]
 enum ProviderAuth {
-    /// `Authorization: Bearer <api_key>`
-    Bearer { api_key: String },
+    /// `Authorization: <header_value>`, where `header_value` is the complete
+    /// `Bearer <api_key>` string precomputed at construction.
+    Bearer { header_value: String },
     /// A provider-specific header (e.g. `x-api-key` for Anthropic).
     Header { name: String, api_key: String },
 }
@@ -787,7 +817,11 @@ fn build_auth(provider_type: ProviderType, api_key: String) -> ProviderAuth {
             name: "x-goog-api-key".to_string(),
             api_key,
         },
-        ProviderType::OpenAi | ProviderType::OpenAiCompatible => ProviderAuth::Bearer { api_key },
+        // Build the complete `Bearer <key>` header value once, here, so the
+        // final-policy hot path never formats a credential per pass.
+        ProviderType::OpenAi | ProviderType::OpenAiCompatible => ProviderAuth::Bearer {
+            header_value: format!("Bearer {api_key}"),
+        },
     }
 }
 
@@ -2702,10 +2736,14 @@ fn strip_client_credentials(headers: &mut HashMap<String, String>) {
         "openai-project",
     ];
     // Header keys in the map are already lowercased by the proxy, but match
-    // case-insensitively to be safe against any future change.
+    // case-insensitively to be safe against any future change. This runs on
+    // every final-policy pass (once per `before_proxy` pass, per deferred
+    // routing pass, per egress overlay, and per retry attempt), so compare in
+    // place rather than allocating a lowercased copy of every header name.
     headers.retain(|k, _| {
-        let lk = k.to_ascii_lowercase();
-        !CREDENTIAL_HEADERS.contains(&lk.as_str())
+        !CREDENTIAL_HEADERS
+            .iter()
+            .any(|candidate| k.eq_ignore_ascii_case(candidate))
     });
 }
 
@@ -2751,8 +2789,10 @@ fn apply_provider_boundary_headers(
     strip_client_credentials(headers);
     strip_gateway_identity_assertions(headers);
     match &provider.auth {
-        ProviderAuth::Bearer { api_key } => {
-            headers.insert("authorization".to_string(), format!("Bearer {api_key}"));
+        ProviderAuth::Bearer { header_value } => {
+            // `strip_client_credentials` already removed every case variant of
+            // `authorization`, so this insert is the canonical one.
+            headers.insert("authorization".to_string(), header_value.clone());
         }
         ProviderAuth::Header { name, api_key } => {
             // The credential header name is provider-specific and may collide
