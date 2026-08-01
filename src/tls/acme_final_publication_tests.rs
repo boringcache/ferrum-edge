@@ -1,9 +1,10 @@
 //! Final ACME renewal publication boundary (issue #2409 / PR #3506).
 //!
-//! Certificate material and the order `Valid` transition must share one
-//! lease-fenced critical section. A persistence failure after the certificate
-//! write must still request material reload and must not be accounted as a
-//! skip that claims nothing was published.
+//! The already-CA-valid order is persisted as `Valid` first and certificate
+//! material second under one lease-fenced critical section. Partial persistence
+//! failures must never leave published material beside a stale `Processing`
+//! order, must not request reload, and must not be accounted as a successful
+//! renewal.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,9 +14,9 @@ use crate::tls::acme::{
     AcmeCertificateRecord, AcmeCertificateStore, AcmeError, AcmeHttp01ChallengeRecord,
     AcmeHttp01OrderInput, AcmeIssuedCertificateInput, AcmeOrderRecord, AcmeOrderStatus,
     AcmeOrderStore, FinalRenewalPublication, apply_final_renewal_publication,
-    commit_final_renewal_publication,
+    commit_final_renewal_publication, inject_final_publication_certificate_write_fault_for_tests,
 };
-use crate::tls::lease::{FencedCommit, RenewalLeaseKeeper, TlsLeaseStore, acme_renewal_lease_name};
+use crate::tls::lease::{RenewalLeaseKeeper, TlsLeaseStore, acme_renewal_lease_name};
 use crate::tls::private_file::{PrivateFileFault, inject_private_file_fault_for_tests};
 use crate::tls::source::subscription::{install_force_reload_probe, remove_force_reload_probe};
 use tempfile::TempDir;
@@ -80,10 +81,10 @@ fn takeover_document(name: &str) -> String {
     )
 }
 
-/// Happy path: one fenced commit publishes certificate material and marks the
-/// order Valid, then reload is requested.
+/// Happy path: one fenced commit marks the order Valid then publishes
+/// certificate material, and reload is requested.
 #[tokio::test]
-async fn final_publication_commits_certificate_then_order_under_one_lease_fence() {
+async fn final_publication_commits_order_then_certificate_under_one_lease_fence() {
     let dir = TempDir::new().expect("tempdir");
     let certificates = Arc::new(AcmeCertificateStore::open(dir.path()).expect("open cert store"));
     let orders = Arc::new(AcmeOrderStore::open(dir.path()).expect("open order store"));
@@ -105,7 +106,7 @@ async fn final_publication_commits_certificate_then_order_under_one_lease_fence(
         .expect("won");
     let keeper = RenewalLeaseKeeper::start(held, Duration::from_secs(60));
 
-    let surface = "final_publication_complete_reload";
+    let surface = "final_publication_order_then_cert_complete_reload";
     let mut probe = install_force_reload_probe(surface);
 
     let outcome = keeper
@@ -198,17 +199,17 @@ async fn final_publication_runs_neither_write_when_lease_is_lost() {
         orders.get_order("edge-order").expect("order").status,
         AcmeOrderStatus::Processing
     );
+    let _ = keeper.finish().await;
 }
 
-/// Certificate commit + order persistence failure under the lease fence:
-/// material is live, reload is requested, and accounting is an explicit failure.
+/// Order-store persistence failure under the lease fence: no certificate is
+/// published, Processing remains, reload is not requested, and accounting is an
+/// explicit failure.
 #[test]
-fn fenced_certificate_success_with_order_failure_requests_reload() {
+fn order_store_failure_publishes_no_certificate_and_skips_reload() {
     let dir = TempDir::new().expect("tempdir");
     let certificates = AcmeCertificateStore::open(dir.path()).expect("open cert store");
     let orders = AcmeOrderStore::open(dir.path()).expect("open order store");
-    let leases = TlsLeaseStore::open_with_holder(dir.path(), "replica-a".to_string())
-        .expect("open lease store");
     let (cert_pem, key_pem) = generated_cert_and_key();
     let issued = sample_certificate("edge-cert", &cert_pem, &key_pem);
     let order = processing_order("edge-order", "edge-cert");
@@ -216,67 +217,36 @@ fn fenced_certificate_success_with_order_failure_requests_reload() {
         .upsert_order(order.clone(), false)
         .expect("seed processing order");
 
-    let name = acme_renewal_lease_name("edge-cert");
-    let held = leases
-        .try_acquire(&name, Duration::from_secs(60))
-        .expect("claim")
-        .expect("won");
-    let fence = held.fence();
-    std::mem::forget(held);
-
-    let fenced = leases
-        .commit_fenced(&name, fence, || {
-            match certificates.upsert_certificate(issued, true) {
-                Ok(_) => {
-                    let _fault = inject_private_file_fault_for_tests(PrivateFileFault::Rename);
-                    let mut updated = order;
-                    updated.status = AcmeOrderStatus::Valid;
-                    updated.error = None;
-                    match orders.upsert_order(updated, true) {
-                        Ok(_) => FinalRenewalPublication::Complete,
-                        Err(error) => {
-                            FinalRenewalPublication::MaterialPublishedOrderIncomplete(error)
-                        }
-                    }
-                }
-                Err(error) => FinalRenewalPublication::MaterialNotPublished(error),
-            }
-        })
-        .expect("fenced commit answers");
-
-    let FencedCommit::Committed(outcome) = fenced else {
-        panic!("live claim must run the final publication closure");
-    };
+    let surface = "final_publication_order_failure_no_reload";
+    let mut probe = install_force_reload_probe(surface);
+    let _fault = inject_private_file_fault_for_tests(PrivateFileFault::Rename);
+    let outcome = commit_final_renewal_publication(&certificates, &orders, issued, order);
     assert!(matches!(
         outcome,
-        FinalRenewalPublication::MaterialPublishedOrderIncomplete(_)
+        FinalRenewalPublication::OrderNotCommitted(_)
     ));
 
-    let surface = "final_publication_partial_reload";
-    let mut probe = install_force_reload_probe(surface);
-    let error = apply_final_renewal_publication(outcome).expect_err("incomplete order");
+    let error = apply_final_renewal_publication(outcome).expect_err("order write failed");
     let message = error.to_string();
     assert!(
-        message.contains("renewed certificate material was published"),
-        "error must state material was published: {message}"
+        message.contains("marking the ACME order valid failed before certificate publication"),
+        "error must state the order write failed before publication: {message}"
     );
     assert!(
-        message.contains("marking the ACME order valid failed"),
-        "error must state the order update is incomplete: {message}"
-    );
-    assert!(
-        !message.contains("BEGIN CERTIFICATE") && !message.contains(&key_pem),
+        !message.contains("BEGIN CERTIFICATE")
+            && !message.contains("BEGIN PRIVATE KEY")
+            && !message.contains(&key_pem)
+            && !message.contains(&cert_pem),
         "error must not disclose certificate or key material"
     );
     assert!(
-        probe.try_recv().is_ok(),
-        "published material must still request reload"
+        probe.try_recv().is_err(),
+        "order failure must not request reload"
     );
-
-    let stored = certificates
-        .get_certificate("edge-cert")
-        .expect("published cert remains");
-    assert_eq!(stored.cert_pem, cert_pem);
+    assert!(matches!(
+        certificates.get_certificate("edge-cert"),
+        Err(AcmeError::NotFound(_))
+    ));
     assert_eq!(
         orders.get_order("edge-order").expect("order").status,
         AcmeOrderStatus::Processing,
@@ -285,10 +255,79 @@ fn fenced_certificate_success_with_order_failure_requests_reload() {
     remove_force_reload_probe(surface);
 }
 
-/// The production helper itself commits certificate then order with no window
-/// for a separate lease release between them.
+/// Certificate-store failure after a successful order Valid write: order is
+/// Valid, prior/no new cert remains, reload is not requested, and the outcome
+/// is an explicit failure (never a successful renewal).
 #[test]
-fn commit_final_renewal_publication_marks_order_valid_after_certificate() {
+fn certificate_store_failure_after_order_valid_skips_reload() {
+    let dir = TempDir::new().expect("tempdir");
+    let certificates = AcmeCertificateStore::open(dir.path()).expect("open cert store");
+    let orders = AcmeOrderStore::open(dir.path()).expect("open order store");
+    let (old_cert_pem, old_key_pem) = generated_cert_and_key();
+    let prior = sample_certificate("edge-cert", &old_cert_pem, &old_key_pem);
+    certificates
+        .upsert_certificate(prior, false)
+        .expect("seed prior certificate");
+    let (new_cert_pem, new_key_pem) = generated_cert_and_key();
+    let issued = sample_certificate("edge-cert", &new_cert_pem, &new_key_pem);
+    let order = processing_order("edge-order", "edge-cert");
+    orders
+        .upsert_order(order.clone(), false)
+        .expect("seed processing order");
+
+    let surface = "final_publication_cert_failure_after_order_no_reload";
+    let mut probe = install_force_reload_probe(surface);
+    let _fault =
+        inject_final_publication_certificate_write_fault_for_tests(PrivateFileFault::Rename);
+    let outcome = commit_final_renewal_publication(&certificates, &orders, issued, order);
+    assert!(matches!(
+        outcome,
+        FinalRenewalPublication::OrderCommittedMaterialNotPublished(_)
+    ));
+
+    let error = apply_final_renewal_publication(outcome).expect_err("cert write failed");
+    let message = error.to_string();
+    assert!(
+        message.contains(
+            "ACME order was marked valid but renewed certificate material failed to publish"
+        ),
+        "error must state order committed without material: {message}"
+    );
+    assert!(
+        !message.contains("BEGIN CERTIFICATE")
+            && !message.contains("BEGIN PRIVATE KEY")
+            && !message.contains(&new_key_pem)
+            && !message.contains(&new_cert_pem)
+            && !message.contains(&old_key_pem),
+        "error must not disclose certificate or key material"
+    );
+    assert!(
+        probe.try_recv().is_err(),
+        "certificate failure after order Valid must not request reload"
+    );
+
+    let stored = certificates
+        .get_certificate("edge-cert")
+        .expect("prior certificate remains");
+    assert_eq!(
+        stored.cert_pem, old_cert_pem,
+        "failed certificate write must leave the prior material"
+    );
+    assert_ne!(stored.cert_pem, new_cert_pem);
+    assert_eq!(
+        orders.get_order("edge-order").expect("order").status,
+        AcmeOrderStatus::Valid,
+        "order Valid must stick so Processing cannot block a later retry"
+    );
+    // apply_final_renewal_publication returned Err above: this path is never a
+    // successful renewal count.
+    remove_force_reload_probe(surface);
+}
+
+/// The production helper itself commits order Valid then certificate with no
+/// window for a separate lease release between them.
+#[test]
+fn commit_final_renewal_publication_marks_order_valid_before_certificate() {
     let dir = TempDir::new().expect("tempdir");
     let certificates = AcmeCertificateStore::open(dir.path()).expect("open cert store");
     let orders = AcmeOrderStore::open(dir.path()).expect("open order store");
@@ -312,46 +351,4 @@ fn commit_final_renewal_publication_marks_order_valid_after_certificate() {
         orders.get_order("edge-order").expect("order").status,
         AcmeOrderStatus::Valid
     );
-}
-
-/// A certificate-store failure publishes nothing and does not request reload.
-#[test]
-fn certificate_failure_publishes_nothing_and_skips_reload() {
-    let dir = TempDir::new().expect("tempdir");
-    let certificates = AcmeCertificateStore::open(dir.path()).expect("open cert store");
-    let orders = AcmeOrderStore::open(dir.path()).expect("open order store");
-    let (cert_pem, key_pem) = generated_cert_and_key();
-    let issued = sample_certificate("edge-cert", &cert_pem, &key_pem);
-    let order = processing_order("edge-order", "edge-cert");
-    orders
-        .upsert_order(order.clone(), false)
-        .expect("seed processing order");
-
-    let _fault = inject_private_file_fault_for_tests(PrivateFileFault::Rename);
-    let outcome = commit_final_renewal_publication(&certificates, &orders, issued, order);
-    assert!(matches!(
-        outcome,
-        FinalRenewalPublication::MaterialNotPublished(_)
-    ));
-
-    let surface = "final_publication_no_reload_on_cert_failure";
-    let mut probe = install_force_reload_probe(surface);
-    let error = apply_final_renewal_publication(outcome).expect_err("cert failed");
-    assert!(
-        !error.to_string().contains("material was published"),
-        "certificate failure must not claim material was published"
-    );
-    assert!(
-        probe.try_recv().is_err(),
-        "no material means no reload request"
-    );
-    assert!(matches!(
-        certificates.get_certificate("edge-cert"),
-        Err(AcmeError::NotFound(_))
-    ));
-    assert_eq!(
-        orders.get_order("edge-order").expect("order").status,
-        AcmeOrderStatus::Processing
-    );
-    remove_force_reload_probe(surface);
 }

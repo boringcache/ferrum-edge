@@ -823,9 +823,9 @@ fn a_takeover_cannot_cross_a_fenced_commit() {
 }
 
 /// Final renewal publication runs two target-store mutations under one lease
-/// fence. A takeover must not be able to slip between them the way it could
-/// when certificate publication and the order Valid write were separate
-/// `commit_fenced` calls.
+/// fence — order `Valid` first, then certificate material. A takeover must not
+/// be able to slip between them the way it could when those writes were
+/// separate `commit_fenced` calls.
 #[test]
 fn two_target_mutations_share_one_lease_fence_without_a_takeover_window() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -849,7 +849,7 @@ fn two_target_mutations_share_one_lease_fence_without_a_takeover_window() {
     let second_flag = Arc::clone(&second_done);
     let commit = std::thread::spawn(move || {
         committing.commit_fenced(&commit_name, fence, move || {
-            // Stands in for certificate-store publication.
+            // Stands in for the order Valid transition.
             first_flag.store(true, Ordering::SeqCst);
             after_first_tx
                 .send(())
@@ -857,7 +857,7 @@ fn two_target_mutations_share_one_lease_fence_without_a_takeover_window() {
             release_rx
                 .recv_timeout(SETTLE_BUDGET)
                 .expect("the test releases the mid-publication hold");
-            // Stands in for the order Valid transition.
+            // Stands in for certificate-store publication.
             second_flag.store(true, Ordering::SeqCst);
             "published-both"
         })
@@ -868,11 +868,11 @@ fn two_target_mutations_share_one_lease_fence_without_a_takeover_window() {
         .expect("first mutation must run under the live claim");
     assert!(
         first_done.load(Ordering::SeqCst),
-        "certificate publication stand-in must have committed"
+        "order Valid stand-in must have committed"
     );
     assert!(
         !second_done.load(Ordering::SeqCst),
-        "order Valid stand-in must still be pending inside the same fence"
+        "certificate publication stand-in must still be pending inside the same fence"
     );
 
     // While the fence is still held between the two mutations, the lease store

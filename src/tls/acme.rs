@@ -1941,27 +1941,31 @@ fn has_active_renewal_order(
 
 /// Outcome of the lease-fenced final publication of renewed ACME material.
 ///
-/// Certificate publication and the order `Valid` transition are one critical
-/// section under the lease lock. This enum exists so a persistence failure on
-/// the order write cannot be mistaken for "nothing was published".
+/// The already-CA-valid order is persisted as `Valid` first and certificate
+/// material second, under one lease lock. This enum exists so a persistence
+/// failure on either write cannot be mistaken for a successful renewal, and so
+/// a certificate-store failure after a successful order write cannot leave a
+/// stale `Processing` order that would block later retries.
 #[derive(Debug)]
 pub(crate) enum FinalRenewalPublication {
-    /// Certificate material and the order `Valid` status both committed.
+    /// Order `Valid` status and certificate material both committed.
     Complete,
-    /// Certificate material committed, but marking the order `Valid` failed.
-    /// Callers must still request material reload — the new cert is live.
-    MaterialPublishedOrderIncomplete(AcmeError),
-    /// Certificate store write failed; neither final write landed.
-    MaterialNotPublished(AcmeError),
+    /// Order marked `Valid`, but certificate material did not persist.
+    /// Callers must not request reload — prior material remains authoritative,
+    /// and the now-`Valid` order does not block a later renewal retry.
+    OrderCommittedMaterialNotPublished(AcmeError),
+    /// Order `Valid` write failed; certificate material was not published.
+    OrderNotCommitted(AcmeError),
 }
 
-/// Publish renewed certificate material and mark the order `Valid`.
+/// Publish the already-CA-valid order as `Valid`, then persist renewed
+/// certificate material.
 ///
 /// # Lock order
 ///
 /// Called only while the lease store's exclusive lock is already held by
 /// [`crate::tls::lease::TlsLeaseStore::commit_fenced`]. Inside that fence the
-/// certificate store is mutated first and the order store second. Neither ACME
+/// order store is mutated first and the certificate store second. Neither ACME
 /// store takes the lease lock, admin and renewal paths never nest these two
 /// stores in the reverse order while holding a lease, and nothing takes the
 /// lease lock while already holding an ACME store lock — so nesting here cannot
@@ -1975,21 +1979,30 @@ pub(crate) fn commit_final_renewal_publication(
 ) -> FinalRenewalPublication {
     order.status = AcmeOrderStatus::Valid;
     order.error = None;
-    match certificate_store.upsert_certificate(issued, true) {
-        Ok(_) => match order_store.upsert_order(order, true) {
-            Ok(_) => FinalRenewalPublication::Complete,
-            Err(error) => FinalRenewalPublication::MaterialPublishedOrderIncomplete(error),
-        },
-        Err(error) => FinalRenewalPublication::MaterialNotPublished(error),
+    match order_store.upsert_order(order, true) {
+        Ok(_) => {
+            // Test-only: optionally fail the certificate write after the order
+            // `Valid` commit so callers exercise that partial-failure path
+            // through this helper rather than reimplementing it.
+            #[cfg(test)]
+            let _certificate_write_fault = take_final_publication_certificate_write_fault();
+            match certificate_store.upsert_certificate(issued, true) {
+                Ok(_) => FinalRenewalPublication::Complete,
+                Err(error) => FinalRenewalPublication::OrderCommittedMaterialNotPublished(error),
+            }
+        }
+        Err(error) => FinalRenewalPublication::OrderNotCommitted(error),
     }
 }
 
-/// Request material reload whenever certificate material landed, and map the
+/// Request material reload only when both final writes committed, and map the
 /// publication outcome onto renewal success/failure accounting.
 ///
-/// A certificate that committed must never be reported as a no-op skip, even
-/// when the subsequent order-store write fails for an I/O/persistence reason.
-/// On success, returns the surfaces that accepted the force-reload request.
+/// A partial persistence failure is always an explicit renewal error and never
+/// a successful renewal. Reload is requested only on [`FinalRenewalPublication::Complete`]:
+/// an order-only commit must not reload (no new material), and an order-write
+/// failure must not reload (no new material). On success, returns the surfaces
+/// that accepted the force-reload request.
 pub(crate) fn apply_final_renewal_publication(
     outcome: FinalRenewalPublication,
 ) -> Result<Vec<&'static str>, AcmeError> {
@@ -1997,13 +2010,79 @@ pub(crate) fn apply_final_renewal_publication(
         FinalRenewalPublication::Complete => {
             Ok(crate::tls::source::subscription::request_all_material_set_reloads())
         }
-        FinalRenewalPublication::MaterialPublishedOrderIncomplete(error) => {
-            let _ = crate::tls::source::subscription::request_all_material_set_reloads();
+        FinalRenewalPublication::OrderCommittedMaterialNotPublished(error) => {
             Err(AcmeError::Write(format!(
-                "renewed certificate material was published but marking the ACME order valid failed: {error}"
+                "ACME order was marked valid but renewed certificate material failed to publish: {error}"
             )))
         }
-        FinalRenewalPublication::MaterialNotPublished(error) => Err(error),
+        FinalRenewalPublication::OrderNotCommitted(error) => Err(AcmeError::Write(format!(
+            "marking the ACME order valid failed before certificate publication: {error}"
+        ))),
+    }
+}
+
+/// Arms a private-file fault that fires only on the certificate-store write
+/// inside [`commit_final_renewal_publication`], after the order `Valid` write
+/// has already succeeded.
+///
+/// Test-only. Cleared when the returned guard drops, including after a panic
+/// inside the helper, so the thread-local cannot leak into a later test.
+#[cfg(test)]
+pub(crate) fn inject_final_publication_certificate_write_fault_for_tests(
+    fault: crate::tls::private_file::PrivateFileFault,
+) -> FinalPublicationCertificateWriteFaultGuard {
+    FINAL_PUBLICATION_CERTIFICATE_WRITE_FAULT.with(|cell| cell.set(fault));
+    FinalPublicationCertificateWriteFaultGuard { active: true }
+}
+
+/// Clears an armed post-order certificate-write fault on drop.
+#[cfg(test)]
+#[must_use = "the fault is cleared when this guard is dropped"]
+pub(crate) struct FinalPublicationCertificateWriteFaultGuard {
+    active: bool,
+}
+
+#[cfg(test)]
+impl FinalPublicationCertificateWriteFaultGuard {
+    fn clear(&self) {
+        FINAL_PUBLICATION_CERTIFICATE_WRITE_FAULT.with(|cell| {
+            cell.set(crate::tls::private_file::PrivateFileFault::None);
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for FinalPublicationCertificateWriteFaultGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FINAL_PUBLICATION_CERTIFICATE_WRITE_FAULT:
+        std::cell::Cell<crate::tls::private_file::PrivateFileFault> =
+            const { std::cell::Cell::new(crate::tls::private_file::PrivateFileFault::None) };
+}
+
+/// Take any armed post-order certificate-write fault and install it as a
+/// private-file fault for the duration of the certificate upsert.
+#[cfg(test)]
+fn take_final_publication_certificate_write_fault(
+) -> Option<crate::tls::private_file::PrivateFileFaultGuard> {
+    let fault = FINAL_PUBLICATION_CERTIFICATE_WRITE_FAULT.with(|cell| {
+        let fault = cell.get();
+        cell.set(crate::tls::private_file::PrivateFileFault::None);
+        fault
+    });
+    if fault == crate::tls::private_file::PrivateFileFault::None {
+        None
+    } else {
+        Some(crate::tls::private_file::inject_private_file_fault_for_tests(
+            fault,
+        ))
     }
 }
 
@@ -2025,13 +2104,17 @@ pub(crate) fn apply_final_renewal_publication(
 /// is released the moment the write completes and everything after it is fresh
 /// work.
 ///
-/// Final renewal publication is one lease-fenced critical section: the
-/// certificate store is updated first and the order is marked `Valid` second
-/// while that lease lock is still held, so claim loss cannot publish material
-/// and leave the latest order stuck in `Processing`. If the certificate write
-/// commits and the order write then fails for persistence reasons, material
-/// reload is still requested and the failure is reported explicitly rather than
-/// counted as a skip.
+/// Final renewal publication is one lease-fenced critical section: the order is
+/// marked `Valid` first and the certificate store is updated second while that
+/// lease lock is still held. ACME completion and certificate download have
+/// already succeeded by this point, so persisting `Valid` first is accurate and
+/// guarantees published material can never coexist with a stale local
+/// `Processing` status (which `has_active_renewal_order` would treat as
+/// permanently active). If the order write fails, material is not published and
+/// reload is not requested. If the order write succeeds but the certificate
+/// write fails, the failure is reported explicitly with no reload — the prior
+/// certificate remains due and the now-`Valid` order does not block a later
+/// retry.
 ///
 /// One residual is inherent to ACME: an order already created with the CA
 /// cannot be un-created if the claim is lost immediately afterwards. The check
@@ -2167,13 +2250,13 @@ async fn renew_certificate_once(
         chain_pem: None,
     })?;
 
-    // Final publication. Certificate material and the order Valid transition
-    // share one lease-fenced critical section so a claim lost between the two
-    // writes cannot publish material while leaving the latest order Processing
-    // (which would block a later renewal). If the claim is already gone, neither
-    // write runs. If the certificate write commits and the order write then
-    // fails for persistence reasons, reload is still requested and the failure
-    // is reported as a renewal error rather than a skip.
+    // Final publication. The already-CA-valid order is persisted as Valid
+    // first and certificate material second under one lease fence, so a claim
+    // lost between the writes cannot publish material while leaving Processing
+    // (which would block later renewals), and a certificate-store persistence
+    // failure after an order Valid write cannot leave Processing either. If the
+    // claim is already gone, neither write runs. Partial persistence failures
+    // request no reload and are reported as renewal errors, not successes.
     let certs = Arc::clone(certificate_store);
     let orders = Arc::clone(order_store);
     let publication = match keeper
