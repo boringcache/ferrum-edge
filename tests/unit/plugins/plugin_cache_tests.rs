@@ -8655,7 +8655,16 @@ async fn plugin_cache_wires_stable_plugin_config_id_into_dedup_logical_keys() {
         ));
         let keys = request_deduplication_logical_keys_from_context_for_test(&ctx);
         assert_eq!(keys.len(), 1);
-        keys.into_iter().next().unwrap()
+        let key = keys.into_iter().next().unwrap();
+        plugin
+            .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(2))
+            .await;
+        assert_eq!(
+            plugin.tracked_keys_count(),
+            Some(0),
+            "logical-key probe must release in-flight ownership before the next same-identity lookup"
+        );
+        key
     }
 
     let sibling_a = logical_key(&first_plugins[0]).await;

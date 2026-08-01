@@ -89,6 +89,30 @@ paths:
   keyed state. The RFC shared-cache authorization admission checks both pristine
   inbound and live backend-visible `Authorization`, so request transforms cannot
   erase it.
+- Exception: `load_testing` admits at most one effective instance per proxy
+  after merge. Both it and `api_chargeback` are enforced by
+  `exclusive_effective_instance_errors` in `src/plugin_cache.rs`, applied to the
+  merged per-proxy chain in both the full-build and incremental-rebuild paths.
+- Stateful protections are owned by a **stable policy identity**
+  (`namespace` + plugin-config id), never by the plugin instance the cache
+  happened to construct and never by request-controlled data
+  (GHSA-wmqm-6mxj-gm9p). `tcp_connection_throttle` live-connection accounting is
+  carried in a plugin-cache-owned instance map
+  (`TcpConnectionThrottleInstanceMap`); `load_testing` run admission and
+  local-mode `request_deduplication` state use per-plugin weak registries
+  (`SHARED_STATES`, `SHARED_LOCAL_STATES`) whose entries are pruned on insert,
+  so retention is bounded by the currently configured policies plus in-flight
+  holders. A compatible reload inherits live state; a semantic change isolates
+  onto fresh state so a retired generation's late release/completion cannot
+  corrupt the replacement. For deduplication the semantic set is deliberately
+  narrow — `header_name`, `local` vs `redis`, and `on_redis_unavailable` —
+  because everything else is either bound into the logical key or enforced per
+  operation. In-flight operations, completions, and execution barriers retain
+  their admission-time protection windows across reloads; never evaluate an
+  existing lease with a replacement generation's shorter timeout. Weak
+  registries keep every still-live semantic generation for an identity, not
+  just the last one, so A → B → A recovers A's active protection state. Do not
+  reintroduce per-instance ownership for any of these.
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order
@@ -101,6 +125,67 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
 4. `normalize_buffered_request_body_before_before_proxy`: configured request decompression (and any future early body normalizers) after the pre-`before_proxy` buffer is stored
 4b. `validate_client_request_body_contract`: CLIENT-contract admission over the ORIGINAL client representation, after normalization and before any `before_proxy`/`transform_request_body` hook can reshape it. Read-only (admit or reject, never rewrite). `openapi_validator` owns this phase; its `on_final_request_body` is the BACKEND-contract fallback when this validator did not select over the pristine client view but can select after a `before_proxy` route override or header/target rewrite, and is skipped per instance once the client phase decided, so one request is never charged twice (`GHSA-896v-jx23-9g6p`). Unknown-operation admission (`fail_on_unknown_operation`) is rejected in `before_proxy`, not deferred to the final fallback. HBONE CONNECT is NOT a fallback path — the proxy skips request-body buffering for it and returns into `handle_hbone_request` before any final-body hook, so tunnel bytes are never a request body here. The phase also covers the transport-proven-empty H1/H2 `GET`/`HEAD`/`OPTIONS` fast path (validated against `&[]` without materializing a buffer), so a required client body is enforced identically on H1/H2/H3. A plugin declaring `validates_client_request_body_contract()` MUST also declare `requires_request_body_before_before_proxy()`; `validate_plugin_security_composition` rejects the composition otherwise. A plugin here must select buffering from the matched route/operation, never from an attacker-omittable `Content-Type` (`GHSA-6p78-6x8c-9g9x`).
 5. `before_proxy`: SOAP, AI plugins, workload metrics, transformers, mock, gRPC deadline, load, cache, compression
+5b. `enforce_final_backend_header_policy`: synchronous, NON-rejecting
+    re-assertion of a plugin-owned backend-boundary header set over the
+    FINAL backend-visible header map (`GHSA-xhp5-hqj8-3mwg`). Runs after the
+    `before_proxy` pass, after each deferred routing/remaining pass, and after a
+    finalized-egress header overlay — always after the reserved gateway-assertion
+    refresh and the egress baggage strip, on the H1/H2 ladder
+    (`src/proxy/mod.rs`) and the native H3 ladder (`src/http3/server.rs`). Gated
+    on `PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY`. Implementations
+    must be idempotent and must never log header values. `ai_stream_router` owns
+    this phase: priority 2984 does not order it after `request_transformer`
+    (3000), so re-asserting here is what actually keeps a client or
+    normal-backend credential off the third-party provider. Its matching
+    fail-closed decision (final provider-visible `model` must still equal the
+    PRIVATELY committed model AND match the selected provider's
+    `model_patterns`; the committed destination witness must be intact) lives in
+    `on_final_request_body`, which has rejection plumbing on every dispatcher.
+    A plugin declaring this capability may not be composed with
+    `request_deduplication` (a before_proxy fingerprint cannot witness a later
+    mutation). `response_caching` needs no added rule: it already refuses any
+    deferred request-body transformer, which `ai_stream_router` is.
+    Headers are not the whole boundary. `ai_stream_router` records a PRIVATE
+    typed claim (`RequestContext::ai_stream_router_claim`) — never metadata,
+    never logged — carrying an opaque owning-instance identity plus the exact
+    committed MODEL, destination, resolved backend TLS, DNS decision, and
+    backend-visible query. The committed model is the value that selected the
+    provider: final body enforcement compares against it and the claim-owned
+    response normalizers stamp the client-visible generation identity from it,
+    because a later plugin can rewrite the final body's `model` AND republish
+    `ai_stream_router.model` as the same value. Whether the owning transform
+    produced the Anthropic representation, and whether the claim forbids tool
+    use for this generation, are claim state for the same reason. Every
+    `ai_stream_router.*` metadata key is observability/coordination only and is
+    never read back for a decision; the sole exception a claim-owned hook still
+    reads is `ai_stream_router.provider_content_encoding`, which comes from the
+    provider's own response headers and only picks a bounded decoder. The
+    committed query is replayed at
+    `crate::proxy::effective_backend_query_string*`, the single capture funnel
+    for H1/H2, native H3, and retry replay, so later `request_transformer` query
+    rules cannot append a normal-backend secret to a third-party URL. The
+    destination witness includes `route_override_upstream_id` (cleared at claim,
+    required to stay clear) and exact `route_override_resolved_tls` equality, not
+    just scheme/host/port/authority/path. A direct provider claim also sets
+    `RouteOverrideDnsPolicy::ClearInherited` so
+    `RequestContext::apply_route_overrides*` drops an inherited `dns_override`
+    even when the host TEXT is unchanged; the default `InheritProxy` keeps
+    ordinary same-host route semantics. The public `ai_stream_router_claimed`
+    metadata key is likewise observability / third-party coordination only:
+    `ai_federation`, `request_mirror`, `serverless_function`, `mcp_gateway`, and
+    `mesh_route_dispatch` all stand down on
+    `RequestContext::has_ai_stream_router_claim()`, so deleting or rewriting that
+    marker cannot re-arm a routing or irreversible-egress decision on a
+    provider-bound request. Do not add a built-in decision back onto the marker.
+    Intentional pass-through is an UNCLAIMED request and still coordinates
+    through `ai_stream_router_pass_through`.
+    Multiple same-type instances are allowed
+    and may share a provider NAME, so ownership — not the
+    `ai_stream_router.provider` metadata key — gates request transformation,
+    final header/query enforcement, final body revalidation, response-header
+    handling, and response stream inspector/normalizer selection. First matching
+    instance claims; `fail_on_missing_model` / `fail_on_no_matching_provider`
+    still decide an UNCLAIMED request in normal plugin order.
 6. `on_final_request_body`: body validator, gRPC-Web validation, WAF body rules, OpenAPI request schema (backend-final fallback), post-transform request-size ceiling, `ai_prompt_compressor` staged marker-sanitization rejection (4055), and `ai_semantic_cache` exact/semantic lookup (4057). `ai_semantic_cache` looks up here — not in `before_proxy` — so its replay partition binds the finalized outbound headers/query/destination and fully transformed request body, and a hit cannot bypass fail-closed final-body policy.
 6b. `dispatch_finalized_request_egress`: irreversible outbound request egress
     (`request_mirror`, `serverless_function`, `ai_federation`) over the immutable

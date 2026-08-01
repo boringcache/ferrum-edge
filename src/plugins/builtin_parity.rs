@@ -443,7 +443,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "ai_stream_router",
         classification: BuiltinPluginClassification::Public,
         priority: 2984,
-        active_phases: "before_proxy, transform_request_body, normalize_response_body, response_stream_inspector",
+        active_phases: "before_proxy, transform_request_body, enforce_final_backend_header_policy, on_final_request_body, normalize_response_body, response_stream_inspector",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "Claims `stream: true` OpenAI Chat Completions, route-overrides to a provider, normalizes provider SSE to OpenAI SSE",
     },

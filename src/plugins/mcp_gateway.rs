@@ -4493,11 +4493,13 @@ impl Plugin for McpGateway {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if ctx
-            .metadata
-            .get("ai_stream_router_claimed")
-            .is_some_and(|value| value == "true")
-        {
+        // Read the PRIVATE typed claim, not the public
+        // `ai_stream_router_claimed` metadata key: MCP routing rewrites the
+        // backend destination, so a later plugin deleting that observability
+        // marker must not be able to redirect a request whose provider
+        // credential is already committed to a different destination
+        // (`GHSA-xhp5-hqj8-3mwg`).
+        if ctx.has_ai_stream_router_claim() {
             return PluginResult::Continue;
         }
         if !self.enabled || !self.matches_endpoint(ctx) {

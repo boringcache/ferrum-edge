@@ -4838,6 +4838,55 @@ async fn run_finalized_request_egress_hooks_inner(
     }
 }
 
+/// Re-assert every configured backend-boundary header policy over the finalized
+/// outbound header map (`GHSA-xhp5-hqj8-3mwg`).
+///
+/// A plugin that installs a third-party credential from `before_proxy` (today:
+/// `ai_stream_router`) is only protected against plugins ordered before it. The
+/// generic `request_transformer` runs later and can add, overwrite, or rename
+/// any header; a `pre_proxy` function's backend overlay and the deferred
+/// routing-header pass can do the same. This pass runs at every point where the
+/// backend-visible header map is complete — after gateway-assertion refresh and
+/// after the egress baggage strip — so the plugin's policy has the last word
+/// regardless of relative priority.
+///
+/// Non-rejecting by contract: the decision was already committed in
+/// `before_proxy`, and the finalized-state rejection lives in
+/// `on_final_request_body*`, which has rejection plumbing on every dispatcher.
+/// Callers should gate on
+/// [`crate::plugin_cache::PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY`]
+/// where the bitset is already in scope; the internal scan keeps the rarely
+/// reached call sites correct without threading the capability set to them.
+pub(crate) fn run_final_backend_header_policy_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    headers: &mut HashMap<String, String>,
+) {
+    for plugin in plugins {
+        if plugin.enforces_final_backend_header_policy() {
+            plugin.enforce_final_backend_header_policy(ctx, headers);
+        }
+    }
+}
+
+/// `Option<HashMap>` clone-on-write variant of
+/// [`run_final_backend_header_policy_hooks`] for the H1/H2 dispatch ladder.
+pub(crate) fn run_effective_final_backend_header_policy_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    owned_proxy_headers: &mut Option<HashMap<String, String>>,
+) {
+    if let Some(headers) = owned_proxy_headers.as_mut() {
+        run_final_backend_header_policy_hooks(plugins, ctx, headers);
+    } else {
+        // No plugin advertised a header mutation, so nothing has been cloned.
+        // Swap rather than clone to keep this allocation-free.
+        let mut headers = std::mem::take(&mut ctx.headers);
+        run_final_backend_header_policy_hooks(plugins, ctx, &mut headers);
+        ctx.headers = headers;
+    }
+}
+
 /// Merge the finalized-request-egress header overlay into the outbound header
 /// map, then restore gateway-owned assertions and re-apply the egress baggage
 /// policy.
@@ -4847,6 +4896,7 @@ async fn run_finalized_request_egress_hooks_inner(
 /// pass: it can never impersonate `x-consumer-*` / `x-geo-country`, and it
 /// cannot re-add a baggage key the operator configured Ferrum to strip.
 pub(crate) fn apply_finalized_request_egress_header_overlay(
+    plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     owned_proxy_headers: &mut Option<HashMap<String, String>>,
     overlay: HashMap<String, String>,
@@ -4865,12 +4915,17 @@ pub(crate) fn apply_finalized_request_egress_header_overlay(
         &ctx.headers,
         strip_baggage_keys,
     );
+    // The overlay is the last thing that can add a backend-visible header, so
+    // a plugin-owned provider credential boundary is re-asserted over it too
+    // (`GHSA-xhp5-hqj8-3mwg`).
+    run_effective_final_backend_header_policy_hooks(plugins, ctx, owned_proxy_headers);
 }
 
 /// Map-based variant of [`apply_finalized_request_egress_header_overlay`] for
 /// the native HTTP/3 frontend, which owns a plain outbound header map instead of
 /// the H1/H2 `Option<HashMap>` clone-on-write shape.
 pub(crate) fn apply_finalized_request_egress_header_overlay_in_map(
+    plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
     overlay: HashMap<String, String>,
@@ -4884,6 +4939,7 @@ pub(crate) fn apply_finalized_request_egress_header_overlay_in_map(
     }
     refresh_backend_gateway_assertion_headers(ctx, headers);
     crate::modes::mesh::hbone::strip_egress_baggage_in_map(headers, strip_baggage_keys);
+    run_final_backend_header_policy_hooks(plugins, ctx, headers);
 }
 
 pub(crate) struct RejectedResponseParts {
@@ -23154,6 +23210,18 @@ async fn handle_proxy_request_inner(
         &ctx.headers,
         &state.mesh_egress_strip_baggage_keys,
     );
+    // Backend-boundary header policy — the `before_proxy` phase is complete, so
+    // a plugin that owns a third-party credential boundary re-asserts it here,
+    // after every generic header transform, the gateway-assertion refresh, and
+    // the baggage strip (`GHSA-xhp5-hqj8-3mwg`). The deferred `before_proxy`
+    // passes below re-run it because they can mutate the same map again.
+    if capabilities.has(PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY) {
+        run_effective_final_backend_header_policy_hooks(
+            &plugins,
+            &mut ctx,
+            &mut owned_proxy_headers,
+        );
+    }
     let stream_hooks_enabled = plugin_cache_view.requires_response_stream_hooks();
     let maybe_requires_response_body_buffering =
         plugin_cache_view.requires_response_body_buffering();
@@ -23298,6 +23366,15 @@ async fn handle_proxy_request_inner(
                 &ctx.headers,
                 &state.mesh_egress_strip_baggage_keys,
             );
+            // A deferred pass can add or rename headers again, so re-assert the
+            // backend-boundary header policy over the new map.
+            if capabilities.has(PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY) {
+                run_effective_final_backend_header_policy_hooks(
+                    &plugins,
+                    &mut ctx,
+                    &mut owned_proxy_headers,
+                );
+            }
         }
     }
 
@@ -23346,6 +23423,15 @@ async fn handle_proxy_request_inner(
                 &ctx.headers,
                 &state.mesh_egress_strip_baggage_keys,
             );
+            // A deferred pass can add or rename headers again, so re-assert the
+            // backend-boundary header policy over the new map.
+            if capabilities.has(PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY) {
+                run_effective_final_backend_header_policy_hooks(
+                    &plugins,
+                    &mut ctx,
+                    &mut owned_proxy_headers,
+                );
+            }
         }
         match deferred_result {
             PluginResult::Continue => {}
@@ -23609,6 +23695,7 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     apply_finalized_request_egress_header_overlay(
+                        &plugins,
                         &mut ctx,
                         &mut owned_proxy_headers,
                         egress.backend_header_overlay,
@@ -23714,6 +23801,7 @@ async fn handle_proxy_request_inner(
         )
         .await;
         apply_finalized_request_egress_header_overlay(
+            &plugins,
             &mut ctx,
             &mut owned_proxy_headers,
             egress.backend_header_overlay,
@@ -24044,6 +24132,7 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     apply_finalized_request_egress_header_overlay(
+                        &plugins,
                         &mut ctx,
                         &mut owned_proxy_headers,
                         egress.backend_header_overlay,
@@ -24718,6 +24807,7 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 apply_finalized_request_egress_header_overlay(
+                    &plugins,
                     &mut ctx,
                     &mut owned_proxy_headers,
                     egress.backend_header_overlay,
@@ -33449,7 +33539,19 @@ pub(crate) fn query_string_after_plugin_strips<'a>(
 /// defense in depth for the no-transform path and any residual marked names.
 /// Ordinary no-transform / no-strip requests borrow the raw string with no
 /// allocation.
+///
+/// A provider claim (`ai_stream_router`, `GHSA-xhp5-hqj8-3mwg`) short-circuits
+/// both of these: it froze the exact safe backend-visible query at claim time,
+/// and every later generic query transform — which runs at a HIGHER priority
+/// than the claim and could otherwise append a normal-backend secret to the
+/// third-party provider URL — is discarded here. This is the single funnel
+/// through which the backend-visible query reaches H1/H2 dispatch, native H3
+/// dispatch, retry replay, and the replay/cache partition builders, so the
+/// re-assertion cannot be bypassed by adding a call site.
 pub(crate) fn effective_backend_query_string<'a>(ctx: &'a RequestContext) -> Cow<'a, str> {
+    if let Some(committed) = ctx.committed_provider_query() {
+        return Cow::Borrowed(committed);
+    }
     let base = match ctx.outbound_query_string() {
         Some(q) => q,
         None => ctx.raw_query_string().unwrap_or(""),
@@ -33467,6 +33569,9 @@ pub(crate) fn effective_backend_query_string_with_raw<'a>(
     ctx: &RequestContext,
     raw_query: &'a str,
 ) -> Cow<'a, str> {
+    if let Some(committed) = ctx.committed_provider_query() {
+        return Cow::Owned(committed.to_string());
+    }
     match ctx.outbound_query_string() {
         Some(query) => Cow::Owned(query_string_after_plugin_strips(ctx, query).into_owned()),
         None => query_string_after_plugin_strips(ctx, raw_query),
@@ -47564,6 +47669,7 @@ mod tests {
             trust_bundles: None,
             mesh: None,
             mesh_revision: None,
+            k8s_mesh_overlay: Default::default(),
         }
     }
 
