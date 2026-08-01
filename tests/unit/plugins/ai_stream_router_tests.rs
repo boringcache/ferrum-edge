@@ -4963,7 +4963,7 @@ async fn claimed_backend_query(
     (ctx, captured)
 }
 
-fn azure_style_config() -> Value {
+fn azure_final_query_config() -> Value {
     json!({
         "enabled": true,
         "providers": [
@@ -5038,7 +5038,7 @@ async fn final_query_preserves_a_safe_unchanged_client_query() {
 #[tokio::test]
 async fn final_query_is_empty_when_an_endpoint_query_is_folded_into_the_path() {
     let plugins = router_config_then_transformer(
-        azure_style_config(),
+        azure_final_query_config(),
         json!([{"operation": "add", "target": "query", "key": "backend_token",
                 "value": "INTERNAL-BACKEND-SECRET"}]),
     );
