@@ -68,17 +68,17 @@ paths:
   backend-visible headers, in addition to the complete `Vary` tuple, except
   the entry-operation headers whose semantics this plugin actually implements:
   `If-None-Match` / `If-Modified-Since` revalidation, pure honored request
-  `Cache-Control: no-cache` / `no-store` refreshes (bare or qualified
-  `no-cache="…"`, only when every meaningful member is such a refresh and only
-  when `respect_no_cache` is enabled), `Range`, and zero-length `Content-Length`
+  `Cache-Control: no-cache` / `no-store` refreshes (bare and argument-free, only
+  when every meaningful member is such a refresh and only when
+  `respect_no_cache` is enabled), `Range`, and zero-length `Content-Length`
   framing. A conditional revalidation, a pure client no-cache/no-store refresh,
   and `Content-Length: 0` are addressed to an entry rather than selecting a
   different one — keying the raw view would put each of them in a partition
   the entry cannot be reached from and make the `Vary` index unreachable.
   Unsupported precondition / pragma headers (`If-Match`,
   `If-Unmodified-Since`, `If-Range`, `Pragma`), mixed / arbitrary / unrecognized
-  request `Cache-Control` content, and any `Cache-Control` when
-  `respect_no_cache` is false stay bound so they cannot share a replay key.
+  or argument-bearing request `Cache-Control` content, and any `Cache-Control`
+  when `respect_no_cache` is false stay bound so they cannot share a replay key.
   Cross-caller isolation is the mandatory caller partition. `Authorization`,
   `Proxy-Authorization`, and `Cookie` remain mandatory Vary names even for
   anonymous entries because downstream shared caches cannot observe Ferrum's

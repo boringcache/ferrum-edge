@@ -1461,8 +1461,8 @@ impl ResponseCaching {
     ///   header dimension binds every backend-visible header except the
     ///   entry-operation headers whose semantics this plugin actually
     ///   implements (`If-None-Match` / `If-Modified-Since` revalidation,
-    ///   pure honored request `Cache-Control: no-cache` / `no-store` refreshes
-    ///   when `respect_no_cache` is enabled, `Range`, and zero-length
+    ///   pure honored bare request `Cache-Control: no-cache` / `no-store`
+    ///   refreshes when `respect_no_cache` is enabled, `Range`, and zero-length
     ///   `Content-Length` framing). This prevents replay across unannounced
     ///   tenant or policy headers even when an origin omits `Vary`. Unsupported
     ///   precondition / pragma dimensions and mixed / arbitrary
@@ -1476,11 +1476,11 @@ impl ResponseCaching {
     ///   fresh HIT must not ignore a client `If-Match` /
     ///   `If-Unmodified-Since` / `If-Range` / `Pragma` the plugin does not
     ///   gate. `Cache-Control` exclusion is value-aware and gated by
-    ///   `respect_no_cache` — only a header whose every meaningful member is
-    ///   a refresh this plugin honors is omitted; mixed recognized refresh
-    ///   plus any other member, and any `Cache-Control` when
-    ///   `respect_no_cache` is false, stay in the partition as backend-visible
-    ///   policy;
+    ///   `respect_no_cache` — only a header whose every meaningful member is a
+    ///   bare, argument-free refresh this plugin honors is omitted; mixed
+    ///   recognized refresh plus any other member, argument-bearing refreshes,
+    ///   and any `Cache-Control` when `respect_no_cache` is false stay in the
+    ///   partition as backend-visible policy;
     /// * **complete `Vary` tuple** — appended to this base key by
     ///   [`Self::extend_base_key_with_vary`];
     /// * **caller authorization context** — see

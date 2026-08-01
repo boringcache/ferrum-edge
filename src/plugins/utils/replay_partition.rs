@@ -38,7 +38,7 @@
 //!   ([`append_response_cache_request_partition`]) excludes only the entry-
 //!   operation headers whose semantics `response_caching` actually implements
 //!   (`If-None-Match`, `If-Modified-Since`, pure honored request
-//!   `Cache-Control: no-cache` / `no-store` refreshes when
+//!   `Cache-Control: no-cache` / `no-store` refreshes with no arguments when
 //!   `respect_no_cache` is enabled, `Range`, and `Content-Length`) while
 //!   conservatively binding every other representation and policy dimension,
 //!   including headers absent from `Vary`. Mixed Cache-Control members and
@@ -722,9 +722,9 @@ pub fn append_request_context_partition(
 /// `response_caching` actually implements are omitted:
 ///
 /// * `If-None-Match` / `If-Modified-Since` — fresh conditional HIT → 304
-/// * pure honored request `Cache-Control: no-cache` / `no-store` (bare or
-///   qualified `no-cache="…"`, and only when every meaningful member is such
-///   a refresh) — when `respect_no_cache` is enabled, bypass + store the
+/// * pure honored request `Cache-Control: no-cache` / `no-store` (bare
+///   directives with no arguments, and only when every meaningful member is
+///   such a refresh) — when `respect_no_cache` is enabled, bypass + store the
 ///   replacement under the same partition as the entry being refreshed
 /// * `Range` — lookup may still address the stored full representation
 /// * `Content-Length` — zero-length framing on an otherwise empty GET/HEAD
@@ -751,11 +751,12 @@ pub fn append_response_cache_request_partition(
 ///
 /// Name-only exemptions are limited to validators, range, and framing this
 /// plugin handles. `Cache-Control` is value-aware and gated by
-/// `respect_no_cache`: only a pure honored `no-cache` / `no-store` refresh
-/// (every meaningful member is such a refresh) is omitted so a replacement
-/// remains addressable under the original partition. Mixed recognized refresh
-/// plus any other member, and any `Cache-Control` when the plugin will not
-/// honor request no-cache/no-store as an entry operation, stay bound.
+/// `respect_no_cache`: only a pure honored bare `no-cache` / `no-store` refresh
+/// (every meaningful member is such a refresh and has no argument) is omitted
+/// so a replacement remains addressable under the original partition. Mixed
+/// recognized refresh plus any other member, argument-bearing directives, and
+/// any `Cache-Control` when the plugin will not honor request no-cache/no-store
+/// as an entry operation stay bound.
 fn is_response_cache_entry_operation_header(
     name: &str,
     value: &str,
@@ -774,15 +775,15 @@ fn is_response_cache_entry_operation_header(
 }
 
 /// True when every meaningful request `Cache-Control` member is a refresh
-/// this cache implements (`no-cache` / `no-store`, bare or qualified), and at
-/// least one such member exists.
+/// this cache implements as a standard request operation (bare `no-cache` /
+/// `no-store` with no argument), and at least one such member exists.
 ///
-/// Aligned with the grammar-aware walk in `response_caching::parse_cache_control`:
-/// quoted arguments are consumed without splitting on interior commas, trailing
-/// junk after a quoted-string fails closed, and an unterminated quote fails
-/// closed. Presence of any other directive or extension — including
-/// `max-age=0` beside `no-cache` — means the full backend-visible value must
-/// remain partitioned. Empty / whitespace-only values are not refreshes.
+/// The broader cache-control parser deliberately degrades malformed or
+/// argument-bearing `no-cache` spellings to a bypass, but they remain bound
+/// here: their argument is backend-visible context and is not part of the
+/// standard request directive. Presence of any argument, other directive, or
+/// extension — including `max-age=0` beside `no-cache` — means the full value
+/// remains partitioned. Empty / whitespace-only values are not refreshes.
 fn request_cache_control_is_pure_honored_refresh(header_value: &str) -> bool {
     let bytes = header_value.as_bytes();
     let mut index = 0usize;
@@ -816,43 +817,7 @@ fn request_cache_control_is_pure_honored_refresh(header_value: &str) -> bool {
         }
 
         if bytes.get(index) == Some(&b'=') {
-            index += 1;
-            while matches!(bytes.get(index), Some(b' ' | b'\t')) {
-                index += 1;
-            }
-            if bytes.get(index) == Some(&b'"') {
-                index += 1;
-                let mut closed = false;
-                while let Some(&byte) = bytes.get(index) {
-                    match byte {
-                        b'\\' => {
-                            if index + 1 >= bytes.len() {
-                                return false;
-                            }
-                            index += 2;
-                        }
-                        b'"' => {
-                            index += 1;
-                            closed = true;
-                            break;
-                        }
-                        _ => index += 1,
-                    }
-                }
-                if !closed {
-                    return false;
-                }
-                while matches!(bytes.get(index), Some(b' ' | b'\t')) {
-                    index += 1;
-                }
-                if !matches!(bytes.get(index), None | Some(b',')) {
-                    return false;
-                }
-            } else {
-                while !matches!(bytes.get(index), None | Some(b',')) {
-                    index += 1;
-                }
-            }
+            return false;
         }
 
         saw_refresh = true;

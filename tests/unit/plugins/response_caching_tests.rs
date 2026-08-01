@@ -606,7 +606,6 @@ async fn base_cache_key_keeps_supported_entry_operation_headers_reachable() {
         ("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
         ("cache-control", "no-cache"),
         ("cache-control", "no-store"),
-        ("cache-control", r#"no-cache="authorization""#),
         ("range", "bytes=0-3"),
         ("content-length", "0"),
     ];
@@ -679,27 +678,6 @@ async fn base_cache_key_cache_control_exclusion_is_value_aware() {
         "a header of only honored refresh members must stay under the original partition"
     );
 
-    let qualified = staged_base_cache_key(
-        &plugin,
-        path,
-        &[("cache-control", r#"no-cache="authorization, cookie""#)],
-    )
-    .await
-    .expect("qualified no-cache refresh must stage a base key");
-    assert_eq!(
-        qualified, baseline,
-        "a quoted comma inside qualified no-cache must remain one refresh member"
-    );
-
-    let malformed_argument =
-        staged_base_cache_key(&plugin, path, &[("cache-control", "no-cache=opaque")])
-            .await
-            .expect("malformed no-cache argument must stage a base key");
-    assert_eq!(
-        malformed_argument, baseline,
-        "the request parser degrades an unquoted no-cache argument to a bare refresh"
-    );
-
     let unrecognized = [
         ("max-age=0", "request max-age is not a handled refresh"),
         (
@@ -743,6 +721,9 @@ async fn base_cache_key_cache_control_exclusion_is_value_aware() {
     );
 
     for value in [
+        r#"no-cache="authorization, cookie""#,
+        "no-cache=opaque",
+        "no-store=opaque",
         r#"no-cache="authorization", x-tenant=a"#,
         r#"no-cache="authorization"junk"#,
         r#"no-cache="authorization"#,
@@ -752,7 +733,7 @@ async fn base_cache_key_cache_control_exclusion_is_value_aware() {
             .unwrap_or_else(|| panic!("cache-control: {value} must stage a base key"));
         assert_ne!(
             key, baseline,
-            "mixed or malformed quoted cache-control must fail closed into its own partition"
+            "argument-bearing, mixed, or malformed cache-control must fail closed into its own partition"
         );
     }
 }
