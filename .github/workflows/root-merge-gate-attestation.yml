@@ -38,258 +38,184 @@ jobs:
     steps:
       - name: Attest reviewed pull request head
         env:
-          GH_TOKEN: ${{ github.token }}
           PR_NUMBER_INPUT: ${{ github.event.inputs.pr_number }}
           EXPECTED_SHA_INPUT: ${{ github.event.inputs.expected_head_sha }}
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
-          WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const refuse = (message) => {
+              throw new Error(`Refusal: ${message}`);
+            };
 
-          refuse() {
-            echo "Refusal: $1" >&2
-            exit 1
-          }
+            const requireObject = (value, name) => {
+              if (value === null || typeof value !== "object" || Array.isArray(value)) {
+                refuse(`${name} must be an object`);
+              }
+              return value;
+            };
 
-          validate_pr_eligibility() {
-            local pr_json="$1"
-            local expected_sha="$2"
-            local pr_number="$3"
-            local context_label="${4:-}"
+            const requireString = (value, name) => {
+              if (typeof value !== "string" || value.length === 0) {
+                refuse(`${name} must be a non-empty string`);
+              }
+              return value;
+            };
 
-            local validated
-            validated="$(jq -e '
-              def require_string($value; $name):
-                if ($value | type) != "string" or ($value | length) == 0 then
-                  error("\($name) must be a non-empty string")
-                else $value end;
-              def require_boolean($value; $name):
-                if ($value | type) != "boolean" then
-                  error("\($name) must be a boolean")
-                else $value end;
+            const requireBoolean = (value, name) => {
+              if (typeof value !== "boolean") {
+                refuse(`${name} must be a boolean`);
+              }
+              return value;
+            };
 
-              if (type) != "object" then
-                error("pull request response must be an object")
-              else .
-              end
-              | {
-                  state: require_string(.state; "state"),
-                  draft: require_boolean(.draft; "draft"),
-                  base_ref: require_string(.base.ref; "base.ref"),
-                  head_repo: require_string(.head.repo.full_name; "head.repo.full_name"),
-                  head_sha: require_string(.head.sha; "head.sha")
-                }
-            ' <<<"${pr_json}")" || refuse "pull request metadata failed schema validation${context_label:+ (${context_label})}"
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            const prNumberInput = process.env.PR_NUMBER_INPUT;
+            const expectedSha = process.env.EXPECTED_SHA_INPUT;
+            const triggeringActor = process.env.TRIGGERING_ACTOR;
 
-            local pr_state pr_draft pr_base_ref pr_head_repo pr_head_sha
-            pr_state="$(jq -r '.state' <<<"${validated}")"
-            pr_draft="$(jq -r '.draft' <<<"${validated}")"
-            pr_base_ref="$(jq -r '.base_ref' <<<"${validated}")"
-            pr_head_repo="$(jq -r '.head_repo' <<<"${validated}")"
-            pr_head_sha="$(jq -r '.head_sha' <<<"${validated}")"
+            if (context.ref !== "refs/heads/main") {
+              refuse(`workflow must execute from refs/heads/main (got ${context.ref})`);
+            }
+            if (repository !== "ferrum-edge/ferrum-edge") {
+              refuse(`unexpected repository ${repository}`);
+            }
+            if (context.actor !== "jeremyjpj0916") {
+              refuse(`unauthorized actor ${context.actor}`);
+            }
+            if (triggeringActor !== "jeremyjpj0916") {
+              refuse(`unauthorized triggering actor ${triggeringActor}`);
+            }
+            if (!/^[1-9][0-9]*$/.test(prNumberInput || "")) {
+              refuse("invalid pr_number: must be a positive integer");
+            }
+            if (!/^[0-9a-f]{40}$/.test(expectedSha || "")) {
+              refuse("invalid expected_head_sha: must be exactly 40 lowercase hexadecimal characters");
+            }
 
-            if [[ "${pr_state}" != "open" ]]; then
-              refuse "pull request #${pr_number} is not open (state=${pr_state})${context_label:+ ${context_label}}"
-            fi
+            const prNumber = Number(prNumberInput);
+            if (!Number.isSafeInteger(prNumber) || prNumber <= 0) {
+              refuse("invalid pr_number: must fit in a positive safe integer");
+            }
 
-            if [[ "${pr_draft}" == "true" ]]; then
-              refuse "pull request #${pr_number} is a draft${context_label:+ ${context_label}}"
-            fi
+            const validatePullRequest = (raw, contextLabel = "") => {
+              const pr = requireObject(raw, "pull request response");
+              const state = requireString(pr.state, "state");
+              const draft = requireBoolean(pr.draft, "draft");
+              const base = requireObject(pr.base, "base");
+              const head = requireObject(pr.head, "head");
+              const headRepo = requireObject(head.repo, "head.repo");
+              const baseRef = requireString(base.ref, "base.ref");
+              const headRepository = requireString(headRepo.full_name, "head.repo.full_name");
+              const headSha = requireString(head.sha, "head.sha");
+              const suffix = contextLabel ? ` ${contextLabel}` : "";
 
-            if [[ "${pr_base_ref}" != "main" ]]; then
-              refuse "pull request #${pr_number} does not target main (base=${pr_base_ref})${context_label:+ ${context_label}}"
-            fi
+              if (state !== "open") {
+                refuse(`pull request #${prNumber} is not open (state=${state})${suffix}`);
+              }
+              if (draft) {
+                refuse(`pull request #${prNumber} is a draft${suffix}`);
+              }
+              if (baseRef !== "main") {
+                refuse(`pull request #${prNumber} does not target main (base=${baseRef})${suffix}`);
+              }
+              if (headRepository !== repository) {
+                refuse(`pull request #${prNumber} head is not from ${repository}${suffix}`);
+              }
+              if (headSha !== expectedSha) {
+                refuse(`pull request #${prNumber} head sha ${headSha} does not match expected ${expectedSha}${suffix}`);
+              }
+            };
 
-            if [[ "${pr_head_repo}" != "${GITHUB_REPOSITORY}" ]]; then
-              refuse "pull request #${pr_number} head is not from ${GITHUB_REPOSITORY} (head repo=${pr_head_repo})${context_label:+ ${context_label}}"
-            fi
+            const fetchPullRequest = async () => {
+              const response = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+              validatePullRequest(response.data);
+            };
 
-            if [[ "${pr_head_sha}" != "${expected_sha}" ]]; then
-              refuse "pull request #${pr_number} head sha ${pr_head_sha} does not match expected ${expected_sha}${context_label:+ ${context_label}}"
-            fi
-          }
+            await fetchPullRequest();
 
-          validate_review_threads_page() {
-            local threads_response="$1"
-
-            if ! jq -e '
-              if has("errors") then
-                .errors == null
-                or ((.errors | type) == "array")
-                or ((.errors | type) == "object")
-              else true
-              end
-            ' >/dev/null <<<"${threads_response}"; then
-              refuse "GraphQL errors field has an invalid schema"
-            fi
-
-            if jq -e '(.errors | type) == "array" and (.errors | length) > 0' >/dev/null <<<"${threads_response}"; then
-              echo "GraphQL errors while fetching review threads:" >&2
-              jq '.errors' >&2 <<<"${threads_response}"
-              exit 1
-            fi
-
-            if jq -e '(.errors | type) == "object" and (.errors | length) > 0' >/dev/null <<<"${threads_response}"; then
-              echo "GraphQL errors while fetching review threads:" >&2
-              jq '.errors' >&2 <<<"${threads_response}"
-              exit 1
-            fi
-
-            local page_result
-            page_result="$(jq -e '
-              def require_object($value; $name):
-                if ($value | type) != "object" then
-                  error("\($name) must be an object")
-                else $value end;
-              def require_array($value; $name):
-                if ($value | type) != "array" then
-                  error("\($name) must be an array")
-                else $value end;
-              def require_boolean($value; $name):
-                if ($value | type) != "boolean" then
-                  error("\($name) must be a boolean")
-                else $value end;
-
-              .data as $data
-              | if ($data | type) != "object" then error("data must be an object") else $data end
-              | .repository as $repo
-              | require_object($repo; "repository")
-              | $repo.pullRequest as $pr
-              | require_object($pr; "pullRequest")
-              | $pr.reviewThreads as $rt
-              | require_object($rt; "reviewThreads")
-              | require_array($rt.nodes; "reviewThreads.nodes")
-              | ($rt.nodes | map(
-                  if (type) != "object" then error("review thread node must be an object")
-                  elif (.isResolved | type) != "boolean" then error("review thread node isResolved must be a boolean")
-                  else .
-                  end
-                )) as $nodes
-              | $rt.pageInfo as $pi
-              | require_object($pi; "pageInfo")
-              | require_boolean($pi.hasNextPage; "pageInfo.hasNextPage") as $has_next
-              | (if $has_next then
-                  if ($pi.endCursor | type) != "string" or ($pi.endCursor | length) == 0 then
-                    error("pageInfo.endCursor must be a non-empty string when hasNextPage is true")
-                  else $pi.endCursor end
-                else "" end) as $end_cursor
-              | {
-                  unresolved_count: ($nodes | map(select(.isResolved == false)) | length),
-                  has_next_page: $has_next,
-                  end_cursor: $end_cursor
-                }
-            ' <<<"${threads_response}")" || refuse "review thread response failed schema validation"
-
-            THREADS_PAGE_UNRESOLVED="$(jq -r '.unresolved_count' <<<"${page_result}")"
-            THREADS_HAS_NEXT="$(jq -r 'if .has_next_page then "true" else "false" end' <<<"${page_result}")"
-            THREADS_END_CURSOR="$(jq -r '.end_cursor' <<<"${page_result}")"
-          }
-
-          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
-            refuse "workflow must execute from refs/heads/main (got ${GITHUB_REF})"
-          fi
-
-          if [[ "${GITHUB_REPOSITORY}" != "ferrum-edge/ferrum-edge" ]]; then
-            refuse "unexpected repository ${GITHUB_REPOSITORY}"
-          fi
-
-          if [[ "${GITHUB_ACTOR}" != "jeremyjpj0916" ]]; then
-            refuse "unauthorized actor ${GITHUB_ACTOR}"
-          fi
-
-          if [[ "${TRIGGERING_ACTOR}" != "jeremyjpj0916" ]]; then
-            refuse "unauthorized triggering actor ${TRIGGERING_ACTOR}"
-          fi
-
-          pr_number="${PR_NUMBER_INPUT}"
-          expected_sha="${EXPECTED_SHA_INPUT}"
-
-          if ! [[ "${pr_number}" =~ ^[1-9][0-9]*$ ]]; then
-            refuse "invalid pr_number: must be a positive integer"
-          fi
-
-          if ! [[ "${expected_sha}" =~ ^[0-9a-f]{40}$ ]]; then
-            refuse "invalid expected_head_sha: must be exactly 40 lowercase hexadecimal characters"
-          fi
-
-          repo_owner="${GITHUB_REPOSITORY%%/*}"
-          repo_name="${GITHUB_REPOSITORY#*/}"
-
-          pr_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}")" || refuse "failed to fetch pull request metadata"
-          validate_pr_eligibility "${pr_json}" "${expected_sha}" "${pr_number}"
-
-          review_threads_query='
-          query($owner: String!, $repo: String!, $number: Int!, $after: String) {
-            repository(owner: $owner, name: $repo) {
-              pullRequest(number: $number) {
-                reviewThreads(first: 100, after: $after) {
-                  pageInfo {
-                    hasNextPage
-                    endCursor
-                  }
-                  nodes {
-                    isResolved
+            const reviewThreadsQuery = `
+              query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    reviewThreads(first: 100, after: $after) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes { isResolved }
+                    }
                   }
                 }
               }
+            `;
+
+            let cursor = null;
+            let unresolvedCount = 0;
+            const seenCursors = new Set();
+            for (let page = 0; page < 1000; page += 1) {
+              const result = requireObject(await github.graphql(reviewThreadsQuery, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                number: prNumber,
+                after: cursor,
+              }), "GraphQL response");
+              const graphqlRepository = requireObject(result.repository, "repository");
+              const graphqlPr = requireObject(graphqlRepository.pullRequest, "pullRequest");
+              const threads = requireObject(graphqlPr.reviewThreads, "reviewThreads");
+              const pageInfo = requireObject(threads.pageInfo, "reviewThreads.pageInfo");
+              if (!Array.isArray(threads.nodes)) {
+                refuse("reviewThreads.nodes must be an array");
+              }
+              for (const node of threads.nodes) {
+                const thread = requireObject(node, "review thread node");
+                if (!requireBoolean(thread.isResolved, "review thread node isResolved")) {
+                  unresolvedCount += 1;
+                }
+              }
+
+              const hasNextPage = requireBoolean(pageInfo.hasNextPage, "pageInfo.hasNextPage");
+              if (!hasNextPage) {
+                cursor = null;
+                break;
+              }
+              const nextCursor = requireString(pageInfo.endCursor, "pageInfo.endCursor");
+              if (seenCursors.has(nextCursor)) {
+                refuse("review thread pagination repeated a cursor");
+              }
+              seenCursors.add(nextCursor);
+              cursor = nextCursor;
+              if (page === 999) {
+                refuse("review thread pagination exceeded the page limit");
+              }
             }
-          }'
 
-          cursor=""
-          unresolved_count=0
+            if (unresolvedCount > 0) {
+              refuse(`pull request #${prNumber} has ${unresolvedCount} unresolved review thread(s)`);
+            }
 
-          while true; do
-            if [[ -z "${cursor}" ]]; then
-              threads_response="$(gh api graphql \
-                -f query="${review_threads_query}" \
-                -f owner="${repo_owner}" \
-                -f repo="${repo_name}" \
-                -F number="${pr_number}")" || refuse "review thread GraphQL request failed"
-            else
-              threads_response="$(gh api graphql \
-                -f query="${review_threads_query}" \
-                -f owner="${repo_owner}" \
-                -f repo="${repo_name}" \
-                -F number="${pr_number}" \
-                -f after="${cursor}")" || refuse "review thread GraphQL pagination failed"
-            fi
+            const finalResponse = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            validatePullRequest(finalResponse.data, "immediately before approval");
 
-            validate_review_threads_page "${threads_response}"
-            unresolved_count=$((unresolved_count + THREADS_PAGE_UNRESOLVED))
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${repository}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              commit_id: expectedSha,
+              event: "APPROVE",
+              body: [
+                "Root merge-gate attestation",
+                "",
+                `This approval is explicitly bound to commit \`${expectedSha}\`.`,
+                `Authorizing actor: ${context.actor}`,
+                `Workflow run: ${runUrl}`,
+              ].join("\n"),
+            });
 
-            if [[ "${THREADS_HAS_NEXT}" == "true" ]]; then
-              cursor="${THREADS_END_CURSOR}"
-              continue
-            fi
-            break
-          done
-
-          if [[ "${unresolved_count}" -gt 0 ]]; then
-            refuse "pull request #${pr_number} has ${unresolved_count} unresolved review thread(s)"
-          fi
-
-          pr_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}")" || refuse "failed to re-fetch pull request metadata before approval"
-          validate_pr_eligibility "${pr_json}" "${expected_sha}" "${pr_number}" "immediately before approval"
-
-          review_payload="$(jq -n \
-            --arg commit_id "${expected_sha}" \
-            --arg event "APPROVE" \
-            --arg sha "${expected_sha}" \
-            --arg actor "${GITHUB_ACTOR}" \
-            --arg run_url "${WORKFLOW_RUN_URL}" \
-            '{
-              commit_id: $commit_id,
-              event: $event,
-              body: (
-                "Root merge-gate attestation\n\n"
-                + "This approval is explicitly bound to commit `" + $sha + "`.\n"
-                + "Authorizing actor: " + $actor + "\n"
-                + "Workflow run: " + $run_url
-              )
-            }')"
-
-          gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}/reviews" \
-            --method POST \
-            --input - <<<"${review_payload}" || refuse "failed to submit APPROVE review"
-
-          echo "Submitted root merge-gate APPROVE review for pull request #${pr_number} at commit ${expected_sha}"
+            core.info(`Submitted root merge-gate APPROVE review for pull request #${prNumber} at commit ${expectedSha}`);
