@@ -70,6 +70,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/dependency-policy.md`, `docs/vendored-patch-lifecycle.json`, and
   `docs/upstream-*-patches/` off the lightweight documentation path.
 
+### Fixed
+
+- H1/H2 WebSocket backend dials now use the effective proxy of the target they
+  are actually dialing (#2416). The WebSocket branch previously received only
+  the retry-capped base proxy: retry rotation moved the URL, the admission
+  target, and the circuit-breaker key to the next port while the socket kept the
+  unresolved route-level `connectTimeout`, trust roots, client identity, and
+  verification posture — so any selected port with distinct
+  `portLevelSettings` could dial with the wrong timeout, trust an unintended CA,
+  or present the wrong client certificate. Every attempt (the initial one and
+  each rotation) now resolves
+  `resolve_backend_connection_proxy_for_target` for its own `current_target` at
+  the top of the dial loop and passes that one proxy to both the direct
+  TCP/TLS dial and the mesh egress dial, matching what the H3 WebSocket bridge
+  already did. Retry accounting, health/load-balancer feedback, circuit
+  breaking, connection and request guards, and the selected target's identity
+  are unchanged. `docs/mesh.md` no longer documents an H1/H2 WebSocket
+  exception to the effective-proxy pipeline.
+- WebSocket policy-port vs transport-dial-port semantics are now stated
+  explicitly and shared by both frontends (#2416): target selection chooses the
+  **policy port** (`UpstreamTarget::dispatch_policy_port()` — the declared
+  Service port when a Kubernetes `targetPort` remap applies), and that port
+  keys every DestinationRule lookup the upgrade makes. The transport dial port
+  is separate: a `mesh.mtls` target dials `:15006` and a `mesh.hbone` target
+  dials `:15008`, reaching the app port through the tunnel, and those transport
+  listener ports are never policy sources. See "WebSocket policy port vs
+  transport dial port" in `docs/mesh.md`.
+- A WebSocket backend dial whose effective backend TLS carries an `sni`
+  override now fails closed instead of silently verifying the request URI's
+  host (#2416). `client_async_tls_with_config` derives both `Host` and the TLS
+  server name from the request URI and cannot apply a separate SNI, so the
+  upgrade is refused pre-dial as a gateway-side dispatch rejection (`502`,
+  non-retryable, neutral to the circuit breaker and passive health) — the same
+  posture the reqwest retry path already takes. Because the policy is resolved
+  per target, a `portLevelSettings[].tls.sni` refuses only that port's
+  upgrades. Mesh egress is unaffected (its SNI is chosen by the mesh dial
+  plans). **Behavior change:** a `wss://` route that previously connected while
+  ignoring a configured backend TLS SNI now returns `502`. Direct WebSocket
+  transport requires the backend URI hostname to be the intended TLS server
+  name (with `dns_override` available when that name must resolve to a specific
+  address); a distinct backend TLS SNI override is unsupported.
+
 ### Changed
 
 - Gateway API and Istio status planning now build immutable per-reconcile

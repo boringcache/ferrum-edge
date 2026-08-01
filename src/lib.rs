@@ -1971,6 +1971,28 @@ pub mod _test_support {
         crate::proxy::resolve_backend_max_connections(proxy, dispatch_port)
     }
 
+    /// Project the DestinationRule port-level policy (connect timeout, backend
+    /// TLS, pool knobs) of `upstream_target` onto `proxy`, exactly as the H1/H2
+    /// and H3 WebSocket dial loops do before each backend attempt (issue #2416).
+    ///
+    /// Returns a `Cow` so tests can also assert the zero-alloc contract: the
+    /// borrowed variant means no per-target override applied and the dial sees
+    /// the base proxy byte-for-byte.
+    pub fn resolve_backend_connection_proxy_for_target<'a>(
+        proxy: &'a crate::config::types::Proxy,
+        upstream_target: Option<&crate::config::types::UpstreamTarget>,
+    ) -> std::borrow::Cow<'a, crate::config::types::Proxy> {
+        crate::proxy::resolve_backend_connection_proxy_for_target(proxy, upstream_target)
+    }
+
+    /// Whether a WebSocket backend dial configured from `proxy` must fail closed
+    /// because the resolved backend TLS carries an SNI override the WebSocket
+    /// transport cannot apply (issue #2416). Exposes the exact predicate
+    /// `connect_websocket_backend` gates its pre-dial refusal on.
+    pub fn websocket_backend_tls_sni_unsupported(proxy: &crate::config::types::Proxy) -> bool {
+        crate::proxy::websocket_backend_tls_sni_unsupported(proxy)
+    }
+
     pub use crate::proxy::tcp_proxy::{StreamCopyResult, StreamIoSide};
 
     /// Reach into `tcp_proxy` to exercise the `Direction` + IO-side →

@@ -2521,11 +2521,9 @@ pub(crate) fn supports_native_http3_backend(
 ) -> bool {
     // Cheap gate FIRST — this runs per request and per retry rotation on the
     // H1/H2 dispatch path. `dispatch_kind` is not target-overridable: the
-    // per-target projection (`resolve_effective_proxy_for_target`) writes only
-    // connect timeout / pool knobs / `resolved_tls` / `h2_upgrade_policy`, and
-    // `resolve_backend_connection_proxy_for_target` only rebases host/port —
-    // so the common non-HttpsPool case returns before any per-target
-    // capability-key resolution work.
+    // per-target policy projection and selected-target host/port rebase cannot
+    // change it, so the common non-HttpsPool case returns before any
+    // per-target capability-key resolution work.
     proxy.dispatch_kind == DispatchKind::HttpsPool
         && get_backend_capability_for_target(
             state.backend_capabilities.as_ref(),
@@ -10620,11 +10618,43 @@ async fn handle_websocket_request_authenticated(
             .and_then(|uri| uri.path_and_query().map(|pq| pq.as_str().to_string()))
             .map(std::borrow::Cow::Owned)
             .unwrap_or(std::borrow::Cow::Borrowed("/"));
+        // Per-attempt target-effective backend policy (issue #2416). Every H1/H2
+        // WebSocket attempt — the initial one and each retry-rotated one — dials
+        // under the DestinationRule policy projected for its OWN `current_target`
+        // (per-port `connectTimeout` and `tls` CA / client identity /
+        // verification / SAN allow-list). The unresolved base proxy is never
+        // used for those dial decisions, so selection or rotation onto port
+        // 9443 can no longer ignore that port's trust roots or timeout. DNS
+        // override and TTL are route-level fields retained from the base proxy;
+        // the selected target contributes the resolution hostname.
+        //
+        // POLICY PORT vs TRANSPORT DIAL PORT. Target selection chooses the
+        // POLICY port: `UpstreamTarget::dispatch_policy_port()` (the declared
+        // Service port when a Kubernetes `targetPort` remap made the workload
+        // port differ), which is the projection key here and the key the
+        // `maxConnections` gate above uses. The TRANSPORT dial port is a
+        // separate, transport-owned decision: the direct path dials the target's
+        // own `port` (carried in `current_backend_url`), while a mesh egress
+        // target dials its sidecar `:15006` mesh-mTLS listener or its Ambient
+        // `:15008` HBONE listener and reaches the app port THROUGH that tunnel.
+        // Both mesh pools receive the app/policy ports explicitly, so this
+        // projection never redirects a tunnel dial — it only decides which
+        // port's policy configures it.
+        //
+        // Uses the same `resolve_backend_connection_proxy_for_target` helper as
+        // the H3 WebSocket bridge (`src/http3/websocket.rs`) so the two protocol
+        // paths cannot drift. Borrowed (zero-alloc) only when neither a projected
+        // policy field nor the selected target's host/port differs from the base
+        // proxy; otherwise the dispatch-local clone carries both policy and dial
+        // identity.
+        let ws_connection_proxy =
+            resolve_backend_connection_proxy_for_target(&proxy, current_target.as_deref());
+        let ws_dial_proxy: &Proxy = ws_connection_proxy.as_ref();
         let ws_dial_result: Result<WsBackendHandshake, Box<dyn std::error::Error + Send + Sync>> =
             match (&ws_mesh_egress, current_target.as_deref()) {
                 (Some(egress), Some(target)) => connect_mesh_websocket_backend(
                     &state,
-                    &proxy,
+                    ws_dial_proxy,
                     target,
                     egress,
                     ws_client_host.as_deref(),
@@ -10647,7 +10677,7 @@ async fn handle_websocket_request_authenticated(
                 .map(|handshake| WsBackendHandshake::Mesh(Box::new(handshake))),
                 _ => connect_websocket_backend(
                     &current_backend_url,
-                    &proxy,
+                    ws_dial_proxy,
                     &env_config,
                     &client_headers,
                     state.tls_policy.as_deref(),
@@ -11921,6 +11951,22 @@ pub(crate) fn build_websocket_backend_url_with_target(
     url
 }
 
+/// Whether `proxy`'s resolved backend TLS carries an SNI override the WebSocket
+/// transport cannot apply (issue #2416).
+///
+/// `client_async_tls_with_config` derives the TLS server name from the request
+/// URI, so an SNI override would be silently dropped and the handshake would
+/// verify the URI host instead. Callers must fail the dial closed rather than
+/// verify the wrong server name.
+///
+/// Takes the TARGET-EFFECTIVE proxy, so a DestinationRule port-level `tls.sni`
+/// that applies only to the selected target's policy port is caught for that
+/// target and not for its siblings. Plaintext `ws://` backends carry no server
+/// name to verify, so they are unaffected.
+pub(crate) fn websocket_backend_tls_sni_unsupported(proxy: &Proxy) -> bool {
+    matches!(proxy.backend_scheme, Some(BackendScheme::Https)) && proxy.resolved_tls.sni.is_some()
+}
+
 /// Build a rustls TLS connector for WebSocket backends that respects
 /// proxy-level and global TLS settings (CA bundles, client certs, cert verification).
 /// When `tls_policy` is provided, outbound connections use the same cipher suites,
@@ -12075,6 +12121,30 @@ pub(crate) async fn connect_websocket_backend(
             )
             .into());
         }
+    }
+
+    // Fail closed on a backend TLS SNI override this transport cannot carry
+    // (issue #2416). The WebSocket dial derives both the `Host` header and the
+    // TLS server name from the request URI, so a `resolved_tls.sni` value —
+    // whether it came from the proxy/upstream or from the selected target's
+    // DestinationRule port-level `tls` projection — would be silently dropped
+    // and the handshake would verify the URI host instead of the configured
+    // server name. Refuse the dial rather than trust the wrong name; this
+    // mirrors the reqwest retry path, which also 502s on an unreplayable SNI
+    // override instead of dialing without it. Gateway-side and pre-dial, so the
+    // shared `retry::WS_BACKEND_TLS_SNI_UNSUPPORTED` anchor classifies it as
+    // `DispatchPolicyRejected`: non-retryable and neutral to the circuit
+    // breaker / passive health, exactly like the literal-IP denial above. The
+    // configured SNI value itself is never logged or echoed. Shared by the H1/H2
+    // and H3 WebSocket bridges, which both dial through this function.
+    if websocket_backend_tls_sni_unsupported(proxy) {
+        warn!(
+            proxy_id = %proxy.id,
+            "Refusing WebSocket backend dial: backend TLS SNI override cannot be applied to a \
+             WebSocket transport (server name is derived from the request URI); failing closed \
+             rather than verifying the wrong server name"
+        );
+        return Err(retry::WS_BACKEND_TLS_SNI_UNSUPPORTED.into());
     }
 
     let connector = build_websocket_tls_connector(proxy, env_config, tls_policy, crls)?;
@@ -29596,10 +29666,13 @@ pub(crate) fn cap_proxy_retry_for_target(
 /// [`resolve_effective_proxy_for_target`]: a single field read on the
 /// precomputed `Proxy.dispatch_port_overrides` map, no `ArcSwap` load.
 ///
-/// `dispatch_port` is the port the dial will actually use: the LB-selected
-/// `UpstreamTarget.port` for upstream proxies, or `proxy.backend_port` for a
-/// direct-backend proxy with no upstream. This mirrors how the raw-TCP path
-/// reads the same field via `ResolvedPortOverride.max_connections`.
+/// `dispatch_port` is the DestinationRule policy key: callers with a selected
+/// target pass `UpstreamTarget::dispatch_policy_port()` (the declared Service
+/// port when `targetPort` remapping applies), while a direct-backend proxy with
+/// no selected target passes `proxy.backend_port`. The transport may dial a
+/// different workload or mesh-listener port; that address must not become the
+/// policy source. This mirrors how the raw-TCP path reads the same field via
+/// `ResolvedPortOverride.max_connections`.
 pub(crate) fn resolve_backend_max_connections(proxy: &Proxy, dispatch_port: u16) -> Option<u32> {
     proxy
         .dispatch_port_overrides
@@ -29617,9 +29690,11 @@ pub(crate) fn resolve_backend_max_connections(proxy: &Proxy, dispatch_port: u16)
 /// matches [`resolve_backend_max_connections`]: a single field read on the
 /// precomputed `Proxy.dispatch_port_overrides` map, no `ArcSwap` load.
 ///
-/// `dispatch_port` is the port the dial will actually use: the LB-selected
-/// `UpstreamTarget.port` for upstream proxies, or `proxy.backend_port` for a
-/// direct-backend proxy with no upstream.
+/// `dispatch_port` is the DestinationRule policy key: callers with a selected
+/// target pass `UpstreamTarget::dispatch_policy_port()`, while a direct-backend
+/// proxy with no selected target passes `proxy.backend_port`. A remapped
+/// workload port or mesh listener remains a transport address, not the policy
+/// source.
 ///
 /// FIELD-level fallback (#1806 codex r1): when the per-port entry carries no
 /// `http1_max_pending_requests`, inherit the service-discovery top-level
