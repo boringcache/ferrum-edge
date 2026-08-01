@@ -36,6 +36,8 @@ mod shared_store_tests;
 pub mod source;
 #[cfg(test)]
 mod store_atomicity_tests;
+#[cfg(test)]
+mod acme_final_publication_tests;
 // `spiffe` exposes Phase A scaffolding for Phase C — every public item is
 // dead from the binary's perspective until a later phase wires it in.
 #[allow(dead_code)]

@@ -822,6 +822,101 @@ fn a_takeover_cannot_cross_a_fenced_commit() {
     );
 }
 
+/// Final renewal publication runs two target-store mutations under one lease
+/// fence. A takeover must not be able to slip between them the way it could
+/// when certificate publication and the order Valid write were separate
+/// `commit_fenced` calls.
+#[test]
+fn two_target_mutations_share_one_lease_fence_without_a_takeover_window() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let instance_a = instance(dir.path(), "replica-a");
+    let instance_b = instance(dir.path(), "replica-b");
+    let name = acme_renewal_lease_name("edge-cert");
+    let ttl = Duration::from_millis(300);
+
+    let held = instance_a.try_acquire(&name, ttl).expect("A claims");
+    let lease = held.expect("A wins");
+    let fence = lease.fence();
+    std::mem::forget(lease);
+
+    let first_done = Arc::new(AtomicBool::new(false));
+    let second_done = Arc::new(AtomicBool::new(false));
+    let (after_first_tx, after_first_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let committing = Arc::clone(&instance_a);
+    let commit_name = name.clone();
+    let first_flag = Arc::clone(&first_done);
+    let second_flag = Arc::clone(&second_done);
+    let commit = std::thread::spawn(move || {
+        committing.commit_fenced(&commit_name, fence, move || {
+            // Stands in for certificate-store publication.
+            first_flag.store(true, Ordering::SeqCst);
+            after_first_tx
+                .send(())
+                .expect("the test observes the first mutation");
+            release_rx
+                .recv_timeout(SETTLE_BUDGET)
+                .expect("the test releases the mid-publication hold");
+            // Stands in for the order Valid transition.
+            second_flag.store(true, Ordering::SeqCst);
+            "published-both"
+        })
+    });
+
+    after_first_rx
+        .recv_timeout(SETTLE_BUDGET)
+        .expect("first mutation must run under the live claim");
+    assert!(
+        first_done.load(Ordering::SeqCst),
+        "certificate publication stand-in must have committed"
+    );
+    assert!(
+        !second_done.load(Ordering::SeqCst),
+        "order Valid stand-in must still be pending inside the same fence"
+    );
+
+    // While the fence is still held between the two mutations, the lease store
+    // lock itself is busy — a takeover cannot cross that gap.
+    let probe = open_store_lock_file(dir.path());
+    match probe.try_lock() {
+        Err(TryLockError::WouldBlock) => {}
+        Ok(()) => panic!(
+            "the lease store's lock was free between the two final-publication \
+             mutations; a takeover could have crossed the publication boundary"
+        ),
+        Err(TryLockError::Error(error)) => panic!("lease lock probe failed: {error}"),
+    }
+    std::mem::drop(probe);
+
+    let claim = instance_a.peek(&name).expect("read").expect("present");
+    assert!(
+        wait_until(SETTLE_BUDGET, || Utc::now() > claim.expires_at),
+        "the nominal TTL must elapse while the fence still covers both writes"
+    );
+    assert!(
+        !second_done.load(Ordering::SeqCst),
+        "the second mutation must still be inside the held fence after expiry"
+    );
+
+    release_tx.send(()).expect("release the mid-publication hold");
+    let outcome = commit
+        .join()
+        .expect("commit thread")
+        .expect("the commit is answered");
+    assert_eq!(outcome, FencedCommit::Committed("published-both"));
+    assert!(
+        first_done.load(Ordering::SeqCst) && second_done.load(Ordering::SeqCst),
+        "both final-publication mutations must complete under the one fence"
+    );
+
+    // Only after the combined fence releases can a takeover land.
+    let taken = instance_b
+        .try_acquire(&name, ttl)
+        .expect("B attempts")
+        .expect("expired claim is acquirable once the fence releases");
+    assert_eq!(taken.holder(), "replica-b");
+}
+
 /// A target-store failure is not a lease failure: it propagates to the caller
 /// and leaves the claim exactly as it was, rather than rewriting or releasing
 /// the record another holder may be relying on.

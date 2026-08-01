@@ -64,6 +64,23 @@ pub fn request_all_material_set_reloads() -> Vec<&'static str> {
         .collect()
 }
 
+/// Install a force-reload receiver for focused tests that assert reload was
+/// requested without standing up a full material-set watcher.
+#[cfg(test)]
+pub(crate) fn install_force_reload_probe(
+    surface: &'static str,
+) -> mpsc::Receiver<()> {
+    let (force_tx, force_rx) = mpsc::channel(1);
+    force_reload_registry().insert(surface, force_tx);
+    force_rx
+}
+
+/// Remove a probe installed by [`install_force_reload_probe`].
+#[cfg(test)]
+pub(crate) fn remove_force_reload_probe(surface: &'static str) {
+    force_reload_registry().remove(surface);
+}
+
 /// One configured material source to include in a reload fingerprint.
 #[derive(Clone)]
 pub struct WatchedMaterialSource {
