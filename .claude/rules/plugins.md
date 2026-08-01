@@ -62,7 +62,7 @@ paths:
 - `response_caching` likewise requires the proxy's private proof that the
   complete GET/HEAD upload is empty before lookup, binds the complete
   backend-visible request target (including the effective outbound query),
-  rejects later header/query mutation, and rejects deferred body transforms that
+  rejects later header/query/destination mutation, and rejects deferred body transforms that
   could synthesize bytes after lookup. Configured request decompression remains
   compatible because its exact final body is published during pre-`before_proxy`
   normalization. Its request-header dimension is the complete `Vary` tuple, not

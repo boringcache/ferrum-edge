@@ -407,13 +407,15 @@ fn validate_plugin_security_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(
                     // compression to retain final encoded representations.
                     && plugin.name() != "compression"
                     && plugin.priority() >= response_cache.priority()
-                    && (plugin.modifies_request_headers() || plugin.modifies_request_query())
+                    && (plugin.modifies_request_headers()
+                        || plugin.modifies_request_query()
+                        || plugin.modifies_request_destination())
             }) {
                 return Err(format!(
                     "request mutation plugin '{}' at effective priority {} must run before \
                      every response_caching instance for protocol {:?}; response_caching \
                      priority {} would select a retained response before the final \
-                     backend-visible headers/query exist",
+                     backend-visible headers/query/destination exist",
                     later_mutator.name(),
                     later_mutator.priority(),
                     protocol,

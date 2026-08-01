@@ -3860,15 +3860,38 @@ fn response_caching_rejects_unwitnessable_request_mutation_order_and_body() {
     )
     .expect_err("cache lookup must run after the final query mutation");
     assert!(
-        candidate_error.contains("before the final backend-visible headers/query"),
+        candidate_error.contains("before the final backend-visible headers/query/destination"),
         "{candidate_error}"
     );
     let runtime_error = PluginCache::new(&late_query_config)
         .err()
         .expect("runtime construction must repeat the mutation-order refusal");
     assert!(
-        runtime_error.contains("before the final backend-visible headers/query"),
+        runtime_error.contains("before the final backend-visible headers/query/destination"),
         "{runtime_error}"
+    );
+
+    let mut late_route_dispatch = make_plugin_config(
+        "route-dispatch",
+        "mesh_route_dispatch",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    late_route_dispatch.priority_override = Some(3600);
+    let late_route_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["cache", "route-dispatch"])],
+        vec![cache(), late_route_dispatch],
+    );
+    let late_route_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &late_route_config,
+        None,
+    )
+    .expect_err("cache lookup must run after the final route destination");
+    assert!(
+        late_route_error.contains("mesh_route_dispatch")
+            && late_route_error.contains("headers/query/destination"),
+        "{late_route_error}"
     );
 
     let safe_query = make_config(
