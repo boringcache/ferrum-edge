@@ -846,18 +846,21 @@ order with the CA:
 - **Missing or corrupt material fails closed.** A resumable order that no longer
   carries a usable key/CSR is not completed, not replaced with a second CA
   order, and never re-keyed after the fact. Usability is checked before any
-  directory request: the private key must parse, the CSR DER must consume its
-  entire input and verify its proof-of-possession signature, the private-key
-  public SPKI must match the CSR SPKI, and the CSR DNS SAN set must exactly
-  match the order's normalized domains (including wildcards; non-DNS SANs and
-  duplicate/ambiguous names fail closed). It fails with a fixed diagnostic that
-  names the order id and nothing about the material, before the DNS-01 hook or
-  any directory request runs, and the record is left intact for inspection. The
-  key, the CSR, the account credentials, the challenge token, and the key
-  authorization never appear in a log, an error, a `Debug` rendering, or an
-  Admin response: the material is deliberately absent from `AcmeOrderSummary`
-  (so the Admin order shape and `openapi.yaml` are unchanged by it) and its
-  `Debug` is a fixed placeholder.
+  directory request: the package must contain exactly one parseable private key;
+  multiple keys or malformed trailing PEM input are rejected. The CSR DER must
+  consume its entire input and verify its proof-of-possession signature, the
+  private-key public SPKI must match the CSR SPKI, and the CSR DNS SAN set must
+  exactly match the order's normalized domains (including wildcards; non-DNS
+  SANs and duplicate/ambiguous names fail closed). It fails before the DNS-01
+  hook or any directory request runs, and the record is left intact for
+  inspection. Renewal diagnostics may identify the order, while the Admin API
+  uses a fixed `400`; neither describes the material. The
+  persisted finalization key and CSR never appear in a log, an error, a `Debug`
+  rendering, or an Admin response: the material is deliberately absent from
+  `AcmeOrderSummary` (so the Admin order shape and `openapi.yaml` are unchanged
+  by it) and its `Debug` is a fixed placeholder. Existing authenticated order
+  summaries continue to expose the documented challenge-setup fields; account
+  credentials remain excluded.
 - **Retention is tied to resumability.** The material is dropped in the same
   write that sets the order `Valid`, which is exactly when the order stops being
   resumable (`Valid` is terminal, so a later scan plans a fresh order with fresh

@@ -227,13 +227,14 @@ impl AcmeOrderFinalization {
 
 /// Content-free validation of a persisted key/CSR package against `domains`.
 ///
-/// Checks, in order: non-empty key PEM that parses, non-empty standard-base64
-/// CSR DER that consumes the entire input, CSR proof-of-possession signature,
-/// private-key public SPKI equals CSR SPKI, and CSR DNS SAN set exactly equals
-/// the order's normalized domains (wildcards included). Non-DNS SANs,
-/// duplicate DNS SANs, duplicate SAN extensions, and domain ambiguity fail
-/// closed. Errors never carry key, CSR, derived bytes, domains, or parse
-/// detail — only [`UNUSABLE_FINALIZATION_MATERIAL`].
+/// Checks, in order: exactly one private key parses from the PEM input,
+/// non-empty standard-base64 CSR DER consumes the entire input, the CSR
+/// proof-of-possession signature verifies, the private-key public SPKI equals
+/// the CSR SPKI, and the CSR DNS SAN set exactly equals the order's normalized
+/// domains (wildcards included). Multiple keys, malformed trailing PEM input,
+/// non-DNS SANs, duplicate DNS SANs, duplicate SAN extensions, and domain
+/// ambiguity fail closed. Errors never carry key, CSR, derived bytes, domains,
+/// or parse detail — only [`UNUSABLE_FINALIZATION_MATERIAL`].
 fn validate_persisted_finalization_package(
     key_pem: &str,
     csr_der_base64: &str,
@@ -244,15 +245,23 @@ fn validate_persisted_finalization_package(
         return Err(unusable());
     }
     let expected = normalize_finalization_domains(domains).ok_or_else(unusable)?;
-    let key_pair = rcgen::KeyPair::from_pem(key_pem).map_err(|_| unusable())?;
+    // Reuse the repository's exact-one-private-key parser instead of rcgen's
+    // single-block PEM helper: a valid first key followed by a second key or a
+    // malformed trailing record must not be accepted as a usable package.
+    let private_key = crate::tls::parse_pem_private_key(
+        key_pem.as_bytes(),
+        "ACME order finalization",
+        "<redacted>",
+    )
+    .map_err(|_| unusable())?;
+    let key_pair = rcgen::KeyPair::try_from(&private_key).map_err(|_| unusable())?;
     let der = BASE64_STANDARD
         .decode(csr_der_base64.as_bytes())
         .map_err(|_| unusable())?;
     if der.is_empty() {
         return Err(unusable());
     }
-    let (remaining, csr) =
-        X509CertificationRequest::from_der(&der).map_err(|_| unusable())?;
+    let (remaining, csr) = X509CertificationRequest::from_der(&der).map_err(|_| unusable())?;
     if !remaining.is_empty() {
         return Err(unusable());
     }
@@ -4021,12 +4030,9 @@ pub mod client {
                                 })?;
                             match challenge_notify_action(challenge.status)? {
                                 ChallengeNotifyAction::SetReady => {
-                                    challenge
-                                        .set_ready()
-                                        .await
-                                        .map_err(|error| {
-                                            AcmeClientError::Client(error.to_string())
-                                        })?;
+                                    challenge.set_ready().await.map_err(|error| {
+                                        AcmeClientError::Client(error.to_string())
+                                    })?;
                                 }
                                 ChallengeNotifyAction::SkipNotify => {}
                             }

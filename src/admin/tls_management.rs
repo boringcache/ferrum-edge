@@ -19,8 +19,8 @@ use super::{AdminState, PaginationParams};
 use crate::tls::acme::{AcmeCertificateRecord, AcmeError, AcmeIssuedCertificateInput};
 #[cfg(feature = "acme")]
 use crate::tls::acme::{
-    AcmeDns01ChallengeRecord, AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput, AcmeOrderFinalization,
-    AcmeOrderRecord, AcmeOrderStatus, AcmeTlsAlpn01ChallengeRecord,
+    AcmeDns01ChallengeRecord, AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput,
+    AcmeOrderFinalization, AcmeOrderRecord, AcmeOrderStatus, AcmeTlsAlpn01ChallengeRecord,
 };
 use crate::tls::managed::{ManagedTlsError, ManagedTlsMaterialKind, ManagedTlsRecord};
 
@@ -2335,9 +2335,7 @@ fn acme_order_finalization_for_finalize(
     let Some(finalization) = order.finalization.as_ref() else {
         return Err(MESSAGE);
     };
-    finalization
-        .validate(&order.domains)
-        .map_err(|_| MESSAGE)?;
+    finalization.validate(&order.domains).map_err(|_| MESSAGE)?;
     Ok(finalization.clone())
 }
 
@@ -2679,11 +2677,9 @@ mod tests {
         .expect("usable material");
         assert_eq!(accepted.key_pem(), usable.key_pem());
 
-        let missing = acme_order_finalization_for_finalize(&sample_finalize_order(
-            None,
-            domains.clone(),
-        ))
-        .expect_err("missing material");
+        let missing =
+            acme_order_finalization_for_finalize(&sample_finalize_order(None, domains.clone()))
+                .expect_err("missing material");
         assert_eq!(
             missing,
             "ACME order finalization material is missing or unusable"

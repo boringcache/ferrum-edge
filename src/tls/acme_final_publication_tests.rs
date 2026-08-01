@@ -848,7 +848,8 @@ fn finalization_preflight_rejects_malformed_and_mismatched_packages() {
 
     let domains = vec!["example.com".to_string()];
     let good = AcmeOrderFinalization::generate(&domains).expect("generate");
-    good.validate(&domains).expect("generated package validates");
+    good.validate(&domains)
+        .expect("generated package validates");
     good.csr_der(&domains).expect("generated csr decodes");
 
     // Malformed PEM that is non-empty but not a private key.
@@ -857,29 +858,32 @@ fn finalization_preflight_rejects_malformed_and_mismatched_packages() {
         good.csr_der(&domains).expect("csr"),
     );
     assert_unusable_without_disclosure(
-        &malformed_pem
-            .validate(&domains)
-            .expect_err("malformed PEM"),
+        &malformed_pem.validate(&domains).expect_err("malformed PEM"),
+    );
+
+    // A parser that accepts only the first PEM block would silently ignore the
+    // second private key. The package must contain exactly one key record.
+    let trailing_key = rcgen::KeyPair::generate().expect("trailing key");
+    let multiple_keys = package_from_key_and_csr(
+        format!("{}\n{}", good.key_pem(), trailing_key.serialize_pem()),
+        good.csr_der(&domains).expect("csr"),
+    );
+    assert_unusable_without_disclosure(
+        &multiple_keys.validate(&domains).expect_err("multiple private keys"),
     );
 
     // Well-base64-encoded trailing DER after a complete CSR.
     let mut trailing = good.csr_der(&domains).expect("csr");
     trailing.push(0x00);
     let trailing_der = package_from_key_and_csr(good.key_pem().to_string(), trailing);
-    assert_unusable_without_disclosure(
-        &trailing_der
-            .validate(&domains)
-            .expect_err("trailing DER"),
-    );
+    assert_unusable_without_disclosure(&trailing_der.validate(&domains).expect_err("trailing DER"));
 
     // Invalid CSR proof-of-possession signature (flip a byte in the DER).
     let mut tampered = good.csr_der(&domains).expect("csr");
     let last = tampered.last_mut().expect("csr bytes");
     *last ^= 0x01;
     let bad_sig = package_from_key_and_csr(good.key_pem().to_string(), tampered);
-    assert_unusable_without_disclosure(
-        &bad_sig.validate(&domains).expect_err("bad CSR signature"),
-    );
+    assert_unusable_without_disclosure(&bad_sig.validate(&domains).expect_err("bad CSR signature"));
 
     // Private key / CSR public key mismatch.
     let other_key = rcgen::KeyPair::generate().expect("other key");
@@ -900,43 +904,26 @@ fn finalization_preflight_rejects_malformed_and_mismatched_packages() {
         key.serialize_pem(),
         csr_der_for_sans(&key, vec![dns_san("other.example")]),
     );
-    assert_unusable_without_disclosure(
-        &wrong.validate(&domains).expect_err("wrong SAN"),
-    );
+    assert_unusable_without_disclosure(&wrong.validate(&domains).expect_err("wrong SAN"));
 
     // Extra SAN.
     let extra = package_from_key_and_csr(
         key.serialize_pem(),
-        csr_der_for_sans(
-            &key,
-            vec![dns_san("example.com"), dns_san("extra.example")],
-        ),
+        csr_der_for_sans(&key, vec![dns_san("example.com"), dns_san("extra.example")]),
     );
-    assert_unusable_without_disclosure(
-        &extra.validate(&domains).expect_err("extra SAN"),
-    );
+    assert_unusable_without_disclosure(&extra.validate(&domains).expect_err("extra SAN"));
 
     // Missing SAN (empty SAN extension).
-    let missing = package_from_key_and_csr(
-        key.serialize_pem(),
-        csr_der_for_sans(&key, Vec::new()),
-    );
-    assert_unusable_without_disclosure(
-        &missing.validate(&domains).expect_err("missing SAN"),
-    );
+    let missing = package_from_key_and_csr(key.serialize_pem(), csr_der_for_sans(&key, Vec::new()));
+    assert_unusable_without_disclosure(&missing.validate(&domains).expect_err("missing SAN"));
 
     // Duplicate DNS SAN.
     let duplicate = package_from_key_and_csr(
         key.serialize_pem(),
-        csr_der_for_sans(
-            &key,
-            vec![dns_san("example.com"), dns_san("example.com")],
-        ),
+        csr_der_for_sans(&key, vec![dns_san("example.com"), dns_san("example.com")]),
     );
     assert_unusable_without_disclosure(
-        &duplicate
-            .validate(&domains)
-            .expect_err("duplicate DNS SAN"),
+        &duplicate.validate(&domains).expect_err("duplicate DNS SAN"),
     );
 
     // Non-DNS SAN.
@@ -950,9 +937,7 @@ fn finalization_preflight_rejects_malformed_and_mismatched_packages() {
             ],
         ),
     );
-    assert_unusable_without_disclosure(
-        &non_dns.validate(&domains).expect_err("non-DNS SAN"),
-    );
+    assert_unusable_without_disclosure(&non_dns.validate(&domains).expect_err("non-DNS SAN"));
 
     // Wildcard domains are exact-match values, not expanded.
     let wild_domains = vec!["*.example.com".to_string()];
