@@ -788,7 +788,7 @@ The CNI plugin and the kube-rs watcher feed the same enrollment path. They are d
 - **Version gate.** `GC` is accepted only when the negotiated `cniVersion` is `1.1.0`. Older versions keep ADD/DEL/CHECK unchanged and fail closed on GC with an unsupported-version error. `VERSION` advertises `0.3.0`/`0.3.1`/`0.4.0`/`1.0.0`/`1.1.0`.
 - **Valid attachments.** The runtime supplies `cni.dev/valid-attachments` as `(containerID, ifname)` tuples. Ferrum bounds ingestion (attachment count, field length, safe character set) and rejects hostile/path-like input before reconciliation.
 - **Ownership.** Successful CNI ADD records Ferrum ownership of that attachment. GC removes only Ferrum-owned attachments absent from the valid set. Watcher-only enrollments and other node-agent generations are never swept.
-- **Idempotency / partial failure.** Repeat GC with the same valid set is a no-op success. Cleanup continues across candidates; if BPF teardown records attach errors, GC reports a structured error after attempting the full set.
+- **Idempotency / partial failure.** Repeat GC with the same valid set is a no-op success once every stale Ferrum-owned attachment is fully cleaned. When BPF/rule/map teardown leaves removal-blocking state for a stale candidate, GC reports an error, retains Ferrum ownership, and a later GC re-drives the pending-removal retry path until cleanup is complete.
 
 ### Install steps
 

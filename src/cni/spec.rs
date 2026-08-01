@@ -301,16 +301,14 @@ impl CniValidAttachment {
         validate_attachment_field("containerID", &self.container_id)?;
         validate_attachment_field("ifname", &self.ifname)?;
         if !is_safe_cni_container_id(&self.container_id) {
-            return Err(CniError::BadConfig(format!(
-                "containerID {:?} is not a valid CNI container id",
-                self.container_id
-            )));
+            return Err(CniError::BadConfig(
+                "containerID is not a valid CNI container id".to_string(),
+            ));
         }
         if !is_safe_cni_ifname(&self.ifname) {
-            return Err(CniError::BadConfig(format!(
-                "ifname {:?} is not a valid CNI interface name",
-                self.ifname
-            )));
+            return Err(CniError::BadConfig(
+                "ifname is not a valid CNI interface name".to_string(),
+            ));
         }
         Ok(())
     }

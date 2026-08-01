@@ -1054,6 +1054,9 @@ pub struct MockEbpfBackend {
     /// so removal tests can prove a successful pod-IP map delete that cannot
     /// clear the bounded scope map stays pending and retryable.
     pub fail_clear_pod_inbound_ports: bool,
+    /// When `true`, `detach_pod` fails so removal/GC tests can prove partial BPF
+    /// teardown retains Ferrum CNI ownership until retry succeeds.
+    pub fail_detach_pod: bool,
     /// When `true`, `validate_startup_ready` fails even though every earlier
     /// step succeeded, so tests can drive the post-attach startup-validation
     /// unwind (classifier detached, then Ferrum-owned routing removed).
@@ -1126,6 +1129,9 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn detach_pod(&mut self, pod_uid: &str) -> Result<(), String> {
+        if self.fail_detach_pod {
+            return Err(format!("injected pod BPF detach failure for {pod_uid}"));
+        }
         self.detached_pods.push(pod_uid.to_string());
         Ok(())
     }

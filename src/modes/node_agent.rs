@@ -2860,11 +2860,23 @@ fn forget_cni_owned_attachment(state_key: &str) {
     CNI_OWNED_ATTACHMENTS.remove(state_key);
 }
 
-fn forget_cni_owned_attachment_for_pod(
+/// Drop Ferrum CNI ownership only after removal-blocking cleanup for this
+/// attachment is complete. Retains ownership across partial teardown failures so
+/// GC and the pending-removal retry loop can redrive stale candidates.
+fn forget_cni_owned_attachment_if_removal_complete(
     pod_states: &DashMap<String, PodAttachmentState>,
     pod_uid: &str,
 ) {
-    forget_cni_owned_attachment(&pod_state_key(pod_states, pod_uid));
+    if pod_states.contains_key(pod_uid) {
+        return;
+    }
+    let state_key = pod_state_key(pod_states, pod_uid);
+    if has_failed_pod_enrollment_attempt(&state_key)
+        || has_pending_removal_blocking_failure(&state_key)
+    {
+        return;
+    }
+    forget_cni_owned_attachment(&state_key);
 }
 
 /// Reconcile Ferrum-owned CNI attachments against the runtime's valid set.
@@ -2908,20 +2920,33 @@ fn apply_cni_gc(
         }
     }
 
-    let errors_before = metrics.attach_errors.load(Ordering::Relaxed);
     for pod_uid in &stale_uids {
-        handle_pod_removed(backend, pod_states, config, metrics, pod_uid);
-        // handle_pod_removed clears the ownership index; belt-and-suspenders
-        // for the case where the pod was already absent from pod_states.
-        forget_cni_owned_attachment_for_pod(pod_states, pod_uid);
+        if pod_states.contains_key(pod_uid) {
+            handle_pod_removed(backend, pod_states, config, metrics, pod_uid);
+        }
     }
-    let errors_after = metrics.attach_errors.load(Ordering::Relaxed);
-    if errors_after > errors_before {
+    retry_pending_pod_detaches(backend, pod_states, config, metrics);
+    retry_pending_pod_ip_removals(backend, pod_states, config, metrics);
+    retry_pending_node_probe_port_removals(backend, pod_states, config, metrics);
+    retry_pending_cgroup_map_removals(backend, pod_states, config, metrics);
+
+    let mut incomplete = 0usize;
+    for pod_uid in &stale_uids {
+        let state_key = pod_state_key(pod_states, pod_uid);
+        if pod_states.contains_key(pod_uid)
+            || has_failed_pod_enrollment_attempt(&state_key)
+            || has_pending_removal_blocking_failure(&state_key)
+        {
+            incomplete += 1;
+            continue;
+        }
+        forget_cni_owned_attachment_if_removal_complete(pod_states, pod_uid);
+    }
+
+    if incomplete > 0 {
         CniRpcResponse::Error {
             reason: format!(
-                "gc removed {} stale attachment(s) with {} cleanup error(s)",
-                stale_uids.len(),
-                errors_after - errors_before
+                "gc could not complete cleanup for {incomplete} stale Ferrum-owned attachment(s); ownership retained for retry"
             ),
         }
     } else {
@@ -6294,10 +6319,7 @@ pub fn handle_pod_removed(
     pod_uid: &str,
 ) {
     let state_key = pod_state_key(pod_states, pod_uid);
-    // Drop Ferrum CNI ownership before teardown so a concurrent GC cannot
-    // observe a half-removed attachment as still owned.
-    forget_cni_owned_attachment(&state_key);
-    // Snapshot before forgetting: a failed attempt may have written partial
+    // Snapshot before teardown: a failed attempt may have written partial
     // BPF state without ever entering `pod_states`.
     let failed_attempt = FAILED_POD_ENROLLMENT_ATTEMPTS
         .get(&state_key)
@@ -6359,6 +6381,7 @@ pub fn handle_pod_removed(
             forget_pod_enrollment_attempt(&state_key);
         }
         clear_partial_capture_state_if_recovered(pod_states, metrics);
+        forget_cni_owned_attachment_if_removal_complete(pod_states, pod_uid);
         return;
     };
 
@@ -6404,6 +6427,7 @@ pub fn handle_pod_removed(
         }
     }
     clear_partial_capture_state_if_recovered(pod_states, metrics);
+    forget_cni_owned_attachment_if_removal_complete(pod_states, pod_uid);
 }
 
 async fn handle_fallback(
@@ -14244,6 +14268,93 @@ mod tests {
     }
 
     #[test]
+    fn apply_cni_gc_partial_failure_retains_ownership_until_retry_succeeds() {
+        use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
+        use crate::cni::spec::CniValidAttachment;
+
+        let mut backend = MockEbpfBackend {
+            fail_detach_pod: true,
+            ..MockEbpfBackend::default()
+        };
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+
+        pod_states.insert("stale-uid".to_string(), enrolled_pod_state("stale-uid"));
+        remember_cni_owned_attachment(&pod_states, "stale-uid", "ctr-stale", "eth0");
+        let state_key = pod_state_key(&pod_states, "stale-uid");
+
+        let req = CniRpcRequest {
+            verb: RpcVerb::Gc,
+            pod_namespace: String::new(),
+            pod_name: String::new(),
+            pod_uid: None,
+            container_id: String::new(),
+            ifname: None,
+            netns_path: None,
+            args: HashMap::new(),
+            valid_attachments: vec![CniValidAttachment {
+                container_id: "ctr-live".to_string(),
+                ifname: "eth0".to_string(),
+            }],
+        };
+
+        match apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req) {
+            CniRpcResponse::Error { .. } => {}
+            other => panic!("first GC must fail when BPF detach is blocked, got {other:?}"),
+        }
+        assert!(
+            CNI_OWNED_ATTACHMENTS.contains_key(&state_key),
+            "partial teardown must retain Ferrum CNI ownership"
+        );
+        assert!(
+            has_pending_removal_blocking_failure(&state_key),
+            "detach failure must remain a removal blocker"
+        );
+        assert!(
+            !pod_states.contains_key("stale-uid"),
+            "first GC must still remove the tracked pod state"
+        );
+
+        match apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req) {
+            CniRpcResponse::Error { .. } => {}
+            other => panic!("repeated GC must not report success while blockers remain, got {other:?}"),
+        }
+        assert!(
+            CNI_OWNED_ATTACHMENTS.contains_key(&state_key),
+            "repeated GC must retain ownership until cleanup completes"
+        );
+
+        backend.fail_detach_pod = false;
+        assert_eq!(
+            apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req),
+            CniRpcResponse::Ok,
+            "GC must succeed once pending detach retry clears"
+        );
+        assert!(
+            !CNI_OWNED_ATTACHMENTS.contains_key(&state_key),
+            "successful cleanup must clear Ferrum CNI ownership"
+        );
+        assert!(!has_pending_removal_blocking_failure(&state_key));
+
+        assert_eq!(
+            apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req),
+            CniRpcResponse::Ok,
+            "repeat GC after successful cleanup must be idempotent"
+        );
+    }
+
+    #[test]
     fn apply_cni_gc_rejects_malformed_valid_attachments() {
         use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
         use crate::cni::spec::CniValidAttachment;
@@ -14282,8 +14393,12 @@ mod tests {
         match apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req) {
             CniRpcResponse::Error { reason } => {
                 assert!(
-                    reason.contains("containerID") || reason.contains("forbidden"),
+                    reason.contains("forbidden") || reason.contains("containerID"),
                     "expected hostile-input rejection, got: {reason}"
+                );
+                assert!(
+                    !reason.contains("../escape"),
+                    "validation error must not echo hostile input, got: {reason}"
                 );
             }
             other => panic!("expected Error for malformed GC input, got {other:?}"),
