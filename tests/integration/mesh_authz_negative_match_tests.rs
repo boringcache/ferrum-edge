@@ -508,7 +508,7 @@ async fn allow_with_ports_and_not_port_patterns_stays_conjunctive() {
                 trust_domain_pattern: None,
             }],
             to: vec![RequestMatch {
-                ports: vec![9080, 9090],
+                ports: vec![9180, 9090],
                 not_port_patterns: vec!["90*".to_string()],
                 ..RequestMatch::default()
             }],
@@ -522,10 +522,10 @@ async fn allow_with_ports_and_not_port_patterns_stays_conjunctive() {
     };
     let plugin = MeshAuthz::new(&json!({ "mesh_policies": [policy] })).expect("plugin config");
 
-    let mut allowed = http_ctx_with_port("GET", "/api", Some(9080));
+    let mut allowed = http_ctx_with_port("GET", "/api", Some(9180));
     assert!(
         matches!(plugin.authorize(&mut allowed).await, PluginResult::Continue),
-        "9080 is in ports and outside notPorts 90*"
+        "9180 is in ports and outside notPorts 90*"
     );
 
     let mut blocked_negative = http_ctx_with_port("GET", "/api", Some(9090));

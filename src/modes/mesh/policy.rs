@@ -3608,7 +3608,7 @@ mod tests {
             mesh_policies: vec![allow_policy_with_request_match(
                 "allow-9-except-90-prefix",
                 RequestMatch {
-                    ports: vec![9090, 9080],
+                    ports: vec![9090, 9180],
                     not_port_patterns: vec!["90*".to_string()],
                     ..RequestMatch::default()
                 },
@@ -3617,7 +3617,7 @@ mod tests {
         };
 
         let allowed = MeshAuthzRequest {
-            port: Some(9080),
+            port: Some(9180),
             ..MeshAuthzRequest::default()
         };
         let excluded_by_negative = MeshAuthzRequest {
@@ -3632,7 +3632,7 @@ mod tests {
         assert_eq!(
             evaluate_mesh_authorization(&slice, &allowed),
             MeshAuthzDecision::Allow,
-            "9080 is in ports and outside notPorts 90* → allow"
+            "9180 is in ports and outside notPorts 90* → allow"
         );
         assert_eq!(
             evaluate_mesh_authorization(&slice, &excluded_by_negative),
