@@ -25,7 +25,7 @@
 #![cfg_attr(not(feature = "acme"), allow(dead_code))]
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -186,18 +186,22 @@ impl AcmeOrderFinalization {
         let csr = params
             .serialize_request(&key_pair)
             .map_err(|_| AcmeError::InvalidConfiguration(UNUSABLE_FINALIZATION_MATERIAL.into()))?;
-        Self::from_parts(key_pair.serialize_pem(), csr.der().as_ref())
+        Self::from_parts(key_pair.serialize_pem(), csr.der().as_ref(), domains)
     }
 
-    /// Build from an already-generated pair, rejecting anything unusable.
-    pub fn from_parts(key_pem: String, csr_der: &[u8]) -> Result<Self, AcmeError> {
-        if key_pem.trim().is_empty() || csr_der.is_empty() {
-            return Err(AcmeError::Parse(UNUSABLE_FINALIZATION_MATERIAL.to_string()));
-        }
-        Ok(Self {
+    /// Build from an already-generated pair, rejecting anything unusable for
+    /// `domains` before the package is retained anywhere.
+    pub fn from_parts(
+        key_pem: String,
+        csr_der: &[u8],
+        domains: &[String],
+    ) -> Result<Self, AcmeError> {
+        let material = Self {
             key_pem,
             csr_der_base64: BASE64_STANDARD.encode(csr_der),
-        })
+        };
+        material.validate(domains)?;
+        Ok(material)
     }
 
     /// The private key the issued certificate must be published against.
@@ -205,25 +209,127 @@ impl AcmeOrderFinalization {
         &self.key_pem
     }
 
-    /// The DER CSR to finalize with. Fails closed on corrupt material.
-    pub fn csr_der(&self) -> Result<Vec<u8>, AcmeError> {
-        if self.key_pem.trim().is_empty() {
-            return Err(AcmeError::Parse(UNUSABLE_FINALIZATION_MATERIAL.to_string()));
-        }
-        let der = BASE64_STANDARD
-            .decode(self.csr_der_base64.as_bytes())
-            .map_err(|_| AcmeError::Parse(UNUSABLE_FINALIZATION_MATERIAL.to_string()))?;
-        if der.is_empty() {
-            return Err(AcmeError::Parse(UNUSABLE_FINALIZATION_MATERIAL.to_string()));
-        }
-        Ok(der)
+    /// The DER CSR to finalize with, after the full content-free preflight.
+    ///
+    /// Fails closed on corrupt material or a CSR that does not exactly match
+    /// `domains`. Never regenerates anything.
+    pub fn csr_der(&self, domains: &[String]) -> Result<Vec<u8>, AcmeError> {
+        validate_persisted_finalization_package(&self.key_pem, &self.csr_der_base64, domains)
     }
 
-    /// Reject material that cannot later be used, at the store boundary, so a
-    /// corrupt package cannot be written in the first place.
-    fn validate(&self) -> Result<(), AcmeError> {
-        self.csr_der().map(|_| ())
+    /// Reject material that cannot later be used, at the store boundary and
+    /// every network entrypoint, so a corrupt package cannot be written or
+    /// drive a directory request.
+    pub fn validate(&self, domains: &[String]) -> Result<(), AcmeError> {
+        self.csr_der(domains).map(|_| ())
     }
+}
+
+/// Content-free validation of a persisted key/CSR package against `domains`.
+///
+/// Checks, in order: non-empty key PEM that parses, non-empty standard-base64
+/// CSR DER that consumes the entire input, CSR proof-of-possession signature,
+/// private-key public SPKI equals CSR SPKI, and CSR DNS SAN set exactly equals
+/// the order's normalized domains (wildcards included). Non-DNS SANs,
+/// duplicate DNS SANs, duplicate SAN extensions, and domain ambiguity fail
+/// closed. Errors never carry key, CSR, derived bytes, domains, or parse
+/// detail — only [`UNUSABLE_FINALIZATION_MATERIAL`].
+fn validate_persisted_finalization_package(
+    key_pem: &str,
+    csr_der_base64: &str,
+    domains: &[String],
+) -> Result<Vec<u8>, AcmeError> {
+    let unusable = || AcmeError::Parse(UNUSABLE_FINALIZATION_MATERIAL.to_string());
+    if key_pem.trim().is_empty() || csr_der_base64.trim().is_empty() {
+        return Err(unusable());
+    }
+    let expected = normalize_finalization_domains(domains).ok_or_else(unusable)?;
+    let key_pair = rcgen::KeyPair::from_pem(key_pem).map_err(|_| unusable())?;
+    let der = BASE64_STANDARD
+        .decode(csr_der_base64.as_bytes())
+        .map_err(|_| unusable())?;
+    if der.is_empty() {
+        return Err(unusable());
+    }
+    let (remaining, csr) =
+        X509CertificationRequest::from_der(&der).map_err(|_| unusable())?;
+    if !remaining.is_empty() {
+        return Err(unusable());
+    }
+    csr.verify_signature().map_err(|_| unusable())?;
+    let key_spki = rcgen::PublicKeyData::subject_public_key_info(&key_pair);
+    if csr.certification_request_info.subject_pki.raw != key_spki.as_slice() {
+        return Err(unusable());
+    }
+    let actual = csr_dns_san_set(&csr).ok_or_else(unusable)?;
+    if actual != expected {
+        return Err(unusable());
+    }
+    Ok(der)
+}
+
+/// Normalize order domains the same way preparation does: trim, lowercase,
+/// reject empty/control/whitespace/overlong entries, and silently drop exact
+/// duplicates so a generated package round-trips. Returns `None` when the
+/// result would be empty or otherwise unusable for an exact SAN match.
+fn normalize_finalization_domains(domains: &[String]) -> Option<BTreeSet<String>> {
+    let mut normalized = BTreeSet::new();
+    for domain in domains {
+        let domain = domain.trim().to_ascii_lowercase();
+        if domain.is_empty() || domain.len() > 253 {
+            return None;
+        }
+        if domain
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+        {
+            return None;
+        }
+        normalized.insert(domain);
+    }
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(normalized)
+}
+
+/// Extract the CSR's DNS SAN set. Fails closed on missing SAN, more than one
+/// SAN extension, non-DNS names, empty names, or duplicate DNS names — never
+/// guesses which name was intended.
+fn csr_dns_san_set(csr: &X509CertificationRequest<'_>) -> Option<BTreeSet<String>> {
+    let mut dns_names = BTreeSet::new();
+    let mut saw_san_extension = false;
+    for extension in csr.requested_extensions()? {
+        let ParsedExtension::SubjectAlternativeName(san) = extension else {
+            continue;
+        };
+        if saw_san_extension {
+            return None;
+        }
+        saw_san_extension = true;
+        for name in &san.general_names {
+            let GeneralName::DNSName(value) = name else {
+                return None;
+            };
+            let normalized = value.trim().to_ascii_lowercase();
+            if normalized.is_empty() || normalized.len() > 253 {
+                return None;
+            }
+            if normalized
+                .chars()
+                .any(|ch| ch.is_control() || ch.is_whitespace())
+            {
+                return None;
+            }
+            if !dns_names.insert(normalized) {
+                return None;
+            }
+        }
+    }
+    if !saw_san_extension || dns_names.is_empty() {
+        return None;
+    }
+    Some(dns_names)
 }
 
 impl std::fmt::Debug for AcmeOrderFinalization {
@@ -687,7 +793,7 @@ impl AcmeOrderStore {
         validate_tls_alpn01_challenges(&record.tls_alpn01_challenges)?;
         validate_dns01_challenges(&record.dns01_challenges)?;
         if let Some(finalization) = record.finalization.as_ref() {
-            finalization.validate()?;
+            finalization.validate(&record.domains)?;
         }
         self.file.mutate(move |document| {
             let mut record = record;
@@ -969,7 +1075,7 @@ impl AcmeOrderRecord {
         validate_tls_alpn01_challenges(&input.tls_alpn01_challenges)?;
         validate_dns01_challenges(&input.dns01_challenges)?;
         if let Some(finalization) = input.finalization.as_ref() {
-            finalization.validate()?;
+            finalization.validate(&input.domains)?;
         }
         let now = Utc::now();
         Ok(Self {
@@ -2678,7 +2784,7 @@ pub(crate) async fn resume_persisted_renewal_order(
     if !order
         .finalization
         .as_ref()
-        .is_some_and(|finalization| finalization.csr_der().is_ok())
+        .is_some_and(|finalization| finalization.validate(&order.domains).is_ok())
     {
         return Err(AcmeError::UnusableFinalizationMaterial(order.id.clone()));
     }
@@ -2952,10 +3058,14 @@ async fn complete_prepared_renewal_order(
         .finalization
         .clone()
         .ok_or_else(|| AcmeError::UnusableFinalizationMaterial(order.id.clone()))?;
+    finalization
+        .validate(&order.domains)
+        .map_err(|_| AcmeError::UnusableFinalizationMaterial(order.id.clone()))?;
     let complete_config = client::CompleteAcmeHttp01OrderConfig {
         directory_url: order.directory_url.clone(),
         account_credentials_json: crate::tls::source::SecretString::new(account_credentials_json),
         order_url,
+        domains: order.domains.clone(),
         poll_timeout: config.poll_timeout,
         dns_cache: config.dns_cache.clone(),
         finalization,
@@ -3167,6 +3277,9 @@ pub mod client {
         pub directory_url: String,
         pub account_credentials_json: SecretString,
         pub order_url: String,
+        /// Order domains the persisted CSR must cover exactly. Checked before
+        /// any directory request so a mismatched package cannot reach the CA.
+        pub domains: Vec<String>,
         pub poll_timeout: Duration,
         pub dns_cache: DnsCache,
         /// Required, never optional: a completion that cannot present the
@@ -3754,7 +3867,8 @@ pub mod client {
     /// `finalize_csr` in the crate.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum AcmeCompletionAction {
-        /// Set every non-valid challenge ready and poll the order to `ready`.
+        /// Validate challenge endpoints, notify still-pending challenges once,
+        /// and poll the order to `ready`.
         DriveChallengesToReady,
         /// Send exactly one finalize request, carrying the persisted CSR.
         FinalizeWithPersistedCsr,
@@ -3795,6 +3909,39 @@ pub mod client {
         })
     }
 
+    /// Whether a pending order should notify a challenge as ready.
+    ///
+    /// Endpoint validation always happens first; this only decides the
+    /// notification side effect. A crashed holder can leave the order
+    /// `pending` while a challenge is already `processing`, so re-notifying
+    /// that challenge would be a duplicate side effect.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ChallengeNotifyAction {
+        /// Challenge is still awaiting notification: call `set_ready` once.
+        SetReady,
+        /// Challenge is already in flight or finished: keep polling the order
+        /// without calling `set_ready` again.
+        SkipNotify,
+    }
+
+    /// Decide the notify side effect for one remote challenge status.
+    ///
+    /// `Pending` → notify once. `Processing`/`Valid` → validate the endpoint
+    /// but do not notify. `Invalid` → fail closed with a fixed diagnostic.
+    pub(crate) fn challenge_notify_action(
+        status: ChallengeStatus,
+    ) -> Result<ChallengeNotifyAction, AcmeClientError> {
+        match status {
+            ChallengeStatus::Pending => Ok(ChallengeNotifyAction::SetReady),
+            ChallengeStatus::Processing | ChallengeStatus::Valid => {
+                Ok(ChallengeNotifyAction::SkipNotify)
+            }
+            ChallengeStatus::Invalid => Err(AcmeClientError::Client(
+                "ACME challenge is invalid and cannot be completed".to_string(),
+            )),
+        }
+    }
+
     /// Drive a persisted order to a certificate, whatever state the CA is in.
     ///
     /// Idempotent across a crash: the private key is never generated here, only
@@ -3822,7 +3969,7 @@ pub mod client {
         // certificate the CA is already issuing against the original CSR.
         let csr_der = config
             .finalization
-            .csr_der()
+            .csr_der(&config.domains)
             .map_err(|_| AcmeClientError::UnusableFinalizationMaterial)?;
         let key_pem = config.finalization.key_pem().to_string();
         if key_pem.trim().is_empty() {
@@ -3857,7 +4004,9 @@ pub mod client {
                             let authorization_url = authorization.url().to_string();
                             endpoint_policy
                                 .validate_endpoint(&authorization_url, "authorization URL")
-                                .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
+                                .map_err(|error| {
+                                    AcmeClientError::EgressPolicy(error.to_string())
+                                })?;
                             let Some(mut challenge) =
                                 authorization.challenge(challenge_type.clone())
                             else {
@@ -3867,14 +4016,20 @@ pub mod client {
                             };
                             endpoint_policy
                                 .validate_endpoint(&challenge.url, "challenge URL")
-                                .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
-                            if challenge.status == ChallengeStatus::Valid {
-                                continue;
+                                .map_err(|error| {
+                                    AcmeClientError::EgressPolicy(error.to_string())
+                                })?;
+                            match challenge_notify_action(challenge.status)? {
+                                ChallengeNotifyAction::SetReady => {
+                                    challenge
+                                        .set_ready()
+                                        .await
+                                        .map_err(|error| {
+                                            AcmeClientError::Client(error.to_string())
+                                        })?;
+                                }
+                                ChallengeNotifyAction::SkipNotify => {}
                             }
-                            challenge
-                                .set_ready()
-                                .await
-                                .map_err(|error| AcmeClientError::Client(error.to_string()))?;
                         }
                     }
                     let order_status = order
@@ -4490,6 +4645,7 @@ pub mod client {
                     .to_string(),
                 ),
                 order_url: "https://acme.example/order/1".to_string(),
+                domains: vec!["example.com".to_string()],
                 poll_timeout: Duration::from_secs(1),
                 dns_cache: default_acme_dns_cache(),
                 finalization: test_finalization(),
@@ -4524,6 +4680,7 @@ pub mod client {
                     .to_string(),
                 ),
                 order_url: "https://acme.example/order/1".to_string(),
+                domains: vec!["example.com".to_string()],
                 poll_timeout: Duration::from_secs(1),
                 dns_cache: default_acme_dns_cache(),
                 finalization: corrupt_finalization(),
@@ -4601,6 +4758,39 @@ pub mod client {
             let error = completion_actions(OrderStatus::Invalid)
                 .expect_err("an invalid order must fail closed");
             assert!(matches!(error, AcmeClientError::Client(_)));
+        }
+
+        /// Challenge notification is remote-status-aware: only `Pending` is
+        /// notified, `Processing`/`Valid` are left alone after endpoint
+        /// validation, and `Invalid` fails closed with a fixed diagnostic.
+        #[test]
+        fn challenge_notify_plan_covers_every_remote_status() {
+            assert_eq!(
+                challenge_notify_action(ChallengeStatus::Pending).expect("pending"),
+                ChallengeNotifyAction::SetReady,
+            );
+            assert_eq!(
+                challenge_notify_action(ChallengeStatus::Processing).expect("processing"),
+                ChallengeNotifyAction::SkipNotify,
+            );
+            assert_eq!(
+                challenge_notify_action(ChallengeStatus::Valid).expect("valid"),
+                ChallengeNotifyAction::SkipNotify,
+            );
+            let error = challenge_notify_action(ChallengeStatus::Invalid)
+                .expect_err("invalid must fail closed");
+            assert!(matches!(error, AcmeClientError::Client(_)));
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("invalid and cannot be completed"),
+                "unexpected diagnostic: {rendered}"
+            );
+            assert!(
+                !rendered.contains("token")
+                    && !rendered.contains("http-01")
+                    && !rendered.contains("dns-01"),
+                "the diagnostic must stay content-free: {rendered}"
+            );
         }
 
         #[tokio::test]

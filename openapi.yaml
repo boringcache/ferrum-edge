@@ -680,15 +680,19 @@ paths:
       description: |
         Drives the order from whatever state the ACME directory currently reports
         it in, and stores the issued certificate as an `acme://certificates/{id}`
-        record. A `pending` order has its prepared HTTP-01, TLS-ALPN-01, or DNS-01
-        challenges marked ready and is polled to `ready`; a `ready` order is
+        record. A `pending` order validates each challenge endpoint, notifies only
+        challenges that are still `pending` (leaving `processing`/`valid`
+        challenges alone and failing closed on `invalid`), and is polled to
+        `ready`; a `ready` order is
         finalized exactly once with the CSR generated when the order was created;
         a `processing` or `valid` order is **not** finalized again — its
         certificate is retrieved and paired with the private key persisted at
         creation time. An `invalid` order fails closed. An order whose persisted
         key/CSR material is missing or unusable is rejected with `400` before any
         directory request; the response names the order only, never the material.
-        The endpoint requires the optional
+        Usability requires a parseable private key, a complete CSR DER whose
+        signature verifies, matching private-key/CSR public keys, and a CSR DNS
+        SAN set that exactly matches the order domains. The endpoint requires the optional
         `acme` Cargo feature and returns `501 Not Implemented` without it.
         Persisted order and server-provided authorization, challenge, finalize,
         and certificate URLs remain subject to the directory's HTTPS same-origin

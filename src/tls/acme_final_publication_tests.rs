@@ -740,7 +740,9 @@ fn a_live_order_never_discloses_its_finalization_material() {
     let order = processing_order("edge-order", "edge-cert");
     let material = order.finalization.clone().expect("seeded material");
     let key_pem = material.key_pem().to_string();
-    let csr_der = material.csr_der().expect("decodable csr");
+    let csr_der = material
+        .csr_der(&["example.com".to_string()])
+        .expect("decodable csr");
     let csr_base64 = base64::engine::general_purpose::STANDARD.encode(&csr_der);
 
     let debug = format!("{order:?}");
@@ -775,7 +777,9 @@ fn corrupt_finalization_material_fails_closed_without_disclosure() {
     });
     let corrupt: AcmeOrderFinalization =
         serde_json::from_value(material).expect("deserialize corrupt material");
-    let error = corrupt.csr_der().expect_err("corrupt CSR must fail closed");
+    let error = corrupt
+        .csr_der(&["example.com".to_string()])
+        .expect_err("corrupt CSR must fail closed");
     let rendered = error.to_string();
     assert!(
         !rendered.contains("PRIVATE KEY") && !rendered.contains("not-base64"),
@@ -793,5 +797,171 @@ fn corrupt_finalization_material_fails_closed_without_disclosure() {
     assert!(
         !error.to_string().contains("not-base64"),
         "the store diagnostic must not describe the material"
+    );
+}
+
+fn assert_unusable_without_disclosure(error: &AcmeError) {
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("missing or unusable"),
+        "unexpected diagnostic: {rendered}"
+    );
+    assert!(
+        !rendered.contains("PRIVATE KEY")
+            && !rendered.contains("BEGIN")
+            && !rendered.contains("example.com")
+            && !rendered.contains("*.example.com")
+            && !rendered.contains("other.example"),
+        "diagnostic must stay content-free: {rendered}"
+    );
+}
+
+fn package_from_key_and_csr(key_pem: String, csr_der: Vec<u8>) -> AcmeOrderFinalization {
+    serde_json::from_value(serde_json::json!({
+        "key_pem": key_pem,
+        "csr_der_base64": base64::engine::general_purpose::STANDARD.encode(csr_der),
+    }))
+    .expect("deserialize finalization package")
+}
+
+fn csr_der_for_sans(key_pair: &rcgen::KeyPair, sans: Vec<rcgen::SanType>) -> Vec<u8> {
+    let mut params = rcgen::CertificateParams::default();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params.subject_alt_names = sans;
+    params
+        .serialize_request(key_pair)
+        .expect("serialize csr")
+        .der()
+        .as_ref()
+        .to_vec()
+}
+
+fn dns_san(name: &str) -> rcgen::SanType {
+    rcgen::SanType::DnsName(rcgen::string::Ia5String::try_from(name).expect("dns san"))
+}
+
+/// Strong preflight rejects every class of unusable package with the same
+/// fixed diagnostic and never regenerates material.
+#[test]
+fn finalization_preflight_rejects_malformed_and_mismatched_packages() {
+    use base64::Engine as _;
+
+    let domains = vec!["example.com".to_string()];
+    let good = AcmeOrderFinalization::generate(&domains).expect("generate");
+    good.validate(&domains).expect("generated package validates");
+    good.csr_der(&domains).expect("generated csr decodes");
+
+    // Malformed PEM that is non-empty but not a private key.
+    let malformed_pem = package_from_key_and_csr(
+        "-----BEGIN PRIVATE KEY-----\nnot-a-key\n-----END PRIVATE KEY-----\n".to_string(),
+        good.csr_der(&domains).expect("csr"),
+    );
+    assert_unusable_without_disclosure(
+        &malformed_pem
+            .validate(&domains)
+            .expect_err("malformed PEM"),
+    );
+
+    // Well-base64-encoded trailing DER after a complete CSR.
+    let mut trailing = good.csr_der(&domains).expect("csr");
+    trailing.push(0x00);
+    let trailing_der = package_from_key_and_csr(good.key_pem().to_string(), trailing);
+    assert_unusable_without_disclosure(
+        &trailing_der
+            .validate(&domains)
+            .expect_err("trailing DER"),
+    );
+
+    // Invalid CSR proof-of-possession signature (flip a byte in the DER).
+    let mut tampered = good.csr_der(&domains).expect("csr");
+    let last = tampered.last_mut().expect("csr bytes");
+    *last ^= 0x01;
+    let bad_sig = package_from_key_and_csr(good.key_pem().to_string(), tampered);
+    assert_unusable_without_disclosure(
+        &bad_sig.validate(&domains).expect_err("bad CSR signature"),
+    );
+
+    // Private key / CSR public key mismatch.
+    let other_key = rcgen::KeyPair::generate().expect("other key");
+    let mismatched = package_from_key_and_csr(
+        other_key.serialize_pem(),
+        good.csr_der(&domains).expect("csr"),
+    );
+    assert_unusable_without_disclosure(
+        &mismatched
+            .validate(&domains)
+            .expect_err("mismatched key/CSR"),
+    );
+
+    let key = rcgen::KeyPair::generate().expect("key");
+
+    // Wrong SAN set.
+    let wrong = package_from_key_and_csr(
+        key.serialize_pem(),
+        csr_der_for_sans(&key, vec![dns_san("other.example")]),
+    );
+    assert_unusable_without_disclosure(
+        &wrong.validate(&domains).expect_err("wrong SAN"),
+    );
+
+    // Extra SAN.
+    let extra = package_from_key_and_csr(
+        key.serialize_pem(),
+        csr_der_for_sans(
+            &key,
+            vec![dns_san("example.com"), dns_san("extra.example")],
+        ),
+    );
+    assert_unusable_without_disclosure(
+        &extra.validate(&domains).expect_err("extra SAN"),
+    );
+
+    // Missing SAN (empty SAN extension).
+    let missing = package_from_key_and_csr(
+        key.serialize_pem(),
+        csr_der_for_sans(&key, Vec::new()),
+    );
+    assert_unusable_without_disclosure(
+        &missing.validate(&domains).expect_err("missing SAN"),
+    );
+
+    // Duplicate DNS SAN.
+    let duplicate = package_from_key_and_csr(
+        key.serialize_pem(),
+        csr_der_for_sans(
+            &key,
+            vec![dns_san("example.com"), dns_san("example.com")],
+        ),
+    );
+    assert_unusable_without_disclosure(
+        &duplicate
+            .validate(&domains)
+            .expect_err("duplicate DNS SAN"),
+    );
+
+    // Non-DNS SAN.
+    let non_dns = package_from_key_and_csr(
+        key.serialize_pem(),
+        csr_der_for_sans(
+            &key,
+            vec![
+                dns_san("example.com"),
+                rcgen::SanType::IpAddress(std::net::IpAddr::from([127, 0, 0, 1])),
+            ],
+        ),
+    );
+    assert_unusable_without_disclosure(
+        &non_dns.validate(&domains).expect_err("non-DNS SAN"),
+    );
+
+    // Wildcard domains are exact-match values, not expanded.
+    let wild_domains = vec!["*.example.com".to_string()];
+    let wild = AcmeOrderFinalization::generate(&wild_domains).expect("wildcard package");
+    wild.validate(&wild_domains)
+        .expect("wildcard package validates against itself");
+    assert_unusable_without_disclosure(
+        &wild
+            .validate(&["example.com".to_string()])
+            .expect_err("wildcard is not equivalent to the apex"),
     );
 }

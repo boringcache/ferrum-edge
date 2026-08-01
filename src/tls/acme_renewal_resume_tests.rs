@@ -498,7 +498,9 @@ async fn finalization_material_survives_store_reopen_and_takeover() {
     let order = OrderSpec::http01().build();
     let seeded = order.finalization.clone().expect("seeded material");
     let expected_key = seeded.key_pem().to_string();
-    let expected_csr = seeded.csr_der().expect("decodable csr");
+    let expected_csr = seeded
+        .csr_der(&["example.com".to_string()])
+        .expect("decodable csr");
     let fixture = fixture_with(Some(order), Some(issued_certificate(None)), true);
 
     // Reopened from scratch, as a successor process would.
@@ -506,7 +508,9 @@ async fn finalization_material_survives_store_reopen_and_takeover() {
     let reread = reopened.get_order(ORDER_ID).expect("order survives reopen");
     let persisted = reread.finalization.expect("material survives reopen");
     assert_eq!(persisted.key_pem(), expected_key);
-    let persisted_csr = persisted.csr_der().expect("decodable csr");
+    let persisted_csr = persisted
+        .csr_der(&["example.com".to_string()])
+        .expect("decodable csr");
     assert_eq!(persisted_csr, expected_csr);
 
     // And the successor that wins the expired claim is handed the same material
@@ -514,7 +518,9 @@ async fn finalization_material_survives_store_reopen_and_takeover() {
     let resumed = expect_resume(plan_after_claim(&fixture).await);
     let material = resumed.finalization.expect("takeover carries the material");
     assert_eq!(material.key_pem(), expected_key);
-    let resumed_csr = material.csr_der().expect("decodable csr");
+    let resumed_csr = material
+        .csr_der(&["example.com".to_string()])
+        .expect("decodable csr");
     assert_eq!(resumed_csr, expected_csr);
 }
 

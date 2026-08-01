@@ -829,8 +829,12 @@ order with the CA:
   finalizes with the persisted CSR and publishes against the persisted key.
 - **Completion follows the CA's current state, not Ferrum's last-persisted one.**
   The order is re-fetched from the directory after the account is restored, and:
-  - `pending` — non-valid challenges are set ready and the order is polled to
-    `ready` under `FERRUM_ACME_RENEW_POLL_TIMEOUT_SECONDS`, then finalized once;
+  - `pending` — each challenge endpoint is validated; a challenge that is still
+    `pending` is notified ready once, while a challenge already `processing` or
+    `valid` is left alone (a crashed holder can leave the order pending with a
+    challenge already in flight), an `invalid` challenge fails closed, and the
+    order is polled to `ready` under `FERRUM_ACME_RENEW_POLL_TIMEOUT_SECONDS`,
+    then finalized once;
   - `ready` — exactly one finalize request is sent, carrying the persisted CSR;
     no key or CSR is ever generated at this point;
   - `processing` — the crashed renewer's finalize already landed, so **no second
@@ -841,7 +845,12 @@ order with the CA:
   - `invalid`, or an unusable/malformed state, fails closed.
 - **Missing or corrupt material fails closed.** A resumable order that no longer
   carries a usable key/CSR is not completed, not replaced with a second CA
-  order, and never re-keyed after the fact. It fails with a fixed diagnostic that
+  order, and never re-keyed after the fact. Usability is checked before any
+  directory request: the private key must parse, the CSR DER must consume its
+  entire input and verify its proof-of-possession signature, the private-key
+  public SPKI must match the CSR SPKI, and the CSR DNS SAN set must exactly
+  match the order's normalized domains (including wildcards; non-DNS SANs and
+  duplicate/ambiguous names fail closed). It fails with a fixed diagnostic that
   names the order id and nothing about the material, before the DNS-01 hook or
   any directory request runs, and the record is left intact for inspection. The
   key, the CSR, the account credentials, the challenge token, and the key

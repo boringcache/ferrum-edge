@@ -19,8 +19,8 @@ use super::{AdminState, PaginationParams};
 use crate::tls::acme::{AcmeCertificateRecord, AcmeError, AcmeIssuedCertificateInput};
 #[cfg(feature = "acme")]
 use crate::tls::acme::{
-    AcmeDns01ChallengeRecord, AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput, AcmeOrderRecord,
-    AcmeOrderStatus, AcmeTlsAlpn01ChallengeRecord,
+    AcmeDns01ChallengeRecord, AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput, AcmeOrderFinalization,
+    AcmeOrderRecord, AcmeOrderStatus, AcmeTlsAlpn01ChallengeRecord,
 };
 use crate::tls::managed::{ManagedTlsError, ManagedTlsMaterialKind, ManagedTlsRecord};
 
@@ -724,12 +724,17 @@ pub(super) async fn handle_finalize_acme_order(
         // content-free one: this is private-key/CSR material, so the response
         // must not describe what was found. Nothing here regenerates material —
         // a replacement key cannot match a certificate the CA may already be
-        // issuing against the original CSR.
-        let Some(finalization) = order.finalization.clone() else {
-            return Ok(super::json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": "ACME order finalization material is missing or unusable"}),
-            ));
+        // issuing against the original CSR. Structurally corrupt `Some(...)`
+        // is the same 400 as missing material, and both stop before dns-cache,
+        // account restore, or directory work.
+        let finalization = match acme_order_finalization_for_finalize(&order) {
+            Ok(finalization) => finalization,
+            Err(message) => {
+                return Ok(super::json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": message}),
+                ));
+            }
         };
 
         let dns_cache = match acme_dns_cache(state) {
@@ -747,6 +752,7 @@ pub(super) async fn handle_finalize_acme_order(
                 account_credentials_json,
             ),
             order_url: order_url.clone(),
+            domains: order.domains.clone(),
             poll_timeout: Duration::from_secs(
                 request.poll_timeout_seconds.unwrap_or(60).clamp(1, 600),
             ),
@@ -2316,6 +2322,25 @@ fn acme_finalize_certificate_id(
     Ok(order.id.clone())
 }
 
+/// Resolve usable finalization material for Admin finalize, or the fixed
+/// content-free 400 diagnostic used for both missing and corrupt packages.
+///
+/// Runs before dns-cache / account / directory work so a structurally corrupt
+/// `Some(...)` cannot become a 502 from a later network step.
+#[cfg(feature = "acme")]
+fn acme_order_finalization_for_finalize(
+    order: &AcmeOrderRecord,
+) -> Result<AcmeOrderFinalization, &'static str> {
+    const MESSAGE: &str = "ACME order finalization material is missing or unusable";
+    let Some(finalization) = order.finalization.as_ref() else {
+        return Err(MESSAGE);
+    };
+    finalization
+        .validate(&order.domains)
+        .map_err(|_| MESSAGE)?;
+    Ok(finalization.clone())
+}
+
 /// Record an order's terminal failure. Best effort: the caller is already
 /// returning the underlying failure to the operator, so a store problem here
 /// must not replace that diagnostic — but it is offloaded like every other
@@ -2614,5 +2639,69 @@ mod tests {
         );
         assert_eq!(record.account_id.as_deref(), Some("account-1"));
         assert!(overwrite);
+    }
+
+    #[cfg(feature = "acme")]
+    fn sample_finalize_order(
+        finalization: Option<AcmeOrderFinalization>,
+        domains: Vec<String>,
+    ) -> AcmeOrderRecord {
+        let mut order = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+            id: "edge-order".to_string(),
+            certificate_id: Some("edge-cert".to_string()),
+            domains: domains.clone(),
+            directory_url: "https://acme.example/directory".to_string(),
+            account_id: None,
+            account_credentials_json: None,
+            order_url: Some("https://acme.example/order/1".to_string()),
+            status: AcmeOrderStatus::PendingChallenges,
+            http01_challenges: Vec::new(),
+            tls_alpn01_challenges: Vec::new(),
+            dns01_challenges: Vec::new(),
+            finalization: None,
+            error: None,
+        })
+        .expect("order");
+        order.finalization = finalization;
+        order.domains = domains;
+        order
+    }
+
+    #[cfg(feature = "acme")]
+    #[test]
+    fn acme_finalize_preflight_accepts_usable_material_and_rejects_missing_or_corrupt() {
+        let domains = vec!["example.com".to_string()];
+        let usable = AcmeOrderFinalization::generate(&domains).expect("generate");
+        let accepted = acme_order_finalization_for_finalize(&sample_finalize_order(
+            Some(usable.clone()),
+            domains.clone(),
+        ))
+        .expect("usable material");
+        assert_eq!(accepted.key_pem(), usable.key_pem());
+
+        let missing = acme_order_finalization_for_finalize(&sample_finalize_order(
+            None,
+            domains.clone(),
+        ))
+        .expect_err("missing material");
+        assert_eq!(
+            missing,
+            "ACME order finalization material is missing or unusable"
+        );
+
+        let corrupt: AcmeOrderFinalization = serde_json::from_value(serde_json::json!({
+            "key_pem": "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n",
+            "csr_der_base64": "!!!not-base64!!!",
+        }))
+        .expect("deserialize");
+        // Bypass store validation: build the record field directly.
+        let mut order = sample_finalize_order(Some(usable), domains);
+        order.finalization = Some(corrupt);
+        let rejected = acme_order_finalization_for_finalize(&order).expect_err("corrupt");
+        assert_eq!(rejected, missing);
+        assert!(
+            !rejected.contains("PRIVATE KEY") && !rejected.contains("not-base64"),
+            "admin preflight must stay content-free: {rejected}"
+        );
     }
 }
