@@ -153,9 +153,8 @@ fn gemini_stream_generate_content_usage_metadata_is_authoritative() {
 
 #[test]
 fn gemini_stream_without_usage_metadata_is_unmetered() {
-    let body = sse(&[
-        &json!({"candidates": [{"content": {"parts": [{"text": "hello"}]}}]}).to_string(),
-    ]);
+    let body =
+        sse(&[&json!({"candidates": [{"content": {"parts": [{"text": "hello"}]}}]}).to_string()]);
     let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
     extractor.push(&body);
     extractor.finish();
@@ -192,9 +191,7 @@ fn tgi_generate_stream_final_details_are_extracted() {
 fn tgi_empty_prefill_is_not_a_prompt_count_of_zero() {
     // TGI omits input details unless asked; an empty `prefill` array must not
     // be read as "0 prompt tokens" or a large prompt would be charged nothing.
-    let body = sse(&[
-        &json!({"details": {"generated_tokens": 9, "prefill": []}}).to_string(),
-    ]);
+    let body = sse(&[&json!({"details": {"generated_tokens": 9, "prefill": []}}).to_string()]);
     assert_eq!(
         extract(UsageStreamFormat::Sse, &[&body], "prompt_tokens"),
         None
@@ -207,15 +204,13 @@ fn tgi_empty_prefill_is_not_a_prompt_count_of_zero() {
 
 #[test]
 fn tgi_prefill_tokens_supply_the_prompt_count() {
-    let body = sse(&[
-        &json!({
-            "details": {
-                "generated_tokens": 4,
-                "prefill": [{"id": 1, "text": "a"}, {"id": 2, "text": "b"}, {"id": 3, "text": "c"}]
-            }
-        })
-        .to_string(),
-    ]);
+    let body = sse(&[&json!({
+        "details": {
+            "generated_tokens": 4,
+            "prefill": [{"id": 1, "text": "a"}, {"id": 2, "text": "b"}, {"id": 3, "text": "c"}]
+        }
+    })
+    .to_string()]);
     assert_eq!(
         extract(UsageStreamFormat::Sse, &[&body], "prompt_tokens"),
         Some(3)
@@ -257,7 +252,11 @@ fn bedrock_invoke_model_stream_invocation_metrics_are_extracted() {
     })));
 
     assert_eq!(
-        extract(UsageStreamFormat::AwsEventStream, &[&stream], "total_tokens"),
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&stream],
+            "total_tokens"
+        ),
         Some(43)
     );
     assert_eq!(
@@ -278,7 +277,11 @@ fn bedrock_converse_stream_metadata_usage_is_extracted() {
     .unwrap();
     let stream = event_stream_message(b"\x00\x00\x00\x00", &payload);
     assert_eq!(
-        extract(UsageStreamFormat::AwsEventStream, &[&stream], "total_tokens"),
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&stream],
+            "total_tokens"
+        ),
         Some(11)
     );
 }
@@ -405,9 +408,8 @@ fn sse_events_split_across_chunk_boundaries_are_reassembled() {
 #[test]
 fn terminal_event_without_trailing_newline_is_still_applied() {
     let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
-    extractor.push(
-        br#"data: {"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
-    );
+    extractor
+        .push(br#"data: {"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#);
     assert!(!extractor.usage().observed(), "not applied before finish");
     extractor.finish();
     assert_eq!(extractor.usage().total_for_mode("total_tokens"), Some(2));
@@ -444,10 +446,8 @@ fn configured_provider_still_sees_the_native_terminal_signal() {
     let stream = bedrock_invoke_chunk(json!({
         "amazon-bedrock-invocationMetrics": {"inputTokenCount": 7, "outputTokenCount": 7}
     }));
-    let mut extractor = UsageStreamExtractor::new(
-        UsageStreamFormat::AwsEventStream,
-        Some(AiProvider::Google),
-    );
+    let mut extractor =
+        UsageStreamExtractor::new(UsageStreamFormat::AwsEventStream, Some(AiProvider::Google));
     extractor.push(&stream);
     extractor.finish();
     assert_eq!(extractor.usage().total_for_mode("total_tokens"), Some(14));

@@ -468,6 +468,7 @@ impl UsageStreamExtractor {
         let Ok(inner) = serde_json::from_slice::<Value>(&decoded) else {
             return;
         };
-        self.usage.apply_event_json(&inner, self.configured_provider);
+        self.usage
+            .apply_event_json(&inner, self.configured_provider);
     }
 }

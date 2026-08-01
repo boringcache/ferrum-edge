@@ -2343,10 +2343,8 @@ impl Plugin for AiRateLimiter {
             // out-of-order completions). `None` in Redis mode — harmless, the
             // Redis reconciliation path ignores it.
             if let Some(reservation_id) = outcome.reservation_id {
-                ctx.metadata.insert(
-                    self.keys.reservation_id.clone(),
-                    reservation_id.to_string(),
-                );
+                ctx.metadata
+                    .insert(self.keys.reservation_id.clone(), reservation_id.to_string());
             }
             // Carry the Redis window this reservation credited so reconciliation
             // debits the SAME window even across a rollover (centralized mode).
@@ -2480,7 +2478,10 @@ impl Plugin for AiRateLimiter {
         // `reconcile_usage`, which charges the actual provider tokens (or releases
         // the reservation on a non-2xx federation response).
         if ctx.metadata.contains_key("ai_federation_provider") {
-            if !ctx.metadata.contains_key(&self.keys.federation_tokens_recorded) {
+            if !ctx
+                .metadata
+                .contains_key(&self.keys.federation_tokens_recorded)
+            {
                 let actual_tokens = self.read_tokens_from_metadata(&ctx.metadata);
                 // Reconcile against the federation provider's ORIGINAL synthetic
                 // status, not the current after_proxy status. `ai_federation`

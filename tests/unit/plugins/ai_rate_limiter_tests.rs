@@ -5963,7 +5963,11 @@ async fn run_expose_header_lifecycle(
         response_headers
             .get("x-ai-ratelimit-remaining")
             .map(String::as_str),
-        Some(scoped_meta(&ctx, "ai_ratelimit_remaining").unwrap().as_str())
+        Some(
+            scoped_meta(&ctx, "ai_ratelimit_remaining")
+                .unwrap()
+                .as_str()
+        )
     );
     assert_eq!(
         response_headers
@@ -6534,8 +6538,7 @@ async fn framed_grpc_web_response_is_not_charged_as_json_usage() {
         "a framed gRPC-Web body must never be reconciled as provider-reported usage"
     );
     assert_eq!(
-        scoped_meta(&ctx, "ai_ratelimit_unmetered_action")
-            .map(String::as_str),
+        scoped_meta(&ctx, "ai_ratelimit_unmetered_action").map(String::as_str),
         Some("charge_estimate"),
         "framed gRPC-Web must take the unmetered policy path, not JSON usage extract"
     );
@@ -6568,8 +6571,7 @@ async fn ordinary_json_and_sse_responses_remain_eligible() {
             .await,
     );
     assert_eq!(
-        scoped_meta(&ctx, "ai_ratelimit_actual_tokens")
-            .map(String::as_str),
+        scoped_meta(&ctx, "ai_ratelimit_actual_tokens").map(String::as_str),
         Some("700"),
         "an ordinary JSON usage block must still be charged"
     );
@@ -6595,8 +6597,7 @@ async fn ordinary_json_and_sse_responses_remain_eligible() {
             .await,
     );
     assert_eq!(
-        scoped_meta(&sse_ctx, "ai_ratelimit_actual_tokens")
-            .map(String::as_str),
+        scoped_meta(&sse_ctx, "ai_ratelimit_actual_tokens").map(String::as_str),
         Some("15"),
         "SSE usage extraction must be unchanged"
     );
@@ -6717,7 +6718,11 @@ async fn a_release_by_one_instance_does_not_suppress_its_sibling() {
     assert!(observed_usage(&second).await > 0);
 
     let mut response_headers = HashMap::new();
-    assert_continue(first.after_proxy(&mut ctx, 502, &mut response_headers).await);
+    assert_continue(
+        first
+            .after_proxy(&mut ctx, 502, &mut response_headers)
+            .await,
+    );
     assert!(instance_released(&first, &ctx));
     assert!(
         !instance_released(&second, &ctx),
@@ -6746,7 +6751,11 @@ async fn a_repeated_release_pass_is_idempotent_per_instance() {
     // `after_proxy` release, a buffered body pass, and a gateway-rejection
     // re-run of `after_proxy`.
     let mut response_headers = HashMap::new();
-    assert_continue(plugin.after_proxy(&mut ctx, 502, &mut response_headers).await);
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 502, &mut response_headers)
+            .await,
+    );
     assert_continue(
         plugin
             .on_response_body(&mut ctx, 502, &mut response_headers, b"")
@@ -6754,7 +6763,11 @@ async fn a_repeated_release_pass_is_idempotent_per_instance() {
     );
     ctx.metadata
         .insert("ferrum:rejection_response".to_string(), "true".to_string());
-    assert_continue(plugin.after_proxy(&mut ctx, 500, &mut response_headers).await);
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 500, &mut response_headers)
+            .await,
+    );
 
     assert_eq!(
         observed_usage(&plugin).await,
@@ -6794,9 +6807,8 @@ async fn mixed_backend_instances_do_not_share_a_reservation_backend() {
         "the centralized instance must not overwrite the local reservation"
     );
     assert!(
-        !ctx.metadata.contains_key(
-            &centralized.metadata_key_for_test("ai_ratelimit_reserved_window_index")
-        ),
+        !ctx.metadata
+            .contains_key(&centralized.metadata_key_for_test("ai_ratelimit_reserved_window_index")),
         "no Redis window index may be recorded for a refused admission"
     );
 }
@@ -6828,14 +6840,22 @@ async fn exposed_header_metadata_is_instance_owned() {
     // order wins), but each instance publishes a self-consistent set rather
     // than an interleaving of two budgets.
     let mut response_headers = HashMap::new();
-    assert_continue(small.after_proxy(&mut ctx, 200, &mut response_headers).await);
+    assert_continue(
+        small
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+    );
     assert_eq!(
         response_headers
             .get("x-ai-ratelimit-limit")
             .map(String::as_str),
         Some("1000")
     );
-    assert_continue(large.after_proxy(&mut ctx, 200, &mut response_headers).await);
+    assert_continue(
+        large
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+    );
     assert_eq!(
         response_headers
             .get("x-ai-ratelimit-limit")
@@ -6997,7 +7017,10 @@ async fn bedrock_event_stream_is_charged_from_invocation_metrics() {
     .await;
 
     assert!(inspected);
-    assert_eq!(forwarded, message, "event-stream bytes are forwarded intact");
+    assert_eq!(
+        forwarded, message,
+        "event-stream bytes are forwarded intact"
+    );
     assert_eq!(observed_usage(&plugin).await, 43);
 }
 
@@ -7103,7 +7126,11 @@ async fn streamed_response_without_terminal_usage_releases_under_warn() {
     )
     .await;
 
-    assert_eq!(observed_usage(&plugin).await, 0, "warn releases the estimate");
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "warn releases the estimate"
+    );
     assert!(instance_released(&plugin, &ctx));
 }
 
@@ -7138,7 +7165,11 @@ async fn reject_mode_keeps_the_charge_on_a_committed_stream() {
     let mut response_headers = HashMap::new();
     ctx.metadata
         .insert("ferrum:rejection_response".to_string(), "true".to_string());
-    assert_continue(plugin.after_proxy(&mut ctx, 500, &mut response_headers).await);
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 500, &mut response_headers)
+            .await,
+    );
     assert_eq!(observed_usage(&plugin).await, reserved);
 }
 
@@ -7152,9 +7183,8 @@ async fn client_disconnect_mid_stream_still_charges_the_partial_usage() {
 
     // Anthropic reports input tokens up front; the client leaves before the
     // terminal `message_delta`.
-    let start = sse_frame(
-        json!({"type": "message_start", "message": {"usage": {"input_tokens": 77}}}),
-    );
+    let start =
+        sse_frame(json!({"type": "message_start", "message": {"usage": {"input_tokens": 77}}}));
     drive_stream(
         &plugin,
         &mut ctx,
@@ -7233,7 +7263,11 @@ async fn non_ai_and_non_meterable_streams_attach_no_inspector() {
     let mut ai = ai_request_ctx(100, "hello");
     let mut ai_headers = HashMap::new();
     assert_continue(plugin.before_proxy(&mut ai, &mut ai_headers).await);
-    for content_type in ["application/json", "text/plain", "application/grpc-web+json"] {
+    for content_type in [
+        "application/json",
+        "text/plain",
+        "application/grpc-web+json",
+    ] {
         assert!(
             create_response_stream_inspector(&chain, &mut ai, 200, Some(content_type)).is_none(),
             "{content_type} is not an incrementally meterable representation"
