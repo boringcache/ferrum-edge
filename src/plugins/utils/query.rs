@@ -45,8 +45,14 @@ const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
 /// is an unambiguous encoded plus. Normalize only raw `+` before percent-
 /// decoding so `%2B` stays literal plus.
 fn decode_form_urlencoded_component_for_hpp(raw: &str) -> String {
-    let with_spaces = raw.replace('+', " ");
-    percent_decode_str(&with_spaces)
+    let normalized;
+    let component = if raw.as_bytes().contains(&b'+') {
+        normalized = raw.replace('+', " ");
+        normalized.as_str()
+    } else {
+        raw
+    };
+    percent_decode_str(component)
         .decode_utf8_lossy()
         .into_owned()
 }
