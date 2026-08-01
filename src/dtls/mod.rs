@@ -1720,7 +1720,7 @@ pub(crate) fn load_dtls_certificate_with_key_drop_hook(
     // owned DER allocation that ring drops without clearing.
     let borrowed_key = key_der.private_key_der();
     let signing_key =
-        rustls::crypto::ring::sign::any_supported_type(&borrowed_key).map_err(|error| {
+        crate::fips::any_supported_signing_key(&borrowed_key).map_err(|error| {
             anyhow::anyhow!(
                 "DTLS certificate {} and private key {} do not form a valid pair: {error}",
                 cert_material.display_source_id,
@@ -2197,7 +2197,7 @@ mod tests {
     #[tokio::test]
     async fn dtls_backend_handshake_honors_connect_timeout_ms() {
         let _ = rustls::crypto::CryptoProvider::install_default(
-            rustls::crypto::ring::default_provider(),
+            crate::fips::base_crypto_provider(),
         );
 
         // Black-hole peer: bind a UDP socket that never replies. The client

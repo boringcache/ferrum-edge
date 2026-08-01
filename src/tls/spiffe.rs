@@ -91,7 +91,7 @@ pub fn build_spiffe_inbound_config(
     if snapshot.is_none() {
         return Err(SpiffeTlsError::NoSvid);
     }
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(crate::fips::base_crypto_provider());
     let builder = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| SpiffeTlsError::Rustls(e.to_string()))?;
@@ -176,7 +176,7 @@ pub fn build_spiffe_outbound_config(
     if bundle_slot.load_full().is_none() {
         return Err(SpiffeTlsError::NoSvid);
     }
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(crate::fips::base_crypto_provider());
     let builder = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| SpiffeTlsError::Rustls(e.to_string()))?;
@@ -299,7 +299,7 @@ impl SpiffeClientCertVerifier {
             slot,
             peer_required,
             crls,
-            schemes: rustls::crypto::ring::default_provider()
+            schemes: crate::fips::base_crypto_provider()
                 .signature_verification_algorithms
                 .supported_schemes(),
             peer_verifier_cache: ArcSwap::new(Arc::new(None)),
@@ -354,7 +354,7 @@ impl rustls::server::danger::ClientCertVerifier for SpiffeClientCertVerifier {
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &crate::fips::base_crypto_provider().signature_verification_algorithms,
         )
     }
 
@@ -368,7 +368,7 @@ impl rustls::server::danger::ClientCertVerifier for SpiffeClientCertVerifier {
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &crate::fips::base_crypto_provider().signature_verification_algorithms,
         )
     }
 
@@ -414,7 +414,7 @@ impl SpiffeServerCertVerifier {
             expected_peer,
             expected_trust_domain,
             crls,
-            schemes: rustls::crypto::ring::default_provider()
+            schemes: crate::fips::base_crypto_provider()
                 .signature_verification_algorithms
                 .supported_schemes(),
             peer_verifier_cache: ArcSwap::new(Arc::new(None)),
@@ -464,7 +464,7 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &crate::fips::base_crypto_provider().signature_verification_algorithms,
         )
     }
 
@@ -478,7 +478,7 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &crate::fips::base_crypto_provider().signature_verification_algorithms,
         )
     }
 
@@ -503,7 +503,7 @@ fn certified_key_from_bundle(bundle: &SvidBundle) -> Result<rustls::sign::Certif
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
         bundle.private_key_pkcs8_der.to_vec(),
     ));
-    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+    let signing_key = crate::fips::any_supported_signing_key(&key)
         .map_err(|e| format!("ring sign init failed: {e}"))?;
     Ok(rustls::sign::CertifiedKey::new(chain, signing_key))
 }
@@ -725,7 +725,7 @@ fn build_peer_chain_verifier(
     // is the desired behavior for both inbound and outbound mesh peers.
     let mut builder = WebPkiClientVerifier::builder_with_provider(
         Arc::new(roots),
-        Arc::new(rustls::crypto::ring::default_provider()),
+        Arc::new(crate::fips::base_crypto_provider()),
     );
     // Mirror the operator-CA mesh path: when CRLs are configured, enforce
     // end-entity revocation for inbound and outbound mesh peers. Empty CRLs

@@ -858,7 +858,7 @@ fn build_client_config(
     // Pin the ring provider explicitly so the channel does not depend on a
     // globally installed default (unit tests build channels without startup).
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
+        crate::fips::base_crypto_provider(),
     ))
     .with_safe_default_protocol_versions()
     .map_err(|_| SmtpFailure::TlsSetup)?

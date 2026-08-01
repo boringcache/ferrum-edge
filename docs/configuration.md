@@ -723,6 +723,8 @@ See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 | `FERRUM_TLS_NO_VERIFY` | No | `false` | Disable outbound TLS verification for all connections (testing only); also bypasses backend SAN allow-list enforcement and logs a warning when an allow-list is configured |
 | `FERRUM_TLS_CRL_FILE_PATH` | No | — | PEM CRL bundle for revocation checks across TLS/DTLS surfaces |
 | `FERRUM_TLS_CRL_SOURCE` | No | — | Source override for `FERRUM_TLS_CRL_FILE_PATH`; accepts path, `file://`, inline PEM, or provider URI |
+| `FERRUM_FIPS_MODE` | No | `off` | FIPS deployment mode: `off` or `enforce`. Fail-closed — `enforce` refuses startup when the build cannot provide the selected validated cryptographic module rather than downgrading. Must be supplied via the environment or `--fips-mode`; a value set only in `ferrum.conf` is refused because the crypto provider is installed before the settings file is read. Ferrum Edge is **not** independently FIPS-certified — see [FIPS mode](fips.md) |
+| `FERRUM_FIPS_REQUIRED_PROVIDER` | No | `aws-lc-fips` | Validated-module integration this deployment requires. `aws-lc-fips` is the only supported value; any other value is refused while FIPS mode is enforced. See [FIPS mode](fips.md) |
 | `FERRUM_TLS_MIN_VERSION` | No | `1.2` | Minimum TLS protocol version, inbound + outbound (`1.2` or `1.3`) |
 | `FERRUM_TLS_MAX_VERSION` | No | `1.3` | Maximum TLS protocol version, inbound + outbound (`1.2` or `1.3`) |
 | `FERRUM_TLS_CIPHER_SUITES` | No | *(secure defaults)* | Comma-separated cipher suites, inbound + outbound (see [TLS Policy Hardening](frontend_tls.md#tls-policy-hardening)) |

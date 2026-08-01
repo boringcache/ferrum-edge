@@ -3154,7 +3154,7 @@ impl Http3Client {
     ///
     /// The `tls_config` must have ALPN protocols set (typically `b"h3"` for HTTP/3).
     /// The crypto provider must be installed before calling this function
-    /// (typically once at application startup via `rustls::crypto::ring::default_provider().install_default()`).
+    /// (typically once at application startup via `crate::fips::base_crypto_provider().install_default()`).
     ///
     /// The optional `h3_config` provides QUIC transport tuning parameters
     /// (stream/connection window sizes, send window). When `None`, uses
@@ -3727,7 +3727,7 @@ mod h3_pool_health_tests {
         // "ring" provider is installed wholesale by the gateway main; in
         // unit tests several test mods may race to install — `_ = ...`
         // ignores the "already installed" return.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = crate::fips::base_crypto_provider().install_default();
     }
 
     fn issue_cert() -> (

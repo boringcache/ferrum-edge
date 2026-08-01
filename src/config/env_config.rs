@@ -2150,6 +2150,21 @@ pub struct EnvConfig {
     /// Default batch limit when no data recorded yet. Default: 6000.
     pub adaptive_batch_limit_default: usize,
 
+    // FIPS deployment mode
+    /// Requested FIPS posture: "off" (default) or "enforce".
+    ///
+    /// This is the *runtime request*. Whether the build can satisfy it is a
+    /// separate question answered by `crate::fips::BUILD_CAPABLE`; an enforce
+    /// request on a build without the validated module fails closed at
+    /// bootstrap rather than downgrading. See `docs/fips.md`.
+    pub fips_mode: String,
+    /// Validated-module integration the operator requires
+    /// (default: `aws-lc-fips`, the only integration Ferrum supports).
+    ///
+    /// Pinning it means a future build that changed integrations cannot
+    /// silently satisfy an existing FIPS deployment contract.
+    pub fips_required_provider: String,
+
     // TLS Hardening
     /// Minimum TLS version: "1.2" or "1.3" (default: "1.2")
     pub tls_min_version: String,
@@ -2869,6 +2884,8 @@ impl Default for EnvConfig {
             adaptive_buffer_max_size: 262_144,
             adaptive_buffer_default_size: 65_536,
             adaptive_batch_limit_default: 6_000,
+            fips_mode: "off".into(),
+            fips_required_provider: crate::fips::SUPPORTED_PROVIDER_ID.into(),
             tls_min_version: "1.2".into(),
             tls_max_version: "1.3".into(),
             tls_cipher_suites: None,
@@ -3336,6 +3353,8 @@ impl EnvConfig {
             adaptive_buffer_max_size: usize = "FERRUM_ADAPTIVE_BUFFER_MAX_SIZE" => 262_144usize, clamp(1024usize, 1_048_576usize);
             adaptive_buffer_default_size: usize = "FERRUM_ADAPTIVE_BUFFER_DEFAULT_SIZE" => 65_536usize, clamp(1024usize, 1_048_576usize);
             adaptive_batch_limit_default: usize = "FERRUM_ADAPTIVE_BATCH_LIMIT_DEFAULT" => 6_000usize, max(1usize);
+            fips_mode: String = "FERRUM_FIPS_MODE" => "off".to_string();
+            fips_required_provider: String = "FERRUM_FIPS_REQUIRED_PROVIDER" => crate::fips::SUPPORTED_PROVIDER_ID.to_string();
             tls_min_version: String = "FERRUM_TLS_MIN_VERSION" => "1.2".to_string();
             tls_max_version: String = "FERRUM_TLS_MAX_VERSION" => "1.3".to_string();
             tls_cipher_suites: Option<String> = "FERRUM_TLS_CIPHER_SUITES";
@@ -3992,6 +4011,8 @@ impl EnvConfig {
             adaptive_buffer_max_size,
             adaptive_buffer_default_size,
             adaptive_batch_limit_default,
+            fips_mode,
+            fips_required_provider,
             tls_min_version,
             tls_max_version,
             tls_cipher_suites,
@@ -5272,6 +5293,25 @@ impl EnvConfig {
                     .to_string(),
             );
         }
+
+        // ── FIPS deployment mode ────────────────────────────────────────
+        //
+        // Two steps, in this order:
+        //
+        // 1. Parse the request. A malformed value is a configuration error, not
+        //    a silent downgrade to non-FIPS.
+        // 2. Reconcile it with the provider bootstrap already installed. The
+        //    process-default crypto provider is chosen before `ferrum.conf` can
+        //    be read, so a request that reaches Ferrum only through the
+        //    settings file arrives too late to select a validated module;
+        //    `verify_resolved_mode` fails closed rather than serving under a
+        //    provider chosen from a stale view of the request.
+        //
+        // The FIPS policy checks themselves then run against the fully resolved
+        // configuration, so `validate` and startup reach the same verdict.
+        let fips_mode = crate::fips::FipsMode::parse(&self.fips_mode)?;
+        crate::fips::verify_resolved_mode(fips_mode)?;
+        crate::fips::policy::check_env_config(self)?;
 
         // Validate TLS version settings
         match self.tls_min_version.as_str() {

@@ -289,7 +289,7 @@ pub(crate) fn temporary_disabled_listener_tls_config() -> Result<Arc<ServerConfi
 
     Ok(Arc::new(
         rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
+            crate::fips::base_crypto_provider(),
         ))
         .with_safe_default_protocol_versions()
         .map_err(|error| anyhow::anyhow!("failed to apply default TLS versions: {error}"))?
@@ -465,18 +465,26 @@ impl TlsPolicy {
             ));
         }
 
+        // The provider this build links (`ring`, or the AWS-LC-FIPS validated
+        // module under `--features fips`). Suites and groups are resolved
+        // *against* it rather than named through a provider-qualified constant
+        // path, so one policy table serves both builds and an algorithm the
+        // active provider does not implement is a configuration error rather
+        // than a silent substitution.
+        let base_provider = crate::fips::base_crypto_provider();
+
         // Build cipher suites
         let cipher_suites = if let Some(ref suites_str) = env_config.tls_cipher_suites {
-            parse_cipher_suites(suites_str)?
+            parse_cipher_suites(suites_str, &base_provider)?
         } else {
-            default_cipher_suites()
+            default_cipher_suites(&base_provider)?
         };
 
         // Build key exchange groups
         let kx_groups = if let Some(ref curves_str) = env_config.tls_curves {
-            parse_kx_groups(curves_str)?
+            parse_kx_groups(curves_str, &base_provider)?
         } else {
-            default_kx_groups()
+            default_kx_groups(&base_provider)?
         };
 
         // Log the TLS policy
@@ -505,7 +513,6 @@ impl TlsPolicy {
         );
 
         // Build custom CryptoProvider
-        let base_provider = rustls::crypto::ring::default_provider();
         let provider = CryptoProvider {
             cipher_suites,
             kx_groups,
@@ -524,79 +531,164 @@ impl TlsPolicy {
             16_384 // aspirational TCP TLS size; not a QUIC TLS byte cap
         };
 
-        Ok(Self {
+        let policy = Self {
             protocol_versions: versions,
             crypto_provider: Arc::new(provider),
             prefer_server_cipher_order: env_config.tls_prefer_server_cipher_order,
             session_cache_size: env_config.tls_session_cache_size,
             early_data_max_size,
-        })
+        };
+
+        // Last gate before any listener or backend client is built from this
+        // policy. Every Ferrum-owned rustls configuration derives from a
+        // `TlsPolicy`, so screening here covers frontend, admin, backend,
+        // CP/DP, mesh, and HTTP/3 alike — including after a live reload, which
+        // rebuilds through this same constructor.
+        crate::fips::policy::check_tls_policy(&policy).map_err(|e| anyhow::anyhow!(e))?;
+
+        Ok(policy)
     }
 }
 
-/// Default secure cipher suites (TLS 1.3 + TLS 1.2 AEAD-only).
+/// Preference-ordered default cipher suites for an ordinary (non-FIPS) build.
 ///
 /// Prefer AES-128-GCM before AES-256-GCM. AES-128-GCM, AES-256-GCM, and
 /// ChaCha20-Poly1305 are modern AEAD suites; the default order favors cheaper
 /// record processing while keeping AES-256 available for peers/operators that
 /// require it.
-fn default_cipher_suites() -> Vec<rustls::SupportedCipherSuite> {
-    vec![
-        // TLS 1.3
-        rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256,
-        rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384,
-        rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
-        // TLS 1.2
-        rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-        rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-        rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-        rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-        rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-        rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-    ]
+const DEFAULT_CIPHER_SUITE_ORDER: &[rustls::CipherSuite] = &[
+    // TLS 1.3
+    rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
+    rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+    rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+    // TLS 1.2
+    rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+    rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+    rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+    rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+    rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+];
+
+/// Preference-ordered default key-exchange groups for an ordinary build.
+const DEFAULT_KX_GROUP_ORDER: &[rustls::NamedGroup] =
+    &[rustls::NamedGroup::X25519, rustls::NamedGroup::secp256r1];
+
+/// Default secure cipher suites, resolved against the active provider.
+///
+/// While FIPS mode is enforced the defaults narrow to the approved AEAD set
+/// (`crate::fips::policy::FIPS_DEFAULT_CIPHER_SUITES`), which drops
+/// ChaCha20-Poly1305. Taking the ordinary defaults there would make a
+/// default-configured FIPS gateway fail its own admission check at startup —
+/// correct, but a needlessly hostile first experience for a configuration the
+/// operator never wrote.
+fn default_cipher_suites(
+    provider: &CryptoProvider,
+) -> Result<Vec<rustls::SupportedCipherSuite>, anyhow::Error> {
+    let preferred = if crate::fips::is_enforcing() {
+        crate::fips::policy::FIPS_DEFAULT_CIPHER_SUITES
+    } else {
+        DEFAULT_CIPHER_SUITE_ORDER
+    };
+    let suites: Vec<rustls::SupportedCipherSuite> = preferred
+        .iter()
+        .filter_map(|id| lookup_cipher_suite(provider, *id))
+        .collect();
+    if suites.is_empty() {
+        return Err(anyhow::anyhow!(
+            "the active crypto provider implements none of Ferrum's default cipher suites; this \
+             indicates a build whose crypto features are inconsistent"
+        ));
+    }
+    Ok(suites)
 }
 
-/// Default key exchange groups.
-fn default_kx_groups() -> Vec<&'static dyn rustls::crypto::SupportedKxGroup> {
-    vec![
-        rustls::crypto::ring::kx_group::X25519,
-        rustls::crypto::ring::kx_group::SECP256R1,
-    ]
+/// Default key exchange groups, resolved against the active provider.
+///
+/// While FIPS mode is enforced the defaults narrow to P-256/P-384: ECDH over
+/// Curve25519 is not an approved SP 800-56A scheme, so X25519 cannot be a FIPS
+/// default even though it is Ferrum's ordinary first preference.
+fn default_kx_groups(
+    provider: &CryptoProvider,
+) -> Result<Vec<&'static dyn rustls::crypto::SupportedKxGroup>, anyhow::Error> {
+    let preferred = if crate::fips::is_enforcing() {
+        crate::fips::policy::FIPS_DEFAULT_KX_GROUPS
+    } else {
+        DEFAULT_KX_GROUP_ORDER
+    };
+    let groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = preferred
+        .iter()
+        .filter_map(|name| lookup_kx_group(provider, *name))
+        .collect();
+    if groups.is_empty() {
+        return Err(anyhow::anyhow!(
+            "the active crypto provider implements none of Ferrum's default key-exchange groups; \
+             this indicates a build whose crypto features are inconsistent"
+        ));
+    }
+    Ok(groups)
+}
+
+/// Find a cipher suite in a provider by its registry identifier.
+///
+/// Ferrum names suites by identifier rather than through a provider-qualified
+/// constant path (`rustls::crypto::ring::cipher_suite::…`) so that one table
+/// serves both the ordinary and the FIPS build. A `None` here means the active
+/// provider does not implement the suite, which callers turn into an explicit
+/// configuration error — never a silent substitution.
+fn lookup_cipher_suite(
+    provider: &CryptoProvider,
+    id: rustls::CipherSuite,
+) -> Option<rustls::SupportedCipherSuite> {
+    provider
+        .cipher_suites
+        .iter()
+        .find(|suite| suite.suite() == id)
+        .copied()
+}
+
+/// Find a key-exchange group in a provider by its named-group identifier.
+fn lookup_kx_group(
+    provider: &CryptoProvider,
+    name: rustls::NamedGroup,
+) -> Option<&'static dyn rustls::crypto::SupportedKxGroup> {
+    provider
+        .kx_groups
+        .iter()
+        .find(|group| group.name() == name)
+        .copied()
 }
 
 /// Parse comma-separated cipher suite names (OpenSSL naming convention) into rustls suites.
-fn parse_cipher_suites(input: &str) -> Result<Vec<rustls::SupportedCipherSuite>, anyhow::Error> {
+fn parse_cipher_suites(
+    input: &str,
+    provider: &CryptoProvider,
+) -> Result<Vec<rustls::SupportedCipherSuite>, anyhow::Error> {
     let mut suites = Vec::new();
     for name in input.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let suite = match name {
+        let id = match name {
             // TLS 1.3
-            "TLS_AES_256_GCM_SHA384" => {
-                rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384
-            }
-            "TLS_AES_128_GCM_SHA256" => {
-                rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
-            }
-            "TLS_CHACHA20_POLY1305_SHA256" => {
-                rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256
-            }
+            "TLS_AES_256_GCM_SHA384" => rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+            "TLS_AES_128_GCM_SHA256" => rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
+            "TLS_CHACHA20_POLY1305_SHA256" => rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
             // TLS 1.2 (OpenSSL naming)
             "ECDHE-ECDSA-AES256-GCM-SHA384" => {
-                rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+                rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
             }
             "ECDHE-RSA-AES256-GCM-SHA384" => {
-                rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+                rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
             }
             "ECDHE-ECDSA-AES128-GCM-SHA256" => {
-                rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+                rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
             }
             "ECDHE-RSA-AES128-GCM-SHA256" => {
-                rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+                rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
             }
             "ECDHE-ECDSA-CHACHA20-POLY1305" => {
-                rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+                rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
             }
             "ECDHE-RSA-CHACHA20-POLY1305" => {
-                rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+                rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
             }
             unknown => {
                 return Err(anyhow::anyhow!(
@@ -608,6 +700,17 @@ fn parse_cipher_suites(input: &str) -> Result<Vec<rustls::SupportedCipherSuite>,
                 ));
             }
         };
+        // A suite Ferrum knows by name but the active provider does not
+        // implement is rejected here rather than dropped. Silently thinning an
+        // operator's explicit suite list is how a FIPS build would end up
+        // negotiating something the operator did not choose.
+        let suite = lookup_cipher_suite(provider, id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cipher suite '{}' is not implemented by this build's crypto provider. See \
+                 docs/fips.md for the suites available in a FIPS build.",
+                name
+            )
+        })?;
         suites.push(suite);
     }
     if suites.is_empty() {
@@ -619,16 +722,14 @@ fn parse_cipher_suites(input: &str) -> Result<Vec<rustls::SupportedCipherSuite>,
 /// Parse comma-separated curve/key-exchange group names.
 fn parse_kx_groups(
     input: &str,
+    provider: &CryptoProvider,
 ) -> Result<Vec<&'static dyn rustls::crypto::SupportedKxGroup>, anyhow::Error> {
     let mut groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = Vec::new();
     for name in input.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let group: &'static dyn rustls::crypto::SupportedKxGroup = match name
-            .to_lowercase()
-            .as_str()
-        {
-            "x25519" => rustls::crypto::ring::kx_group::X25519,
-            "secp256r1" | "p-256" | "p256" => rustls::crypto::ring::kx_group::SECP256R1,
-            "secp384r1" | "p-384" | "p384" => rustls::crypto::ring::kx_group::SECP384R1,
+        let group_name = match name.to_lowercase().as_str() {
+            "x25519" => rustls::NamedGroup::X25519,
+            "secp256r1" | "p-256" | "p256" => rustls::NamedGroup::secp256r1,
+            "secp384r1" | "p-384" | "p384" => rustls::NamedGroup::secp384r1,
             unknown => {
                 return Err(anyhow::anyhow!(
                     "Unknown curve/group '{}'. Supported: X25519, secp256r1 (P-256), secp384r1 (P-384)",
@@ -636,6 +737,13 @@ fn parse_kx_groups(
                 ));
             }
         };
+        let group = lookup_kx_group(provider, group_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Curve/group '{}' is not implemented by this build's crypto provider. See \
+                 docs/fips.md for the groups available in a FIPS build.",
+                name
+            )
+        })?;
         groups.push(group);
     }
     if groups.is_empty() {
@@ -874,7 +982,7 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
     // Stateless tickets (TLS 1.3): server encrypts session state into the ticket,
     // no server-side storage needed. Tickets rotate keys every 6 hours automatically.
     // Stateful cache (TLS 1.2 fallback): configurable LRU for session ID resumption.
-    match rustls::crypto::ring::Ticketer::new() {
+    match crate::fips::ticketer() {
         Ok(ticketer) => {
             config.ticketer = ticketer;
         }
@@ -1271,7 +1379,7 @@ pub fn svid_rotating_mesh_server_identity(
 fn default_crypto_provider() -> Arc<CryptoProvider> {
     CryptoProvider::get_default()
         .cloned()
-        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()))
+        .unwrap_or_else(|| Arc::new(crate::fips::base_crypto_provider()))
 }
 
 /// Borrowed client CA bundle contents paired with their display path.
@@ -1461,7 +1569,7 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
     config.ignore_client_order = tls_policy.prefer_server_cipher_order;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-    match rustls::crypto::ring::Ticketer::new() {
+    match crate::fips::ticketer() {
         Ok(ticketer) => {
             config.ticketer = ticketer;
         }
@@ -1579,7 +1687,7 @@ pub fn backend_client_config_builder(
         None => {
             // Use the ring default provider explicitly so this works even when
             // no global CryptoProvider is installed (e.g., in unit tests).
-            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let provider = Arc::new(crate::fips::base_crypto_provider());
             rustls::ClientConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions()
                 .map_err(|e| anyhow::anyhow!("Failed to set default TLS protocol versions: {}", e))
@@ -1598,7 +1706,7 @@ pub fn build_server_verifier_with_crls(
 ) -> Result<Arc<rustls::client::WebPkiServerVerifier>, anyhow::Error> {
     // Use ring provider explicitly so this works even when no global CryptoProvider
     // is installed (e.g., in unit/integration tests).
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(crate::fips::base_crypto_provider());
     let mut builder =
         rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(root_store), provider);
     if !crls.is_empty() {
@@ -1650,7 +1758,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        crate::fips::base_crypto_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -1837,7 +1945,7 @@ mod tests {
     }
 
     fn ring_provider() -> Arc<CryptoProvider> {
-        Arc::new(rustls::crypto::ring::default_provider())
+        Arc::new(crate::fips::base_crypto_provider())
     }
 
     /// The resolver serves the slot's CURRENT leaf and follows a rotation:
@@ -1917,7 +2025,7 @@ mod tests {
     }
 
     fn new_test_client_config() -> rustls::ClientConfig {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(crate::fips::base_crypto_provider());
         rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .expect("default protocol versions")
@@ -1944,7 +2052,7 @@ mod tests {
             .expect("private key present");
 
         rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
+            crate::fips::base_crypto_provider(),
         ))
         .with_safe_default_protocol_versions()
         .expect("default protocol versions")
@@ -1963,7 +2071,7 @@ mod tests {
     fn apply_client_session_resumption_with_policy() {
         let policy = TlsPolicy {
             protocol_versions: vec![&rustls::version::TLS13],
-            crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
+            crypto_provider: Arc::new(crate::fips::base_crypto_provider()),
             prefer_server_cipher_order: false,
             session_cache_size: 123,
             early_data_max_size: 0,
@@ -2003,7 +2111,7 @@ mod tests {
     fn validate_backend_tls_policy_for_quic_accepts_tls13_defaults() {
         let policy = TlsPolicy {
             protocol_versions: vec![&rustls::version::TLS13],
-            crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
+            crypto_provider: Arc::new(crate::fips::base_crypto_provider()),
             prefer_server_cipher_order: false,
             session_cache_size: 4096,
             early_data_max_size: 0,
@@ -2017,7 +2125,7 @@ mod tests {
     fn validate_backend_tls_policy_for_quic_rejects_tls12_only_policy() {
         let policy = TlsPolicy {
             protocol_versions: vec![&rustls::version::TLS12],
-            crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
+            crypto_provider: Arc::new(crate::fips::base_crypto_provider()),
             prefer_server_cipher_order: false,
             session_cache_size: 4096,
             early_data_max_size: 0,
@@ -2029,10 +2137,14 @@ mod tests {
 
     #[test]
     fn validate_backend_tls_policy_for_quic_rejects_tls12_only_cipher_suites() {
-        let base_provider = rustls::crypto::ring::default_provider();
+        let base_provider = crate::fips::base_crypto_provider();
         let provider = rustls::crypto::CryptoProvider {
             cipher_suites: vec![
-                rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                lookup_cipher_suite(
+                    &base_provider,
+                    rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                )
+                .expect("provider implements ECDHE-RSA-AES256-GCM-SHA384"),
             ],
             kx_groups: base_provider.kx_groups,
             ..base_provider

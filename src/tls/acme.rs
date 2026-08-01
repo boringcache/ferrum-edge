@@ -1768,7 +1768,7 @@ fn build_tls_alpn01_certified_key(
     let cert = params
         .self_signed(&key_pair)
         .map_err(|error| AcmeError::Write(error.to_string()))?;
-    let crypto_provider = rustls::crypto::ring::default_provider();
+    let crypto_provider = crate::fips::base_crypto_provider();
     let signing_key = crypto_provider
         .key_provider
         .load_private_key(
@@ -3208,7 +3208,7 @@ fn validate_completed_certificate_pair(cert_pem: &str, key_pem: &str) -> Result<
     let key = rustls_pemfile::private_key(&mut Cursor::new(key_pem.as_bytes()))
         .map_err(|error| AcmeError::Parse(error.to_string()))?
         .ok_or_else(|| AcmeError::Parse("no PEM private key found".to_string()))?;
-    rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+    rustls::ServerConfig::builder_with_provider(Arc::new(crate::fips::base_crypto_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .map_err(|error| AcmeError::Parse(error.to_string()))?
         .with_no_client_auth()

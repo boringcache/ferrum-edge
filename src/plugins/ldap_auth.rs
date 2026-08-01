@@ -1371,7 +1371,7 @@ fn build_ldap_tls_config(
     // unit tests that exercise `LdapAuth::new()` before `install_default()`
     // has run. Always supplying the provider explicitly avoids that ordering
     // hazard.
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(crate::fips::base_crypto_provider());
     let builder = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("ldap_auth: failed to build rustls client config: {e}"))?;
@@ -1730,7 +1730,7 @@ mod tests {
 
     fn ensure_crypto_provider() {
         INIT_CRYPTO.call_once(|| {
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            let _ = crate::fips::base_crypto_provider().install_default();
         });
     }
 
@@ -1951,7 +1951,7 @@ mod tests {
             ),
             "private key should be present",
         );
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(crate::fips::base_crypto_provider());
         let builder = must(
             rustls::ServerConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions(),

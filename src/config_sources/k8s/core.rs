@@ -492,7 +492,7 @@ fn secret_data_decodes_to_valid_tls_pair(cert_value: &str, key_value: &str) -> b
     let Some(key) = secret_data_decodes_to_private_key(key_value) else {
         return false;
     };
-    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let provider = std::sync::Arc::new(crate::fips::base_crypto_provider());
     rustls::sign::CertifiedKey::from_der(certs, key, &provider).is_ok()
 }
 

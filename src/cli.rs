@@ -51,6 +51,15 @@ pub struct RunArgs {
     #[arg(short = 'm', long = "mode")]
     pub mode: Option<String>,
 
+    /// FIPS deployment mode: `off` (default) or `enforce`.
+    ///
+    /// Highest-precedence source for the FIPS request; it is materialized into
+    /// `FERRUM_FIPS_MODE` before the crypto provider is installed. A request
+    /// that only appears in `ferrum.conf` arrives too late to select a
+    /// validated module and is refused. See docs/fips.md.
+    #[arg(long = "fips-mode")]
+    pub fips_mode: Option<String>,
+
     /// Increase log verbosity (-v=info, -vv=debug, -vvv=trace).
     #[arg(short = 'v', long = "verbose", action = ArgAction::Count)]
     pub verbose: u8,
@@ -69,6 +78,15 @@ pub struct ValidateArgs {
     /// Operating mode (database, file, cp, dp, mesh, injector, node_agent, migrate).
     #[arg(short = 'm', long = "mode")]
     pub mode: Option<String>,
+
+    /// FIPS deployment mode: `off` (default) or `enforce`.
+    ///
+    /// Highest-precedence source for the FIPS request; it is materialized into
+    /// `FERRUM_FIPS_MODE` before the crypto provider is installed. A request
+    /// that only appears in `ferrum.conf` arrives too late to select a
+    /// validated module and is refused. See docs/fips.md.
+    #[arg(long = "fips-mode")]
+    pub fips_mode: Option<String>,
 
     /// Increase log verbosity (-v=info, -vv=debug, -vvv=trace).
     #[arg(short = 'v', long = "verbose", action = ArgAction::Count)]
@@ -251,6 +269,16 @@ pub fn apply_run_overrides(args: &RunArgs) {
         unsafe { std::env::set_var("FERRUM_MODE", mode) };
     }
 
+    // The FIPS request must reach the environment before `main()` installs the
+    // crypto provider, which happens immediately after this call. `ferrum.conf`
+    // is not readable that early, so CLI and environment are the only sources
+    // that can select a validated module; a settings-file-only request is
+    // caught and refused by `fips::verify_resolved_mode`.
+    if let Some(ref fips_mode) = args.fips_mode {
+        // SAFETY: single-threaded context, before tokio runtime.
+        unsafe { std::env::set_var(crate::fips::FIPS_MODE_ENV, fips_mode) };
+    }
+
     if args.verbose > 0 {
         let level = match args.verbose {
             1 => "info",
@@ -269,6 +297,16 @@ pub fn apply_validate_overrides(args: &ValidateArgs) {
     if let Some(ref mode) = args.mode {
         // SAFETY: single-threaded context, before tokio runtime.
         unsafe { std::env::set_var("FERRUM_MODE", mode) };
+    }
+
+    // The FIPS request must reach the environment before `main()` installs the
+    // crypto provider, which happens immediately after this call. `ferrum.conf`
+    // is not readable that early, so CLI and environment are the only sources
+    // that can select a validated module; a settings-file-only request is
+    // caught and refused by `fips::verify_resolved_mode`.
+    if let Some(ref fips_mode) = args.fips_mode {
+        // SAFETY: single-threaded context, before tokio runtime.
+        unsafe { std::env::set_var(crate::fips::FIPS_MODE_ENV, fips_mode) };
     }
 
     if args.verbose > 0 {
@@ -831,7 +869,7 @@ fn health_request_tls(
     // before the global `CryptoProvider::install_default()` call. Build the
     // ClientConfig with an explicit provider so we don't depend on (or panic
     // on) a globally installed one.
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(crate::fips::base_crypto_provider());
 
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -899,7 +937,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        crate::fips::base_crypto_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }

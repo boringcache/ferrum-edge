@@ -32,6 +32,11 @@ mod date_cache;
 mod dns;
 mod dtls;
 mod ebpf;
+// Most of this module is consumed by the library target, `validate`, the admin
+// surface, and the external test suites; the binary target only reaches the
+// bootstrap entry point, so its remaining items are dead code *here* only.
+#[allow(dead_code)]
+mod fips;
 mod grpc;
 mod health_check;
 mod http3;
@@ -171,7 +176,8 @@ fn emit_bootstrap_error(message: &str, fields: &[(&str, String)]) {
 ///
 /// Startup sequence:
 /// 1. Parse CLI arguments
-/// 2. Install rustls crypto provider (ring backend)
+/// 2. Install the rustls crypto provider and resolve FIPS state
+///    (`ring`, or the AWS-LC-FIPS validated module on a `--features fips` build)
 /// 3. Resolve external secrets (Vault, AWS, Azure, GCP, env, file) using a
 ///    temporary runtime that is dropped before env mutation
 /// 4. Initialize structured JSON logging
@@ -231,12 +237,41 @@ fn main() {
     }
 
     // ── Crypto provider ─────────────────────────────────────────────────
-    // Initialize rustls crypto provider (needed by validate for TLS cert checks)
-    if rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
-        .is_err()
-    {
-        emit_bootstrap_error("failed to install rustls crypto provider", &[]);
-        std::process::exit(1);
+    // Install the rustls crypto provider (needed by `validate` for TLS cert
+    // checks) and resolve this process's FIPS state in the same step.
+    //
+    // This has to happen before any TLS material is parsed and therefore before
+    // `ferrum.conf` is resolvable — reading the settings file here would pin
+    // `CONF_FILE_CACHE` before `FERRUM_CONF_PATH_FILE` is materialized (see
+    // `.claude/rules/tls-security.md`). `apply_run_overrides` /
+    // `apply_validate_overrides` above already materialized `--fips-mode` into
+    // the environment, so CLI and env are both visible. A request that reaches
+    // Ferrum only through `ferrum.conf` is caught after `EnvConfig` resolution
+    // by `fips::verify_resolved_mode`, which fails closed.
+    //
+    // Fail-closed: when FIPS is requested and the build capability, the
+    // module's power-on self-test, or the provider's algorithm classification
+    // is missing, this errors out instead of installing a non-validated
+    // provider.
+    match fips::install_crypto_provider() {
+        Ok(state) => {
+            if state.is_enforcing() {
+                // Startup-time operator record. Every value is from a fixed set
+                // — no secrets, no paths, no operator-supplied strings.
+                eprintln!(
+                    "FIPS mode: enforce (provider={}, module self-test passed; ferrum-edge is \
+                     not itself a validated cryptographic module — see docs/fips.md)",
+                    state.provider_id()
+                );
+            }
+        }
+        Err(e) => {
+            emit_bootstrap_error(
+                "failed to initialize the cryptographic provider",
+                &[("error", e.to_string())],
+            );
+            std::process::exit(1);
+        }
     }
 
     // Initialize tracing/logging with non-blocking writers and run the
