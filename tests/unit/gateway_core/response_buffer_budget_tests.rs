@@ -2553,9 +2553,9 @@ fn the_root_review_repairs_are_pinned_in_source() {
         .find("fn resolve_trailer_frame_value")
         .expect("resolve_trailer_frame_value must exist");
     let resolve_body = grpc_web[resolve_start..]
-        .split("fn ")
-        .next()
-        .expect("resolve_trailer_frame_value body");
+        .split_once("\npub fn sync_translated_body_trailer_frame_from_trailers")
+        .map(|(body, _)| body)
+        .expect("resolve_trailer_frame_value must precede the translated-body sync helper");
     assert!(
         !resolve_body.contains("trailer_value.clone()")
             && !resolve_body.contains("view_value.to_string()")
