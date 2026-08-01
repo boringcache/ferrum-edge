@@ -4804,10 +4804,12 @@ fn final_backend_header_policy_capability_tracks_enabled() {
 fn enforcement_is_not_a_priority_reordering() {
     // The advisory's ordering is unchanged: the generic transformer still runs
     // AFTER the router. The fix is the later shared phase, not a renumbering.
-    assert!(
-        priority::AI_STREAM_ROUTER < priority::REQUEST_TRANSFORMER,
-        "the fix must not depend on moving ai_stream_router after request_transformer"
-    );
+    const {
+        assert!(
+            priority::AI_STREAM_ROUTER < priority::REQUEST_TRANSFORMER,
+            "the fix must not depend on moving ai_stream_router after request_transformer"
+        );
+    }
 }
 
 #[test]
