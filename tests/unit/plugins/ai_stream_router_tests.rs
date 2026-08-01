@@ -2891,12 +2891,15 @@ async fn mcp_gateway_ignores_a_sabotaged_claim_marker() {
     let _ = control
         .before_proxy(&mut unclaimed, &mut control_headers)
         .await;
-    assert!(
-        unclaimed
-            .metadata
-            .keys()
-            .any(|key| key.starts_with("mcp_gateway")),
+    assert_eq!(
+        unclaimed.metadata.get("mcp.enabled").map(String::as_str),
+        Some("true"),
         "control: mcp_gateway selects this endpoint when there is no claim"
+    );
+    assert_eq!(
+        unclaimed.metadata.get("mcp.mode").map(String::as_str),
+        Some("transparent_proxy"),
+        "control: mcp_gateway engaged the canonical MCP metadata namespace"
     );
 
     for sabotage in MARKER_SABOTAGE_CASES {
@@ -2916,7 +2919,7 @@ async fn mcp_gateway_ignores_a_sabotaged_claim_marker() {
         assert!(
             !ctx.metadata
                 .keys()
-                .any(|key| key.starts_with("mcp_gateway")),
+                .any(|key| key.starts_with("mcp.")),
             "mcp_gateway must not even emit base metadata for a claimed request"
         );
     }
