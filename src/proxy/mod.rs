@@ -1594,8 +1594,28 @@ fn simulate_final_after_proxy_response_headers(
     }
     let mut simulated_ctx = ctx.clone();
     let mut simulated_headers = response_headers.clone();
-    for plugin in plugins {
+    // Mirror the live `run_after_proxy_hooks` / non-retry refine boundary: the
+    // matched route response-header list is applied exactly once after the last
+    // eligible `response_transformer`, not by each transformer's simulate hook.
+    // Without this, a chain-level `Cache-Control: no-store` route rule never
+    // reaches `should_release_response_body_for_simulated_final_headers`
+    // (GHSA-pwcm-6rh8-f2gh).
+    let last_route_response_finalizer =
+        if simulated_ctx.route_override_response_transform.is_some() {
+            plugins
+                .iter()
+                .rposition(|plugin| plugin.participates_in_route_response_header_finalization())
+        } else {
+            None
+        };
+    for (index, plugin) in plugins.iter().enumerate() {
         plugin.simulate_after_proxy_response_headers(&mut simulated_ctx, &mut simulated_headers);
+        if last_route_response_finalizer == Some(index) {
+            crate::plugins::utils::route_header_transform::finalize_route_override_response_headers(
+                &mut simulated_ctx,
+                &mut simulated_headers,
+            );
+        }
     }
     Some(simulated_headers)
 }
@@ -19473,6 +19493,24 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     // Read after the gate: a decoded body installs fresh representation headers.
     let content_type = response_headers.get("content-type").cloned();
     let content_type = content_type.as_deref();
+    // An already-exceeded RPC deadline owns the client-visible outcome. Do not
+    // open a retained-response window first: under concurrent load that can
+    // exhaust the aggregate budget and install RESOURCE_EXHAUSTED instead of
+    // DEADLINE_EXCEEDED, losing the authoritative gRPC-Web trailer status.
+    if ctx
+        .grpc_deadline_at()
+        .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+    {
+        *response_status = replace_buffered_grpc_response_with_deadline(
+            ctx,
+            grpc_web_response_content_type,
+            response_headers,
+            response_body,
+            initial_response_header_policy_plugins,
+        )
+        .as_u16();
+        return (true, representation_rewritten);
+    }
     // A transform allocates its output itself, so the blocks that will pay for
     // that allocation are reserved BEFORE the first hook can run — charging
     // afterwards would let arbitrarily many concurrent transform outputs exist

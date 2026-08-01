@@ -5537,6 +5537,27 @@ pub async fn normalize_response_body_for_inspection(
         return false;
     }
     let content_type = response_headers.get("content-type").cloned();
+    // An already-exceeded RPC deadline owns the client-visible outcome. Opening
+    // a retained-response window first would compete for the process-wide
+    // aggregate budget and, under concurrent load, could install RESOURCE_EXHAUSTED
+    // instead of DEADLINE_EXCEEDED — losing the authoritative status and, on
+    // gRPC-Web, the deadline trailer frame (GHSA-pwcm-6rh8-f2gh).
+    if ctx
+        .grpc_deadline_at()
+        .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+    {
+        let owned_grpc_web_response_content_type =
+            crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
+        *response_status = crate::proxy::replace_buffered_grpc_response_with_deadline(
+            ctx,
+            owned_grpc_web_response_content_type.as_deref(),
+            response_headers,
+            response_body,
+            initial_response_header_policy_plugins,
+        )
+        .as_u16();
+        return true;
+    }
     // A normalizer allocates its replacement itself, so the blocks that will pay
     // for that allocation are reserved BEFORE the first hook can run — a charge
     // taken after the fact would let arbitrarily many concurrent replacements

@@ -921,10 +921,11 @@ fn every_capacity_refusal_uses_the_shared_gateway_terminal() {
         proxy
             .matches("replace_buffered_response_with_capacity_refusal_with_policy_source(")
             .count(),
-        3,
-        "one definition, the prefiltered delegation, and the representation \
-         gate's decode refusal — the gate is reached from callers holding the \
-         unfiltered protocol plugin list, so it cannot use the prefiltered \
+        4,
+        "one definition, the prefiltered delegation, the representation gate's \
+         CapacityRefused decode path, and the install_decoded_response_body \
+         charge refusal — both gate sites are reached from callers holding the \
+         unfiltered protocol plugin list, so they cannot use the prefiltered \
          wrapper"
     );
     assert!(
@@ -2596,10 +2597,18 @@ fn the_root_review_repairs_are_pinned_in_source() {
     let resolve_start = grpc_web
         .find("fn resolve_trailer_frame_value")
         .expect("resolve_trailer_frame_value must exist");
+    // Match the sync helper by name rather than a brittle `\npub fn` prefix: a
+    // narrow `#[allow(dead_code)]` (or `pub(crate)`) may sit on the line before
+    // the signature without changing the ordering invariant.
     let resolve_body = grpc_web[resolve_start..]
-        .split_once("\npub fn sync_translated_body_trailer_frame_from_trailers")
+        .split_once("sync_translated_body_trailer_frame_from_trailers")
         .map(|(body, _)| body)
         .expect("resolve_trailer_frame_value must precede the translated-body sync helper");
+    assert!(
+        resolve_body.contains(") -> Option<&'a str>"),
+        "resolve_trailer_frame_value's borrowed return must still appear before \
+         the translated-body sync helper"
+    );
     assert!(
         !resolve_body.contains("trailer_value.clone()")
             && !resolve_body.contains("view_value.to_string()")

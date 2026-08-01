@@ -1036,6 +1036,12 @@ impl Plugin for ResponseTransformer {
         //   * framed gRPC `+json` flavors — length-prefixed frames, declined by
         //     both the transform and the claim predicate.
         //
+        // Exact `text/event-stream` (optional parameters allowed) is released as
+        // the unbounded SSE representation. Ambiguous lookalikes that merely
+        // contain the `event-stream` substring — vendor types, `*-like` names,
+        // `+json` / profile parameters — stay buffered so they cannot inherit
+        // SSE streaming treatment by substring coincidence.
+        //
         // An ABSENT `Content-Type` is deliberately NOT released: the transform
         // treats it as JSON, so those bytes are still inspected and a body rule
         // still applies (including the fail-closed rejection of an untyped
@@ -1055,8 +1061,10 @@ impl Plugin for ResponseTransformer {
             return true;
         }
         !content_type.is_some_and(|ct| {
-            !body_transform::is_json_content_type(ct)
-                || body_transform::is_framed_grpc_content_type(ct)
+            let release_declined_non_json = !body_transform::is_json_content_type(ct)
+                && !(body_transform::is_event_stream_content_type(ct)
+                    && !is_text_event_stream_media_type(ct));
+            release_declined_non_json || body_transform::is_framed_grpc_content_type(ct)
         })
     }
 

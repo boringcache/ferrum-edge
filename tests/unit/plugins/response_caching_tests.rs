@@ -606,7 +606,6 @@ async fn base_cache_key_keeps_supported_entry_operation_headers_reachable() {
         ("if-none-match", r#""etag-1""#),
         ("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
         ("cache-control", "no-cache"),
-        ("cache-control", "no-store"),
         ("content-length", "0"),
     ];
     for (name, value) in supported {
@@ -618,6 +617,18 @@ async fn base_cache_key_keeps_supported_entry_operation_headers_reachable() {
             "{name}: {value} is a handled entry operation and must stay reachable"
         );
     }
+
+    // Request `Cache-Control: no-store` is still excluded from the key digest
+    // (same entry-operation class as no-cache), but RFC 9111 §5.2.1.5 makes the
+    // store path unreachable, so staging is cleared rather than retained for a
+    // store that can never happen (see
+    // `request_no_store_releases_the_response_buffer_and_does_not_store`).
+    assert!(
+        staged_base_cache_key(&plugin, path, &[("cache-control", "no-store")])
+            .await
+            .is_none(),
+        "cache-control: no-store must clear lookup staging rather than retain a store key"
+    );
 }
 
 #[tokio::test]
@@ -662,21 +673,20 @@ async fn base_cache_key_cache_control_exclusion_is_value_aware() {
         "recognized no-cache must remain under the original partition for replacement"
     );
 
-    let recognized_store = staged_base_cache_key(&plugin, path, &[("cache-control", "no-store")])
-        .await
-        .expect("recognized no-store refresh must stage a base key");
-    assert_eq!(
-        recognized_store, baseline,
-        "recognized no-store must remain under the original partition for replacement"
+    // Bare `no-store` (alone or beside `no-cache`) clears staging: RFC 9111
+    // §5.2.1.5 forbids retaining any part of the request or its response, so
+    // there is no store-side replacement partition to keep reachable.
+    assert!(
+        staged_base_cache_key(&plugin, path, &[("cache-control", "no-store")])
+            .await
+            .is_none(),
+        "recognized no-store must clear staging rather than retain a store key"
     );
-
-    let pure_pair =
+    assert!(
         staged_base_cache_key(&plugin, path, &[("cache-control", "no-cache, no-store")])
             .await
-            .expect("pure no-cache/no-store pair must stage a base key");
-    assert_eq!(
-        pure_pair, baseline,
-        "a header of only honored refresh members must stay under the original partition"
+            .is_none(),
+        "a pure no-cache/no-store pair still carries no-store, so staging must clear"
     );
 
     let unrecognized = [
@@ -724,7 +734,6 @@ async fn base_cache_key_cache_control_exclusion_is_value_aware() {
     for value in [
         r#"no-cache="authorization, cookie""#,
         "no-cache=opaque",
-        "no-store=opaque",
         r#"no-cache="authorization", x-tenant=a"#,
         r#"no-cache="authorization"junk"#,
         r#"no-cache="authorization"#,
@@ -737,6 +746,16 @@ async fn base_cache_key_cache_control_exclusion_is_value_aware() {
             "argument-bearing, mixed, or malformed cache-control must fail closed into its own partition"
         );
     }
+
+    // Argument-bearing `no-store=…` is not a pure honored refresh for keying,
+    // but the store-path parser still treats any `no-store` member as forbidding
+    // retention — staging clears rather than partitioning a dead store key.
+    assert!(
+        staged_base_cache_key(&plugin, path, &[("cache-control", "no-store=opaque")])
+            .await
+            .is_none(),
+        "argument-bearing no-store still forbids retention, so staging must clear"
+    );
 }
 
 #[tokio::test]

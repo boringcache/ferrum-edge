@@ -4535,9 +4535,13 @@ async fn test_buffered_normalizer_is_bounded_by_a_route_ceiling_below_the_slice_
         )
         .await
         .expect("a ceiling equal to the output must admit it");
+    let admitted_text = String::from_utf8_lossy(&admitted);
+    let normalized_text = String::from_utf8_lossy(&normalized);
     assert_eq!(
-        admitted, normalized,
-        "bounding the accumulator must not change the normalized bytes"
+        strip_created(&admitted_text),
+        strip_created(&normalized_text),
+        "bounding the accumulator must not change the normalized bytes \
+         (modulo the per-instance created epoch)"
     );
 }
 
