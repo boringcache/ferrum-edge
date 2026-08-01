@@ -210,6 +210,33 @@ DEDICATED_WORKFLOW_NAMES = {
     ),
 }
 
+# Every required status check owner must trigger on merge_group. Without that
+# trigger a merge queue never receives the required check and deadlocks.
+REQUIRED_MERGE_GROUP_WORKFLOWS = {
+    ".github/workflows/ci.yml": "Tests",
+    ".github/workflows/coverage.yml": "Merge Coverage",
+    ".github/workflows/gateway-api-conformance.yml": "Gateway API Conformance",
+    ".github/workflows/mesh-e2e-sidecar-live.yml": "Mesh E2E Sidecar Live",
+    ".github/workflows/cross-build-policy.yml": "Trusted Cross Build Policy",
+    ".github/workflows/multicluster-federation-live.yml": (
+        "Multicluster Federation Live"
+    ),
+}
+
+# Markers that prove merge-group runs bind validation to the synthesized SHA /
+# payload base rather than absent pull_request fields or a main-only fallback.
+MERGE_GROUP_SHA_CONTRACT_MARKERS = (
+    "merge_group",
+    "github.event.merge_group.base_sha",
+    "merge_group base_sha missing or malformed",
+)
+
+# Concurrency keys must distinguish merge-group runs from PR/push/manual lanes.
+MERGE_GROUP_CONCURRENCY_MARKERS = (
+    "merge_group",
+    "merge_group.head_sha",
+)
+
 # The polling implementation is a release-integrity boundary. Pinning the exact
 # job body prevents a later pull request from satisfying individual substring
 # checks with comments while changing the array, query, row validation, or
@@ -321,8 +348,129 @@ def workflow_event_body(workflow_yml: str, event: str) -> str | None:
 def pull_request_trigger_is_unconditional(workflow_yml: str) -> bool:
     body = workflow_event_body(workflow_yml, "pull_request")
     if body is None:
-        return False
+        # Trusted Cross Build Policy uses pull_request_target instead.
+        body = workflow_event_body(workflow_yml, "pull_request_target")
+        if body is None:
+            return False
     return not re.search(r"(?m)^    paths(?:-ignore)?:", body)
+
+
+def merge_group_trigger_is_present(workflow_yml: str) -> bool:
+    """Return whether the workflow declares an unconditional merge_group trigger."""
+
+    body = workflow_event_body(workflow_yml, "merge_group")
+    if body is None:
+        return False
+    if re.search(r"(?m)^    (?:branches(?:-ignore)?|paths(?:-ignore)?):", body):
+        return False
+    return True
+
+
+def merge_group_self_test() -> list[str]:
+    """Deterministic fixtures for merge-queue required-check contracts."""
+
+    failures: list[str] = []
+
+    # Absent pull_request payload must not be treated as a path-gated event by
+    # the planners once merge_group is selected.
+    from coverage_plan import select_mode as coverage_select_mode
+    from pr_ci_plan import select_job_gates, select_mode as pr_select_mode
+
+    mode, _ = pr_select_mode("merge_group", [])
+    if mode != "full":
+        failures.append("empty merge_group change set must fail closed to full CI")
+    mode, _ = pr_select_mode(
+        "merge_group",
+        ["docs/admin_api.md", "src/proxy/mod.rs"],
+    )
+    if mode != "full":
+        failures.append("multi-PR merge_group with code paths must stay full CI")
+    mode, _ = pr_select_mode("merge_group", ["docs/admin_api.md"])
+    if mode != "light":
+        failures.append("docs-only merge_group should remain path-gated light CI")
+    gates = select_job_gates("merge_group", [])
+    if not all(gates.values()):
+        failures.append("empty merge_group gates must fail closed to all suites")
+    gates = select_job_gates("merge_group", ["README.md"])
+    if any(gates.values()):
+        failures.append("irrelevant merge_group paths must not force live suites")
+    mode, _ = coverage_select_mode("merge_group", [])
+    if mode != "full":
+        failures.append("empty merge_group coverage must fail closed to full")
+    mode, _ = coverage_select_mode("merge_group", ["docs/configuration.md"])
+    if mode != "skip":
+        failures.append("irrelevant merge_group coverage paths should skip")
+
+    # Synthetic workflow snippets: path filters / concurrency / fork-safe base.
+    bare_pr_only = "on:\n  pull_request:\n"
+    if merge_group_trigger_is_present(bare_pr_only):
+        failures.append("pull_request-only workflow must not report merge_group")
+    with_merge_group = (
+        "on:\n  pull_request:\n  merge_group:\n    types:\n      - checks_requested\n"
+    )
+    if not merge_group_trigger_is_present(with_merge_group):
+        failures.append("checks_requested merge_group trigger must be accepted")
+    path_filtered = (
+        "on:\n  merge_group:\n    paths:\n      - src/**\n"
+    )
+    if merge_group_trigger_is_present(path_filtered):
+        failures.append("path-filtered merge_group must be rejected")
+    branches_filtered = (
+        "on:\n  merge_group:\n    branches:\n      - main\n"
+    )
+    if merge_group_trigger_is_present(branches_filtered):
+        failures.append("branches-restricted merge_group must be rejected")
+
+    # A merge queue admits a pull request only after its required checks have
+    # already passed on the pull request itself, so every required owner must
+    # also report unconditionally on the PR event it uses. Trusted Cross Build
+    # Policy reports through `pull_request_target`, not `pull_request`.
+    target_only = "on:\n  pull_request_target:\n    branches:\n      - main\n"
+    if not pull_request_trigger_is_unconditional(target_only):
+        failures.append(
+            "pull_request_target-only workflow must count as an unconditional "
+            "pull-request trigger"
+        )
+    target_path_filtered = (
+        "on:\n  pull_request_target:\n    paths:\n      - src/**\n"
+    )
+    if pull_request_trigger_is_unconditional(target_path_filtered):
+        failures.append("path-filtered pull_request_target must be rejected")
+    no_pr_trigger = "on:\n  push:\n    branches:\n      - main\n"
+    if pull_request_trigger_is_unconditional(no_pr_trigger):
+        failures.append("workflow without any pull-request trigger must be rejected")
+
+    # Fork-origin PR provenance still uses base_ref charset validation in the
+    # frozen live-suite contract; merge_group uses payload base_sha instead.
+    relevance = Path(
+        ".github/workflows/mesh-e2e-sidecar-live.yml"
+    ).read_text(encoding="utf-8")
+    for marker in (
+        'elif [ "$EVENT_NAME" = "merge_group" ]; then',
+        "MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}",
+        'github.base_ref',
+        "^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$",
+    ):
+        if marker not in relevance:
+            failures.append(
+                f"mesh live relevance contract missing merge_group/fork marker {marker!r}"
+            )
+
+    cross = Path(".github/workflows/cross-build-policy.yml").read_text(encoding="utf-8")
+    for marker in (
+        "pull_request_target:",
+        "merge_group:",
+        "contents: read",
+        'EVENT_NAME: ${{ github.event_name }}',
+        'unsupported event',
+        "persist-credentials: false",
+        "github.event.merge_group.base_sha",
+        "github.event.merge_group.head_sha",
+    ):
+        if marker not in cross:
+            failures.append(f"cross-build policy missing merge_group safety marker {marker!r}")
+
+    return failures
 
 
 def main_push_trigger_is_unconditional(workflow_yml: str) -> bool:
@@ -577,11 +725,138 @@ def main() -> int:
                     f"{workflow_path} jobs.{job} is missing fail-closed contract `{contract}`"
                 )
 
+    for workflow_path, required_name in sorted(REQUIRED_MERGE_GROUP_WORKFLOWS.items()):
+        workflow_yml = Path(workflow_path).read_text(encoding="utf-8")
+        if not merge_group_trigger_is_present(workflow_yml):
+            planner_errors.append(
+                f"{workflow_path} must declare an unconditional merge_group "
+                "trigger so the merge queue can report required check "
+                f"`{required_name}`"
+            )
+        # Exact check-name parity on PR and merge-group runs: the job `name:`
+        # is the GitHub Actions check context for both events.
+        if not re.search(
+            rf"(?m)^    name: {re.escape(required_name)}$",
+            workflow_yml,
+        ):
+            planner_errors.append(
+                f"{workflow_path} must keep required check name `{required_name}`"
+            )
+        for marker in MERGE_GROUP_SHA_CONTRACT_MARKERS:
+            if marker not in workflow_yml:
+                planner_errors.append(
+                    f"{workflow_path} must be event-aware for merge_group SHA/base "
+                    f"selection (missing `{marker}`)"
+                )
+        for marker in MERGE_GROUP_CONCURRENCY_MARKERS:
+            if marker not in workflow_yml:
+                planner_errors.append(
+                    f"{workflow_path} concurrency must distinguish merge_group "
+                    f"runs (missing `{marker}`)"
+                )
+        # A merge queue only admits a pull request whose required checks have
+        # already passed on the pull request itself, so a `paths:` filter that
+        # keeps a required owner from reporting on the PR event would strand
+        # the queue entry precondition, including for the merge-group-only
+        # trusted boundary, whose PR-side run is what keeps a candidate from
+        # rewriting its own gate before the queue executes it.
+        if not pull_request_trigger_is_unconditional(workflow_yml):
+            planner_errors.append(
+                f"{workflow_path} must trigger on every pull request "
+                "(pull_request or pull_request_target) without path filters"
+            )
+        # Fail closed: never trust absent pull_request fields as a silent
+        # main-only / no-op path for required merge-group validation.
+        if workflow_path == ".github/workflows/cross-build-policy.yml":
+            if "pull_request_target:" not in workflow_yml:
+                planner_errors.append(
+                    f"{workflow_path} must preserve pull_request_target for fork-safe PR checks"
+                )
+            if "persist-credentials: false" not in workflow_yml:
+                planner_errors.append(
+                    f"{workflow_path} must keep persist-credentials disabled"
+                )
+            if re.search(r"(?m)^\s+contents:\s+write\s*$", workflow_yml):
+                planner_errors.append(
+                    f"{workflow_path} must not grant contents: write"
+                )
+        if workflow_path == ".github/workflows/ci.yml":
+            if "github.event_name == 'merge_group'" not in workflow_yml:
+                planner_errors.append(
+                    "ci.yml job gates must include merge_group alongside pull_request"
+                )
+            if 'EVENT_NAME" = "merge_group"' not in workflow_yml and \
+               '"$EVENT_NAME" = "merge_group"' not in workflow_yml:
+                planner_errors.append(
+                    "ci.yml planner must handle merge_group base/head selection"
+                )
+
+    planner_errors.extend(merge_group_self_test())
+
     ci_plan_body = extract_job_body(ci_yml, "ci-plan")
     if 'git diff --name-only --no-renames "${base_ref}...HEAD"' not in ci_plan_body:
         planner_errors.append(
             "jobs.ci-plan must disable rename detection when collecting changed files"
         )
+    if 'git diff --name-only --no-renames "${MERGE_BASE_SHA}...HEAD"' not in ci_plan_body:
+        planner_errors.append(
+            "jobs.ci-plan must diff merge_group commits with rename detection disabled"
+        )
+
+    coverage_plan_body = extract_job_body(
+        Path(".github/workflows/coverage.yml").read_text(encoding="utf-8"),
+        "coverage-plan",
+    )
+    if (
+        'git diff --name-only --no-renames "${base_ref}...HEAD" > "$changed_files"'
+        not in coverage_plan_body
+    ):
+        planner_errors.append(
+            "jobs.coverage-plan must disable rename detection when collecting "
+            "pull_request changed files"
+        )
+    if (
+        'git diff --name-only --no-renames "${MERGE_BASE_SHA}...HEAD" > "$changed_files"'
+        not in coverage_plan_body
+    ):
+        planner_errors.append(
+            "jobs.coverage-plan must diff merge_group commits with rename "
+            "detection disabled"
+        )
+
+    gateway_changes_body = extract_job_body(
+        Path(".github/workflows/gateway-api-conformance.yml").read_text(
+            encoding="utf-8"
+        ),
+        "changes",
+    )
+    if (
+        'git diff --name-only --no-renames "${base_ref}...HEAD" | sort > "$changed_files"'
+        not in gateway_changes_body
+    ):
+        planner_errors.append(
+            "jobs.changes in gateway-api-conformance.yml must disable rename "
+            "detection when collecting pull_request changed files"
+        )
+    if (
+        'git diff --name-only --no-renames "${MERGE_BASE_SHA}...HEAD" | sort > "$changed_files"'
+        not in gateway_changes_body
+    ):
+        planner_errors.append(
+            "jobs.changes in gateway-api-conformance.yml must diff merge_group "
+            "commits with rename detection disabled"
+        )
+
+    performance_regression_body = extract_job_body(ci_yml, "performance-regression")
+    if (
+        'git diff --name-only --no-renames "${perf_base}...HEAD"'
+        not in performance_regression_body
+    ):
+        planner_errors.append(
+            "jobs.performance-regression must disable rename detection when "
+            "collecting changed files for pull_request and merge_group diffs"
+        )
+
     for output in sorted(set(PATH_GATED_JOBS.values())):
         if not re.search(rf"(?m)^      {re.escape(output)}:", ci_plan_body):
             planner_errors.append(f"jobs.ci-plan must publish `{output}`")
