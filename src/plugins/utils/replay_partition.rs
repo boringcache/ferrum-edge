@@ -761,16 +761,12 @@ fn is_response_cache_entry_operation_header(
     value: &str,
     respect_no_cache: bool,
 ) -> bool {
-    if name.eq_ignore_ascii_case("if-none-match")
-        || name.eq_ignore_ascii_case("if-modified-since")
+    if name.eq_ignore_ascii_case("if-none-match") || name.eq_ignore_ascii_case("if-modified-since")
     {
         return true;
     }
     if name.eq_ignore_ascii_case("content-length") {
-        return value
-            .trim()
-            .parse::<u64>()
-            .is_ok_and(|length| length == 0);
+        return value.trim().parse::<u64>().is_ok_and(|length| length == 0);
     }
     respect_no_cache
         && name.eq_ignore_ascii_case("cache-control")
