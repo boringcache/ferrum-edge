@@ -21,6 +21,7 @@ use crate::tls::acme::{
 use crate::tls::lease::{RenewalLeaseKeeper, TlsLeaseStore, acme_renewal_lease_name};
 use crate::tls::private_file::PrivateFileFault;
 use crate::tls::source::subscription::{install_force_reload_probe, remove_force_reload_probe};
+use base64::Engine as _;
 use tempfile::TempDir;
 
 const DIRECTORY_URL: &str = "https://acme.example/directory";
@@ -735,8 +736,6 @@ fn finalization_material_is_cleared_only_when_the_order_becomes_terminal() {
 /// carrying them.
 #[test]
 fn a_live_order_never_discloses_its_finalization_material() {
-    use base64::Engine as _;
-
     let order = processing_order("edge-order", "edge-cert");
     let material = order.finalization.clone().expect("seeded material");
     let key_pem = material.key_pem().to_string();
@@ -844,8 +843,6 @@ fn dns_san(name: &str) -> rcgen::SanType {
 /// fixed diagnostic and never regenerates material.
 #[test]
 fn finalization_preflight_rejects_malformed_and_mismatched_packages() {
-    use base64::Engine as _;
-
     let domains = vec!["example.com".to_string()];
     let good = AcmeOrderFinalization::generate(&domains).expect("generate");
     good.validate(&domains)
