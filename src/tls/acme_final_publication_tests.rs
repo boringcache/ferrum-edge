@@ -869,7 +869,9 @@ fn finalization_preflight_rejects_malformed_and_mismatched_packages() {
         good.csr_der(&domains).expect("csr"),
     );
     assert_unusable_without_disclosure(
-        &multiple_keys.validate(&domains).expect_err("multiple private keys"),
+        &multiple_keys
+            .validate(&domains)
+            .expect_err("multiple private keys"),
     );
 
     // Well-base64-encoded trailing DER after a complete CSR.
