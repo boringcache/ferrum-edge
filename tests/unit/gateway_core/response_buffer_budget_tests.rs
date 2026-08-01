@@ -2492,6 +2492,39 @@ fn the_two_ceiling_peak_is_documented_as_exact() {
     );
 }
 
+/// Startup must not silently pin lazy defaults when `init()` loses the race.
+#[test]
+fn init_warns_when_startup_configuration_arrives_after_lazy_initialization() {
+    let budget = include_str!("../../../src/proxy/response_buffer_budget.rs");
+    assert!(
+        budget.contains("tracing::warn!"),
+        "init() must log when BUDGET.set fails so ordering regressions cannot \
+         pin defaults silently"
+    );
+    assert!(
+        budget.contains("requested_fallback_per_response_bytes"),
+        "the warning must name the ignored configuration numerically without secrets"
+    );
+}
+
+/// Operator docs must state that every rewrite reserves a full window, not only
+/// maximum-size bodies.
+#[test]
+fn the_rewrite_concurrency_bound_applies_to_every_concurrent_rewrite() {
+    let ferrum_conf = include_str!("../../../ferrum.conf");
+    let configuration = include_str!("../../../docs/configuration.md");
+    for (name, doc) in [("ferrum.conf", ferrum_conf), ("docs/configuration.md", configuration)] {
+        assert!(
+            doc.contains("full ceiling-sized") || doc.contains("full** per-response"),
+            "{name} must state that the producer window is reserved at the full ceiling"
+        );
+        assert!(
+            doc.contains("every concurrently rewriting") || doc.contains("**every** concurrently rewriting"),
+            "{name} must state the two-ceiling peak applies to every concurrent rewrite"
+        );
+    }
+}
+
 /// The reserve-then-fill seam's CONTRACT, stated exactly.
 ///
 /// `append_with` documents that it verifies the produced length and fails
