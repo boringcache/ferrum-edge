@@ -172,8 +172,9 @@ configuration, NodeWaypoint, and CI contract/runbook files) remains full mode.
 The planner runs `git diff --check` for PR/merge-group diff hygiene and disables
 rename detection when classifying paths, so both the source and destination of a
 rename are checked. The same `--no-renames` fail-closed classification applies
-to `coverage.yml` coverage planning and `gateway-api-conformance.yml` relevance
-filtering on both `pull_request` and `merge_group` diffs. Merge-group planning diffs
+to `coverage.yml` coverage planning, `gateway-api-conformance.yml` relevance
+filtering, and the `performance-regression` path classifier on both
+`pull_request` and `merge_group` diffs. Merge-group planning diffs
 `merge_group.base_sha...HEAD` and executes the planner from that base SHA so a
 queued planner edit cannot self-classify as light.
 Any unrecognized path, an empty/unavailable diff, a mixed code-and-docs change,
@@ -432,7 +433,10 @@ benchmarks): workflow verifier `--self-test`, repository-contract verification,
 evaluator `--self-test`, and `python3 -m py_compile` on
 `tests/performance/multi_protocol/run_protocol_regression_scenarios.py`. PRs then
 apply a performance-sensitive path filter; unrelated PRs skip the expensive
-benchmark and report success. The PR gate covers proxy and connection hot paths,
+benchmark and report success. On pull requests and merge-queue groups, changed
+files are collected with `git diff --name-only --no-renames` so both sides of a
+rename are classified and a move into an irrelevant path cannot suppress the
+benchmark. The PR gate covers proxy and connection hot paths,
 the file-mode startup path used by this benchmark, performance fixtures, and
 dependency/build-graph inputs. Plugin-internal, admin, secrets, and unrelated
 operating-mode changes are excluded because this plain HTTP/1.1 file-mode route

@@ -817,6 +817,16 @@ def main() -> int:
             "commits with rename detection disabled"
         )
 
+    performance_regression_body = extract_job_body(ci_yml, "performance-regression")
+    if (
+        'git diff --name-only --no-renames "${perf_base}...HEAD"'
+        not in performance_regression_body
+    ):
+        planner_errors.append(
+            "jobs.performance-regression must disable rename detection when "
+            "collecting changed files for pull_request and merge_group diffs"
+        )
+
     for output in sorted(set(PATH_GATED_JOBS.values())):
         if not re.search(rf"(?m)^      {re.escape(output)}:", ci_plan_body):
             planner_errors.append(f"jobs.ci-plan must publish `{output}`")

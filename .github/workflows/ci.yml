@@ -4149,7 +4149,7 @@ jobs:
             else
               perf_base="origin/${BASE_REF}"
             fi
-            if changed_files="$(git diff --name-only "${perf_base}...HEAD" 2>/dev/null)"; then
+            if changed_files="$(git diff --name-only --no-renames "${perf_base}...HEAD" 2>/dev/null)"; then
               run_benchmark=false
               reason="No performance-sensitive paths changed."
 
