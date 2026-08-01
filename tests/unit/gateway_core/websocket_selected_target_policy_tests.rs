@@ -4,10 +4,11 @@
 //! Before the fix the WebSocket branch received only the retry-capped BASE
 //! proxy and used it for every attempt: retry rotation moved the URL, the
 //! admission target, and the circuit-breaker key to the next port but left the
-//! dial's connect timeout, trust roots, client identity, verification posture,
-//! and DNS policy pinned to the first target. These tests pin the projection
+//! dial's connect timeout, trust roots, client identity, and verification
+//! posture at the unresolved route-level values. These tests pin the projection
 //! itself (per attempt, per target) and the source-level wiring that feeds it,
-//! plus the H3 parity the fix is written against.
+//! plus the H3 parity the fix is written against. DNS override and TTL remain
+//! route-level fields; the selected target changes the resolution hostname.
 
 use std::borrow::Cow;
 use std::collections::HashMap;

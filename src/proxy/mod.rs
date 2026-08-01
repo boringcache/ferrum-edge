@@ -2485,11 +2485,9 @@ pub(crate) fn supports_native_http3_backend(
 ) -> bool {
     // Cheap gate FIRST — this runs per request and per retry rotation on the
     // H1/H2 dispatch path. `dispatch_kind` is not target-overridable: the
-    // per-target projection (`resolve_effective_proxy_for_target`) writes only
-    // connect timeout / pool knobs / `resolved_tls` / `h2_upgrade_policy`, and
-    // `resolve_backend_connection_proxy_for_target` only rebases host/port —
-    // so the common non-HttpsPool case returns before any per-target
-    // capability-key resolution work.
+    // per-target policy projection and selected-target host/port rebase cannot
+    // change it, so the common non-HttpsPool case returns before any
+    // per-target capability-key resolution work.
     proxy.dispatch_kind == DispatchKind::HttpsPool
         && get_backend_capability_for_target(
             state.backend_capabilities.as_ref(),
@@ -10587,11 +10585,12 @@ async fn handle_websocket_request_authenticated(
         // Per-attempt target-effective backend policy (issue #2416). Every H1/H2
         // WebSocket attempt — the initial one and each retry-rotated one — dials
         // under the DestinationRule policy projected for its OWN `current_target`
-        // (per-port `connectTimeout`, `tls` CA / client identity / verification /
-        // SAN allow-list, and the DNS override / TTL the dial reads). The base
-        // proxy is never used for dial configuration, so a rotation from port
-        // 8443 to 9443 can no longer carry the first target's trust roots or
-        // timeout forward.
+        // (per-port `connectTimeout` and `tls` CA / client identity /
+        // verification / SAN allow-list). The unresolved base proxy is never
+        // used for those dial decisions, so selection or rotation onto port
+        // 9443 can no longer ignore that port's trust roots or timeout. DNS
+        // override and TTL are route-level fields retained from the base proxy;
+        // the selected target contributes the resolution hostname.
         //
         // POLICY PORT vs TRANSPORT DIAL PORT. Target selection chooses the
         // POLICY port: `UpstreamTarget::dispatch_policy_port()` (the declared
