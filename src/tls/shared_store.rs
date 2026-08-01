@@ -80,6 +80,10 @@ pub enum SharedStoreError {
         "timed out after {seconds}s waiting for exclusive access to shared TLS store '{path}'; another instance may be holding it"
     )]
     LockTimeout { path: String, seconds: u64 },
+    /// A setting the shared store depends on is present but unusable. Carries
+    /// the rule that was broken, never the configured value.
+    #[error("invalid shared TLS store configuration: {details}")]
+    InvalidConfig { details: String },
 }
 
 impl SharedStoreError {
@@ -210,6 +214,13 @@ struct Cached<T> {
     stamp: Option<FileStamp>,
     /// Open handle to exactly the inode `stamp` describes, retained so the
     /// identity stays unique. Never read from again.
+    ///
+    /// Retained **only** when the stamp actually carries an identity, i.e. on a
+    /// platform with [`StoreIdentityMode::Native`]. Without an identity the
+    /// handle secures nothing — every read re-reads regardless — so holding one
+    /// would be a file descriptor kept open for the process lifetime for no
+    /// benefit, on exactly the targets (Windows) where an open handle on a
+    /// destination is most likely to interfere with replacing it.
     pinned: Option<File>,
 }
 
@@ -266,10 +277,16 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
         identity_mode: StoreIdentityMode,
     ) -> Result<Self, SharedStoreError> {
         let lock_path = lock_path_for(&path)?;
+        // Fail closed on a malformed bound rather than opening the store on a
+        // default the operator never asked for: this setting is the only thing
+        // standing between a wedged shared volume and an unbounded wait, so a
+        // silent substitution would make it unauditable.
+        let lock_timeout = crate::config::env_config::tls_store_lock_timeout_from_env()
+            .map_err(|details| SharedStoreError::InvalidConfig { details })?;
         let store = Self {
             path,
             lock_path,
-            lock_timeout: crate::config::env_config::tls_store_lock_timeout_from_env(),
+            lock_timeout,
             identity_mode,
             cached: RwLock::new(Cached {
                 value: Arc::new(T::default()),
@@ -427,12 +444,26 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
         self.publish_cached(Arc::new(value.clone()), stamp, pinned)
     }
 
+    /// Republish the cache, retaining the open handle only where it is
+    /// load-bearing.
+    ///
+    /// A handle is worth keeping for exactly one reason: it stops the inode
+    /// number in `stamp` from being recycled, which is what makes an equal
+    /// identity a proof. When the stamp has no identity there is nothing to
+    /// protect, so the handle is dropped here rather than held for the
+    /// process's lifetime.
     fn publish_cached(
         &self,
         value: Arc<T>,
         stamp: Option<FileStamp>,
         pinned: Option<File>,
     ) -> Result<(), SharedStoreError> {
+        let identity_is_load_bearing = stamp.is_some_and(|stamp| stamp.identity.is_some());
+        let pinned = if identity_is_load_bearing {
+            pinned
+        } else {
+            None
+        };
         let mut cached = self.cached.write().map_err(|_| self.poisoned())?;
         *cached = Cached {
             value,

@@ -31,6 +31,8 @@ pub fn tls_managed_store_path_from_env() -> String {
 
 /// Default bound on waiting for the shared managed-TLS/ACME store lock.
 pub const DEFAULT_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 10;
+/// Settings key for that bound.
+pub const TLS_STORE_LOCK_TIMEOUT_KEY: &str = "FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS";
 const MIN_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 1;
 const MAX_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 120;
 
@@ -40,18 +42,54 @@ const MAX_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 120;
 /// Read directly rather than through `EnvConfig` because the stores are opened
 /// lazily by the admin API, the `managed://` / `acme://` source loaders, and the
 /// renewal scheduler — all of which can run before or without a full
-/// `EnvConfig`. An unparseable value falls back to the default; the setting only
-/// bounds a wait, so a hard startup failure here would be worse than the bound.
-pub fn tls_store_lock_timeout_from_env() -> std::time::Duration {
-    let key = "FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS";
-    let raw = crate::config::conf_file::resolve_ferrum_var(key);
-    let parsed = raw.and_then(|value| value.trim().parse::<u64>().ok());
-    let seconds = parsed.unwrap_or(DEFAULT_TLS_STORE_LOCK_TIMEOUT_SECONDS);
-    let seconds = seconds.clamp(
+/// `EnvConfig`.
+///
+/// # Absent, clamped, and malformed are three different things
+///
+/// * **Absent** — the key appears in neither the environment nor `ferrum.conf` —
+///   selects [`DEFAULT_TLS_STORE_LOCK_TIMEOUT_SECONDS`]. That is the documented
+///   default, not a fallback from a failure.
+/// * **A valid number outside the supported range** is clamped to
+///   `[1, 120]` seconds, which is the documented contract for this setting: the
+///   operator asked for a bound and gets the nearest supported one.
+/// * **A malformed value** — anything present that is not a whole number of
+///   seconds, blank included — is an **error**. Quietly substituting the
+///   default here would make a documented availability/security control lie: an
+///   operator who set `30s`, `sixty`, or nothing at all after the `=` would be
+///   told nothing and would run on a 10-second bound they never chose. A
+///   configured-but-unusable value is surfaced wherever the shared store is
+///   opened and fails that open closed.
+///
+/// The error names the variable and the rule, never the configured value:
+/// external-secret suffixes apply to every `FERRUM_*` key, so the value must
+/// not be echoed into a diagnostic (`secrets::is_external_secret_key`).
+pub fn tls_store_lock_timeout_from_env() -> Result<std::time::Duration, String> {
+    parse_tls_store_lock_timeout(
+        crate::config::conf_file::resolve_ferrum_var(TLS_STORE_LOCK_TIMEOUT_KEY).as_deref(),
+    )
+}
+
+/// The parsing/validation half of [`tls_store_lock_timeout_from_env`], split out
+/// from the environment read.
+///
+/// `None` is "the key is configured nowhere". Keeping the decision pure is what
+/// lets the three-outcome contract above be tested exhaustively without any
+/// test mutating a process-wide `FERRUM_*` variable that concurrently running
+/// store-open tests in the same binary would read.
+pub fn parse_tls_store_lock_timeout(raw: Option<&str>) -> Result<std::time::Duration, String> {
+    let seconds = match raw {
+        None => DEFAULT_TLS_STORE_LOCK_TIMEOUT_SECONDS,
+        Some(value) => value.trim().parse::<u64>().map_err(|_| {
+            format!(
+                "{TLS_STORE_LOCK_TIMEOUT_KEY} must be a whole number of seconds; \
+                 the configured value is not"
+            )
+        })?,
+    };
+    Ok(std::time::Duration::from_secs(seconds.clamp(
         MIN_TLS_STORE_LOCK_TIMEOUT_SECONDS,
         MAX_TLS_STORE_LOCK_TIMEOUT_SECONDS,
-    );
-    std::time::Duration::from_secs(seconds)
+    )))
 }
 
 /// Operator-pinned identity for this instance's shared TLS store leases

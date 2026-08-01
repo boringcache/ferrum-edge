@@ -1134,3 +1134,97 @@ async fn finish_settles_an_in_flight_heartbeat_before_release() {
         "a settled, released claim hands over immediately"
     );
 }
+
+/// Dropping a keeper must not release its claim on the runtime thread.
+///
+/// `TlsLeaseGuard`'s release is a synchronous read-modify-write under the lease
+/// store's *cross-process* advisory lock, bounded only by
+/// `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`. `finish()` has always offloaded it,
+/// but the emergency path — a keeper abandoned by an early return, a panic, or
+/// a cancelled scheduler — used to let the guard drop in place, which on a
+/// Tokio worker parks that worker for as long as a peer holds the lock.
+///
+/// The test holds the lock exactly as a mid-flight peer writer would, so an
+/// inline release would block. A single-worker runtime makes that observable:
+/// if the drop blocked, the `yield_now` below could never complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn dropping_a_keeper_never_releases_the_claim_on_a_runtime_worker() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let instance_a = instance(dir.path(), "instance-a");
+    let name = acme_renewal_lease_name("cert-abandoned-mid-renewal");
+    let ttl = Duration::from_secs(30);
+    let guard = instance_a
+        .try_acquire(&name, ttl)
+        .expect("A claims")
+        .expect("an unclaimed lease is acquirable");
+    let keeper = RenewalLeaseKeeper::start(guard, ttl);
+
+    // A peer writer holds the store lock, so any synchronous release would wait
+    // on it rather than returning promptly.
+    let blocker = hold_store_lock(dir.path());
+
+    drop(keeper);
+
+    // The sole worker is still able to make progress. An inline release would
+    // be parked on the lock the blocker holds, and this could not complete.
+    tokio::time::timeout(Duration::from_secs(5), tokio::task::yield_now())
+        .await
+        .expect("a keeper drop must not park the runtime worker");
+
+    // Hand the lock back; the deferred release can now land.
+    std::mem::drop(blocker);
+
+    // Fail-safe either way: the claim is released promptly if the deferred work
+    // ran, and lapses at `expires_at` if it could not be scheduled. What must
+    // not happen is the runtime stalling, which the assertion above covers.
+    let instance_b = instance(dir.path(), "instance-b");
+    let taken_over = wait_until_async(SETTLE_BUDGET, || {
+        instance_a
+            .peek(&name)
+            .ok()
+            .flatten()
+            .is_some_and(|record| record.expires_at <= Utc::now())
+    })
+    .await;
+    assert!(
+        taken_over,
+        "a dropped keeper's claim must be released rather than held for the full TTL"
+    );
+
+    let reclaimed = instance_b.try_acquire(&name, ttl).expect("B claims");
+    let reclaimed = reclaimed.expect("a released claim hands over to another instance");
+
+    // Release off the runtime for the same reason the keeper does.
+    tokio::task::spawn_blocking(move || drop(reclaimed))
+        .await
+        .expect("release the takeover claim");
+}
+
+/// `finish()` keeps its stronger guarantee: the release is awaited, so by the
+/// time it returns the claim is observably released rather than merely
+/// scheduled.
+///
+/// This is the contrast with the drop path above, and it is what stops the
+/// offload from being mistaken for a weakening of the normal shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finish_still_settles_the_release_before_it_returns() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let instance_a = instance(dir.path(), "instance-a");
+    let name = acme_renewal_lease_name("cert-finished-cleanly");
+    let ttl = Duration::from_secs(30);
+    let guard = instance_a
+        .try_acquire(&name, ttl)
+        .expect("A claims")
+        .expect("an unclaimed lease is acquirable");
+    let keeper = RenewalLeaseKeeper::start(guard, ttl);
+
+    keeper.finish().await.expect("finish releases the claim");
+
+    // Read immediately, with no polling: `finish()` awaited the release, so the
+    // claim is already released on return.
+    let record = instance_a.peek(&name).expect("read").expect("present");
+    assert!(
+        record.expires_at <= Utc::now(),
+        "finish() must not return before the release has landed"
+    );
+}

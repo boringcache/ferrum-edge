@@ -324,6 +324,11 @@ pub enum AcmeError {
     Parse(String),
     #[error("ACME directory URL is not permitted: {0}")]
     BlockedDirectoryUrl(String),
+    /// A gateway setting the store depends on is present but unusable. This is
+    /// an operator configuration failure on the server, not a bad request, and
+    /// is reported as such. Carries only the rule that was broken.
+    #[error("ACME store is misconfigured: {0}")]
+    InvalidConfiguration(String),
 }
 
 impl From<SharedStoreError> for AcmeError {
@@ -336,6 +341,10 @@ impl From<SharedStoreError> for AcmeError {
             SharedStoreError::Write { .. } | SharedStoreError::LockTimeout { .. } => {
                 Self::Write(error.to_string())
             }
+            // A store that cannot be opened on the configured settings is a
+            // configuration failure, not a missing record: fail closed with the
+            // rule that was broken so the operator can see it.
+            SharedStoreError::InvalidConfig { .. } => Self::InvalidConfiguration(error.to_string()),
         }
     }
 }
@@ -2253,6 +2262,32 @@ async fn cleanup_dns01_challenges_with_hook(
     Ok(())
 }
 
+/// Invoke the operator's DNS-01 provider hook for one challenge.
+///
+/// The command is executed **directly**, never through a shell, and challenge
+/// material is passed in the environment rather than on a command line, so a
+/// hostile identifier or token cannot become shell syntax and does not appear
+/// in the process table. Failure diagnostics carry the exit status only —
+/// never the token, the key authorization, or the TXT value.
+///
+/// # Cancellation kills the child
+///
+/// `kill_on_drop(true)` is load-bearing for the shared renewal claim, not a
+/// tidy-up. `RenewalLeaseKeeper::guarded` cancels by *dropping* this future the
+/// moment the claim is lost, and a DNS-01 hook's whole purpose is to publish or
+/// retract `_acme-challenge` records that the instance which took the claim
+/// over is now relying on. Without `kill_on_drop` the child survives its
+/// dropped future and can still perform that side effect after takeover,
+/// silently contradicting the ownership guarantee the lease exists to provide.
+/// With it, dropping the future kills the child on the next runtime turn.
+///
+/// The boundary is the **direct child**. A hook that forks its own detached
+/// descendants — a background `dig` loop, a daemonized provider client, a shell
+/// wrapper that backgrounds work — cannot be reached from here on any
+/// supported platform without a process group or job object, which the hook
+/// itself controls. Operators writing hooks that outlive their own exit must
+/// therefore make them idempotent and re-checkable; Ferrum guarantees the
+/// process it started is terminated, not the process tree it may have spawned.
 #[cfg(feature = "acme")]
 async fn run_dns01_hook(
     command: &str,
@@ -2275,6 +2310,7 @@ async fn run_dns01_hook(
             &summary.txt_record_name,
         )
         .env("FERRUM_ACME_DNS01_TXT_VALUE", &summary.txt_value)
+        .kill_on_drop(true)
         .status()
         .await
         .map_err(|error| AcmeError::Write(format!("failed to run DNS-01 hook: {error}")))?;
@@ -2284,6 +2320,23 @@ async fn run_dns01_hook(
         )));
     }
     Ok(())
+}
+
+/// Test seam for `run_dns01_hook`.
+///
+/// The cancellation contract above is only meaningful if something proves it,
+/// and proving it needs a real child process driven from a real runtime. The
+/// hook runner itself stays private; this forwards to it without widening the
+/// production surface with anything callers could mistake for an API.
+#[cfg(feature = "acme")]
+#[doc(hidden)]
+#[allow(dead_code)]
+pub async fn run_dns01_hook_for_tests(
+    command: &str,
+    action: &str,
+    challenge: &AcmeDns01ChallengeRecord,
+) -> Result<(), AcmeError> {
+    run_dns01_hook(command, action, challenge).await
 }
 
 #[cfg(feature = "acme")]

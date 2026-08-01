@@ -462,6 +462,11 @@ pub struct RenewalLeaseLost;
 ///   almost no lifetime left could expire and be taken over between the
 ///   confirmation and the hook's first poll.
 ///
+/// Every one of those store operations is synchronous and lock-taking, so none
+/// of them ever runs on a runtime worker — including the release performed when
+/// a keeper is dropped rather than finished, which is handed to the blocking
+/// pool and falls back to expiry if it cannot be scheduled.
+///
 /// A crashed process runs no heartbeat, so its claim expires and the
 /// certificate becomes reclaimable exactly as before.
 #[derive(Debug)]
@@ -882,15 +887,54 @@ impl Drop for RenewalLeaseKeeper {
         // sleep does not wait out the interval).
         //
         // A single detached in-flight beat cannot resurrect the claim. The
-        // guard's release — which runs immediately after this, when the
-        // keeper's fields drop — checks only holder and fence, while an
-        // extension additionally requires the record to be *live*. So a beat
-        // that lands first is overwritten by the release, and one that lands
-        // after it sees an already-elapsed `expires_at` and declines.
+        // guard's release checks only holder and fence, while an extension
+        // additionally requires the record to be *live*. So a beat that lands
+        // before the release is overwritten by it, and one that lands after
+        // sees an already-elapsed `expires_at` and declines. That holds whether
+        // the release runs now or a moment later on a blocking thread, which is
+        // why the deferral below is safe.
         self.progress.request_stop();
         let _ = self.stop_tx.send(true);
         if let Some(handle) = self.heartbeat.take() {
             handle.abort();
+        }
+        self.release_without_blocking_the_runtime();
+    }
+}
+
+impl RenewalLeaseKeeper {
+    /// Release the claim from `Drop` without ever parking a runtime thread.
+    ///
+    /// `TlsLeaseGuard::drop` performs a *synchronous* read-modify-write under
+    /// the lease store's cross-process advisory lock, which can wait up to
+    /// `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`. Letting the keeper's fields
+    /// drop in place would therefore block whichever thread abandoned the
+    /// renewal — on the emergency path that is a Tokio worker, and blocking one
+    /// for up to two minutes because a shared volume is contended is exactly
+    /// the runtime stall this offload exists to prevent. `finish()` is
+    /// unaffected: it still settles the heartbeat and then awaits the release
+    /// on a blocking thread, so its ordering guarantee is unchanged.
+    ///
+    /// Fail-safe by expiry. If the guard cannot be handed to a blocking thread
+    /// the claim is simply not released here; it stops being heartbeaten (the
+    /// loop has just been stopped and aborted) and lapses at `expires_at`,
+    /// after which another replica takes it over. Never releasing is always
+    /// safe; blocking the runtime is not.
+    fn release_without_blocking_the_runtime(&mut self) {
+        let Some(guard) = self.guard.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            // On a runtime: the release must not run here. Dropping the guard
+            // inside the blocking task performs exactly the same release.
+            // The join handle is discarded deliberately: dropping a
+            // `spawn_blocking` handle does not cancel the task, so the release
+            // still runs to completion on the blocking pool.
+            Ok(handle) => drop(handle.spawn_blocking(move || drop(guard))),
+            // Off-runtime (a synchronous caller, a test, shutdown after the
+            // runtime is gone): there is no worker to protect and no blocking
+            // pool to schedule onto, so release inline as before.
+            Err(_) => drop(guard),
         }
     }
 }
@@ -983,6 +1027,15 @@ fn heartbeat_interval(ttl: Duration) -> Duration {
 }
 
 impl Drop for TlsLeaseGuard {
+    /// Release the claim synchronously.
+    ///
+    /// This waits on the lease store's advisory lock, so it must not run on a
+    /// Tokio worker. Every async owner arranges that: `RenewalLeaseKeeper`
+    /// releases through `spawn_blocking` on both the normal
+    /// ([`RenewalLeaseKeeper::finish`]) and emergency
+    /// (`RenewalLeaseKeeper::release_without_blocking_the_runtime`) paths. A
+    /// guard held directly by async code must do the same rather than letting
+    /// it drop in place.
     fn drop(&mut self) {
         if self.released {
             return;

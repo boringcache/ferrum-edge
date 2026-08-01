@@ -163,6 +163,11 @@ pub enum ManagedTlsError {
     Write(String),
     #[error("failed to parse managed TLS store: {0}")]
     Parse(String),
+    /// A gateway setting the store depends on is present but unusable. This is
+    /// an operator configuration failure on the server, not a bad request, and
+    /// is reported as such. Carries only the rule that was broken.
+    #[error("managed TLS store is misconfigured: {0}")]
+    InvalidConfiguration(String),
 }
 
 impl From<SharedStoreError> for ManagedTlsError {
@@ -175,6 +180,10 @@ impl From<SharedStoreError> for ManagedTlsError {
             SharedStoreError::Write { .. } | SharedStoreError::LockTimeout { .. } => {
                 Self::Write(error.to_string())
             }
+            // A store that cannot be opened on the configured settings is a
+            // configuration failure, not a missing record: fail closed with the
+            // rule that was broken so the operator can see it.
+            SharedStoreError::InvalidConfig { .. } => Self::InvalidConfiguration(error.to_string()),
         }
     }
 }

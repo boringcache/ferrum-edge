@@ -289,3 +289,58 @@ fn a_challenge_committed_by_another_instance_becomes_visible() {
         );
     }
 }
+
+/// A *missing* account store is an empty credential set; an *unreadable* one is
+/// an error. These are not the same answer and must never collapse into one.
+///
+/// The admin accounts listing depends on exactly this distinction. Accounts are
+/// also derivable from orders, so "no persisted credentials" is a legitimate
+/// result and a missing file must produce it. But an invalid store path, a
+/// corrupt document, or a misconfigured store is unreachable state, and
+/// reporting that as "no persisted credentials" tells an operator their ACME
+/// accounts are gone when in fact they cannot be read — which is exactly the
+/// moment they most need to know the difference.
+#[test]
+fn a_missing_account_store_reads_empty_but_an_unreadable_one_fails_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Nothing has ever been written: opening succeeds and the store is empty.
+    let store = AcmeAccountStore::open(dir.path()).expect("a missing store opens");
+    assert!(
+        store
+            .list_accounts()
+            .expect("a missing store reads as empty, not as a failure")
+            .is_empty()
+    );
+    assert!(
+        store
+            .get_credentials(DIRECTORY_URL, ACCOUNT_ID)
+            .expect("a missing store answers rather than failing")
+            .is_none()
+    );
+
+    store
+        .upsert_account(
+            ACCOUNT_ID.to_string(),
+            DIRECTORY_URL.to_string(),
+            r#"{"redacted":true}"#.to_string(),
+        )
+        .expect("persist an account");
+
+    // Corrupt the shared document as a truncated write or a damaged volume
+    // would. A fresh reader must fail rather than report an empty account set.
+    std::fs::write(dir.path().join("acme-accounts.json"), b"{ not json")
+        .expect("corrupt the account store");
+
+    let reopened = AcmeAccountStore::open(dir.path());
+    let error = match reopened {
+        Err(error) => error,
+        Ok(store) => store
+            .list_accounts()
+            .expect_err("an unreadable account store must not read as empty"),
+    };
+    assert!(
+        matches!(error, AcmeError::Parse(_) | AcmeError::Read(_)),
+        "a corrupt account store must surface as a read/parse failure, got {error:?}"
+    );
+}

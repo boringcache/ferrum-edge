@@ -795,13 +795,14 @@ directory.
 | Concern | Mechanism |
 | --- | --- |
 | Cross-instance visibility | Every read revalidates the document against the file's replacement identity and re-reads on change. `managed://` / `acme://` source polling (`FERRUM_SECRET_REFRESH_INTERVAL_SECONDS`, or a per-source `?poll=`) therefore picks up another replica's rotation through the ordinary reload path. |
-| Read availability | Reads never wait on the writer lock. Publication is fsync + atomic rename, so a reader observes one complete generation or the other and its next read detects the newer one. Challenge lookups and admin reads cannot be stalled by a slow writer. |
+| Read availability | Reads never wait on the writer lock. Publication is fsync + atomic replacement of the destination (`rename(2)` on Unix; `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING \| MOVEFILE_WRITE_THROUGH` on Windows), so a reader observes one complete generation or the other and its next read detects the newer one. The destination is never unlinked first, so it is never observably absent — an absent store document reads as an empty one. Challenge lookups and admin reads cannot be stalled by a slow writer. |
+| Runtime isolation of blocking work | Every mutation is a synchronous read-modify-write that can wait on the advisory lock for up to `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`. Admin managed-TLS/ACME writes, account-credential mirroring, failed-order persistence, and every lease operation (acquire, heartbeat, fenced commit, refresh, release) therefore run on the blocking pool, never on a Tokio worker, so a contended or wedged shared volume cannot stall request serving. A write that cannot be driven to a conclusion is reported as a server error, never as success. Reads stay on the runtime because they take no lock. |
 | Lost-update prevention | Each mutation takes an exclusive advisory lock on a sidecar `.<file>.lock`, re-reads the authoritative document under that lock, applies the change, and republishes atomically. Create-without-overwrite and cross-kind ID conflicts are evaluated against authoritative state, so a concurrent create returns `409` rather than silently replacing another instance's record. |
 | Single renewer | Before renewing a certificate, an instance must win that certificate's claim in `tls-leases.json`. Exactly one holder is granted at a time — a live claim excludes *every* other acquirer, including one presenting the same instance identity — so two replicas cannot create duplicate orders or collide on challenge state. |
 | Ownership for the whole operation | The winner heartbeats its claim at a third of the TTL for as long as the renewal runs, and every stretch of external work (account/order calls, the DNS-01 publication hook, the propagation wait, authorization polling, finalization, certificate download, and the DNS-01 *cleanup* hook) is cancelled if the claim is lost — so a superseded instance never retracts `_acme-challenge` records the new owner is about to revalidate. The cleanup hook additionally *refreshes* the claim under the lease store's own lock before it starts, rather than relying on the heartbeat having already published the loss: a takeover lands in the table before any beat has had a reason to notice it, and a retraction that is ready to run would otherwise complete inside that gap. Refreshing rather than merely re-reading also means the hook starts on a full TTL — a claim confirmed with a sliver of lifetime left could legally expire and be taken over between the check and the hook's first poll. A refresh that cannot be granted (taken over, expired, or a store error) abandons the renewal. |
 | Fenced store commits | Each account/order/certificate write runs *while the lease table's exclusive lock is held*, after re-verifying holder, fence, and liveness under that lock. Acquisition and takeover block on the same lock, so a superseded instance cannot land a stale write alongside the new owner's — a before/after ownership check would detect that race but could not undo it. The lease document itself is never rewritten by a commit, so a target-store error propagates without disturbing any holder's claim. The lock is held only across the synchronous write, never across a network call, hook, or sleep. |
 | Crash recovery | A claim carries `expires_at` (`FERRUM_ACME_RENEWAL_LEASE_TTL_SECONDS`) and a monotonic fence. A dead holder runs no heartbeat, so the claim expires and another replica takes over; the dead holder's fence is stale, so it can no longer renew or release the claim if it comes back. |
-| Fail-closed ambiguity | A lock that cannot be taken within `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`, an unreadable or unparseable document, an unreadable lease table, or any heartbeat error is an error. Admin mutations fail, HTTP-01/TLS-ALPN-01 challenges are not served from stale state, and the renewal is abandoned rather than run twice. |
+| Fail-closed ambiguity | A lock that cannot be taken within `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`, a malformed value for that setting, an unreadable or unparseable document, an unreadable lease table, or any heartbeat error is an error. Admin mutations fail, HTTP-01/TLS-ALPN-01 challenges are not served from stale state, and the renewal is abandoned rather than run twice. A store that is merely *missing* is a successful empty store — that is a real answer, not a failure — but a store that cannot be opened or parsed is never reported as an empty one. |
 
 ### Operational notes
 
@@ -829,6 +830,27 @@ directory.
   for Ferrum, so a renewal that outran a static TTL would previously have
   overlapped with its successor. Continuous maintenance plus
   cancel-on-loss — not the TTL value — is what bounds overlap.
+- **DNS-01 hook cancellation stops the process Ferrum started, not its
+  descendants.** A DNS-01 hook is a child process, and cancelling the renewal
+  cancels it: the hook is spawned with kill-on-drop, so losing the claim
+  terminates the running hook instead of leaving it free to publish or retract
+  `_acme-challenge` records the new owner depends on. That guarantee covers the
+  **direct child**. A hook that forks detached descendants — a backgrounded
+  provider client, a shell wrapper that returns before its work finishes — is
+  outside Ferrum's reach on every supported platform, because only the hook
+  itself can put that work in a process group or job object. Write hooks that
+  do their work in the foreground; if a hook must spawn background work, make
+  it idempotent and safe to interleave with another replica performing the same
+  publication.
+- **An abandoned renewal releases its claim off the runtime.** Normal
+  completion settles the heartbeat and then awaits the release, so the claim is
+  observably free when the renewal returns. An *abandoned* renewal — an early
+  return, a panic, a cancelled scheduler — cannot await anything, so the release
+  is handed to the blocking pool instead of running inline; a lock-taking
+  release on a Tokio worker would park that worker for up to
+  `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`. If it cannot be scheduled at all the
+  claim is simply not released and lapses at `expires_at`, which is the same
+  path a crash takes. Never releasing is safe; stalling the runtime is not.
 - Managed TLS and ACME admin endpoints use the non-topology admin write gate
   (read-only mode and database-unavailable) only. They deliberately do not
   acquire a config-database write-topology pin and are not gated by

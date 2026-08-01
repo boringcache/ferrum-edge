@@ -373,6 +373,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: importAcmeCertificate
       summary: Import an ACME-issued certificate and private key
@@ -500,6 +502,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createAcmeOrder
       summary: Create an ACME HTTP-01, TLS-ALPN-01, or DNS-01 order
@@ -549,6 +553,10 @@ paths:
         Lists non-secret ACME account metadata discovered from persisted
         ACME account credentials, orders, and certificates. Account credentials
         are never returned.
+
+        An empty list means the shared stores hold no accounts. A store that
+        cannot be opened, read, or parsed returns `500` instead: an unreachable
+        account store is never reported as "no persisted credentials".
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/PaginationLimit"
@@ -566,6 +574,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/acme/renew/{id}:
     post:
@@ -715,6 +725,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createManagedTlsCertificate
       summary: Upload an admin-managed TLS certificate and private key
@@ -848,6 +860,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createManagedTlsCaBundle
       summary: Upload an admin-managed TLS CA bundle
@@ -978,6 +992,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createManagedTlsCrl
       summary: Upload an admin-managed TLS CRL bundle
@@ -1106,6 +1122,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createManagedTlsOcspResponse
       summary: Upload an admin-managed DER OCSP response
@@ -1234,6 +1252,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createManagedTlsJwks
       summary: Upload an admin-managed JWKS document
