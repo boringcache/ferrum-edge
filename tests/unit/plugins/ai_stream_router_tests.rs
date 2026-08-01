@@ -4118,3 +4118,79 @@ async fn test_upstream_error_envelope_is_serialized_through_the_bound() {
          construction"
     );
 }
+
+/// A route-effective retained ceiling BELOW the buffered slice size.
+///
+/// Slicing the input at a constant only bounds the input; the normalized
+/// expansion of one slice is still unbounded by this response's ceiling. The
+/// accumulator itself is now the bound, so a normalization whose output crosses
+/// a small route ceiling is refused while it is being written — and a ceiling
+/// that comfortably holds the same output still produces the exact bytes
+/// (GHSA-pwcm-6rh8-f2gh).
+#[tokio::test]
+async fn test_buffered_normalizer_is_bounded_by_a_route_ceiling_below_the_slice_size() {
+    let body = long_anthropic_sse(600);
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+
+    let mut roomy = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut roomy, &mut headers).await;
+    let normalized = plugin
+        .normalize_response_body_with_context(
+            &mut roomy,
+            200,
+            body.as_bytes(),
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("an ample ceiling must still normalize");
+    assert!(
+        normalized.len() > 8 * 1024,
+        "the fixture must normalize to more than the small ceiling below, got {}",
+        normalized.len()
+    );
+
+    for ceiling in [1usize, 512, 8 * 1024, 16 * 1024] {
+        let mut ctx = post_ctx(&claude);
+        let mut headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        ctx.max_response_body_size_bytes = ceiling;
+        assert!(
+            plugin
+                .normalize_response_body_with_context(
+                    &mut ctx,
+                    200,
+                    body.as_bytes(),
+                    Some("text/event-stream"),
+                    &HashMap::new(),
+                )
+                .await
+                .is_none(),
+            "a normalization larger than a {ceiling}-byte retained ceiling must be \
+             refused, including ceilings below the buffered slice size"
+        );
+    }
+
+    // A ceiling that exactly covers the normalized output still admits it, so
+    // the refusals above are the bound and not an unconditional failure.
+    let mut exact = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut exact, &mut headers).await;
+    exact.max_response_body_size_bytes = normalized.len();
+    let admitted = plugin
+        .normalize_response_body_with_context(
+            &mut exact,
+            200,
+            body.as_bytes(),
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("a ceiling equal to the output must admit it");
+    assert_eq!(
+        admitted, normalized,
+        "bounding the accumulator must not change the normalized bytes"
+    );
+}

@@ -580,7 +580,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "ai_response_guard",
         classification: BuiltinPluginClassification::Public,
         priority: 4075,
-        active_phases: "after_proxy, on_response_body, transform_response_body",
+        active_phases: "after_proxy, on_response_body, transform_response_body, on_final_response_body",
         matrix_protocols: HTTP_GRPC_PROTOCOLS,
         protocol_rationale: "HTTP JSON/SSE/text response inspection; native gRPC only for methods enrolled in the descriptor-based `grpc` block",
     },

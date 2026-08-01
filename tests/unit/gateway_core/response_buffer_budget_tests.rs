@@ -2446,3 +2446,145 @@ fn the_two_ceiling_peak_is_documented_as_exact() {
          so a later build-then-copy producer is visibly a doc violation"
     );
 }
+
+/// The reserve-then-fill seam's CONTRACT, stated exactly.
+///
+/// `append_with` documents that it verifies the produced length and fails
+/// closed on a mismatch. A zero-length append used to return `true` without
+/// invoking `fill` at all, so the documented failure/length checks did not
+/// describe what it did. It now runs the fill and verifies the result for every
+/// admitted length, including zero.
+#[test]
+fn the_reserve_then_fill_seam_honours_its_contract_at_zero_length() {
+    use ferrum_edge::_test_support::BoundedResponseBodySinkProbe;
+
+    // A zero-length fill that writes nothing is admitted, and the fill really
+    // ran: the observed room is the length it was admitted for.
+    let mut empty = BoundedResponseBodySinkProbe::with_ceiling(8);
+    assert_eq!(
+        empty.append_observing_room(0),
+        Some(0),
+        "a zero-length append must still invoke the fill"
+    );
+    assert_eq!(empty.len(), 0);
+    assert!(!empty.overflowed());
+
+    // A zero-length fill that FAILS is fail-closed like any other.
+    let mut failed = BoundedResponseBodySinkProbe::with_ceiling(8);
+    assert!(!failed.append_failing(0));
+    assert!(failed.overflowed());
+    assert!(failed.finish().is_none());
+
+    // A zero-length fill that writes anyway is a length mismatch.
+    let mut sneaky = BoundedResponseBodySinkProbe::with_ceiling(8);
+    assert!(!sneaky.append_declaring(0, b"x"));
+    assert!(sneaky.overflowed());
+    assert!(sneaky.finish().is_none());
+}
+
+/// The fill's target is LIMITED to the room it was admitted for, so a producer
+/// cannot grow the sink past its ceiling before the post-fill length check runs.
+#[test]
+fn the_reserve_then_fill_target_admits_exactly_the_reserved_room() {
+    use ferrum_edge::_test_support::BoundedResponseBodySinkProbe;
+
+    let mut sink = BoundedResponseBodySinkProbe::with_ceiling(64);
+    assert_eq!(
+        sink.append_observing_room(8),
+        Some(8),
+        "the fill may address exactly the bytes it was admitted for, never the \
+         buffer's spare capacity"
+    );
+    assert_eq!(sink.len(), 8);
+
+    // A second append is limited to its own room, not to the ceiling remainder.
+    assert_eq!(sink.append_observing_room(4), Some(4));
+    assert_eq!(sink.len(), 12);
+
+    // Room past the ceiling is refused before the target exists at all.
+    assert!(sink.append_observing_room(64).is_none());
+    assert!(sink.overflowed());
+    assert!(sink.finish().is_none());
+}
+
+/// Long fills still stream: an append that fills the whole ceiling in one call
+/// is admitted, and the one that would cross it is refused with nothing partial
+/// retained.
+#[test]
+fn the_reserve_then_fill_seam_admits_a_full_ceiling_and_refuses_the_next_byte() {
+    use ferrum_edge::_test_support::BoundedResponseBodySinkProbe;
+
+    let mut sink = BoundedResponseBodySinkProbe::with_ceiling(4096);
+    assert_eq!(sink.append_observing_room(4096), Some(4096));
+    assert_eq!(sink.len(), 4096);
+    assert!(!sink.overflowed());
+    assert!(!sink.append_exact(b"x"));
+    assert!(sink.overflowed());
+    assert!(sink.finish().is_none());
+}
+
+/// The construction-side bounds this repair round added, pinned present so a
+/// later change cannot quietly restore a build-then-measure shape.
+#[test]
+fn the_root_review_repairs_are_pinned_in_source() {
+    let grpc_web = include_str!("../../../src/plugins/grpc_web.rs");
+    assert!(
+        grpc_web.contains("struct CountingTrailerPayloadSink")
+            && grpc_web.contains("struct WriterTrailerPayloadSink"),
+        "the gRPC-Web trailer frame must be measured by a counting pass and \
+         written straight into the final bounded destination"
+    );
+    assert!(
+        !grpc_web.contains("let trailer_payload = payload_sink.finish()?;"),
+        "a complete trailer payload must not be materialised beside the output"
+    );
+    assert!(
+        !grpc_web.contains("let mut eligible: Vec<(String, String)> = Vec::new();"),
+        "eligible trailer values must not be cloned into an owned vector before \
+         the bounded sink applies"
+    );
+
+    let stream_router = include_str!("../../../src/plugins/ai_stream_router.rs");
+    assert!(
+        stream_router.contains("pub(crate) struct NormalizedSseOut"),
+        "normalized SSE bytes must be written through a ceiling-bounded \
+         accumulator from the first byte"
+    );
+    assert!(
+        stream_router.contains("NormalizedSseOut::with_ceiling(ceiling)"),
+        "the buffered path must bind the accumulator to this response's \
+         retained ceiling, not to a constant"
+    );
+    assert!(
+        !stream_router.contains("fn chunk_line(&mut self"),
+        "an SSE line must not be built as a complete `String` outside the sink"
+    );
+
+    let guard = include_str!("../../../src/plugins/ai_response_guard.rs");
+    assert!(
+        guard.contains("ai_response_guard_pending_redactions"),
+        "a promised redaction must be tracked in typed request state so a \
+         refused construction cannot be forwarded as `unchanged`"
+    );
+    assert!(
+        guard.contains("async fn on_final_response_body("),
+        "the final verification seam must stay in place"
+    );
+    assert_eq!(
+        guard.matches("ResponseTransformWindow::open(").count(),
+        3,
+        "every full-size candidate built outside a producer phase — the SSE \
+         residual scan, the JSON/content residual scan, and the native-gRPC \
+         redaction preflight — must reserve a real window first"
+    );
+
+    let budget = include_str!("../../../src/proxy/response_buffer_budget.rs");
+    assert!(
+        budget.contains("bytes::buf::Limit"),
+        "the reserve-then-fill target must be limited to the admitted room"
+    );
+    assert!(
+        !budget.contains("if additional == 0 {\n            return true;\n        }"),
+        "the zero-length append must not skip the fill and its length check"
+    );
+}

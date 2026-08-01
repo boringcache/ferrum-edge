@@ -2237,6 +2237,22 @@ pub struct RequestContext {
     /// redaction transform. Kept outside public metadata so response data or a
     /// custom plugin cannot opt a replay into or out of mandatory rewriting.
     pub(crate) ai_response_guard_replay_redactions: HashSet<u64>,
+    /// `ai_response_guard` instances that DETECTED governed content under
+    /// `action: redact` and have not yet installed a replacement for it.
+    ///
+    /// Detection returns `Continue` so the redaction can happen in the producer
+    /// phase, but a producer may legitimately return `None` — an over-ceiling or
+    /// refused construction, a representation its rewriter cannot address — and
+    /// `None` means UNCHANGED to the shared transform loop. Without this, the
+    /// original detected body would be forwarded while the request was recorded
+    /// as redacted. The instance clears its own entry when its transform installs
+    /// bytes, and anything still pending at `on_final_response_body` is a
+    /// fail-closed rejection (GHSA-pwcm-6rh8-f2gh).
+    ///
+    /// Typed and outside `metadata` deliberately: this is the authority for
+    /// whether a redaction actually happened, so neither response content nor a
+    /// custom plugin may clear it.
+    pub(crate) ai_response_guard_pending_redactions: HashMap<u64, String>,
     /// `ai_tool_governor` equivalent of
     /// `ai_response_guard_replay_redactions`. Instance scoping prevents one
     /// governor from consuming another instance's transform requirement.
@@ -2870,6 +2886,7 @@ impl RequestContext {
             openapi_validator_client_contract_enforced: HashSet::new(),
             ai_tool_governor_response_hashes: HashMap::new(),
             ai_response_guard_replay_redactions: HashSet::new(),
+            ai_response_guard_pending_redactions: HashMap::new(),
             ai_tool_governor_replay_redactions: HashSet::new(),
             json_scan_memo: crate::util::json_dup_keys::JsonScanMemo::default(),
             ai_tool_governor_call_hashes: HashMap::new(),
@@ -3804,6 +3821,7 @@ impl RequestContext {
                 .clone(),
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
             ai_response_guard_replay_redactions: self.ai_response_guard_replay_redactions.clone(),
+            ai_response_guard_pending_redactions: self.ai_response_guard_pending_redactions.clone(),
             ai_tool_governor_replay_redactions: self.ai_tool_governor_replay_redactions.clone(),
             // Carried into the final-request-body stage so every plugin in that
             // stage shares one duplicate-key screen of the same body.

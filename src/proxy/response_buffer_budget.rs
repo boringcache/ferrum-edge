@@ -94,18 +94,41 @@
 //! [`bounded_vec_from`] on it afterwards. [`bounded_vec_from`] remains correct
 //! only where its input is not itself a would-be complete replacement.
 //!
-//! Two corollaries follow, and both are load-bearing:
+//! Three corollaries follow, and all are load-bearing:
 //!
 //! * a producer that genuinely needs an intermediate representation (the
 //!   `ai_response_guard` regex redactor applies its pattern set in sequential
 //!   passes, because a placeholder one pattern renders may legitimately be
 //!   rewritten by a later one) keeps its live input and its pass output under ONE
 //!   shared ceiling, so the transient scratch never adds a second window's worth;
+//! * a producer that needs to know its own output's LENGTH before it can write
+//!   it does not learn that by building the output and measuring it. The
+//!   gRPC-Web reframer has to put the trailer payload's length in the frame
+//!   header that precedes the payload, so it emits the payload twice from one
+//!   writer — once into a bounded counter that retains nothing, once straight
+//!   into the final bounded destination (the binary sink, or the base64 encoder
+//!   streaming into the text sink) — and re-checks the written length before
+//!   publishing. Neither a complete trailer payload nor a complete binary
+//!   preimage is ever resident beside the output;
 //! * a full-size candidate body built OUTSIDE a producer phase is charged like
-//!   one. `ai_response_guard`'s SSE residual check builds the exact bytes the
-//!   client would receive in order to decide whether to fail closed, during
-//!   inspection, where no window is open; it opens a [`ResponseTransformWindow`]
-//!   for the duration of that check and treats a refused window as residual.
+//!   one. `ai_response_guard` builds the exact bytes the client would receive in
+//!   order to decide whether to fail closed — the SSE residual scan, the JSON /
+//!   content residual scan, and the native-gRPC redaction preflight all do this
+//!   during inspection, where no window is open. Each opens a
+//!   [`ResponseTransformWindow`] sized to this response's retained ceiling for
+//!   exactly the lifetime of its candidate, and each treats a refused window as
+//!   a REJECTION (residual / unredactable) rather than as licence to build the
+//!   candidate anyway.
+//!
+//! A promised rewrite that never happens is the same hole seen from the other
+//! side. A refused construction returns "no replacement", and to a transform
+//! loop that is indistinguishable from "nothing to change" — so a policy plugin
+//! that already decided the original bytes are unsafe would have them forwarded
+//! by the very refusal that was supposed to be fail-closed. `ai_response_guard`
+//! therefore records a detected-but-not-yet-redacted response in typed request
+//! state (`RequestContext::ai_response_guard_pending_redactions`), discharges it
+//! only when its producer actually installs bytes, and rejects at
+//! `on_final_response_body` when the promise is still outstanding.
 //!
 //! The same rule covers a body a plugin *copies out* into storage that outlives
 //! the request — `response_caching`'s entry copy is a distinct allocation from
@@ -239,6 +262,18 @@
 //! Both shapes are structurally excluded above, and
 //! `tests/unit/gateway_core/response_buffer_budget_tests.rs` holds static
 //! source guards over the declared producer set so neither can come back.
+//!
+//! Stated as precisely as the implementation actually proves it, "two ceilings"
+//! bounds the RETAINED-REPRESENTATION allocations: the body being read, and the
+//! reserved window the replacement is built inside (or, outside a producer
+//! phase, the window a fail-closed candidate is built inside). It is not a claim
+//! about every byte a producer touches. A producer still holds ordinary parse
+//! state derived from its already-charged input — a `serde_json::Value` tree for
+//! one buffered document, one SSE event's parsed frame, one decoded protobuf
+//! message — which is bounded by that input and by the per-event / per-message
+//! caps the plugins enforce, not by a second window. What is excluded is the
+//! shape this advisory is about: a COMPLETE would-be client-visible body, or a
+//! complete preimage of one, alive outside a reservation.
 //!
 //! # Admission
 //!
@@ -1065,20 +1100,32 @@ impl BoundedResponseBodySink {
     /// stop — so instead the room is checked and reserved FIRST and the producer
     /// writes into the sink's own buffer.
     ///
-    /// `additional` must be the exact byte count `fill` will write. A `fill`
-    /// that writes a different length, or fails, is fail-closed: the sink is
-    /// marked overflowed and releases what it held, so nothing partial can be
-    /// published.
+    /// What `fill` receives is deliberately NOT the sink's `Vec`. A `Vec` is an
+    /// auto-growing target: a producer whose declared length disagreed with what
+    /// it writes would reallocate past the ceiling first and only be caught by
+    /// the length check afterwards, which is the "measure a finished
+    /// over-ceiling allocation" shape this module exists to exclude. `fill` gets
+    /// a [`bytes::buf::Limit`] over that buffer instead, whose `remaining_mut()`
+    /// is exactly `additional`, so the room admitted here is the room the
+    /// producer can address. `prost::Message::encode` — the only production
+    /// `fill` — checks `remaining_mut()` against `encoded_len()` up front and
+    /// returns `EncodeError` rather than writing when it is short, so an
+    /// over-declaring producer fails closed instead of growing anything.
+    ///
+    /// `additional` must be the exact byte count `fill` will write, INCLUDING
+    /// zero: a zero-length append still invokes `fill` and still verifies the
+    /// resulting length, because "the fill ran and wrote nothing" and "the fill
+    /// was never called" are different facts and this seam documents the former.
+    /// A `fill` that writes a different length, or fails, is fail-closed: the
+    /// sink is marked overflowed and releases what it held, so nothing partial
+    /// can be published.
     pub(crate) fn append_with<E>(
         &mut self,
         additional: usize,
-        fill: impl FnOnce(&mut Vec<u8>) -> Result<(), E>,
+        fill: impl FnOnce(&mut bytes::buf::Limit<&mut Vec<u8>>) -> Result<(), E>,
     ) -> bool {
         if self.overflowed {
             return false;
-        }
-        if additional == 0 {
-            return true;
         }
         let prospective = prospective_retained_len(self.data.len(), additional);
         if prospective > self.ceiling {
@@ -1090,7 +1137,11 @@ impl BoundedResponseBodySink {
             let target = growth_target(self.data.capacity(), prospective, self.ceiling);
             self.data.reserve_exact(target - self.data.len());
         }
-        let wrote = fill(&mut self.data).is_ok();
+        let wrote = {
+            use bytes::BufMut;
+            let mut limited = (&mut self.data).limit(additional);
+            fill(&mut limited).is_ok()
+        };
         if !wrote || self.data.len() != prospective {
             // Either the producer failed, or it wrote a length that disagrees
             // with the room it was admitted for. Neither may be published.
@@ -1099,6 +1150,20 @@ impl BoundedResponseBodySink {
             return false;
         }
         true
+    }
+
+    /// Discard everything written after `len`.
+    ///
+    /// This only ever SHRINKS, and only for a sink that has not already refused
+    /// a write: an overflowed sink released its buffer, so there is nothing left
+    /// to roll back to and the refusal must stay sticky. The one caller is a
+    /// producer that accumulates across several driver calls and has to abandon
+    /// the current call's emission without losing the ones before it
+    /// ([`crate::plugins::ai_stream_router`]'s normalized-output bound).
+    pub(crate) fn truncate(&mut self, len: usize) {
+        if !self.overflowed && len < self.data.len() {
+            self.data.truncate(len);
+        }
     }
 
     /// The finished buffer, or `None` when any write was refused.

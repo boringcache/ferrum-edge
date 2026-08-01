@@ -6444,17 +6444,23 @@ pub mod _test_support {
         /// re-encode), so it writes into the sink's own buffer instead of
         /// building a complete replacement beside it.
         pub fn append_exact(&mut self, bytes: &[u8]) -> bool {
-            self.0.append_with(bytes.len(), |buffer| {
-                buffer.extend_from_slice(bytes);
-                Ok::<(), ()>(())
-            })
+            self.append_declaring(bytes.len(), bytes)
         }
 
         /// The same seam driven by a `fill` that writes a length other than the
         /// one it was admitted for — which must fail closed rather than publish.
+        ///
+        /// The write mirrors what `prost::Message::encode` does with the limited
+        /// target this seam hands out: check `remaining_mut()` first and refuse
+        /// rather than write past the admitted room, so an over-declaring fill
+        /// is an `Err` and an under-writing one is caught by the length check.
         pub fn append_declaring(&mut self, declared: usize, bytes: &[u8]) -> bool {
             self.0.append_with(declared, |buffer| {
-                buffer.extend_from_slice(bytes);
+                use bytes::BufMut;
+                if buffer.remaining_mut() < bytes.len() {
+                    return Err(());
+                }
+                buffer.put_slice(bytes);
                 Ok::<(), ()>(())
             })
         }
@@ -6462,6 +6468,22 @@ pub mod _test_support {
         /// The same seam driven by a `fill` that FAILS.
         pub fn append_failing(&mut self, declared: usize) -> bool {
             self.0.append_with(declared, |_buffer| Err::<(), ()>(()))
+        }
+
+        /// The room the limited target actually admits, observed from inside
+        /// `fill` — the proof that a producer cannot address more than the
+        /// bytes it was admitted for.
+        pub fn append_observing_room(&mut self, declared: usize) -> Option<usize> {
+            let mut observed = None;
+            let admitted = self.0.append_with(declared, |buffer| {
+                use bytes::BufMut;
+                observed = Some(buffer.remaining_mut());
+                for _ in 0..declared {
+                    buffer.put_u8(0);
+                }
+                Ok::<(), ()>(())
+            });
+            if admitted { observed } else { None }
         }
 
         pub fn finish(self) -> Option<Vec<u8>> {

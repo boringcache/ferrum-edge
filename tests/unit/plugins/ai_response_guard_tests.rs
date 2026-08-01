@@ -5177,3 +5177,142 @@ async fn test_sse_redaction_is_assembled_eventwise_and_preserves_framing() {
         "event framing must be preserved: {redacted}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A promised redaction that never produced a replacement must not be delivered
+// (GHSA-pwcm-6rh8-f2gh).
+//
+// `action: redact` detection returns `Continue` and relies on the producer
+// phase to install the redacted bytes. Every construction refusal — a refused
+// retained ceiling most of all — surfaces as `None`, which the shared transform
+// loop reads as "unchanged". Without a final verification seam that is exactly
+// the original detected body being forwarded while the request is recorded as
+// redacted.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_refused_redaction_construction_does_not_serve_the_detected_body() {
+    let plugin = plaintext_redactor();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    let body = b"a@b.com a@b.com a@b.com a@b.com a@b.com";
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    // Below the expanded replacement, so the producer is refused mid-construction.
+    ctx.max_response_body_size_bytes = 40;
+
+    // Inspection detects and promises a redaction.
+    let inspected = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
+    assert!(
+        matches!(inspected, PluginResult::Continue),
+        "redact-mode detection continues into the producer phase"
+    );
+    assert!(
+        ctx.metadata.contains_key("ai_response_guard_redacted"),
+        "the detection is recorded"
+    );
+
+    // The producer cannot build the replacement under this ceiling.
+    assert!(
+        plugin
+            .transform_response_body_with_context(&mut ctx, body, Some("text/plain"), &headers)
+            .await
+            .is_none(),
+        "the amplifying redaction must be refused during construction"
+    );
+
+    // The final seam must therefore reject rather than let the original through.
+    let final_result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, body)
+        .await;
+    match final_result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(
+                body.contains("could not be redacted before delivery"),
+                "the rejection must be the fixed-cardinality guard terminal: {body}"
+            );
+            assert!(
+                !body.contains("a@b.com"),
+                "the rejection must never echo the detected body: {body}"
+            );
+        }
+        other => panic!("an undischarged redaction must be rejected, got {other:?}"),
+    }
+    assert!(
+        ctx.metadata.contains_key("ai_response_guard_rejected"),
+        "the rejection is recorded for telemetry"
+    );
+}
+
+#[tokio::test]
+async fn test_completed_redaction_discharges_the_final_seam() {
+    let plugin = plaintext_redactor();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    let body = b"mail user@example.com about it";
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    assert!(matches!(
+        plugin.on_response_body(&mut ctx, 200, &mut headers, body).await,
+        PluginResult::Continue
+    ));
+    let redacted = plugin
+        .transform_response_body_with_context(&mut ctx, body, Some("text/plain"), &headers)
+        .await
+        .expect("the redaction is constructible under an ordinary ceiling");
+    assert!(!String::from_utf8(redacted.clone()).unwrap().contains("user@example.com"));
+
+    assert!(
+        matches!(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &headers, &redacted)
+                .await,
+            PluginResult::Continue
+        ),
+        "an installed replacement discharges the promise"
+    );
+}
+
+#[tokio::test]
+async fn test_clean_and_warn_responses_never_arm_the_final_seam() {
+    // A clean body detects nothing, so nothing is promised.
+    let plugin = plaintext_redactor();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let clean = b"nothing to see here";
+    assert!(matches!(
+        plugin.on_response_body(&mut ctx, 200, &mut headers, clean).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        plugin.on_final_response_body(&mut ctx, 200, &headers, clean).await,
+        PluginResult::Continue
+    ));
+
+    // Warn mode forwards deliberately and must not be turned into a rejection.
+    let warner = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "warn"
+    }));
+    let mut warn_ctx = ctx_with_content_type("POST", "application/json");
+    let dirty = b"mail user@example.com about it";
+    assert!(matches!(
+        warner
+            .on_response_body(&mut warn_ctx, 200, &mut headers, dirty)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        warner
+            .on_final_response_body(&mut warn_ctx, 200, &headers, dirty)
+            .await,
+        PluginResult::Continue
+    ));
+}

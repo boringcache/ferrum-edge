@@ -1048,19 +1048,29 @@ impl GrpcWebPlugin {
         let binary_ceiling = if is_text { ceiling / 4 * 3 } else { ceiling };
         use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
 
-        // Build the trailer payload from response headers under the room the
-        // data frames and the frame header leave, so upstream-controlled trailer
-        // values cannot materialise an over-ceiling `Vec` before the output bound
-        // applies (GHSA-pwcm-6rh8-f2gh). When the backend omitted a valid
-        // grpc-status, synthesize from the stashed HTTP status (official client
-        // mapping). Provenance (when recorded) keeps initial-header-only fields
-        // out of the body trailer block.
+        // The trailer payload is emitted TWICE and retained neither time
+        // (GHSA-pwcm-6rh8-f2gh). The frame header declares the payload length,
+        // so the length must be known before the payload can be written; the
+        // counting pass below establishes it under the room the data frames and
+        // the frame header leave, WITHOUT holding a single trailer value, and
+        // the writing pass then emits the payload straight into the final
+        // bounded destination (the binary sink, or the base64 encoder streaming
+        // into the text sink). Neither a complete trailer payload nor a complete
+        // binary preimage is ever resident beside the output.
+        //
+        // When the backend omitted a valid grpc-status, the writer synthesizes
+        // from the stashed HTTP status (official client mapping). Provenance
+        // (when recorded) keeps initial-header-only fields out of the body
+        // trailer block. Both passes read the same immutable header map, so they
+        // produce identical bytes; the written length is re-checked below
+        // anyway, so a disagreement fails closed instead of shipping a frame
+        // whose declared length lies.
         let payload_ceiling = binary_ceiling
             .checked_sub(body.len())?
             .checked_sub(GRPC_FRAME_HEADER_BYTES)?;
-        let mut payload_sink = BoundedResponseBodySink::with_ceiling(payload_ceiling);
+        let mut counted = CountingTrailerPayloadSink::with_ceiling(payload_ceiling);
         if !write_trailer_frame_payload(
-            &mut payload_sink,
+            &mut counted,
             response_headers,
             provenance.http_status,
             provenance.trailer_name_allowlist,
@@ -1069,12 +1079,12 @@ impl GrpcWebPlugin {
         ) {
             return None;
         }
-        let trailer_payload = payload_sink.finish()?;
-        let payload_len = u32::try_from(trailer_payload.len()).ok()?;
+        let payload_len_usize = counted.len;
+        let payload_len = u32::try_from(payload_len_usize).ok()?;
         let mut frame_header = [0u8; GRPC_FRAME_HEADER_BYTES];
         frame_header[0] = GRPC_FRAME_TRAILER;
         frame_header[1..].copy_from_slice(&payload_len.to_be_bytes());
-        let binary_len = body.len() + frame_header.len() + trailer_payload.len();
+        let binary_len = body.len() + frame_header.len() + payload_len_usize;
 
         let mut output = BoundedResponseBodySink::with_ceiling(ceiling);
         if is_text {
@@ -1088,10 +1098,25 @@ impl GrpcWebPlugin {
                 let mut encoder = base64::write::EncoderWriter::new(&mut output, &engine);
                 encoder.write_all(body).ok()?;
                 encoder.write_all(&frame_header).ok()?;
-                encoder.write_all(&trailer_payload).ok()?;
+                if !write_trailer_frame_payload(
+                    &mut WriterTrailerPayloadSink(&mut encoder),
+                    response_headers,
+                    provenance.http_status,
+                    provenance.trailer_name_allowlist,
+                    provenance.shadowed_trailers,
+                    provenance.policy_state,
+                ) {
+                    return None;
+                }
                 encoder.finish().ok()?;
             }
             let encoded = output.finish()?;
+            // Padded standard base64 is a pure function of the preimage length,
+            // so this proves the writing pass emitted exactly the payload the
+            // counting pass declared in the frame header.
+            if encoded.len() != binary_len.div_ceil(3).checked_mul(4)? {
+                return None;
+            }
             debug!(
                 plugin = "grpc_web",
                 instance = %self.instance_id_str,
@@ -1101,10 +1126,23 @@ impl GrpcWebPlugin {
             );
             Some(encoded)
         } else {
-            for segment in [body, &frame_header[..], &trailer_payload[..]] {
+            for segment in [body, &frame_header[..]] {
                 if !output.push(segment) {
                     return None;
                 }
+            }
+            if !write_trailer_frame_payload(
+                &mut output,
+                response_headers,
+                provenance.http_status,
+                provenance.trailer_name_allowlist,
+                provenance.shadowed_trailers,
+                provenance.policy_state,
+            ) {
+                return None;
+            }
+            if output.len() != binary_len {
+                return None;
             }
             let framed = output.finish()?;
             debug!(
@@ -2636,6 +2674,66 @@ impl TrailerPayloadSink for crate::proxy::response_buffer_budget::BoundedRespons
     }
 }
 
+/// Measure the trailer payload without retaining a byte of it.
+///
+/// The frame header carries the payload LENGTH, so the length has to be known
+/// before the payload can be written — and the retained-response bound
+/// (GHSA-pwcm-6rh8-f2gh) forbids learning it by building the payload first and
+/// measuring it afterwards, because that complete payload is upstream-controlled
+/// and would be resident beside the output sink. So the payload is emitted
+/// TWICE from the same writer: once into this counter, once into the final
+/// bounded destination. Both passes read the same immutable header map, so they
+/// cannot disagree — and the caller re-checks the written length anyway.
+///
+/// The counter is itself bounded, so a header block that could not fit the frame
+/// is refused during the counting pass rather than after it.
+struct CountingTrailerPayloadSink {
+    len: usize,
+    ceiling: usize,
+    overflowed: bool,
+}
+
+impl CountingTrailerPayloadSink {
+    fn with_ceiling(ceiling: usize) -> Self {
+        Self {
+            len: 0,
+            ceiling,
+            overflowed: false,
+        }
+    }
+}
+
+impl TrailerPayloadSink for CountingTrailerPayloadSink {
+    fn append(&mut self, bytes: &[u8]) -> bool {
+        if self.overflowed {
+            return false;
+        }
+        // Saturating, not wrapping: an impossible total must fail the finite
+        // ceiling rather than wrap down into an affordable one.
+        let next = self.len.saturating_add(bytes.len());
+        if next > self.ceiling {
+            self.overflowed = true;
+            return false;
+        }
+        self.len = next;
+        true
+    }
+}
+
+/// Write the payload straight through an [`std::io::Write`] — the base64
+/// encoder that streams into the text-mode output sink.
+///
+/// The encoder writes armoured bytes into the ceiling-bounded sink as they are
+/// produced, so neither a complete binary preimage nor a complete encoded
+/// `String` is ever materialised beside the output.
+struct WriterTrailerPayloadSink<'w, W: std::io::Write>(&'w mut W);
+
+impl<W: std::io::Write> TrailerPayloadSink for WriterTrailerPayloadSink<'_, W> {
+    fn append(&mut self, bytes: &[u8]) -> bool {
+        self.0.write_all(bytes).is_ok()
+    }
+}
+
 /// Bytes of the gRPC frame header: one compressed flag plus a 4-byte
 /// big-endian message length.
 const GRPC_FRAME_HEADER_BYTES: usize = 5;
@@ -2671,6 +2769,14 @@ fn build_trailer_frame_with_full_provenance(
 ///
 /// Returns `false` only when the sink refused a write, which the bounded
 /// producer path treats as "no translation" and fails closed on.
+///
+/// Nothing eligible is RETAINED here: names are sorted up front (a stable sort
+/// over names alone reproduces exactly what a stable sort over `(name, value)`
+/// pairs produced, because every occurrence a candidate contributes carries that
+/// candidate's name), and each field's value is resolved, emitted, and dropped
+/// before the next one is resolved. That is what lets the bounded producer path
+/// run this writer against a counter and then against the final sink without
+/// ever holding a complete trailer payload (GHSA-pwcm-6rh8-f2gh).
 fn write_trailer_frame_payload<S: TrailerPayloadSink>(
     payload: &mut S,
     response_headers: &HashMap<String, String>,
@@ -2680,7 +2786,6 @@ fn write_trailer_frame_payload<S: TrailerPayloadSink>(
     policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
 ) -> bool {
     let connection_listed = parse_connection_listed_from_str_map(response_headers);
-    let mut eligible: Vec<(String, String)> = Vec::new();
     // Candidate names are the live view plus any allowlisted trailer that a
     // final initial-header policy removed from the compatibility view.
     // Reserved terminal metadata must still frame from the pre-policy trailer
@@ -2698,6 +2803,15 @@ fn write_trailer_frame_payload<S: TrailerPayloadSink>(
             }
         }
     }
+    // Deterministic ordering: sort by name, and keep relative occurrence order
+    // for duplicates of the same name. Sorting the NAMES (stably) before
+    // resolution is equivalent to the previous stable sort of resolved
+    // `(name, value)` pairs — all of a candidate's occurrences share its name
+    // and stay contiguous either way — and it is what removes the retained
+    // pair vector.
+    candidate_names.sort();
+
+    let mut has_grpc_status = false;
     for name in candidate_names {
         if connection_listed
             .iter()
@@ -2731,50 +2845,44 @@ fn write_trailer_frame_payload<S: TrailerPayloadSink>(
             continue;
         }
         // Emit each occurrence as its own trailer line and retain the ordinary
-        // printable-ASCII check for every LF-separated value.
+        // printable-ASCII check for every LF-separated value. The occurrence is
+        // written straight through and never accumulated.
         for occurrence in value.split('\n') {
-            if is_valid_trailer_value(occurrence) {
-                eligible.push((name.clone(), occurrence.to_owned()));
-            }
-        }
-    }
-    // Deterministic ordering: sort by name, then keep relative occurrence
-    // order for duplicates of the same name (stable sort).
-    eligible.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut has_grpc_status = false;
-    for (name, value) in eligible {
-        if name == "grpc-status" {
-            // Only a present, numeric grpc-status is a valid terminal
-            // status. An empty (`grpc-status:`) or non-numeric
-            // (`grpc-status: abc`) value is malformed — skip forwarding it
-            // so the synthesized mapped status below is emitted instead of
-            // passing a bogus status (or duplicating it).
-            let Ok(code) = value.trim().parse::<u32>() else {
-                continue;
-            };
-            // Prefer the first valid grpc-status when duplicates are present.
-            if has_grpc_status {
+            if !is_valid_trailer_value(occurrence) {
                 continue;
             }
-            has_grpc_status = true;
-            // Emit the normalized (parsed) value, not the raw header, so the
-            // forwarded frame is self-consistent with what was validated
-            // (e.g. any surrounding OWS is dropped).
-            if !payload.append(b"grpc-status: ")
-                || !payload.append(code.to_string().as_bytes())
+            if name == "grpc-status" {
+                // Only a present, numeric grpc-status is a valid terminal
+                // status. An empty (`grpc-status:`) or non-numeric
+                // (`grpc-status: abc`) value is malformed — skip forwarding it
+                // so the synthesized mapped status below is emitted instead of
+                // passing a bogus status (or duplicating it).
+                let Ok(code) = occurrence.trim().parse::<u32>() else {
+                    continue;
+                };
+                // Prefer the first valid grpc-status when duplicates are present.
+                if has_grpc_status {
+                    continue;
+                }
+                has_grpc_status = true;
+                // Emit the normalized (parsed) value, not the raw header, so the
+                // forwarded frame is self-consistent with what was validated
+                // (e.g. any surrounding OWS is dropped).
+                if !payload.append(b"grpc-status: ")
+                    || !payload.append(code.to_string().as_bytes())
+                    || !payload.append(b"\r\n")
+                {
+                    return false;
+                }
+                continue;
+            }
+            if !payload.append(name.as_bytes())
+                || !payload.append(b": ")
+                || !payload.append(occurrence.as_bytes())
                 || !payload.append(b"\r\n")
             {
                 return false;
             }
-            continue;
-        }
-        if !payload.append(name.as_bytes())
-            || !payload.append(b": ")
-            || !payload.append(value.as_bytes())
-            || !payload.append(b"\r\n")
-        {
-            return false;
         }
     }
 

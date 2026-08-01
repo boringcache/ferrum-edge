@@ -224,6 +224,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail-closed residual check builds its candidate body under a reserved budget
   window as well. That keeps the documented worst-case peak of a rewriting
   response at exactly two ceilings (the old body plus one covering window).
+  Three residual holes in that construction-side bound are closed with it.
+  `grpc_web` no longer builds a complete trailer payload — every eligible,
+  upstream-controlled `(name, value)` cloned into an owned vector — before
+  copying or armouring it: the frame's declared length now comes from a bounded
+  counting pass that retains no value, and a second pass writes the payload
+  straight into the final bounded destination, so neither a complete payload nor
+  a complete binary preimage is ever resident beside the output. The buffered
+  Anthropic SSE normalizer writes every normalized byte through an accumulator
+  bound to the response's own retained ceiling rather than returning a complete
+  expanded emission per call, so a small route-effective ceiling is enforced
+  from the first output byte instead of only after a constant-sized transient.
+  `ai_response_guard` reserves a real budget window for the two remaining
+  full-size candidates it builds during inspection (the JSON/content residual
+  scan and the native-gRPC redaction preflight), treating a refused window as a
+  rejection; and a detected `redact` that never produced a safe replacement is
+  now tracked in typed request state and rejected at the final response-body
+  hook, because a refused construction returns "no replacement", which a
+  transform loop would otherwise read as "unchanged" and forward the original
+  sensitive body. The reserve-then-fill sink seam hands its producer a target
+  limited to exactly the room it was admitted for, and no longer skips the fill
+  and its length check for a zero-length append.
 
 - `body_validator` no longer fails open on unusual methods, empty bodies, or
   uninspectable data (GHSA-2vmr-ww8r-mww3,

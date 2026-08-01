@@ -3752,3 +3752,132 @@ async fn test_translation_is_refused_when_the_trailer_frame_cannot_fit_the_ceili
         .expect("an in-ceiling translation must still be produced");
     assert!(ok.len() > body.len(), "the trailer frame was appended");
 }
+
+// ---------------------------------------------------------------------------
+// The trailer frame is emitted twice and retained neither time
+// (GHSA-pwcm-6rh8-f2gh).
+//
+// The reframer used to build a COMPLETE trailer payload — every eligible
+// upstream-controlled `(name, value)` cloned into an owned `Vec` first — and
+// then copy or base64-encode it while that payload was still live. A counting
+// pass now establishes the frame-header length without retaining a value, and a
+// second pass writes the payload straight into the final bounded destination.
+// These pin the observable consequences: the frame is byte-identical to what
+// the retaining implementation produced, in both representations, for a trailer
+// block far larger than any single frame header.
+// ---------------------------------------------------------------------------
+
+fn large_trailer_headers(content_type: &str) -> HashMap<String, String> {
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), content_type.to_string());
+    response_headers.insert("grpc-status".to_string(), " 7 ".to_string());
+    response_headers.insert("grpc-message".to_string(), "denied".to_string());
+    // Deliberately inserted out of alphabetical order, with multi-value
+    // (LF-joined) metadata, so both the sort and the duplicate occurrence order
+    // are exercised.
+    for index in (0..64).rev() {
+        response_headers.insert(
+            format!("x-meta-{index:03}"),
+            format!("{}\n{}", "v".repeat(512), "w".repeat(512)),
+        );
+    }
+    response_headers
+}
+
+#[tokio::test]
+async fn test_large_trailer_block_frames_identically_in_binary_and_text() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let plugin = create_plugin_default();
+    let mut body = vec![0x00u8];
+    body.extend_from_slice(&5u32.to_be_bytes());
+    body.extend_from_slice(b"hello");
+
+    let binary = plugin
+        .transform_response_body(
+            &body,
+            Some("application/grpc-web"),
+            &large_trailer_headers("application/grpc-web"),
+        )
+        .await
+        .expect("binary transform");
+    let text = plugin
+        .transform_response_body(
+            &body,
+            Some("application/grpc-web-text"),
+            &large_trailer_headers("application/grpc-web-text"),
+        )
+        .await
+        .expect("text transform");
+
+    // The declared frame length must match the payload the writing pass
+    // produced — the counting pass is only correct if these agree.
+    let payload = trailing_grpc_web_trailer_payload(&binary);
+    assert!(
+        payload.len() > 64 * 1024,
+        "the fixture must exceed any plausible single-frame temporary, got {}",
+        payload.len()
+    );
+    assert_eq!(
+        String::from_utf8(text).expect("armoured body is ASCII"),
+        BASE64.encode(&binary),
+        "the streamed text frame must equal the base64 of the binary frame"
+    );
+
+    // Deterministic ordering: names sorted, duplicate occurrences in order, the
+    // normalized grpc-status emitted exactly once.
+    let lines: Vec<&str> = payload.trim_end_matches("\r\n").split("\r\n").collect();
+    let names: Vec<&str> = lines
+        .iter()
+        .map(|line| line.split(':').next().unwrap_or_default())
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted, "trailer names must stay sorted");
+    assert_eq!(
+        lines.iter().filter(|line| line.starts_with("grpc-status")).count(),
+        1,
+        "exactly one normalized grpc-status line"
+    );
+    assert!(
+        payload.contains("grpc-status: 7\r\n"),
+        "surrounding whitespace must still be normalized away"
+    );
+    let first_meta = lines
+        .iter()
+        .position(|line| line.starts_with("x-meta-000"))
+        .expect("multi-value metadata is framed");
+    assert!(
+        lines[first_meta].ends_with(&"v".repeat(512))
+            && lines[first_meta + 1].ends_with(&"w".repeat(512)),
+        "duplicate occurrences of one name must keep their relative order"
+    );
+}
+
+#[tokio::test]
+async fn test_large_trailer_block_is_refused_under_a_small_retained_ceiling() {
+    let plugin = create_plugin_default();
+    let mut body = vec![0x00u8];
+    body.extend_from_slice(&5u32.to_be_bytes());
+    body.extend_from_slice(b"hello");
+
+    for content_type in ["application/grpc-web", "application/grpc-web-text"] {
+        let mut ctx = create_grpc_web_context(content_type);
+        plugin.on_request_received(&mut ctx).await;
+        ctx.max_response_body_size_bytes = 4096;
+        assert!(
+            plugin
+                .transform_response_body_with_context(
+                    &mut ctx,
+                    &body,
+                    Some(content_type),
+                    &large_trailer_headers(content_type),
+                )
+                .await
+                .is_none(),
+            "{content_type}: a trailer block above the retained ceiling must be \
+             refused during the counting pass, never materialised first"
+        );
+    }
+}

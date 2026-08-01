@@ -1295,6 +1295,17 @@ impl AiResponseGuard {
                 }
                 ctx.metadata
                     .insert("ai_response_guard_redacted".to_string(), detected.join(","));
+                // `Continue` here is a PROMISE that the producer phase will
+                // install a redacted replacement, not a decision to deliver
+                // these bytes. Record the promise in typed request state so a
+                // producer that returns `None` — refused ceiling, refused
+                // scratch, a representation this plugin's rewriter cannot
+                // address — cannot silently become "unchanged" and forward the
+                // original detected body (GHSA-pwcm-6rh8-f2gh). The instance
+                // discharges its own entry when it installs bytes;
+                // `on_final_response_body` rejects anything still outstanding.
+                ctx.ai_response_guard_pending_redactions
+                    .insert(self.instance_id, detected.join(","));
                 if ctx.finalized_response_replay {
                     ctx.ai_response_guard_replay_redactions
                         .insert(self.instance_id);
@@ -1756,13 +1767,38 @@ impl AiResponseGuard {
             // boundaries are matchable but not rewritable in any one scalar.
             let key_match = !self.detect_matches(&scan.map_keys).is_empty();
             let cross_boundary_only = self.grpc_match_only_across_boundaries(&scan);
-            let rewritten = self.redacted_grpc_body(
-                ctx,
-                response_headers,
-                body,
-                ctx.retained_response_body_ceiling(),
-            );
-            if key_match || cross_boundary_only || rewritten.is_none() {
+            // This preflight builds a COMPLETE would-be client-visible body
+            // during INSPECTION, before the transform phase has reserved
+            // anything. Building it against nothing would leave a full-size
+            // attacker-shaped replacement resident beside the response body with
+            // no charge covering it, which is the aggregate-bound bypass this
+            // advisory closes. So a window sized to THIS response's retained
+            // ceiling is reserved first and released as soon as the preflight is
+            // done — the same shape `redact_sse_leaves_residual` uses, and the
+            // same documented two-ceiling peak. A budget that cannot admit the
+            // window is a REFUSAL, not a licence to build the candidate anyway
+            // (GHSA-pwcm-6rh8-f2gh).
+            let redaction_verified =
+                match crate::proxy::response_buffer_budget::ResponseTransformWindow::open(
+                    ctx.retained_response_body_ceiling(),
+                ) {
+                    Some(window) => {
+                        let rewritten = self.redacted_grpc_body(
+                            ctx,
+                            response_headers,
+                            body,
+                            window.window_bytes(),
+                        );
+                        let verified = rewritten.is_some();
+                        // The candidate is released BEFORE the window is, so the
+                        // charge covers it for its whole lifetime.
+                        drop(rewritten);
+                        drop(window);
+                        verified
+                    }
+                    None => false,
+                };
+            if key_match || cross_boundary_only || !redaction_verified {
                 debug!(
                     "ai_response_guard: gRPC redaction leaves residual content \
                      (types: {:?}), rejecting response",
@@ -2327,6 +2363,10 @@ fn push_reframed_grpc_message(
         return out.append_with(encoded_len, |buffer| message.encode(buffer));
     }
 
+    // The compressed branch needs the encoded message before it can be deflated,
+    // so the preimage is one MESSAGE (already bounded by `max_bytes` above), not
+    // a would-be complete replacement, and it is itself built through a sink
+    // sized to exactly that length.
     let mut payload = BoundedResponseBodySink::with_ceiling(encoded_len);
     if !payload.append_with(encoded_len, |buffer| message.encode(buffer)) {
         return false;
@@ -3379,11 +3419,31 @@ impl Plugin for AiResponseGuard {
         // so fail closed (reject) when redaction would leave residual
         // detections rather than emit false "redacted" telemetry. Bodies whose
         // PII is fully rewritable fall through to the normal redact path below.
+        //
+        // Both residual scans build a COMPLETE redacted candidate (a cloned
+        // document tree, and in scan-all its serialized form) during INSPECTION,
+        // where no producer phase has reserved anything. That candidate is
+        // upstream-shaped and the same order of size as the response, so it is
+        // charged like any other retained allocation: a window sized to this
+        // response's retained ceiling is reserved before the candidate exists
+        // and released as soon as the scan is done, keeping the peak at the
+        // documented two ceilings. A budget that cannot admit the window is a
+        // refusal, and a refusal is residual — fail closed rather than build the
+        // candidate anyway (GHSA-pwcm-6rh8-f2gh).
         let leaves_residual = self.action == GuardAction::Redact
-            && if self.scan_mode == ScanMode::All {
-                self.redact_leaves_residual(&json)
-            } else {
-                self.content_redact_leaves_residual(&json)
+            && match crate::proxy::response_buffer_budget::ResponseTransformWindow::open(
+                ctx.retained_response_body_ceiling(),
+            ) {
+                Some(window) => {
+                    let residual = if self.scan_mode == ScanMode::All {
+                        self.redact_leaves_residual(&json)
+                    } else {
+                        self.content_redact_leaves_residual(&json)
+                    };
+                    drop(window);
+                    residual
+                }
+                None => true,
             };
         if leaves_residual {
             debug!(
@@ -3424,7 +3484,8 @@ impl Plugin for AiResponseGuard {
         // after a larger buffer is resident (GHSA-pwcm-6rh8-f2gh).
         let ceiling = ctx.retained_response_body_ceiling();
         if self.grpc_transform_applies(ctx, content_type) {
-            return self.redacted_grpc_body(ctx, response_headers, body, ceiling);
+            let replacement = self.redacted_grpc_body(ctx, response_headers, body, ceiling);
+            return self.discharge_pending_redaction(ctx, replacement);
         }
         // A gRPC or gRPC-Web response body is length-prefixed protobuf framing
         // — or the base64 armoring of it — whatever the response `Content-Type`
@@ -3444,7 +3505,8 @@ impl Plugin for AiResponseGuard {
         if ctx.is_native_grpc_request() || response_is_grpc_framed(ctx, content_type, body) {
             return None;
         }
-        self.redacted_response_body(body, content_type, ceiling)
+        let replacement = self.redacted_response_body(body, content_type, ceiling);
+        self.discharge_pending_redaction(ctx, replacement)
     }
 
     /// Context-free entry point. Without a request context there is no
@@ -3469,6 +3531,54 @@ impl Plugin for AiResponseGuard {
             .contains(&self.instance_id)
     }
 
+    /// The final verification seam for a promised redaction.
+    ///
+    /// A `redact` detection returns `Continue` from inspection and relies on the
+    /// producer phase to install the replacement. Every way that can fail —
+    /// a refused retained ceiling, a refused scratch pass, a serialization
+    /// error, a representation the rewriter declines — surfaces as `None`, which
+    /// the shared transform loop reads as "unchanged". This hook runs after
+    /// every transform over the bytes the client would actually receive, so an
+    /// undischarged promise here means the original detected body is still in
+    /// flight and must be replaced by a rejection rather than delivered
+    /// (GHSA-pwcm-6rh8-f2gh).
+    ///
+    /// The gateway's own capacity terminal is not affected: when the transform
+    /// phase installs it, the response is already replaced and this hook is not
+    /// reached at all.
+    async fn on_final_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        let Some(detected) = ctx
+            .ai_response_guard_pending_redactions
+            .remove(&self.instance_id)
+        else {
+            return PluginResult::Continue;
+        };
+        warn!(
+            "ai_response_guard: detected content was not redacted before delivery (types: {}), rejecting response",
+            detected
+        );
+        Self::mark_rejected(ctx, detected.clone());
+        let types_json: Vec<String> = detected
+            .split(',')
+            .filter(|name| !name.is_empty())
+            .map(|name| format!("\"{}\"", escape_json_string(name)))
+            .collect();
+        PluginResult::Reject {
+            status_code: 502,
+            body: format!(
+                r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
+                types_json.join(","),
+            ),
+            headers: HashMap::new(),
+        }
+    }
+
     fn on_response_body_transformed(
         &self,
         _ctx: &mut RequestContext,
@@ -3487,6 +3597,24 @@ impl Plugin for AiResponseGuard {
 }
 
 impl AiResponseGuard {
+    /// Clear this instance's promised-redaction marker when — and only when — a
+    /// replacement was actually produced.
+    ///
+    /// `None` leaves the marker outstanding, so `on_final_response_body` turns
+    /// it into a rejection instead of letting the original detected body be
+    /// forwarded as "unchanged".
+    fn discharge_pending_redaction(
+        &self,
+        ctx: &mut RequestContext,
+        replacement: Option<Vec<u8>>,
+    ) -> Option<Vec<u8>> {
+        if replacement.is_some() {
+            ctx.ai_response_guard_pending_redactions
+                .remove(&self.instance_id);
+        }
+        replacement
+    }
+
     /// The single ceiling-bounded materialisation point for this plugin's
     /// JSON / SSE / text replacement bodies.
     fn redacted_response_body(
