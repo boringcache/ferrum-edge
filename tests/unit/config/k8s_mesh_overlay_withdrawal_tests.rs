@@ -780,7 +780,10 @@ fn overlay_slot_compose_preserves_same_namespace_mesh_from_a_non_kubernetes_base
         services: vec![native_mesh_service("default", "native-svc")],
         ..MeshConfig::default()
     });
-    let objects = [service(), service_entry("default", "api", "api.example.com")];
+    let objects = [
+        service(),
+        service_entry("default", "api", "api.example.com"),
+    ];
 
     store_accepted_k8s_overlay(
         &overlay_slot,
@@ -1003,21 +1006,9 @@ fn two_pod_backed_workloads_with_different_uids_coexist() {
 /// distinct.
 #[test]
 fn non_pod_workloads_sharing_a_spiffe_identity_coexist_when_addresses_differ() {
-    let base_workload = workload(
-        "default",
-        "vm-sa",
-        &["10.1.0.1"],
-        None,
-        "legacy-vm-alpha",
-    );
+    let base_workload = workload("default", "vm-sa", &["10.1.0.1"], None, "legacy-vm-alpha");
     let base = mesh_with_workloads(vec![base_workload]);
-    let k8s = workload(
-        "default",
-        "vm-sa",
-        &["10.1.0.2"],
-        None,
-        "legacy-vm-beta",
-    );
+    let k8s = workload("default", "vm-sa", &["10.1.0.2"], None, "legacy-vm-beta");
     let overlay = mesh_with_workloads(vec![k8s]);
 
     let composed = compose_workloads(&base, Some(overlay));
@@ -1040,13 +1031,7 @@ fn an_empty_pod_uid_falls_back_instead_of_becoming_a_pod_identity() {
         Some(""),
         "legacy-empty-uid",
     );
-    let absent_uid = workload(
-        "default",
-        "vm-sa",
-        &["10.1.0.2"],
-        None,
-        "legacy-absent-uid",
-    );
+    let absent_uid = workload("default", "vm-sa", &["10.1.0.2"], None, "legacy-absent-uid");
     let unrelated = mesh_with_workloads(vec![empty_uid, absent_uid]);
     assert_eq!(
         unrelated.object_identities().len(),
@@ -1060,13 +1045,7 @@ fn an_empty_pod_uid_falls_back_instead_of_becoming_a_pod_identity() {
 
     // An absent and an explicitly empty UID are the SAME (fallback) tier, so a
     // matching SPIFFE id plus addresses still shadows.
-    let reauthoring = workload(
-        "default",
-        "vm-sa",
-        &["10.1.0.1"],
-        None,
-        "legacy-reauthored",
-    );
+    let reauthoring = workload("default", "vm-sa", &["10.1.0.1"], None, "legacy-reauthored");
     let shadowing = mesh_with_workloads(vec![reauthoring]);
     let reauthored = compose_workloads(&unrelated, Some(shadowing));
     assert_eq!(
@@ -1317,8 +1296,7 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
         "a same-key collision must resolve to one object per collection"
     );
     assert_eq!(
-        collided,
-        overlay,
+        collided, overlay,
         "Kubernetes must deterministically win every same-key collision"
     );
 }
