@@ -220,7 +220,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded output, `ai_stream_router` serializes its upstream-error envelope
   through the sink and drives the buffered Anthropic normalizer in fixed-size
   slices, and `grpc_web` streams base64 armouring into the sink rather than
-  holding a second complete encoded copy. `ai_response_guard`'s SSE
+  holding a second complete encoded copy. Multi-pattern whole-body text redaction
+  keeps the prior pass buffer live while building the next inside one
+  ceiling-sized window, so allocator capacity slack can reduce the largest
+  redactable body to well below the per-response ceiling (often on the order of
+  half or less, depending on pattern count) and fail closed rather than
+  forwarding partially redacted bytes. `ai_response_guard`'s SSE
   fail-closed residual check builds its candidate body under a reserved budget
   window as well. That keeps the documented worst-case peak of a rewriting
   response at exactly two ceilings (the old body plus one covering window).
@@ -230,7 +235,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   copying or armouring it: the frame's declared length now comes from a bounded
   counting pass that retains no value, and a second pass writes the payload
   straight into the final bounded destination, so neither a complete payload nor
-  a complete binary preimage is ever resident beside the output. The buffered
+  a complete binary preimage is ever resident beside the output. gRPC-Web
+  **text**-mode bodies that concatenate independently padded base64 segments
+  (one padded run per upstream flush boundary) are now accepted at reframing time,
+  decoded as one framed stream, and re-emitted as a single canonical standard
+  base64 body — original flush segment boundaries are not preserved on output.
+  The buffered
   Anthropic SSE normalizer writes every normalized byte through an accumulator
   bound to the response's own retained ceiling rather than returning a complete
   expanded emission per call, so a small route-effective ceiling is enforced

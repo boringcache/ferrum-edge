@@ -6178,6 +6178,8 @@ The `redaction_placeholder` template is emitted literally: any `$`-sequences in 
 
 Unknown root fields and unknown keys inside custom pattern objects are rejected at construction. Enforcing actions also fail closed when a governed response is oversized, malformed, non-UTF-8, or not representable in content mode. `scan_fields: all` can inspect and redact arbitrary UTF-8 response text; `warn` remains explicitly non-enforcing and records a bounded warning for uninspectable content. When redaction changes body bytes, representation validators (`ETag`, `Last-Modified`, `Content-Digest`, `Repr-Digest`, `Digest`, and `Content-MD5`) are removed case-insensitively; clean responses retain them.
 
+**Whole-body text redaction (`action: redact`).** Plain-text and other whole-body redaction paths apply configured patterns **sequentially** inside one ceiling-sized transform window. Each pass writes into a bounded sink while the prior pass buffer may still be resident; the shared ceiling budgets that scratch by **allocator capacity**, not logical length. With several patterns configured, geometric growth slack can therefore reduce the largest body that can be redacted to well below the per-response retained ceiling — often on the order of half that ceiling or less, depending on pattern count and allocator behavior — and the guard fails closed with `502` rather than forwarding partially redacted bytes. This is an operational limit of the fail-closed construction, not a separate tunable threshold.
+
 **Metadata keys** (for observability):
 - `ai_response_guard_detected` — comma-separated list of detected pattern types (warn mode)
 - `ai_response_guard_redacted` — comma-separated list of redacted pattern types (redact mode)

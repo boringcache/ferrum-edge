@@ -436,7 +436,18 @@ impl Budget {
 /// call site is invisible.
 #[allow(dead_code)] // binary startup caller; dead in the separately compiled library unit
 pub(crate) fn init(fallback_per_response_bytes: usize, total_bytes: usize) {
-    let _ = BUDGET.set(Budget::new(fallback_per_response_bytes, total_bytes));
+    if BUDGET
+        .set(Budget::new(fallback_per_response_bytes, total_bytes))
+        .is_err()
+    {
+        tracing::warn!(
+            requested_fallback_per_response_bytes = fallback_per_response_bytes,
+            requested_total_bytes = total_bytes,
+            "FERRUM_RESPONSE_BUFFER_FALLBACK_MAX_BYTES / FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES \
+             startup configuration was ignored because the retained-response budget was already \
+             initialized; restart the process to apply new values"
+        );
+    }
 }
 
 /// The effective ceiling for a response the gateway is about to *retain*.
