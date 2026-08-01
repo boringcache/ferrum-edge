@@ -263,6 +263,15 @@ impl Plugin for MeshRouteDispatchFinalizer {
         crate::plugins::HTTP_FAMILY_PROTOCOLS
     }
 
+    /// Cache-internal request-phase sentinel: never replaces a response body.
+    /// Declare `Never` explicitly — the internal name is absent from the public
+    /// built-in inventory, so the trait default would resolve to `Undeclared`
+    /// and the shared producer gate would refuse every buffered response
+    /// (GHSA-pwcm-6rh8-f2gh).
+    fn response_body_production(&self) -> crate::plugins::ResponseBodyProduction {
+        crate::plugins::ResponseBodyProduction::Never
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
