@@ -399,10 +399,8 @@ fn the_aggregate_budget_is_finite_and_always_admits_one_fallback_sized_response(
     // exactly what was asked for (16 MiB), even though a route could configure a
     // 1 GiB per-response ceiling: such a response is refused rather than
     // silently uncapping the aggregate bound.
-    let not_widened = ferrum_edge::_test_support::response_buffer_budget_blocks_for_test(
-        unit,
-        16 * 1024 * 1024,
-    );
+    let not_widened =
+        ferrum_edge::_test_support::response_buffer_budget_blocks_for_test(unit, 16 * 1024 * 1024);
     assert_eq!(not_widened, (16 * 1024 * 1024usize).div_ceil(unit));
 
     // The budget scales with the configured total, in whole blocks.

@@ -2641,11 +2641,11 @@ pub(crate) fn sync_translated_body_trailer_frame_into(
     };
     let is_text = is_grpc_web_text(content_type);
 
-    let Some((suffix_start, binary_len)) = if is_text {
+    let Some((suffix_start, binary_len)) = (if is_text {
         scan_text_grpc_web_trailer_suffix(body)
     } else {
         trailing_trailer_suffix_start(body).map(|start| (start, body.len()))
-    } else {
+    }) else {
         // The body transform always emits a complete trailing frame. Refuse to
         // invent frames when that invariant cannot be proven.
         return SyncTranslatedTrailerOutcome::NoRewrite;

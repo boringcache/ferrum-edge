@@ -17,19 +17,17 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
-use ferrum_edge::HttpFlavor;
 use ferrum_edge::_test_support::{
     BufferedRepresentationOutcome, MAX_DECODED_RESPONSE_INSPECTION_BYTES,
     RESPONSE_BUFFER_OVERLOAD_BODY, RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS,
     RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS, RESPONSE_BUFFER_OVERLOAD_STATUS,
     RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT, RESPONSE_DECODE_BROTLI_SCRATCH_BYTES,
-    RESPONSE_DECODE_GZIP_SCRATCH_BYTES, ResponseBufferBudgetProbe,
-    ResponseBufferRetainRejection, error_class_is_backend_failure_for_test,
-    error_class_is_health_neutral_for_test,
-    install_response_buffer_capacity_refusal_for_test,
-    projected_decode_output_capacity_for_test, set_request_http_flavor_for_test,
-    stamp_original_response_metadata_for_test,
+    RESPONSE_DECODE_GZIP_SCRATCH_BYTES, ResponseBufferBudgetProbe, ResponseBufferRetainRejection,
+    error_class_is_backend_failure_for_test, error_class_is_health_neutral_for_test,
+    install_response_buffer_capacity_refusal_for_test, projected_decode_output_capacity_for_test,
+    set_request_http_flavor_for_test, stamp_original_response_metadata_for_test,
 };
+use ferrum_edge::HttpFlavor;
 use ferrum_edge::plugins::{Plugin, RequestContext, response_transformer::ResponseTransformer};
 use ferrum_edge::retry::ErrorClass;
 
@@ -444,7 +442,11 @@ fn an_unaffordable_cache_entry_copy_is_refused_rather_than_stored() {
         budget.charge_retained_copy(&[9u8; UNIT]).is_none(),
         "an unaffordable entry copy must be refused so the store is skipped"
     );
-    assert_eq!(budget.available_bytes(), 0, "a refused copy leaks no partial reservation");
+    assert_eq!(
+        budget.available_bytes(),
+        0,
+        "a refused copy leaks no partial reservation"
+    );
 }
 
 /// The eager small-response path drives the PRODUCTION collector, with the
@@ -468,7 +470,9 @@ fn the_eager_path_charges_its_preallocation_before_it_allocates() {
         "the preallocation is charged before the buffer is allocated"
     );
 
-    collector.append(&[3u8; UNIT]).expect("the declared body fits its hint");
+    collector
+        .append(&[3u8; UNIT])
+        .expect("the declared body fits its hint");
     let body = collector
         .into_charged_bytes()
         .expect("the collected body publishes with its charge attached");
@@ -540,7 +544,11 @@ fn eager_buffering_is_refused_once_the_aggregate_budget_is_spent() {
     );
 
     drop((first, second));
-    assert_eq!(budget.available_bytes(), 2 * UNIT, "released eager charges restore capacity");
+    assert_eq!(
+        budget.available_bytes(),
+        2 * UNIT,
+        "released eager charges restore capacity"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -623,12 +631,17 @@ fn a_refused_http_replacement_becomes_a_gateway_503_with_clean_metadata() {
     );
 
     assert_eq!(
-        status,
-        RESPONSE_BUFFER_OVERLOAD_STATUS,
+        status, RESPONSE_BUFFER_OVERLOAD_STATUS,
         "the backend status must not survive a refusal that discarded its body"
     );
-    assert_eq!(body, bytes::Bytes::from_static(RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes()));
-    assert_eq!(headers.get("content-type").map(String::as_str), Some("application/json"));
+    assert_eq!(
+        body,
+        bytes::Bytes::from_static(RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes())
+    );
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
     let expected_length = RESPONSE_BUFFER_OVERLOAD_BODY.len().to_string();
     assert_eq!(
         headers.get("content-length"),
@@ -695,7 +708,10 @@ fn a_refused_native_grpc_replacement_terminates_through_grpc_metadata() {
     );
 
     assert_eq!(status, 200, "a gRPC terminal must stay on HTTP 200");
-    assert!(body.is_empty(), "the refused frame must not reach the client");
+    assert!(
+        body.is_empty(),
+        "the refused frame must not reach the client"
+    );
     let expected_grpc_status = RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS.to_string();
     assert_eq!(
         headers.get("grpc-status"),
@@ -729,7 +745,8 @@ fn a_refused_native_grpc_replacement_terminates_through_grpc_metadata() {
 fn a_refused_grpc_web_replacement_terminates_through_a_body_trailer_frame() {
     let mut ctx = refusal_ctx();
     ctx.metadata.insert(
-        ferrum_edge::_test_support::GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY.to_string(),
+        ferrum_edge::_test_support::GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY
+            .to_string(),
         "application/grpc-web+proto".to_string(),
     );
     let mut status = 200u16;
@@ -1630,7 +1647,8 @@ fn the_final_decode_handoff_is_checked_rather_than_only_narrowed() {
     let budget = include_str!("../../../src/proxy/response_buffer_budget.rs");
 
     assert!(
-        budget.contains("pub(crate) fn narrow_to_covered(&mut self, retained_bytes: usize) -> bool")
+        budget
+            .contains("pub(crate) fn narrow_to_covered(&mut self, retained_bytes: usize) -> bool")
             && budget.contains("if wanted > self.blocks {\n            return false;"),
         "narrowing must refuse when the charge does not cover the allocation, \
          rather than silently publishing under-charged bytes"
@@ -1721,7 +1739,9 @@ fn a_grown_collector_is_charged_for_its_capacity_not_its_length() {
 
     let body = {
         let mut collector = budget.collector(8 * UNIT);
-        collector.append(&vec![0u8; 3 * UNIT]).expect("first append admits");
+        collector
+            .append(&vec![0u8; 3 * UNIT])
+            .expect("first append admits");
         collector.append(&[1u8]).expect("one more byte admits");
         assert_eq!(
             collector.len(),
@@ -1763,7 +1783,9 @@ fn growth_the_budget_cannot_cover_is_refused_instead_of_allocated() {
     let total = budget.available_bytes();
 
     let mut collector = budget.collector(8 * UNIT);
-    collector.append(&vec![0u8; 3 * UNIT]).expect("first append admits");
+    collector
+        .append(&vec![0u8; 3 * UNIT])
+        .expect("first append admits");
     assert_eq!(
         collector.append(&[1u8]),
         Err(ResponseBufferRetainRejection::BudgetExhausted),
@@ -1834,7 +1856,9 @@ fn a_preallocation_hint_is_charged_before_it_is_allocated() {
     assert_eq!(budget.available_bytes(), total);
 
     assert_eq!(
-        budget.collector_with_preallocation(8 * UNIT, 5 * UNIT).err(),
+        budget
+            .collector_with_preallocation(8 * UNIT, 5 * UNIT)
+            .err(),
         Some(ResponseBufferRetainRejection::BudgetExhausted),
         "an unaffordable hint refuses the response instead of allocating it"
     );
@@ -1847,7 +1871,12 @@ fn a_preallocation_hint_is_charged_before_it_is_allocated() {
         total,
         "a bodyless response must not consume budget it never occupies"
     );
-    assert!(empty.into_charged_bytes().expect("empty publishes").is_empty());
+    assert!(
+        empty
+            .into_charged_bytes()
+            .expect("empty publishes")
+            .is_empty()
+    );
     assert_eq!(budget.available_bytes(), total);
 }
 
@@ -1909,7 +1938,9 @@ fn a_charged_replacement_transfers_blocks_out_of_the_window() {
     let budget = probe(16);
     let total = budget.available_bytes();
 
-    let mut window = budget.transform_window(2 * UNIT).expect("the window admits");
+    let mut window = budget
+        .transform_window(2 * UNIT)
+        .expect("the window admits");
     assert_eq!(
         budget.available_bytes(),
         total - 2 * UNIT,
@@ -2026,7 +2057,10 @@ fn an_output_larger_than_the_window_is_refused_while_it_is_written() {
          allocation it would need"
     );
     assert!(sink.overflowed());
-    assert!(sink.is_empty(), "a refused sink releases what it had written");
+    assert!(
+        sink.is_empty(),
+        "a refused sink releases what it had written"
+    );
     assert!(
         sink.finish().is_none(),
         "an overflowed sink yields no replacement body at all"
@@ -2078,7 +2112,6 @@ fn bounded_json_materialisation_refuses_an_amplified_document() {
          serialized, not after a larger buffer exists"
     );
 }
-
 
 // ---------------------------------------------------------------------------
 // The producer precondition, evaluated before every invocation.
@@ -2145,7 +2178,10 @@ fn a_second_producer_is_not_invoked_when_the_window_cannot_be_refilled() {
     // An out-of-tree plugin is refused even when the window is full, because
     // the gateway cannot prove its output is bounded.
     drop(competitor);
-    assert!(window.ensure_covering_window(), "the window can refill again");
+    assert!(
+        window.ensure_covering_window(),
+        "the window can refill again"
+    );
     assert_eq!(
         admit(ResponseBodyProduction::Undeclared, Some(&mut window)),
         Some(PRODUCER_REFUSED_UNDECLARED_CONTRACT),
@@ -2348,7 +2384,10 @@ fn no_declared_producer_builds_a_complete_replacement_before_the_bound() {
 #[test]
 fn the_repaired_producers_construct_through_the_bound() {
     let required: &[(&str, &[&str])] = &[
-        ("sse", &["fn write_lossy_sse_data(", "SSE_DATA_FIELD_PREFIX"]),
+        (
+            "sse",
+            &["fn write_lossy_sse_data(", "SSE_DATA_FIELD_PREFIX"],
+        ),
         (
             "ai_stream_router",
             &[
@@ -2638,8 +2677,7 @@ fn the_root_review_repairs_are_pinned_in_source() {
     );
     let h3_cross_protocol = include_str!("../../../src/http3/cross_protocol.rs");
     assert!(
-        h3_cross_protocol
-            .contains("let retained_ceiling = ctx.retained_response_body_ceiling();"),
+        h3_cross_protocol.contains("let retained_ceiling = ctx.retained_response_body_ceiling();"),
         "the H3 cross-protocol final reconciliation call site must fold unlimited to the finite retained ceiling"
     );
 

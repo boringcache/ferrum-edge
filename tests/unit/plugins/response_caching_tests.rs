@@ -15,8 +15,8 @@ use ferrum_edge::_test_support::{
     response_caching_staging_metadata_key_for_test, response_caching_vary_index_snapshot_for_test,
     retry_response_decision_context_for_test, run_after_proxy_hooks_for_test,
     run_after_proxy_hooks_reject_for_test, set_replay_credential_headers_for_test,
-    set_replay_request_body_empty_proven_for_test, set_response_presentation_policy_digest_for_test,
-    stamp_original_response_metadata_for_test,
+    set_replay_request_body_empty_proven_for_test,
+    set_response_presentation_policy_digest_for_test, stamp_original_response_metadata_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::response_caching::{RESPONSE_CACHING_CONFIG_KEYS, ResponseCaching};
@@ -6666,7 +6666,15 @@ async fn invalidating_response_directives_release_and_still_evict() {
 
     for directive in ["no-store", "private", "no-cache", "max-age=0"] {
         let plugin = Arc::new(default_plugin());
-        cache_response(&plugin, "GET", "/api/resource", 200, &HashMap::new(), b"old").await;
+        cache_response(
+            &plugin,
+            "GET",
+            "/api/resource",
+            200,
+            &HashMap::new(),
+            b"old",
+        )
+        .await;
         assert_eq!(
             response_caching_cache_keys_for_test(&plugin).len(),
             1,
@@ -6795,7 +6803,15 @@ async fn set_cookie_with_an_invalidating_directive_releases_and_evicts() {
 
     for (extra, must_evict) in cases {
         let plugin = Arc::new(default_plugin());
-        cache_response(&plugin, "GET", "/api/resource", 200, &HashMap::new(), b"old").await;
+        cache_response(
+            &plugin,
+            "GET",
+            "/api/resource",
+            200,
+            &HashMap::new(),
+            b"old",
+        )
+        .await;
         assert_eq!(response_caching_cache_keys_for_test(&plugin).len(), 1);
 
         let mut ctx = refresh_ctx(&plugin, "/api/resource").await;
@@ -6819,7 +6835,10 @@ async fn set_cookie_with_an_invalidating_directive_releases_and_evicts() {
         assert!(!run_final_response_header_phase(&plugin, &mut ctx, 200, &response_headers).await);
         let remaining = response_caching_cache_keys_for_test(&plugin).len();
         if must_evict {
-            assert_eq!(remaining, 0, "{pairs:?} must still evict what it supersedes");
+            assert_eq!(
+                remaining, 0,
+                "{pairs:?} must still evict what it supersedes"
+            );
         } else {
             assert_eq!(
                 remaining, 1,
@@ -6840,9 +6859,17 @@ async fn origin_selected_sse_streams_under_every_non_store_header_condition() {
 
     // (label, extra response headers, whether this case must also evict)
     let cases: Vec<(&str, Vec<(&str, &str)>, bool)> = vec![
-        ("plain cacheable", vec![("cache-control", "public, max-age=60")], false),
+        (
+            "plain cacheable",
+            vec![("cache-control", "public, max-age=60")],
+            false,
+        ),
         ("no-store", vec![("cache-control", "no-store")], true),
-        ("private", vec![("cache-control", "private, max-age=60")], true),
+        (
+            "private",
+            vec![("cache-control", "private, max-age=60")],
+            true,
+        ),
         ("no-cache", vec![("cache-control", "no-cache")], true),
         ("max-age=0", vec![("cache-control", "max-age=0")], true),
         (
@@ -7202,7 +7229,15 @@ async fn response_caching_alone_enables_retry_time_release() {
 async fn a_discarded_retry_attempt_never_mutates_cache_state() {
     let _policy_guard = response_cache_replay_policy_guard();
     let plugin = Arc::new(default_plugin());
-    cache_response(&plugin, "GET", "/api/resource", 200, &HashMap::new(), b"old").await;
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/resource",
+        200,
+        &HashMap::new(),
+        b"old",
+    )
+    .await;
     assert_eq!(response_caching_cache_keys_for_test(&plugin).len(), 1);
 
     let mut ctx = refresh_ctx(&plugin, "/api/resource").await;
@@ -7245,7 +7280,15 @@ async fn a_discarded_retry_attempt_never_mutates_cache_state() {
 async fn the_header_phase_reads_the_final_transformed_headers() {
     let _policy_guard = response_cache_replay_policy_guard();
     let plugin = Arc::new(default_plugin());
-    cache_response(&plugin, "GET", "/api/resource", 200, &HashMap::new(), b"old").await;
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/resource",
+        200,
+        &HashMap::new(),
+        b"old",
+    )
+    .await;
 
     let mut ctx = refresh_ctx(&plugin, "/api/resource").await;
 
@@ -7386,28 +7429,30 @@ fn retry_refinement_streams(
 /// at priority 4000, after `response_caching` at 3500, so it is exactly a
 /// "later hook" for the refinement.
 fn later_content_type_rewriter() -> Arc<dyn Plugin> {
-    let transformer = ferrum_edge::plugins::response_transformer::ResponseTransformer::new(&json!({
-        "rules": [{
-            "operation": "update",
-            "target": "header",
-            "key": "Content-Type",
-            "value": "application/json"
-        }]
-    }))
-    .expect("response_transformer config");
+    let transformer =
+        ferrum_edge::plugins::response_transformer::ResponseTransformer::new(&json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "Content-Type",
+                "value": "application/json"
+            }]
+        }))
+        .expect("response_transformer config");
     Arc::new(transformer)
 }
 
 fn later_header_transformer(key: &str, value: &str) -> Arc<dyn Plugin> {
-    let transformer = ferrum_edge::plugins::response_transformer::ResponseTransformer::new(&json!({
-        "rules": [{
-            "operation": "update",
-            "target": "header",
-            "key": key,
-            "value": value
-        }]
-    }))
-    .expect("response_transformer config");
+    let transformer =
+        ferrum_edge::plugins::response_transformer::ResponseTransformer::new(&json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": key,
+                "value": value
+            }]
+        }))
+        .expect("response_transformer config");
     Arc::new(transformer)
 }
 
@@ -7524,7 +7569,15 @@ async fn a_route_level_response_header_rule_participates_in_the_retry_projection
 
     let _policy_guard = response_cache_replay_policy_guard();
     let plugin: Arc<ResponseCaching> = Arc::new(default_plugin());
-    cache_response(&plugin, "GET", "/api/resource", 200, &HashMap::new(), b"old").await;
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/resource",
+        200,
+        &HashMap::new(),
+        b"old",
+    )
+    .await;
     assert_eq!(response_caching_cache_keys_for_test(&plugin).len(), 1);
 
     let mut ctx = refresh_ctx(&plugin, "/api/resource").await;
@@ -7535,10 +7588,11 @@ async fn a_route_level_response_header_rule_participates_in_the_retry_projection
     }];
     ctx.route_override_response_transform = Some(Arc::new(route_rules));
 
-    let transformer = ferrum_edge::plugins::response_transformer::ResponseTransformer::new(&json!({
-        "apply_route_overrides": true
-    }))
-    .expect("route override response_transformer config");
+    let transformer =
+        ferrum_edge::plugins::response_transformer::ResponseTransformer::new(&json!({
+            "apply_route_overrides": true
+        }))
+        .expect("route override response_transformer config");
     let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone(), Arc::new(transformer)];
 
     let storable = response_headers_from(&[
@@ -7586,10 +7640,8 @@ async fn a_content_type_dependent_plugin_still_buffers_behind_a_later_rewrite() 
     let validator: Arc<dyn Plugin> = Arc::new(body_validator);
     // `no-store` closes the cache's store path, so the cache is not what decides
     // this case — the validator is.
-    let png = response_headers_from(&[
-        ("content-type", "image/png"),
-        ("cache-control", "no-store"),
-    ]);
+    let png =
+        response_headers_from(&[("content-type", "image/png"), ("cache-control", "no-store")]);
 
     // Without a relabelling hook both instances release this representation.
     let without_rewrite: Vec<Arc<dyn Plugin>> = vec![plugin.clone(), validator.clone()];
@@ -7641,7 +7693,15 @@ async fn retry_release_still_requires_every_active_buffering_plugin_to_agree() {
 async fn a_discarded_transformed_retry_attempt_is_side_effect_free() {
     let _policy_guard = response_cache_replay_policy_guard();
     let plugin: Arc<ResponseCaching> = Arc::new(default_plugin());
-    cache_response(&plugin, "GET", "/api/resource", 200, &HashMap::new(), b"old").await;
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/resource",
+        200,
+        &HashMap::new(),
+        b"old",
+    )
+    .await;
     assert_eq!(response_caching_cache_keys_for_test(&plugin).len(), 1);
 
     let mut ctx = refresh_ctx(&plugin, "/api/resource").await;
@@ -7697,7 +7757,12 @@ async fn an_unreproducible_later_plugin_keeps_the_conservative_answer() {
         plugin.clone(),
         later_header_transformer("cache-control", "no-store"),
     ];
-    assert!(retry_refinement_streams(&reproducible, &ctx, 200, &storable));
+    assert!(retry_refinement_streams(
+        &reproducible,
+        &ctx,
+        200,
+        &storable
+    ));
 
     // The SAME rule behind a plugin whose `after_proxy` the gateway cannot
     // reproduce does not: the projection is not a proof there, so the

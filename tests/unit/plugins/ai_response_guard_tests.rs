@@ -5258,14 +5258,20 @@ async fn test_completed_redaction_discharges_the_final_seam() {
 
     let mut ctx = ctx_with_content_type("POST", "application/json");
     assert!(matches!(
-        plugin.on_response_body(&mut ctx, 200, &mut headers, body).await,
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, body)
+            .await,
         PluginResult::Continue
     ));
     let redacted = plugin
         .transform_response_body_with_context(&mut ctx, body, Some("text/plain"), &headers)
         .await
         .expect("the redaction is constructible under an ordinary ceiling");
-    assert!(!String::from_utf8(redacted.clone()).unwrap().contains("user@example.com"));
+    assert!(
+        !String::from_utf8(redacted.clone())
+            .unwrap()
+            .contains("user@example.com")
+    );
 
     assert!(
         matches!(
@@ -5287,11 +5293,15 @@ async fn test_clean_and_warn_responses_never_arm_the_final_seam() {
     let mut ctx = ctx_with_content_type("POST", "application/json");
     let clean = b"nothing to see here";
     assert!(matches!(
-        plugin.on_response_body(&mut ctx, 200, &mut headers, clean).await,
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, clean)
+            .await,
         PluginResult::Continue
     ));
     assert!(matches!(
-        plugin.on_final_response_body(&mut ctx, 200, &headers, clean).await,
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, clean)
+            .await,
         PluginResult::Continue
     ));
 
@@ -5386,9 +5396,8 @@ async fn test_single_large_sse_event_is_rewritten_under_the_retained_ceiling() {
     // One event whose JSON payload is large but still under a modest ceiling
     // after redaction. The event is the entire retained body.
     let padding = "x".repeat(2000);
-    let body = format!(
-        "event: msg\ndata: {{\"pad\":\"{padding}\",\"mail\":\"user@example.com\"}}\n\n"
-    );
+    let body =
+        format!("event: msg\ndata: {{\"pad\":\"{padding}\",\"mail\":\"user@example.com\"}}\n\n");
     let mut ctx = ctx_with_content_type("POST", "application/json");
     ctx.max_response_body_size_bytes = 8192;
 

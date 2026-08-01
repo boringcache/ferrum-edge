@@ -2490,9 +2490,8 @@ fn final_trailer_reconciliation_is_bounded_for_binary_and_text() {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use ferrum_edge::_test_support::{
-        GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY,
-        RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS, build_trailer_frame,
-        store_charged_grpc_web_reframed_body_for_test,
+        GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY, RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+        build_trailer_frame, store_charged_grpc_web_reframed_body_for_test,
         sync_translated_body_trailer_frame_into_for_test,
     };
 
@@ -4034,7 +4033,10 @@ async fn test_large_trailer_block_frames_identically_in_binary_and_text() {
     sorted.sort();
     assert_eq!(names, sorted, "trailer names must stay sorted");
     assert_eq!(
-        lines.iter().filter(|line| line.starts_with("grpc-status")).count(),
+        lines
+            .iter()
+            .filter(|line| line.starts_with("grpc-status"))
+            .count(),
         1,
         "exactly one normalized grpc-status line"
     );
