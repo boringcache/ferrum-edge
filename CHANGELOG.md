@@ -178,6 +178,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Buffered response bodies the gateway retains are now bounded per response and
+  in aggregate, and every retained allocation is charged before it exists
+  (GHSA-pwcm-6rh8-f2gh). `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0` ("unlimited")
+  remains a streaming policy but folds to a finite fail-closed ceiling whenever
+  a body is retained, and a new process-wide budget
+  (`FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES`, default 256 MiB, charged in 64 KiB
+  blocks) caps what all concurrent buffered responses hold at once. The charge
+  is owned by the allocation rather than by the request, so it survives the
+  collector's return and is released when the last handle drops — covering
+  retries, plugin replacement, the response cache entry copy, deadlines,
+  disconnects, and cancellation identically. What is charged is CAPACITY, not
+  payload length: collectors pick their own growth target and reserve it before
+  asking the allocator, preallocation hints are charged before they are
+  allocated, and the eager small-response paths collect through that same
+  collector instead of awaiting an opaque whole-body read (a declared
+  `Content-Length` is a backend claim, not proof of the capacity handed out).
+  Representation decodes charge their output capacity, their stacked
+  input+output peak, and a conservative per-codec working-set ceiling. Plugins
+  that replace a buffered response body (`response_transformer` body rules,
+  `compression`, `sse`, `grpc_web`, `mcp_gateway`, and the AI response
+  plugins) now run inside a reserved window: a full covering window is a
+  precondition of every producer invocation, refilled only after the previous
+  replacement was installed, and each producer materialises its output through
+  a ceiling-bounded sink so an oversized replacement is refused while it is
+  written rather than after it is resident. A plugin whose replacement contract
+  the gateway cannot prove — any out-of-tree plugin that does not declare
+  `Plugin::response_body_production()` — is refused rather than invoked, and a
+  chain that cannot rewrite reserves no window at all. Refusals are separated
+  by cause: a body past the per-response ceiling keeps its backend
+  `response_body_too_large` attribution, while an exhausted aggregate budget is
+  the gateway-local, health-neutral `gateway_buffer_capacity` terminal
+  (HTTP `503` / gRPC `RESOURCE_EXHAUSTED`) with a fixed redacted body, so it
+  never poisons circuit breaking, passive health, or adaptive concurrency.
+
 - `body_validator` no longer fails open on unusual methods, empty bodies, or
   uninspectable data (GHSA-2vmr-ww8r-mww3,
   <https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-2vmr-ww8r-mww3>).
