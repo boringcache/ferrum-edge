@@ -391,8 +391,11 @@ fn budget() -> &'static Budget {
 
 impl Budget {
     fn new(fallback_per_response_bytes: usize, total_bytes: usize) -> Self {
-        // A zero/short total would refuse every buffered response and take the
-        // proxy down, so the aggregate budget is floored at the FALLBACK
+        // A zero/short fallback would not cover even one reservation block, and
+        // an enormous one would make the fallback arithmetic needlessly close
+        // to `usize` overflow, so normalize it to the documented range first. A
+        // zero/short total would then refuse every buffered response and take
+        // the proxy down, so the aggregate budget is floored at that FALLBACK
         // per-response ceiling — and at nothing else.
         //
         // Stated exactly, because the difference is load-bearing: the floor

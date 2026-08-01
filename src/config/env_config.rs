@@ -1686,7 +1686,9 @@ pub struct EnvConfig {
     /// in memory for a plugin rather than streamed. `0 = unlimited` remains a
     /// valid streaming policy; it is not a valid buffering policy, because one
     /// client-chosen response could then grow without bound
-    /// (GHSA-pwcm-6rh8-f2gh). Default: 10485760 (10 MiB).
+    /// (GHSA-pwcm-6rh8-f2gh). Runtime clamps this fallback to one 64 KiB
+    /// reservation block at minimum and `usize::MAX / 2` at maximum. Default:
+    /// 10485760 (10 MiB).
     pub response_buffer_fallback_max_bytes: usize,
     /// Aggregate ceiling (bytes) on everything concurrent buffered responses
     /// retain at once. A finite per-response ceiling still multiplies by
