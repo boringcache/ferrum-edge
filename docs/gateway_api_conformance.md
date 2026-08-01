@@ -24,7 +24,10 @@ authoritative Gateway API conformance check, and it **gates** merges:
   translation/status, CP/DP sync, data-plane startup, plugins, charts, the
   runtime image, proto, the conformance script, dependencies, or related CI.
   On `merge_group`, the filter diffs `merge_group.base_sha...HEAD` and fails
-  closed if that base SHA is missing.
+  closed if that base SHA is missing. Both pull-request and merge-group changed-
+  file lists use `git diff --name-only --no-renames` so a rename's source and
+  destination are both classified and a move into an irrelevant path cannot
+  skip the lab.
 - **Gating:** the workflow's `gate` job fails the check when change detection,
   the upstream suite, or the black-box checks fail (a lab skipped on an
   irrelevant PR passes). The `gate` job (`Gateway API Conformance`) is a

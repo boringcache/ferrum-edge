@@ -69,7 +69,7 @@ jobs:
 
           if [ "$EVENT_NAME" = "pull_request" ]; then
             base_ref="origin/${BASE_REF}"
-            git diff --name-only "${base_ref}...HEAD" > "$changed_files"
+            git diff --name-only --no-renames "${base_ref}...HEAD" > "$changed_files"
           elif [ "$EVENT_NAME" = "merge_group" ]; then
             if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
               echo "::error::merge_group base_sha missing or malformed" >&2
@@ -78,7 +78,7 @@ jobs:
             if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
               git fetch --no-tags origin "${MERGE_BASE_SHA}"
             fi
-            git diff --name-only "${MERGE_BASE_SHA}...HEAD" > "$changed_files"
+            git diff --name-only --no-renames "${MERGE_BASE_SHA}...HEAD" > "$changed_files"
           fi
 
           plan="$(python3 .github/scripts/coverage_plan.py \

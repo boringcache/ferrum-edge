@@ -772,6 +772,51 @@ def main() -> int:
         planner_errors.append(
             "jobs.ci-plan must diff merge_group commits with rename detection disabled"
         )
+
+    coverage_plan_body = extract_job_body(
+        Path(".github/workflows/coverage.yml").read_text(encoding="utf-8"),
+        "coverage-plan",
+    )
+    if (
+        'git diff --name-only --no-renames "${base_ref}...HEAD" > "$changed_files"'
+        not in coverage_plan_body
+    ):
+        planner_errors.append(
+            "jobs.coverage-plan must disable rename detection when collecting "
+            "pull_request changed files"
+        )
+    if (
+        'git diff --name-only --no-renames "${MERGE_BASE_SHA}...HEAD" > "$changed_files"'
+        not in coverage_plan_body
+    ):
+        planner_errors.append(
+            "jobs.coverage-plan must diff merge_group commits with rename "
+            "detection disabled"
+        )
+
+    gateway_changes_body = extract_job_body(
+        Path(".github/workflows/gateway-api-conformance.yml").read_text(
+            encoding="utf-8"
+        ),
+        "changes",
+    )
+    if (
+        'git diff --name-only --no-renames "${base_ref}...HEAD" | sort > "$changed_files"'
+        not in gateway_changes_body
+    ):
+        planner_errors.append(
+            "jobs.changes in gateway-api-conformance.yml must disable rename "
+            "detection when collecting pull_request changed files"
+        )
+    if (
+        'git diff --name-only --no-renames "${MERGE_BASE_SHA}...HEAD" | sort > "$changed_files"'
+        not in gateway_changes_body
+    ):
+        planner_errors.append(
+            "jobs.changes in gateway-api-conformance.yml must diff merge_group "
+            "commits with rename detection disabled"
+        )
+
     for output in sorted(set(PATH_GATED_JOBS.values())):
         if not re.search(rf"(?m)^      {re.escape(output)}:", ci_plan_body):
             planner_errors.append(f"jobs.ci-plan must publish `{output}`")
