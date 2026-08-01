@@ -198,11 +198,8 @@ async fn final_publication_runs_neither_write_when_lease_is_lost() {
         .expect("won");
     let keeper = RenewalLeaseKeeper::start(held, Duration::from_secs(60));
 
-    std::fs::write(
-        dir.path().join("tls-leases.json"),
-        takeover_document(&name),
-    )
-    .expect("simulate takeover");
+    std::fs::write(dir.path().join("tls-leases.json"), takeover_document(&name))
+        .expect("simulate takeover");
 
     let entered = Arc::new(AtomicBool::new(false));
     let saw_entry = Arc::clone(&entered);
@@ -264,13 +261,16 @@ async fn order_failure_certificate_success_publishes_reloads_and_clears_active_o
 
     let surface = "final_publication_matrix_material_without_valid_reload";
     let mut probe = install_force_reload_probe(surface);
-    let _fault = inject_final_publication_order_write_fault_for_tests(PrivateFileFault::Rename);
 
     let outcome = keeper
         .commit_fenced({
             let certificates = Arc::clone(&certificates);
             let orders = Arc::clone(&orders);
-            move || commit_final_renewal_publication(&certificates, &orders, issued, order)
+            move || {
+                let _fault =
+                    inject_final_publication_order_write_fault_for_tests(PrivateFileFault::Rename);
+                commit_final_renewal_publication(&certificates, &orders, issued, order)
+            }
         })
         .await
         .expect("lease still held for both attempted writes");
@@ -319,7 +319,12 @@ fn order_success_certificate_failure_retains_prior_material_without_reload() {
     let certificates = AcmeCertificateStore::open(dir.path()).expect("open cert store");
     let orders = AcmeOrderStore::open(dir.path()).expect("open order store");
     let (old_cert_pem, old_key_pem) = generated_cert_and_key();
-    let prior = sample_certificate("edge-cert", &old_cert_pem, &old_key_pem, Some(OTHER_ORDER_URL));
+    let prior = sample_certificate(
+        "edge-cert",
+        &old_cert_pem,
+        &old_key_pem,
+        Some(OTHER_ORDER_URL),
+    );
     certificates
         .upsert_certificate(prior, false)
         .expect("seed prior certificate");
@@ -420,9 +425,8 @@ fn both_final_writes_fail_without_reload_or_material_disclosure() {
     let error = apply_final_renewal_publication(outcome).expect_err("both writes failed");
     let message = error.to_string();
     assert!(
-        message.contains(
-            "ACME final publication failed for both order and certificate stores"
-        ) && message.contains("order:")
+        message.contains("ACME final publication failed for both order and certificate stores")
+            && message.contains("order:")
             && message.contains("certificate:"),
         "combined failure must preserve both diagnostics: {message}"
     );

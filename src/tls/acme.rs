@@ -1977,9 +1977,7 @@ pub(crate) fn plan_renewal_order(
     };
     if !matches!(
         order.status,
-        AcmeOrderStatus::PendingChallenges
-            | AcmeOrderStatus::Ready
-            | AcmeOrderStatus::Processing
+        AcmeOrderStatus::PendingChallenges | AcmeOrderStatus::Ready | AcmeOrderStatus::Processing
     ) {
         return Ok(RenewalOrderPlan::NewOrder);
     }
@@ -2182,10 +2180,9 @@ pub(crate) fn commit_final_renewal_publication(
         (Ok(_), Ok(_)) => FinalRenewalPublication::Complete,
         (Ok(_), Err(error)) => FinalRenewalPublication::OrderCommittedMaterialNotPublished(error),
         (Err(error), Ok(_)) => FinalRenewalPublication::MaterialPublishedOrderNotCommitted(error),
-        (Err(order), Err(certificate)) => FinalRenewalPublication::NeitherCommitted {
-            order,
-            certificate,
-        },
+        (Err(order), Err(certificate)) => {
+            FinalRenewalPublication::NeitherCommitted { order, certificate }
+        }
     }
 }
 
@@ -2316,8 +2313,8 @@ std::thread_local! {
 /// Take any armed order-write fault and install it as a private-file fault for
 /// the duration of the order upsert.
 #[cfg(test)]
-fn take_final_publication_order_write_fault(
-) -> Option<crate::tls::private_file::PrivateFileFaultGuard> {
+fn take_final_publication_order_write_fault()
+-> Option<crate::tls::private_file::PrivateFileFaultGuard> {
     let fault = FINAL_PUBLICATION_ORDER_WRITE_FAULT.with(|cell| {
         let fault = cell.get();
         cell.set(crate::tls::private_file::PrivateFileFault::None);
@@ -2326,17 +2323,15 @@ fn take_final_publication_order_write_fault(
     if fault == crate::tls::private_file::PrivateFileFault::None {
         None
     } else {
-        Some(crate::tls::private_file::inject_private_file_fault_for_tests(
-            fault,
-        ))
+        Some(crate::tls::private_file::inject_private_file_fault_for_tests(fault))
     }
 }
 
 /// Take any armed certificate-write fault and install it as a private-file
 /// fault for the duration of the certificate upsert.
 #[cfg(test)]
-fn take_final_publication_certificate_write_fault(
-) -> Option<crate::tls::private_file::PrivateFileFaultGuard> {
+fn take_final_publication_certificate_write_fault()
+-> Option<crate::tls::private_file::PrivateFileFaultGuard> {
     let fault = FINAL_PUBLICATION_CERTIFICATE_WRITE_FAULT.with(|cell| {
         let fault = cell.get();
         cell.set(crate::tls::private_file::PrivateFileFault::None);
@@ -2345,9 +2340,7 @@ fn take_final_publication_certificate_write_fault(
     if fault == crate::tls::private_file::PrivateFileFault::None {
         None
     } else {
-        Some(crate::tls::private_file::inject_private_file_fault_for_tests(
-            fault,
-        ))
+        Some(crate::tls::private_file::inject_private_file_fault_for_tests(fault))
     }
 }
 

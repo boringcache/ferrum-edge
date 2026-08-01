@@ -898,7 +898,9 @@ fn two_target_mutations_share_one_lease_fence_without_a_takeover_window() {
         "the second mutation must still be inside the held fence after expiry"
     );
 
-    release_tx.send(()).expect("release the mid-publication hold");
+    release_tx
+        .send(())
+        .expect("release the mid-publication hold");
     let outcome = commit
         .join()
         .expect("commit thread")

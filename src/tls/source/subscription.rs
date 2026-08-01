@@ -67,9 +67,7 @@ pub fn request_all_material_set_reloads() -> Vec<&'static str> {
 /// Install a force-reload receiver for focused tests that assert reload was
 /// requested without standing up a full material-set watcher.
 #[cfg(test)]
-pub(crate) fn install_force_reload_probe(
-    surface: &'static str,
-) -> mpsc::Receiver<()> {
+pub(crate) fn install_force_reload_probe(surface: &'static str) -> mpsc::Receiver<()> {
     let (force_tx, force_rx) = mpsc::channel(1);
     force_reload_registry().insert(surface, force_tx);
     force_rx

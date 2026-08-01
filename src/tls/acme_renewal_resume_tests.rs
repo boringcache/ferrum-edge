@@ -494,12 +494,43 @@ fn assert_no_challenge_disclosure(message: &str) {
 async fn a_claim_lost_during_resumed_work_cancels_completion_and_cleanup() {
     let order = OrderSpec::dns01().build();
     let fixture = fixture_with(Some(order), Some(issued_certificate(None)), true);
-    let keeper = successor_keeper(&fixture);
+    let keeper = Arc::new(successor_keeper(&fixture));
 
-    let document = live_takeover_document(&fixture.lease_name());
-    std::fs::write(fixture.lease_file(), document).expect("simulate a takeover");
+    let work_started = Arc::new(tokio::sync::Notify::new());
+    let work_hold = Arc::new(tokio::sync::Notify::new());
+    let started_for_work = Arc::clone(&work_started);
+    let hold_for_work = Arc::clone(&work_hold);
 
-    let completion = keeper.guarded(async { "completed order" }).await;
+    let completion = {
+        let keeper = Arc::clone(&keeper);
+        async move {
+            keeper
+                .guarded(async move {
+                    started_for_work.notify_one();
+                    hold_for_work.notified().await;
+                    "completed order"
+                })
+                .await
+        }
+    };
+
+    let takeover = {
+        let keeper = Arc::clone(&keeper);
+        let lease_file = fixture.lease_file();
+        let lease_name = fixture.lease_name();
+        async move {
+            work_started.notified().await;
+            std::fs::write(lease_file, live_takeover_document(&lease_name))
+                .expect("simulate a takeover");
+            keeper.ensure_owned().await
+        }
+    };
+
+    let (completion, ownership) = tokio::join!(completion, takeover);
+    assert!(
+        ownership.is_err(),
+        "authoritative ownership must observe the takeover"
+    );
     assert!(
         completion.is_err(),
         "a superseded owner must not keep completing a resumed order"
@@ -521,7 +552,10 @@ async fn a_claim_lost_during_resumed_work_cancels_completion_and_cleanup() {
         !ran_cleanup.load(Ordering::SeqCst),
         "the cleanup hook must never start after the claim is lost"
     );
-    let _ = keeper.finish().await;
+    let _ = Arc::try_unwrap(keeper)
+        .expect("keeper fully owned at test end")
+        .finish()
+        .await;
 }
 
 /// A resumed DNS-01 order whose hook is no longer configured is skipped
