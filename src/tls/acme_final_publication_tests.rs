@@ -13,9 +13,8 @@ use std::time::Duration;
 use crate::tls::acme::{
     AcmeCertificateRecord, AcmeCertificateStore, AcmeError, AcmeHttp01ChallengeRecord,
     AcmeHttp01OrderInput, AcmeIssuedCertificateInput, AcmeOrderFinalization, AcmeOrderRecord,
-    AcmeOrderStatus, AcmeOrderStore, FinalRenewalPublication,
-    commit_final_renewal_publication, has_active_renewal_order,
-    inject_final_publication_certificate_write_fault_for_tests,
+    AcmeOrderStatus, AcmeOrderStore, FinalRenewalPublication, commit_final_renewal_publication,
+    has_active_renewal_order, inject_final_publication_certificate_write_fault_for_tests,
     inject_final_publication_order_write_fault_for_tests, map_final_renewal_publication_outcome,
 };
 use crate::tls::lease::{RenewalLeaseKeeper, TlsLeaseStore, acme_renewal_lease_name};
@@ -445,10 +444,7 @@ fn both_final_writes_fail_without_reload_or_material_disclosure() {
         "combined failure must preserve both diagnostics: {message}"
     );
     assert_no_material_disclosure(&message, &[&cert_pem, &key_pem]);
-    assert!(
-        !reload_requested,
-        "both-failure must not request reload"
-    );
+    assert!(!reload_requested, "both-failure must not request reload");
     assert!(matches!(
         certificates.get_certificate("edge-cert"),
         Err(AcmeError::NotFound(_))
