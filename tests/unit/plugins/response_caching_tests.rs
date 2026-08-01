@@ -670,10 +670,24 @@ async fn base_cache_key_cache_control_exclusion_is_value_aware() {
         "recognized no-store must remain under the original partition for replacement"
     );
 
+    let pure_pair = staged_base_cache_key(&plugin, path, &[("cache-control", "no-cache, no-store")])
+        .await
+        .expect("pure no-cache/no-store pair must stage a base key");
+    assert_eq!(
+        pure_pair, baseline,
+        "a header of only honored refresh members must stay under the original partition"
+    );
+
     let unrecognized = [
         ("max-age=0", "request max-age is not a handled refresh"),
-        ("only-if-cached", "only-if-cached is not interpreted by this cache"),
-        ("foo", "arbitrary Cache-Control extensions are backend-visible"),
+        (
+            "only-if-cached",
+            "only-if-cached is not interpreted by this cache",
+        ),
+        (
+            "foo",
+            "arbitrary Cache-Control extensions are backend-visible",
+        ),
         ("public", "public on a request is not a handled refresh"),
     ];
     for (value, reason) in unrecognized {
@@ -686,19 +700,44 @@ async fn base_cache_key_cache_control_exclusion_is_value_aware() {
         );
     }
 
-    // Mixed recognized refresh + extension still collapses to the refresh
-    // partition so a no-cache replacement stays addressable.
-    let mixed = staged_base_cache_key(
-        &plugin,
-        path,
-        &[("cache-control", "no-cache, max-age=0")],
-    )
-    .await
-    .expect("mixed no-cache refresh must stage a base key");
-    assert_eq!(
-        mixed, baseline,
-        "presence of recognized no-cache keeps the refresh under the original partition"
+    // Mixed recognized refresh + unimplemented members remain backend-visible
+    // context and must not collapse onto the baseline refresh partition.
+    let mixed_max_age =
+        staged_base_cache_key(&plugin, path, &[("cache-control", "no-cache, max-age=0")])
+            .await
+            .expect("mixed no-cache refresh must stage a base key");
+    assert_ne!(
+        mixed_max_age, baseline,
+        "mixed no-cache plus max-age=0 must not share the baseline replay key"
     );
+
+    let mixed_extension =
+        staged_base_cache_key(&plugin, path, &[("cache-control", "no-cache, x-tenant=a")])
+            .await
+            .expect("mixed no-cache plus extension must stage a base key");
+    assert_ne!(
+        mixed_extension, baseline,
+        "mixed no-cache plus an arbitrary extension must not share the baseline replay key"
+    );
+}
+
+#[tokio::test]
+async fn base_cache_key_binds_cache_control_when_respect_no_cache_disabled() {
+    let plugin = plugin_with_config(json!({ "respect_no_cache": false }));
+    let path = "/cache-control-respect-disabled";
+    let baseline = staged_base_cache_key(&plugin, path, &[])
+        .await
+        .expect("baseline request must stage a base key");
+
+    for value in ["no-cache", "no-store", r#"no-cache="authorization""#] {
+        let key = staged_base_cache_key(&plugin, path, &[("cache-control", value)])
+            .await
+            .unwrap_or_else(|| panic!("cache-control: {value} must stage a base key"));
+        assert_ne!(
+            key, baseline,
+            "respect_no_cache=false leaves cache-control: {value} backend-visible and bound"
+        );
+    }
 }
 
 #[tokio::test]

@@ -37,10 +37,12 @@
 //!   reach the origin and are bound. The shared HTTP cache
 //!   ([`append_response_cache_request_partition`]) excludes only the entry-
 //!   operation headers whose semantics `response_caching` actually implements
-//!   (`If-None-Match`, `If-Modified-Since`, recognized request `Cache-Control:
-//!   no-cache` / `no-store` refreshes, `Range`, and `Content-Length`) while
+//!   (`If-None-Match`, `If-Modified-Since`, pure honored request
+//!   `Cache-Control: no-cache` / `no-store` refreshes when
+//!   `respect_no_cache` is enabled, `Range`, and `Content-Length`) while
 //!   conservatively binding every other representation and policy dimension,
-//!   including headers absent from `Vary`.
+//!   including headers absent from `Vary`. Mixed Cache-Control members and
+//!   Cache-Control under `respect_no_cache: false` stay bound.
 //!
 //! Every component is serialized with typed, length-framed fields
 //! ([`PartitionHasher`]) so no attacker-controlled byte can impersonate a field
@@ -720,39 +722,45 @@ pub fn append_request_context_partition(
 /// `response_caching` actually implements are omitted:
 ///
 /// * `If-None-Match` / `If-Modified-Since` — fresh conditional HIT → 304
-/// * recognized request `Cache-Control: no-cache` / `no-store` (bare or
-///   qualified `no-cache="…"`) — bypass + store the replacement under the
-///   same partition as the entry being refreshed
+/// * pure honored request `Cache-Control: no-cache` / `no-store` (bare or
+///   qualified `no-cache="…"`, and only when every meaningful member is such
+///   a refresh) — when `respect_no_cache` is enabled, bypass + store the
+///   replacement under the same partition as the entry being refreshed
 /// * `Range` — lookup may still address the stored full representation
 /// * `Content-Length` — zero-length framing on an otherwise empty GET/HEAD
 ///
 /// Unsupported precondition / cache-directive dimensions (`If-Match`,
-/// `If-Unmodified-Since`, `If-Range`, `Pragma`, and arbitrary / unrecognized
-/// `Cache-Control` content) stay bound so they cannot share a replay key with
-/// a request that did not carry them. Labeling unimplemented semantics as
-/// "cache operations" would let a fresh HIT ignore a client precondition.
+/// `If-Unmodified-Since`, `If-Range`, `Pragma`, mixed / arbitrary /
+/// unrecognized `Cache-Control` content, and any `Cache-Control` when
+/// `respect_no_cache` is false) stay bound so they cannot share a replay key
+/// with a request that did not carry them. Labeling unimplemented semantics
+/// as "cache operations" would let a fresh HIT ignore a client precondition.
 pub fn append_response_cache_request_partition(
     hasher: &mut PartitionHasher,
     ctx: &RequestContext,
     request_headers: &HashMap<String, String>,
+    respect_no_cache: bool,
 ) {
-    append_filtered_request_context_partition(
-        hasher,
-        ctx,
-        request_headers,
-        is_response_cache_entry_operation_header,
-    );
+    append_filtered_request_context_partition(hasher, ctx, request_headers, |name, value| {
+        is_response_cache_entry_operation_header(name, value, respect_no_cache)
+    });
 }
 
 /// Whether `name`/`value` is an entry-operation header this response cache
 /// safely omits from the request-header partition.
 ///
 /// Name-only exemptions are limited to validators, range, and framing this
-/// plugin handles. `Cache-Control` is value-aware: only recognized request
-/// `no-cache` / `no-store` refreshes are omitted so a replacement remains
-/// addressable under the original partition; every other directive string is
-/// a backend-visible policy dimension and must be bound.
-fn is_response_cache_entry_operation_header(name: &str, value: &str) -> bool {
+/// plugin handles. `Cache-Control` is value-aware and gated by
+/// `respect_no_cache`: only a pure honored `no-cache` / `no-store` refresh
+/// (every meaningful member is such a refresh) is omitted so a replacement
+/// remains addressable under the original partition. Mixed recognized refresh
+/// plus any other member, and any `Cache-Control` when the plugin will not
+/// honor request no-cache/no-store as an entry operation, stay bound.
+fn is_response_cache_entry_operation_header(
+    name: &str,
+    value: &str,
+    respect_no_cache: bool,
+) -> bool {
     if name.eq_ignore_ascii_case("if-none-match")
         || name.eq_ignore_ascii_case("if-modified-since")
         || name.eq_ignore_ascii_case("range")
@@ -760,19 +768,25 @@ fn is_response_cache_entry_operation_header(name: &str, value: &str) -> bool {
     {
         return true;
     }
-    name.eq_ignore_ascii_case("cache-control")
-        && request_cache_control_is_recognized_refresh(value)
+    respect_no_cache
+        && name.eq_ignore_ascii_case("cache-control")
+        && request_cache_control_is_pure_honored_refresh(value)
 }
 
-/// True when a request `Cache-Control` value asks for a refresh this cache
-/// implements (`no-cache` / `no-store`, bare or qualified).
+/// True when every meaningful request `Cache-Control` member is a refresh
+/// this cache implements (`no-cache` / `no-store`, bare or qualified), and at
+/// least one such member exists.
 ///
-/// Matches the bypass contract in `response_caching`: presence of either
-/// directive (including `no-cache="…"`) is enough. Other request directives
-/// and extensions are not interpreted here and must remain partitioned.
-fn request_cache_control_is_recognized_refresh(header_value: &str) -> bool {
+/// Aligned with the grammar-aware walk in `response_caching::parse_cache_control`:
+/// quoted arguments are consumed without splitting on interior commas, trailing
+/// junk after a quoted-string fails closed, and an unterminated quote fails
+/// closed. Presence of any other directive or extension — including
+/// `max-age=0` beside `no-cache` — means the full backend-visible value must
+/// remain partitioned. Empty / whitespace-only values are not refreshes.
+fn request_cache_control_is_pure_honored_refresh(header_value: &str) -> bool {
     let bytes = header_value.as_bytes();
     let mut index = 0usize;
+    let mut saw_refresh = false;
 
     while index < bytes.len() {
         while matches!(bytes.get(index), Some(b',' | b' ' | b'\t')) {
@@ -787,11 +801,18 @@ fn request_cache_control_is_recognized_refresh(header_value: &str) -> bool {
             index += 1;
         }
         let Some(name) = header_value.get(name_start..index).map(str::trim) else {
-            break;
+            return false;
         };
+        if name.is_empty() {
+            // `=…` without a directive name is not a recognized refresh.
+            if bytes.get(index) == Some(&b'=') {
+                return false;
+            }
+            continue;
+        }
 
-        if name.eq_ignore_ascii_case("no-cache") || name.eq_ignore_ascii_case("no-store") {
-            return true;
+        if !name.eq_ignore_ascii_case("no-cache") && !name.eq_ignore_ascii_case("no-store") {
+            return false;
         }
 
         if bytes.get(index) == Some(&b'=') {
@@ -801,15 +822,31 @@ fn request_cache_control_is_recognized_refresh(header_value: &str) -> bool {
             }
             if bytes.get(index) == Some(&b'"') {
                 index += 1;
+                let mut closed = false;
                 while let Some(&byte) = bytes.get(index) {
                     match byte {
-                        b'\\' => index = index.saturating_add(2),
+                        b'\\' => {
+                            if index + 1 >= bytes.len() {
+                                return false;
+                            }
+                            index += 2;
+                        }
                         b'"' => {
                             index += 1;
+                            closed = true;
                             break;
                         }
                         _ => index += 1,
                     }
+                }
+                if !closed {
+                    return false;
+                }
+                while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+                    index += 1;
+                }
+                if !matches!(bytes.get(index), None | Some(b',')) {
+                    return false;
                 }
             } else {
                 while !matches!(bytes.get(index), None | Some(b',')) {
@@ -817,9 +854,11 @@ fn request_cache_control_is_recognized_refresh(header_value: &str) -> bool {
                 }
             }
         }
+
+        saw_refresh = true;
     }
 
-    false
+    saw_refresh
 }
 
 fn append_filtered_request_context_partition(
