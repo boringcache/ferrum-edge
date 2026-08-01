@@ -152,8 +152,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty proto3 message is validated normally. Response-side no-body exemptions
   are now explicit and protocol-correct (`1xx`, `204`, `205`, `304`, `HEAD`
   responses, and gRPC Trailers-Only replies); an ordinary body-bearing success
-  such as `200` with an empty body is no longer exempt. All fail-closed
-  diagnostics are fixed strings that never log or echo body bytes.
+  such as `200` with an empty body is no longer exempt. The new
+  representation-failure diagnostics are fixed strings that never log or echo
+  body bytes.
+
 - `body_validator` and `openapi_validator` validation diagnostics no longer
   disclose the rejected representation (GHSA-5p2h-fq6q-gwh9). Both plugins used
   to format the offending instance value — or a payload-chosen JSON, XML, form,

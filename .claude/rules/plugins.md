@@ -187,8 +187,8 @@ on a native-gRPC request.
   own empty proof, and fails closed otherwise. Native gRPC always runs
   `parse_grpc_frame`. The only exemptions are protocol-defined: gRPC
   Trailers-Only replies, and responses with no content by status/method
-  semantics (1xx, 204, 205, 304, `HEAD`). Fail-closed diagnostics are fixed
-  strings and never echo body bytes.
+  semantics (1xx, 204, 205, 304, `HEAD`). Representation-gap diagnostics are
+  fixed strings and never echo body bytes.
 - A configured finalized-egress plugin forces buffered request-body
   finalization to complete BEFORE backend dispatch (the `has_finalized_request_egress`
   term in `final_request_body_requirements`), because the ordinary ladder

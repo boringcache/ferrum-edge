@@ -19292,7 +19292,8 @@ components:
         always runs frame validation. The only exemptions are protocol-defined:
         gRPC Trailers-Only replies, and responses that carry no content by
         status/method semantics (1xx, 204, 205, 304, and responses to HEAD).
-        Fail-closed diagnostics are fixed strings and never echo body bytes.
+        Representation-gap diagnostics are fixed strings and never echo body
+        bytes.
       properties:
         json_schema:
           type: object
