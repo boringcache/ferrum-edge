@@ -16,8 +16,9 @@
 
 #![cfg(target_os = "linux")]
 
+use crate::common::{TestGateway, gateway_harness::ephemeral_port_excluding};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
-use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -84,102 +85,55 @@ fn spawn_trickle_backend(listener: TcpListener) -> JoinHandle<()> {
 
 // ── Gateway harness ─────────────────────────────────────────────────────────
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
-fn spawn_gateway(
-    config_path: &str,
-    http_port: u16,
-    admin_port: u16,
+async fn start_gateway_with_retry(
+    proxy_id: &str,
+    backend_port: u16,
+    backend_read_timeout_ms: u64,
+    backend_write_timeout_ms: u64,
+    tcp_idle_timeout_seconds: u64,
     extra_env: &[(&str, &str)],
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    let mut cmd = std::process::Command::new(gateway_binary_path());
-    cmd.env("FERRUM_MODE", "file")
-        .env("FERRUM_FILE_CONFIG_PATH", config_path)
-        .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        .env("RUST_LOG", "ferrum_edge=info")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    for (key, value) in extra_env {
-        cmd.env(key, value);
-    }
-    Ok(cmd.spawn()?)
-}
-
-async fn wait_for_health(admin_port: u16) -> bool {
-    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        match reqwest::get(&health_url).await {
-            Ok(r) if r.status().is_success() => return true,
-            _ => sleep(Duration::from_millis(250)).await,
-        }
-    }
-}
-
-async fn start_gateway_with_retry<F>(
-    make_config: F,
-    extra_env: &[(&str, &str)],
-) -> (std::process::Child, u16, u16, TempDir)
-where
-    F: Fn(u16) -> String,
-{
+) -> (TestGateway, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        let stream_port = bind_and_release_port().await;
-        let http_port = bind_and_release_port().await;
-        let admin_port = bind_and_release_port().await;
-
-        let dir = TempDir::new().unwrap();
-        let config_path = dir.path().join("config.yaml");
-        std::fs::write(&config_path, make_config(stream_port)).unwrap();
-
-        let mut child = match spawn_gateway(
-            config_path.to_str().unwrap(),
-            http_port,
-            admin_port,
-            extra_env,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Gateway spawn attempt {attempt}/{MAX_ATTEMPTS} failed: {e}");
-                if attempt < MAX_ATTEMPTS {
-                    sleep(Duration::from_secs(1)).await;
-                }
-                continue;
-            }
-        };
-        if wait_for_health(admin_port).await {
-            return (child, stream_port, admin_port, dir);
-        }
-        eprintln!(
-            "Gateway startup attempt {attempt}/{MAX_ATTEMPTS} failed \
-             (stream={stream_port} http={http_port} admin={admin_port})"
+        let mut allocated_ports = HashSet::new();
+        let stream_port = ephemeral_port_excluding(&mut allocated_ports)
+            .await
+            .expect("allocate stream port");
+        let admin_port = ephemeral_port_excluding(&mut allocated_ports)
+            .await
+            .expect("allocate distinct admin port");
+        let config = tcp_proxy_config(
+            proxy_id,
+            backend_port,
+            stream_port,
+            backend_read_timeout_ms,
+            backend_write_timeout_ms,
+            tcp_idle_timeout_seconds,
         );
-        let _ = child.kill();
-        let _ = child.wait();
+
+        let mut builder = TestGateway::builder()
+            .mode_file(config)
+            .skip_auto_build()
+            .max_attempts(1)
+            // This test exercises only the configured raw stream listener.
+            .env("FERRUM_PROXY_HTTP_PORT", "0")
+            .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string());
+        for (key, value) in extra_env {
+            builder = builder.env(*key, *value);
+        }
+
+        match builder.spawn().await {
+            Ok(gateway) => return (gateway, stream_port),
+            Err(error) => eprintln!(
+                "Gateway startup attempt {attempt}/{MAX_ATTEMPTS} failed \
+                 (stream={stream_port} admin={admin_port}): {error}"
+            ),
+        }
         if attempt < MAX_ATTEMPTS {
             sleep(Duration::from_secs(1)).await;
         }
     }
     panic!("Gateway did not start after {MAX_ATTEMPTS} attempts");
-}
-
-async fn bind_and_release_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
 }
 
 fn tcp_proxy_config(
@@ -237,16 +191,14 @@ async fn connect_stream(port: u16) -> TcpStream {
 // ── Per-test setup ──────────────────────────────────────────────────────────
 
 struct SpliceTestSetup {
-    gateway: std::process::Child,
+    gateway: TestGateway,
     proxy_port: u16,
     backend_task: JoinHandle<()>,
-    _dir: TempDir,
 }
 
 impl SpliceTestSetup {
     fn teardown(mut self) {
-        let _ = self.gateway.kill();
-        let _ = self.gateway.wait();
+        self.gateway.shutdown();
         self.backend_task.abort();
     }
 }
@@ -267,17 +219,12 @@ async fn setup_splice_proxy(
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_task = backend_factory(backend_listener);
 
-    let (gateway, proxy_port, _admin_port, dir) = start_gateway_with_retry(
-        |stream_port| {
-            tcp_proxy_config(
-                proxy_id,
-                backend_port,
-                stream_port,
-                backend_read_timeout_ms,
-                backend_write_timeout_ms,
-                tcp_idle_timeout_seconds,
-            )
-        },
+    let (gateway, proxy_port) = start_gateway_with_retry(
+        proxy_id,
+        backend_port,
+        backend_read_timeout_ms,
+        backend_write_timeout_ms,
+        tcp_idle_timeout_seconds,
         extra_env,
     )
     .await;
@@ -286,7 +233,6 @@ async fn setup_splice_proxy(
         gateway,
         proxy_port,
         backend_task,
-        _dir: dir,
     }
 }
 
