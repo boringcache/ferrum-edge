@@ -1600,14 +1600,14 @@ fn simulate_final_after_proxy_response_headers(
     // Without this, a chain-level `Cache-Control: no-store` route rule never
     // reaches `should_release_response_body_for_simulated_final_headers`
     // (GHSA-pwcm-6rh8-f2gh).
-    let last_route_response_finalizer =
-        if simulated_ctx.route_override_response_transform.is_some() {
-            plugins
-                .iter()
-                .rposition(|plugin| plugin.participates_in_route_response_header_finalization())
-        } else {
-            None
-        };
+    let last_route_response_finalizer = if simulated_ctx.route_override_response_transform.is_some()
+    {
+        plugins
+            .iter()
+            .rposition(|plugin| plugin.participates_in_route_response_header_finalization())
+    } else {
+        None
+    };
     for (index, plugin) in plugins.iter().enumerate() {
         plugin.simulate_after_proxy_response_headers(&mut simulated_ctx, &mut simulated_headers);
         if last_route_response_finalizer == Some(index) {
