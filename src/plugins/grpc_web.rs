@@ -2889,7 +2889,10 @@ impl GrpcWebFrameScanner {
     }
 
     fn finish(&self) -> bool {
-        !self.malformed && !self.in_payload && self.header_filled == 0 && self.suffix_start.is_some()
+        !self.malformed
+            && !self.in_payload
+            && self.header_filled == 0
+            && self.suffix_start.is_some()
     }
 }
 

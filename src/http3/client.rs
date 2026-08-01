@@ -394,7 +394,10 @@ pub(crate) async fn drain_h3_response_body(
                 // to allocate rather than over the post-append length
                 // (GHSA-pwcm-6rh8-f2gh).
                 if let Err(rejection) = body.append(chunk.chunk()) {
-                    return Err(h3_body_retain_error(rejection, max_response_body_size_bytes));
+                    return Err(h3_body_retain_error(
+                        rejection,
+                        max_response_body_size_bytes,
+                    ));
                 }
             }
             Ok(None) => {

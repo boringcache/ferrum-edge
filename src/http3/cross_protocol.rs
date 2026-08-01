@@ -2799,8 +2799,8 @@ where
                 // (`502`) from an exhausted gateway retention budget (`503`);
                 // outcome recording follows the same status so passive health
                 // and admission see the classification actually returned.
-                let reject_status_code = StatusCode::from_u16(reject_status)
-                    .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+                let reject_status_code =
+                    StatusCode::from_u16(reject_status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
                 record_backend_outcome(
                     state,
                     proxy,

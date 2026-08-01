@@ -5544,10 +5544,11 @@ pub async fn normalize_response_body_for_inspection(
     // concurrency the aggregate budget supports for no bound gained. A plugin
     // that produces WITHOUT being declared has no window to charge out of and is
     // refused below, so the optimisation is fail-closed rather than trusting.
-    let mut window = if plugins
-        .iter()
-        .any(|plugin| plugin.response_body_production().may_replace_response_body())
-    {
+    let mut window = if plugins.iter().any(|plugin| {
+        plugin
+            .response_body_production()
+            .may_replace_response_body()
+    }) {
         let ceiling = ctx.effective_max_response_body_size_bytes();
         match crate::proxy::response_buffer_budget::ResponseTransformWindow::open(ceiling) {
             Some(window) => Some(window),
@@ -5584,8 +5585,7 @@ pub async fn normalize_response_body_for_inspection(
         {
             warn!(
                 plugin = plugin.name(),
-                reason,
-                "Response normalization refused before invoking the producer"
+                reason, "Response normalization refused before invoking the producer"
             );
             crate::proxy::replace_buffered_response_with_capacity_refusal(
                 ctx,

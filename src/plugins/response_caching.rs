@@ -1515,11 +1515,8 @@ impl ResponseCaching {
         let lookup_headers = self.restore_request_headers_view(ctx);
 
         // 6. RFC 9111 §3.5 shared-cache authorization admission.
-        if !Self::shared_cache_allows_authorized_response(
-            ctx,
-            &lookup_headers.headers,
-            &directives,
-        ) {
+        if !Self::shared_cache_allows_authorized_response(ctx, &lookup_headers.headers, &directives)
+        {
             return FinalHeaderDecision::MarkUncacheable;
         }
 

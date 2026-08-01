@@ -1683,22 +1683,22 @@ pub(crate) fn refine_stream_response_for_content_type(
                 // This plugin's own answer for the representation as it stands at
                 // its position in the chain: every earlier hook's header effects
                 // are already folded into `simulated_response_headers`.
-                let mut released =
-                    if plugin.may_release_response_body_under_retries(&simulated_ctx) {
-                        saw_retry_release_plugin = true;
-                        plugin.should_release_response_body_under_retries(
-                            &simulated_ctx,
-                            response_status,
-                            &simulated_response_headers,
-                        )
-                    } else {
-                        !plugin.should_buffer_response_body_for_content_type(
-                            &simulated_ctx,
-                            simulated_content_type,
-                            response_status,
-                            &simulated_response_headers,
-                        )
-                    };
+                let mut released = if plugin.may_release_response_body_under_retries(&simulated_ctx)
+                {
+                    saw_retry_release_plugin = true;
+                    plugin.should_release_response_body_under_retries(
+                        &simulated_ctx,
+                        response_status,
+                        &simulated_response_headers,
+                    )
+                } else {
+                    !plugin.should_buffer_response_body_for_content_type(
+                        &simulated_ctx,
+                        simulated_content_type,
+                        response_status,
+                        &simulated_response_headers,
+                    )
+                };
                 // Otherwise: does the projected FINAL header view already close
                 // this plugin's remaining use for the body? Computed only when it
                 // can change the answer, and refused wholesale when a later
@@ -17804,7 +17804,12 @@ pub(crate) async fn run_after_proxy_hooks(
     // A rejected response deliberately does NOT reach it: the backend
     // representation was discarded, exactly as today's buffered
     // `on_final_response_body` is skipped for an `after_proxy` reject.
-    crate::plugins::run_final_response_header_hooks(plugins, ctx, response_status, response_headers);
+    crate::plugins::run_final_response_header_hooks(
+        plugins,
+        ctx,
+        response_status,
+        response_headers,
+    );
     None
 }
 
@@ -19038,7 +19043,10 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
         *response_status = budget::RESPONSE_BUFFER_OVERLOAD_STATUS;
         *response_body = Bytes::from_static(budget::RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
         response_headers.insert("content-type".to_string(), "application/json".to_string());
-        response_headers.insert("content-length".to_string(), response_body.len().to_string());
+        response_headers.insert(
+            "content-length".to_string(),
+            response_body.len().to_string(),
+        );
     }
     ctx.record_deadline_response_header_mutations(response_headers);
 }
@@ -19479,10 +19487,11 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     // concurrency the aggregate budget supports without bounding anything. The
     // declaration is fail-closed — an undeclared plugin is refused below rather
     // than trusted — so this cannot silently miss a rewriter.
-    let mut window = if plugins
-        .iter()
-        .any(|plugin| plugin.response_body_production().may_replace_response_body())
-    {
+    let mut window = if plugins.iter().any(|plugin| {
+        plugin
+            .response_body_production()
+            .may_replace_response_body()
+    }) {
         let ceiling = ctx.effective_max_response_body_size_bytes();
         match response_buffer_budget::ResponseTransformWindow::open(ceiling) {
             Some(window) => Some(window),
@@ -19519,8 +19528,7 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
         ) {
             warn!(
                 plugin = plugin.name(),
-                reason,
-                "Response body transform refused before invoking the producer"
+                reason, "Response body transform refused before invoking the producer"
             );
             replace_buffered_response_with_capacity_refusal(
                 ctx,
@@ -26892,8 +26900,7 @@ async fn handle_proxy_request_inner(
                         // `&mut plugin_response_headers` (the refusal terminal
                         // writes into it), so the content type cannot stay
                         // borrowed from that map.
-                        let content_type =
-                            plugin_response_headers.get("content-type").cloned();
+                        let content_type = plugin_response_headers.get("content-type").cloned();
                         let retained_ceiling = ctx.retained_response_body_ceiling();
                         // Keep the charged original body alive while the covering
                         // window builds any replacement through a bounded sink
@@ -30828,10 +30835,9 @@ pub(crate) async fn proxy_to_backend_retry(
                     // aggregate budget is the neutral transient capacity
                     // response, never a backend fault; the streaming arm below is
                     // untouched and retains nothing.
-                    let retained_ceiling =
-                        response_buffer_budget::buffered_response_body_ceiling(
-                            effective_max_response_body_size_bytes,
-                        );
+                    let retained_ceiling = response_buffer_budget::buffered_response_body_ceiling(
+                        effective_max_response_body_size_bytes,
+                    );
                     let collected = match crate::plugins::await_grpc_deadline(
                         request_ctx.grpc_deadline_at(),
                         eager_collect_charged_backend_body(
@@ -34198,7 +34204,9 @@ enum HyperBodyCollectError {
     /// gRPC collectors use.
     BudgetExhausted,
     Read(hyper::Error),
-    ReadTimeout { timeout_ms: u64 },
+    ReadTimeout {
+        timeout_ms: u64,
+    },
 }
 
 async fn collect_hyper_body_with_limit(
