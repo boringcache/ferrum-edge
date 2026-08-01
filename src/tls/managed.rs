@@ -295,7 +295,7 @@ impl ManagedTlsStore {
         let id = id.to_string();
         self.file.mutate(move |document| {
             let removed = document.records.remove(&id);
-            removed.ok_or_else(|| ManagedTlsError::NotFound(id))
+            removed.ok_or(ManagedTlsError::NotFound(id))
         })
     }
 

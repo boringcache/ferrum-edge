@@ -483,7 +483,7 @@ impl AcmeCertificateStore {
         let id = id.to_string();
         self.file.mutate(move |document| {
             let removed = document.certificates.remove(&id);
-            removed.ok_or_else(|| AcmeError::NotFound(id))
+            removed.ok_or(AcmeError::NotFound(id))
         })
     }
 
@@ -592,7 +592,7 @@ impl AcmeOrderStore {
         let id = id.to_string();
         self.file.mutate(move |document| {
             let removed = document.orders.remove(&id);
-            removed.ok_or_else(|| AcmeError::OrderNotFound(id))
+            removed.ok_or(AcmeError::OrderNotFound(id))
         })
     }
 

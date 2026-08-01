@@ -221,7 +221,7 @@ struct Cached<T> {
     /// would be a file descriptor kept open for the process lifetime for no
     /// benefit, on exactly the targets (Windows) where an open handle on a
     /// destination is most likely to interfere with replacing it.
-    pinned: Option<File>,
+    _pinned: Option<File>,
 }
 
 /// Releases an advisory file lock on drop.
@@ -291,7 +291,7 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
             cached: RwLock::new(Cached {
                 value: Arc::new(T::default()),
                 stamp: None,
-                pinned: None,
+                _pinned: None,
             }),
             write_gate: Mutex::new(()),
         };
@@ -468,7 +468,7 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
         *cached = Cached {
             value,
             stamp,
-            pinned,
+            _pinned: pinned,
         };
         Ok(())
     }
