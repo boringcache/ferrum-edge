@@ -405,6 +405,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/acme/certificates/{id}:
     get:
@@ -426,6 +428,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateAcmeCertificate
       summary: Replace an ACME-issued certificate and private key
@@ -455,6 +459,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "408":
           $ref: "#/components/responses/RequestTimeout"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteAcmeCertificate
       summary: Delete an unreferenced ACME-issued TLS certificate
@@ -472,6 +478,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/acme/orders:
     get:
@@ -542,6 +550,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "501":
           $ref: "#/components/responses/NotImplemented"
 
@@ -618,6 +628,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "501":
           $ref: "#/components/responses/NotImplemented"
 
@@ -641,6 +653,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteAcmeOrder
       summary: Delete an ACME order and stop serving its challenges
@@ -656,6 +670,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/acme/orders/{id}/finalize:
     post:
@@ -699,10 +715,12 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
-        "502":
-          $ref: "#/components/responses/BadGateway"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "501":
           $ref: "#/components/responses/NotImplemented"
+        "502":
+          $ref: "#/components/responses/BadGateway"
 
   /admin/tls/certificates:
     get:
@@ -759,6 +777,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/certificates/{id}:
     get:
@@ -782,6 +802,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateManagedTlsCertificate
       summary: Rotate an admin-managed TLS certificate and private key
@@ -819,6 +841,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteManagedTlsCertificate
       summary: Delete an unreferenced admin-managed TLS certificate
@@ -838,6 +862,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/ca-bundles:
     get:
@@ -893,6 +919,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/ca-bundles/{id}:
     get:
@@ -916,6 +944,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateManagedTlsCaBundle
       summary: Rotate an admin-managed TLS CA bundle
@@ -951,6 +981,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteManagedTlsCaBundle
       summary: Delete an unreferenced admin-managed TLS CA bundle
@@ -970,6 +1002,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/crls:
     get:
@@ -1025,6 +1059,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/crls/{id}:
     get:
@@ -1048,6 +1084,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateManagedTlsCrl
       summary: Rotate an admin-managed TLS CRL bundle
@@ -1081,6 +1119,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteManagedTlsCrl
       summary: Delete an unreferenced admin-managed TLS CRL bundle
@@ -1100,6 +1140,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/ocsp-responses:
     get:
@@ -1155,6 +1197,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/ocsp-responses/{id}:
     get:
@@ -1178,6 +1222,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateManagedTlsOcspResponse
       summary: Rotate an admin-managed DER OCSP response
@@ -1211,6 +1257,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteManagedTlsOcspResponse
       summary: Delete an unreferenced admin-managed OCSP response
@@ -1230,6 +1278,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/jwks:
     get:
@@ -1285,6 +1335,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/jwks/{id}:
     get:
@@ -1308,6 +1360,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateManagedTlsJwks
       summary: Rotate an admin-managed JWKS document
@@ -1341,6 +1395,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteManagedTlsJwks
       summary: Delete an unreferenced admin-managed JWKS document
@@ -1360,6 +1416,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/rotate/{surface}:
     post:
