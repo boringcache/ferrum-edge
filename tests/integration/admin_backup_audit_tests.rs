@@ -15,13 +15,78 @@ use ferrum_edge::config::types::{
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
+use tracing_subscriber::fmt::MakeWriter;
 
 const JWT_SECRET: &str = "test-secret-key-for-backup-audit-32chars!!";
 const JWT_ISSUER: &str = "test-ferrum-edge";
 const JWT_CANARY: &str = "backup-jwt-canary-secret-value-32chars";
+const COOKIE_CANARY: &str = "session=backup-cookie-canary-never-in-logs";
+const RESOURCES_CANARY: &str = "canary-secret-token-never-in-audit-or-logs";
+const PAYLOAD_FRAGMENT_CANARY: &str = "secret-user";
+
+/// In-memory tracing sink mirroring the admin SharedAdminLogWriter pattern so
+/// backup-path diagnostics can be asserted without production test helpers.
+#[derive(Clone, Default)]
+struct SharedBackupAuditLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl SharedBackupAuditLogWriter {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap_or_default()
+    }
+}
+
+impl Write for SharedBackupAuditLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for SharedBackupAuditLogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn capture_backup_audit_logs() -> (SharedBackupAuditLogWriter, tracing::subscriber::DefaultGuard) {
+    let writer = SharedBackupAuditLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_writer(writer.clone())
+        .finish();
+    (writer, tracing::subscriber::set_default(subscriber))
+}
+
+fn assert_logs_omit_hostile_canaries(logs: &str, extra: &[&str]) {
+    let mut canaries = vec![
+        JWT_CANARY,
+        COOKIE_CANARY,
+        RESOURCES_CANARY,
+        PAYLOAD_FRAGMENT_CANARY,
+        "Bearer ",
+        "Cookie:",
+        "eyJhbGciOi",
+    ];
+    canaries.extend_from_slice(extra);
+    for canary in canaries {
+        assert!(
+            !logs.contains(canary),
+            "backup audit path leaked canary {canary:?} into tracing output:\n{logs}"
+        );
+    }
+}
 
 fn jwt_manager() -> JwtManager {
     JwtManager::new(JwtConfig {
@@ -248,11 +313,24 @@ async fn get_backup(
     bearer: &str,
     request_id: Option<&str>,
 ) -> (u16, Value, Option<String>) {
+    get_backup_with_cookie(base, path, bearer, request_id, None).await
+}
+
+async fn get_backup_with_cookie(
+    base: &str,
+    path: &str,
+    bearer: &str,
+    request_id: Option<&str>,
+    cookie: Option<&str>,
+) -> (u16, Value, Option<String>) {
     let mut req = reqwest::Client::new()
         .get(format!("{base}{path}"))
         .bearer_auth(bearer);
     if let Some(request_id) = request_id {
         req = req.header("X-Request-Id", request_id);
+    }
+    if let Some(cookie) = cookie {
+        req = req.header("Cookie", cookie);
     }
     let response = req.send().await.expect("GET backup");
     let status = response.status().as_u16();
@@ -414,4 +492,120 @@ async fn cached_backup_without_db_uses_local_fallback_audit_sink() {
     assert!(events[0].diff["bytes"].as_u64().unwrap() > 0);
     let rendered = serde_json::to_string(&events[0]).unwrap();
     assert!(!rendered.contains(JWT_CANARY));
+}
+
+/// Issue #2422: credentials/tokens/cookies/payload fragments must never appear
+/// in tracing output for backup success, authenticated denial, validation
+/// failure, or audit-sink failure. Uses current_thread so the capturing
+/// subscriber sees handler-emitted logs from the in-process admin server.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
+async fn backup_paths_omit_hostile_canaries_from_tracing_output() {
+    let (logs, _guard) = capture_backup_audit_logs();
+
+    // --- success (cached unredacted payload) ---
+    let success_fallback = TempDir::new().unwrap();
+    let mut success_state = cached_only_state(sample_cached_config());
+    success_state.admin_audit_fallback_dir = Some(success_fallback.path().to_path_buf());
+    let (success_base, _success_shutdown) = start_admin(success_state).await;
+    let admin = token("backup-admin", Some("admin"));
+    let admin_jwt = admin.clone();
+
+    let (status, body, source) = get_backup_with_cookie(
+        &success_base,
+        "/backup",
+        &admin,
+        Some("req-log-success-1"),
+        Some(COOKIE_CANARY),
+    )
+    .await;
+    assert_eq!(status, 200, "success body: {body:?}");
+    assert_eq!(source.as_deref(), Some("cached"));
+    assert!(
+        body.to_string().contains(JWT_CANARY),
+        "export body still carries the credential canary"
+    );
+    assert!(
+        body.to_string().contains(PAYLOAD_FRAGMENT_CANARY),
+        "export body still carries the payload-fragment canary"
+    );
+
+    // --- authenticated denial ---
+    let deny_tmp = TempDir::new().unwrap();
+    let (deny_base, _deny_shutdown) = start_admin(admin_state(make_store(&deny_tmp).await)).await;
+    let operator = token("ops-user", Some("operator"));
+    let (deny_status, deny_body, _) = get_backup_with_cookie(
+        &deny_base,
+        "/backup",
+        &operator,
+        Some("req-log-deny-1"),
+        Some(COOKIE_CANARY),
+    )
+    .await;
+    assert_eq!(deny_status, 403, "denied body: {deny_body:?}");
+
+    // --- validation failure with hostile resources token ---
+    let validation_tmp = TempDir::new().unwrap();
+    let (validation_base, _validation_shutdown) =
+        start_admin(admin_state(make_store(&validation_tmp).await)).await;
+    let (validation_status, validation_body, _) = get_backup_with_cookie(
+        &validation_base,
+        &format!("/backup?resources=proxies,{RESOURCES_CANARY}"),
+        &admin,
+        Some("req-log-validation-1"),
+        Some(COOKIE_CANARY),
+    )
+    .await;
+    assert_eq!(validation_status, 400, "validation body: {validation_body:?}");
+    assert!(!validation_body.to_string().contains(RESOURCES_CANARY));
+
+    // --- audit-sink failure (no DB + symlink fallback) before releasing body ---
+    #[cfg(unix)]
+    {
+        let parent = TempDir::new().unwrap();
+        let real = parent.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut fail_state = cached_only_state(sample_cached_config());
+        fail_state.admin_audit_fallback_dir = Some(link);
+        let (fail_base, _fail_shutdown) = start_admin(fail_state).await;
+        let (fail_status, fail_body, _) = get_backup_with_cookie(
+            &fail_base,
+            "/backup",
+            &admin,
+            Some("req-log-admit-fail-1"),
+            Some(COOKIE_CANARY),
+        )
+        .await;
+        assert_eq!(fail_status, 503, "admit-fail body: {fail_body:?}");
+        assert!(!fail_body.to_string().contains(JWT_CANARY));
+        assert!(!fail_body.to_string().contains(PAYLOAD_FRAGMENT_CANARY));
+        assert_eq!(
+            fail_body["error"],
+            "Backup aborted: security audit record could not be admitted"
+        );
+    }
+
+    let captured = logs.contents();
+    assert_logs_omit_hostile_canaries(&captured, &[&admin_jwt, &operator]);
+    // Stable sanitized success marker — counts/bytes only, never payload.
+    assert!(
+        captured.contains("Backup:") && captured.contains("bytes)"),
+        "expected sanitized backup success log, got:\n{captured}"
+    );
+    #[cfg(unix)]
+    {
+        assert!(
+            captured.contains("audit_security_admit_local_fallback")
+                || captured.contains(
+                    "Failed to admit security-sensitive audit event to local fallback"
+                ),
+            "expected audit-sink failure surface in logs:\n{captured}"
+        );
+        assert!(
+            captured.contains("detail_withheld"),
+            "audit-sink failure must withhold detail:\n{captured}"
+        );
+    }
 }

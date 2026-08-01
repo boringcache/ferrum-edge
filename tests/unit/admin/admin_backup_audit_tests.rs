@@ -10,8 +10,77 @@ use ferrum_edge::admin::jwt_auth::AdminRole;
 use hyper::HeaderMap;
 use serde_json::json;
 use std::collections::HashSet;
+use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
+use tracing_subscriber::fmt::MakeWriter;
+
+const JWT_CANARY: &str = "super-secret-jwt-value-never-in-audit";
+const COOKIE_CANARY: &str = "cookie=session-canary; Authorization: Bearer jwt-canary";
+const PAYLOAD_FRAGMENT_CANARY: &str =
+    r#"{"consumers":[{"credentials":{"jwt":[{"secret":"leak"}]}}]}"#;
+const RESOURCES_CANARY: &str = "canary-token-credential-value-should-never-persist";
+const BEARER_FRAGMENT: &str = "eyJhbGciOiJIUzI1NiJ9.payload.sig";
+
+/// Local tracing sink (same shape as admin_tests SharedAdminLogWriter).
+#[derive(Clone, Default)]
+struct SharedBackupAuditLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl SharedBackupAuditLogWriter {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap_or_default()
+    }
+}
+
+impl Write for SharedBackupAuditLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for SharedBackupAuditLogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn capture_backup_audit_logs() -> (SharedBackupAuditLogWriter, tracing::subscriber::DefaultGuard) {
+    let writer = SharedBackupAuditLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_writer(writer.clone())
+        .finish();
+    (writer, tracing::subscriber::set_default(subscriber))
+}
+
+fn assert_logs_omit_hostile_canaries(logs: &str) {
+    for canary in [
+        JWT_CANARY,
+        COOKIE_CANARY,
+        PAYLOAD_FRAGMENT_CANARY,
+        RESOURCES_CANARY,
+        BEARER_FRAGMENT,
+        "Bearer ",
+        "Cookie:",
+        "eyJhbGciOi",
+        "basicauth",
+    ] {
+        assert!(
+            !logs.contains(canary),
+            "backup audit helper leaked canary {canary:?} into tracing output:\n{logs}"
+        );
+    }
+}
 
 fn admin_actor() -> AuditActor {
     AuditActor {
@@ -23,8 +92,6 @@ fn admin_actor() -> AuditActor {
 
 #[test]
 fn backup_success_diff_is_fixed_shape_without_payload_bytes() {
-    let canary_secret = "super-secret-jwt-value-never-in-audit";
-    let canary_payload = r#"{"consumers":[{"credentials":{"jwt":[{"secret":"leak"}]}}]}"#;
     let diff = backup_success_diff(
         "database",
         json!("all"),
@@ -41,8 +108,8 @@ fn backup_success_diff_is_fixed_shape_without_payload_bytes() {
     assert_eq!(diff["data_source"], "database");
     assert_eq!(diff["bytes"], 4096);
     assert_eq!(diff["counts"]["consumers"], 2);
-    assert!(!rendered.contains(canary_secret));
-    assert!(!rendered.contains(canary_payload));
+    assert!(!rendered.contains(JWT_CANARY));
+    assert!(!rendered.contains(PAYLOAD_FRAGMENT_CANARY));
     assert!(!rendered.contains("Authorization"));
     assert!(!rendered.contains("Bearer "));
 }
@@ -73,14 +140,13 @@ fn backup_resources_audit_value_sorts_and_uses_all_sentinel() {
 
 #[test]
 fn backup_resources_audit_value_never_persists_unknown_raw_token() {
-    let canary = "canary-token-credential-value-should-never-persist";
     let mut filter = HashSet::new();
     filter.insert("proxies");
-    filter.insert(canary);
+    filter.insert(RESOURCES_CANARY);
     let value = backup_resources_audit_value(Some(&filter));
     assert_eq!(value, json!(BACKUP_RESOURCES_INVALID_SENTINEL));
     let rendered = serde_json::to_string(&value).unwrap();
-    assert!(!rendered.contains(canary));
+    assert!(!rendered.contains(RESOURCES_CANARY));
     assert!(!rendered.contains("credential"));
 }
 
@@ -93,10 +159,10 @@ fn request_id_accepts_safe_header_and_rejects_hostile_values() {
     let mut hostile = HeaderMap::new();
     hostile.insert(
         "x-request-id",
-        "Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig".parse().unwrap(),
+        format!("Bearer {BEARER_FRAGMENT}").parse().unwrap(),
     );
     let generated = extract_or_generate_request_id(&hostile);
-    assert_ne!(generated, "Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig");
+    assert_ne!(generated, format!("Bearer {BEARER_FRAGMENT}"));
     assert!(uuid::Uuid::parse_str(&generated).is_ok());
 
     let mut oversized = HeaderMap::new();
@@ -147,7 +213,6 @@ fn backup_event_builder_attaches_context_and_outcome() {
 #[serial_test::serial(admin_audit_local_fallback_lock)]
 fn local_fallback_persists_event_without_secret_canaries() {
     let dir = TempDir::new().expect("tempdir");
-    let secret = "cookie=session-canary; Authorization: Bearer jwt-canary";
     let event = AuditEvent::new(
         &admin_actor(),
         "backup",
@@ -157,7 +222,7 @@ fn local_fallback_persists_event_without_secret_canaries() {
         backup_failure_diff(audit::failure_category::FORBIDDEN, json!("all")),
     )
     .with_outcome(audit::outcome::DENIED);
-    assert!(!serde_json::to_string(&event).unwrap().contains(secret));
+    assert!(!serde_json::to_string(&event).unwrap().contains(COOKIE_CANARY));
 
     append_local_fallback_event(dir.path(), &event).expect("append");
     let listed = list_local_fallback_events(dir.path()).expect("list");
@@ -165,7 +230,7 @@ fn local_fallback_persists_event_without_secret_canaries() {
     assert_eq!(listed[0].id, event.id);
     assert_eq!(listed[0].outcome, "denied");
     let raw = std::fs::read_to_string(dir.path().join("admin-audit-fallback.json")).unwrap();
-    assert!(!raw.contains(secret));
+    assert!(!raw.contains(COOKIE_CANARY));
     assert!(!raw.contains("Bearer "));
     assert!(!raw.contains("basicauth"));
     #[cfg(unix)]
@@ -444,4 +509,115 @@ async fn admit_security_sensitive_event_uses_local_fallback_without_db() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].diff["data_source"], "cached");
     assert_eq!(listed[0].diff["bytes"], 2);
+}
+
+fn hostile_backup_event(outcome: audit::AuditOutcome) -> AuditEvent {
+    // Plant hostile strings only in fields that fixed-shape logging must not
+    // echo. Diff stays canonical; actor/resource carry canaries to prove the
+    // admit/attempt failure paths withhold them.
+    let mut actor = admin_actor();
+    actor.sub = format!("{JWT_CANARY}|{COOKIE_CANARY}|{BEARER_FRAGMENT}");
+    let diff = if outcome == audit::outcome::SUCCESS {
+        backup_success_diff("cached", json!("all"), json!({"proxies": 0}), 2)
+    } else {
+        backup_failure_diff(
+            audit::failure_category::VALIDATION_FAILED,
+            json!(BACKUP_RESOURCES_INVALID_SENTINEL),
+        )
+    };
+    AuditEvent::new(
+        &actor,
+        "backup",
+        &format!("gateway_config:{PAYLOAD_FRAGMENT_CANARY}"),
+        RESOURCES_CANARY,
+        RESOURCES_CANARY,
+        diff,
+    )
+    .with_outcome(outcome)
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
+async fn admit_security_sensitive_failure_logs_omit_hostile_canaries() {
+    let (logs, _guard) = capture_backup_audit_logs();
+    let event = hostile_backup_event(audit::outcome::SUCCESS);
+
+    #[cfg(unix)]
+    {
+        let parent = TempDir::new().expect("tempdir");
+        let real = parent.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = audit::admit_security_sensitive_event(None, &event, Some(link.as_path()))
+            .await
+            .expect_err("symlink fallback must fail closed");
+        assert!(
+            err.to_string().contains("could not be admitted"),
+            "unexpected admit error: {err}"
+        );
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _holder = ferrum_edge::_test_support::hold_audit_local_fallback_process_lock_for_test()
+            .expect("hold process lock");
+        let dir = TempDir::new().expect("tempdir");
+        let err = audit::admit_security_sensitive_event(None, &event, Some(dir.path()))
+            .await
+            .expect_err("contended fallback must fail closed");
+        assert!(
+            err.to_string().contains("could not be admitted"),
+            "unexpected admit error: {err}"
+        );
+    }
+
+    let captured = logs.contents();
+    assert_logs_omit_hostile_canaries(&captured);
+    assert!(
+        captured.contains("audit_security_admit_local_fallback")
+            || captured.contains("Failed to admit security-sensitive audit event to local fallback"),
+        "expected local-fallback admit failure surface:\n{captured}"
+    );
+    assert!(
+        captured.contains("detail_withheld"),
+        "admit failure must withhold detail:\n{captured}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
+async fn record_backup_attempt_failure_logs_omit_hostile_canaries() {
+    let (logs, _guard) = capture_backup_audit_logs();
+    let event = hostile_backup_event(audit::outcome::VALIDATION_FAILED);
+
+    #[cfg(unix)]
+    {
+        let parent = TempDir::new().expect("tempdir");
+        let real = parent.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        audit::record_backup_attempt_best_effort(None, &event, Some(link.as_path())).await;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _holder = ferrum_edge::_test_support::hold_audit_local_fallback_process_lock_for_test()
+            .expect("hold process lock");
+        let dir = TempDir::new().expect("tempdir");
+        audit::record_backup_attempt_best_effort(None, &event, Some(dir.path())).await;
+    }
+
+    let captured = logs.contents();
+    assert_logs_omit_hostile_canaries(&captured);
+    assert!(
+        captured.contains("backup_audit_attempt")
+            || captured.contains("Authenticated backup attempt could not be audited"),
+        "expected best-effort backup attempt failure surface:\n{captured}"
+    );
+    assert!(
+        captured.contains("detail_withheld"),
+        "attempt failure must withhold detail:\n{captured}"
+    );
 }
