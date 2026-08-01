@@ -288,14 +288,14 @@ pub(crate) fn temporary_disabled_listener_tls_config() -> Result<Arc<ServerConfi
         .ok_or_else(|| anyhow::anyhow!("temporary listener TLS key was not generated"))?;
 
     Ok(Arc::new(
-        rustls::ServerConfig::builder_with_provider(Arc::new(
-            crate::fips::base_crypto_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|error| anyhow::anyhow!("failed to apply default TLS versions: {error}"))?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|error| anyhow::anyhow!("temporary listener TLS config is invalid: {error}"))?,
+        rustls::ServerConfig::builder_with_provider(Arc::new(crate::fips::base_crypto_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|error| anyhow::anyhow!("failed to apply default TLS versions: {error}"))?
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|error| {
+                anyhow::anyhow!("temporary listener TLS config is invalid: {error}")
+            })?,
     ))
 }
 
@@ -2051,14 +2051,12 @@ mod tests {
             .expect("read private key")
             .expect("private key present");
 
-        rustls::ServerConfig::builder_with_provider(Arc::new(
-            crate::fips::base_crypto_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("default protocol versions")
-        .with_no_client_auth()
-        .with_single_cert(certs, private_key)
-        .expect("server cert")
+        rustls::ServerConfig::builder_with_provider(Arc::new(crate::fips::base_crypto_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("default protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, private_key)
+            .expect("server cert")
     }
 
     #[test]

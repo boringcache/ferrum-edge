@@ -1147,7 +1147,8 @@ mod tests {
                 .expect("provider implements ECDHE-RSA-AES256-GCM-SHA384"),
             ],
             kx_groups: vec![
-                crate::fips::kx_group(rustls::NamedGroup::X25519).expect("provider implements X25519"),
+                crate::fips::kx_group(rustls::NamedGroup::X25519)
+                    .expect("provider implements X25519"),
             ],
             ..base_provider
         };

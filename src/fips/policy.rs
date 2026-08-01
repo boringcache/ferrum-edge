@@ -99,7 +99,6 @@ pub fn check_env_config(env_config: &EnvConfig) -> Result<(), String> {
 /// [`super::BUILD_CAPABLE`] is `false` and enforcement can therefore never be
 /// established at runtime. Production callers use the gated wrapper.
 pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
-
     // ── Provider pin ────────────────────────────────────────────────────
     // The operator names the integration they audited. Today exactly one is
     // supported; pinning it means a future build that changed integrations
@@ -118,8 +117,14 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
     // both. Re-assert here so a future widening of the ordinary vocabulary
     // cannot silently widen the FIPS one.
     for (name, value) in [
-        ("FERRUM_TLS_MIN_VERSION", env_config.tls_min_version.as_str()),
-        ("FERRUM_TLS_MAX_VERSION", env_config.tls_max_version.as_str()),
+        (
+            "FERRUM_TLS_MIN_VERSION",
+            env_config.tls_min_version.as_str(),
+        ),
+        (
+            "FERRUM_TLS_MAX_VERSION",
+            env_config.tls_max_version.as_str(),
+        ),
     ] {
         if !matches!(value, "1.2" | "1.3") {
             return Err(format!(
@@ -206,7 +211,6 @@ pub fn check_gateway_config(config: &GatewayConfig) -> Result<(), String> {
 /// The enforced half of [`check_gateway_config`]. See
 /// [`check_env_config_enforced`] for why the gate is split out.
 pub fn check_gateway_config_enforced(config: &GatewayConfig) -> Result<(), String> {
-
     let mut non_approved_plugins: Vec<String> = Vec::new();
     let mut jwt_violations: Vec<String> = Vec::new();
 
@@ -329,7 +333,6 @@ pub fn check_tls_policy(policy: &crate::tls::TlsPolicy) -> Result<(), String> {
 /// The enforced half of [`check_tls_policy`]. See
 /// [`check_env_config_enforced`] for why the gate is split out.
 pub fn check_tls_policy_enforced(policy: &crate::tls::TlsPolicy) -> Result<(), String> {
-
     let provider = policy.crypto_provider.as_ref();
 
     let rejected_suites: Vec<String> = provider

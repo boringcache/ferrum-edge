@@ -41,14 +41,24 @@ fn config_with(plugins: Vec<PluginConfig>) -> GatewayConfig {
 
 #[test]
 fn mode_parses_documented_spellings() {
-    for raw in ["", "off", "OFF", " off ", "false", "0", "disabled", "disable"] {
+    for raw in [
+        "", "off", "OFF", " off ", "false", "0", "disabled", "disable",
+    ] {
         assert_eq!(
             fips::FipsMode::parse(raw).expect("parses"),
             fips::FipsMode::Off,
             "expected {raw:?} to parse as off"
         );
     }
-    for raw in ["enforce", "ENFORCE", " enforce ", "true", "1", "on", "enabled"] {
+    for raw in [
+        "enforce",
+        "ENFORCE",
+        " enforce ",
+        "true",
+        "1",
+        "on",
+        "enabled",
+    ] {
         assert_eq!(
             fips::FipsMode::parse(raw).expect("parses"),
             fips::FipsMode::Enforce,
@@ -107,7 +117,10 @@ fn bootstrap_error_text_is_bounded_and_makes_no_certification_claim() {
         !rendered.to_lowercase().contains("certified"),
         "must not imply certification: {rendered}"
     );
-    assert!(rendered.contains("will not fall back"), "states fail-closed");
+    assert!(
+        rendered.contains("will not fall back"),
+        "states fail-closed"
+    );
 }
 
 // ── Status metadata ─────────────────────────────────────────────────────────
@@ -265,7 +278,11 @@ fn gateway_policy_diagnostics_stay_bounded_under_a_large_configuration() {
     let err = policy::check_gateway_config_enforced(&config_with(plugins))
         .expect_err("non-approved algorithms are rejected");
     assert!(err.contains("and "), "reports a residual count: {err}");
-    assert!(err.len() < 2048, "diagnostic stays bounded: {} bytes", err.len());
+    assert!(
+        err.len() < 2048,
+        "diagnostic stays bounded: {} bytes",
+        err.len()
+    );
 }
 
 // ── The gate itself ─────────────────────────────────────────────────────────
@@ -284,7 +301,6 @@ fn fips_policy_is_inert_when_mode_is_off() {
     policy::check_gateway_config(&config).expect("gated wrapper is inert when mode is off");
 }
 
-
 // ── Crypto inventory ────────────────────────────────────────────────────────
 
 #[test]
@@ -297,7 +313,10 @@ fn inventory_entries_are_all_classified_and_documented() {
     );
     for entry in inventory::INVENTORY {
         assert!(!entry.operation.is_empty(), "every row names an operation");
-        assert!(!entry.location.is_empty(), "every row names a source location");
+        assert!(
+            !entry.location.is_empty(),
+            "every row names a source location"
+        );
         assert!(
             !entry.implementation.is_empty(),
             "every row names an implementing library"
@@ -324,8 +343,8 @@ fn inventory_rejected_plugins_agree_with_the_admission_policy() {
 
     // The inventory is documentation; the policy is enforcement. If they drift,
     // the document is lying about what the gateway does.
-    let rejected_kafka = inventory::rejected()
-        .any(|entry| entry.location.contains("kafka_logging"));
+    let rejected_kafka =
+        inventory::rejected().any(|entry| entry.location.contains("kafka_logging"));
     assert_eq!(
         rejected_kafka,
         policy::NON_APPROVED_PLUGINS.contains(&"kafka_logging"),
