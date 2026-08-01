@@ -745,6 +745,16 @@ accepted-generation observability for every stable `api_chargeback_sink`
 plugin-config ID. Validation-only construction and uncommitted staged reloads
 never publish into this view.
 
+Owned spool `files` / `bytes` gauges (status totals, per-instance spool
+blocks, and the matching Prometheus series) are maintained atomically across
+writer, replay, quarantine, dead-letter, eviction, and cleanup transitions.
+Admin and `/metrics` scrapes read those maintained gauges (and a short-lived
+JSON status cache) and never walk or `stat` the spool tree on the request
+path. A bounded background reconcile owned by the spool worker refreshes
+absolute on-disk truth via `spawn_blocking` on each replay tick and keeps the
+previous last-good values when a reconcile fails. Scrapes never launch that
+walk or a new reconcile task.
+
 Response contract:
 
 - `enabled` is `true` when at least one accepted instance is live.

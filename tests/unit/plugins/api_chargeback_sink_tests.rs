@@ -18,13 +18,15 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     probe_charge_body_materialization_for_tests,
     probe_charge_body_materialization_with_projection_for_tests,
     probe_compact_recovery_retry_for_tests, probe_shared_spool_batch_clone_for_tests,
-    render_prometheus, render_status_json, replay_spool_once_for_tests,
-    replay_spool_once_with_batch_size_for_tests, replay_spool_once_with_ceiling_for_tests,
-    serialize_json_each_row, serialize_json_each_row_projected, set_spool_write_hook_for_tests,
+    reconcile_active_spool_usage_for_tests, render_prometheus, render_status_json,
+    replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
+    replay_spool_once_with_ceiling_for_tests, serialize_json_each_row,
+    serialize_json_each_row_projected, set_spool_write_hook_for_tests,
     spool_artifact_byte_limit_for_tests, spool_claim_lease_secs_for_tests,
     spool_decompression_limit_for_tests, spool_index_entry_bytes_for_tests,
     spool_replay_peak_bytes_for_tests, spool_split_worklist_max_entries_for_tests,
     write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
+    active_spool_inventory_walks_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
 use ferrum_edge::plugins::utils::byte_budget::RetainedByteCeiling;
@@ -1824,6 +1826,11 @@ async fn prometheus_counts_quarantined_owned_spool_bytes() {
         fs::create_dir_all(&day).unwrap();
         let corrupt = day.join("00000000000000000000000000.ndjson.corrupt");
         fs::write(&corrupt, vec![0u8; corrupt_bytes as usize]).unwrap();
+
+        // Planted files sit outside the writer path; a bounded worker reconcile
+        // (or this test seam) publishes them into the maintained gauges that
+        // status/Prometheus scrapes read without walking the tree.
+        reconcile_active_spool_usage_for_tests();
 
         let prom = render_prometheus();
         if prom.contains(&byte_line) {
@@ -7796,4 +7803,200 @@ fn sink_constructor_accepts_and_rejects_schemas_at_construction() {
         err.contains("'summary_type' is not supported"),
         "got: {err}"
     );
+}
+
+#[test]
+fn spool_usage_counters_track_write_evict_and_reconcile_lifecycle() {
+    let temp = tempfile::tempdir().unwrap();
+    let event = sample_event("usage-lifecycle");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: encoded_len,
+        replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
+        compression: SpoolCompression::None,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    assert!(
+        spool.inventory_walks_for_tests() >= 1,
+        "startup prepare must seed gauges from one bounded inventory"
+    );
+    let walks_before_cached_read = spool.inventory_walks_for_tests();
+    let _ = spool.cached_stats_for_tests();
+    assert_eq!(
+        spool.inventory_walks_for_tests(),
+        walks_before_cached_read,
+        "cached gauge reads must not inventory the spool"
+    );
+
+    spool
+        .write_events(std::slice::from_ref(&event))
+        .expect("first write");
+    let after_write = spool.cached_stats_for_tests();
+    assert_eq!(after_write.files, 1);
+    assert_eq!(after_write.bytes, encoded_len);
+
+    spool
+        .write_events(&[sample_event("usage-lifecycle-2")])
+        .expect("evicting second write");
+    let after_evict = spool.cached_stats_for_tests();
+    assert_eq!(after_evict.files, 1);
+    assert_eq!(after_evict.bytes, encoded_len);
+    assert_eq!(
+        after_evict.bytes,
+        disk_owned_bytes(&default_test_namespace_root(temp.path())),
+        "maintained bytes must match on-disk owned usage after eviction"
+    );
+
+    // Plant an owned corrupt artifact outside the writer path; gauges stay at
+    // last-good until a bounded reconcile publishes absolute truth.
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let planted_len = 128u64;
+    fs::write(
+        day.join("00000000000000000000000000.ndjson.corrupt"),
+        vec![0u8; planted_len as usize],
+    )
+    .unwrap();
+    assert_eq!(
+        spool.cached_stats_for_tests().files,
+        1,
+        "status gauges must not synchronously discover planted files"
+    );
+    let reconciled = spool
+        .reconcile_cached_usage_for_tests()
+        .expect("reconcile");
+    assert_eq!(reconciled.files, 2);
+    assert_eq!(
+        reconciled.bytes,
+        encoded_len.saturating_add(planted_len),
+        "reconcile must publish planted owned bytes"
+    );
+    assert_eq!(spool.cached_stats_for_tests(), reconciled);
+
+    let again = spool
+        .reconcile_cached_usage_for_tests()
+        .expect("second reconcile");
+    assert_eq!(again, reconciled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn large_spool_status_and_prometheus_do_not_inventory_or_block_progress() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!(server.uri());
+    // Keep the background replayer from racing reconciles during the scrape
+    // window under test; the explicit test seam owns refresh.
+    config["spool"]["replay_interval_secs"] = json!(3600);
+
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    plugin.start_background_tasks().expect("chargeback start");
+    plugin.commit_background_tasks();
+
+    let mut namespace_root = None;
+    for _ in 0..200 {
+        namespace_root = find_spool_namespace_root(temp.path());
+        if namespace_root.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let namespace_root = namespace_root.expect("committed spool namespace");
+    // Let the startup prepare/reconcile tick finish so later walk-count
+    // assertions are not racing the first replay interval fire.
+    for _ in 0..50 {
+        let before = active_spool_inventory_walks_for_tests();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let after = active_spool_inventory_walks_for_tests();
+        if after == before && before > 0 {
+            break;
+        }
+    }
+
+    let day = namespace_root.join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    // Large owned spool: enough files that a synchronous scrape walk would be
+    // expensive, without relying on wall-clock flake thresholds.
+    const PLANTED: u64 = 2_500;
+    const FILE_BYTES: u64 = 64;
+    for idx in 0..PLANTED {
+        let name = format!("{idx:026}.ndjson.corrupt");
+        fs::write(day.join(name), vec![0u8; FILE_BYTES as usize]).unwrap();
+    }
+    reconcile_active_spool_usage_for_tests();
+
+    let expected_bytes = PLANTED.saturating_mul(FILE_BYTES);
+    let status_before = serde_json::from_str::<Value>(&render_status_json()).expect("status");
+    assert_eq!(
+        status_before["totals"]["spool"]["files"].as_u64(),
+        Some(PLANTED)
+    );
+    assert_eq!(
+        status_before["totals"]["spool"]["bytes"].as_u64(),
+        Some(expected_bytes)
+    );
+
+    let walks_baseline = active_spool_inventory_walks_for_tests();
+    let progress = Arc::new(AtomicBool::new(false));
+    let progress_flag = Arc::clone(&progress);
+    let progress_task = tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        progress_flag.store(true, Ordering::SeqCst);
+    });
+
+    let status = render_status_json();
+    let prom = render_prometheus();
+    let status2 = render_status_json();
+    let prom2 = render_prometheus();
+    assert_eq!(
+        active_spool_inventory_walks_for_tests(),
+        walks_baseline,
+        "status/Prometheus rendering must not inventory the spool"
+    );
+    assert!(
+        status.contains(&format!("\"files\":{PLANTED}")),
+        "status must report planted files from cached gauges; got {status}"
+    );
+    assert!(
+        prom.contains(&format!("chargeback_sink_spool_files {PLANTED}\n")),
+        "prometheus must report planted files from cached gauges; got {prom}"
+    );
+    assert_eq!(status, status2);
+    assert_eq!(prom, prom2);
+
+    progress_task.await.expect("progress task");
+    assert!(
+        progress.load(Ordering::SeqCst),
+        "unrelated async progress must complete while status/metrics use cached gauges"
+    );
+
+    // Plant one more file without reconciling: scrapes must keep last-good
+    // values, proving they are not walking the tree for freshness.
+    fs::write(
+        day.join(format!("{:026}.ndjson.corrupt", PLANTED)),
+        vec![0u8; FILE_BYTES as usize],
+    )
+    .unwrap();
+    let stale = serde_json::from_str::<Value>(&render_status_json()).expect("stale status");
+    assert_eq!(
+        stale["totals"]["spool"]["files"].as_u64(),
+        Some(PLANTED),
+        "without reconcile, scrapes must retain last-good file count"
+    );
+    assert_eq!(
+        active_spool_inventory_walks_for_tests(),
+        walks_baseline,
+        "observing stale last-good must not walk"
+    );
+    drop(plugin);
 }
