@@ -141,7 +141,11 @@ impl WsSessionPolicy {
             "WAF WebSocket session policy indexed with a foreign rule index"
         );
         !self.suppressed_by_request
-            && self.rule_conditions.get(rule_index).copied().unwrap_or(false)
+            && self
+                .rule_conditions
+                .get(rule_index)
+                .copied()
+                .unwrap_or(false)
     }
 
     fn inspects(&self, direction: BodyDirection) -> bool {

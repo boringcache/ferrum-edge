@@ -2363,7 +2363,10 @@ pub mod _test_support {
         plugins: &[Arc<dyn crate::plugins::Plugin>],
         requires_websocket_framing: bool,
         upgrade_ctx: &crate::plugins::RequestContext,
-    ) -> (Vec<Arc<dyn crate::plugins::Plugin>>, Vec<Arc<dyn crate::plugins::Plugin>>) {
+    ) -> (
+        Vec<Arc<dyn crate::plugins::Plugin>>,
+        Vec<Arc<dyn crate::plugins::Plugin>>,
+    ) {
         crate::proxy::collect_websocket_relay_plugins(
             plugins,
             requires_websocket_framing,

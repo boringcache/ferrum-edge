@@ -224,8 +224,7 @@ async fn control_frames_are_never_scanned_as_application_payload() {
         for direction in directions {
             let outgoing = relay(&plugins, &ctx, direction, control.clone()).await;
             assert_eq!(
-                outgoing,
-                control,
+                outgoing, control,
                 "control frames must keep ping/pong semantics untouched"
             );
         }
@@ -296,8 +295,7 @@ async fn rule_conditions_are_resolved_from_the_upgrade_request() {
     let other_ctx = upgrade_ctx("/other-ws");
     let other = relay_to_backend(&plugins, &other_ctx, original.clone()).await;
     assert_eq!(
-        other,
-        original,
+        other, original,
         "a rule whose upgrade-time conditions did not match cannot block"
     );
 }
@@ -357,8 +355,7 @@ async fn oversize_message_scan_truncated_opt_out_forwards() {
     let outgoing = relay_to_backend(&plugins, &ctx, original.clone()).await;
 
     assert_eq!(
-        outgoing,
-        original,
+        outgoing, original,
         "the documented prefix-only opt-out still forwards the suffix"
     );
 }
@@ -581,8 +578,7 @@ async fn anomaly_scoring_is_evaluated_per_message() {
     let single = Message::Text("alpha".into());
     let outgoing = relay_to_backend(&plugins, &ctx, single.clone()).await;
     assert_eq!(
-        outgoing,
-        single,
+        outgoing, single,
         "one high hit (5) stays under the threshold (6)"
     );
 
@@ -590,8 +586,7 @@ async fn anomaly_scoring_is_evaluated_per_message() {
     let second = Message::Text("beta".into());
     let outgoing = relay_to_backend(&plugins, &ctx, second.clone()).await;
     assert_eq!(
-        outgoing,
-        second,
+        outgoing, second,
         "scores must not accumulate across a long-lived session"
     );
 
