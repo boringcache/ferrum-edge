@@ -1004,9 +1004,9 @@ pub enum ResponseBody {
     ///
     /// Stored as cheaply cloneable [`Bytes`] so cached synthetic short-circuits
     /// (spec exposure, response cache, dedup replay, AI semantic cache) can share
-    /// one immutable allocation across concurrent deliveries. Mutating later
-    /// response-body phases must take ownership and copy only when the buffer is
-    /// still shared — see [`ResponseBody::take_buffered_vec`].
+    /// one immutable allocation across concurrent deliveries. Retained-body
+    /// transforms replace it only with allocations constructed and published
+    /// through the response-buffer budget.
     Buffered(Bytes),
     /// Body is still attached to the backend response and will be streamed
     /// to the client. The status code and headers have already been extracted.
@@ -1029,23 +1029,6 @@ impl ResponseBody {
     #[inline]
     pub fn buffered(data: impl Into<Bytes>) -> Self {
         Self::Buffered(data.into())
-    }
-
-    /// Take a uniquely owned `Vec` for in-place mutation.
-    ///
-    /// Shared `Bytes` (multiple clones of one cached entry) copy once; uniquely
-    /// owned buffers reclaim without copying when the bytes crate can take the
-    /// underlying allocation. Callers must restore via
-    /// [`ResponseBody::store_buffered_vec`] (or assign `Buffered` directly).
-    #[inline]
-    pub fn take_buffered_vec(body: &mut Bytes) -> Vec<u8> {
-        std::mem::take(body).into()
-    }
-
-    /// Restore a previously taken owned buffer as shared [`Bytes`].
-    #[inline]
-    pub fn store_buffered_vec(body: &mut Bytes, owned: Vec<u8>) {
-        *body = Bytes::from(owned);
     }
 }
 

@@ -2522,12 +2522,13 @@ fn final_trailer_reconciliation_is_bounded_for_binary_and_text() {
     assert!(payload.contains("request-id: mutated\r\n"), "{payload}");
 
     // Exact-ceiling refusal: one byte short of the rebuilt body.
+    let one_byte_short = replaced.len().saturating_sub(1);
     let err = sync_translated_body_trailer_frame_into_for_test(
         &binary,
         Some("application/grpc-web"),
         &mutated,
         Some(200),
-        binary.len().saturating_sub(1).max(1),
+        one_byte_short,
     )
     .expect_err("over-ceiling binary rebuild must overflow");
     assert!(err, "overflow is distinct from malformed");

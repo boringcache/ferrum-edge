@@ -2555,7 +2555,7 @@ fn resolve_trailer_frame_value<'a>(
 /// a [`crate::proxy::response_buffer_budget::BoundedResponseBodySink`] and is
 /// ready for [`crate::proxy::response_buffer_budget::ResponseTransformWindow::charge`].
 #[derive(Debug)]
-pub enum SyncTranslatedTrailerOutcome {
+pub(crate) enum SyncTranslatedTrailerOutcome {
     /// Trailer suffix already matched the reconciled trailers; keep the original.
     Unchanged,
     /// Replacement bytes constructed under the retained ceiling.
@@ -2584,7 +2584,7 @@ pub enum SyncTranslatedTrailerOutcome {
 /// [`crate::proxy::store_charged_grpc_web_reframed_body`], which reserves a real
 /// transform window and publishes only a sink-built replacement
 /// (GHSA-pwcm-6rh8-f2gh).
-pub fn sync_translated_body_trailer_frame_from_trailers(
+pub(crate) fn sync_translated_body_trailer_frame_from_trailers(
     body: &mut Vec<u8>,
     content_type: Option<&str>,
     reconciled_trailers: &HashMap<String, String>,
@@ -2620,7 +2620,7 @@ pub fn sync_translated_body_trailer_frame_from_trailers(
 /// [`base64::write::EncoderWriter`] so neither a decoded binary preimage, a
 /// separately built trailer frame, nor a complete encoded `String` is ever
 /// resident beside the output (GHSA-pwcm-6rh8-f2gh).
-pub fn sync_translated_body_trailer_frame_into(
+pub(crate) fn sync_translated_body_trailer_frame_into(
     body: &[u8],
     content_type: Option<&str>,
     reconciled_trailers: &HashMap<String, String>,

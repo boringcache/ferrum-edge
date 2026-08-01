@@ -5326,7 +5326,7 @@ where
                 // Keep the charged original body alive while the covering window
                 // builds any replacement through a bounded sink
                 // (GHSA-pwcm-6rh8-f2gh).
-                let retained_ceiling = ctx.effective_max_response_body_size_bytes();
+                let retained_ceiling = ctx.retained_response_body_ceiling();
                 let stored = crate::proxy::store_charged_grpc_web_reframed_body(
                     &mut response_body,
                     &mut plugin_response_headers,

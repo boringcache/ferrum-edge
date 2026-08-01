@@ -2362,7 +2362,7 @@ fn the_repaired_producers_construct_through_the_bound() {
             "grpc_web",
             &[
                 "base64::write::EncoderWriter::new(&mut output, &engine)",
-                "fn write_trailer_frame_payload<S: TrailerPayloadSink>(",
+                "fn write_trailer_frame_payload<'a, S: TrailerPayloadSink>(",
             ],
         ),
         (
@@ -2611,6 +2611,19 @@ fn the_root_review_repairs_are_pinned_in_source() {
             && store_body.contains("window.charge("),
         "final publication must not copy out of the charged owner; it must build \
          through sync_into and charge the sink-built replacement"
+    );
+    assert_eq!(
+        proxy
+            .matches("let retained_ceiling = ctx.retained_response_body_ceiling();")
+            .count(),
+        2,
+        "both H1/H2 final reconciliation call sites must fold unlimited to the finite retained ceiling"
+    );
+    let h3_cross_protocol = include_str!("../../../src/http3/cross_protocol.rs");
+    assert!(
+        h3_cross_protocol
+            .contains("let retained_ceiling = ctx.retained_response_body_ceiling();"),
+        "the H3 cross-protocol final reconciliation call site must fold unlimited to the finite retained ceiling"
     );
 
     let stream_router = include_str!("../../../src/plugins/ai_stream_router.rs");
