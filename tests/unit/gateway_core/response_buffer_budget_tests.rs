@@ -2507,20 +2507,21 @@ fn init_warns_when_startup_configuration_arrives_after_lazy_initialization() {
     );
 }
 
-/// Operator docs must state that every rewrite reserves a full window, not only
-/// maximum-size bodies.
+/// Operator docs must distinguish the full producer window from the input's
+/// actual charged allocation capacity.
 #[test]
-fn the_rewrite_concurrency_bound_applies_to_every_concurrent_rewrite() {
+fn the_rewrite_concurrency_bound_uses_actual_input_capacity() {
     let ferrum_conf = include_str!("../../../ferrum.conf");
     let configuration = include_str!("../../../docs/configuration.md");
     for (name, doc) in [("ferrum.conf", ferrum_conf), ("docs/configuration.md", configuration)] {
         assert!(
-            doc.contains("full ceiling-sized") || doc.contains("full** per-response"),
+            doc.contains("FULL ceiling-sized") || doc.contains("**full** per-response"),
             "{name} must state that the producer window is reserved at the full ceiling"
         );
         assert!(
-            doc.contains("every concurrently rewriting") || doc.contains("**every** concurrently rewriting"),
-            "{name} must state the two-ceiling peak applies to every concurrent rewrite"
+            doc.contains("charged_input_capacity")
+                || doc.contains("charged input allocation capacity"),
+            "{name} must account for the retained input at its actual charged capacity"
         );
     }
 }

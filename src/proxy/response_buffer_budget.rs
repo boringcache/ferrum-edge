@@ -445,7 +445,7 @@ pub(crate) fn init(fallback_per_response_bytes: usize, total_bytes: usize) {
             requested_total_bytes = total_bytes,
             "FERRUM_RESPONSE_BUFFER_FALLBACK_MAX_BYTES / FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES \
              startup configuration was ignored because the retained-response budget was already \
-             initialized; restart the process to apply new values"
+             initialized; the earlier retained-response budget remains active"
         );
     }
 }
