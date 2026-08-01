@@ -258,6 +258,7 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: Some("us-east-1/zone-a".to_string()),
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: Some(UpstreamLocalityLbSetting::default()),
         backend_tls_client_cert_path: None,

@@ -1580,6 +1580,14 @@ fn project_mesh_source_locality(
         }
     }
 
+    let source_labels = mesh_source_workload_labels(mesh_slice);
+    for upstream in &mut config.upstreams {
+        if upstream.source_labels != source_labels {
+            upstream.source_labels = source_labels.clone();
+            upstream.updated_at = bump;
+        }
+    }
+
     let Some(locality) = mesh_source_workload_locality(mesh_slice) else {
         return;
     };
@@ -1588,6 +1596,121 @@ fn project_mesh_source_locality(
             upstream.source_locality = Some(locality.to_string());
             upstream.updated_at = bump;
         }
+    }
+}
+
+/// Build the source-workload label map used by
+/// `localityLbSetting.failoverPriority` matching.
+///
+/// Starts from the slice's effective workload labels, then overlays derived
+/// topology labels from the source workload's locality / network / cluster so
+/// Istio special keys (`topology.kubernetes.io/region`, …,
+/// `topology.istio.io/network`, `topology.istio.io/cluster`) resolve even when
+/// the operator did not also stamp them as ordinary workload labels.
+fn mesh_source_workload_labels(
+    mesh_slice: &MeshSlice,
+) -> std::collections::HashMap<String, String> {
+    let mut labels = mesh_slice.labels.clone();
+    let source_workload = mesh_source_workload(mesh_slice);
+    let locality = source_workload
+        .and_then(|workload| workload.locality.as_deref())
+        .or_else(|| mesh_source_workload_locality(mesh_slice));
+    merge_derived_topology_labels(
+        &mut labels,
+        locality,
+        source_workload.and_then(|workload| workload.network.as_deref()),
+        source_workload.and_then(|workload| workload.cluster.as_deref()),
+    );
+    // Prefer the authoritative SPIFFE-matched (or label-matched) workload's
+    // own selector labels over the possibly-intersected slice.labels map.
+    if let Some(workload) = source_workload {
+        for (key, value) in &workload.selector.labels {
+            labels.insert(key.clone(), value.clone());
+        }
+        // Re-apply derived topology AFTER workload labels so locality/network/
+        // cluster metadata wins over a stale operator-authored topology key
+        // that disagrees with the structured fields (matches Istio's preference
+        // for locality metadata on the well-known keys).
+        merge_derived_topology_labels(
+            &mut labels,
+            workload.locality.as_deref(),
+            workload.network.as_deref(),
+            workload.cluster.as_deref(),
+        );
+    }
+    labels
+}
+
+fn mesh_source_workload(mesh_slice: &MeshSlice) -> Option<&crate::modes::mesh::config::Workload> {
+    let multi_cluster = mesh_slice.multi_cluster.as_ref();
+    if let Some(spiffe_id) = mesh_slice.workload_spiffe_id.as_deref() {
+        return mesh_slice.workloads.iter().find(|workload| {
+            workload.spiffe_id.as_str() == spiffe_id
+                && !crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster)
+        });
+    }
+    let mut matched: Option<&crate::modes::mesh::config::Workload> = None;
+    for workload in &mesh_slice.workloads {
+        if crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster) {
+            continue;
+        }
+        if workload.namespace != mesh_slice.namespace {
+            continue;
+        }
+        let labels_match = mesh_slice.labels.iter().all(|(key, value)| {
+            workload
+                .selector
+                .labels
+                .get(key)
+                .is_some_and(|candidate| candidate == value)
+        });
+        if !labels_match {
+            continue;
+        }
+        match matched {
+            None => matched = Some(workload),
+            Some(prev) if prev.spiffe_id == workload.spiffe_id => {}
+            Some(_) => return None,
+        }
+    }
+    matched
+}
+
+fn merge_derived_topology_labels(
+    labels: &mut std::collections::HashMap<String, String>,
+    locality: Option<&str>,
+    network: Option<&str>,
+    cluster: Option<&str>,
+) {
+    if let Some(locality) = locality.and_then(crate::config::types::LocalityPreference::parse) {
+        labels.insert(
+            crate::config::types::FAILOVER_PRIORITY_LABEL_REGION.to_string(),
+            locality.region,
+        );
+        if let Some(zone) = locality.zone {
+            labels.insert(
+                crate::config::types::FAILOVER_PRIORITY_LABEL_ZONE.to_string(),
+                zone,
+            );
+        }
+        if let Some(sub_zone) = locality.sub_zone {
+            labels.insert(
+                crate::config::types::FAILOVER_PRIORITY_LABEL_SUBZONE.to_string(),
+                sub_zone,
+            );
+        }
+    }
+    if let Some(network) = network.filter(|value| !value.is_empty()) {
+        labels.insert(
+            crate::config::types::FAILOVER_PRIORITY_LABEL_NETWORK.to_string(),
+            network.to_string(),
+        );
+    }
+    if let Some(cluster) = cluster.filter(|value| !value.is_empty()) {
+        labels.insert(
+            crate::config::types::FAILOVER_PRIORITY_LABEL_CLUSTER.to_string(),
+            cluster.to_string(),
+        );
     }
 }
 
@@ -2471,6 +2594,7 @@ fn build_east_west_service_proxies_and_upstreams(
                 subsets: None,
                 port_overrides: HashMap::new(),
                 source_locality: None,
+                source_labels: Default::default(),
                 locality_lb_strict: false,
                 locality_lb_setting: None,
                 backend_tls_client_cert_path: None,
@@ -2769,6 +2893,12 @@ fn build_east_west_service_targets(
             // masquerade as remote and be excluded by strict locality LB.
             let mut tags = workload.selector.labels.clone();
             crate::modes::mesh::multicluster::strip_reserved_mesh_tags(&mut tags);
+            merge_derived_topology_labels(
+                &mut tags,
+                workload.locality.as_deref(),
+                workload.network.as_deref(),
+                workload.cluster.as_deref(),
+            );
             targets.push(UpstreamTarget {
                 host: address.clone(),
                 port: target_port,
@@ -6711,6 +6841,7 @@ fn mesh_outbound_route_upstream(
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
@@ -7570,6 +7701,7 @@ fn into_upstream_locality(
                 to: entry.to.clone(),
             })
             .collect(),
+        failover_priority: locality.failover_priority.clone(),
     }
 }
 
@@ -8440,6 +8572,7 @@ fn build_egress_upstream(
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
@@ -19967,6 +20100,7 @@ mod tests {
             subsets: None,
             port_overrides: HashMap::new(),
             source_locality: None,
+            source_labels: Default::default(),
             locality_lb_strict: false,
             locality_lb_setting: None,
             backend_tls_client_cert_path: None,
@@ -20177,6 +20311,7 @@ mod tests {
                                     },
                                 ],
                                 failover: Vec::new(),
+                                failover_priority: Vec::new(),
                             },
                         ),
                         ..MeshTrafficPolicy::default()
@@ -24329,6 +24464,7 @@ mod tests {
             subsets: None,
             port_overrides: HashMap::new(),
             source_locality: None,
+            source_labels: Default::default(),
             locality_lb_strict: false,
             locality_lb_setting: None,
             backend_tls_client_cert_path: None,
@@ -24552,6 +24688,7 @@ mod tests {
             subsets: None,
             port_overrides: HashMap::new(),
             source_locality: None,
+            source_labels: Default::default(),
             locality_lb_strict: false,
             locality_lb_setting: None,
             backend_tls_client_cert_path: None,

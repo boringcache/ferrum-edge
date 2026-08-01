@@ -10528,6 +10528,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         // backends do not persist it (no column), and `Upstream::validate_fields`
         // rejects operator writes via the admin API. SQL rows always start `None`.
         source_locality: None,
+        source_labels: Default::default(),
         // Mesh-only projection (`FERRUM_MESH_LOCALITY_LB_STRICT`): SQL backends
         // do not persist it and `Upstream::validate_fields` rejects operator
         // writes, so SQL rows always start `false`.

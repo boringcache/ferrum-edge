@@ -114,6 +114,7 @@ fn make_upstream(id: &str) -> Upstream {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
@@ -240,6 +241,7 @@ fn upstream_locality_lb_setting_round_trips_through_serde() {
             from: "us-west".to_string(),
             to: "us-east".to_string(),
         }],
+        failover_priority: Vec::new(),
     });
 
     let json = serde_json::to_value(&upstream).expect("serialize upstream");
@@ -270,6 +272,53 @@ fn upstream_locality_lb_setting_round_trips_through_serde() {
     assert_eq!(setting.failover.len(), 1);
     assert_eq!(setting.failover[0].from, "us-west");
     assert_eq!(setting.failover[0].to, "us-east");
+}
+
+#[test]
+fn upstream_locality_lb_setting_failover_priority_round_trips_through_serde() {
+    use ferrum_edge::config::types::UpstreamLocalityLbSetting;
+
+    let mut upstream: Upstream = serde_json::from_value(serde_json::json!({
+        "id": "u",
+        "targets": [{"host": "reviews", "port": 8080}]
+    }))
+    .expect("upstream deserialize");
+    upstream.locality_lb_setting = Some(UpstreamLocalityLbSetting {
+        enabled: true,
+        distribute: Vec::new(),
+        failover: Vec::new(),
+        failover_priority: vec![
+            "topology.kubernetes.io/region".to_string(),
+            "version=v1".to_string(),
+        ],
+    });
+
+    let json = serde_json::to_value(&upstream).expect("serialize");
+    let setting = json["locality_lb_setting"]
+        .as_object()
+        .expect("locality_lb_setting object");
+    assert_eq!(
+        setting.get("failover_priority"),
+        Some(&serde_json::json!([
+            "topology.kubernetes.io/region",
+            "version=v1"
+        ]))
+    );
+    assert!(setting.get("distribute").is_none());
+    assert!(setting.get("failover").is_none());
+
+    let round_tripped: Upstream = serde_json::from_value(json).expect("round-trip");
+    let setting = round_tripped
+        .locality_lb_setting
+        .as_ref()
+        .expect("setting round-trips");
+    assert_eq!(
+        setting.failover_priority,
+        vec![
+            "topology.kubernetes.io/region".to_string(),
+            "version=v1".to_string(),
+        ]
+    );
 }
 
 #[test]
@@ -304,6 +353,7 @@ fn upstream_port_override_locality_lb_setting_round_trips_through_serde() {
                 from: "us-west".to_string(),
                 to: "us-east".to_string(),
             }],
+            failover_priority: Vec::new(),
         }),
         ..UpstreamPortOverride::default()
     };

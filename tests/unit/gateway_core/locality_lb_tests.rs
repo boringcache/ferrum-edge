@@ -67,6 +67,7 @@ fn make_upstream(
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: source_locality.map(str::to_string),
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
@@ -934,6 +935,7 @@ fn cross_cluster_local_first_when_locality_lb_disabled() {
         enabled: false,
         distribute: Vec::new(),
         failover: Vec::new(),
+        failover_priority: Vec::new(),
     });
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
@@ -1355,6 +1357,7 @@ fn locality_distribute_overrides_priority_tier_with_weights() {
             to,
         }],
         failover: Vec::new(),
+        failover_priority: Vec::new(),
     };
     let up = upstream_with_locality_lb(
         "us-west/us-west-1/a",
@@ -1421,6 +1424,7 @@ fn locality_distribute_excludes_targets_with_zero_weight() {
             to,
         }],
         failover: Vec::new(),
+        failover_priority: Vec::new(),
     };
     let up = upstream_with_locality_lb(
         "us-west/us-west-1/a",
@@ -1462,6 +1466,7 @@ fn locality_distribute_treats_all_zero_endpoint_weight_locality_as_ineligible() 
             to,
         }],
         failover: Vec::new(),
+        failover_priority: Vec::new(),
     };
     let up = upstream_with_locality_lb(
         "us-west/us-west-1/a",
@@ -1501,6 +1506,7 @@ fn locality_distribute_preserves_endpoint_weights_within_locality_share() {
             to,
         }],
         failover: Vec::new(),
+        failover_priority: Vec::new(),
     };
     let mut up = make_upstream(
         "u1",
@@ -1554,6 +1560,7 @@ fn locality_distribute_assigns_overlapping_to_localities_once() {
             to,
         }],
         failover: Vec::new(),
+        failover_priority: Vec::new(),
     };
     let up = upstream_with_locality_lb(
         "us-east/us-east-1/a",
@@ -1607,6 +1614,7 @@ fn locality_distribute_preserves_consistent_hashing_within_selected_locality() {
             to,
         }],
         failover: Vec::new(),
+        failover_priority: Vec::new(),
     };
     let mut up = make_upstream(
         "u1",
@@ -1659,6 +1667,7 @@ fn locality_distribute_vec_fallback_preserves_consistent_hashing_within_selected
             to,
         }],
         failover: Vec::new(),
+        failover_priority: Vec::new(),
     };
     let mut targets = Vec::with_capacity(131);
     targets.push(target("west.local", Some("us-west/us-west-1/a")));
@@ -1715,6 +1724,7 @@ fn locality_distribute_from_terminal_wildcard_matches_source_subzone() {
             to,
         }],
         failover: Vec::new(),
+        failover_priority: Vec::new(),
     };
     let up = upstream_with_locality_lb(
         "us-west/us-west-1/a",
@@ -1754,6 +1764,7 @@ fn locality_distribute_from_region_only_matches_zoned_source_locality() {
             to,
         }],
         failover: Vec::new(),
+        failover_priority: Vec::new(),
     };
     let up = upstream_with_locality_lb(
         "us-west/us-west-1/a",
@@ -1793,6 +1804,7 @@ fn locality_distribute_from_global_wildcard_matches_any_source_locality() {
             to,
         }],
         failover: Vec::new(),
+        failover_priority: Vec::new(),
     };
     let up = upstream_with_locality_lb(
         "us-west/us-west-1/a",
@@ -1836,6 +1848,7 @@ fn locality_distribute_falls_through_when_every_weighted_target_is_unhealthy() {
             to,
         }],
         failover: Vec::new(),
+        failover_priority: Vec::new(),
     };
     let up = upstream_with_locality_lb(
         "us-west/us-west-1/a",
@@ -1884,6 +1897,7 @@ fn locality_distribute_vec_fallback_empty_mask_preserves_priority_tier() {
             to,
         }],
         failover: Vec::new(),
+        failover_priority: Vec::new(),
     };
     let mut targets = Vec::with_capacity(132);
     targets.push(target("west.local", Some("us-west/us-west-1/a")));
@@ -1935,6 +1949,7 @@ fn locality_distribute_no_matching_from_uses_priority_tier() {
             to,
         }],
         failover: Vec::new(),
+        failover_priority: Vec::new(),
     };
     let up = upstream_with_locality_lb(
         "us-west/us-west-1/a",
@@ -1980,6 +1995,7 @@ fn locality_failover_overrides_region_fallback_when_all_local_tiers_unhealthy() 
             from: "us-west".to_string(),
             to: "us-east".to_string(),
         }],
+        failover_priority: Vec::new(),
     };
     let up = upstream_with_locality_lb(
         "us-west/us-west-1/a",
@@ -2030,6 +2046,7 @@ fn locality_failover_does_not_apply_when_local_tier_is_healthy() {
             from: "us-west".to_string(),
             to: "us-east".to_string(),
         }],
+        failover_priority: Vec::new(),
     };
     let up = upstream_with_locality_lb(
         "us-west/us-west-1/a",
@@ -2069,6 +2086,7 @@ fn locality_failover_falls_through_when_failover_region_is_also_empty() {
             from: "us-west".to_string(),
             to: "us-east".to_string(),
         }],
+        failover_priority: Vec::new(),
     };
     let up = upstream_with_locality_lb(
         "us-west/us-west-1/a",
@@ -2109,6 +2127,7 @@ fn locality_lb_enabled_false_disables_priority_distribute_and_failover() {
             from: "us-west".to_string(),
             to: "us-east".to_string(),
         }],
+        failover_priority: Vec::new(),
     };
     let up = upstream_with_locality_lb(
         "us-west/us-west-1/a",
@@ -2137,5 +2156,358 @@ fn locality_lb_enabled_false_disables_priority_distribute_and_failover() {
         seen.len(),
         2,
         "enabled=false must let RR visit both targets across the full set — saw {seen:?}"
+    );
+}
+
+// ── localityLbSetting.failoverPriority ────────────────────────────────────
+
+fn labeled_target(host: &str, locality: Option<&str>, labels: &[(&str, &str)]) -> UpstreamTarget {
+    let mut target = target(host, locality);
+    for (key, value) in labels {
+        target.tags.insert((*key).to_string(), (*value).to_string());
+    }
+    target
+}
+
+fn upstream_with_failover_priority(
+    source_labels: HashMap<String, String>,
+    targets: Vec<UpstreamTarget>,
+    failover_priority: Vec<String>,
+) -> Upstream {
+    let mut up = make_upstream("u1", LoadBalancerAlgorithm::RoundRobin, None, targets);
+    up.source_labels = source_labels;
+    up.locality_lb_setting = Some(UpstreamLocalityLbSetting {
+        enabled: true,
+        distribute: Vec::new(),
+        failover: Vec::new(),
+        failover_priority,
+    });
+    up
+}
+
+#[test]
+fn failover_priority_prefers_full_label_match() {
+    // Ordered keys: region then zone. Source is us-west / us-west-1.
+    // Full match must win over region-only and no-match endpoints.
+    let source_labels = HashMap::from([
+        (
+            "topology.kubernetes.io/region".to_string(),
+            "us-west".to_string(),
+        ),
+        (
+            "topology.kubernetes.io/zone".to_string(),
+            "us-west-1".to_string(),
+        ),
+    ]);
+    let up = upstream_with_failover_priority(
+        source_labels,
+        vec![
+            labeled_target(
+                "full.local",
+                Some("us-west/us-west-1/a"),
+                &[
+                    ("topology.kubernetes.io/region", "us-west"),
+                    ("topology.kubernetes.io/zone", "us-west-1"),
+                ],
+            ),
+            labeled_target(
+                "region.local",
+                Some("us-west/us-west-2/a"),
+                &[
+                    ("topology.kubernetes.io/region", "us-west"),
+                    ("topology.kubernetes.io/zone", "us-west-2"),
+                ],
+            ),
+            labeled_target(
+                "other.local",
+                Some("eu-central/eu-central-1/a"),
+                &[
+                    ("topology.kubernetes.io/region", "eu-central"),
+                    ("topology.kubernetes.io/zone", "eu-central-1"),
+                ],
+            ),
+        ],
+        vec![
+            "topology.kubernetes.io/region".to_string(),
+            "topology.kubernetes.io/zone".to_string(),
+        ],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("fp-{i}"),
+            no_health(),
+        )
+        .expect("selected");
+        assert_eq!(
+            selection.target.host, "full.local",
+            "full failoverPriority match must win"
+        );
+    }
+}
+
+#[test]
+fn failover_priority_falls_back_when_higher_tier_unhealthy() {
+    let source_labels = HashMap::from([
+        (
+            "topology.kubernetes.io/region".to_string(),
+            "us-west".to_string(),
+        ),
+        (
+            "topology.kubernetes.io/zone".to_string(),
+            "us-west-1".to_string(),
+        ),
+    ]);
+    let full = labeled_target(
+        "full.local",
+        Some("us-west/us-west-1/a"),
+        &[
+            ("topology.kubernetes.io/region", "us-west"),
+            ("topology.kubernetes.io/zone", "us-west-1"),
+        ],
+    );
+    let up = upstream_with_failover_priority(
+        source_labels,
+        vec![
+            full.clone(),
+            labeled_target(
+                "region.local",
+                Some("us-west/us-west-2/a"),
+                &[
+                    ("topology.kubernetes.io/region", "us-west"),
+                    ("topology.kubernetes.io/zone", "us-west-2"),
+                ],
+            ),
+            labeled_target(
+                "other.local",
+                Some("eu-central/eu-central-1/a"),
+                &[
+                    ("topology.kubernetes.io/region", "eu-central"),
+                    ("topology.kubernetes.io/zone", "eu-central-1"),
+                ],
+            ),
+        ],
+        vec![
+            "topology.kubernetes.io/region".to_string(),
+            "topology.kubernetes.io/zone".to_string(),
+        ],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let active_unhealthy = DashMap::new();
+    active_unhealthy.insert(target_key("ferrum|u1", &full), 1);
+    let health = HealthContext {
+        active_unhealthy: &active_unhealthy,
+        proxy_passive: None,
+        max_ejection_percent: None,
+    };
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("fp-fb-{i}"),
+            Some(&health),
+        )
+        .expect("selected");
+        assert_eq!(
+            selection.target.host, "region.local",
+            "region-only match must win once the full-match tier is unhealthy"
+        );
+    }
+}
+
+#[test]
+fn failover_priority_key_value_overrides_source_labels() {
+    // key=value entries compare configured values against endpoint labels,
+    // ignoring the source workload's own values for that key.
+    let source_labels = HashMap::from([("version".to_string(), "v2".to_string())]);
+    let up = upstream_with_failover_priority(
+        source_labels,
+        vec![
+            labeled_target("v1.local", None, &[("version", "v1")]),
+            labeled_target("v2.local", None, &[("version", "v2")]),
+        ],
+        vec!["version=v1".to_string()],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("kv-{i}"),
+            no_health(),
+        )
+        .expect("selected");
+        assert_eq!(
+            selection.target.host, "v1.local",
+            "key=value override must select the configured value, not the source label"
+        );
+    }
+}
+
+#[test]
+fn failover_priority_missing_labels_compare_as_empty() {
+    // Missing labels on both sides match (Istio map-lookup empty-string
+    // semantics). An endpoint that carries the key with a non-empty value
+    // mismatches and falls to a lower tier.
+    let up = upstream_with_failover_priority(
+        HashMap::new(),
+        vec![
+            labeled_target("missing.local", None, &[]),
+            labeled_target("present.local", None, &[("version", "v1")]),
+        ],
+        vec!["version".to_string()],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("miss-{i}"),
+            no_health(),
+        )
+        .expect("selected");
+        assert_eq!(
+            selection.target.host, "missing.local",
+            "missing-on-both-sides must outrank a present-but-mismatched label"
+        );
+    }
+}
+
+#[test]
+fn failover_priority_derives_topology_labels_from_locality_string() {
+    // Endpoints without explicit topology tags still match via locality
+    // region/zone segments (cold-path derivation, no hot-path allocation).
+    let source_labels = HashMap::from([
+        (
+            "topology.kubernetes.io/region".to_string(),
+            "us-west".to_string(),
+        ),
+        (
+            "topology.kubernetes.io/zone".to_string(),
+            "us-west-1".to_string(),
+        ),
+    ]);
+    let up = upstream_with_failover_priority(
+        source_labels,
+        vec![
+            target("exact.local", Some("us-west/us-west-1/a")),
+            target("other.local", Some("eu-central/eu-central-1/a")),
+        ],
+        vec![
+            "topology.kubernetes.io/region".to_string(),
+            "topology.kubernetes.io/zone".to_string(),
+        ],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("loc-{i}"),
+            no_health(),
+        )
+        .expect("selected");
+        assert_eq!(
+            selection.target.host, "exact.local",
+            "locality-derived topology labels must drive failoverPriority tiers"
+        );
+    }
+}
+
+#[test]
+fn failover_priority_recomputes_on_endpoint_reload() {
+    // update_targets must rebuild failoverPriority ranks from the preserved
+    // source_labels + locality_lb_setting against the new endpoint set.
+    let source_labels = HashMap::from([("version".to_string(), "v1".to_string())]);
+    let initial = upstream_with_failover_priority(
+        source_labels.clone(),
+        vec![
+            labeled_target("v1-a.local", None, &[("version", "v1")]),
+            labeled_target("v2.local", None, &[("version", "v2")]),
+        ],
+        vec!["version".to_string()],
+    );
+    let cache = LoadBalancerCache::new(&config(initial));
+    let snapshot = cache.load();
+    let selection = LoadBalancerCache::select_target_from(
+        &snapshot,
+        "ferrum",
+        "u1",
+        "before",
+        no_health(),
+    )
+    .expect("selected");
+    assert_eq!(selection.target.host, "v1-a.local");
+
+    // Reload endpoints: only a v2 endpoint remains healthy-candidate pool,
+    // plus a new v1 endpoint that must now win.
+    cache.update_targets(
+        "ferrum",
+        "u1",
+        vec![
+            labeled_target("v2.local", None, &[("version", "v2")]),
+            labeled_target("v1-b.local", None, &[("version", "v1")]),
+        ],
+        LoadBalancerAlgorithm::RoundRobin,
+        None,
+    );
+    let snapshot = cache.load();
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("after-{i}"),
+            no_health(),
+        )
+        .expect("selected after reload");
+        assert_eq!(
+            selection.target.host, "v1-b.local",
+            "endpoint reload must recompute failoverPriority tiers"
+        );
+    }
+}
+
+#[test]
+fn failover_priority_enabled_false_suppresses_label_tiers() {
+    let mut up = upstream_with_failover_priority(
+        HashMap::from([("version".to_string(), "v1".to_string())]),
+        vec![
+            labeled_target("v1.local", None, &[("version", "v1")]),
+            labeled_target("v2.local", None, &[("version", "v2")]),
+        ],
+        vec!["version".to_string()],
+    );
+    up.locality_lb_setting.as_mut().unwrap().enabled = false;
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let mut seen: HashSet<String> = HashSet::new();
+    for i in 0..30 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("off-{i}"),
+            no_health(),
+        )
+        .expect("selected");
+        seen.insert(selection.target.host.clone());
+    }
+    assert_eq!(
+        seen.len(),
+        2,
+        "enabled=false must suppress failoverPriority tiers — saw {seen:?}"
     );
 }

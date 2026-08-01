@@ -667,6 +667,7 @@ fn destination_rule_status(
             // Surface the rest so operators see the gap in `kubectl describe`.
             let mut deferred: Vec<&'static str> = Vec::new();
             deferred.extend(deferred_connection_pool_http_fields(&object.spec));
+            deferred.extend(deferred_locality_lb_fields(&object.spec));
             let message = if deferred.is_empty() {
                 format!("Ferrum accepted this DestinationRule (host: {host})")
             } else {
@@ -745,6 +746,81 @@ const SUBSET_DEFERRED_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[
         "subsets[].trafficPolicy.connectionPool.http.http1MaxPendingRequests (not applied for subsets)",
     ),
 ];
+
+/// Surface Istio's advisory that `failoverPriority` should be paired with
+/// `outlierDetection` (or other health signals) so lower-priority tiers are
+/// only selected after higher tiers become unhealthy. Ferrum still accepts and
+/// precomputes the priority ranks; without a health signal every endpoint stays
+/// healthy and only the best rank is ever selected.
+fn deferred_locality_lb_fields(spec: &Value) -> Vec<&'static str> {
+    let mut deferred = Vec::new();
+    let policies = locality_lb_setting_values(spec);
+    let has_failover_priority = policies.iter().any(|locality| {
+        locality
+            .get("failoverPriority")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| !entries.is_empty())
+    });
+    if !has_failover_priority {
+        return deferred;
+    }
+    let has_outlier = policies_have_outlier_detection(spec);
+    if !has_outlier {
+        deferred.push(
+            "trafficPolicy.loadBalancer.localityLbSetting.failoverPriority (accepted; pair with outlierDetection or active health so lower priority tiers are selected only after higher tiers are unhealthy)",
+        );
+    }
+    deferred
+}
+
+fn locality_lb_setting_values(spec: &Value) -> Vec<&Value> {
+    let mut out = Vec::new();
+    if let Some(locality) = spec
+        .get("trafficPolicy")
+        .and_then(|policy| policy.get("loadBalancer"))
+        .and_then(|lb| lb.get("localityLbSetting"))
+    {
+        out.push(locality);
+    }
+    if let Some(ports) = spec
+        .get("trafficPolicy")
+        .and_then(|policy| policy.get("portLevelSettings"))
+        .and_then(Value::as_array)
+    {
+        for entry in ports {
+            if let Some(locality) = entry
+                .get("loadBalancer")
+                .and_then(|lb| lb.get("localityLbSetting"))
+            {
+                out.push(locality);
+            }
+        }
+    }
+    out
+}
+
+fn policies_have_outlier_detection(spec: &Value) -> bool {
+    if spec
+        .get("trafficPolicy")
+        .and_then(|policy| policy.get("outlierDetection"))
+        .is_some()
+    {
+        return true;
+    }
+    if let Some(ports) = spec
+        .get("trafficPolicy")
+        .and_then(|policy| policy.get("portLevelSettings"))
+        .and_then(Value::as_array)
+    {
+        if ports
+            .iter()
+            .any(|entry| entry.get("outlierDetection").is_some())
+        {
+            return true;
+        }
+    }
+    false
+}
 
 /// Collect the deferred `connectionPool.http.*` field labels. Two layers:
 /// 1. `DEFERRED_CONNECTION_POOL_HTTP_FIELDS` — deferred in EVERY scope; scanned

@@ -5,7 +5,9 @@
 
 use crate::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, LocalityPreference, Proxy, SubsetDefinition, Upstream,
-    UpstreamLocalityLbSetting, UpstreamPortOverride, UpstreamTarget,
+    UpstreamLocalityLbSetting, UpstreamPortOverride, UpstreamTarget, FAILOVER_PRIORITY_LABEL_NETWORK,
+    FAILOVER_PRIORITY_LABEL_REGION, FAILOVER_PRIORITY_LABEL_SUBZONE, FAILOVER_PRIORITY_LABEL_ZONE,
+    FAILOVER_PRIORITY_LABEL_CLUSTER, FAILOVER_PRIORITY_LABEL_HOSTNAME, parse_failover_priority_entry,
 };
 use crate::health_check::ProxyHealthState;
 use arc_swap::ArcSwap;
@@ -1194,6 +1196,7 @@ impl LoadBalancerCache {
                     upstream.subsets.as_deref(),
                     Some(&upstream.port_overrides),
                     upstream.source_locality.as_deref(),
+                    &upstream.source_labels,
                     upstream.locality_lb_setting.as_ref(),
                     upstream.locality_lb_strict,
                 )),
@@ -1262,6 +1265,7 @@ impl LoadBalancerCache {
                     upstream.subsets.as_deref(),
                     Some(&upstream.port_overrides),
                     upstream.source_locality.as_deref(),
+                    &upstream.source_labels,
                     upstream.locality_lb_setting.as_ref(),
                     upstream.locality_lb_strict,
                 )),
@@ -1346,6 +1350,7 @@ impl LoadBalancerCache {
             .map(|subsets| subsets.to_vec());
         let existing_port_overrides = existing_upstream.port_overrides.clone();
         let existing_source_locality = existing_upstream.source_locality.clone();
+        let existing_source_labels = existing_upstream.source_labels.clone();
         let existing_locality_lb_setting = existing_upstream.locality_lb_setting.clone();
         let existing_locality_lb_strict = existing_upstream.locality_lb_strict;
         new_balancers.insert(
@@ -1358,6 +1363,7 @@ impl LoadBalancerCache {
                 existing_subsets.as_deref(),
                 Some(&existing_port_overrides),
                 existing_source_locality.as_deref(),
+                &existing_source_labels,
                 existing_locality_lb_setting.as_ref(),
                 existing_locality_lb_strict,
             )),
@@ -1897,27 +1903,31 @@ fn retry_exclude_target_matches(target: &UpstreamTarget, exclude: &UpstreamTarge
 }
 
 /// Build the pre-computed locality-LB state from an operator's
-/// `UpstreamLocalityLbSetting` against the upstream's `source_locality`.
+/// `UpstreamLocalityLbSetting` against the upstream's `source_locality` and
+/// `source_labels`.
 ///
 /// Returns `None` when no setting applies — the load balancer then skips
 /// every locality-aware path beyond the existing priority-tier preference.
 /// Returns `Some(LocalityLbState { enabled: false, .. })` when the operator
 /// explicitly disabled locality LB; the request path treats that as "no
-/// priority, no distribute, no failover" (matches Istio semantics).
+/// priority, no distribute, no failover, no failover-priority" (matches Istio
+/// semantics).
 ///
-/// Pre-computes per-target weights / failover masks once at construction so
-/// the hot path stays branch-light: distribute is a candidate mask plus a
-/// weighted bucket pick, failover is one Vec index check inside the existing
-/// tier preference.
+/// Pre-computes per-target weights / failover masks / failover-priority ranks
+/// once at construction so the hot path stays branch-light: distribute is a
+/// candidate mask plus a weighted bucket pick, failover is one Vec index check
+/// inside the existing tier preference, and failover-priority is a precomputed
+/// per-target rank consulted instead of the default region/zone/subzone tiers.
 fn build_locality_lb_state(
     setting: Option<&UpstreamLocalityLbSetting>,
     source_locality: Option<&str>,
+    source_labels: &HashMap<String, String>,
     targets: &[UpstreamTarget],
 ) -> Option<LocalityLbState> {
     let setting = setting?;
     // When the operator disabled the block we still surface the state so
     // `preferred_locality_bitset` can short-circuit priority-tier preference
-    // alongside distribute / failover.
+    // alongside distribute / failover / failover-priority.
     if !setting.enabled {
         return Some(LocalityLbState {
             enabled: false,
@@ -1925,6 +1935,27 @@ fn build_locality_lb_state(
             distribute_groups: None,
             distribute_counter: new_selection_counters(),
             failover_target_matches: None,
+            failover_priority_ranks: None,
+        });
+    }
+
+    // failoverPriority replaces the default locality tiers entirely (Istio
+    // mutual exclusivity with distribute/failover). Precompute ranks even when
+    // source labels are empty — missing labels compare as "" on both sides,
+    // matching Istio's map lookup semantics.
+    if !setting.failover_priority.is_empty() {
+        let ranks = compute_failover_priority_ranks(
+            &setting.failover_priority,
+            source_labels,
+            targets,
+        );
+        return Some(LocalityLbState {
+            enabled: true,
+            distribute_weights: None,
+            distribute_groups: None,
+            distribute_counter: new_selection_counters(),
+            failover_target_matches: None,
+            failover_priority_ranks: Some(ranks),
         });
     }
 
@@ -1939,6 +1970,7 @@ fn build_locality_lb_state(
             distribute_groups: None,
             distribute_counter: new_selection_counters(),
             failover_target_matches: None,
+            failover_priority_ranks: None,
         });
     };
 
@@ -2102,7 +2134,100 @@ fn build_locality_lb_state(
         distribute_groups,
         distribute_counter: new_selection_counters(),
         failover_target_matches,
+        failover_priority_ranks: None,
     })
+}
+
+/// Precompute per-target Istio `failoverPriority` ranks.
+///
+/// Rank `0` is highest priority (matched all configured labels). Rank `N` is
+/// lowest (matched none). Missing labels on either the source or the endpoint
+/// compare as empty strings (Istio map-lookup semantics). When the first
+/// configured label is `topology.istio.io/network` and it mismatches, Istio
+/// demotes the endpoint by `N` while continuing to match the remaining labels.
+fn compute_failover_priority_ranks(
+    failover_priority: &[String],
+    source_labels: &HashMap<String, String>,
+    targets: &[UpstreamTarget],
+) -> Vec<u8> {
+    let n = failover_priority.len();
+    let lowest = n.min(u8::MAX as usize) as u8;
+    let includes_network = failover_priority
+        .first()
+        .is_some_and(|entry| parse_failover_priority_entry(entry).is_some_and(|(key, _)| key == FAILOVER_PRIORITY_LABEL_NETWORK));
+
+    // Resolve (key, expected_value) once for the source so the per-target loop
+    // stays allocation-free.
+    let mut expected: Vec<(&str, String)> = Vec::with_capacity(n);
+    for entry in failover_priority {
+        let Some((key, override_value)) = parse_failover_priority_entry(entry) else {
+            // Translator rejects invalid entries; treat any residual as a
+            // never-matching sentinel so we fail closed rather than silently
+            // degrading to another locality mode.
+            expected.push(("", String::new()));
+            continue;
+        };
+        let value = match override_value {
+            Some(value) => value.to_string(),
+            None => source_labels.get(key).cloned().unwrap_or_default(),
+        };
+        expected.push((key, value));
+    }
+
+    targets
+        .iter()
+        .map(|target| {
+            let mut priority: u8 = 0;
+            let mut adjust: u8 = 0;
+            for (j, (key, expected_value)) in expected.iter().enumerate() {
+                let endpoint_value = endpoint_failover_priority_label(target, key);
+                if endpoint_value == expected_value.as_str() {
+                    continue;
+                }
+                if j == 0 && includes_network {
+                    adjust = lowest;
+                    continue;
+                }
+                let matched_prefix = j.min(u8::MAX as usize) as u8;
+                priority = lowest.saturating_sub(matched_prefix);
+                break;
+            }
+            priority.saturating_add(adjust)
+        })
+        .collect()
+}
+
+/// Resolve an endpoint's value for a failoverPriority label key.
+///
+/// Prefer an explicit target tag, then derive well-known topology keys from
+/// the target's `locality` string without allocating. Missing values are the
+/// empty string so comparisons match Istio's absent-map-entry semantics.
+fn endpoint_failover_priority_label<'a>(target: &'a UpstreamTarget, key: &str) -> &'a str {
+    if let Some(value) = target.tags.get(key) {
+        return value.as_str();
+    }
+    match key {
+        FAILOVER_PRIORITY_LABEL_REGION => locality_segment(target.locality.as_deref(), 0).unwrap_or(""),
+        FAILOVER_PRIORITY_LABEL_ZONE => locality_segment(target.locality.as_deref(), 1).unwrap_or(""),
+        FAILOVER_PRIORITY_LABEL_SUBZONE => {
+            locality_segment(target.locality.as_deref(), 2).unwrap_or("")
+        }
+        // Network / cluster / hostname are only available as explicit tags
+        // (stamped at materialization from workload.network/cluster when known).
+        FAILOVER_PRIORITY_LABEL_NETWORK
+        | FAILOVER_PRIORITY_LABEL_CLUSTER
+        | FAILOVER_PRIORITY_LABEL_HOSTNAME => "",
+        _ => "",
+    }
+}
+
+#[inline]
+fn locality_segment(raw: Option<&str>, index: usize) -> Option<&str> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    raw.split('/').nth(index).filter(|part| !part.is_empty())
 }
 
 /// True when `to` (a distribute key, e.g. `us-west` or `us-west/us-west-1`)
@@ -2321,6 +2446,11 @@ struct LocalityLbState {
     /// region for this source. `None` when no `failover[]` entry matched
     /// the source region. Consulted as a fourth tier after exact/zone/region.
     failover_target_matches: Option<Vec<bool>>,
+    /// Per-target Istio `failoverPriority` rank, index-aligned with
+    /// `LoadBalancer.targets`. `0` is highest priority. `None` when
+    /// failoverPriority is not configured. When present, replaces the
+    /// default region/zone/subzone `target_locality_ranks` preference.
+    failover_priority_ranks: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -2376,6 +2506,7 @@ impl LoadBalancer {
             subsets,
             None,
             None,
+            &HashMap::new(),
             None,
             false,
         )
@@ -2392,6 +2523,7 @@ impl LoadBalancer {
         subsets: Option<&[SubsetDefinition]>,
         port_overrides: Option<&HashMap<u16, UpstreamPortOverride>>,
         source_locality: Option<&str>,
+        source_labels: &HashMap<String, String>,
         locality_lb_setting: Option<&UpstreamLocalityLbSetting>,
         locality_lb_strict: bool,
     ) -> Self {
@@ -2571,8 +2703,12 @@ impl LoadBalancer {
                     .locality_lb_setting
                     .as_ref()
                     .or(locality_lb_setting);
-                let port_locality_lb =
-                    build_locality_lb_state(port_locality_setting, source_locality, targets);
+                let port_locality_lb = build_locality_lb_state(
+                    port_locality_setting,
+                    source_locality,
+                    source_labels,
+                    targets,
+                );
                 port_states.insert(
                     *port,
                     PortLbState {
@@ -2614,7 +2750,12 @@ impl LoadBalancer {
         // `enabled: false` disables every locality-aware path; `distribute`
         // and `failover` are mutually exclusive at evaluation time so the
         // pre-compute below is allowed to populate one, the other, or neither.
-        let locality_lb = build_locality_lb_state(locality_lb_setting, source_locality, targets);
+        let locality_lb = build_locality_lb_state(
+            locality_lb_setting,
+            source_locality,
+            source_labels,
+            targets,
+        );
 
         // Strict local-first locality LB: precompute which targets are LOCAL so
         // the request path can restrict to them when no source locality
@@ -3262,6 +3403,16 @@ impl LoadBalancer {
             // fallback.
         }
 
+        // failoverPriority replaces the default region/zone/subzone tiers.
+        // Prefer the lowest (best) healthy rank; when every ranked target is
+        // unhealthy fall through to the residual candidate set.
+        if let Some(ranks) = locality_lb.and_then(|state| state.failover_priority_ranks.as_ref()) {
+            return (
+                self.preferred_failover_priority_bitset(candidates, ranks),
+                false,
+            );
+        }
+
         // No source locality → no tier preference. Default (fail-open) returns
         // the input unchanged. Strict mode restricts to LOCAL endpoints and fails
         // CLOSED to unhealthy local rather than widening to remote
@@ -3319,6 +3470,65 @@ impl LoadBalancer {
         (*candidates, false)
     }
 
+    #[inline]
+    fn preferred_failover_priority_bitset(
+        &self,
+        candidates: &HealthBitset,
+        ranks: &[u8],
+    ) -> HealthBitset {
+        let mut best_rank = u8::MAX;
+        for idx in 0..self.targets.len() {
+            if !candidates.contains(idx) {
+                continue;
+            }
+            let rank = ranks.get(idx).copied().unwrap_or(u8::MAX);
+            if rank < best_rank {
+                best_rank = rank;
+            }
+        }
+        if best_rank == u8::MAX {
+            return *candidates;
+        }
+        let mut preferred = HealthBitset::empty();
+        for idx in 0..self.targets.len() {
+            if candidates.contains(idx) && ranks.get(idx).copied().unwrap_or(u8::MAX) == best_rank {
+                preferred.set(idx);
+            }
+        }
+        if preferred.is_empty() {
+            *candidates
+        } else {
+            preferred
+        }
+    }
+
+    fn preferred_failover_priority_candidates<'a>(
+        &self,
+        candidates: Vec<(usize, &'a Arc<UpstreamTarget>)>,
+        ranks: &[u8],
+    ) -> Vec<(usize, &'a Arc<UpstreamTarget>)> {
+        let mut best_rank = u8::MAX;
+        for (idx, _) in &candidates {
+            let rank = ranks.get(*idx).copied().unwrap_or(u8::MAX);
+            if rank < best_rank {
+                best_rank = rank;
+            }
+        }
+        if best_rank == u8::MAX {
+            return candidates;
+        }
+        let preferred: Vec<(usize, &'a Arc<UpstreamTarget>)> = candidates
+            .iter()
+            .copied()
+            .filter(|(idx, _)| ranks.get(*idx).copied().unwrap_or(u8::MAX) == best_rank)
+            .collect();
+        if preferred.is_empty() {
+            candidates
+        } else {
+            preferred
+        }
+    }
+
     fn preferred_locality_candidates<'a>(
         &'a self,
         candidates: Vec<(usize, &'a Arc<UpstreamTarget>)>,
@@ -3367,6 +3577,14 @@ impl LoadBalancer {
             if !masked.is_empty() {
                 return (masked, false);
             }
+        }
+
+        // failoverPriority replaces the default region/zone/subzone tiers.
+        if let Some(ranks) = locality_lb.and_then(|state| state.failover_priority_ranks.as_ref()) {
+            return (
+                self.preferred_failover_priority_candidates(candidates, ranks),
+                false,
+            );
         }
 
         // No source locality → no tier preference. Default returns the mixed
@@ -6048,6 +6266,7 @@ mod tests {
             None,
             Some(&port_overrides),
             None,
+            &HashMap::new(),
             None,
             false,
         );

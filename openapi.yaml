@@ -9986,12 +9986,21 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/LocalityDistribute"
-          description: Weighted target-locality distributions.
+          description: Weighted target-locality distributions. Mutually exclusive with failover and failover_priority.
         failover:
           type: array
           items:
             $ref: "#/components/schemas/LocalityFailover"
-          description: Source-region to failover-region mappings.
+          description: Source-region to failover-region mappings. Mutually exclusive with distribute and failover_priority.
+        failover_priority:
+          type: array
+          items:
+            type: string
+          description: |
+            Ordered Istio failoverPriority label keys (`key`) or key/value
+            overrides (`key=value`). Replaces default region/zone/subzone tiers
+            with label-match priority tiers. Mutually exclusive with distribute
+            and failover.
 
     LocalityDistribute:
       type: object

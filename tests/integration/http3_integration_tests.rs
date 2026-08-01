@@ -1456,6 +1456,7 @@ fn create_sticky_cookie_upstream() -> ferrum_edge::config::types::Upstream {
         subsets: None,
         port_overrides: std::collections::HashMap::new(),
         source_locality: None,
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,

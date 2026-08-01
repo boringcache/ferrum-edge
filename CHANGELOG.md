@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Istio DestinationRule `trafficPolicy.loadBalancer.localityLbSetting.failoverPriority`
+  is implemented end to end (#3238). The K8s/native translator accepts ordered
+  label keys (`key`) and key/value overrides (`key=value`), rejects empty or
+  malformed entries and mutually exclusive combinations with `distribute` /
+  `failover` (fail closed — never silently degrades to another locality mode),
+  and projects the list onto mesh upstreams. The load balancer precomputes
+  deterministic priority tiers from source workload labels (plus derived
+  topology metadata) against endpoint labels/locality, prefers the best healthy
+  rank, and recomputes on endpoint/locality/label reload. Missing labels compare
+  as empty strings; duplicates are accepted as independent ordered steps with a
+  warning. FerrumAccepted status reports field-specific rejection diagnostics
+  and a deferred advisory when `failoverPriority` is set without
+  `outlierDetection`. Docs, support matrix, OpenAPI, and focused create/update/
+  delete/data-path tests cover the behavior.
+
 - Kubernetes controller watch scopes now rebuild their reflector from an
   authoritative list when they go idle past `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`
   (default `300`, `0` disables, clamped to `0`–`86400`). kube-rs raises an

@@ -2130,16 +2130,19 @@ pub struct MeshConsistentHash {
 /// `enabled` defaults to `true` when the block is present (matches Istio
 /// semantics — an explicit `enabled: false` disables locality-aware LB
 /// entirely, including the priority-tier preference projected by
-/// `Upstream.source_locality`). `distribute` and `failover` are mutually
-/// exclusive at evaluation time: when a `distribute` entry matches the
-/// source locality the load balancer uses per-locality weights and ignores
-/// the priority-tier preference; otherwise `failover` (when configured)
-/// adds a fourth tier consulted after `region` and before the unfiltered
-/// fallback set.
+/// `Upstream.source_locality`). Exactly one of `distribute`, `failover`,
+/// or `failover_priority` may be set (Istio mutual exclusivity). When a
+/// `distribute` entry matches the source locality the load balancer uses
+/// per-locality weights and ignores the priority-tier preference;
+/// otherwise `failover` (when configured) adds a fourth tier consulted
+/// after `region` and before the unfiltered fallback set. When
+/// `failover_priority` is set it replaces the default region/zone/subzone
+/// tiers with ordered workload-label priority tiers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshLocalityLbSetting {
     /// When `false`, disables all locality preference (priority tier,
-    /// distribute weighting, and failover override). Defaults to `true`.
+    /// distribute weighting, failover override, and failover-priority
+    /// tiers). Defaults to `true`.
     #[serde(default = "default_true_bool")]
     pub enabled: bool,
     /// Per-source-locality weighted distribution to target localities.
@@ -2152,6 +2155,11 @@ pub struct MeshLocalityLbSetting {
     /// target exists in the source's exact/zone/region tiers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failover: Vec<MeshLocalityFailover>,
+    /// Ordered Istio `failoverPriority` label keys (`key`) or
+    /// key/value overrides (`key=value`). Mutually exclusive with
+    /// `distribute` and `failover`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failover_priority: Vec<String>,
 }
 
 fn default_true_bool() -> bool {
@@ -2164,6 +2172,7 @@ impl Default for MeshLocalityLbSetting {
             enabled: true,
             distribute: Vec::new(),
             failover: Vec::new(),
+            failover_priority: Vec::new(),
         }
     }
 }

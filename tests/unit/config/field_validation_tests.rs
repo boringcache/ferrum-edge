@@ -116,6 +116,7 @@ fn make_upstream(id: &str) -> Upstream {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
@@ -1126,6 +1127,7 @@ fn test_upstream_locality_lb_setting_rejected_by_admin_api() {
             from: "us-west".to_string(),
             to: "us-east".to_string(),
         }],
+        failover_priority: Vec::new(),
     });
     let errs = upstream
         .validate_operator_provided_fields()
@@ -2696,6 +2698,7 @@ fn test_validate_backend_ip_policy_upstream_target_denied() {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        source_labels: Default::default(),
         locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
