@@ -67,8 +67,8 @@ paths:
   decompression remains compatible because its exact final body is published
   during pre-`before_proxy` normalization. Its request-header dimension
   conservatively binds all backend-visible headers, in addition to the complete
-  `Vary` tuple, except
-  the entry-operation headers whose semantics this plugin actually implements:
+  `Vary` tuple, except the entry-operation headers whose semantics this plugin
+  actually implements:
   `If-None-Match` / `If-Modified-Since` revalidation, pure honored request
   `Cache-Control: no-cache` / `no-store` refreshes (bare and argument-free, only
   when every meaningful member is such a refresh and only when
