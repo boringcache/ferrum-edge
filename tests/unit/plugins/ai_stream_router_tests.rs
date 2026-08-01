@@ -7,9 +7,13 @@ use ferrum_edge::plugins::ai_stream_router::{
     AiStreamRouter, MAX_SSE_EVENT_BYTES, MAX_SSE_EVENT_JSON_DEPTH, MAX_SSE_EVENTS,
     MAX_SSE_NORMALIZED_BODY_BYTES, MAX_SSE_NORMALIZED_OUTPUT_BYTES,
 };
+use ferrum_edge::plugins::mcp_gateway::McpGateway;
+use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
+use ferrum_edge::plugins::request_mirror::RequestMirror;
 use ferrum_edge::plugins::request_transformer::RequestTransformer;
 use ferrum_edge::plugins::response_caching::ResponseCaching;
+use ferrum_edge::plugins::serverless_function::ServerlessFunction;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
     ResponseStreamAction, ResponseStreamInspector, ResponseStreamInspectorStage,
@@ -2599,15 +2603,12 @@ async fn test_ai_federation_rejects_streaming_without_marker() {
 
 #[tokio::test]
 async fn test_ai_federation_defers_to_claimed_stream_router_request() {
-    // With the coordination marker set, ai_federation immediately continues so
-    // ai_stream_router owns the streaming request.
+    // Drive a REAL claim rather than faking the public coordination marker:
+    // the private typed claim is what `ai_federation` decides on
+    // (`GHSA-xhp5-hqj8-3mwg`), so a marker-only fixture would no longer prove
+    // the composition.
     let fed = ai_federation_openai();
-    let body =
-        json!({"model": "gpt-4o", "stream": true, "messages": [{"role": "user", "content": "hi"}]});
-    let mut ctx = post_ctx(&body);
-    ctx.metadata
-        .insert("ai_stream_router_claimed".to_string(), "true".to_string());
-    let headers = json_headers();
+    let (mut ctx, headers) = claimed_provider_context(None).await;
     let res = run_federation_final_body(&fed, &mut ctx, &headers).await;
     assert!(
         matches!(res, PluginResult::Continue),
@@ -2668,6 +2669,346 @@ async fn test_end_to_end_composition_streaming_vs_non_streaming() {
         PluginResult::Continue
     ));
     assert!(!ctx2.metadata.contains_key("ai_stream_router_claimed"));
+}
+
+// ---------------------------------------------------------------------------
+// GHSA-xhp5-hqj8-3mwg — the PRIVATE claim, not the public marker, is what
+// makes a built-in stand down.
+//
+// `ai_stream_router_claimed` is a plain string in a mutable metadata map. Every
+// built-in that must not act on a provider-bound request now decides from
+// `RequestContext::has_ai_stream_router_claim()`, so deleting or rewriting the
+// marker after a real claim changes nothing.
+// ---------------------------------------------------------------------------
+
+/// How a later plugin might sabotage the public coordination marker.
+#[derive(Clone, Copy)]
+enum MarkerSabotage {
+    Removed,
+    RewrittenToFalse,
+    RewrittenToGarbage,
+}
+
+const MARKER_SABOTAGE_CASES: [MarkerSabotage; 3] = [
+    MarkerSabotage::Removed,
+    MarkerSabotage::RewrittenToFalse,
+    MarkerSabotage::RewrittenToGarbage,
+];
+
+/// Drive a REAL claim through `ai_stream_router`, then optionally sabotage the
+/// public marker exactly as a later plugin could.
+async fn claimed_provider_context(
+    sabotage: Option<MarkerSabotage>,
+) -> (RequestContext, HashMap<String, String>) {
+    let router = build(openai_and_anthropic_config());
+    let body = streaming_request("gpt-4o");
+    let mut ctx = post_ctx(&body);
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    let mut headers = json_headers();
+    assert!(matches!(
+        router.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_stream_router_claimed")
+            .map(String::as_str),
+        Some("true"),
+        "the observability marker should still be published for logs and \
+         third-party coordination"
+    );
+    match sabotage {
+        None => {}
+        Some(MarkerSabotage::Removed) => {
+            ctx.metadata.remove("ai_stream_router_claimed");
+        }
+        Some(MarkerSabotage::RewrittenToFalse) => {
+            ctx.metadata
+                .insert("ai_stream_router_claimed".to_string(), "false".to_string());
+        }
+        Some(MarkerSabotage::RewrittenToGarbage) => {
+            ctx.metadata.insert(
+                "ai_stream_router_claimed".to_string(),
+                "TRUE-but-not-the-literal".to_string(),
+            );
+        }
+    }
+    (ctx, headers)
+}
+
+/// The committed provider destination, so a routing built-in can be shown not
+/// to have moved it.
+fn committed_destination(ctx: &RequestContext) -> (Option<String>, Option<u16>, Option<String>) {
+    (
+        ctx.route_override_backend_host.clone(),
+        ctx.route_override_backend_port,
+        ctx.route_override_path.clone(),
+    )
+}
+
+#[tokio::test]
+async fn federation_ignores_a_sabotaged_claim_marker() {
+    let fed = ai_federation_openai();
+
+    // Non-vacuity: with no claim at all, this exact request IS acted on.
+    let body = streaming_request("gpt-4o");
+    let mut unclaimed = post_ctx(&body);
+    let headers = json_headers();
+    assert_eq!(
+        reject_status(&run_federation_final_body(&fed, &mut unclaimed, &headers).await),
+        Some(501),
+        "control: ai_federation acts on an unclaimed streaming request"
+    );
+
+    for sabotage in MARKER_SABOTAGE_CASES {
+        let (mut ctx, headers) = claimed_provider_context(Some(sabotage)).await;
+        assert!(
+            matches!(
+                run_federation_final_body(&fed, &mut ctx, &headers).await,
+                PluginResult::Continue
+            ),
+            "federation must stand down on a real claim regardless of the marker"
+        );
+    }
+}
+
+#[tokio::test]
+async fn request_mirror_ignores_a_sabotaged_claim_marker() {
+    fn mirror() -> RequestMirror {
+        RequestMirror::new(
+            &json!({
+                "mirror_host": "127.0.0.1",
+                "mirror_port": 1,
+                "mirror_protocol": "http",
+                "percentage": 100.0,
+                "mirror_request_body": false
+            }),
+            http_client(),
+        )
+        .expect("mirror config should be valid")
+    }
+
+    // Non-vacuity: an unclaimed request is dispatched to the shadow target.
+    let control = mirror();
+    let body = streaming_request("gpt-4o");
+    let mut unclaimed = post_ctx(&body);
+    unclaimed.matched_proxy = Some(Arc::new(create_test_proxy()));
+    let headers = json_headers();
+    let mut overlay = HashMap::new();
+    let _ = control
+        .dispatch_finalized_request_egress(&mut unclaimed, &headers, b"{}", &mut overlay)
+        .await;
+    let control_metrics =
+        ferrum_edge::_test_support::request_mirror_metrics_snapshot_for_test(&control);
+    assert_eq!(
+        control_metrics.dispatched, 1,
+        "control: an unclaimed request is mirrored"
+    );
+
+    for sabotage in MARKER_SABOTAGE_CASES {
+        let plugin = mirror();
+        let (mut ctx, headers) = claimed_provider_context(Some(sabotage)).await;
+        let mut overlay = HashMap::new();
+        assert!(matches!(
+            plugin
+                .dispatch_finalized_request_egress(&mut ctx, &headers, b"{}", &mut overlay)
+                .await,
+            PluginResult::Continue
+        ));
+        let metrics =
+            ferrum_edge::_test_support::request_mirror_metrics_snapshot_for_test(&plugin);
+        assert_eq!(
+            metrics.dispatched, 0,
+            "a provider-bound request must never be mirrored, whatever the marker says"
+        );
+    }
+}
+
+#[tokio::test]
+async fn serverless_function_ignores_a_sabotaged_claim_marker() {
+    fn serverless() -> ServerlessFunction {
+        ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": "https://example.invalid/func",
+                "forward_headers": ["Authorization"]
+            }),
+            http_client(),
+        )
+        .expect("serverless config should be valid")
+    }
+
+    for sabotage in MARKER_SABOTAGE_CASES {
+        let plugin = serverless();
+        let (mut ctx, headers) = claimed_provider_context(Some(sabotage)).await;
+        let mut overlay = HashMap::new();
+        assert!(matches!(
+            plugin
+                .dispatch_finalized_request_egress(&mut ctx, &headers, b"{}", &mut overlay)
+                .await,
+            PluginResult::Continue
+        ));
+        assert!(
+            !ctx.metadata
+                .keys()
+                .any(|key| key.starts_with("serverless_function")),
+            "the function must not be invoked for a provider-bound request"
+        );
+        assert!(
+            overlay.is_empty(),
+            "no backend header overlay may be published for a claimed request"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_gateway_ignores_a_sabotaged_claim_marker() {
+    // The MCP endpoint path deliberately equals the claimed request's path, so
+    // the plugin WOULD select this request if the claim were not decisive.
+    fn mcp() -> McpGateway {
+        McpGateway::new(
+            &json!({
+                "enabled": true,
+                "mode": "transparent_proxy",
+                "endpoint": {"path": "/v1/chat/completions"},
+                "servers": {
+                    "primary": {
+                        "upstream_url": "http://mcp.invalid/rpc",
+                        "namespace": "primary",
+                        "enabled": true
+                    }
+                }
+            }),
+            http_client(),
+        )
+        .expect("mcp_gateway config should be valid")
+    }
+
+    // Non-vacuity: the same endpoint selects an unclaimed request.
+    let control = mcp();
+    let body = streaming_request("gpt-4o");
+    let mut unclaimed = post_ctx(&body);
+    let mut control_headers = json_headers();
+    let _ = control
+        .before_proxy(&mut unclaimed, &mut control_headers)
+        .await;
+    assert!(
+        unclaimed
+            .metadata
+            .keys()
+            .any(|key| key.starts_with("mcp_gateway")),
+        "control: mcp_gateway selects this endpoint when there is no claim"
+    );
+
+    for sabotage in MARKER_SABOTAGE_CASES {
+        let plugin = mcp();
+        let (mut ctx, mut headers) = claimed_provider_context(Some(sabotage)).await;
+        let committed = committed_destination(&ctx);
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            committed_destination(&ctx),
+            committed,
+            "mcp_gateway must not repoint a request whose provider credential is \
+             already committed"
+        );
+        assert!(
+            !ctx.metadata.keys().any(|key| key.starts_with("mcp_gateway")),
+            "mcp_gateway must not even emit base metadata for a claimed request"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_ignores_a_sabotaged_claim_marker() {
+    fn mesh() -> MeshRouteDispatch {
+        MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["POST"]},
+                "destination": {"backend_host": "mesh.invalid", "backend_port": 8443}
+            }]
+        }))
+        .expect("mesh_route_dispatch config should be valid")
+    }
+
+    // Non-vacuity: the same rule repoints an unclaimed POST.
+    let control = mesh();
+    let body = streaming_request("gpt-4o");
+    let mut unclaimed = post_ctx(&body);
+    let mut control_headers = json_headers();
+    let control_result = control
+        .before_proxy(&mut unclaimed, &mut control_headers)
+        .await;
+    assert!(matches!(control_result, PluginResult::Continue));
+    assert_eq!(
+        unclaimed.route_override_backend_host.as_deref(),
+        Some("mesh.invalid"),
+        "control: mesh_route_dispatch repoints an unclaimed POST"
+    );
+
+    for sabotage in MARKER_SABOTAGE_CASES {
+        let plugin = mesh();
+        let (mut ctx, mut headers) = claimed_provider_context(Some(sabotage)).await;
+        let committed = committed_destination(&ctx);
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            committed_destination(&ctx),
+            committed,
+            "mesh_route_dispatch must not move a provider-bound request"
+        );
+        assert_ne!(
+            ctx.route_override_backend_host.as_deref(),
+            Some("mesh.invalid"),
+            "the committed provider destination must survive the sabotaged marker"
+        );
+    }
+}
+
+#[tokio::test]
+async fn intentional_pass_through_still_coordinates_through_metadata() {
+    // An UNCLAIMED pass-through is a genuinely different state: there is no
+    // private claim to read, so the public `ai_stream_router_pass_through` key
+    // remains the coordination signal and must keep working.
+    let router = build(pass_through_config());
+    let body = streaming_request("unmatched-model");
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        router.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_stream_router_pass_through")
+            .map(String::as_str),
+        Some("true"),
+        "an unclaimed pass-through must still publish its coordination marker"
+    );
+    assert!(
+        !ferrum_edge::_test_support::request_has_ai_stream_router_claim_for_test(&ctx),
+        "pass-through must not record a private claim"
+    );
+
+    let fed = ai_federation_openai();
+    assert!(
+        matches!(
+            run_federation_final_body(&fed, &mut ctx, &headers).await,
+            PluginResult::Continue
+        ),
+        "ai_federation must still defer to an explicit pass-through"
+    );
+}
+
+fn pass_through_config() -> Value {
+    let mut config = openai_and_anthropic_config();
+    config["fail_on_no_matching_provider"] = json!(false);
+    config["fail_on_missing_model"] = json!(false);
+    config
 }
 
 // ---------------------------------------------------------------------------
