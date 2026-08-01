@@ -723,6 +723,7 @@ fn charge_retained_copy_against(budget: &Budget, data: &[u8]) -> Option<Bytes> {
 /// [`ResponseTransformWindow`] exists to close: production reserves the window
 /// first and TRANSFERS blocks into the finished allocation with
 /// [`ResponseBufferReservation::split_charge`].
+#[allow(dead_code)] // used only by external tests via IsolatedBudget; dead in binary unit
 fn charge_owned_allocation_against(budget: &Budget, data: Vec<u8>) -> Option<Bytes> {
     if data.is_empty() {
         return Some(Bytes::new());
@@ -975,6 +976,7 @@ impl<'a> ResponseTransformWindow<'a> {
     /// rather than merely impossible to install: the sink refuses the write that
     /// would carry the buffer past the ceiling, so the larger allocation is
     /// never requested from the allocator in the first place.
+    #[allow(dead_code)] // reached via `_test_support` from the external test crate
     pub(crate) fn sink(&self) -> BoundedResponseBodySink {
         BoundedResponseBodySink::with_ceiling(self.window_bytes)
     }
@@ -1075,6 +1077,7 @@ impl BoundedResponseBodySink {
     /// External tests observe this so they can pin that a successful write never
     /// leaves `capacity() > ceiling()`, without inventing allocator assumptions
     /// about when `reserve_exact` over-returns.
+    #[allow(dead_code)] // reached via `_test_support` from the external test crate
     pub(crate) fn capacity(&self) -> usize {
         self.data.capacity()
     }
@@ -1273,6 +1276,9 @@ pub(crate) fn bounded_vec_from(bytes: &[u8], ceiling: usize) -> Option<Vec<u8>> 
 /// implementation of the rules.
 pub(crate) struct IsolatedBudget(Budget);
 
+/// External tests bind this through [`crate::_test_support::ResponseBufferBudgetProbe`];
+/// the separately compiled binary unit has no caller.
+#[allow(dead_code)]
 impl IsolatedBudget {
     pub(crate) fn new(fallback_per_response_bytes: usize, total_bytes: usize) -> Self {
         Self(Budget::new(fallback_per_response_bytes, total_bytes))

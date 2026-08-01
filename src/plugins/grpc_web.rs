@@ -2584,6 +2584,7 @@ pub(crate) enum SyncTranslatedTrailerOutcome {
 /// [`crate::proxy::store_charged_grpc_web_reframed_body`], which reserves a real
 /// transform window and publishes only a sink-built replacement
 /// (GHSA-pwcm-6rh8-f2gh).
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn sync_translated_body_trailer_frame_from_trailers(
     body: &mut Vec<u8>,
     content_type: Option<&str>,

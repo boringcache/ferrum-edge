@@ -6858,7 +6858,8 @@ async fn origin_selected_sse_streams_under_every_non_store_header_condition() {
     let _policy_guard = response_cache_replay_policy_guard();
 
     // (label, extra response headers, whether this case must also evict)
-    let cases: Vec<(&str, Vec<(&str, &str)>, bool)> = vec![
+    type SseHeaderCase<'a> = (&'a str, Vec<(&'a str, &'a str)>, bool);
+    let cases: Vec<SseHeaderCase<'_>> = vec![
         (
             "plain cacheable",
             vec![("cache-control", "public, max-age=60")],

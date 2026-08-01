@@ -2046,7 +2046,7 @@ fn an_output_larger_than_the_window_is_refused_while_it_is_written() {
     let budget = probe(16);
     let total = budget.available_bytes();
 
-    let mut window = budget.transform_window(UNIT).expect("the window admits");
+    let window = budget.transform_window(UNIT).expect("the window admits");
     let mut sink = window.sink();
     assert_eq!(sink.ceiling(), UNIT, "the sink is sized to the window");
 
