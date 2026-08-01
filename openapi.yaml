@@ -373,6 +373,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: importAcmeCertificate
       summary: Import an ACME-issued certificate and private key
@@ -403,6 +405,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/acme/certificates/{id}:
     get:
@@ -424,6 +428,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateAcmeCertificate
       summary: Replace an ACME-issued certificate and private key
@@ -453,6 +459,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "408":
           $ref: "#/components/responses/RequestTimeout"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteAcmeCertificate
       summary: Delete an unreferenced ACME-issued TLS certificate
@@ -470,6 +478,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/acme/orders:
     get:
@@ -500,6 +510,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createAcmeOrder
       summary: Create an ACME HTTP-01, TLS-ALPN-01, or DNS-01 order
@@ -538,6 +550,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "501":
           $ref: "#/components/responses/NotImplemented"
 
@@ -549,6 +563,10 @@ paths:
         Lists non-secret ACME account metadata discovered from persisted
         ACME account credentials, orders, and certificates. Account credentials
         are never returned.
+
+        An empty list means the shared stores hold no accounts. A store that
+        cannot be opened, read, or parsed returns `500` instead: an unreachable
+        account store is never reported as "no persisted credentials".
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/PaginationLimit"
@@ -566,6 +584,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/acme/renew/{id}:
     post:
@@ -608,6 +628,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "501":
           $ref: "#/components/responses/NotImplemented"
 
@@ -631,6 +653,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteAcmeOrder
       summary: Delete an ACME order and stop serving its challenges
@@ -646,16 +670,30 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/acme/orders/{id}/finalize:
     post:
       operationId: finalizeAcmeOrder
       summary: Finalize an ACME HTTP-01, TLS-ALPN-01, or DNS-01 order
       description: |
-        Marks the order's prepared HTTP-01, TLS-ALPN-01, or DNS-01 challenges ready,
-        waits for the ACME directory to accept the authorizations, finalizes
-        the order, fetches the issued certificate, and stores it as an
-        `acme://certificates/{id}` record. The endpoint requires the optional
+        Drives the order from whatever state the ACME directory currently reports
+        it in, and stores the issued certificate as an `acme://certificates/{id}`
+        record. A `pending` order validates each challenge endpoint, notifies only
+        challenges that are still `pending` (leaving `processing`/`valid`
+        challenges alone and failing closed on `invalid`), and is polled to
+        `ready`; a `ready` order is
+        finalized exactly once with the CSR generated when the order was created;
+        a `processing` or `valid` order is **not** finalized again — its
+        certificate is retrieved and paired with the private key persisted at
+        creation time. An `invalid` order fails closed. An order whose persisted
+        key/CSR material is missing or unusable is rejected with `400` before any
+        directory request using a fixed response that never describes the material.
+        Usability requires exactly one parseable private key PEM record, a complete
+        CSR DER whose signature verifies, matching private-key/CSR public keys, and
+        a CSR DNS SAN set that exactly matches the order domains. The endpoint
+        requires the optional
         `acme` Cargo feature and returns `501 Not Implemented` without it.
         Persisted order and server-provided authorization, challenge, finalize,
         and certificate URLs remain subject to the directory's HTTPS same-origin
@@ -689,10 +727,12 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
-        "502":
-          $ref: "#/components/responses/BadGateway"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "501":
           $ref: "#/components/responses/NotImplemented"
+        "502":
+          $ref: "#/components/responses/BadGateway"
 
   /admin/tls/certificates:
     get:
@@ -715,6 +755,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createManagedTlsCertificate
       summary: Upload an admin-managed TLS certificate and private key
@@ -747,6 +789,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/certificates/{id}:
     get:
@@ -770,6 +814,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateManagedTlsCertificate
       summary: Rotate an admin-managed TLS certificate and private key
@@ -807,6 +853,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteManagedTlsCertificate
       summary: Delete an unreferenced admin-managed TLS certificate
@@ -826,6 +874,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/ca-bundles:
     get:
@@ -848,6 +898,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createManagedTlsCaBundle
       summary: Upload an admin-managed TLS CA bundle
@@ -879,6 +931,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/ca-bundles/{id}:
     get:
@@ -902,6 +956,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateManagedTlsCaBundle
       summary: Rotate an admin-managed TLS CA bundle
@@ -937,6 +993,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteManagedTlsCaBundle
       summary: Delete an unreferenced admin-managed TLS CA bundle
@@ -956,6 +1014,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/crls:
     get:
@@ -978,6 +1038,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createManagedTlsCrl
       summary: Upload an admin-managed TLS CRL bundle
@@ -1009,6 +1071,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/crls/{id}:
     get:
@@ -1032,6 +1096,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateManagedTlsCrl
       summary: Rotate an admin-managed TLS CRL bundle
@@ -1065,6 +1131,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteManagedTlsCrl
       summary: Delete an unreferenced admin-managed TLS CRL bundle
@@ -1084,6 +1152,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/ocsp-responses:
     get:
@@ -1106,6 +1176,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createManagedTlsOcspResponse
       summary: Upload an admin-managed DER OCSP response
@@ -1137,6 +1209,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/ocsp-responses/{id}:
     get:
@@ -1160,6 +1234,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateManagedTlsOcspResponse
       summary: Rotate an admin-managed DER OCSP response
@@ -1193,6 +1269,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteManagedTlsOcspResponse
       summary: Delete an unreferenced admin-managed OCSP response
@@ -1212,6 +1290,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/jwks:
     get:
@@ -1234,6 +1314,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createManagedTlsJwks
       summary: Upload an admin-managed JWKS document
@@ -1265,6 +1347,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/jwks/{id}:
     get:
@@ -1288,6 +1372,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateManagedTlsJwks
       summary: Rotate an admin-managed JWKS document
@@ -1321,6 +1407,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteManagedTlsJwks
       summary: Delete an unreferenced admin-managed JWKS document
@@ -1340,6 +1428,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/rotate/{surface}:
     post:
@@ -13891,7 +13981,9 @@ components:
 
         Unknown top-level keys are rejected. Present values must match their
         declared types (`enabled` boolean, `quiet_hours_utc` array,
-        `max_concurrent_dispatches` integer >= 1). The `channels` map remains
+        `max_concurrent_dispatches` integer >= 1, `max_delivery_retries`
+        integer 0..=8, `delivery_retry_base_ms` / `delivery_retry_max_ms`
+        integers in [10, 60000]). The `channels` map remains
         open for arbitrary channel names; each channel/rule variant is closed
         to its selected shape. Rules may also be `enabled: false` drafts.
       additionalProperties: false
@@ -13934,6 +14026,31 @@ components:
           minimum: 1
           default: 8
           description: Maximum concurrent outbound notification requests. Excess alerts are dropped, not queued.
+        max_delivery_retries:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 8
+          default: 2
+          description: |
+            Number of re-attempts after the initial send for transient
+            transport/HTTP failures (408/429/5xx and connect/timeout errors).
+            Retries hold the dispatch semaphore permit and never enqueue extra
+            work. Permanent failures (other 4xx) are not retried.
+        delivery_retry_base_ms:
+          type: integer
+          format: uint32
+          minimum: 10
+          maximum: 60000
+          default: 100
+          description: Initial jittered backoff delay between transient delivery retries.
+        delivery_retry_max_ms:
+          type: integer
+          format: uint32
+          minimum: 10
+          maximum: 60000
+          default: 2000
+          description: Upper bound for exponential jittered backoff between transient delivery retries. Must be >= delivery_retry_base_ms.
         quiet_hours_utc:
           type: array
           default: []
@@ -13970,6 +14087,9 @@ components:
         default_window_seconds: 60
         default_resolved_window_seconds: 300
         max_concurrent_dispatches: 8
+        max_delivery_retries: 2
+        delivery_retry_base_ms: 100
+        delivery_retry_max_ms: 2000
         quiet_hours_utc:
           - from: "23:00"
             to: "06:00"
@@ -16028,12 +16148,16 @@ components:
                   Per-rule request header transforms (Istio VirtualService
                   `http[].headers.request.{set,add,remove}`). Published onto
                   `RequestContext.route_override_request_transform` when this
-                  rule matches; consumed by the `request_transformer` plugin
-                  on the proxy when its `apply_route_overrides` flag is true.
-                  Route-level transforms layer AFTER the static plugin rules,
-                  so route-level header writes win on conflict. Validated at
-                  config load — CRLF in values and unknown operations are
-                  rejected.
+                  rule matches. Every enabled `request_transformer` on the
+                  proxy applies only its static header rules first; proxy core
+                  then applies this list exactly once after the last eligible
+                  (enabled) instance so route-level header writes win under
+                  multiple same-type instances and priority overrides. A
+                  disabled RTDS transformer is not eligible and does not
+                  consume the list. `apply_route_overrides: true` lets an
+                  auto-emitted empty-rules instance act as that eligible
+                  consumer. Validated at config load — CRLF in values and
+                  unknown operations are rejected.
                 items:
                   type: object
                   additionalProperties: false
@@ -16076,8 +16200,11 @@ components:
                 description: |
                   Per-rule response header transforms (Istio VirtualService
                   `http[].headers.response.{set,add,remove}`). Same shape as
-                  `request_transform` but applied on the response path via
-                  the `response_transformer` plugin.
+                  `request_transform` but applied on the response path: every
+                  enabled `response_transformer` applies static header rules
+                  first, then proxy core applies this list exactly once after
+                  the last eligible instance (ordinary H1/H2/H3, synthetic/
+                  rejection, header simulation, and deadline provenance paths).
 
                   Because this publishes onto the `response_transformer`
                   write surface, it shares that plugin's closed destination
@@ -17937,11 +18064,14 @@ components:
         rejected. Every rule must set an explicit `target` (`header`,
         `query`, or `body`); there is no default.
 
-        When `apply_route_overrides: true`, the plugin also consumes per-rule
-        header transforms published by `mesh_route_dispatch` onto
-        `RequestContext.route_override_request_transform`. Static `rules`
-        run first, then per-rule overrides — route-level header writes win
-        on conflict. The Istio VirtualService translator auto-emits a
+        When `apply_route_overrides: true`, the plugin accepts an empty `rules`
+        array so it can participate in the chain-level route-header final
+        phase for per-rule transforms published by `mesh_route_dispatch` onto
+        `RequestContext.route_override_request_transform`. Every enabled
+        instance applies only its static `rules` first; proxy core then applies
+        the matched route list exactly once after the last eligible instance —
+        route-level header writes win under multiple same-type instances and
+        priority overrides. The Istio VirtualService translator auto-emits a
         proxy-scoped instance with `rules: []` + `apply_route_overrides: true`
         on routes that carry `headers.request.{set,add,remove}` and have no
         operator-configured `request_transformer`. Operators with a global
@@ -17969,12 +18099,12 @@ components:
           default: false
           description: |
             When `true`, this instance accepts an empty `rules` array and
-            consumes per-rule header transforms published by
-            `mesh_route_dispatch` on the matching route. The plugin declares
-            `modifies_request_headers() == true` so the dispatcher allocates
-            a separate cloned header map for route-level writes (preserving
-            the gateway invariant that `ctx.headers` carries the original
-            inbound headers during `before_proxy`). Auto-emitted by the
+            participates in the chain-level request route-header finalization
+            phase for transforms published by `mesh_route_dispatch`. The plugin
+            declares `modifies_request_headers() == true` so the dispatcher
+            allocates a separate cloned header map for route-level writes
+            (preserving the gateway invariant that `ctx.headers` carries the
+            original inbound headers during `before_proxy`). Auto-emitted by the
             Istio VirtualService translator.
         runtime_overlay_scope:
           type: string
@@ -18145,10 +18275,13 @@ components:
         `body` only — unlike request_transformer, there is no `query`
         target.
 
-        When `apply_route_overrides: true`, the plugin consumes per-rule
-        header transforms published by `mesh_route_dispatch` onto
-        `RequestContext.route_override_response_transform`. See the
-        `request_transformer` notes on shadowing of operator-configured
+        When `apply_route_overrides: true`, the plugin accepts an empty `rules`
+        array so it can participate in the chain-level response route-header
+        final phase for transforms published by `mesh_route_dispatch` onto
+        `RequestContext.route_override_response_transform`. Every enabled
+        instance applies only its static rules first; proxy core then applies
+        the matched route list exactly once after the last eligible instance.
+        See the `request_transformer` notes on shadowing of operator-configured
         globals — the same applies on the response side.
       properties:
         rules:
@@ -18167,9 +18300,11 @@ components:
           default: false
           description: |
             Counterpart to `request_transformer.apply_route_overrides` for
-            response headers. Auto-emitted by the Istio VirtualService
-            translator on routes carrying `headers.response.{set,add,remove}`
-            that have no operator-configured `response_transformer`.
+            response headers: accept empty `rules` and remain eligible for the
+            chain-level route-header finalization phase. Auto-emitted by the
+            Istio VirtualService translator on routes carrying
+            `headers.response.{set,add,remove}` that have no operator-configured
+            `response_transformer`.
         runtime_overlay_scope:
           type: string
           minLength: 1
@@ -18704,12 +18839,19 @@ components:
           default: log_and_allow
         on_body_too_large:
           type: string
-          enum: [scan_truncated, skip, block]
-          default: scan_truncated
+          enum: [fail_closed, scan_truncated, skip, block]
+          default: fail_closed
           description: >-
-            Behavior when a body exceeds max_scan_bytes. scan_truncated scans
-            the prefix; skip scans nothing; block rejects (fail closed) when
-            mode is enforce, otherwise scans the prefix.
+            Behavior when a governed body exceeds max_scan_bytes. fail_closed
+            (default) rejects when that direction has an applicable enforcing
+            body rule or anomaly scoring with an applicable body rule, and
+            otherwise scans the prefix and records truncation, so monitor-only
+            or conditionally out-of-scope policy never starts blocking.
+            scan_truncated is the explicit compatibility opt-out that always
+            scans only the prefix and forwards the complete body — prefix-only
+            inspection lets a padded suffix carry blocked content past an
+            enforcing rule. skip scans nothing. block rejects every oversize
+            governed body while mode is enforce, otherwise scans the prefix.
         include_default_rules:
           type: boolean
           default: true
@@ -19237,7 +19379,23 @@ components:
         decoded protobuf messages must satisfy proto2 required-field
         initialization. Configuration errors use value-free field and category
         messages; supplied keys, paths, URIs, schema values, XML entries, and
-        compiler diagnostics are not reproduced.
+        compiler diagnostics are not reproduced. Applicability follows the
+        configured representation, never the request method: any request whose
+        Content-Type matches content_types (or is application/grpc for protobuf
+        configs) is buffered and validated, including GET, HEAD, OPTIONS,
+        DELETE, PUT, PATCH, and non-standard methods. Once a configured rule
+        applies, an empty, absent, or non-UTF-8 representation fails closed
+        (400 request, 502 response) instead of being skipped, and native gRPC
+        always runs frame validation. The only exemptions are protocol-defined:
+        empty terminal gRPC error replies (a single valid non-zero grpc-status),
+        and responses that carry no content by status/method semantics (1xx,
+        204, 205, 304, and responses to HEAD). Early before_proxy inspection
+        prefers a rewritten UTF-8 request_body metadata view when present,
+        falls back to raw buffered bytes when no text view exists, then the
+        transport-proven-empty witness, and otherwise fails closed; the final
+        request-body hook validates the exact backend-visible bytes.
+        Representation-gap diagnostics are fixed strings and never echo body
+        bytes.
       properties:
         json_schema:
           type: object
@@ -19600,7 +19758,18 @@ components:
           type: integer
           format: uint64
           default: 1024
-          description: Maximum validation-error characters written to metadata and problem bodies.
+          description: >
+            Size bound on the validation diagnostic written to
+            openapi_validator.request_error / openapi_validator.response_error
+            metadata and to the problem body. Only ever narrows: the effective
+            cap is min(error_truncate_chars, 256). This is not a
+            confidentiality control. Diagnostics are payload-free by
+            construction and never contain the rejected instance value, an
+            expected enum/const constant, a raw schema path or schema-library
+            / XML-parser rendering, a configured XML name or namespace, a
+            hostile Content-Encoding coding token, a backend Content-Type, the
+            request target, or a payload-chosen JSON/XML/form/multipart member
+            name.
 
     OpenapiValidatorJsonSchema:
       type: [object, boolean]
@@ -22221,7 +22390,7 @@ components:
     AiRateLimiterConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_rate_limiter — HTTP-only token-aware rate limiting for LLM APIs. Native gRPC is unsupported (not registered for the Grpc protocol view): protobuf message frames have no supported usage schema, so an attachment there would never charge the budget. Framed gRPC-Web bodies are likewise never classified as JSON AI traffic and are never charged as zero usage. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
+      description: "Plugin: ai_rate_limiter — HTTP-only token-aware rate limiting for LLM APIs. Native gRPC is unsupported (not registered for the Grpc protocol view): protobuf message frames have no supported usage schema, so an attachment there would never charge the budget. Framed gRPC-Web bodies are likewise never classified as JSON AI traffic and are never charged as zero usage. Pre-dispatch prompt estimates walk the request JSON once, counting billable string values, visited object member names (including tool/function schema property names), and JSON scalar literals at serialized width so a present recognized field cannot suppress unknown billed text; exclusions are path/context aware (unsigned numeric output caps only at the exact paths also read for completion-budget reservation — negative/fractional values count fail-closed; multimodal URL/base64/file leaves only inside matching provider content-part family and part type — member names and unrelated textual siblings still count; wrong-family/malformed parts and ordinary strings including data: URLs in instructions/schemas always count). The estimate is a conservative chars/4 heuristic, not provider tokenizer parity. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
       required: [token_limit]
       properties:
         token_limit:

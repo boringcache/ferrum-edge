@@ -1834,6 +1834,10 @@ impl Plugin for MeshRouteDispatch {
             .any(|rule| rule.rewrite.as_ref().is_some_and(|r| r.authority.is_some()))
     }
 
+    fn modifies_request_destination(&self) -> bool {
+        true
+    }
+
     fn enable_deferred_unmatched_rejection(&self) {
         self.aggregate_reject_unmatched
             .store(true, Ordering::Relaxed);
@@ -1844,11 +1848,13 @@ impl Plugin for MeshRouteDispatch {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if ctx
-            .metadata
-            .get("ai_stream_router_claimed")
-            .is_some_and(|value| value == "true")
-        {
+        // Read the PRIVATE typed claim, not the public
+        // `ai_stream_router_claimed` metadata key: mesh dispatch rewrites
+        // `route_override_*`, so a later plugin deleting that observability
+        // marker must not be able to move a request whose provider credential
+        // is already committed onto a different backend
+        // (`GHSA-xhp5-hqj8-3mwg`).
+        if ctx.has_ai_stream_router_claim() {
             return PluginResult::Continue;
         }
         // Query predicates select a backend, so they are a security decision.

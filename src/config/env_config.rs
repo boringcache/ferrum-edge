@@ -12,6 +12,10 @@
 use super::conf_file::ConfFile;
 use super::db_backend::redact_url;
 use crate::ebpf::NodeAgentProxyMode;
+use crate::k8s_controller::watcher::{
+    K8S_WATCH_IDLE_RELIST_SECS_DEFAULT, K8S_WATCH_IDLE_RELIST_SECS_MAX,
+    K8S_WATCH_IDLE_RELIST_SECS_MIN,
+};
 use crate::plugins::utils::fault_delay::DEFAULT_MAX_CONCURRENT_FAULT_DELAYS;
 use crate::tls::inventory_cache::DEFAULT_SNAPSHOT_TTL_SECONDS;
 use crate::util::cidr::CidrSet;
@@ -27,6 +31,83 @@ pub const DEFAULT_TLS_MANAGED_STORE_PATH: &str = "./ferrum-managed-tls";
 pub fn tls_managed_store_path_from_env() -> String {
     crate::config::conf_file::resolve_ferrum_var("FERRUM_TLS_MANAGED_STORE_PATH")
         .unwrap_or_else(|| DEFAULT_TLS_MANAGED_STORE_PATH.to_string())
+}
+
+/// Default bound on waiting for the shared managed-TLS/ACME store lock.
+pub const DEFAULT_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 10;
+/// Settings key for that bound.
+pub const TLS_STORE_LOCK_TIMEOUT_KEY: &str = "FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS";
+const MIN_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 1;
+const MAX_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 120;
+
+/// How long a managed TLS / ACME store mutation waits for the cross-instance
+/// advisory lock before failing closed (`FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`).
+///
+/// Read directly rather than through `EnvConfig` because the stores are opened
+/// lazily by the admin API, the `managed://` / `acme://` source loaders, and the
+/// renewal scheduler — all of which can run before or without a full
+/// `EnvConfig`.
+///
+/// # Absent, clamped, and malformed are three different things
+///
+/// * **Absent** — the key appears in neither the environment nor `ferrum.conf` —
+///   selects [`DEFAULT_TLS_STORE_LOCK_TIMEOUT_SECONDS`]. That is the documented
+///   default, not a fallback from a failure.
+/// * **A valid number outside the supported range** is clamped to
+///   `[1, 120]` seconds, which is the documented contract for this setting: the
+///   operator asked for a bound and gets the nearest supported one.
+/// * **A malformed value** — anything present that is not a whole number of
+///   seconds, blank included — is an **error**. Quietly substituting the
+///   default here would make a documented availability/security control lie: an
+///   operator who set `30s`, `sixty`, or nothing at all after the `=` would be
+///   told nothing and would run on a 10-second bound they never chose. A
+///   configured-but-unusable value is surfaced wherever the shared store is
+///   opened and fails that open closed.
+///
+/// The error names the variable and the rule, never the configured value:
+/// external-secret suffixes apply to every `FERRUM_*` key, so the value must
+/// not be echoed into a diagnostic (`secrets::is_external_secret_key`).
+pub fn tls_store_lock_timeout_from_env() -> Result<std::time::Duration, String> {
+    parse_tls_store_lock_timeout(
+        crate::config::conf_file::resolve_ferrum_var(TLS_STORE_LOCK_TIMEOUT_KEY).as_deref(),
+    )
+}
+
+/// The parsing/validation half of [`tls_store_lock_timeout_from_env`], split out
+/// from the environment read.
+///
+/// `None` is "the key is configured nowhere". Keeping the decision pure is what
+/// lets the three-outcome contract above be tested exhaustively without any
+/// test mutating a process-wide `FERRUM_*` variable that concurrently running
+/// store-open tests in the same binary would read.
+pub fn parse_tls_store_lock_timeout(raw: Option<&str>) -> Result<std::time::Duration, String> {
+    let seconds = match raw {
+        None => DEFAULT_TLS_STORE_LOCK_TIMEOUT_SECONDS,
+        Some(value) => value.trim().parse::<u64>().map_err(|_| {
+            format!(
+                "{TLS_STORE_LOCK_TIMEOUT_KEY} must be a whole number of seconds; \
+                 the configured value is not"
+            )
+        })?,
+    };
+    Ok(std::time::Duration::from_secs(seconds.clamp(
+        MIN_TLS_STORE_LOCK_TIMEOUT_SECONDS,
+        MAX_TLS_STORE_LOCK_TIMEOUT_SECONDS,
+    )))
+}
+
+/// Operator-pinned identity for this instance's shared TLS store leases
+/// (`FERRUM_TLS_STORE_INSTANCE_ID`).
+///
+/// Returned **verbatim**: `tls::lease` validates it and fails closed on an
+/// empty, overlong, or otherwise unusable value. Trimming or filtering here
+/// would be a silent normalization, and normalizing two distinct configured
+/// identities onto one is precisely what lets two replicas collide on a single
+/// renewal claim. A setting that is simply absent yields `None`, which selects
+/// the always-distinct generated identity.
+pub fn tls_store_instance_id_from_env() -> Option<String> {
+    let key = "FERRUM_TLS_STORE_INSTANCE_ID";
+    crate::config::conf_file::resolve_ferrum_var(key)
 }
 
 /// SQL connection target for secondary consumers that must track the gateway
@@ -983,6 +1064,14 @@ pub struct EnvConfig {
     /// Seconds to wait after DNS-01 hook publication before marking the ACME
     /// challenge ready.
     pub acme_dns01_propagation_seconds: u64,
+    /// Lifetime of the shared per-certificate ACME renewal lease that makes one
+    /// instance the single renewer for a given certificate. The holder
+    /// heartbeats the claim every third of this value for as long as the
+    /// renewal runs, so it does **not** have to cover a whole order/finalize
+    /// cycle — only one heartbeat interval plus scheduling slack. What it does
+    /// set is how long a *crashed* holder's certificate stays unrenewable
+    /// before another instance takes over. Default: 900.
+    pub acme_renewal_lease_ttl_seconds: u64,
     /// When true, streaming responses are wrapped with a lightweight tracker
     /// that records the final transfer time via a deferred task. Adds one
     /// `Arc<StreamingMetrics>` + one `tokio::spawn` per streaming request.
@@ -1609,9 +1698,18 @@ pub struct EnvConfig {
     /// arriving within this window are batched into a single reconciliation.
     /// Default: 500.
     pub k8s_reconcile_debounce_ms: u64,
-    /// Periodic full re-list interval in seconds. Safety valve against missed
-    /// watch events. Default: 300 (5 minutes).
+    /// Periodic re-reconcile interval in seconds. Re-translates whatever the
+    /// reflector stores currently hold; it does NOT re-list Kubernetes, so it
+    /// cannot recover objects a stalled watch never delivered — see
+    /// `k8s_watch_idle_relist_secs` for that. Default: 300 (5 minutes).
     pub k8s_full_sync_interval_secs: u64,
+    /// Rebuild a watch scope's reflector from an authoritative Kubernetes list
+    /// once it has delivered no event for this many seconds. Bounds how long a
+    /// watch that stalls without failing (kube-rs surfaces an error only when
+    /// the watch *fails*) can hide objects from every reconcile. `0` disables
+    /// it. Clamped to `0..=86_400`, since the window is doubled and added to an
+    /// `Instant` at runtime. Default: 300.
+    pub k8s_watch_idle_relist_secs: u64,
     /// Enable watching Istio CRDs (security.istio.io, networking.istio.io,
     /// telemetry.istio.io). Default: true.
     pub k8s_watch_istio_crds: bool,
@@ -2508,6 +2606,7 @@ impl Default for EnvConfig {
             acme_renew_poll_timeout_seconds: 60,
             acme_dns01_hook_command: None,
             acme_dns01_propagation_seconds: 60,
+            acme_renewal_lease_ttl_seconds: 900,
             enable_streaming_latency_tracking: false,
             proxy_http_port: 8000,
             proxy_https_port: 8443,
@@ -2635,6 +2734,7 @@ impl Default for EnvConfig {
             k8s_kubeconfig_path: None,
             k8s_reconcile_debounce_ms: 500,
             k8s_full_sync_interval_secs: 300,
+            k8s_watch_idle_relist_secs: K8S_WATCH_IDLE_RELIST_SECS_DEFAULT,
             k8s_watch_istio_crds: true,
             k8s_watch_mesh_config: true,
             k8s_watch_gateway_api_crds: true,
@@ -2866,6 +2966,7 @@ impl EnvConfig {
             acme_renew_poll_timeout_seconds: u64 = "FERRUM_ACME_RENEW_POLL_TIMEOUT_SECONDS" => 60u64, clamp(1u64, 600u64);
             acme_dns01_hook_command: Option<String> = "FERRUM_ACME_DNS01_HOOK_COMMAND";
             acme_dns01_propagation_seconds: u64 = "FERRUM_ACME_DNS01_PROPAGATION_SECONDS" => 60u64, clamp(0u64, 3600u64);
+            acme_renewal_lease_ttl_seconds: u64 = "FERRUM_ACME_RENEWAL_LEASE_TTL_SECONDS" => 900u64, clamp(60u64, 7_200u64);
             enable_streaming_latency_tracking: bool = "FERRUM_ENABLE_STREAMING_LATENCY_TRACKING" => false;
         }
         let log_buffer_bytes = log_buffer_bytes.max(log_max_record_bytes);
@@ -3075,6 +3176,7 @@ impl EnvConfig {
             k8s_kubeconfig_path: Option<String> = "FERRUM_K8S_KUBECONFIG_PATH";
             k8s_reconcile_debounce_ms: u64 = "FERRUM_K8S_RECONCILE_DEBOUNCE_MS" => 500u64;
             k8s_full_sync_interval_secs: u64 = "FERRUM_K8S_FULL_SYNC_INTERVAL_SECS" => 300u64;
+            k8s_watch_idle_relist_secs: u64 = "FERRUM_K8S_WATCH_IDLE_RELIST_SECS" => K8S_WATCH_IDLE_RELIST_SECS_DEFAULT, clamp(K8S_WATCH_IDLE_RELIST_SECS_MIN, K8S_WATCH_IDLE_RELIST_SECS_MAX);
             k8s_watch_istio_crds: bool = "FERRUM_K8S_WATCH_ISTIO_CRDS" => true;
             k8s_watch_mesh_config: bool = "FERRUM_K8S_WATCH_MESH_CONFIG" => true;
             k8s_watch_gateway_api_crds: bool = "FERRUM_K8S_WATCH_GATEWAY_API_CRDS" => true;
@@ -3631,6 +3733,7 @@ impl EnvConfig {
             acme_renew_poll_timeout_seconds,
             acme_dns01_hook_command,
             acme_dns01_propagation_seconds,
+            acme_renewal_lease_ttl_seconds,
             enable_streaming_latency_tracking,
             proxy_http_port,
             proxy_https_port,
@@ -3755,6 +3858,7 @@ impl EnvConfig {
             k8s_kubeconfig_path,
             k8s_reconcile_debounce_ms,
             k8s_full_sync_interval_secs,
+            k8s_watch_idle_relist_secs,
             k8s_watch_istio_crds,
             k8s_watch_mesh_config,
             k8s_watch_gateway_api_crds,

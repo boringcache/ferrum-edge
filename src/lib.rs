@@ -767,6 +767,19 @@ pub mod _test_support {
         (transformed, result)
     }
 
+    /// Run the shared final backend-header-policy pass exactly as every dispatch
+    /// ladder does: after all `before_proxy` header transforms, over the
+    /// finalized backend-visible header map (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// `plugins` must already be sorted by effective priority.
+    pub fn run_final_backend_header_policy_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::run_final_backend_header_policy_hooks(plugins, ctx, headers);
+    }
+
     pub async fn run_context_free_final_request_body_hooks_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
@@ -1228,6 +1241,19 @@ pub mod _test_support {
         plugin.mirror_metrics_snapshot_for_test()
     }
 
+    // ── plugins/ai_stream_router ─────────────────────────────────────────────
+    /// Whether an `ai_stream_router` instance successfully claimed this request.
+    ///
+    /// Exposes only the EXISTENCE of the private claim, never its owner, model,
+    /// destination, TLS, DNS decision, query, or credential
+    /// (`GHSA-xhp5-hqj8-3mwg`). Tests use it to distinguish a real claim from
+    /// the public observability marker.
+    pub fn request_has_ai_stream_router_claim_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.has_ai_stream_router_claim()
+    }
+
     // ── plugins/api_chargeback_sink ──────────────────────────────────────────
     pub fn api_chargeback_sink_snapshot_accumulator_for_test(
         plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
@@ -1327,6 +1353,24 @@ pub mod _test_support {
         plugin.compact_excluded_by_emission_lock_for_tests(hold)
     }
 
+    // ── plugins/load_testing ─────────────────────────────────────────────────
+    /// Construct through the identity-aware production path so a test can
+    /// simulate a plugin-cache reload generation for one stable policy
+    /// identity (`namespace` + plugin-config id).
+    pub fn load_testing_with_policy_identity_for_test(
+        config: &serde_json::Value,
+        http_client: crate::plugins::PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<crate::plugins::load_testing::LoadTesting, String> {
+        crate::plugins::load_testing::LoadTesting::new_with_instance_id(
+            config,
+            http_client,
+            namespace,
+            config_id,
+        )
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_with_instance_id_for_test(
         config: &serde_json::Value,
@@ -1338,6 +1382,30 @@ pub mod _test_support {
             http_client,
             instance_id,
         )
+    }
+
+    /// Construct through the identity-aware production path so a test can
+    /// simulate a plugin-cache reload generation for one stable policy
+    /// identity (`namespace` + plugin-config id).
+    pub fn request_deduplication_with_policy_identity_for_test(
+        config: &serde_json::Value,
+        http_client: crate::plugins::PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<crate::plugins::request_deduplication::RequestDeduplication, String> {
+        crate::plugins::request_deduplication::RequestDeduplication::new_with_policy_identity(
+            config,
+            http_client,
+            namespace,
+            config_id,
+        )
+    }
+
+    pub fn request_deduplication_backdate_inflight_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+        age: std::time::Duration,
+    ) {
+        plugin.backdate_inflight_entries_for_tests(age);
     }
 
     pub fn request_deduplication_logical_keys_from_context_for_test(
@@ -1969,6 +2037,28 @@ pub mod _test_support {
         dispatch_port: u16,
     ) -> Option<u32> {
         crate::proxy::resolve_backend_max_connections(proxy, dispatch_port)
+    }
+
+    /// Project the DestinationRule port-level policy (connect timeout, backend
+    /// TLS, pool knobs) of `upstream_target` onto `proxy`, exactly as the H1/H2
+    /// and H3 WebSocket dial loops do before each backend attempt (issue #2416).
+    ///
+    /// Returns a `Cow` so tests can also assert the zero-alloc contract: the
+    /// borrowed variant means no per-target override applied and the dial sees
+    /// the base proxy byte-for-byte.
+    pub fn resolve_backend_connection_proxy_for_target<'a>(
+        proxy: &'a crate::config::types::Proxy,
+        upstream_target: Option<&crate::config::types::UpstreamTarget>,
+    ) -> std::borrow::Cow<'a, crate::config::types::Proxy> {
+        crate::proxy::resolve_backend_connection_proxy_for_target(proxy, upstream_target)
+    }
+
+    /// Whether a WebSocket backend dial configured from `proxy` must fail closed
+    /// because the resolved backend TLS carries an SNI override the WebSocket
+    /// transport cannot apply (issue #2416). Exposes the exact predicate
+    /// `connect_websocket_backend` gates its pre-dial refusal on.
+    pub fn websocket_backend_tls_sni_unsupported(proxy: &crate::config::types::Proxy) -> bool {
+        crate::proxy::websocket_backend_tls_sni_unsupported(proxy)
     }
 
     pub use crate::proxy::tcp_proxy::{StreamCopyResult, StreamIoSide};
@@ -4303,6 +4393,18 @@ pub mod _test_support {
         crate::proxy::effective_backend_query_string(ctx).into_owned()
     }
 
+    /// The caller-held-raw-query variant the H1/H2 (`proxy/mod.rs`) and native
+    /// HTTP/3 (`http3/server.rs`) ladders actually capture once per request and
+    /// reuse for every retry attempt. Exposed so composition tests can assert
+    /// both funnels agree, including the provider-claim re-assertion
+    /// (`GHSA-xhp5-hqj8-3mwg`).
+    pub fn effective_backend_query_string_with_raw_for_test(
+        ctx: &crate::plugins::RequestContext,
+        raw_query: &str,
+    ) -> String {
+        crate::proxy::effective_backend_query_string_with_raw(ctx, raw_query).into_owned()
+    }
+
     pub fn collect_forwardable_websocket_headers_for_test(
         raw_headers: &hyper::HeaderMap,
         proxy_headers: &HashMap<String, String>,
@@ -4694,6 +4796,25 @@ pub mod _test_support {
         );
     }
 
+    /// Run reject-path `after_proxy` hooks (including chain-level response
+    /// route-header finalization) over an already-built rejection map.
+    pub async fn apply_replaceable_after_proxy_hooks_to_rejection_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        status_code: &mut u16,
+        response_body: &mut bytes::Bytes,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
+            plugins,
+            ctx,
+            status_code,
+            response_body,
+            response_headers,
+        )
+        .await;
+    }
+
     pub async fn run_after_proxy_hooks_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
@@ -4703,6 +4824,23 @@ pub mod _test_support {
         crate::proxy::run_after_proxy_hooks(plugins, ctx, response_status, response_headers)
             .await
             .is_some()
+    }
+
+    /// Run the production `before_proxy` chain including the chain-level
+    /// request route-header finalization phase (GHSA-3xxr-xhhj-9962).
+    pub async fn run_before_proxy_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> crate::plugins::PluginResult {
+        crate::proxy::run_before_proxy_hooks_for_backend_path_policy(
+            plugins,
+            ctx,
+            headers,
+            false,
+            crate::proxy::BackendPathBeforeProxyPass::Initial,
+        )
+        .await
     }
 
     /// Like [`run_after_proxy_hooks_for_test`] but surfaces the terminal
@@ -6056,9 +6194,10 @@ pub mod _test_support {
     };
 
     /// Test-only view of the crate-private shared status-object generation
-    /// helper.
+    /// helper. Takes ownership of the reconcile `Vec` and moves it into one
+    /// shared `Arc<[K8sObject]>` when a writer is present (no element clone).
     pub fn shared_status_objects_snapshot(
-        objects: &[crate::config_sources::k8s::K8sObject],
+        objects: Vec<crate::config_sources::k8s::K8sObject>,
         gateway_writer_present: bool,
         istio_writer_present: bool,
     ) -> Option<std::sync::Arc<[crate::config_sources::k8s::K8sObject]>> {
@@ -6127,6 +6266,188 @@ pub mod _test_support {
     /// making the task set a production-public field.
     pub fn k8s_controller_registry_for_test() -> K8sControllerRegistryForTest {
         K8sControllerRegistryForTest(crate::k8s_controller::ControllerTaskRegistry::new())
+    }
+
+    /// One watch scope driven by the production watcher task
+    /// ([`crate::k8s_controller::watcher::run_watcher_generations`]) over
+    /// scripted reflector generations instead of a live Kubernetes API server.
+    ///
+    /// Each generation gets its own event channel, so a test can hold a
+    /// replacement generation mid-initial-list and observe exactly what the
+    /// reconciler would see at that moment — which is what the make-before-break
+    /// relist contract is about.
+    pub struct K8sWatchScopeForTest {
+        store_set: std::sync::Arc<
+            tokio::sync::Mutex<crate::k8s_controller::resource_store::ResourceStoreSet>,
+        >,
+        senders: Vec<
+            tokio::sync::mpsc::UnboundedSender<
+                kube::runtime::watcher::Event<kube::api::DynamicObject>,
+            >,
+        >,
+        resource: kube::api::ApiResource,
+    }
+
+    impl K8sWatchScopeForTest {
+        /// A `DynamicObject` in this scope's namespace, shaped like one the
+        /// reflector would receive.
+        pub fn object(&self, namespace: &str, name: &str) -> kube::api::DynamicObject {
+            kube::api::DynamicObject::new(name, &self.resource)
+                .within(namespace)
+                .data(serde_json::json!({ "spec": {} }))
+        }
+
+        /// Deliver one watch event on `generation`'s stream. Panics if that
+        /// generation was never scripted.
+        pub fn emit(
+            &self,
+            generation: usize,
+            event: kube::runtime::watcher::Event<kube::api::DynamicObject>,
+        ) {
+            self.senders[generation]
+                .send(event)
+                .expect("scripted watch generation stream was dropped");
+        }
+
+        /// Object names the reconciler would see right now, sorted. This reads
+        /// the same `snapshot_all` the reconciler reads.
+        pub async fn visible_names(&self) -> Vec<String> {
+            let mut names: Vec<String> = self
+                .store_set
+                .lock()
+                .await
+                .snapshot_all()
+                .into_iter()
+                .map(|object| object.metadata.name)
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    /// The bounded per-scope idle-relist offset for one watch scope, in
+    /// milliseconds.
+    ///
+    /// Exposed so tests can assert its BOUNDS and its stability within one
+    /// process. The offset carries a per-process random seed (so control-plane
+    /// replicas do not relist the same scope in the same instant), so no test
+    /// may assert a particular value.
+    pub fn k8s_watch_idle_relist_jitter_millis(
+        api_version: &str,
+        kind: &str,
+        scope: &str,
+        idle_relist_secs: u64,
+    ) -> u64 {
+        use crate::k8s_controller::watcher::{RelistPolicy, idle_relist_jitter};
+
+        let window = RelistPolicy::from_idle_secs(idle_relist_secs).idle_window;
+        idle_relist_jitter(api_version, kind, scope, window).as_millis() as u64
+    }
+
+    /// Build a watch scope with `generations` scripted reflector generations and
+    /// return it alongside the production watcher task future.
+    ///
+    /// Generation 0's store is pre-registered exactly as `start_crd_watchers`
+    /// registers it. Streams past `generations` never yield and never end, so a
+    /// test cannot accidentally trip the stream-end deregistration path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn k8s_watch_scope_for_test(
+        group: &str,
+        version: &str,
+        kind: &str,
+        plural: &str,
+        scope: &str,
+        idle_relist_secs: u64,
+        generations: usize,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> (K8sWatchScopeForTest, impl std::future::Future<Output = ()>) {
+        use crate::k8s_controller::resource_store::{CrdResourceStore, ResourceStoreSet};
+        use crate::k8s_controller::watcher::{RelistPolicy, WatchTarget, run_watcher_generations};
+        use futures_util::{Stream, StreamExt};
+        use kube::api::{ApiResource, DynamicObject};
+        use kube::runtime::{reflector, watcher};
+
+        let api_version = if group.is_empty() {
+            version.to_string()
+        } else {
+            format!("{group}/{version}")
+        };
+        let resource = ApiResource {
+            group: group.to_string(),
+            version: version.to_string(),
+            api_version: api_version.clone(),
+            kind: kind.to_string(),
+            plural: plural.to_string(),
+        };
+
+        let mut senders = Vec::with_capacity(generations);
+        let mut receivers = std::collections::VecDeque::with_capacity(generations);
+        for _ in 0..generations {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            senders.push(tx);
+            receivers.push_back(rx);
+        }
+
+        let initial_writer = reflector::store::Writer::new(resource.clone());
+        let mut set = ResourceStoreSet::new();
+        set.add_store(std::sync::Arc::new(CrdResourceStore::new_scoped(
+            api_version.clone(),
+            kind.to_string(),
+            scope.to_string(),
+            initial_writer.as_reader(),
+        )));
+        let change_notifier = set.change_notifier();
+        let store_set = std::sync::Arc::new(tokio::sync::Mutex::new(set));
+
+        let target = WatchTarget {
+            api_version,
+            kind: kind.to_string(),
+            scope: scope.to_string(),
+            resource: resource.clone(),
+            watcher_label: "CRD watcher",
+        };
+
+        type ScriptedStream = std::pin::Pin<
+            Box<
+                dyn Stream<Item = Result<watcher::Event<DynamicObject>, watcher::Error>>
+                    + Send
+                    + 'static,
+            >,
+        >;
+        let make_stream = move |writer: reflector::store::Writer<DynamicObject>| -> ScriptedStream {
+            match receivers.pop_front() {
+                Some(rx) => Box::pin(reflector::reflector(
+                    writer,
+                    tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
+                        .map(Ok::<_, watcher::Error>),
+                )),
+                // Unscripted generations stay silent forever rather than ending,
+                // so they never look like a watch that closed.
+                None => Box::pin(futures_util::stream::pending::<
+                    Result<watcher::Event<DynamicObject>, watcher::Error>,
+                >()),
+            }
+        };
+
+        let task = run_watcher_generations(
+            target,
+            initial_writer,
+            store_set.clone(),
+            change_notifier,
+            RelistPolicy::from_idle_secs(idle_relist_secs),
+            std::sync::Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new()),
+            shutdown,
+            make_stream,
+        );
+
+        (
+            K8sWatchScopeForTest {
+                store_set,
+                senders,
+                resource,
+            },
+            task,
+        )
     }
 
     /// Thin wrapper over the production CP full-reload publication so external

@@ -12,7 +12,7 @@ mod mesh_config;
 pub(crate) use core::secret_object_is_valid_tls_certificate;
 pub(crate) use gateway_api::{
     allowed_route_namespaces as parse_gateway_listener_allowed_route_namespaces,
-    namespace_selector_matches,
+    namespace_selector_matches, parse_reference_grant_permissions,
 };
 // Shared with the Istio status writer (`crate::k8s_controller::istio_status`) so
 // the translator's "emit cors plugin vs. leave unprojected" decision and the
@@ -120,6 +120,22 @@ pub struct K8sTranslationOptions {
     /// default and the slice builder). Egress narrowing has its OWN, looser gate
     /// (`enforced || dry_run`) and is not affected by this.
     pub mesh_sidecar_ingress_enforced: bool,
+    /// Whether this Kubernetes source is an authoritative owner of mesh state
+    /// (issue #2452).
+    ///
+    /// True exactly when the controller watches at least one mesh-contributing
+    /// kind — Istio CRDs, Gateway API (waypoint bindings / mesh services), or
+    /// core Pod/Service/EndpointSlice discovery. Only then may an empty
+    /// translation withdraw previously published Kubernetes mesh objects;
+    /// a controller that watches none of them owns nothing and must never
+    /// withdraw mesh state another source published.
+    ///
+    /// Deliberately derived from CONFIGURATION, not from the current
+    /// snapshot's contents: deriving it from content would revoke authority at
+    /// exactly the moment the last object is deleted, which is the bug this
+    /// flag exists to fix. Defaults to `false` so a caller that has not thought
+    /// about ownership cannot widen Kubernetes authority by accident.
+    pub mesh_overlay_authority: bool,
     source_namespaces: Option<HashSet<String>>,
     pod_source_namespaces: Option<HashSet<String>>,
 }
@@ -181,6 +197,7 @@ impl K8sTranslationOptions {
             cluster_domain: "cluster.local".to_string(),
             pod_discovery_enabled: false,
             mesh_sidecar_ingress_enforced: false,
+            mesh_overlay_authority: false,
             source_namespaces: Some(source_namespaces),
             pod_source_namespaces: Some(pod_source_namespaces),
         }
@@ -198,6 +215,13 @@ impl K8sTranslationOptions {
     /// builder actually materializes.
     pub fn with_mesh_sidecar_ingress_enforced(mut self, enforced: bool) -> Self {
         self.mesh_sidecar_ingress_enforced = enforced;
+        self
+    }
+
+    /// Declare whether this Kubernetes source authoritatively owns mesh state.
+    /// See [`K8sTranslationOptions::mesh_overlay_authority`].
+    pub fn with_mesh_overlay_authority(mut self, authoritative: bool) -> Self {
+        self.mesh_overlay_authority = authoritative;
         self
     }
 
@@ -338,6 +362,41 @@ impl K8sResourceKey {
             namespace: object.metadata.namespace.clone(),
             name: object.metadata.name.clone(),
         }
+    }
+
+    /// Identity of the resource that caused a translation failure.
+    ///
+    /// `Unsupported` errors do not carry an API version; status planning keys
+    /// off kind/namespace/name only in that case (empty `api_version`).
+    pub fn from_error(error: &K8sTranslateError) -> Self {
+        match error {
+            K8sTranslateError::Unsupported(resource) => Self {
+                api_version: String::new(),
+                kind: resource.kind.clone(),
+                namespace: resource.namespace.clone(),
+                name: resource.name.clone(),
+            },
+            K8sTranslateError::InvalidResource {
+                kind,
+                namespace,
+                name,
+                ..
+            } => Self {
+                api_version: String::new(),
+                kind: kind.clone(),
+                namespace: namespace.clone(),
+                name: name.clone(),
+            },
+        }
+    }
+
+    /// Match against a live object when the key may have been built from a
+    /// translation error (empty `api_version`).
+    pub fn matches_object(&self, object: &K8sObject) -> bool {
+        self.kind == object.kind
+            && self.namespace == object.metadata.namespace
+            && self.name == object.metadata.name
+            && (self.api_version.is_empty() || self.api_version == object.api_version)
     }
 }
 
@@ -734,11 +793,22 @@ impl K8sAccumulator {
         self.mesh.proxy_configs.sort_by(|left, right| {
             (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
         });
-        let empty_mesh = MeshConfig {
-            istio_root_namespace: self.mesh.istio_root_namespace.clone(),
-            ..MeshConfig::default()
+        // Claim mesh ownership of this translation. `Authoritative` with an
+        // EMPTY `mesh` is the load-bearing state (issue #2452): it says "this
+        // managed Kubernetes snapshot supplies no mesh objects", which the
+        // merge withdraws, as distinct from `NoAuthority`, which says
+        // "Kubernetes is not a mesh source at all; leave whatever another
+        // source owns alone". A translation has no base layer underneath it —
+        // every object in its `mesh` is Kubernetes-owned by construction.
+        self.config.k8s_mesh_overlay = if self.options.mesh_overlay_authority {
+            crate::config::types::K8sMeshOverlay::authoritative_translation()
+        } else {
+            crate::config::types::K8sMeshOverlay::NoAuthority
         };
-        if self.mesh != empty_mesh {
+        // An empty mesh still serializes as `None` so `mesh.is_some()` keeps
+        // meaning "this deployment has mesh state" for every reader; the
+        // authority marker above, not `mesh`, is what carries the withdrawal.
+        if !self.mesh.is_empty_overlay() {
             self.config.mesh = Some(Box::new(self.mesh));
         }
         let mut known_namespaces: Vec<String> = self.known_namespaces.into_iter().collect();
@@ -790,9 +860,15 @@ pub fn gateway_api_route_conflict_keys_with_context(
     options: &K8sTranslationOptions,
     object: &K8sObject,
 ) -> Vec<GatewayApiRouteConflictKey> {
-    let mut acc = K8sAccumulator::new(options.clone());
-    collect_gateway_api_status_context(objects, &mut acc);
+    let acc = gateway_api_status_conflict_context(objects, options.clone());
     gateway_api::route_conflict_keys_for_acc(object, Some(&acc))
+}
+
+pub(crate) fn gateway_api_route_conflict_keys_with_acc(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+) -> Vec<GatewayApiRouteConflictKey> {
+    gateway_api::route_conflict_keys_for_acc(object, Some(acc))
 }
 
 fn collect_gateway_api_status_context(objects: &[K8sObject], acc: &mut K8sAccumulator) {
@@ -826,6 +902,19 @@ fn collect_gateway_api_status_context(objects: &[K8sObject], acc: &mut K8sAccumu
     }
 }
 
+/// Build the Gateway API status-context accumulator once per reconcile/plan.
+///
+/// Status planning reuses this for every route conflict-key lookup instead of
+/// rescanning the snapshot three times per route (#2397).
+pub(crate) fn gateway_api_status_conflict_context(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+) -> K8sAccumulator {
+    let mut acc = K8sAccumulator::new(options);
+    collect_gateway_api_status_context(objects, &mut acc);
+    acc
+}
+
 pub(crate) fn translate_k8s_objects_with_filter<F>(
     objects: &[K8sObject],
     options: K8sTranslationOptions,
@@ -834,18 +923,12 @@ pub(crate) fn translate_k8s_objects_with_filter<F>(
 where
     F: Fn(&K8sObject) -> bool,
 {
-    // Performance follow-up: each K8sObject carries the entire `spec`/`status`
-    // `serde_json::Value` (HTTPRoute/VirtualService specs can be tens of KB).
-    // Cloning every included object once per reconcile is bounded by reconcile
-    // cadence (~30s on the CP) but unnecessary — every downstream consumer
-    // borrows immutably. Migrating this to `Vec<&K8sObject>` requires
-    // `gateway_api::route_conflicts` (and any future `&[K8sObject]` consumers)
-    // to take `&[&K8sObject]`; left as a follow-up to keep this slice focused.
-    let included_objects: Vec<K8sObject> = objects
-        .iter()
-        .filter(|object| include(object))
-        .cloned()
-        .collect();
+    // Borrow included objects in place. Each `K8sObject` carries arbitrary-size
+    // `spec`/`status` JSON; deep-cloning the filtered set once per translate
+    // (and historically once per status object) dominated large-cluster
+    // reconciles. Downstream collectors only need `&K8sObject`.
+    let included_objects: Vec<&K8sObject> =
+        objects.iter().filter(|object| include(object)).collect();
     let mut acc = K8sAccumulator::new(options);
 
     for object in &included_objects {
@@ -897,7 +980,7 @@ where
     }
 
     let gateway_api_route_conflicts =
-        gateway_api::route_conflicts(&included_objects, &acc.options, Some(&acc));
+        gateway_api::route_conflicts(included_objects.iter().copied(), &acc.options, Some(&acc));
     for conflict in &gateway_api_route_conflicts {
         // GRPCRoute method / header predicates now carry their own conflict
         // signature (see `gateway_api::grpc_route_match_signature`), so two
@@ -986,6 +1069,132 @@ where
     }
 
     Ok(acc.finish())
+}
+
+/// O(1)-average skipped-object membership that preserves
+/// [`K8sResourceKey::matches_object`] without cloning per candidate (#2397).
+///
+/// Exact `(api_version, kind, namespace, name)` keys match only that version;
+/// a versionless (empty `api_version`) key matches any API version for the
+/// same kind/namespace/name. Nested `String`-keyed maps accept borrowed
+/// `&str` lookups via `Borrow<str>`.
+struct SkippedObjectIdentities {
+    /// Non-empty api_version: kind → namespace → name → api_versions
+    exact: HashMap<String, HashMap<String, HashMap<String, HashSet<String>>>>,
+    /// Empty api_version: kind → namespace → names
+    versionless: HashMap<String, HashMap<String, HashSet<String>>>,
+}
+
+impl SkippedObjectIdentities {
+    fn new() -> Self {
+        Self {
+            exact: HashMap::new(),
+            versionless: HashMap::new(),
+        }
+    }
+
+    fn insert_key(&mut self, key: &K8sResourceKey) {
+        if key.api_version.is_empty() {
+            self.versionless
+                .entry(key.kind.clone())
+                .or_default()
+                .entry(key.namespace.clone())
+                .or_default()
+                .insert(key.name.clone());
+        } else {
+            self.exact
+                .entry(key.kind.clone())
+                .or_default()
+                .entry(key.namespace.clone())
+                .or_default()
+                .entry(key.name.clone())
+                .or_default()
+                .insert(key.api_version.clone());
+        }
+    }
+
+    fn contains_object(&self, object: &K8sObject) -> bool {
+        let kind = object.kind.as_str();
+        let namespace = object.metadata.namespace.as_str();
+        let name = object.metadata.name.as_str();
+        if self
+            .versionless
+            .get(kind)
+            .and_then(|by_ns| by_ns.get(namespace))
+            .is_some_and(|names| names.contains(name))
+        {
+            return true;
+        }
+        self.exact
+            .get(kind)
+            .and_then(|by_ns| by_ns.get(namespace))
+            .and_then(|by_name| by_name.get(name))
+            .is_some_and(|versions| versions.contains(object.api_version.as_str()))
+    }
+}
+
+/// Translate the snapshot while collecting per-object failures that were
+/// skipped so a later object could succeed.
+///
+/// Used by the reconciler and by Gateway API / Istio status planning so status
+/// writers can reuse one materialization (plus the skip errors) instead of
+/// retranslating a filtered snapshot once per status-bearing object (#2397).
+pub fn translate_k8s_objects_collecting_skips(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+) -> Option<(
+    K8sTranslation,
+    std::collections::HashMap<K8sResourceKey, K8sTranslateError>,
+)> {
+    let mut skipped = std::collections::HashMap::new();
+    // Identity membership for the include filter — O(1) average, never
+    // `skipped.keys().any(matches_object)` which is O(objects × errors) (#2397).
+    let mut skipped_identities = SkippedObjectIdentities::new();
+
+    loop {
+        let translation = translate_k8s_objects_with_filter(objects, options.clone(), |object| {
+            !skipped_identities.contains_object(object)
+        });
+
+        match translation {
+            Ok(translation) => return Some((translation, skipped)),
+            Err(error) => {
+                let key = objects
+                    .iter()
+                    .find(|object| {
+                        // Prefer an object that is not already skipped so an
+                        // exact-version sibling can still be identified after
+                        // its peer was filtered out (#2397).
+                        if skipped_identities.contains_object(object) {
+                            return false;
+                        }
+                        match &error {
+                            K8sTranslateError::Unsupported(resource) => {
+                                object.kind == resource.kind
+                                    && object.metadata.namespace == resource.namespace
+                                    && object.metadata.name == resource.name
+                            }
+                            K8sTranslateError::InvalidResource {
+                                kind,
+                                namespace,
+                                name,
+                                ..
+                            } => {
+                                object.kind == *kind
+                                    && object.metadata.namespace == *namespace
+                                    && object.metadata.name == *name
+                            }
+                        }
+                    })
+                    .map(K8sResourceKey::from_object)
+                    .unwrap_or_else(|| K8sResourceKey::from_error(&error));
+                skipped_identities.insert_key(&key);
+                if skipped.insert(key, error).is_some() {
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 fn includes_object_namespace(options: &K8sTranslationOptions, object: &K8sObject) -> bool {

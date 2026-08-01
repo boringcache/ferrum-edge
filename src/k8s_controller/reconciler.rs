@@ -8,27 +8,29 @@ use serde_json::Value;
 use tokio::sync::{broadcast, watch};
 use tracing::{debug, error, info, warn};
 
-use crate::config::types::GatewayConfig;
+use crate::config::types::{GatewayConfig, K8sMeshOverlay};
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
-    translate_k8s_objects_with_filter,
+    translate_k8s_objects_collecting_skips,
 };
 use crate::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry, NamespaceBroadcasts};
 use crate::grpc::mesh_registry::MeshNodeRegistry;
 use crate::grpc::mesh_server::{MeshConfigBroadcast, MeshGrpcServer};
 use crate::identity::spiffe::TrustDomain;
 use crate::k8s_controller::ControllerTaskRegistry;
-use crate::k8s_controller::istio_status::{IstioStatusWriter, plan_istio_status_updates};
+use crate::k8s_controller::istio_status::{IstioStatusWriter, plan_istio_status_updates_budgeted};
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::resource_store::ResourceStoreSet;
 use crate::k8s_controller::status::{
-    GatewayApiStatusContext, GatewayApiStatusWriter, gateway_api_data_plane_service_ready,
-    plan_gateway_api_status_updates_with_context,
+    GatewayApiStatusContext, GatewayApiStatusWriter, StatusTranslationReuse,
+    gateway_api_data_plane_service_ready, plan_gateway_api_status_updates_budgeted,
 };
+use crate::k8s_controller::status_plan::{DEFAULT_STATUS_PLAN_WORK_BUDGET, StatusPlanBudget};
 use crate::k8s_controller::watcher::namespaces_with_istio_root;
+use crate::modes::mesh::config::MeshConfig;
 
 const INITIAL_STORE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
-const GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP: usize = 256;
+const GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP: usize = DEFAULT_STATUS_PLAN_WORK_BUDGET;
 const STATUS_PATCH_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Last reconciler-accepted Kubernetes translation, held independently of the
@@ -101,18 +103,26 @@ impl CpPublicationGate {
 /// Only ever called after a translation SUCCEEDS, so a failed translate never
 /// overwrites the last accepted overlay with an empty one.
 ///
-/// Mesh retention matches [`merge_k8s_translation`]: a successful translate that
-/// omits `mesh` must not erase a previously accepted mesh block. The overlay
-/// slot is the sole mesh source on CP full-reload re-merge (DB snapshots clear
-/// `mesh`), so dropping it here would let the next DB poll wipe mesh from
-/// `config_arc` even though merging the same translate into the live snapshot
-/// would have kept it (#2982).
+/// Mesh retention matches [`merge_k8s_translation`] and is gated on the same
+/// ownership marker (#2982, then #2452):
+///
+/// * With no Kubernetes mesh authority, a translate that omits `mesh` carries
+///   no mesh update at all, so the previously accepted block is retained. The
+///   overlay slot is the sole mesh source on CP full-reload re-merge (DB
+///   snapshots clear `mesh`), so dropping it would let the next DB poll wipe
+///   mesh from `config_arc` even though merging the same translate into the
+///   live snapshot would have kept it.
+/// * With Kubernetes mesh authority, an omitted `mesh` is an authoritative
+///   empty set. Retaining the previous block here would resurrect withdrawn
+///   mesh objects on the next CP full reload, so the translation is stored
+///   exactly as translated.
 pub fn store_accepted_k8s_overlay(
     slot: &K8sOverlaySlot,
     mut translation: GatewayConfig,
     managed_namespaces: BTreeSet<String>,
 ) {
-    if translation.mesh.is_none()
+    if !translation.k8s_mesh_overlay.is_authoritative()
+        && translation.mesh.is_none()
         && let Some(previous) = slot.load_full().as_ref()
     {
         translation.mesh = previous.translation.mesh.clone();
@@ -155,6 +165,10 @@ pub struct ReconcilerConfig {
     /// passed to the Istio status writer so it reports `ingress_modeled` only
     /// when the data plane actually materializes the listeners (F6 §6.2).
     pub mesh_sidecar_ingress_enforced: bool,
+    /// Whether this controller is an authoritative owner of mesh state
+    /// (issue #2452). See
+    /// [`crate::config_sources::k8s::K8sTranslationOptions::mesh_overlay_authority`].
+    pub mesh_overlay_authority: bool,
 }
 
 pub struct ReconcileBroadcasters {
@@ -279,6 +293,7 @@ async fn run_reconcile_loop(
                 .clone(),
             gateway_api_status_address: reconciler_config.gateway_api_status_address.clone(),
             mesh_sidecar_ingress_enforced: reconciler_config.mesh_sidecar_ingress_enforced,
+            mesh_overlay_authority: reconciler_config.mesh_overlay_authority,
             gateway_status_writer: gateway_status_writer.clone(),
             istio_status_writer: istio_status_writer.clone(),
             metrics: Arc::clone(&metrics),
@@ -327,6 +342,7 @@ async fn run_reconcile_loop(
                             .clone(),
                         mesh_sidecar_ingress_enforced: reconciler_config
                             .mesh_sidecar_ingress_enforced,
+                        mesh_overlay_authority: reconciler_config.mesh_overlay_authority,
                         gateway_status_writer: gateway_status_writer.clone(),
                         istio_status_writer: istio_status_writer.clone(),
                         metrics: Arc::clone(&metrics),
@@ -369,6 +385,7 @@ async fn run_reconcile_loop(
                             .clone(),
                         mesh_sidecar_ingress_enforced: reconciler_config
                             .mesh_sidecar_ingress_enforced,
+                        mesh_overlay_authority: reconciler_config.mesh_overlay_authority,
                         gateway_status_writer: gateway_status_writer.clone(),
                         istio_status_writer: istio_status_writer.clone(),
                         metrics: Arc::clone(&metrics),
@@ -554,6 +571,8 @@ struct ReconcileContext {
     gateway_api_data_plane_service_name: Option<String>,
     gateway_api_status_address: Option<String>,
     mesh_sidecar_ingress_enforced: bool,
+    /// Kubernetes mesh-overlay ownership gate (issue #2452).
+    mesh_overlay_authority: bool,
     gateway_status_writer: Option<GatewayApiStatusWriter>,
     /// T2-B: Istio CRD status sub-resource patcher. `None` when the
     /// controller couldn't be built (no Istio CRD watching, or the
@@ -697,12 +716,19 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         .with_source_namespaces(source_namespaces)
         .with_pod_source_namespaces(ctx.watch_namespaces.clone())
         .with_pod_discovery_enabled(ctx.pod_discovery_enabled)
-        .with_mesh_sidecar_ingress_enforced(ctx.mesh_sidecar_ingress_enforced);
-    let Some(translation) = translate_with_skip_retries(&objects, options.clone(), &ctx.metrics)
+        .with_mesh_sidecar_ingress_enforced(ctx.mesh_sidecar_ingress_enforced)
+        .with_mesh_overlay_authority(ctx.mesh_overlay_authority);
+    let Some((translation, translation_errors)) =
+        translate_with_skip_retries(&objects, options.clone(), &ctx.metrics)
     else {
         return;
     };
     let gateway_api_status_context = gateway_api_status_context(&objects, &ctx);
+    let status_reuse = StatusTranslationReuse {
+        translation: Arc::new(translation),
+        errors: Arc::new(translation_errors),
+    };
+    let translation = status_reuse.translation.as_ref();
 
     for warning in &translation.warnings {
         warn!(warning, "K8s translation warning");
@@ -733,15 +759,17 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         // Status writers share one immutable `Arc<[K8sObject]>` generation
         // (see [`shared_status_objects_snapshot`]). Deployments that don't
         // watch Gateway API / Istio CRDs (the default) pay zero per-
-        // reconcile clone cost.
-        run_status_patchers(
-            ctx.gateway_status_writer,
-            ctx.istio_status_writer,
-            &objects,
-            &options,
-            Some(&translation.route_conflicts),
+        // reconcile move cost.
+        run_status_patchers(StatusPatchersRequest {
+            gateway_writer: ctx.gateway_status_writer,
+            istio_writer: ctx.istio_status_writer,
+            objects,
+            options: &options,
+            route_conflicts: Some(&translation.route_conflicts),
             gateway_api_status_context,
-        )
+            translation_reuse: Some(&status_reuse),
+            metrics: &ctx.metrics,
+        })
         .await;
         let elapsed = start.elapsed();
         ctx.metrics.last_reconcile_duration_ms.store(
@@ -752,14 +780,16 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
     };
 
     // Same shared-snapshot contract as the no-change branch above.
-    run_status_patchers(
-        ctx.gateway_status_writer,
-        ctx.istio_status_writer,
-        &objects,
-        &options,
-        Some(&translation.route_conflicts),
+    run_status_patchers(StatusPatchersRequest {
+        gateway_writer: ctx.gateway_status_writer,
+        istio_writer: ctx.istio_status_writer,
+        objects,
+        options: &options,
+        route_conflicts: Some(&translation.route_conflicts),
         gateway_api_status_context,
-    )
+        translation_reuse: Some(&status_reuse),
+        metrics: &ctx.metrics,
+    })
     .await;
 
     let elapsed = start.elapsed();
@@ -781,22 +811,38 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
 /// status writers for one reconcile.
 ///
 /// Returns `None` when neither writer will run so the default deployment
-/// (no Gateway API / Istio status watching) pays zero snapshot clone cost.
-/// When at least one writer is present, objects are deep-cloned exactly once
-/// into an `Arc<[K8sObject]>`; a second writer only bumps the refcount.
+/// (no Gateway API / Istio status watching) pays zero snapshot cost and the
+/// caller's `Vec` is dropped without wrapping. When at least one writer is
+/// present, the already-owned reconcile `Vec<K8sObject>` is moved into one
+/// `Arc<[K8sObject]>` without cloning elements or their `spec`/`status`
+/// payloads; a second writer only bumps the refcount.
 ///
 /// The Arc keeps planner futures `Send + 'static` across the reconciler's
 /// `tokio::spawn` HRTB boundary without aliasing the store's mutable
 /// reflector state — each reconcile owns a distinct generation.
 pub(crate) fn shared_status_objects_snapshot(
-    objects: &[K8sObject],
+    objects: Vec<K8sObject>,
     gateway_writer_present: bool,
     istio_writer_present: bool,
 ) -> Option<Arc<[K8sObject]>> {
     if !gateway_writer_present && !istio_writer_present {
         return None;
     }
-    Some(Arc::from(objects))
+    // `From<Vec<T>> for Arc<[T]>` moves the allocation; do not use
+    // `Arc::from(&[T])`, which deep-clones every `K8sObject` (#2397).
+    Some(Arc::<[K8sObject]>::from(objects))
+}
+
+/// Inputs for one reconcile's Gateway API / Istio status patch dispatch.
+struct StatusPatchersRequest<'a> {
+    gateway_writer: Option<GatewayApiStatusWriter>,
+    istio_writer: Option<IstioStatusWriter>,
+    objects: Vec<K8sObject>,
+    options: &'a K8sTranslationOptions,
+    route_conflicts: Option<&'a [crate::config_sources::k8s::GatewayApiRouteConflict]>,
+    gateway_api_status_context: GatewayApiStatusContext,
+    translation_reuse: Option<&'a StatusTranslationReuse>,
+    metrics: &'a ControllerMetrics,
 }
 
 /// Dispatch to whichever status patchers are configured.
@@ -807,14 +853,17 @@ pub(crate) fn shared_status_objects_snapshot(
 /// handling. Writers are taken by value so they can be moved into the helper
 /// futures (required for `tokio::spawn`'s HRTB Send check — see the
 /// `Send is not general enough` history in `spawn_reconcile_loop`).
-async fn run_status_patchers(
-    gateway_writer: Option<GatewayApiStatusWriter>,
-    istio_writer: Option<IstioStatusWriter>,
-    objects: &[K8sObject],
-    options: &K8sTranslationOptions,
-    route_conflicts: Option<&[crate::config_sources::k8s::GatewayApiRouteConflict]>,
-    gateway_api_status_context: GatewayApiStatusContext,
-) {
+async fn run_status_patchers(request: StatusPatchersRequest<'_>) {
+    let StatusPatchersRequest {
+        gateway_writer,
+        istio_writer,
+        objects,
+        options,
+        route_conflicts,
+        gateway_api_status_context,
+        translation_reuse,
+        metrics,
+    } = request;
     let Some(snapshot) =
         shared_status_objects_snapshot(objects, gateway_writer.is_some(), istio_writer.is_some())
     else {
@@ -828,11 +877,13 @@ async fn run_status_patchers(
             options.clone(),
             route_conflicts.map(<[_]>::to_vec).unwrap_or_default(),
             gateway_api_status_context,
+            translation_reuse,
+            metrics,
         )
         .await;
     }
     if let Some(writer) = istio_writer {
-        patch_istio_statuses(writer, snapshot, options.clone()).await;
+        patch_istio_statuses(writer, snapshot, options.clone(), translation_reuse).await;
     }
 }
 
@@ -842,40 +893,66 @@ async fn patch_gateway_api_statuses(
     options: K8sTranslationOptions,
     route_conflicts: Vec<crate::config_sources::k8s::GatewayApiRouteConflict>,
     status_context: GatewayApiStatusContext,
+    translation_reuse: Option<&StatusTranslationReuse>,
+    metrics: &ControllerMetrics,
 ) {
-    let mut updates = plan_gateway_api_status_updates_with_context(
+    let cursor = metrics
+        .gateway_api_status_plan_cursor
+        .load(std::sync::atomic::Ordering::Relaxed) as usize;
+    let outcome = plan_gateway_api_status_updates_budgeted(
         &objects,
         options,
         &route_conflicts,
         status_context,
+        translation_reuse,
+        StatusPlanBudget::new(GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP, cursor),
     );
+    let updates = outcome.updates;
+    // Advance the cursor when planning succeeds with an empty write set (fairness
+    // must progress) or after a successful patch batch. Patch errors and batch
+    // timeouts leave the prior cursor so the same bounded window retries on the
+    // next serialized reconcile (#2397).
     if updates.is_empty() {
+        metrics.gateway_api_status_plan_cursor.store(
+            outcome.next_cursor as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         return;
     }
-    if updates.len() > GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP {
+    if outcome.eligible_candidates > GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP {
         warn!(
+            eligible = outcome.eligible_candidates,
+            planned = outcome.planned_candidates,
             updates = updates.len(),
             cap = GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP,
-            "Capping Gateway API status updates for this reconcile round"
+            cursor,
+            next_cursor = outcome.next_cursor,
+            "Budgeted Gateway API status planning for this reconcile round"
         );
-        updates.truncate(GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP);
     }
     let updates_len = updates.len();
     match await_status_patch_batch(writer.patch_updates(updates), STATUS_PATCH_BATCH_TIMEOUT).await
     {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => {
+            metrics.gateway_api_status_plan_cursor.store(
+                outcome.next_cursor as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         Ok(Err(error)) => {
             warn!(
                 error = %error,
                 updates = updates_len,
-                "Failed to patch Gateway API status"
+                cursor,
+                "Failed to patch Gateway API status; leaving status-plan cursor unchanged to retry this window"
             );
         }
         Err(_) => {
             warn!(
                 updates = updates_len,
                 timeout_secs = STATUS_PATCH_BATCH_TIMEOUT.as_secs(),
-                "Gateway API status patch batch timed out; unfinished updates will retry on a later reconcile"
+                cursor,
+                "Gateway API status patch batch timed out; leaving status-plan cursor unchanged so this window retries on a later reconcile"
             );
         }
     }
@@ -901,7 +978,7 @@ fn gateway_api_status_context(
 }
 
 /// T2-B: emit `status.conditions[]` patches for the Istio CRDs supported
-/// by [`plan_istio_status_updates`]. No-op when the writer wasn't built
+/// by [`crate::k8s_controller::istio_status::plan_istio_status_updates`]. No-op when the writer wasn't built
 /// (Istio CRD watching is off, or kube client unavailable) or when the
 /// plan is empty (no supported Istio CRDs in the snapshot). Failures
 /// are logged and never abort reconcile. Shares the same immutable
@@ -910,8 +987,15 @@ async fn patch_istio_statuses(
     writer: IstioStatusWriter,
     objects: Arc<[K8sObject]>,
     options: K8sTranslationOptions,
+    translation_reuse: Option<&StatusTranslationReuse>,
 ) {
-    let updates = plan_istio_status_updates(&objects, options);
+    let updates = plan_istio_status_updates_budgeted(
+        &objects,
+        options,
+        translation_reuse,
+        StatusPlanBudget::unlimited(0),
+    )
+    .updates;
     if updates.is_empty() {
         return;
     }
@@ -946,6 +1030,13 @@ where
     tokio::time::timeout(timeout, future).await
 }
 
+/// Commit one Kubernetes translation into `config_arc`.
+///
+/// The merge is recomputed on every CAS retry, so the mesh overlay is always
+/// withdrawn from — and layered onto — the snapshot that actually loses the
+/// race, and the winning store publishes ONE complete snapshot. A consumer
+/// holding an older `Arc` keeps a consistent pre-withdrawal view for the life
+/// of its request; the next load sees the complete post-withdrawal view.
 pub fn swap_merged_k8s_translation(
     config_arc: &ArcSwap<GatewayConfig>,
     k8s_config: &GatewayConfig,
@@ -965,6 +1056,7 @@ pub fn swap_merged_k8s_translation(
 
         let previous = config_arc.compare_and_swap(&*old_config, new_config.clone());
         if Arc::ptr_eq(&*old_config, &*previous) {
+            log_mesh_overlay_transition(old_config.as_ref(), &new_config, k8s_config);
             return Some(new_config);
         }
 
@@ -974,6 +1066,31 @@ pub fn swap_merged_k8s_translation(
 
 fn gateway_config_content_changed(new_config: &GatewayConfig, old_config: &GatewayConfig) -> bool {
     stable_config_value(new_config) != stable_config_value(old_config)
+}
+
+/// Report a Kubernetes mesh-overlay transition on the winning publication so
+/// operators can correlate "the last mesh resource was deleted" with the exact
+/// snapshot that withdrew it (issue #2452).
+///
+/// The message carries no resource identifiers, selectors, or policy contents,
+/// so a mesh withdrawal cannot become a configuration-disclosure surface in
+/// logs.
+fn log_mesh_overlay_transition(
+    old_config: &GatewayConfig,
+    new_config: &GatewayConfig,
+    k8s_config: &GatewayConfig,
+) {
+    if !k8s_config.k8s_mesh_overlay.is_authoritative() || k8s_config.mesh.is_some() {
+        return;
+    }
+    if old_config.mesh.is_some() && new_config.mesh.is_none() {
+        info!(
+            "Kubernetes mesh overlay withdrawn: the managed Kubernetes snapshot supplies no \
+             mesh resources and no other source owns any"
+        );
+    } else if old_config.mesh.is_some() {
+        info!("Kubernetes mesh overlay withdrawn; other sources' mesh state retained");
+    }
 }
 
 const K8S_MANAGED_PROXY_ID_PREFIXES: &[&str] = &["gwapi-route-", "gwapi-l4-", "istio-vs-"];
@@ -1009,6 +1126,25 @@ fn namespace_is_managed(namespace: &str, managed_namespaces: &BTreeSet<String>) 
     managed_namespaces.is_empty() || managed_namespaces.contains(namespace)
 }
 
+/// Compose the active snapshot with one Kubernetes translation.
+///
+/// Mesh state follows `k8s_config.k8s_mesh_overlay` (issue #2452):
+///
+/// * [`K8sMeshOverlay::NoAuthority`] — Kubernetes is not a mesh source. Mesh
+///   state owned by another source is left exactly as found, and a mesh block
+///   the caller did supply still replaces the active one (the pre-#2452
+///   contract for hand-composed overlays).
+/// * [`K8sMeshOverlay::Authoritative`] — Kubernetes owns an overlay layered on
+///   a retained non-Kubernetes base. The composed mesh is rebuilt from that
+///   base plus this translation's objects, so an authoritatively EMPTY
+///   translation withdraws every Kubernetes-owned mesh object and leaves the
+///   base exactly as another source authored it — same namespace, same kind,
+///   or same name included.
+///
+/// The result is a whole new `GatewayConfig`; the caller publishes it through
+/// a single `ArcSwap` compare-and-swap, so an in-flight consumer observes
+/// either the complete old snapshot or the complete new one — never a
+/// half-withdrawn mesh.
 pub fn merge_k8s_translation(
     active: &GatewayConfig,
     k8s_config: &GatewayConfig,
@@ -1040,12 +1176,74 @@ pub fn merge_k8s_translation(
     namespaces.extend(k8s_config.known_namespaces.iter().cloned());
     merged.known_namespaces = namespaces.into_iter().collect();
 
-    if k8s_config.mesh.is_some() {
-        merged.mesh = k8s_config.mesh.clone();
-    }
+    merge_k8s_mesh_overlay(&mut merged, k8s_config);
 
     merged.normalize_fields();
     merged
+}
+
+/// Recompose `merged.mesh` from its non-Kubernetes base layer plus the
+/// Kubernetes overlay this translation carries (issue #2452).
+///
+/// Ownership is by OBJECT IDENTITY, never by namespace. A namespace routinely
+/// holds objects from several sources at once — a `Service`-derived
+/// `MeshService` next to a natively authored one, an Istio `AuthorizationPolicy`
+/// next to a file-authored `MeshPolicy` — so withdrawing a namespace would
+/// erase mesh state Kubernetes never published. Instead:
+///
+/// 1. The base layer is recovered. When the active snapshot already carries a
+///    Kubernetes overlay, its retained `base_mesh` IS the base; otherwise the
+///    active `mesh` is entirely non-Kubernetes and becomes the base.
+/// 2. The translation's objects are layered onto a copy of that base
+///    ([`MeshConfig::overlay_objects_from`]), shadowing a base object only on
+///    an exact same-collection `(namespace, key)` collision.
+/// 3. The base is retained on the result, so the NEXT publish recomposes from
+///    it. An authoritatively empty translation therefore yields the base
+///    verbatim — every Kubernetes object gone, every other source's object
+///    intact, and any base object the overlay had shadowed restored.
+///
+/// Because step 2 rebuilds from the base rather than editing the composed
+/// view, a Kubernetes object is withdrawn purely by being absent from the new
+/// translation. Nothing depends on the watch scope, so shrinking
+/// `FERRUM_K8S_WATCH_NAMESPACES` cannot strand an object — including a
+/// waypoint binding or policy whose own namespace differs from the namespace
+/// of the services it governs.
+///
+/// Mesh-global blocks (`trust_bundles`, `multi_cluster`,
+/// `outbound_traffic_policy`, `extension_configs`) ride the base untouched:
+/// the Kubernetes translator does not produce them, so it does not own them.
+/// `istio_root_namespace` is adopted from the translation only when the
+/// translation actually carries a mesh block.
+fn merge_k8s_mesh_overlay(merged: &mut GatewayConfig, k8s_config: &GatewayConfig) {
+    if !k8s_config.k8s_mesh_overlay.is_authoritative() {
+        // No Kubernetes mesh authority: this source may not withdraw anything.
+        // A mesh block it did supply still replaces the active one (the
+        // pre-#2452 contract for hand-composed overlays), and that replacement
+        // is wholly non-Kubernetes-owned.
+        if k8s_config.mesh.is_some() {
+            merged.mesh = k8s_config.mesh.clone();
+            merged.k8s_mesh_overlay = K8sMeshOverlay::NoAuthority;
+        }
+        return;
+    }
+
+    let base_mesh: Option<Box<MeshConfig>> = match &merged.k8s_mesh_overlay {
+        K8sMeshOverlay::Authoritative { base_mesh } => base_mesh.clone(),
+        K8sMeshOverlay::NoAuthority => merged.mesh.clone(),
+    };
+
+    let mut composed = base_mesh.as_deref().cloned().unwrap_or_default();
+    if let Some(k8s_mesh) = k8s_config.mesh.as_deref() {
+        composed.istio_root_namespace = k8s_mesh.istio_root_namespace.clone();
+        composed.overlay_objects_from(k8s_mesh);
+    }
+
+    merged.mesh = if composed.is_empty_overlay() {
+        None
+    } else {
+        Some(Box::new(composed))
+    };
+    merged.k8s_mesh_overlay = K8sMeshOverlay::Authoritative { base_mesh };
 }
 
 fn merge_k8s_frontend_tls(merged: &mut GatewayConfig, k8s_config: &GatewayConfig) {
@@ -1218,6 +1416,59 @@ fn canonical_json_sort_key(value: &Value) -> String {
     }
 }
 
+fn translate_with_skip_retries(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+    metrics: &ControllerMetrics,
+) -> Option<(
+    K8sTranslation,
+    std::collections::HashMap<crate::config_sources::k8s::K8sResourceKey, K8sTranslateError>,
+)> {
+    let outcome = translate_k8s_objects_collecting_skips(objects, options);
+    if let Some((_, ref errors)) = outcome {
+        let skipped = errors.len() as u64;
+        if skipped > 0 {
+            metrics
+                .errors
+                .fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
+            for error in errors.values() {
+                log_skipped_resource(error);
+            }
+        }
+    } else {
+        metrics
+            .errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        error!("K8s translation failed repeatedly on the same resource");
+    }
+    outcome
+}
+
+fn log_skipped_resource(error: &K8sTranslateError) {
+    match error {
+        K8sTranslateError::Unsupported(resource) => {
+            warn!(
+                kind = resource.kind,
+                namespace = resource.namespace,
+                name = resource.name,
+                reason = resource.reason,
+                "Unsupported K8s resource skipped"
+            );
+        }
+        K8sTranslateError::InvalidResource {
+            kind,
+            namespace,
+            name,
+            message,
+        } => {
+            warn!(
+                kind,
+                namespace, name, message, "Invalid K8s resource, skipping"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1226,7 +1477,9 @@ mod tests {
     };
     use crate::config_sources::k8s::{K8sMetadata, K8sObject};
     use crate::identity::spiffe::SpiffeId;
+    use crate::k8s_controller::istio_status::plan_istio_status_updates;
     use crate::k8s_controller::resource_store::CrdResourceStore;
+    use crate::k8s_controller::status::plan_gateway_api_status_updates_with_context;
     use crate::modes::mesh::config::{
         MeshConfig, MeshPolicy, MeshService, PolicyScope, Workload, WorkloadRef, WorkloadSelector,
     };
@@ -1298,20 +1551,78 @@ mod tests {
     #[test]
     fn shared_status_snapshot_skipped_when_no_writers() {
         let objects = vec![status_snapshot_object("ConfigMap", "cm")];
-        assert!(shared_status_objects_snapshot(&objects, false, false).is_none());
+        assert!(shared_status_objects_snapshot(objects, false, false).is_none());
     }
 
     #[test]
     fn shared_status_snapshot_built_once_for_single_writer() {
         let objects = vec![status_snapshot_object("HTTPRoute", "api")];
-        let gateway_only = shared_status_objects_snapshot(&objects, true, false)
+        let expected = objects.clone();
+        let gateway_only = shared_status_objects_snapshot(objects.clone(), true, false)
             .expect("gateway writer requires a snapshot");
-        let istio_only = shared_status_objects_snapshot(&objects, false, true)
+        let istio_only = shared_status_objects_snapshot(objects, false, true)
             .expect("istio writer requires a snapshot");
-        assert_eq!(gateway_only.as_ref(), objects.as_slice());
-        assert_eq!(istio_only.as_ref(), objects.as_slice());
+        assert_eq!(gateway_only.as_ref(), expected.as_slice());
+        assert_eq!(istio_only.as_ref(), expected.as_slice());
         assert_eq!(Arc::strong_count(&gateway_only), 1);
         assert_eq!(Arc::strong_count(&istio_only), 1);
+    }
+
+    #[test]
+    fn shared_status_snapshot_moves_owned_vec_without_element_deep_copy() {
+        let mut large_spec = serde_json::Map::new();
+        large_spec.insert("payload".to_string(), Value::String("x".repeat(64 * 1024)));
+        let objects = vec![K8sObject {
+            api_version: "gateway.networking.k8s.io/v1".to_string(),
+            kind: "HTTPRoute".to_string(),
+            metadata: K8sMetadata {
+                name: "large".to_string(),
+                uid: "uid-large".to_string(),
+                namespace: "default".to_string(),
+                generation: Some(1),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                creation_timestamp: None,
+                deletion_timestamp: None,
+            },
+            spec: Value::Object(large_spec),
+            status: json!({"observedGeneration": 1}),
+        }];
+        // Heap pointers inside the moved `K8sObject` must be preserved. A
+        // slice-based `Arc::from(&[T])` deep clone would allocate new String
+        // buffers and change these addresses.
+        let name_ptr = objects[0].metadata.name.as_ptr();
+        let payload_ptr = objects[0].spec["payload"]
+            .as_str()
+            .expect("payload")
+            .as_ptr();
+
+        let snapshot = shared_status_objects_snapshot(objects, true, true)
+            .expect("both writers share one snapshot");
+        assert_eq!(snapshot[0].metadata.name.as_ptr(), name_ptr);
+        assert_eq!(
+            snapshot[0].spec["payload"]
+                .as_str()
+                .expect("payload")
+                .as_ptr(),
+            payload_ptr
+        );
+        assert_eq!(Arc::strong_count(&snapshot), 1);
+
+        // Simulate the reconciler handoff: each writer receives an Arc clone,
+        // not a second deep copy of the large JSON payloads.
+        let gateway_view = Arc::clone(&snapshot);
+        let istio_view = Arc::clone(&snapshot);
+        assert!(Arc::ptr_eq(&gateway_view, &istio_view));
+        assert_eq!(Arc::strong_count(&snapshot), 3);
+        assert_eq!(
+            gateway_view[0].spec["payload"].as_str().map(str::len),
+            Some(64 * 1024)
+        );
+        // Dropping one writer view must not invalidate the other.
+        drop(gateway_view);
+        assert_eq!(Arc::strong_count(&snapshot), 2);
+        assert_eq!(istio_view.len(), 1);
     }
 
     #[test]
@@ -1335,24 +1646,14 @@ mod tests {
             status: json!({"observedGeneration": 1}),
         }];
 
-        let snapshot = shared_status_objects_snapshot(&objects, true, true)
+        let snapshot = shared_status_objects_snapshot(objects, true, true)
             .expect("both writers share one snapshot");
         assert_eq!(Arc::strong_count(&snapshot), 1);
 
-        // Simulate the reconciler handoff: each writer receives an Arc clone,
-        // not a second deep copy of the large JSON payloads.
         let gateway_view = Arc::clone(&snapshot);
         let istio_view = Arc::clone(&snapshot);
         assert!(Arc::ptr_eq(&gateway_view, &istio_view));
         assert_eq!(Arc::strong_count(&snapshot), 3);
-        assert_eq!(
-            gateway_view[0].spec["payload"].as_str().map(str::len),
-            Some(64 * 1024)
-        );
-        // Dropping one writer view must not invalidate the other.
-        drop(gateway_view);
-        assert_eq!(Arc::strong_count(&snapshot), 2);
-        assert_eq!(istio_view.len(), 1);
     }
 
     #[test]
@@ -1362,10 +1663,10 @@ mod tests {
             status_snapshot_object("VirtualService", "gone"),
         ];
         let first =
-            shared_status_objects_snapshot(&first_objects, true, true).expect("initial generation");
+            shared_status_objects_snapshot(first_objects, true, true).expect("initial generation");
 
         let reloaded_objects = vec![status_snapshot_object("HTTPRoute", "keep")];
-        let reloaded = shared_status_objects_snapshot(&reloaded_objects, true, true)
+        let reloaded = shared_status_objects_snapshot(reloaded_objects, true, true)
             .expect("reload generation");
 
         assert!(!Arc::ptr_eq(&first, &reloaded));
@@ -1387,8 +1688,8 @@ mod tests {
             status_snapshot_object("VirtualService", "vs"),
             status_snapshot_object("ConfigMap", "noise"),
         ];
-        let snapshot =
-            shared_status_objects_snapshot(&objects, true, true).expect("both writers present");
+        let snapshot = shared_status_objects_snapshot(objects.clone(), true, true)
+            .expect("both writers present");
         let options = K8sTranslationOptions::new(
             "default".to_string(),
             TrustDomain::new("cluster.local").expect("test trust domain"),
@@ -1426,7 +1727,7 @@ mod tests {
             status_snapshot_object("VirtualService", "vs"),
         ];
         let snapshot =
-            shared_status_objects_snapshot(&objects, true, true).expect("both writers present");
+            shared_status_objects_snapshot(objects, true, true).expect("both writers present");
         let options = K8sTranslationOptions::new(
             "default".to_string(),
             TrustDomain::new("cluster.local").expect("test trust domain"),
@@ -2017,8 +2318,12 @@ mod tests {
         );
     }
 
+    /// A source with NO mesh authority carries no mesh update at all, so the
+    /// active mesh survives. Issue #2452 changed only the authoritative case:
+    /// see `tests/unit/config/k8s_mesh_overlay_withdrawal_tests.rs` for the
+    /// withdrawal coverage.
     #[test]
-    fn merge_k8s_translation_preserves_existing_mesh_when_k8s_has_none() {
+    fn merge_k8s_translation_preserves_existing_mesh_when_k8s_has_no_authority() {
         let mut active = GatewayConfig {
             mesh: Some(Box::new(MeshConfig::default())),
             ..GatewayConfig::default()
@@ -2201,6 +2506,7 @@ mod tests {
         .with_source_namespaces(Vec::new());
         translate_with_skip_retries(objects, options, &ControllerMetrics::default())
             .expect("reconciliation translation")
+            .0
     }
 
     #[test]
@@ -2309,97 +2615,5 @@ mod tests {
             ready,
             "timed-out readiness should continue with available stores"
         );
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct K8sResourceKey {
-    kind: String,
-    namespace: String,
-    name: String,
-}
-
-impl K8sResourceKey {
-    fn from_object(object: &K8sObject) -> Self {
-        Self {
-            kind: object.kind.clone(),
-            namespace: object.metadata.namespace.clone(),
-            name: object.metadata.name.clone(),
-        }
-    }
-
-    fn from_error(error: &K8sTranslateError) -> Self {
-        match error {
-            K8sTranslateError::Unsupported(resource) => Self {
-                kind: resource.kind.clone(),
-                namespace: resource.namespace.clone(),
-                name: resource.name.clone(),
-            },
-            K8sTranslateError::InvalidResource {
-                kind,
-                namespace,
-                name,
-                ..
-            } => Self {
-                kind: kind.clone(),
-                namespace: namespace.clone(),
-                name: name.clone(),
-            },
-        }
-    }
-}
-
-fn translate_with_skip_retries(
-    objects: &[K8sObject],
-    options: K8sTranslationOptions,
-    metrics: &ControllerMetrics,
-) -> Option<K8sTranslation> {
-    let mut skipped = std::collections::HashSet::new();
-
-    loop {
-        let translation = translate_k8s_objects_with_filter(objects, options.clone(), |object| {
-            !skipped.contains(&K8sResourceKey::from_object(object))
-        });
-
-        match translation {
-            Ok(translation) => return Some(translation),
-            Err(error) => {
-                metrics
-                    .errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                log_skipped_resource(&error);
-
-                let key = K8sResourceKey::from_error(&error);
-                if !skipped.insert(key) {
-                    error!(error = %error, "K8s translation failed repeatedly on the same resource");
-                    return None;
-                }
-            }
-        }
-    }
-}
-
-fn log_skipped_resource(error: &K8sTranslateError) {
-    match error {
-        K8sTranslateError::Unsupported(resource) => {
-            warn!(
-                kind = resource.kind,
-                namespace = resource.namespace,
-                name = resource.name,
-                reason = resource.reason,
-                "Unsupported K8s resource skipped"
-            );
-        }
-        K8sTranslateError::InvalidResource {
-            kind,
-            namespace,
-            name,
-            message,
-        } => {
-            warn!(
-                kind,
-                namespace, name, message, "Invalid K8s resource, skipping"
-            );
-        }
     }
 }
