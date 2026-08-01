@@ -145,7 +145,9 @@ fn test_request_body_buffering_follows_representation_not_method() {
 
     // GHSA-2vmr-ww8r-mww3: a governed representation must never bypass the
     // validator because of the request method alone.
-    for method in ["GET", "HEAD", "OPTIONS", "DELETE", "PUT", "PATCH", "PROPFIND"] {
+    for method in [
+        "GET", "HEAD", "OPTIONS", "DELETE", "PUT", "PATCH", "PROPFIND",
+    ] {
         let mut ctx = make_xml_ctx("<root/>");
         ctx.method = method.to_string();
         assert!(
