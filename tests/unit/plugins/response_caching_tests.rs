@@ -1379,7 +1379,24 @@ async fn test_bypassed_zero_freshness_with_new_vary_invalidates_matched_entry() 
     let path = "/api/no-cache-zero-new-vary";
     let mut resp_headers = HashMap::new();
     resp_headers.insert("cache-control".to_string(), "max-age=60".to_string());
-    cache_response(&plugin, "GET", path, 200, &resp_headers, b"cached").await;
+    // Seed the entry under the same origin-visible Accept-Encoding partition
+    // as the refresh below. A different request-header view is deliberately a
+    // different base key and must not be invalidated by this response.
+    let mut store_ctx = make_ctx("GET", path);
+    store_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    let mut store_headers = store_ctx.headers.clone();
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut store_ctx, &mut store_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    plugin.after_proxy(&mut store_ctx, 200, &mut resp_headers).await;
+    plugin
+        .on_final_response_body(&mut store_ctx, 200, &resp_headers, b"cached")
+        .await;
     assert!(response_caching_current_total_size_for_test(&plugin) > 0);
 
     let mut bypass_ctx = make_ctx("GET", path);
@@ -3694,15 +3711,11 @@ async fn test_concurrent_stores_atomically_union_vary_dimensions_and_remove_narr
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
 
     let mut tasks = Vec::new();
-    for (request_header, request_value, body) in
-        [("x-a", "value-a", b"body-a"), ("x-b", "value-b", b"body-b")]
-    {
+    for (vary_header, body) in [("x-a", b"body-a"), ("x-b", b"body-b")] {
         let plugin = Arc::clone(&plugin);
         let barrier = Arc::clone(&barrier);
         tasks.push(tokio::spawn(async move {
             let mut ctx = make_ctx("GET", "/vary-race");
-            ctx.headers
-                .insert(request_header.to_string(), request_value.to_string());
             let mut request_headers = ctx.headers.clone();
             assert!(matches!(
                 plugin.before_proxy(&mut ctx, &mut request_headers).await,
@@ -3714,7 +3727,7 @@ async fn test_concurrent_stores_atomically_union_vary_dimensions_and_remove_narr
                     "cache-control".to_string(),
                     "public, max-age=60".to_string(),
                 ),
-                ("vary".to_string(), request_header.to_string()),
+                ("vary".to_string(), vary_header.to_string()),
             ]);
             plugin
                 .after_proxy(&mut ctx, 200, &mut response_headers)
@@ -3754,18 +3767,10 @@ async fn test_concurrent_stores_atomically_union_vary_dimensions_and_remove_narr
     );
     assert_size_accounting_exact(&plugin);
 
-    let mut hit_count = 0;
-    for (request_header, request_value) in [("x-a", "value-a"), ("x-b", "value-b")] {
-        let mut ctx = make_ctx("GET", "/vary-race");
-        ctx.headers
-            .insert(request_header.to_string(), request_value.to_string());
-        let mut request_headers = ctx.headers.clone();
-        if is_reject(&plugin.before_proxy(&mut ctx, &mut request_headers).await) {
-            hit_count += 1;
-        }
-    }
-    assert_eq!(
-        hit_count, 1,
+    let mut ctx = make_ctx("GET", "/vary-race");
+    let mut request_headers = ctx.headers.clone();
+    assert!(
+        is_reject(&plugin.before_proxy(&mut ctx, &mut request_headers).await),
         "the sole retained wide-key entry must remain reachable under the final union"
     );
 }
