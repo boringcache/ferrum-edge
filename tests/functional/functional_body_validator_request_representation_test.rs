@@ -369,7 +369,18 @@ async fn spawn_counting_backend() -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
                 if read == 0 {
                     return;
                 }
-                hits.fetch_add(1, Ordering::SeqCst);
+                // File-mode startup performs a backend-capability probe when
+                // pool warmup is disabled. Count only the route exercised by
+                // this test so that infrastructure traffic cannot masquerade
+                // as a policy bypass.
+                let request = String::from_utf8_lossy(&buf[..read]);
+                if request
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.contains(" /api "))
+                {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                }
                 let body = br#"{"ok":true}"#;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
