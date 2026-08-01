@@ -5585,7 +5585,8 @@ pub async fn normalize_response_body_for_inspection(
         {
             tracing::warn!(
                 plugin = plugin.name(),
-                reason, "Response normalization refused before invoking the producer"
+                reason,
+                "Response normalization refused before invoking the producer"
             );
             crate::proxy::replace_buffered_response_with_capacity_refusal(
                 ctx,
