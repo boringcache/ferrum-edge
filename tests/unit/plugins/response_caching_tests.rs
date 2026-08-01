@@ -1393,7 +1393,9 @@ async fn test_bypassed_zero_freshness_with_new_vary_invalidates_matched_entry() 
             .await,
         PluginResult::Continue
     ));
-    plugin.after_proxy(&mut store_ctx, 200, &mut resp_headers).await;
+    plugin
+        .after_proxy(&mut store_ctx, 200, &mut resp_headers)
+        .await;
     plugin
         .on_final_response_body(&mut store_ctx, 200, &resp_headers, b"cached")
         .await;
