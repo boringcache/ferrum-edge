@@ -4239,11 +4239,14 @@ same decision, so H1, H2, and H3 behave identically. A body whose length is
 
 Monitor-only operation is unchanged: with `mode: monitor`, or with every body
 rule left at the built-in monitor default, an oversize body is prefix-scanned and
-recorded, never blocked. With `log_to_metadata: true` every oversize governed
-body sets the fixed-cardinality `waf.body_too_large=true` and
-`waf.body_too_large_target` (`request_body` or `response_body`); a blocked one
-adds `waf.action=blocked` and `waf.block_reason=body_too_large`, and a
-prefix-scanned one adds `waf.scan_truncated=true`. No body bytes are logged.
+recorded, never blocked. With `log_to_metadata: true`, oversize bodies handled by
+`fail_closed`, `scan_truncated`, or `block` set the fixed-cardinality
+`waf.body_too_large=true` and `waf.body_too_large_target` (`request_body` or
+`response_body`); a blocked one adds `waf.action=blocked` and
+`waf.block_reason=body_too_large`, and a prefix-scanned one adds
+`waf.scan_truncated=true`. No body bytes are logged. The explicit `skip` mode
+records none of these fields because it may avoid buffering a known-oversize
+request entirely.
 
 Set `on_body_too_large: scan_truncated` to keep the previous prefix-only
 behavior. That is an explicit acceptance of the suffix bypass and should be

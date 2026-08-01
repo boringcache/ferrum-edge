@@ -114,15 +114,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Monitor-only operation is deliberately unaffected: with `mode: monitor`, or
   with every body rule left at the built-in monitor default, an oversize body is
-  still prefix-scanned and recorded rather than blocked. Every oversize governed
-  body now records fixed-cardinality `waf.body_too_large=true` and
-  `waf.body_too_large_target` (`request_body` / `response_body`); blocks add
-  `waf.action=blocked` with `waf.block_reason=body_too_large`, and prefix scans
-  keep `waf.scan_truncated=true`. No body bytes are logged. Operators who
-  deliberately accept prefix-only inspection can opt out with the still-supported
-  `on_body_too_large: scan_truncated`; `skip` and `block` are unchanged. The
-  unbounded-SSE decision is also unchanged — the prefix-only opt-out concedes the
-  suffix of a bounded body and does not reach a stream with no scanned prefix.
+  still prefix-scanned and recorded rather than blocked. Oversize bodies handled
+  by `fail_closed`, `scan_truncated`, or `block` record fixed-cardinality
+  `waf.body_too_large=true` and `waf.body_too_large_target` (`request_body` /
+  `response_body`); blocks add `waf.action=blocked` with
+  `waf.block_reason=body_too_large`, and prefix scans keep
+  `waf.scan_truncated=true`. No body bytes are logged. The explicit `skip` mode
+  still avoids body inspection and may avoid buffering a known-oversize request,
+  so it emits none of this body-size metadata. Operators who deliberately accept
+  prefix-only inspection can opt out with the still-supported
+  `on_body_too_large: scan_truncated`; `skip` and `block` are otherwise
+  unchanged. The unbounded-SSE decision is also unchanged — the prefix-only
+  opt-out concedes the suffix of a bounded body and does not reach a stream with
+  no scanned prefix.
 
 - Irreversible request egress no longer precedes request-body transformation or
   final request policy (GHSA-4vr5-4wm3-x5xv). `request_mirror` and
