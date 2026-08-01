@@ -19468,6 +19468,24 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     // `Content-Encoding` after a decode cannot be resurrected by a later rebuild,
     // which replays gateway output only.
     ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
+    // An already-exceeded RPC deadline owns the client-visible outcome. Check it
+    // before the representation gate or any transform window: either one can
+    // need aggregate retained-response capacity, but neither result is eligible
+    // to replace the authoritative DEADLINE_EXCEEDED terminal.
+    if ctx
+        .grpc_deadline_at()
+        .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+    {
+        *response_status = replace_buffered_grpc_response_with_deadline(
+            ctx,
+            grpc_web_response_content_type,
+            response_headers,
+            response_body,
+            initial_response_header_policy_plugins,
+        )
+        .as_u16();
+        return (true, false);
+    }
     let (rewrite_allowed, representation_rewritten) = match admit_buffered_response_body_transforms(
         plugins,
         ctx,
@@ -19493,24 +19511,6 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     // Read after the gate: a decoded body installs fresh representation headers.
     let content_type = response_headers.get("content-type").cloned();
     let content_type = content_type.as_deref();
-    // An already-exceeded RPC deadline owns the client-visible outcome. Do not
-    // open a retained-response window first: under concurrent load that can
-    // exhaust the aggregate budget and install RESOURCE_EXHAUSTED instead of
-    // DEADLINE_EXCEEDED, losing the authoritative gRPC-Web trailer status.
-    if ctx
-        .grpc_deadline_at()
-        .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-    {
-        *response_status = replace_buffered_grpc_response_with_deadline(
-            ctx,
-            grpc_web_response_content_type,
-            response_headers,
-            response_body,
-            initial_response_header_policy_plugins,
-        )
-        .as_u16();
-        return (true, representation_rewritten);
-    }
     // A transform allocates its output itself, so the blocks that will pay for
     // that allocation are reserved BEFORE the first hook can run — charging
     // afterwards would let arbitrarily many concurrent transform outputs exist

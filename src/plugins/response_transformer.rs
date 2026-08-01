@@ -1025,22 +1025,23 @@ impl Plugin for ResponseTransformer {
         // backend named the media type, every representation this plugin
         // provably declines can be released instead of collected up to the
         // response-body ceiling and then rejected unread
-        // (GHSA-pwcm-6rh8-f2gh). The release condition is the EXACT negation of
-        // what `transform_response_body` acts on, so eligibility is unchanged —
-        // only the moment the decision is taken moves earlier:
+        // (GHSA-pwcm-6rh8-f2gh). The release condition mirrors what
+        // `transform_response_body` declines, with one fail-closed exception for
+        // ambiguous event-stream lookalikes that must remain bounded:
         //
-        //   * a DECLARED non-JSON type (binary downloads, `text/event-stream`,
-        //     video, `application/octet-stream`, …) — the transform returns
-        //     `None` for it, and `enforces_response_body_policy` declines it for
-        //     the same reason, so nothing was ever going to read these bytes;
+        //   * an ordinary DECLARED non-JSON type (binary downloads,
+        //     `text/event-stream`, video, `application/octet-stream`, …) — the
+        //     transform returns `None` for it, and `enforces_response_body_policy`
+        //     declines it for the same reason, so nothing was ever going to read
+        //     these bytes;
         //   * framed gRPC `+json` flavors — length-prefixed frames, declined by
         //     both the transform and the claim predicate.
         //
         // Exact `text/event-stream` (optional parameters allowed) is released as
         // the unbounded SSE representation. Ambiguous lookalikes that merely
         // contain the `event-stream` substring — vendor types, `*-like` names,
-        // `+json` / profile parameters — stay buffered so they cannot inherit
-        // SSE streaming treatment by substring coincidence.
+        // `+json` / profile parameters — stay buffered under the retained ceiling
+        // so they cannot inherit unbounded SSE treatment by substring coincidence.
         //
         // An ABSENT `Content-Type` is deliberately NOT released: the transform
         // treats it as JSON, so those bytes are still inspected and a body rule

@@ -5533,10 +5533,6 @@ pub async fn normalize_response_body_for_inspection(
     // rewrites can still be replaced by the request's gRPC deadline, and an
     // unseeded provenance strips every header from that replacement.
     ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
-    if !response_body_rewrite_allowed(response_status_in) {
-        return false;
-    }
-    let content_type = response_headers.get("content-type").cloned();
     // An already-exceeded RPC deadline owns the client-visible outcome. Opening
     // a retained-response window first would compete for the process-wide
     // aggregate budget and, under concurrent load, could install RESOURCE_EXHAUSTED
@@ -5558,6 +5554,10 @@ pub async fn normalize_response_body_for_inspection(
         .as_u16();
         return true;
     }
+    if !response_body_rewrite_allowed(response_status_in) {
+        return false;
+    }
+    let content_type = response_headers.get("content-type").cloned();
     // A normalizer allocates its replacement itself, so the blocks that will pay
     // for that allocation are reserved BEFORE the first hook can run — a charge
     // taken after the fact would let arbitrarily many concurrent replacements

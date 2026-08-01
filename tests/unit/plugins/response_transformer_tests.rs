@@ -2291,9 +2291,11 @@ async fn test_response_transformer_header_mutations_never_log_configured_values(
 }
 
 // ---------------------------------------------------------------------------
-// GHSA-pwcm-6rh8-f2gh — a representation the body transform provably declines
-// must be released once the backend named its media type, not collected up to
-// the response ceiling and then rejected unread.
+// GHSA-pwcm-6rh8-f2gh — ordinary representations the body transform provably
+// declines are released once the backend names their media type, rather than
+// collected up to the response ceiling and rejected unread. Ambiguous
+// event-stream lookalikes are the fail-closed exception: they remain bounded so
+// a substring resemblance cannot grant unbounded SSE treatment.
 // ---------------------------------------------------------------------------
 
 fn headers_from(pairs: &[(&str, &str)]) -> HashMap<String, String> {

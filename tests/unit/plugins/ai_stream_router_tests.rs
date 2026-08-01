@@ -4535,8 +4535,9 @@ async fn test_buffered_normalizer_is_bounded_by_a_route_ceiling_below_the_slice_
         )
         .await
         .expect("a ceiling equal to the output must admit it");
-    let admitted_text = String::from_utf8_lossy(&admitted);
-    let normalized_text = String::from_utf8_lossy(&normalized);
+    let admitted_text = std::str::from_utf8(&admitted).expect("normalized SSE must be UTF-8");
+    let normalized_text =
+        std::str::from_utf8(&normalized).expect("normalized SSE must be UTF-8");
     assert_eq!(
         strip_created(&admitted_text),
         strip_created(&normalized_text),
