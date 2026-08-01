@@ -39,6 +39,7 @@ fn challenge() -> AcmeDns01ChallengeRecord {
         key_authorization: "test-token.test-thumbprint".to_string(),
     }
 }
+
 /// Write an executable hook that sleeps and *then* creates `marker`.
 ///
 /// The marker is the side effect under test: if it exists, the hook ran to
