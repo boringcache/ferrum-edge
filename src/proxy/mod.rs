@@ -4673,6 +4673,47 @@ pub(crate) async fn run_final_request_body_hooks_with_provenance(
     if deadline_expired {
         return crate::plugins::RequestPluginDeadlineResult::DeadlineExceeded;
     }
+    // The authoritative backend-visible request representation phase. It runs
+    // once, here, immediately before the first final hook, so every dispatch
+    // ladder (H1/H2 terminal and ordinary preparation, the native-gRPC branch,
+    // native H3, the H3 bridge) reaches the same conclusion about the same bytes
+    // (`GHSA-3973-47g5-4mcx`). Staging is unconditional — including the clear —
+    // so a retry or a second finalization can never read a view decoded for a
+    // different `(headers, body)` pair.
+    if let Some(ctx) = ctx.as_deref_mut() {
+        ctx.clear_governed_request_body_plaintext();
+        use crate::plugins::request_representation::{
+            FinalRequestBodyPosture, REQUEST_REPRESENTATION_REJECTED_METADATA_KEY,
+            REQUEST_REPRESENTATION_UNINSPECTABLE_MESSAGE, evaluate_final_request_body_posture,
+        };
+        match evaluate_final_request_body_posture(plugins, ctx, headers, body) {
+            FinalRequestBodyPosture::Inspectable => {}
+            FinalRequestBodyPosture::Decoded(plaintext) => {
+                ctx.stage_governed_request_body_plaintext(plaintext);
+            }
+            FinalRequestBodyPosture::Reject(rejection) => {
+                // Fixed-cardinality reason only: no coding token, no header
+                // value, and no body byte reaches the log or the client.
+                warn!(
+                    reason = rejection.reason(),
+                    "Governed request body could not be reduced to plaintext; failing closed"
+                );
+                ctx.metadata.insert(
+                    REQUEST_REPRESENTATION_REJECTED_METADATA_KEY.to_string(),
+                    rejection.reason().to_string(),
+                );
+                return crate::plugins::RequestPluginDeadlineResult::Completed(
+                    PluginResult::Reject {
+                        status_code: 400,
+                        body: format!(
+                            r#"{{"error":"{REQUEST_REPRESENTATION_UNINSPECTABLE_MESSAGE}"}}"#
+                        ),
+                        headers: HashMap::new(),
+                    },
+                );
+            }
+        }
+    }
     for plugin in plugins {
         let deadline = ctx
             .as_deref()
@@ -17339,69 +17380,103 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
         }
     ) {
         let mut mandatory_replay_transform_failed = None;
-        for plugin in plugins.iter() {
-            let mandatory_replay_transform = ctx.finalized_response_replay
-                && plugin.requires_replay_response_body_transform(ctx);
-            if ctx.finalized_response_replay && !mandatory_replay_transform {
-                continue;
-            }
-            let deadline = ctx.grpc_deadline_at();
-            let transformed = match crate::plugins::await_grpc_deadline(
-                deadline,
-                plugin.transform_response_body_with_context(
-                    ctx,
-                    response_body,
-                    ct_ref,
-                    response_headers,
-                ),
-            )
-            .await
+        // Same two-stage shape as the backend buffered lifecycle: every semantic
+        // transform, then the authoritative final client-visible body policy
+        // phase, then gateway transport encoding. Keeping the split identical on
+        // both lifecycles is what stops a synthetic 2xx (a semantic-cache hit, a
+        // mock, a serverless terminate reply) from being the one representation
+        // output policy never sees in plaintext.
+        'stages: for stage in [
+            ResponseTransformStage::Semantic,
+            ResponseTransformStage::TransportEncoding,
+        ] {
+            for plugin in plugins
+                .iter()
+                .filter(|plugin| response_transform_stage(plugin.as_ref()) == stage)
             {
-                Ok(transformed) => transformed,
-                Err(()) if mandatory_replay_transform => {
-                    let _ = ctx.take_buffered_response_capacity_refusal_pending();
-                    mandatory_replay_transform_failed = Some(plugin.name());
-                    break;
+                let mandatory_replay_transform = ctx.finalized_response_replay
+                    && plugin.requires_replay_response_body_transform(ctx);
+                if ctx.finalized_response_replay && !mandatory_replay_transform {
+                    continue;
                 }
-                Err(()) => {
-                    let _ = ctx.take_buffered_response_capacity_refusal_pending();
-                    break;
-                }
-            };
-            // Claimed transform capacity refusal must install the shared
-            // terminal before later plugins, validators, or publication.
-            if install_pending_buffered_response_capacity_refusal(
-                ctx,
-                response_status,
-                response_headers,
-                response_body,
-                InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
-            ) {
-                terminal_body_response_selected = true;
-                break;
-            }
-            if let Some(transformed) = transformed {
-                response_headers
-                    .insert("content-length".to_string(), transformed.len().to_string());
-                *response_body = Bytes::from(transformed);
-                crate::plugins::finalize_response_body_transformation(
-                    plugin.as_ref(),
-                    ctx,
-                    response_headers,
-                );
-            } else if mandatory_replay_transform {
-                mandatory_replay_transform_failed = Some(plugin.name());
-                break;
-            } else {
-                if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                let deadline = ctx.grpc_deadline_at();
+                let transformed = match crate::plugins::await_grpc_deadline(
+                    deadline,
+                    plugin.transform_response_body_with_context(
+                        ctx,
+                        response_body,
+                        ct_ref,
+                        response_headers,
+                    ),
+                )
+                .await
+                {
+                    Ok(transformed) => transformed,
+                    Err(()) if mandatory_replay_transform => {
+                        let _ = ctx.take_buffered_response_capacity_refusal_pending();
+                        mandatory_replay_transform_failed = Some(plugin.name());
+                        break 'stages;
+                    }
+                    Err(()) => {
+                        let _ = ctx.take_buffered_response_capacity_refusal_pending();
+                        break 'stages;
+                    }
+                };
+                // Claimed transform capacity refusal must install the shared
+                // terminal before later plugins, validators, or publication.
+                if install_pending_buffered_response_capacity_refusal(
                     ctx,
                     response_status,
                     response_headers,
                     response_body,
+                    InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
                 ) {
                     terminal_body_response_selected = true;
-                    break;
+                    break 'stages;
                 }
+                if let Some(transformed) = transformed {
+                    response_headers
+                        .insert("content-length".to_string(), transformed.len().to_string());
+                    *response_body = Bytes::from(transformed);
+                    crate::plugins::finalize_response_body_transformation(
+                        plugin.as_ref(),
+                        ctx,
+                        response_headers,
+                    );
+                } else if mandatory_replay_transform {
+                    mandatory_replay_transform_failed = Some(plugin.name());
+                    break 'stages;
+                } else {
+                    if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                        ctx,
+                        response_status,
+                        response_headers,
+                        response_body,
+                    ) {
+                        terminal_body_response_selected = true;
+                        break 'stages;
+                    }
+                }
+            }
+            // Authoritative final client-visible body policy, between the two
+            // stages. Skipped once a gateway-authored terminal owns the response:
+            // a capacity refusal or an earlier rejection is already the answer and
+            // must not be re-decided against its own error payload — the same rule
+            // the `on_final_response_body` loop below follows.
+            if stage == ResponseTransformStage::Semantic
+                && !terminal_body_response_selected
+                && mandatory_replay_transform_failed.is_none()
+                && run_final_client_visible_response_body_policy(
+                    plugins,
+                    ctx,
+                    response_status,
+                    response_headers,
+                    response_body,
+                )
+                .await
+            {
+                terminal_body_response_selected = true;
+                break 'stages;
             }
         }
         if let Some(plugin_name) = mandatory_replay_transform_failed {
@@ -17420,6 +17495,22 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
             );
             terminal_body_response_selected = true;
         }
+    } else if !terminal_body_response_selected
+        && run_final_client_visible_response_body_policy(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+        )
+        .await
+    {
+        // The transform phase was skipped (an unclaimed range/delta
+        // representation, or a gate rejection that did not select a terminal),
+        // but the final client-visible policy phase is non-rewriting and must
+        // still decide. Skipping it would drop `waf` / `body_validator` /
+        // `ai_response_guard` enforcement on exactly those responses.
+        terminal_body_response_selected = true;
     }
 
     if !terminal_body_response_selected {
@@ -19502,6 +19593,100 @@ pub(crate) async fn admit_buffered_response_body_transforms(
     }
 }
 
+/// Which stage of the buffered body-transform phase a plugin's
+/// `transform_response_body*` hook belongs to.
+///
+/// The phase is split so the authoritative final client-visible body policy can
+/// run between them: after every SEMANTIC rewrite has produced the
+/// representation the client will receive, and before the gateway turns that
+/// representation into wire bytes (`GHSA-62jg-v563-4q23`,
+/// `GHSA-4vqr-427g-5cg7`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResponseTransformStage {
+    /// Ordinary representation rewrites: `grpc_web` re-framing, `mcp_gateway`
+    /// reverse mapping, `response_transformer` body rules, `ai_response_guard`
+    /// redaction. Configured plugin order is preserved inside the stage.
+    Semantic,
+    /// Gateway-generated `Content-Encoding` (`compression`). Runs last, after
+    /// every security decision and rewrite, so nothing downstream has to read
+    /// compressed bytes.
+    TransportEncoding,
+}
+
+fn response_transform_stage(plugin: &dyn Plugin) -> ResponseTransformStage {
+    if plugin.applies_response_transport_encoding() {
+        ResponseTransformStage::TransportEncoding
+    } else {
+        ResponseTransformStage::Semantic
+    }
+}
+
+/// Run the authoritative final client-visible response body policy phase.
+///
+/// This is the single decision point for output security policy over the exact
+/// representation the client receives: after every semantic transform, before
+/// transport encoding, on both the backend buffered lifecycle
+/// ([`transform_buffered_response_body_with_deadline`]) and the synthetic /
+/// short-circuit lifecycle ([`apply_synthetic_response_body_hooks`]).
+///
+/// The phase is rejecting and non-rewriting. A rejection replaces the response
+/// through the shared rejection rebuild, which clears backend representation
+/// headers and re-applies gateway-owned decorators, exactly as an
+/// `on_final_response_body` rejection does. Returns `true` when the response was
+/// replaced, in which case the caller must treat the gateway-authored terminal
+/// metadata as authoritative and must not run later body hooks over the
+/// replacement.
+async fn run_final_client_visible_response_body_policy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+) -> bool {
+    let mut selected_reject = None;
+    for plugin in plugins.iter() {
+        if !plugin.enforces_final_client_visible_response_body(ctx) {
+            continue;
+        }
+        let deadline = ctx.grpc_deadline_at();
+        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
+            deadline,
+            plugin.finalize_client_visible_response_body(
+                ctx,
+                *response_status,
+                response_headers,
+                response_body,
+            ),
+        )
+        .await
+        .into_plugin_result(ctx);
+        match result {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                    // Unreachable: `plugin_result_into_reject_parts` converts
+                    // both rejection shapes. Failing closed on a conversion that
+                    // cannot happen still beats publishing the claimed body.
+                    continue;
+                };
+                debug!(
+                    plugin = plugin.name(),
+                    status_code = reject.status_code,
+                    "Plugin rejected the final client-visible response body"
+                );
+                selected_reject = Some(reject);
+                break;
+            }
+        }
+    }
+    let Some(reject) = selected_reject else {
+        return false;
+    };
+    *response_body =
+        rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
+    true
+}
+
 /// Run buffered response transforms under the request's absolute gRPC
 /// deadline. A transform that exhausts the deadline selects the same
 /// flavor-aware terminal response as every other buffered response phase.
@@ -19593,6 +19778,22 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
         BufferedTransformAdmission::Rejected => return (true, false),
     };
     if !rewrite_allowed {
+        // No transform may rewrite this representation — an unclaimed `206`
+        // range slice or `226` delta. Output policy must still decide on it: the
+        // final client-visible phase is non-rewriting, and skipping it here would
+        // silently drop `waf` response scanning and `body_validator` response
+        // validation for exactly the statuses a client can select.
+        if run_final_client_visible_response_body_policy(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+        )
+        .await
+        {
+            return (true, true);
+        }
         return (false, false);
     }
     // Read after the gate: a decoded body installs fresh representation headers.
@@ -19639,96 +19840,32 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
         None
     };
     let mut body_transformed = representation_rewritten;
-    for plugin in plugins {
-        // Precondition for EVERY producer invocation: a full covering window
-        // must exist before the producer can allocate into it, and it is
-        // re-established only now — after any previous replacement was installed
-        // and the body it replaced dropped its charge — so the old body and a
-        // fresh full window are never both charged. An out-of-tree plugin that
-        // declares no bounded construction contract is refused instead of being
-        // invoked, because invoking it is what would let it allocate unbounded.
-        if let Some(reason) = crate::plugins::admit_response_body_producer(
-            plugin.response_body_production(),
-            window.as_mut(),
-        ) {
-            warn!(
-                plugin = plugin.name(),
-                reason, "Response body transform refused before invoking the producer"
-            );
-            replace_buffered_response_with_capacity_refusal(
-                ctx,
-                response_status,
-                response_headers,
-                response_body,
-                initial_response_header_policy_plugins,
-            );
-            return (true, body_transformed);
-        }
-        let transformed = match crate::plugins::await_grpc_deadline(
-            ctx.grpc_deadline_at(),
-            plugin.transform_response_body_with_context(
-                ctx,
-                response_body,
-                content_type,
-                response_headers,
-            ),
-        )
-        .await
+    // Two stages, with the authoritative final client-visible body policy phase
+    // between them. Configured plugin order is preserved inside each stage; the
+    // only reordering is that gateway transport encoding moves behind every
+    // semantic transform and every security decision (`GHSA-4vqr-427g-5cg7`).
+    for stage in [
+        ResponseTransformStage::Semantic,
+        ResponseTransformStage::TransportEncoding,
+    ] {
+        for plugin in plugins
+            .iter()
+            .filter(|plugin| response_transform_stage(plugin.as_ref()) == stage)
         {
-            Ok(transformed) => transformed,
-            Err(()) => {
-                // An elapsed authoritative deadline owns the outcome; discard any
-                // pending transform capacity signal so it cannot leak.
-                let _ = ctx.take_buffered_response_capacity_refusal_pending();
-                *response_status = replace_buffered_grpc_response_with_deadline(
-                    ctx,
-                    grpc_web_response_content_type,
-                    response_headers,
-                    response_body,
-                    initial_response_header_policy_plugins,
-                )
-                .as_u16();
-                return (true, body_transformed);
-            }
-        };
-        // A claimed transform that refused its ceiling marks a pending signal
-        // and returns ordinary `None`. Consume it before later plugins,
-        // encoding reconciliation, or treating the body as unchanged.
-        if install_pending_buffered_response_capacity_refusal(
-            ctx,
-            response_status,
-            response_headers,
-            response_body,
-            InitialResponseHeaderPolicySource::Prefiltered(initial_response_header_policy_plugins),
-        ) {
-            return (true, body_transformed);
-        }
-        if let Some(transformed) = transformed {
-            // The transform installs a DIFFERENT allocation than the one the
-            // collector charged (and a decode can be far larger than its
-            // input), so the replacement carries its OWN charge, transferred out
-            // of the window reserved above and owned by the replacement
-            // allocation rather than by this request: the permit is returned
-            // when the last handle to those bytes drops, wherever they are
-            // copied or stored (GHSA-pwcm-6rh8-f2gh).
-            //
-            // Refusal fails closed with the shared gateway-capacity terminal —
-            // `503` plus the fixed redaction-safe body, or the gRPC
-            // `RESOURCE_EXHAUSTED` terminal for a gRPC-flavored response —
-            // rather than retaining uncharged bytes. An output larger than the
-            // window is refused for the same reason a backend body that size
-            // would be: it is above this response's retained ceiling.
-            //
-            // A `None` window here means a plugin declared as a non-producer
-            // returned bytes anyway: nothing was reserved for them, so they are
-            // refused rather than installed uncharged.
-            let transformed_len = transformed.len();
-            let Some(charged) = window.as_mut().and_then(|w| w.charge(transformed)) else {
+            // Precondition for EVERY producer invocation: a full covering window
+            // must exist before the producer can allocate into it, and it is
+            // re-established only now — after any previous replacement was installed
+            // and the body it replaced dropped its charge — so the old body and a
+            // fresh full window are never both charged. An out-of-tree plugin that
+            // declares no bounded construction contract is refused instead of being
+            // invoked, because invoking it is what would let it allocate unbounded.
+            if let Some(reason) = crate::plugins::admit_response_body_producer(
+                plugin.response_body_production(),
+                window.as_mut(),
+            ) {
                 warn!(
                     plugin = plugin.name(),
-                    replacement_bytes = transformed_len,
-                    "Response body transform refused: replacement body is not covered by a \
-                     reserved retained-response window"
+                    reason, "Response body transform refused before invoking the producer"
                 );
                 replace_buffered_response_with_capacity_refusal(
                     ctx,
@@ -19737,27 +19874,119 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
                     response_body,
                     initial_response_header_policy_plugins,
                 );
-                return (true, true);
+                return (true, body_transformed);
+            }
+            let transformed = match crate::plugins::await_grpc_deadline(
+                ctx.grpc_deadline_at(),
+                plugin.transform_response_body_with_context(
+                    ctx,
+                    response_body,
+                    content_type,
+                    response_headers,
+                ),
+            )
+            .await
+            {
+                Ok(transformed) => transformed,
+                Err(()) => {
+                    // An elapsed authoritative deadline owns the outcome; discard any
+                    // pending transform capacity signal so it cannot leak.
+                    let _ = ctx.take_buffered_response_capacity_refusal_pending();
+                    *response_status = replace_buffered_grpc_response_with_deadline(
+                        ctx,
+                        grpc_web_response_content_type,
+                        response_headers,
+                        response_body,
+                        initial_response_header_policy_plugins,
+                    )
+                    .as_u16();
+                    return (true, body_transformed);
+                }
             };
-            response_headers.insert("content-length".to_string(), transformed_len.to_string());
-            *response_body = charged;
-            crate::plugins::finalize_response_body_transformation(
-                plugin.as_ref(),
-                ctx,
-                response_headers,
-            );
-            body_transformed = true;
-        } else {
-            if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+            // A claimed transform that refused its ceiling marks a pending signal
+            // and returns ordinary `None`. Consume it before later plugins,
+            // encoding reconciliation, or treating the body as unchanged.
+            if install_pending_buffered_response_capacity_refusal(
                 ctx,
                 response_status,
                 response_headers,
                 response_body,
+                InitialResponseHeaderPolicySource::Prefiltered(initial_response_header_policy_plugins),
             ) {
-                return (true, true);
+                return (true, body_transformed);
             }
+            if let Some(transformed) = transformed {
+                // The transform installs a DIFFERENT allocation than the one the
+                // collector charged (and a decode can be far larger than its
+                // input), so the replacement carries its OWN charge, transferred out
+                // of the window reserved above and owned by the replacement
+                // allocation rather than by this request: the permit is returned
+                // when the last handle to those bytes drops, wherever they are
+                // copied or stored (GHSA-pwcm-6rh8-f2gh).
+                //
+                // Refusal fails closed with the shared gateway-capacity terminal —
+                // `503` plus the fixed redaction-safe body, or the gRPC
+                // `RESOURCE_EXHAUSTED` terminal for a gRPC-flavored response —
+                // rather than retaining uncharged bytes. An output larger than the
+                // window is refused for the same reason a backend body that size
+                // would be: it is above this response's retained ceiling.
+                //
+                // A `None` window here means a plugin declared as a non-producer
+                // returned bytes anyway: nothing was reserved for them, so they are
+                // refused rather than installed uncharged.
+                let transformed_len = transformed.len();
+                let Some(charged) = window.as_mut().and_then(|w| w.charge(transformed)) else {
+                    warn!(
+                        plugin = plugin.name(),
+                        replacement_bytes = transformed_len,
+                        "Response body transform refused: replacement body is not covered by a \
+                         reserved retained-response window"
+                    );
+                    replace_buffered_response_with_capacity_refusal(
+                        ctx,
+                        response_status,
+                        response_headers,
+                        response_body,
+                        initial_response_header_policy_plugins,
+                    );
+                    return (true, true);
+                };
+                response_headers.insert("content-length".to_string(), transformed_len.to_string());
+                *response_body = charged;
+                crate::plugins::finalize_response_body_transformation(
+                    plugin.as_ref(),
+                    ctx,
+                    response_headers,
+                );
+                body_transformed = true;
+            } else {
+                if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                    ctx,
+                    response_status,
+                    response_headers,
+                    response_body,
+                ) {
+                    return (true, true);
+                }
+            }
+            ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
         }
-        ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
+        if stage == ResponseTransformStage::Semantic
+            && run_final_client_visible_response_body_policy(
+                plugins,
+                ctx,
+                response_status,
+                response_headers,
+                response_body,
+            )
+            .await
+        {
+            // A gateway-authored rejection replaced the response. Report it as a
+            // replacement so the caller drops backend trailers and skips the
+            // later final-body hooks, and as a representation rewrite because the
+            // published bytes are no longer the backend's.
+            return (true, true);
+        }
     }
     (false, body_transformed)
 }

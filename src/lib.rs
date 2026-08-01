@@ -6452,6 +6452,61 @@ pub mod _test_support {
         }
     }
 
+    /// What the shared REQUEST representation gate decided for one finalized
+    /// backend-visible body, projected so external tests can assert on it
+    /// without reaching into the crate-private posture.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum FinalRequestRepresentationOutcome {
+        /// Nothing to prove: either no configured final request-body policy
+        /// claims these bytes, or they are already identity-coded.
+        Inspectable,
+        /// Claimed and decoded. Carries the plaintext the claiming hooks receive
+        /// through `RequestContext::inspectable_final_request_body`.
+        Decoded(Vec<u8>),
+        /// Claimed and uninspectable, carrying the gate's low-cardinality reason.
+        Rejected(&'static str),
+    }
+
+    /// Drive the PRODUCTION request representation gate
+    /// (`evaluate_final_request_body_posture`) over one finalized
+    /// `(headers, body)` pair.
+    ///
+    /// This is the same call `run_final_request_body_hooks_with_provenance`
+    /// makes immediately before the first final hook, so an assertion here is an
+    /// assertion about the real fail-closed decision rather than a reimplemented
+    /// one (`GHSA-3973-47g5-4mcx`).
+    pub fn evaluate_final_request_representation(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> FinalRequestRepresentationOutcome {
+        use crate::plugins::request_representation::{
+            FinalRequestBodyPosture, evaluate_final_request_body_posture,
+        };
+        match evaluate_final_request_body_posture(plugins, ctx, headers, body) {
+            FinalRequestBodyPosture::Inspectable => {
+                FinalRequestRepresentationOutcome::Inspectable
+            }
+            FinalRequestBodyPosture::Decoded(plaintext) => {
+                FinalRequestRepresentationOutcome::Decoded(plaintext)
+            }
+            FinalRequestBodyPosture::Reject(rejection) => {
+                FinalRequestRepresentationOutcome::Rejected(rejection.reason())
+            }
+        }
+    }
+
+    /// Stage a plaintext view exactly as the gate stages it, so a test can call
+    /// a plugin's final request-body hook and observe that it inspects the
+    /// decoded document rather than the wire octets.
+    pub fn stage_final_request_body_plaintext(
+        ctx: &mut crate::plugins::RequestContext,
+        plaintext: Vec<u8>,
+    ) {
+        ctx.stage_governed_request_body_plaintext(plaintext);
+    }
+
     /// What the shared representation gate decided for one buffered response,
     /// projected so external tests can assert on it without reaching into the
     /// crate-private posture.

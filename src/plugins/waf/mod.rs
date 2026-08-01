@@ -928,6 +928,75 @@ impl Waf {
         // gated earlier by `should_buffer_request_body`.
         self.config.inspect_binary_body || self.should_inspect_body_content_type(content_type)
     }
+
+    /// Whether the configured request-body policy would actually inspect this
+    /// request's finalized representation.
+    ///
+    /// Exactly the predicate `on_final_request_body_with_context` uses to decide
+    /// whether to scan, factored out so the shared request representation gate
+    /// asks the same question (`GHSA-3973-47g5-4mcx`). Over-claiming here would
+    /// turn benign compressed uploads into `400`s; under-claiming would let an
+    /// encoded body reach the scanner as opaque octets.
+    fn request_body_policy_applies(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+    ) -> bool {
+        self.requires_request_body_buffering()
+            && !self.exemptions.request_short_circuits(ctx)
+            && self
+                .config
+                .body_methods
+                .iter()
+                .any(|method| method.eq_ignore_ascii_case(&ctx.method))
+            && self.request_body_eligible_for_scan(headers.get("content-type").map(String::as_str))
+    }
+
+    /// Whether the configured response-body policy would actually scan this
+    /// response's client-visible representation.
+    fn response_body_policy_applies(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx) && self.response_body_eligible_for_scan(content_type)
+    }
+
+    /// Whether response-header policy is configured and applies to this request.
+    fn response_header_policy_applies(&self, ctx: &RequestContext) -> bool {
+        self.active
+            && self.config.response_inspection
+            && self.compiled.response_header_rules_active
+            && !self.exemptions.request_short_circuits(ctx)
+    }
+}
+
+/// Order-independent digest of a response header map.
+///
+/// Names are lowercased and each `(name, value)` pair is length-prefixed before
+/// being folded in, so neither `HashMap` iteration order nor a `:`/length
+/// ambiguity between adjacent fields can make two different maps digest alike.
+/// Folding is an XOR of per-pair SHA-256 digests: commutative, so it is stable
+/// across iteration orders, and each pair's own digest is still collision-hard.
+///
+/// Used only to answer "did anything change since `after_proxy`?" — it is never
+/// logged, exported, or compared against attacker-supplied input.
+fn response_header_map_digest(headers: &HashMap<String, String>) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut folded = [0u8; 32];
+    for (name, value) in headers {
+        let mut hasher = Sha256::new();
+        let lowered = name.to_ascii_lowercase();
+        hasher.update((lowered.len() as u64).to_le_bytes());
+        hasher.update(lowered.as_bytes());
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+        let digest = hasher.finalize();
+        for (slot, byte) in folded.iter_mut().zip(digest.iter()) {
+            *slot ^= *byte;
+        }
+    }
+    folded
 }
 
 #[async_trait]
@@ -1248,6 +1317,20 @@ impl Plugin for Waf {
         self.requires_request_body_buffering()
     }
 
+    /// Claim the finalized request representation whenever the configured body
+    /// policy would scan it, so the shared request representation gate decodes a
+    /// content coding into plaintext or fails the request closed rather than
+    /// letting this scan run over opaque compressed octets
+    /// (`GHSA-3973-47g5-4mcx`).
+    fn enforces_final_request_body_policy(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> bool {
+        self.request_body_policy_applies(ctx, headers)
+    }
+
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
@@ -1257,17 +1340,20 @@ impl Plugin for Waf {
         if self.active {
             ctx.ensure_waf_metadata_initialized();
         }
-        if !self.requires_request_body_buffering()
-            || self.exemptions.request_short_circuits(ctx)
-            || !self
-                .config
-                .body_methods
-                .iter()
-                .any(|method| method.eq_ignore_ascii_case(&ctx.method))
-            || !self.request_body_eligible_for_scan(headers.get("content-type").map(String::as_str))
-        {
+        if !self.request_body_policy_applies(ctx, headers) {
             return PluginResult::Continue;
         }
+        // Scan the PLAINTEXT the backend will end up parsing, not the wire
+        // octets. `inspectable_final_request_body` returns `body` itself unless
+        // the gate decoded a content coding, and the gate rejected the request
+        // outright if it could not — so reaching here always means these bytes
+        // are the document the policy is configured about. The copy is taken
+        // only on the decoded path (`clamp_body` needs `&mut ctx`, which cannot
+        // coexist with a borrow of the staged view).
+        let decoded_view = ctx
+            .final_request_body_was_decoded()
+            .then(|| ctx.inspectable_final_request_body(body).to_vec());
+        let body: &[u8] = decoded_view.as_deref().unwrap_or(body);
         let (body, truncated) = match self.clamp_body(ctx, BodyDirection::Request, body) {
             Ok(value) => value,
             Err(result) => return result,
@@ -1297,6 +1383,12 @@ impl Plugin for Waf {
         if self.compiled.response_header_rules_active {
             let outcome =
                 self.run_cheap_with_budget(|| self.run_response_header_scan(ctx, response_headers));
+            // Record exactly what this instance scanned. The final client-visible
+            // phase re-asserts policy only if a later hook changed the map, so an
+            // untouched header set is neither rescanned nor rescored
+            // (`GHSA-62jg-v563-4q23`).
+            let digest = response_header_map_digest(response_headers);
+            ctx.waf_response_header_digests.insert(self.instance_id, digest);
             let result = self.finish_scan(ctx, outcome);
             if !matches!(&result, PluginResult::Continue) {
                 return result;
@@ -1400,7 +1492,68 @@ impl Plugin for Waf {
             && self.response_body_eligible_for_scan(content_type)
     }
 
-    async fn on_final_response_body(
+    /// Claim the buffered response so the shared representation gate decodes an
+    /// origin `Content-Encoding` into plaintext — or fails the response closed —
+    /// before any scan reads it (`GHSA-4vqr-427g-5cg7`).
+    ///
+    /// The claim is deliberately narrow on three axes, because claiming is not
+    /// free: it converts an uninspectable representation into a `502`.
+    ///
+    /// * the configured response-body rules must actually scan this media type
+    ///   on this request;
+    /// * the ORIGIN must have declared a content coding
+    ///   ([`crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY`], the pristine
+    ///   pre-`after_proxy` stamp). An identity-coded response is already the
+    ///   plaintext this plugin scans, so there is nothing for the gate to prove
+    ///   and ordinary traffic keeps its pre-existing behavior exactly. Gateway
+    ///   compression is not a reason to claim either: it now runs in the deferred
+    ///   transport-encoding stage, after this plugin has decided;
+    /// * framed gRPC bodies are declined. They are length-prefixed frames rather
+    ///   than a document, the gate's gRPC-Web re-encode rule would reject a
+    ///   translated route wholesale, and their transfer coding is `grpc-encoding`
+    ///   rather than `Content-Encoding` anyway.
+    fn enforces_response_body_policy(
+        &self,
+        ctx: &RequestContext,
+        response_content_type: Option<&str>,
+        _response_body: &[u8],
+    ) -> bool {
+        self.response_body_policy_applies(ctx, response_content_type)
+            && !response_content_type.is_some_and(
+                crate::plugins::utils::body_transform::is_framed_grpc_content_type,
+            )
+            && ctx
+                .metadata
+                .contains_key(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY)
+    }
+
+    /// Over-approximation used before the response `Content-Type` is known.
+    /// Depends only on configuration and request state, as the contract requires.
+    fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
+        self.should_buffer_response_body(ctx)
+    }
+
+    fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {
+        self.response_header_policy_applies(ctx) || self.should_buffer_response_body(ctx)
+    }
+
+    /// The authoritative WAF response decision, over the exact representation
+    /// the client receives.
+    ///
+    /// Two things move here from earlier phases:
+    ///
+    /// * **Header rules.** `after_proxy` runs at priority 2930, before
+    ///   `response_transformer` (4000) can `add`/`update`/`remove`/`rename` the
+    ///   same fields. A rename that carries a backend-controlled value into a
+    ///   protected header used to land after the only enforcing pass
+    ///   (`GHSA-62jg-v563-4q23`). Re-asserting is gated on the map having
+    ///   actually changed, so an untouched header set is not rescored.
+    /// * **Body rules.** The scan previously ran in `on_final_response_body`,
+    ///   after `compression` (4050) had already encoded the body, so it matched
+    ///   gzip/Brotli octets rather than the document
+    ///   (`GHSA-4vqr-427g-5cg7`). This phase runs before transport encoding, and
+    ///   an origin coding was already decoded by the representation gate.
+    async fn finalize_client_visible_response_body(
         &self,
         ctx: &mut RequestContext,
         _response_status: u16,
@@ -1410,6 +1563,25 @@ impl Plugin for Waf {
         if self.active {
             ctx.ensure_waf_metadata_initialized();
         }
+        if self.response_header_policy_applies(ctx) {
+            let digest = response_header_map_digest(response_headers);
+            let unchanged = ctx
+                .waf_response_header_digests
+                .get(&self.instance_id)
+                .is_some_and(|scanned| *scanned == digest);
+            if !unchanged {
+                let outcome = self.run_cheap_with_budget(|| {
+                    self.run_response_header_scan(ctx, response_headers)
+                });
+                ctx.waf_response_header_digests
+                    .insert(self.instance_id, digest);
+                let result = self.finish_scan(ctx, outcome);
+                if !matches!(&result, PluginResult::Continue) {
+                    return result;
+                }
+            }
+        }
+
         if !self.should_buffer_response_body(ctx) {
             return PluginResult::Continue;
         }

@@ -451,7 +451,7 @@ async fn test_response_json_seq_neighbor_type_is_not_validated() {
     let body = b"\x1e{\"id\":1}\n";
     assert_continue(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
             .await,
     );
 }
@@ -468,7 +468,7 @@ async fn test_response_parameter_collision_is_not_validated() {
     );
     assert_continue(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, b"not-json")
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, b"not-json")
             .await,
     );
 }
@@ -493,7 +493,7 @@ async fn test_response_malformed_content_type_is_skipped() {
         headers.insert("content-type".to_string(), content_type.to_string());
         assert_continue(
             plugin
-                .on_final_response_body(&mut ctx, 200, &headers, b"not-json")
+                .finalize_client_visible_response_body(&mut ctx, 200, &headers, b"not-json")
                 .await,
         );
     }
@@ -514,7 +514,7 @@ async fn test_response_parameterized_json_still_validated_502() {
     );
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, br#"{"name":"x"}"#)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, br#"{"name":"x"}"#)
             .await,
         Some(502),
     );
@@ -1864,7 +1864,7 @@ async fn test_response_json_schema_valid() {
     let body = br#"{"id": 1, "name": "Alice"}"#;
     assert_continue(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
             .await,
     );
 }
@@ -1880,7 +1880,7 @@ async fn test_response_json_schema_missing_required_field() {
     let body = br#"{"id": 1}"#;
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
             .await,
         Some(502),
     );
@@ -1894,7 +1894,7 @@ async fn test_response_json_schema_wrong_type() {
     let body = br#"[1, 2, 3]"#;
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
             .await,
         Some(502),
     );
@@ -1908,7 +1908,7 @@ async fn test_response_json_invalid_json() {
     let body = b"not json at all";
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
             .await,
         Some(502),
     );
@@ -1923,7 +1923,7 @@ async fn test_response_json_empty_body_on_200_fails_closed() {
     let headers = response_json_headers();
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, b"")
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, b"")
             .await,
         Some(502),
     );
@@ -1939,7 +1939,7 @@ async fn test_response_protocol_no_content_semantics_are_exempt() {
         let mut ctx = make_response_ctx();
         assert_continue(
             plugin
-                .on_final_response_body(&mut ctx, status, &headers, b"")
+                .finalize_client_visible_response_body(&mut ctx, status, &headers, b"")
                 .await,
         );
     }
@@ -1953,7 +1953,7 @@ async fn test_response_protocol_no_content_semantics_are_exempt() {
     );
     assert_continue(
         plugin
-            .on_final_response_body(&mut head_ctx, 200, &headers, b"")
+            .finalize_client_visible_response_body(&mut head_ctx, 200, &headers, b"")
             .await,
     );
 
@@ -1962,7 +1962,7 @@ async fn test_response_protocol_no_content_semantics_are_exempt() {
     let mut ctx = make_response_ctx();
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 204, &headers, b"[]")
+            .finalize_client_visible_response_body(&mut ctx, 204, &headers, b"[]")
             .await,
         Some(502),
     );
@@ -1976,7 +1976,7 @@ async fn test_response_non_utf8_json_fails_closed_without_echoing_bytes() {
     let mut ctx = make_response_ctx();
     let headers = response_json_headers();
     let result = plugin
-        .on_final_response_body(&mut ctx, 200, &headers, b"{\"a\":\"\xFF\xFE\"}")
+        .finalize_client_visible_response_body(&mut ctx, 200, &headers, b"{\"a\":\"\xFF\xFE\"}")
         .await;
     match result {
         PluginResult::Reject {
@@ -2000,7 +2000,7 @@ async fn test_response_json_non_matching_content_type_skipped() {
     let body = b"not json";
     assert_continue(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
             .await,
     );
 }
@@ -2018,7 +2018,7 @@ async fn test_response_required_fields_valid() {
     let body = br#"{"status": "ok", "data": []}"#;
     assert_continue(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
             .await,
     );
 }
@@ -2034,7 +2034,7 @@ async fn test_response_required_fields_missing() {
     let body = br#"{"status": "ok"}"#;
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
             .await,
         Some(502),
     );
@@ -2053,7 +2053,7 @@ async fn test_response_xml_valid() {
     let body = b"<root><item>text</item></root>";
     assert_continue(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
             .await,
     );
 }
@@ -2069,7 +2069,7 @@ async fn test_response_xml_invalid() {
     let body = b"<root><item></root>";
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
             .await,
         Some(502),
     );
@@ -2087,7 +2087,7 @@ async fn test_response_xml_required_elements() {
     let body = b"<root><data>text</data></root>";
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
             .await,
         Some(502),
     );
@@ -2108,7 +2108,7 @@ async fn test_on_final_response_body_enforces_xml_required_elements_without_resp
     let body = b"<root><data>text</data></root>";
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
             .await,
         Some(502),
     );
@@ -2124,7 +2124,7 @@ async fn test_on_final_response_body_accepts_present_xml_required_elements_witho
     let body = b"<root><result>ok</result></root>";
     assert_continue(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
             .await,
     );
 }
@@ -2159,14 +2159,14 @@ async fn test_both_request_and_response_validation() {
     let resp_headers = response_json_headers();
     assert_continue(
         plugin
-            .on_final_response_body(&mut resp_ctx, 200, &resp_headers, br#"{"result": "ok"}"#)
+            .finalize_client_visible_response_body(&mut resp_ctx, 200, &resp_headers, br#"{"result": "ok"}"#)
             .await,
     );
 
     // Response with missing field is rejected (502)
     assert_reject(
         plugin
-            .on_final_response_body(&mut resp_ctx, 200, &resp_headers, br#"{"other": "value"}"#)
+            .finalize_client_visible_response_body(&mut resp_ctx, 200, &resp_headers, br#"{"other": "value"}"#)
             .await,
         Some(502),
     );
@@ -2190,7 +2190,7 @@ async fn test_response_json_schema_pattern_valid() {
     let body = br#"{"code": "ABC-123"}"#;
     assert_continue(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
             .await,
     );
 }
@@ -2208,7 +2208,7 @@ async fn test_response_json_schema_pattern_invalid() {
     let body = br#"{"code": "invalid"}"#;
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
             .await,
         Some(502),
     );
@@ -2228,7 +2228,7 @@ async fn test_response_no_validation_skips() {
     let body = b"totally invalid json!!!";
     assert_continue(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
             .await,
     );
 }
@@ -2569,7 +2569,7 @@ async fn test_protobuf_compressed_gzip_response_valid() {
     headers.insert("content-type".to_string(), "application/grpc".to_string());
     assert_continue(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, &frame)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, &frame)
             .await,
     );
 }
@@ -2610,13 +2610,13 @@ async fn test_protobuf_empty_response_transport_body_fails_closed() {
 
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, b"")
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, b"")
             .await,
         Some(502),
     );
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, b"\x00\x00")
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, b"\x00\x00")
             .await,
         Some(502),
     );
@@ -2626,7 +2626,7 @@ async fn test_protobuf_empty_response_transport_body_fails_closed() {
     ok_status.insert("grpc-status".to_string(), "0".to_string());
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 200, &ok_status, b"")
+            .finalize_client_visible_response_body(&mut ctx, 200, &ok_status, b"")
             .await,
         Some(502),
     );
@@ -2637,7 +2637,7 @@ async fn test_protobuf_empty_response_transport_body_fails_closed() {
         hostile.insert("grpc-status".to_string(), bad.to_string());
         assert_reject(
             plugin
-                .on_final_response_body(&mut ctx, 200, &hostile, b"")
+                .finalize_client_visible_response_body(&mut ctx, 200, &hostile, b"")
                 .await,
             Some(502),
         );
@@ -2649,7 +2649,7 @@ async fn test_protobuf_empty_response_transport_body_fails_closed() {
     trailers_only.insert("grpc-status".to_string(), "5".to_string());
     assert_continue(
         plugin
-            .on_final_response_body(&mut ctx, 200, &trailers_only, b"")
+            .finalize_client_visible_response_body(&mut ctx, 200, &trailers_only, b"")
             .await,
     );
 }
@@ -2730,7 +2730,7 @@ async fn test_protobuf_response_per_method_descriptor_resolved_from_ctx_path() {
     // Note: no `:path` in response_headers — that's the bug being guarded against.
     assert_continue(
         plugin
-            .on_final_response_body(&mut ctx, 200, &response_headers, &frame)
+            .finalize_client_visible_response_body(&mut ctx, 200, &response_headers, &frame)
             .await,
     );
 }
@@ -2750,7 +2750,7 @@ async fn test_protobuf_response_per_method_invalid_body_rejected() {
     response_headers.insert("content-type".to_string(), "application/grpc".to_string());
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 200, &response_headers, &frame)
+            .finalize_client_visible_response_body(&mut ctx, 200, &response_headers, &frame)
             .await,
         Some(502),
     );
@@ -2777,7 +2777,7 @@ async fn test_protobuf_response_uses_grpc_full_method_metadata_when_present() {
     response_headers.insert("content-type".to_string(), "application/grpc".to_string());
     assert_continue(
         plugin
-            .on_final_response_body(&mut ctx, 200, &response_headers, &frame)
+            .finalize_client_visible_response_body(&mut ctx, 200, &response_headers, &frame)
             .await,
     );
 }
@@ -2831,7 +2831,7 @@ async fn test_protobuf_valid_response() {
     headers.insert("content-type".to_string(), "application/grpc".to_string());
     assert_continue(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, &frame)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, &frame)
             .await,
     );
 }
@@ -2850,7 +2850,7 @@ async fn test_protobuf_invalid_response() {
     headers.insert("content-type".to_string(), "application/grpc".to_string());
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, &frame)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, &frame)
             .await,
         Some(502),
     );
@@ -2892,7 +2892,7 @@ async fn test_protobuf_missing_descriptor_fails_closed_for_applicable_request_an
     );
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, &[0, 0, 0, 0, 0])
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, &[0, 0, 0, 0, 0])
             .await,
         Some(502),
     );
@@ -3935,7 +3935,7 @@ async fn local_pointer_into_literal_container_enables_response_unique_items_poli
     let body = br#"[{"left": 1, "right": 2}, {"right": 2, "left": 1}]"#;
     assert_reject(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
             .await,
         Some(502),
     );
@@ -4221,7 +4221,7 @@ async fn json_schema_property_named_id_compiles_for_request_and_response() {
     let headers = response_json_headers();
     assert_continue(
         response_plugin
-            .on_final_response_body(&mut ctx, 200, &headers, br#"{"id": 7}"#)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, br#"{"id": 7}"#)
             .await,
     );
 }
@@ -4638,7 +4638,7 @@ async fn schema_violations_do_not_echo_request_or_response_values() {
     let headers = response_json_headers();
     let body = br#"{"token": "upstream-secret"}"#;
     let result = response_plugin
-        .on_final_response_body(&mut ctx, 200, &headers, body)
+        .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
         .await;
     let body = reject_body(result);
     assert!(
@@ -4723,7 +4723,7 @@ async fn exact_xml_document_text_preserves_outer_whitespace_semantics() {
     let headers = response_xml_headers();
     assert_continue(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, legal.as_bytes())
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, legal.as_bytes())
             .await,
     );
 
@@ -4738,7 +4738,7 @@ async fn exact_xml_document_text_preserves_outer_whitespace_semantics() {
         let headers = response_xml_headers();
         assert_reject(
             plugin
-                .on_final_response_body(&mut ctx, 200, &headers, body.as_bytes())
+                .finalize_client_visible_response_body(&mut ctx, 200, &headers, body.as_bytes())
                 .await,
             Some(502),
         );
@@ -4765,7 +4765,7 @@ async fn external_xml_identifiers_are_rejected_for_request_and_response() {
         let mut ctx = make_response_ctx();
         let headers = response_xml_headers();
         let result = plugin
-            .on_final_response_body(&mut ctx, 200, &headers, body.as_bytes())
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body.as_bytes())
             .await;
         assert_reject(result, Some(502));
     }
@@ -4789,7 +4789,7 @@ async fn internal_dtd_and_quoted_keyword_text_remain_valid() {
         let headers = response_xml_headers();
         assert_continue(
             plugin
-                .on_final_response_body(&mut ctx, 200, &headers, body.as_bytes())
+                .finalize_client_visible_response_body(&mut ctx, 200, &headers, body.as_bytes())
                 .await,
         );
     }
@@ -4862,7 +4862,7 @@ async fn malformed_response_xml_does_not_echo_the_upstream_body() {
     let headers = response_xml_headers();
     let body = b"<approved/><secret>upstream-secret</secret>";
     let result = plugin
-        .on_final_response_body(&mut ctx, 200, &headers, body)
+        .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
         .await;
     let body = reject_body(result);
     assert!(
@@ -5229,14 +5229,14 @@ async fn proto2_initialization_applies_to_per_method_descriptors() {
     let headers = grpc_response_headers();
     let mut ctx = grpc_ctx();
     let result = plugin
-        .on_final_response_body(&mut ctx, 200, &headers, &frame)
+        .finalize_client_visible_response_body(&mut ctx, 200, &headers, &frame)
         .await;
     assert_reject(result, Some(502));
 
     let frame = grpc_frame(&pb_str_field(1, "OK"));
     let mut ctx = grpc_ctx();
     let result = plugin
-        .on_final_response_body(&mut ctx, 200, &headers, &frame)
+        .finalize_client_visible_response_body(&mut ctx, 200, &headers, &frame)
         .await;
     assert_continue(result);
 }
@@ -5426,7 +5426,7 @@ async fn duplicate_member_in_response_body_is_rejected() {
 
     let mut ctx = make_response_ctx();
     let result = plugin
-        .on_final_response_body(
+        .finalize_client_visible_response_body(
             &mut ctx,
             200,
             &headers,
@@ -5438,7 +5438,7 @@ async fn duplicate_member_in_response_body_is_rejected() {
     let mut clean_ctx = make_response_ctx();
     assert_continue(
         plugin
-            .on_final_response_body(&mut clean_ctx, 200, &headers, br#"{"role":"safe"}"#)
+            .finalize_client_visible_response_body(&mut clean_ctx, 200, &headers, br#"{"role":"safe"}"#)
             .await,
     );
 }

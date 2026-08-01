@@ -136,12 +136,22 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 10. transform_response_body │ Buffered presentation rewrites
+│ 10. transform_response_body │ Buffered presentation rewrites (semantic stage)
 └────────────┬────────────┘
              │
              ▼
+┌─────────────────────────────────────┐
+│ 10b. finalize_client_visible_response_body │ Authoritative output policy
+└────────────┬────────────────────────┘        over the exact client bytes
+             │
+             ▼
+┌─────────────────────────────────────┐
+│ 10c. transform_response_body │ Transport encoding stage (compression)
+└────────────┬────────────────────────┘
+             │
+             ▼
 ┌─────────────────────────┐
-│ 11. on_final_response_body │ Buffered body validation/storage
+│ 11. on_final_response_body │ Buffered body storage/size accounting
 └────────────┬────────────┘
              │
              ▼
@@ -453,6 +463,94 @@ Peak accounting follows from (2): while a rewrite runs, the body being read from
 When a plugin returns a replacement body from `transform_response_body`, the core first removes representation metadata that can no longer describe the client-visible bytes: range fields, ETag/Last-Modified validators, content digests/checksums, and content-bound signatures. It then calls that plugin's `on_response_body_transformed` callback before the next transform, allowing the plugin to attach metadata it recomputed for the replacement representation. Neither step runs when the transform returns `None`, so unmodified responses retain their original semantics — with one exception: a body the representation gate **decoded** has already had its client-visible bytes changed (encoded in, identity out), so that same metadata invalidation is applied at the decode itself, whether or not a later rule matches. Otherwise a decoded body no rule happened to change would be served as identity bytes carrying the origin's validator for the encoded ones. `206 Partial Content` and `226 IM Used` responses that no configured body policy claims skip provider normalization and presentation transforms entirely: the buffered bytes are only a selected range or delta, so Ferrum cannot rewrite them into a truthful full representation merely by changing headers or status. When a configured body policy *does* claim such a response, skipping the transform would silently forward protected bytes, so the representation gate described below rejects it instead — see [Buffered response representation gate](#buffered-response-representation-gate). Transform-dependent header hooks also decline these statuses: compression does not attach `Content-Encoding`, gRPC-Web does not relabel native gRPC bytes or expose transformed trailers, and SSE does not force a non-SSE representation into event-stream headers when wrapping cannot run. Inspection hooks still run. If an enforcing policy detects content whose safe disposition requires redaction, it rejects the response instead of forwarding the original bytes with false redaction telemetry. This lifecycle rule is shared by buffered H1, H2, H3, gRPC, and synthetic/rejection response paths rather than delegated to individual transformer implementations.
 
 Gateway-generated synthetic responses normally skip the body pipeline when they contain zero bytes. A validator whose contract distinguishes an empty representation from a valid one can opt into zero-byte processing; `openapi_validator` does so for matching response contracts, keeping empty synthetic and buffered backend responses under the same final-schema rule. HEAD and 1xx/204/205/304 responses retain their no-body semantics and do not enter this path.
+
+### Authoritative backend-visible request representation phase
+
+Immediately before the first `on_final_request_body*` hook — on every dispatch
+ladder (H1/H2 terminal and ordinary preparation, the native-gRPC branch, native
+H3, the H3 cross-protocol bridge) — one shared gate establishes the plaintext a
+final request-body policy is entitled to inspect (`GHSA-3973-47g5-4mcx`).
+
+A plugin opts in by returning `true` from `enforces_final_request_body_policy`
+for a given request. `waf`, `body_validator`, and `graphql` do so whenever their
+configured rules would actually inspect the finalized representation.
+
+- **Nothing claims the request, or the finalized bytes are identity-coded.**
+  Nothing changes. Ordinary compressed uploads keep flowing to backends that
+  understand them.
+- **A policy claims a request whose finalized `Content-Encoding` names a
+  transforming coding.** The ordered `#content-coding` list (RFC 9110 §8.4) is
+  parsed, each supported coding is decoded in reverse application order, and the
+  plaintext is staged for the claiming hooks. Anything that cannot be reduced to
+  one complete plaintext document is rejected with a fixed `400` and a
+  low-cardinality reason (`unsupported_content_coding`,
+  `malformed_content_coding`, `too_many_content_codings`,
+  `undecodable_content_coding`) that never echoes a coding token or a body byte.
+
+Bounds: at most 4 stacked codings; at most the smaller of 10 MiB and any active
+route request-body ceiling per layer and in aggregate; at most 1024:1 expansion
+per layer and end-to-end. `gzip`, `x-gzip`, and `br` are supported; `identity`
+alone is a no-op and `identity` mixed with a transforming coding is malformed.
+
+The decoded bytes are an **inspection view only** — the backend still receives
+the exact octets and headers the client sent, so `Content-Length`,
+`Content-Encoding`, and request signing stay intact. Claiming plugins read the
+view through `RequestContext::inspectable_final_request_body`, which returns the
+finalized bytes themselves whenever no decode was owed.
+
+This phase is deliberately independent of the optional `compression` plugin. When
+`compression` is configured with `decompress_request: true` it has already
+rewritten the body and stripped `Content-Encoding` during
+`normalize_buffered_request_body_before_before_proxy`, so this gate sees an
+identity representation and does no work; when it is absent, disabled, or scoped
+elsewhere, the security policy still gets plaintext or the request is refused.
+An enforcing policy never silently depends on that composition.
+
+### Authoritative final client-visible response phase
+
+The buffered body-transform phase runs in **two stages**, with an authoritative
+output-policy phase between them (`GHSA-62jg-v563-4q23`,
+`GHSA-4vqr-427g-5cg7`). Configured plugin order is preserved inside each stage:
+
+1. **Semantic stage.** Every ordinary representation rewrite — `grpc_web`
+   re-framing, `mcp_gateway` reverse mapping, `response_transformer` body rules
+   (4000), `ai_response_guard` redaction (4075).
+2. **`finalize_client_visible_response_body`.** A rejecting, non-rewriting phase
+   over the exact bytes and header map the client will receive. `waf` (response
+   header rules plus the response body scan), `body_validator` (response
+   validation), and `ai_response_guard` (undischarged-redaction check plus a
+   residual re-detection) decide here.
+3. **Transport-encoding stage.** Plugins declaring
+   `applies_response_transport_encoding` — `compression` (4050) — generate the
+   wire representation last, after every security decision and rewrite.
+
+Why the split matters:
+
+- WAF response-header rules previously ran only in `after_proxy` at priority
+  2930, so a later `response_transformer` `rename` could create a prohibited
+  client-visible header after the only enforcing pass. The re-assertion is gated
+  on an instance-scoped digest of the header map, so an untouched header set is
+  neither rescanned nor rescored.
+- `compression` at 4050 previously encoded the body before WAF's and
+  `body_validator`'s final response hooks and before `ai_response_guard`'s
+  redaction transform: the WAF matched gzip/Brotli octets, the validator read
+  them as non-UTF-8 and skipped, and a promised redaction could not parse them
+  while its metadata already claimed one.
+- `ai_response_guard` inspects at phase 9, before `response_transformer`. Its
+  residual scan here is what binds redaction metadata to a rewrite that actually
+  happened *and* to the representation actually delivered; a `redact`
+  disposition with nothing left to discharge it becomes a rejection, while
+  `warn` still passes through.
+
+The phase also runs when the transform phase is skipped (an unclaimed `206`/`226`
+representation), because it is non-rewriting and must still decide.
+
+`waf`, `body_validator`, and `ai_response_guard` additionally claim an
+**origin-encoded** buffered response through `enforces_response_body_policy`, so
+the gate below decodes it to plaintext or fails it closed. The claim is narrow by
+design: only when the configured rules would inspect this media type, only when
+the pristine pre-`after_proxy` snapshot says the origin declared a content
+coding, and never for framed gRPC bodies.
 
 ### Buffered response representation gate
 
@@ -872,14 +970,14 @@ Given all built-in plugins enabled, the execution order is:
 | 29 | `ai_transcript_audit` | 2740 | before_proxy, on_final_request_body, on_final_response_body, on_response_committed, response_stream_inspector, on_response_stream_terminated, log |
 | 30 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
 | 31 | `ws_message_size_limiting` | 2810 | parser-level frame/message limits |
-| 32 | `graphql` | 2850 | before_proxy |
+| 32 | `graphql` | 2850 | before_proxy, on_final_request_body |
 | 33 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
 | 34 | `ws_rate_limiting` | 2910 | on_ws_frame, on_ws_reassembly_frames |
 | 35 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 36 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body, on_final_request_body |
-| 37 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body, on_stream_connect, on_udp_datagram |
+| 37 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, finalize_client_visible_response_body, on_stream_connect, on_udp_datagram |
 | 38 | `fault_injection` | 2940 | before_proxy, on_stream_connect, on_udp_datagram |
-| 39 | `body_validator` | 2950 | before_proxy, on_final_request_body, after_proxy, on_final_response_body |
+| 39 | `body_validator` | 2950 | before_proxy, on_final_request_body, after_proxy, finalize_client_visible_response_body |
 | 40 | `openapi_validator` | 2960 | validate_client_request_body_contract, before_proxy, on_final_request_body, after_proxy, on_final_response_body |
 | 41 | `ai_semantic_firewall` | 2968 | before_proxy, on_final_request_body, on_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
 | 42 | `ai_request_guard` | 2975 | before_proxy, transform_request_body, on_final_request_body |
@@ -902,7 +1000,7 @@ Given all built-in plugins enabled, the execution order is:
 | 59 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body_with_context, on_final_request_body_with_context |
 | 60 | `ai_semantic_cache` | 4057 | on_final_request_body_with_context, after_proxy, on_final_response_body |
 | 61 | `ai_federation` | 4060 | finalized request egress (HTTP only) |
-| 62 | `ai_response_guard` | 4075 | after_proxy, on_response_body, transform_response_body, on_final_response_body |
+| 62 | `ai_response_guard` | 4075 | after_proxy, on_response_body, transform_response_body, finalize_client_visible_response_body |
 | 63 | `security_headers` | 4080 | after_proxy, initial response-header boundary |
 | 64 | `ai_token_metrics` | 4100 | on_response_body |
 | 65 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |

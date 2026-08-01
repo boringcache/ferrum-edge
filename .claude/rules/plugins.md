@@ -186,6 +186,21 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     handling, and response stream inspector/normalizer selection. First matching
     instance claims; `fail_on_missing_model` / `fail_on_no_matching_provider`
     still decide an UNCLAIMED request in normal plugin order.
+5c. `evaluate_final_request_body_posture`: the AUTHORITATIVE backend-visible
+    request representation phase, run once by
+    `run_final_request_body_hooks_with_provenance` immediately before step 6 on
+    every dispatch ladder (`GHSA-3973-47g5-4mcx`). A plugin claims a request with
+    `enforces_final_request_body_policy` (`waf`, `body_validator`, `graphql`);
+    for a claimed request whose finalized `Content-Encoding` names a transforming
+    coding, the ordered `#content-coding` list is parsed and decoded in reverse
+    application order into a staged PLAINTEXT INSPECTION VIEW, and anything
+    unsupported / malformed / over-4-layers / over-limit / over-1024:1 is a fixed
+    `400` with a low-cardinality reason that never echoes a token or a body byte.
+    The backend still receives the exact client octets and headers — the decode
+    is never installed. Claiming hooks MUST read through
+    `RequestContext::inspectable_final_request_body`; reading the raw slice
+    reopens the bypass. This phase is independent of `compression`: an enforcing
+    policy may not silently depend on a separately configured decompressor.
 6. `on_final_request_body`: body validator, gRPC-Web validation, WAF body rules, OpenAPI request schema (backend-final fallback), post-transform request-size ceiling, `ai_prompt_compressor` staged marker-sanitization rejection (4055), and `ai_semantic_cache` exact/semantic lookup (4057). `ai_semantic_cache` looks up here — not in `before_proxy` — so its replay partition binds the finalized outbound headers/query/destination and fully transformed request body, and a hit cannot bypass fail-closed final-body policy.
 6b. `dispatch_finalized_request_egress`: irreversible outbound request egress
     (`request_mirror`, `serverless_function`, `ai_federation`) over the immutable
@@ -231,6 +246,25 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
       over-ceiling replacement is refused during construction. Adding a
       `Some`-returning producer hook to a built-in means adding it to that table
       and building through the bounded sink.
+10b. `finalize_client_visible_response_body`: the AUTHORITATIVE final
+    client-visible response phase (`GHSA-62jg-v563-4q23`,
+    `GHSA-4vqr-427g-5cg7`). Phase 10 is SPLIT in two around it: every semantic
+    transform first, then this phase, then the TRANSPORT-ENCODING stage
+    (`applies_response_transport_encoding` — only `compression`). Rejecting and
+    NON-rewriting; a plugin that must rewrite does so in `transform_response_body`
+    and verifies the result here. `waf` (response header re-assertion gated on an
+    instance-scoped header digest, plus the response body scan), `body_validator`
+    (response validation), and `ai_response_guard` (undischarged-redaction check
+    plus a residual re-detection; `warn` still passes through) own it. It also
+    runs when the transform phase is skipped for an unclaimed `206`/`226`, on both
+    the backend buffered lifecycle and the synthetic/short-circuit lifecycle. Do
+    not move gateway compression back ahead of it, and do not move these
+    decisions back into `on_final_response_body` — that hook runs after transport
+    encoding. `waf`/`body_validator`/`ai_response_guard` additionally claim an
+    ORIGIN-ENCODED response through `enforces_response_body_policy` (narrow: only
+    when their rules apply, only on the pristine `ORIGIN_ENCODED_RESPONSE`
+    stamp, never for framed gRPC) so the representation gate decodes it or fails
+    it closed.
 11. `on_final_response_body`: dedup/cache store, size limiting, response cache predictor
 12. `log`: stdout/statsd/http/tcp/kafka/loki/udp/ws/tx_debug/prometheus/chargeback
 13. `on_ws_frame`: WS size, rate, and frame logging

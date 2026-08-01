@@ -138,7 +138,15 @@ pub struct GraphqlPlugin {
     epoch_base: Instant,
     last_periodic_sweep_secs: AtomicU64,
     has_any_config: bool,
+    /// Process-unique identity for this constructed instance, used to scope the
+    /// per-request "already evaluated this envelope" marker so multiple
+    /// configured `graphql` instances cannot consume each other's decision.
+    instance_id: u64,
 }
+
+/// Source of [`GraphqlPlugin::instance_id`]. Process-unique and never persisted;
+/// it exists only to key per-request state for the lifetime of one request.
+static NEXT_GRAPHQL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl GraphqlPlugin {
     #[allow(dead_code)] // direct/test construction; production factory supplies the config id
@@ -245,6 +253,7 @@ impl GraphqlPlugin {
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
             has_any_config,
+            instance_id: NEXT_GRAPHQL_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -1455,6 +1464,14 @@ impl Plugin for GraphqlPlugin {
         GRAPHQL_PROTOCOLS
     }
 
+    /// GraphQL policy now also decides in the final request-body phase, over the
+    /// exact backend-visible envelope. Composition admission therefore refuses to
+    /// pair it with a plugin that egresses the request before finalization, the
+    /// same rule `waf` and `body_validator` carry (GHSA-4vr5-4wm3-x5xv).
+    fn enforces_finalized_request_policy(&self) -> bool {
+        self.has_any_config
+    }
+
     fn tracked_keys_count(&self) -> Option<usize> {
         Some(self.limiter.tracked_keys_count())
     }
@@ -1511,7 +1528,132 @@ impl Plugin for GraphqlPlugin {
             }
         };
 
-        let parsed: Value = match serde_json::from_str(body) {
+        let body = body.as_bytes().to_vec();
+        ctx.graphql_request_envelope_hashes
+            .insert(self.instance_id, graphql_envelope_digest(&body));
+        self.enforce_graphql_envelope(ctx, &body).await
+    }
+
+    /// Re-evaluate the envelope the backend will actually receive.
+    ///
+    /// `before_proxy` (priority 2850) is the only pass GraphQL policy used to
+    /// get, and `request_transformer` (3000) applies its `add`/`update`/
+    /// `remove`/`rename` body rules afterwards. A rename of an
+    /// attacker-controlled `pending_query` onto `query`, or a replacement of
+    /// `operationName`, therefore produced a backend-visible operation that was
+    /// never parsed for depth, complexity, aliases, or introspection, and was
+    /// never charged against the configured per-type / per-operation budgets
+    /// (`GHSA-3xrr-4h3f-89pc`).
+    ///
+    /// Work is skipped for an UNCHANGED envelope through an instance-scoped
+    /// digest, so the ordinary untransformed request neither re-parses its query
+    /// nor spends a second rate-limit token. A CHANGED envelope is a different
+    /// operation and is charged as one — the earlier charge belonged to the
+    /// document the gateway was shown, this one to the document it dispatches.
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        if !self.has_any_config {
+            return PluginResult::Continue;
+        }
+        // Only a request this instance already admitted has a recorded digest.
+        // Its absence means `before_proxy` never ran or already rejected, so
+        // there is nothing to re-decide here.
+        let Some(previous) = ctx
+            .graphql_request_envelope_hashes
+            .get(&self.instance_id)
+            .copied()
+        else {
+            return PluginResult::Continue;
+        };
+
+        // Inspect the plaintext: `inspectable_final_request_body` returns `body`
+        // itself unless the shared request representation gate decoded a content
+        // coding, and a claimed representation it could not decode never reaches
+        // this hook (`GHSA-3973-47g5-4mcx`).
+        let envelope = ctx.inspectable_final_request_body(body).to_vec();
+        if graphql_envelope_digest(&envelope) == previous {
+            return PluginResult::Continue;
+        }
+
+        // The dispatched representation must still be an inspectable GraphQL
+        // JSON envelope. A transform that turned it into something else removed
+        // the gateway's ability to enforce, which is a rejection rather than a
+        // pass-through.
+        if !headers
+            .get("content-type")
+            .is_some_and(|ct| is_graphql_json_content_type(ct))
+        {
+            return reject_uninspectable_transport(
+                "GraphQL request uses an unsupported content type; \
+                 only JSON content types are inspectable",
+            );
+        }
+        if envelope.is_empty() {
+            return reject_uninspectable_transport(
+                "GraphQL request body is missing or empty \
+                 and cannot be inspected",
+            );
+        }
+        ctx.graphql_request_envelope_hashes
+            .insert(self.instance_id, graphql_envelope_digest(&envelope));
+        self.enforce_graphql_envelope(ctx, &envelope).await
+    }
+
+    fn needs_final_request_body_context(&self) -> bool {
+        self.has_any_config
+    }
+
+    /// Claim the finalized envelope so the shared request representation gate
+    /// hands this plugin plaintext for a compressed GraphQL upload, or fails the
+    /// request closed (`GHSA-3973-47g5-4mcx`).
+    fn enforces_final_request_body_policy(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> bool {
+        self.has_any_config
+            && ctx
+                .graphql_request_envelope_hashes
+                .contains_key(&self.instance_id)
+            && headers
+                .get("content-type")
+                .is_some_and(|ct| is_graphql_json_content_type(ct))
+    }
+}
+
+/// SHA-256 over one GraphQL request envelope.
+///
+/// Used only to answer "is the dispatched envelope the one already parsed and
+/// charged?". It is never logged, exported, or compared against
+/// attacker-supplied input; SHA-256 is used rather than a fast non-cryptographic
+/// hash because a collision would let a transformed operation reuse the admitted
+/// one's decision.
+fn graphql_envelope_digest(envelope: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(envelope);
+    hasher.finalize().into()
+}
+
+impl GraphqlPlugin {
+    /// Parse one GraphQL envelope and apply the complete structural,
+    /// introspection, alias, complexity, selection, and rate policy to the
+    /// operation it selects.
+    ///
+    /// Shared by `before_proxy` and the final request-body re-check so the
+    /// operation actually dispatched is governed by exactly the same rules as
+    /// the one the client first presented.
+    async fn enforce_graphql_envelope(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+    ) -> PluginResult {
+        let parsed: Value = match serde_json::from_slice(body) {
             Ok(v) => v,
             Err(_) => {
                 debug!("graphql: request body is not valid JSON");

@@ -1327,3 +1327,131 @@ async fn test_deep_non_cyclic_fragment_chain_is_bounded() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
+
+// ── Final backend-visible envelope re-evaluation (GHSA-3xrr-4h3f-89pc) ──
+
+/// The exact envelope `before_proxy` inspected must not be parsed or charged a
+/// second time in the final request-body phase.
+#[tokio::test]
+async fn unchanged_envelope_is_not_re_evaluated_in_the_final_phase() {
+    let plugin = create_plugin("graphql", &json!({ "max_depth": 3 }))
+        .unwrap()
+        .unwrap();
+    let mut ctx = create_graphql_context("{ a { b } }", None);
+    let mut headers = make_graphql_headers();
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let depth_after_before_proxy = ctx.metadata.get("graphql_depth").cloned();
+
+    let envelope = ctx.metadata.get("request_body").cloned().unwrap();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, envelope.as_bytes())
+        .await;
+
+    assert_continue(result);
+    assert_eq!(ctx.metadata.get("graphql_depth").cloned(), depth_after_before_proxy);
+}
+
+/// A request transform that replaces `query` with a deeper document after
+/// `before_proxy` allowed the original must be caught over the dispatched
+/// envelope.
+#[tokio::test]
+async fn transformed_envelope_is_re_evaluated_against_the_depth_limit() {
+    let plugin = create_plugin("graphql", &json!({ "max_depth": 2 }))
+        .unwrap()
+        .unwrap();
+    let mut ctx = create_graphql_context("{ a }", None);
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let transformed = json!({ "query": "{ a { b { c { d { e } } } } }" }).to_string();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+        .await;
+
+    assert_reject(result, Some(400));
+}
+
+/// The same hazard through introspection: a rename can install an introspecting
+/// document after the policy allowed an ordinary one.
+#[tokio::test]
+async fn transformed_envelope_is_re_evaluated_against_introspection_policy() {
+    let plugin = create_plugin("graphql", &json!({ "introspection_allowed": false }))
+        .unwrap()
+        .unwrap();
+    let mut ctx = create_graphql_context("{ user { id } }", None);
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let transformed = json!({ "query": "{ __schema { types { name } } }" }).to_string();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+        .await;
+
+    assert_reject(result, Some(403));
+}
+
+/// A transform that destroys the inspectable envelope is a rejection, not a
+/// pass-through.
+#[tokio::test]
+async fn transformed_envelope_that_is_not_json_fails_closed() {
+    let plugin = create_plugin("graphql", &json!({ "max_depth": 5 }))
+        .unwrap()
+        .unwrap();
+    let mut ctx = create_graphql_context("{ a }", None);
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, b"not json at all")
+        .await;
+
+    assert_reject(result, Some(400));
+}
+
+/// A request this instance never admitted has no recorded envelope digest, so
+/// the final phase stays inert rather than inventing a decision.
+#[tokio::test]
+async fn final_phase_is_inert_without_a_before_proxy_decision() {
+    let plugin = create_plugin("graphql", &json!({ "max_depth": 1 }))
+        .unwrap()
+        .unwrap();
+    let mut ctx = create_graphql_context("{ a { b { c } } }", None);
+    let headers = make_graphql_headers();
+
+    let envelope = ctx.metadata.get("request_body").cloned().unwrap();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, envelope.as_bytes())
+        .await;
+
+    assert_continue(result);
+}
+
+/// Two configured instances each keep their own envelope marker, so one cannot
+/// consume the other's decision.
+#[tokio::test]
+async fn multiple_instances_track_their_own_envelope_decisions() {
+    let permissive = create_plugin("graphql", &json!({ "max_depth": 10 }))
+        .unwrap()
+        .unwrap();
+    let strict = create_plugin("graphql", &json!({ "max_depth": 2 }))
+        .unwrap()
+        .unwrap();
+    let mut ctx = create_graphql_context("{ a }", None);
+    let mut headers = make_graphql_headers();
+    assert_continue(permissive.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(strict.before_proxy(&mut ctx, &mut headers).await);
+
+    let transformed = json!({ "query": "{ a { b { c { d } } } }" }).to_string();
+    assert_continue(
+        permissive
+            .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+            .await,
+    );
+    assert_reject(
+        strict
+            .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+            .await,
+        Some(400),
+    );
+}

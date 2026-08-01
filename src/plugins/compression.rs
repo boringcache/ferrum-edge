@@ -2064,6 +2064,25 @@ impl Plugin for CompressionPlugin {
         }
     }
 
+    /// Gateway response compression is TRANSPORT encoding, not a semantic
+    /// rewrite, so the buffered transform phase defers it behind every semantic
+    /// transform and behind the authoritative final client-visible body policy
+    /// phase.
+    ///
+    /// Priority 4050 previously put this encode ahead of `waf`'s and
+    /// `body_validator`'s final response scans and ahead of
+    /// `ai_response_guard`'s redaction transform (4075): the WAF then scanned
+    /// gzip/Brotli octets, the validator read them as non-UTF-8 and skipped
+    /// JSON/XML validation, and the guard's redactor could not parse them while
+    /// its metadata already claimed a redaction (`GHSA-4vqr-427g-5cg7`).
+    ///
+    /// Nothing downstream re-reads this output: the encode is the last thing that
+    /// touches the body before publication, and `after_proxy` still owns the
+    /// `Content-Encoding` / `Vary` commitment that describes it.
+    fn applies_response_transport_encoding(&self) -> bool {
+        true
+    }
+
     async fn transform_response_body(
         &self,
         _body: &[u8],
