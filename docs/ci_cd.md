@@ -16,15 +16,15 @@ Ferrum Edge includes comprehensive CI/CD pipelines for automated testing, buildi
 
 ## Pipeline Overview
 
-The publish-critical flows are `ci.yml` and `release.yml`: CI validates PRs and
-`main`, then publishes `latest` artifacts from `main`; Release publishes
-versioned artifacts from `v*` tags. Additional workflows provide coverage,
-scheduled dependency governance, live datapath/conformance labs, manual
-benchmark suites, and repository maintenance automation.
+The publish-critical flows are `ci.yml` and `release.yml`: CI validates PRs,
+merge-queue groups, and `main`, then publishes `latest` artifacts from `main`;
+Release publishes versioned artifacts from `v*` tags. Additional workflows
+provide coverage, scheduled dependency governance, live datapath/conformance
+labs, manual benchmark suites, and repository maintenance automation.
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| **CI** (`ci.yml`) | Pull Requests, push to `main` | Required validation for PRs and `main`; latest binaries and Docker images after `main` validation |
+| **CI** (`ci.yml`) | Pull Requests, `merge_group`, push to `main` | Required validation for PRs, merge-queue groups, and `main`; latest binaries and Docker images after `main` validation |
 | **Release** (`release.yml`) | Push tag matching `v*` | Validate the tagged SHA, then publish versioned binaries, GitHub release, and Docker tags |
 
 ## Workflow Inventory
