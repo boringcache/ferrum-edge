@@ -20,15 +20,13 @@ use crate::tls::acme::{
 };
 use crate::tls::lease::{RenewalLeaseKeeper, TlsLeaseStore, acme_renewal_lease_name};
 use crate::tls::private_file::PrivateFileFault;
-use crate::tls::source::subscription::{
-    install_force_reload_probe, remove_force_reload_probe, request_all_material_set_reloads,
-};
 use base64::Engine as _;
 use tempfile::TempDir;
 
 const DIRECTORY_URL: &str = "https://acme.example/directory";
 const ORDER_URL: &str = "https://acme.example/order/1";
 const OTHER_ORDER_URL: &str = "https://acme.example/order/2";
+const TEST_RELOAD_SURFACE: &str = "final_publication_matrix_local_reload";
 
 fn generated_cert_and_key() -> (String, String) {
     let key_pair =
@@ -133,7 +131,7 @@ fn track_reload_request(
     let requested = AtomicBool::new(false);
     let result = map_final_renewal_publication_outcome(outcome, || {
         requested.store(true, Ordering::SeqCst);
-        request_all_material_set_reloads()
+        vec![TEST_RELOAD_SURFACE]
     });
     (requested.load(Ordering::SeqCst), result)
 }
@@ -163,9 +161,6 @@ async fn final_publication_commits_order_then_certificate_under_one_lease_fence(
         .expect("won");
     let keeper = RenewalLeaseKeeper::start(held, Duration::from_secs(60));
 
-    let surface = "final_publication_matrix_complete_reload";
-    let _probe = install_force_reload_probe(surface);
-
     let outcome = keeper
         .commit_fenced({
             let certificates = Arc::clone(&certificates);
@@ -182,9 +177,10 @@ async fn final_publication_commits_order_then_certificate_under_one_lease_fence(
         reload_requested,
         "successful publication must request material reload"
     );
-    assert!(
-        reloaded.contains(&surface),
-        "successful publication must request material reload"
+    assert_eq!(
+        reloaded,
+        vec![TEST_RELOAD_SURFACE],
+        "successful publication must return the reload callback's surfaces"
     );
 
     let stored = certificates
@@ -195,7 +191,6 @@ async fn final_publication_commits_order_then_certificate_under_one_lease_fence(
         orders.get_order("edge-order").expect("order").status,
         AcmeOrderStatus::Valid
     );
-    remove_force_reload_probe(surface);
     let _ = keeper.finish().await;
 }
 
