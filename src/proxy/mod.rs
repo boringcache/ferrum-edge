@@ -8647,8 +8647,11 @@ impl ProxyState {
     /// projections such as `dispatch_port_overrides` and
     /// `dispatch_port_override_fallback` are `#[serde(skip)]` fields populated by
     /// `GatewayConfig::resolve_dispatch_port_overrides()`. A DestinationRule-only
-    /// edit can therefore leave `delta.modified_proxies` empty while the route
-    /// table's stored `Arc<Proxy>` needs to carry new dispatch policy.
+    /// edit can therefore leave `delta.modified_proxies` empty (or leave the
+    /// entire `ConfigDelta` empty when upstream timestamps are also unchanged)
+    /// while the route table's stored `Arc<Proxy>` needs to carry new dispatch
+    /// policy. Callers must consult this helper from both the non-empty delta
+    /// path and the empty-delta publish path (#3243).
     fn projected_route_proxy_content_changed(
         old_config: &GatewayConfig,
         new_config: &GatewayConfig,
@@ -9295,7 +9298,22 @@ impl ProxyState {
                             ),
                         )?;
                     let mesh_changed = current.config.mesh != new_config.mesh;
-                    if !mesh_changed && country_mmdb_plugin_cache.is_none() {
+                    // DestinationRule-derived projections
+                    // (`dispatch_port_overrides`, `dispatch_port_override_fallback`,
+                    // `resolved_tls`, stream-relay dispatch maps) are
+                    // `#[serde(skip)]` and invisible to ConfigDelta's
+                    // `updated_at` comparison. A DR-only edit that left every
+                    // resource timestamp unchanged must still republish the
+                    // route table (and LB, which also consumes DR-derived
+                    // upstream policy) before any status/revision ACK — otherwise
+                    // route-held `Arc<Proxy>` values stay stale until an
+                    // unrelated event (#3243).
+                    let projected_routes_changed =
+                        Self::projected_route_proxy_content_changed(&current.config, &new_config);
+                    if !mesh_changed
+                        && !projected_routes_changed
+                        && country_mmdb_plugin_cache.is_none()
+                    {
                         return Ok(None);
                     }
 
@@ -9318,11 +9336,13 @@ impl ProxyState {
                     // a mesh slice update that retargets/adds/removes a local
                     // stream-family port would leave the inbound accept loop relaying
                     // to a stale loopback backend (or falling through to Hyper for a
-                    // newly added port). An MMDB-only publish reuses that table.
-                    route_changed.set(mesh_changed);
+                    // newly added port). An MMDB-only publish reuses that table
+                    // unless a projected DR-derived proxy field also changed.
+                    let rebuild_routes = mesh_changed || projected_routes_changed;
+                    route_changed.set(rebuild_routes);
                     return Ok(Some(StagedRequestEpoch {
                         config: Arc::clone(&staged_config),
-                        route_table: if mesh_changed {
+                        route_table: if rebuild_routes {
                             RouterCache::build_route_table_snapshot(&new_config)
                         } else {
                             Arc::clone(&current.route_table)
@@ -9330,9 +9350,13 @@ impl ProxyState {
                         plugin_cache: country_mmdb_plugin_cache
                             .unwrap_or_else(|| Arc::clone(&current.plugin_cache)),
                         consumer_index: Arc::clone(&current.consumer_index),
-                        load_balancer: Arc::clone(&current.load_balancer),
-                        route_changed: mesh_changed,
-                        lb_changed: false,
+                        load_balancer: if projected_routes_changed {
+                            LoadBalancerCache::build_inner(&new_config)
+                        } else {
+                            Arc::clone(&current.load_balancer)
+                        },
+                        route_changed: rebuild_routes,
+                        lb_changed: projected_routes_changed,
                     }));
                 }
                 let country_mmdb_load_mode = if matches!(

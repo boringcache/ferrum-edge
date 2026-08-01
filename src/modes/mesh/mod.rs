@@ -1910,14 +1910,14 @@ fn plugin_config_content_eq_ignoring_persistence(
 /// byte-identical. Comparing it here bumps the upstream's `updated_at` so the LB
 /// cache (and `ConfigDelta`) reflect the change.
 ///
-/// NOTE (#1816): immediate route-TABLE rebuild on a DR-only edit is DEFERRED.
-/// `ProxyState::delta_routes_changed` keys on PROXY add/modify/remove, and the
-/// route table holds the `Arc<Proxy>` carrying the projected fallback — a
-/// shared characteristic of ALL `#[serde(skip)]` DR-derived proxy fields (incl.
-/// the established per-port `dispatch_port_overrides`), not unique to the
-/// fallback. Until #1816 wires a proxy-side route-rebuild signal for these
-/// derived fields, an SD `connectionPool.http` edit applies on the next route
-/// rebuild (proxy change / full reload).
+/// Route-table rebuild for the projected proxy fields does not wait on this
+/// timestamp alone (#3243 / #1826): `ProxyState::delta_routes_changed` and the
+/// empty-delta publish path consult
+/// `projected_route_proxy_content_changed`, which compares the `#[serde(skip)]`
+/// DR-derived proxy projections (`dispatch_port_overrides`,
+/// `dispatch_port_override_fallback`, `resolved_tls`, and mesh stream-relay
+/// dispatch maps) so route-held `Arc<Proxy>` values cannot stay stale until an
+/// unrelated proxy edit.
 fn upstream_content_eq(a: &Upstream, b: &Upstream) -> bool {
     fn content_value(upstream: &Upstream) -> serde_json::Value {
         let mut normalized = upstream.clone();

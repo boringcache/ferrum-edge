@@ -837,9 +837,10 @@ pub(crate) fn dispatch_port_override_fallback_from_upstream(
     // their resolved dial port.
     // We deliberately do NOT fold the upstream's `port_overrides` into this fallback:
     // a multi-port upstream would cross-leak one port's `connectionPool.http` onto a
-    // different port (codex r3). Immediate route-rebuild on a DR-only edit remains
-    // tracked separately because this is a `#[serde(skip)]` DR-derived field, like
-    // the established per-port `dispatch_port_overrides`.
+    // different port (codex r3). Immediate route rebuild on a DR-only edit of this
+    // `#[serde(skip)]` field (and the sibling per-port `dispatch_port_overrides`)
+    // is handled by `ProxyState::projected_route_proxy_content_changed` (#3243 /
+    // #1826) so route-held `Arc<Proxy>` values cannot stay stale.
     upstream
         .dispatch_port_override_fallback
         .as_ref()
