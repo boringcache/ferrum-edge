@@ -100,7 +100,9 @@
 //!   `ai_response_guard` regex redactor applies its pattern set in sequential
 //!   passes, because a placeholder one pattern renders may legitimately be
 //!   rewritten by a later one) keeps its live input and its pass output under ONE
-//!   shared ceiling, so the transient scratch never adds a second window's worth;
+//!   shared ceiling — budgeting the still-live prior pass by its resident
+//!   CAPACITY, not its logical length — so geometric growth slack cannot mint
+//!   room for the next sink past the covering window;
 //! * a producer that needs to know its own output's LENGTH before it can write
 //!   it does not learn that by building the output and measuring it. The
 //!   gRPC-Web reframer has to put the trailer payload's length in the frame
@@ -1032,9 +1034,11 @@ impl<'a> ResponseTransformWindow<'a> {
 /// Growth reuses the collector's [`growth_target`], clamped to the ceiling, so
 /// the buffer stays amortised `O(n)` without doubling past the bound. The only
 /// residual slack is the allocator's right to return more than `reserve_exact`
-/// asked for, which is the same single-statement window documented for the
-/// collectors — and the window's [`ResponseTransformWindow::charge`] still
-/// refuses to install an allocation whose real capacity its blocks do not cover.
+/// asked for; when that happens the sink immediately sticky-overflows and
+/// releases its partial allocation, so a producer that holds the sink across
+/// awaits cannot retain over-ceiling capacity before publication. The window's
+/// [`ResponseTransformWindow::charge`] remains a second gate that refuses to
+/// install an allocation whose real capacity its blocks do not cover.
 pub(crate) struct BoundedResponseBodySink {
     ceiling: usize,
     data: Vec<u8>,
@@ -1058,11 +1062,33 @@ impl BoundedResponseBodySink {
         self.data.len()
     }
 
+    /// Resident allocation capacity currently held by the sink.
+    ///
+    /// External tests observe this so they can pin that a successful write never
+    /// leaves `capacity() > ceiling()`, without inventing allocator assumptions
+    /// about when `reserve_exact` over-returns.
+    pub(crate) fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
     /// Whether a write has already been refused. Once set, the buffer is
     /// released and every later write is refused too, so a producer that ignores
     /// a `false` cannot accumulate anything further.
     pub(crate) fn overflowed(&self) -> bool {
         self.overflowed
+    }
+
+    /// After `reserve_exact`, refuse immediately if the allocator reported more
+    /// capacity than this sink's admitted ceiling. Sticky-overflow and release
+    /// the partial allocation so the over-ceiling bytes cannot outlive the
+    /// current write — including across a producer await before publication.
+    fn refuse_if_capacity_exceeds_ceiling(&mut self) -> bool {
+        if self.data.capacity() > self.ceiling {
+            self.overflowed = true;
+            self.data = Vec::new();
+            return false;
+        }
+        true
     }
 
     /// Append `bytes`, or refuse. `false` means the ceiling would have been
@@ -1085,6 +1111,9 @@ impl BoundedResponseBodySink {
         if prospective > self.data.capacity() {
             let target = growth_target(self.data.capacity(), prospective, self.ceiling);
             self.data.reserve_exact(target - self.data.len());
+            if !self.refuse_if_capacity_exceeds_ceiling() {
+                return false;
+            }
         }
         self.data.extend_from_slice(bytes);
         true
@@ -1136,6 +1165,9 @@ impl BoundedResponseBodySink {
         if prospective > self.data.capacity() {
             let target = growth_target(self.data.capacity(), prospective, self.ceiling);
             self.data.reserve_exact(target - self.data.len());
+            if !self.refuse_if_capacity_exceeds_ceiling() {
+                return false;
+            }
         }
         let wrote = {
             use bytes::BufMut;

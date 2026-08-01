@@ -2309,10 +2309,13 @@ fn no_declared_producer_builds_a_complete_replacement_before_the_bound() {
             "ai_response_guard",
             // The rewritten SSE stream, the expanded plain-text redaction, and
             // the re-encoded protobuf frame were each complete before the bound.
+            // The bounded SSE path must also never rebuild a complete event
+            // `String` (including via `to_string`) before the sink sees it.
             &[
                 "bounded_vec_from(output.as_bytes()",
                 "encode_to_vec()",
                 "encode_grpc_frame(",
+                "ceiling.checked_sub(buffer.len())?",
             ],
         ),
         // The four already-clean producers must stay clean: none of them may
@@ -2366,7 +2369,10 @@ fn the_repaired_producers_construct_through_the_bound() {
             "ai_response_guard",
             &[
                 "fn rewrite_sse_events_bounded<'a>(",
+                "fn rewrite_sse_json_event_into(",
+                "serde_json::to_writer(&mut *output, &json)",
                 "fn redact_text_bounded(",
+                "ceiling.checked_sub(buffer.capacity())?",
                 "fn write_pattern_replaced(",
                 "fn push_reframed_grpc_message(",
                 // The SSE residual candidate is a full would-be client body
@@ -2606,5 +2612,142 @@ fn the_root_review_repairs_are_pinned_in_source() {
     assert!(
         !budget.contains("if additional == 0 {\n            return true;\n        }"),
         "the zero-length append must not skip the fill and its length check"
+    );
+    assert!(
+        budget.contains("fn refuse_if_capacity_exceeds_ceiling(&mut self) -> bool")
+            && budget.contains("if self.data.capacity() > self.ceiling"),
+        "BoundedResponseBodySink must sticky-overflow when reserve_exact returns \
+         capacity above the admitted ceiling"
+    );
+    // Both growth sites must check immediately after reserve_exact.
+    let sink_impl = budget
+        .split("impl BoundedResponseBodySink {")
+        .nth(1)
+        .expect("BoundedResponseBodySink impl");
+    let push_region = sink_impl
+        .split("pub(crate) fn append_with")
+        .next()
+        .expect("push precedes append_with");
+    assert!(
+        push_region.contains("self.data.reserve_exact(target - self.data.len());")
+            && push_region.contains("if !self.refuse_if_capacity_exceeds_ceiling()"),
+        "push must refuse over-ceiling capacity immediately after reserve_exact"
+    );
+    let append_region = sink_impl
+        .split("pub(crate) fn append_with")
+        .nth(1)
+        .expect("append_with body");
+    let append_growth = append_region
+        .split("let wrote = {")
+        .next()
+        .expect("append_with growth precedes fill");
+    assert!(
+        append_growth.contains("self.data.reserve_exact(target - self.data.len());")
+            && append_growth.contains("if !self.refuse_if_capacity_exceeds_ceiling()"),
+        "append_with must refuse over-ceiling capacity immediately after reserve_exact"
+    );
+}
+
+/// Geometric growth leaves capacity above length; that slack is resident and
+/// must not mint room for a later sequential redaction pass
+/// (GHSA-pwcm-6rh8-f2gh root finding).
+#[test]
+fn sequential_scratch_budgets_resident_capacity_not_length() {
+    use ferrum_edge::_test_support::BoundedResponseBodySinkProbe;
+
+    // Reproduce the sink's geometric growth: many one-byte writes leave
+    // capacity well above length once doubling jumps to the ceiling.
+    let ceiling = 64usize;
+    let mut sink = BoundedResponseBodySinkProbe::with_ceiling(ceiling);
+    for _ in 0..33 {
+        assert!(sink.push(b"a"));
+    }
+    assert_eq!(sink.len(), 33);
+    assert!(
+        sink.capacity() > sink.len(),
+        "growth must leave capacity slack above length so the regression is meaningful"
+    );
+    assert!(
+        sink.capacity() <= sink.ceiling(),
+        "a successful write must never leave capacity above the admitted ceiling"
+    );
+    // The capacity-based remainder is strictly smaller than the length-based
+    // one whenever slack exists — that gap is what the old arithmetic minted.
+    let capacity_room = ceiling.checked_sub(sink.capacity()).expect("in-ceiling");
+    let length_room = ceiling.checked_sub(sink.len()).expect("in-ceiling");
+    assert!(
+        capacity_room < length_room,
+        "capacity slack must not be treatable as free room for the next scratch buffer"
+    );
+}
+
+/// Observed successful writes stay inside the admitted ceiling. This does not
+/// invent an allocator over-return; it pins the invariant the sticky-overflow
+/// gate upholds whenever growth actually runs.
+#[test]
+fn bounded_sink_capacity_never_exceeds_ceiling_on_successful_writes() {
+    use ferrum_edge::_test_support::BoundedResponseBodySinkProbe;
+
+    let mut sink = BoundedResponseBodySinkProbe::with_ceiling(128);
+    // Mix small and medium writes so growth_target runs repeatedly.
+    for size in [1usize, 2, 3, 5, 8, 13, 21, 34] {
+        let chunk = vec![b'x'; size];
+        if sink.len() + size > sink.ceiling() {
+            assert!(!sink.push(&chunk));
+            assert!(sink.overflowed());
+            assert_eq!(
+                sink.capacity(),
+                0,
+                "an overflow must release the partial allocation"
+            );
+            return;
+        }
+        assert!(sink.push(&chunk));
+        assert!(
+            sink.capacity() <= sink.ceiling(),
+            "capacity {} exceeded ceiling {} after a successful write",
+            sink.capacity(),
+            sink.ceiling()
+        );
+    }
+    assert!(!sink.overflowed());
+    let finished = sink.finish().expect("in-ceiling writes finish");
+    assert!(finished.len() <= 128);
+}
+
+/// `ResponseCaching::before_proxy` must pin provenance exactly once. A merge
+/// that stacks the declaration-and-comment block would reintroduce the
+/// GHSA-pwcm merge artifact without changing observable cache semantics.
+#[test]
+fn response_caching_before_proxy_pins_provenance_exactly_once() {
+    let source = include_str!("../../../src/plugins/response_caching.rs");
+    let start = source
+        .find("async fn before_proxy(")
+        .expect("ResponseCaching::before_proxy");
+    let rest = &source[start..];
+    let end = rest
+        .find("\n    async fn observe_origin_http_response_status(")
+        .expect("observe_origin_http_response_status follows before_proxy");
+    let before_proxy = &rest[..end];
+    assert_eq!(
+        before_proxy
+            .matches("let policy_stamp = ctx.pin_response_policy_stamp().clone();")
+            .count(),
+        1,
+        "policy_stamp must be declared once at the start of before_proxy"
+    );
+    assert_eq!(
+        before_proxy
+            .matches("let presentation_digest = ctx.response_presentation_policy_digest;")
+            .count(),
+        1,
+        "presentation_digest must be declared once at the start of before_proxy"
+    );
+    assert_eq!(
+        before_proxy
+            .matches("Pin the response-side gate provenance before anything on this")
+            .count(),
+        1,
+        "the provenance comment block must not be duplicated by a merge artifact"
     );
 }

@@ -804,9 +804,14 @@ impl AiResponseGuard {
         for pattern in self.pii_patterns.iter().chain(self.blocked_phrases.iter()) {
             // Pass 1 reads the already-charged response body, so the whole
             // ceiling is available to it; later passes read a scratch buffer that
-            // is still resident, so only the remainder is.
+            // is still resident, so only the remainder is. Charge CAPACITY, not
+            // length: geometric growth leaves slack above `len()`, and that
+            // slack is still resident inside the covering window
+            // (GHSA-pwcm-6rh8-f2gh). `checked_sub` fails closed on underflow /
+            // saturation when a prior pass somehow retained more than the
+            // shared ceiling.
             let room = match current.as_ref() {
-                Some(buffer) => ceiling.checked_sub(buffer.len())?,
+                Some(buffer) => ceiling.checked_sub(buffer.capacity())?,
                 None => ceiling,
             };
             let mut sink = BoundedResponseBodySink::with_ceiling(room);
@@ -1562,8 +1567,14 @@ impl AiResponseGuard {
         }
     }
 
-    fn redact_sse_event(&self, lines: &[&str]) -> Option<String> {
-        rewrite_sse_json_event(lines, |json| {
+    /// Rewrite one SSE event's JSON `data:` payload into `output`, or report
+    /// that the event is unchanged. `None` is construction refusal.
+    fn redact_sse_event(
+        &self,
+        output: &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+        lines: &[&str],
+    ) -> Option<bool> {
+        rewrite_sse_json_event_into(output, lines, |json| {
             if self.scan_mode == ScanMode::All {
                 self.redact_all_strings_with_argument_shield(json);
             } else {
@@ -1578,9 +1589,9 @@ impl AiResponseGuard {
     ///
     /// Rewritten `data:` lines preserve their original CR/LF terminator so
     /// CRLF-encoded streams round-trip without mixing line endings. Frame JSON
-    /// is reserialized compactly by `serde_json::to_string`, which may alter
-    /// whitespace within a frame — clients consuming SSE byte-for-byte should
-    /// not depend on inner-frame formatting.
+    /// is reserialized compactly by `serde_json::to_writer` into the bounded
+    /// sink, which may alter whitespace within a frame — clients consuming SSE
+    /// byte-for-byte should not depend on inner-frame formatting.
     fn redact_sse_body(&self, body: &[u8], ceiling: usize) -> Option<Vec<u8>> {
         let body_str = std::str::from_utf8(body).ok()?;
 
@@ -1606,9 +1617,11 @@ impl AiResponseGuard {
 
         // Assembled eventwise through the ceiling-bounded sink, so the rewritten
         // stream is never materialised in full before the bound applies
-        // (GHSA-pwcm-6rh8-f2gh).
-        let (output, modified) =
-            rewrite_sse_events_bounded(body_str, ceiling, |lines| self.redact_sse_event(lines))?;
+        // (GHSA-pwcm-6rh8-f2gh). Each event is framed/serialized directly into
+        // that sink — never as a complete would-be event `String` beside it.
+        let (output, modified) = rewrite_sse_events_bounded(body_str, ceiling, |output, lines| {
+            self.redact_sse_event(output, lines)
+        })?;
 
         if modified { Some(output) } else { None }
     }
@@ -3742,6 +3755,11 @@ fn blank_top_level_structural_scalars(value: &mut Value) {
 
 /// Parse and rewrite one complete SSE event's joined JSON `data:` payload,
 /// preserving non-data fields and the first data line's terminator.
+///
+/// Used by residual-scan masking, which already holds a covering transform
+/// window for its complete candidate. The producer path uses
+/// [`rewrite_sse_json_event_into`] so a would-be event is never materialised
+/// beside the covering sink.
 fn rewrite_sse_json_event(lines: &[&str], mutate: impl FnOnce(&mut Value)) -> Option<String> {
     let mut data_lines = Vec::new();
     let mut payloads = Vec::new();
@@ -3796,6 +3814,89 @@ fn rewrite_sse_json_event(lines: &[&str], mutate: impl FnOnce(&mut Value)) -> Op
     Some(output)
 }
 
+/// Rewrite one SSE event's JSON `data:` payload straight into `output`.
+///
+/// Returns:
+/// - `Some(false)` when the event is unchanged (nothing written; caller copies
+///   the original lines);
+/// - `Some(true)` when the rewritten event was framed/serialized into `output`;
+/// - `None` when construction was refused (overflow, serialization failure).
+///
+/// The rewritten JSON and event framing are written THROUGH the ceiling-aware
+/// sink from the first byte — never as a complete would-be event `String`
+/// beside it (GHSA-pwcm-6rh8-f2gh). Placeholder expansion and JSON escaping
+/// that amplify past the ceiling are therefore refused DURING construction.
+fn rewrite_sse_json_event_into(
+    output: &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+    lines: &[&str],
+    mutate: impl FnOnce(&mut Value),
+) -> Option<bool> {
+    let mut data_lines = Vec::new();
+    let mut payloads = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let content = line
+            .strip_suffix("\r\n")
+            .or_else(|| line.strip_suffix('\n'))
+            .unwrap_or(line);
+        if let Some(data) = content
+            .strip_prefix("data: ")
+            .or_else(|| content.strip_prefix("data:"))
+        {
+            data_lines.push(idx);
+            payloads.push(data);
+        }
+    }
+    if payloads.is_empty() {
+        return Some(false);
+    }
+
+    let joined = payloads.join("\n");
+    let trimmed = joined.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return Some(false);
+    }
+    let Ok(mut json) = serde_json::from_str::<Value>(trimmed) else {
+        // Unparseable data payloads are left untouched, matching the unbounded
+        // rewriter and the historical no-op semantics for non-JSON frames.
+        return Some(false);
+    };
+    let original = json.clone();
+    mutate(&mut json);
+    if json == original {
+        return Some(false);
+    }
+
+    let first_data_line = data_lines[0];
+    for (idx, line) in lines.iter().enumerate() {
+        if idx == first_data_line {
+            let ending: &[u8] = if line.ends_with("\r\n") {
+                b"\r\n"
+            } else if line.ends_with('\n') {
+                b"\n"
+            } else {
+                b""
+            };
+            if !output.push(b"data: ") {
+                return None;
+            }
+            // Serialize the rewritten frame directly into the sink. An amplifying
+            // rewrite (placeholder expansion, JSON escaping) stops at the ceiling
+            // instead of materialising a complete over-budget event first.
+            if serde_json::to_writer(&mut *output, &json).is_err() {
+                return None;
+            }
+            if !ending.is_empty() && !output.push(ending) {
+                return None;
+            }
+        } else if data_lines.binary_search(&idx).is_err() {
+            if !output.push(line.as_bytes()) {
+                return None;
+            }
+        }
+    }
+    Some(true)
+}
+
 /// Apply an event-level rewrite across a buffered SSE body while preserving
 /// event order, non-data fields, separators, and LF/CRLF framing.
 fn rewrite_sse_events<'a>(
@@ -3835,55 +3936,46 @@ fn rewrite_sse_events<'a>(
     (output, modified)
 }
 
-/// [`rewrite_sse_events`] writing THROUGH a ceiling-bounded sink.
+/// Ceiling-bounded SSE rewrite: each event is serialized/framed into the sink
+/// from the first output byte.
 ///
 /// The client-visible replacement is assembled one event at a time, so the only
 /// full-size representation alive at any moment is the bounded output itself —
-/// never a complete rewritten `String` that a bounded copy would measure
-/// afterwards (GHSA-pwcm-6rh8-f2gh). The per-event `String` a rewriter returns is
-/// bounded by one event of the already-charged input.
+/// never a complete rewritten event `String` that a bounded copy would measure
+/// afterwards (GHSA-pwcm-6rh8-f2gh). Per-event parse state is still derived from
+/// the already-charged input and is bounded by one event of that input.
 ///
-/// `modified` is computed per event (did this event's emitted bytes differ from
-/// its original lines?) rather than by comparing the finished output to `body`.
-/// The two are equivalent: both sides are the concatenation of the same event
-/// partition, so they differ exactly when at least one event's emission does.
+/// `rewrite_event` returns:
+/// - `Some(false)` when the event is unchanged (caller copies original lines);
+/// - `Some(true)` when the rewriter already wrote the replacement into `output`;
+/// - `None` when construction was refused.
+///
+/// `modified` is true when at least one event was rewritten.
 ///
 /// `None` means a write was refused; the caller must leave the response
 /// unchanged / fail closed per its own contract.
 fn rewrite_sse_events_bounded<'a>(
     body: &'a str,
     ceiling: usize,
-    mut rewrite_event: impl FnMut(&[&'a str]) -> Option<String>,
+    mut rewrite_event: impl FnMut(
+        &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+        &[&'a str],
+    ) -> Option<bool>,
 ) -> Option<(Vec<u8>, bool)> {
     use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
-
-    /// Whether `rewritten` is byte-identical to the concatenation of
-    /// `event_lines`. Allocation-free: the lines are consumed as prefixes.
-    fn event_is_unchanged(event_lines: &[&str], rewritten: &str) -> bool {
-        let mut rest = rewritten;
-        for line in event_lines {
-            match rest.strip_prefix(*line) {
-                Some(remaining) => rest = remaining,
-                None => return false,
-            }
-        }
-        rest.is_empty()
-    }
 
     fn flush_event(
         output: &mut BoundedResponseBodySink,
         modified: &mut bool,
         event_lines: &[&str],
-        rewritten: Option<String>,
+        rewritten: Option<bool>,
     ) -> bool {
         match rewritten {
-            Some(rewritten) => {
-                if !event_is_unchanged(event_lines, &rewritten) {
-                    *modified = true;
-                }
-                output.push(rewritten.as_bytes())
+            Some(true) => {
+                *modified = true;
+                true
             }
-            None => {
+            Some(false) => {
                 for original in event_lines {
                     if !output.push(original.as_bytes()) {
                         return false;
@@ -3891,6 +3983,7 @@ fn rewrite_sse_events_bounded<'a>(
                 }
                 true
             }
+            None => false,
         }
     }
 
@@ -3904,7 +3997,7 @@ fn rewrite_sse_events_bounded<'a>(
             .or_else(|| line.strip_suffix('\n'))
             .unwrap_or(line);
         if content.is_empty() {
-            let rewritten = rewrite_event(&event_lines);
+            let rewritten = rewrite_event(&mut output, &event_lines);
             if !flush_event(&mut output, &mut modified, &event_lines, rewritten) {
                 return None;
             }
@@ -3912,7 +4005,7 @@ fn rewrite_sse_events_bounded<'a>(
         }
     }
     if !event_lines.is_empty() {
-        let rewritten = rewrite_event(&event_lines);
+        let rewritten = rewrite_event(&mut output, &event_lines);
         if !flush_event(&mut output, &mut modified, &event_lines, rewritten) {
             return None;
         }

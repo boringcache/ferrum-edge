@@ -6506,6 +6506,11 @@ pub mod _test_support {
             self.0.len()
         }
 
+        /// Resident allocation capacity currently held by the sink.
+        pub fn capacity(&self) -> usize {
+            self.0.capacity()
+        }
+
         pub fn is_empty(&self) -> bool {
             self.0.len() == 0
         }

@@ -5316,3 +5316,177 @@ async fn test_clean_and_warn_responses_never_arm_the_final_seam() {
         PluginResult::Continue
     ));
 }
+
+/// Sequential whole-body redaction must budget the still-live prior pass by
+/// resident CAPACITY. Geometric growth leaves capacity above length; treating
+/// that slack as free room for the next sink would let two simultaneous
+/// scratch allocations exceed the covering transform window
+/// (GHSA-pwcm-6rh8-f2gh root finding).
+#[tokio::test]
+async fn test_sequential_redaction_capacity_slack_cannot_mint_room() {
+    // Pass 1 replaces each `.` with the one-byte placeholder `a`. Thirty-three
+    // one-byte writes make the sink double from 32 → 64, so capacity == ceiling
+    // while length is only 33. Pass 2 then collapses the `a` run to `b`.
+    //
+    // Capacity-based room for pass 2 is 0 → refuse during construction.
+    // Length-based room would be 31 → enough to write the one-byte `b`, which
+    // is exactly the slack-minting hole this regression seals.
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [
+            {"name": "a", "regex": "\\."},
+            {"name": "b", "regex": "a+"}
+        ],
+        "redaction_placeholder": "{type}",
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    let body = b"................................."; // 33 dots
+    assert_eq!(body.len(), 33);
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.max_response_body_size_bytes = 64;
+    assert!(
+        plugin
+            .transform_response_body_with_context(&mut ctx, body, Some("text/plain"), &headers)
+            .await
+            .is_none(),
+        "capacity slack from pass 1 must not mint room for pass 2"
+    );
+
+    // Control: the same body under a ceiling that leaves capacity remainder
+    // after pass 1 still redacts through both passes.
+    let mut roomy = ctx_with_content_type("POST", "application/json");
+    roomy.max_response_body_size_bytes = 256;
+    let redacted = plugin
+        .transform_response_body_with_context(&mut roomy, body, Some("text/plain"), &headers)
+        .await
+        .expect("ample capacity remainder admits both passes");
+    assert_eq!(
+        String::from_utf8(redacted).unwrap(),
+        "b",
+        "both pattern passes must still apply when capacity room remains"
+    );
+}
+
+/// A single SSE event that spans essentially the whole retained body must be
+/// framed/serialized through the ceiling-aware sink — never materialised as a
+/// complete would-be event beside it.
+#[tokio::test]
+async fn test_single_large_sse_event_is_rewritten_under_the_retained_ceiling() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+
+    // One event whose JSON payload is large but still under a modest ceiling
+    // after redaction. The event is the entire retained body.
+    let padding = "x".repeat(2000);
+    let body = format!(
+        "event: msg\ndata: {{\"pad\":\"{padding}\",\"mail\":\"user@example.com\"}}\n\n"
+    );
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.max_response_body_size_bytes = 8192;
+
+    let redacted = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            body.as_bytes(),
+            Some("text/event-stream"),
+            &headers,
+        )
+        .await
+        .expect("a single large in-ceiling SSE event must be rewritten");
+    let redacted = String::from_utf8(redacted).unwrap();
+    assert!(
+        redacted.starts_with("event: msg\ndata: "),
+        "non-data fields and framing must survive: {redacted}"
+    );
+    assert!(!redacted.contains("user@example.com"));
+    assert!(redacted.contains("[REDACTED:pii:email]"));
+    assert!(redacted.ends_with("\n\n"));
+}
+
+/// Placeholder expansion plus JSON string escaping can amplify a legal SSE
+/// event past the retained ceiling. That amplification must be refused WHILE
+/// the event is being serialized into the sink — not after a complete event
+/// `String` already exists.
+#[tokio::test]
+async fn test_amplifying_sse_redaction_is_refused_during_event_construction() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+
+    // Many short emails expand to the longer `[REDACTED:pii:email]` placeholder,
+    // and JSON escaping of that placeholder keeps every replacement on the
+    // construction path. Size the ceiling just under the amplified event.
+    let emails = (0..40)
+        .map(|i| format!("a{i}@b.co"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let body = format!("data: {{\"t\":\"{emails}\"}}\n\n");
+    let placeholder = "[REDACTED:pii:email]";
+    let amplified_payload = emails
+        .split(' ')
+        .map(|_| placeholder)
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Compact JSON envelope around the amplified text, plus SSE framing.
+    let amplified_event = format!(
+        "data: {{\"t\":\"{}\"}}\n\n",
+        amplified_payload.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    assert!(
+        body.len() < amplified_event.len(),
+        "fixture must amplify: {} → {}",
+        body.len(),
+        amplified_event.len()
+    );
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    // Admit the original event, refuse the amplified rewrite.
+    ctx.max_response_body_size_bytes = body.len() + 8;
+    assert!(
+        body.len() <= ctx.max_response_body_size_bytes,
+        "original must fit the ceiling"
+    );
+    assert!(
+        amplified_event.len() > ctx.max_response_body_size_bytes,
+        "amplified event must exceed the ceiling"
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                body.as_bytes(),
+                Some("text/event-stream"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "an amplifying SSE rewrite must be refused during construction"
+    );
+
+    // Control: an ample ceiling still redacts the same stream.
+    let mut roomy = ctx_with_content_type("POST", "application/json");
+    let redacted = plugin
+        .transform_response_body_with_context(
+            &mut roomy,
+            body.as_bytes(),
+            Some("text/event-stream"),
+            &headers,
+        )
+        .await
+        .expect("the same SSE body redacts under an ordinary ceiling");
+    let redacted = String::from_utf8(redacted).unwrap();
+    assert!(!redacted.contains("@b.co"));
+    assert!(redacted.contains("[REDACTED:pii:email]"));
+}
