@@ -798,11 +798,57 @@ directory.
 | Read availability | Reads never wait on the writer lock. Publication is fsync + atomic replacement of the destination (`rename(2)` on Unix; `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING \| MOVEFILE_WRITE_THROUGH` on Windows), so a reader observes one complete generation or the other and its next read detects the newer one. The destination is never unlinked first, so it is never observably absent — an absent store document reads as an empty one. Challenge lookups and admin reads cannot be stalled by a slow writer. |
 | Runtime isolation of blocking work | Every mutation is a synchronous read-modify-write that can wait on the advisory lock for up to `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`. Admin managed-TLS/ACME writes, account-credential mirroring, failed-order persistence, and every lease operation (acquire, heartbeat, fenced commit, refresh, release) therefore run on the blocking pool, never on a Tokio worker, so a contended or wedged shared volume cannot stall request serving. A write that cannot be driven to a conclusion is reported as a server error, never as success. Reads stay on the runtime because they take no lock. |
 | Lost-update prevention | Each mutation takes an exclusive advisory lock on a sidecar `.<file>.lock`, re-reads the authoritative document under that lock, applies the change, and republishes atomically. Create-without-overwrite and cross-kind ID conflicts are evaluated against authoritative state, so a concurrent create returns `409` rather than silently replacing another instance's record. |
-| Single renewer | Before renewing a certificate, an instance must win that certificate's claim in `tls-leases.json`. Exactly one holder is granted at a time — a live claim excludes *every* other acquirer, including one presenting the same instance identity — so two replicas cannot create duplicate orders or collide on challenge state. |
+| Single renewer | Before renewing a certificate, an instance must win that certificate's claim in `tls-leases.json`. Exactly one holder is granted at a time — a live claim excludes *every* other acquirer, including one presenting the same instance identity — so two replicas cannot create duplicate orders or collide on challenge state. The claim is what excludes a second renewer; a persisted in-flight order never is. Every due certificate goes through the claim attempt first, and the authoritative order is read only by the winner. |
 | Ownership for the whole operation | The winner heartbeats its claim at a third of the TTL for as long as the renewal runs, and every stretch of external work (account/order calls, the DNS-01 publication hook, the propagation wait, authorization polling, finalization, certificate download, and the DNS-01 *cleanup* hook) is cancelled if the claim is lost — so a superseded instance never retracts `_acme-challenge` records the new owner is about to revalidate. The cleanup hook additionally *refreshes* the claim under the lease store's own lock before it starts, rather than relying on the heartbeat having already published the loss: a takeover lands in the table before any beat has had a reason to notice it, and a retraction that is ready to run would otherwise complete inside that gap. Refreshing rather than merely re-reading also means the hook starts on a full TTL — a claim confirmed with a sliver of lifetime left could legally expire and be taken over between the check and the hook's first poll. A refresh that cannot be granted (taken over, expired, or a store error) abandons the renewal. |
 | Fenced store commits | Each account/order/certificate write runs *while the lease table's exclusive lock is held*, after re-verifying holder, fence, and liveness under that lock. Acquisition and takeover block on the same lock, so a superseded instance cannot land a stale write alongside the new owner's — a before/after ownership check would detect that race but could not undo it. Final renewal publication persists the already-CA-valid order as `Valid` first and always attempts the certificate store second inside that same lease fence, even when the order write fails. The lease document itself is never rewritten by a commit, so a target-store error propagates without disturbing any holder's claim. The lock is held only across the synchronous write(s), never across a network call, hook, or sleep. Both writes succeed: reload is requested and the renewal counts as renewed. Order succeeds and certificate fails: no reload; prior material remains due; the now-`Valid` order does not block a later retry. Order fails and certificate succeeds: new material is authoritative and reload is requested, but the renewal is still reported as failed; the published certificate's exact non-empty `order_url` is durable completion evidence so a matching stale `Pending`/`Ready`/`Processing` order is not treated as active on a later scan. Both fail: no reload and an explicit combined failure (that storage-outage case may remain fail-closed). Lease loss before entering the fence performs neither write. |
-| Crash recovery | A claim carries `expires_at` (`FERRUM_ACME_RENEWAL_LEASE_TTL_SECONDS`) and a monotonic fence. A dead holder runs no heartbeat, so the claim expires and another replica takes over; the dead holder's fence is stale, so it can no longer renew or release the claim if it comes back. |
+| Crash recovery | A claim carries `expires_at` (`FERRUM_ACME_RENEWAL_LEASE_TTL_SECONDS`) and a monotonic fence. A dead holder runs no heartbeat, so the claim expires and another replica takes over; the dead holder's fence is stale, so it can no longer renew or release the claim if it comes back. The successor then **resumes that holder's authoritative persisted order** rather than skipping the certificate or ordering it again — see "Resuming a crashed renewer's order" below. |
 | Fail-closed ambiguity | A lock that cannot be taken within `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`, a malformed value for that setting, an unreadable or unparseable document, an unreadable lease table, or any heartbeat error is an error. Admin mutations fail, HTTP-01/TLS-ALPN-01 challenges are not served from stale state, and the renewal is abandoned rather than run twice. A store that is merely *missing* is a successful empty store — that is a real answer, not a failure — but a store that cannot be opened or parsed is never reported as an empty one. |
+
+### Resuming a crashed renewer's order
+
+An ACME renewal persists its order before it can finish it. A holder that dies
+after that fenced write — but before the final certificate/order publication —
+leaves an authoritative order behind in `pending_challenges`, `ready`, or
+`processing`. Its claim then expires and a successor takes over.
+
+The successor **finishes that same order**. It never treats the leftover record
+as a reason to skip the certificate (which would wedge renewal permanently,
+since the record outlives the claim that produced it) and never creates a second
+order with the CA:
+
+- **Claim first, decide second.** The per-certificate claim is attempted for
+  every due certificate. Only after winning it is the latest authoritative order
+  re-read. A replica that is not the renewer is turned away by lease denial and
+  never selects an order at all.
+- **Completed work is still recognised.** If the published certificate's exact,
+  non-empty `order_url` matches the leftover order, that order is finished work
+  (the material-published-but-`Valid`-write-failed case above) and a fresh order
+  is planned instead. A different URL, an empty URL, a missing URL, or a missing
+  certificate record is not completion evidence.
+- **The order's own challenge type is used**, inferred from the challenge
+  records it actually carries — not from whatever
+  `FERRUM_ACME_RENEWAL_CHALLENGE_TYPE` is set to now. Exactly one non-empty
+  challenge family is required; no families or more than one is an explicit
+  failure and the order is left untouched. Diagnostics name the order id only,
+  never a token, key authorization, or account credential.
+- **HTTP-01 and TLS-ALPN-01 need nothing republished.** The shared challenge
+  resolvers answer out of the order store for any order still in an active
+  status, so the prior renewer's tokens keep being served while the successor
+  polls for completion.
+- **DNS-01 is re-presented through the hook.** Those records live in the
+  operator's DNS provider, so the successor republishes the stored challenges
+  with `FERRUM_ACME_DNS01_HOOK_COMMAND`, honours
+  `FERRUM_ACME_DNS01_PROPAGATION_SECONDS`, and runs the same lease-guarded
+  cleanup afterwards. **A resumed DNS-01 order therefore requires the DNS hook
+  to still be configured.** If it is not, the order is skipped explicitly — it
+  is not deleted, not marked complete, and not counted as renewed — and the
+  certificate stays due until a hook is configured again.
+- **Losing the claim mid-resume abandons the work** at exactly the points a
+  newly prepared renewal does: no further store writes, no DNS cleanup, no
+  reload.
+
+Order age is deliberately not consulted. Lease ownership plus persisted state is
+the whole recovery authority.
 
 ### Operational notes
 

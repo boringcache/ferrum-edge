@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-#[cfg(feature = "acme")]
+#[cfg(any(feature = "acme", test))]
 use std::time::Duration;
 
 use base64::Engine;
@@ -1713,7 +1713,10 @@ pub fn global_account_store() -> Result<Arc<AcmeAccountStore>, String> {
         .clone()
 }
 
-#[cfg(feature = "acme")]
+// Also compiled for `test` without the `acme` feature: the renewal-resumption
+// planner infers this type from persisted challenge records, and that inference
+// is pure store logic that must be provable without real ACME networking.
+#[cfg(any(feature = "acme", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcmeRenewalChallengeType {
     Http01,
@@ -1721,7 +1724,7 @@ pub enum AcmeRenewalChallengeType {
     Dns01,
 }
 
-#[cfg(feature = "acme")]
+#[cfg(any(feature = "acme", test))]
 impl AcmeRenewalChallengeType {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -1838,66 +1841,60 @@ pub async fn run_due_renewals(
             summary.skipped += 1;
             continue;
         }
-        if has_active_renewal_order(&order_store, &certificate_store, &certificate.id)? {
-            summary.skipped += 1;
-            continue;
-        }
-        // Single-renewer claim. Exactly one instance can hold this name at a
-        // time; the claim expires on its own so a crashed holder does not wedge
-        // renewal for the certificate. Acquisition is a synchronous
-        // read-modify-write under the store's advisory lock, so it runs on a
-        // blocking thread rather than on this runtime worker.
-        let lease_name = crate::tls::lease::acme_renewal_lease_name(&certificate.id);
-        let claim = {
-            let store = Arc::clone(&lease_store);
-            let name = lease_name.clone();
-            let ttl = config.renewal_lease_ttl;
-            tokio::task::spawn_blocking(move || store.try_acquire(&name, ttl)).await
-        };
-        let lease = match claim {
-            Ok(Ok(Some(lease))) => lease,
-            Ok(Ok(None)) => {
+        // Claim first, decide second. An active persisted order is *not*
+        // allowed to gate the claim: a prior renewer can crash after its fenced
+        // order upsert landed but before final publication, and if that record
+        // could skip a successor before the lease is even attempted, the
+        // expiring claim would provide no crash recovery at all and the due
+        // certificate would wedge forever. A still-live other replica remains
+        // excluded the only legitimate way — by lease denial.
+        let claim = claim_and_plan_renewal(
+            &lease_store,
+            &order_store,
+            &certificate_store,
+            &certificate.id,
+            config.renewal_lease_ttl,
+        )
+        .await;
+        let (keeper, plan) = match claim {
+            RenewalClaim::Denied => {
                 summary.lease_denied += 1;
                 summary.skipped += 1;
                 continue;
             }
-            Ok(Err(error)) => {
+            RenewalClaim::Failed(reason) => {
                 summary.failed += 1;
                 tracing::warn!(
                     certificate_id = %certificate.id,
-                    error = %error,
+                    error = %reason,
                     "could not claim the ACME renewal lease; skipping this certificate"
                 );
                 continue;
             }
-            Err(error) => {
-                summary.failed += 1;
-                tracing::warn!(
-                    certificate_id = %certificate.id,
-                    error = %error,
-                    "ACME renewal lease acquisition could not be joined; skipping this certificate"
-                );
-                continue;
-            }
+            RenewalClaim::Claimed(claimed) => (claimed.keeper, claimed.plan),
         };
-        // The claim now stays alive for the whole external operation: the
-        // keeper heartbeats it off-runtime and cancels the renewal the moment
-        // it is lost, so an order/finalize cycle longer than the TTL cannot
-        // leave two instances acting on the same certificate.
-        let keeper = crate::tls::lease::RenewalLeaseKeeper::start(lease, config.renewal_lease_ttl);
-        // Re-check under the claim: another instance may have created an order
-        // between the scan above and the moment this lease was granted.
-        let active_order =
-            has_active_renewal_order(&order_store, &certificate_store, &certificate.id);
-        let outcome = match active_order {
-            Ok(true) => Ok(false),
-            Ok(false) => {
+        let outcome = match plan {
+            Ok(RenewalOrderPlan::NewOrder) => {
                 renew_certificate_once(
                     &certificate_store,
                     &order_store,
                     &account_store,
                     &keeper,
                     certificate,
+                    config,
+                )
+                .await
+            }
+            // A prior renewer's authoritative order is still mid-flight and is
+            // not proven completed. Resume that same order rather than creating
+            // a duplicate one with the CA.
+            Ok(RenewalOrderPlan::Resume(order)) => {
+                resume_persisted_renewal_order(
+                    &certificate_store,
+                    &order_store,
+                    &keeper,
+                    certificate,
+                    *order,
                     config,
                 )
                 .await
@@ -1923,22 +1920,60 @@ pub async fn run_due_renewals(
     Ok(summary)
 }
 
-/// Whether the latest order for `certificate_id` should block a new renewal.
+/// Whether the latest order for `certificate_id` is still authoritative work.
 ///
-/// Pending/Ready/Processing normally block. When a prior final-publication
+/// Pending/Ready/Processing normally count. When a prior final-publication
 /// attempt published certificate material but failed to persist `Valid`, the
 /// authoritative certificate record's exact non-empty `order_url` is durable
-/// completion evidence: a matching stale active-status order must not block a
-/// retry. Missing URLs, empty URLs, a different URL, or an unrelated
-/// certificate do not clear the block. Age/time heuristics are not used.
+/// completion evidence: a matching stale active-status order is completed, not
+/// active. Missing URLs, empty URLs, a different URL, or an unrelated
+/// certificate are not completion evidence. Age/time heuristics are not used.
+///
+/// This is a thin view over [`plan_renewal_order`]. It does **not** gate the
+/// lease claim: an active order is the successor's work to resume, not a reason
+/// to skip before the claim is attempted. The scheduler therefore consumes the
+/// plan directly and this boolean projection exists for the tests that pin the
+/// completion-evidence matrix, so it is deliberately allowed to be unused.
 #[cfg(any(feature = "acme", test))]
+#[allow(dead_code)]
 pub(crate) fn has_active_renewal_order(
     order_store: &AcmeOrderStore,
     certificate_store: &AcmeCertificateStore,
     certificate_id: &str,
 ) -> Result<bool, AcmeError> {
+    Ok(matches!(
+        plan_renewal_order(order_store, certificate_store, certificate_id)?,
+        RenewalOrderPlan::Resume(_)
+    ))
+}
+
+/// What the latest persisted order implies for a due certificate's renewal.
+#[cfg(any(feature = "acme", test))]
+#[derive(Debug)]
+pub(crate) enum RenewalOrderPlan {
+    /// Nothing authoritative is in flight: create a fresh ACME order.
+    NewOrder,
+    /// An authoritative order is mid-flight and is not proven completed by the
+    /// published certificate's exact `order_url`. The claim holder resumes that
+    /// same order; it must never create a duplicate one with the CA.
+    Resume(Box<AcmeOrderRecord>),
+}
+
+/// Decide between a fresh order and resuming the authoritative persisted one.
+///
+/// This is the same predicate [`has_active_renewal_order`] documents, kept in
+/// one place so the "blocks a new order" and "is the order to resume" answers
+/// cannot drift apart: an active-status record either belongs to a live claim
+/// holder (which lease denial already excluded) or is a crashed renewer's work
+/// this claim holder must finish.
+#[cfg(any(feature = "acme", test))]
+pub(crate) fn plan_renewal_order(
+    order_store: &AcmeOrderStore,
+    certificate_store: &AcmeCertificateStore,
+    certificate_id: &str,
+) -> Result<RenewalOrderPlan, AcmeError> {
     let Some(order) = order_store.latest_order_for_certificate(certificate_id)? else {
-        return Ok(false);
+        return Ok(RenewalOrderPlan::NewOrder);
     };
     if !matches!(
         order.status,
@@ -1946,15 +1981,16 @@ pub(crate) fn has_active_renewal_order(
             | AcmeOrderStatus::Ready
             | AcmeOrderStatus::Processing
     ) {
-        return Ok(false);
+        return Ok(RenewalOrderPlan::NewOrder);
     }
     let Some(order_url) = order
         .order_url
         .as_deref()
         .map(str::trim)
         .filter(|url| !url.is_empty())
+        .map(str::to_string)
     else {
-        return Ok(true);
+        return Ok(RenewalOrderPlan::Resume(Box::new(order)));
     };
     match certificate_store.get_certificate(certificate_id) {
         Ok(certificate) => {
@@ -1963,11 +1999,120 @@ pub(crate) fn has_active_renewal_order(
                 .as_deref()
                 .map(str::trim)
                 .filter(|url| !url.is_empty());
-            Ok(published_url != Some(order_url))
+            if published_url == Some(order_url.as_str()) {
+                Ok(RenewalOrderPlan::NewOrder)
+            } else {
+                Ok(RenewalOrderPlan::Resume(Box::new(order)))
+            }
         }
-        Err(AcmeError::NotFound(_)) => Ok(true),
+        Err(AcmeError::NotFound(_)) => Ok(RenewalOrderPlan::Resume(Box::new(order))),
         Err(error) => Err(error),
     }
+}
+
+/// The challenge type an order was actually prepared with, inferred fail-closed.
+///
+/// A resumed order must be driven with *its own* challenge type, not with
+/// whatever `FERRUM_ACME_RENEWAL_CHALLENGE_TYPE` happens to say now: an operator
+/// who switched types between the crash and the takeover would otherwise have
+/// the successor poll authorizations it never provisioned. Exactly one non-empty
+/// challenge family is a usable answer; zero families and two or more families
+/// are both explicit failures. Diagnostics name the order id only — never a
+/// token, key authorization, or credential.
+#[cfg(any(feature = "acme", test))]
+pub(crate) fn infer_persisted_challenge_type(
+    order: &AcmeOrderRecord,
+) -> Result<AcmeRenewalChallengeType, AcmeError> {
+    let families = [
+        (
+            AcmeRenewalChallengeType::Http01,
+            !order.http01_challenges.is_empty(),
+        ),
+        (
+            AcmeRenewalChallengeType::TlsAlpn01,
+            !order.tls_alpn01_challenges.is_empty(),
+        ),
+        (
+            AcmeRenewalChallengeType::Dns01,
+            !order.dns01_challenges.is_empty(),
+        ),
+    ];
+    let mut present = families.iter().filter(|(_, populated)| *populated);
+    match (present.next(), present.next()) {
+        (Some((challenge_type, _)), None) => Ok(*challenge_type),
+        (None, _) => Err(AcmeError::InvalidId(format!(
+            "ACME order {} has no persisted challenge records, so its challenge type cannot be \
+             determined; not resuming it",
+            order.id
+        ))),
+        (Some(_), Some(_)) => Err(AcmeError::InvalidId(format!(
+            "ACME order {} has more than one persisted challenge family, so its challenge type is \
+             ambiguous; not resuming it",
+            order.id
+        ))),
+    }
+}
+
+/// Outcome of claiming a certificate's renewal lease and, only on success,
+/// planning the work under that claim.
+#[cfg(any(feature = "acme", test))]
+pub(crate) enum RenewalClaim {
+    /// Another instance holds a live claim. No plan is computed, so a persisted
+    /// order is never even read on a replica that is not the renewer.
+    Denied,
+    /// The claim could not be attempted. Carries an already-rendered reason.
+    Failed(String),
+    /// This instance owns the certificate for the lifetime of the keeper. Boxed
+    /// so the heartbeat keeper does not make every `RenewalClaim` that large.
+    Claimed(Box<ClaimedRenewal>),
+}
+
+/// A won claim and the work it authorizes.
+#[cfg(any(feature = "acme", test))]
+pub(crate) struct ClaimedRenewal {
+    pub keeper: crate::tls::lease::RenewalLeaseKeeper,
+    pub plan: Result<RenewalOrderPlan, AcmeError>,
+}
+
+/// Claim the per-certificate renewal lease, then plan under that claim.
+///
+/// The ordering is the crash-recovery contract, which is why it lives in one
+/// function: the claim is attempted for every due certificate regardless of what
+/// is persisted, and the authoritative order is re-read only *after* the claim
+/// is won. Acquisition is a synchronous read-modify-write under the lease
+/// store's advisory lock, so it runs on a blocking thread rather than on this
+/// runtime worker. Once granted, the keeper heartbeats the claim off-runtime and
+/// cancels the renewal the moment it is lost, so an order/finalize cycle longer
+/// than the TTL cannot leave two instances acting on the same certificate.
+#[cfg(any(feature = "acme", test))]
+pub(crate) async fn claim_and_plan_renewal(
+    lease_store: &Arc<crate::tls::lease::TlsLeaseStore>,
+    order_store: &AcmeOrderStore,
+    certificate_store: &AcmeCertificateStore,
+    certificate_id: &str,
+    ttl: Duration,
+) -> RenewalClaim {
+    let lease_name = crate::tls::lease::acme_renewal_lease_name(certificate_id);
+    let claim = {
+        let store = Arc::clone(lease_store);
+        tokio::task::spawn_blocking(move || store.try_acquire(&lease_name, ttl)).await
+    };
+    let lease = match claim {
+        Ok(Ok(Some(lease))) => lease,
+        Ok(Ok(None)) => return RenewalClaim::Denied,
+        Ok(Err(error)) => return RenewalClaim::Failed(error.to_string()),
+        Err(error) => {
+            return RenewalClaim::Failed(format!(
+                "lease acquisition task could not be joined: {error}"
+            ));
+        }
+    };
+    let keeper = crate::tls::lease::RenewalLeaseKeeper::start(lease, ttl);
+    // Authoritative re-read under the claim: another instance may have created
+    // an order between the scan and the moment this lease was granted, and a
+    // crashed one may have left an order that only the claim holder may resume.
+    let plan = plan_renewal_order(order_store, certificate_store, certificate_id);
+    RenewalClaim::Claimed(Box::new(ClaimedRenewal { keeper, plan }))
 }
 
 /// Outcome of the lease-fenced final publication of renewed ACME material.
@@ -2312,23 +2457,178 @@ async fn renew_certificate_once(
             );
             return Ok(false);
         };
-        let publication = publish_dns01_challenges_with_hook(command, &order.dns01_challenges);
-        match keeper.guarded(publication).await {
-            Ok(result) => result?,
-            Err(_) => return Ok(abandon_renewal(&certificate.id)),
-        }
-        if !config.dns01_propagation.is_zero() {
-            let wait = tokio::time::sleep(config.dns01_propagation);
-            if keeper.guarded(wait).await.is_err() {
-                return Ok(abandon_renewal(&certificate.id));
-            }
+        match present_dns01_challenges_and_wait(
+            keeper,
+            command,
+            &order.dns01_challenges,
+            config.dns01_propagation,
+        )
+        .await
+        {
+            Dns01Presentation::Presented => {}
+            Dns01Presentation::Failed(error) => return Err(error),
+            Dns01Presentation::Lost => return Ok(abandon_renewal(&certificate.id)),
         }
     }
 
+    finish_renewal_order(
+        certificate_store,
+        order_store,
+        keeper,
+        &certificate,
+        order,
+        config.challenge_type,
+        config,
+    )
+    .await
+}
+
+/// Resume the authoritative persisted order a prior renewer left mid-flight.
+///
+/// Reached only after this instance won the certificate's claim, so the prior
+/// renewer is either gone or superseded. Nothing here creates a second ACME
+/// order: the persisted account credentials, order URL, and challenge records
+/// are the resumption inputs, and the order is driven with the challenge type it
+/// was actually prepared with rather than with the current configuration's.
+///
+/// HTTP-01 and TLS-ALPN-01 need no republication step — the shared challenge
+/// resolvers answer straight out of the order store for any order still in an
+/// active status, so leaving the record untouched keeps the prior renewer's
+/// tokens being served. DNS-01 records live in the operator's DNS provider
+/// instead, so they are re-presented through the configured hook. When that hook
+/// is no longer configured the order is left exactly as it is: not deleted, not
+/// marked complete, and not counted as renewed.
+///
+/// Loss of the claim abandons the work at the same points a newly prepared
+/// renewal does, including the lease-guarded DNS-01 cleanup.
+///
+/// `pub(crate)` only so the sibling test module can drive the pre-network
+/// decisions (challenge-type inference, the missing-hook skip) directly; the
+/// scheduler is the sole production caller.
+#[cfg(feature = "acme")]
+pub(crate) async fn resume_persisted_renewal_order(
+    certificate_store: &Arc<AcmeCertificateStore>,
+    order_store: &Arc<AcmeOrderStore>,
+    keeper: &crate::tls::lease::RenewalLeaseKeeper,
+    certificate: AcmeCertificateRecord,
+    order: AcmeOrderRecord,
+    config: &AcmeRenewalSchedulerConfig,
+) -> Result<bool, AcmeError> {
+    let challenge_type = infer_persisted_challenge_type(&order)?;
+    // Fail before any side effect if the persisted order cannot actually be
+    // driven. `complete_prepared_renewal_order` checks both again; checking here
+    // keeps a hopeless resume from re-presenting DNS-01 records first.
+    if order.account_credentials_json.is_none() {
+        return Err(AcmeError::InvalidId(format!(
+            "ACME order {} has no persisted account credentials; not resuming it",
+            order.id
+        )));
+    }
+    if order
+        .order_url
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return Err(AcmeError::InvalidId(format!(
+            "ACME order {} has no persisted order URL; not resuming it",
+            order.id
+        )));
+    }
+    tracing::info!(
+        certificate_id = %certificate.id,
+        order_id = %order.id,
+        challenge_type = challenge_type.as_str(),
+        "resuming a persisted ACME renewal order under a newly acquired claim"
+    );
+
+    if challenge_type == AcmeRenewalChallengeType::Dns01 {
+        let Some(command) = config.dns01_hook_command.as_deref() else {
+            tracing::warn!(
+                certificate_id = %certificate.id,
+                order_id = %order.id,
+                "cannot resume a persisted ACME DNS-01 order because FERRUM_ACME_DNS01_HOOK_COMMAND is not configured; leaving the order untouched"
+            );
+            return Ok(false);
+        };
+        match present_dns01_challenges_and_wait(
+            keeper,
+            command,
+            &order.dns01_challenges,
+            config.dns01_propagation,
+        )
+        .await
+        {
+            Dns01Presentation::Presented => {}
+            Dns01Presentation::Failed(error) => return Err(error),
+            Dns01Presentation::Lost => return Ok(abandon_renewal(&certificate.id)),
+        }
+    }
+
+    finish_renewal_order(
+        certificate_store,
+        order_store,
+        keeper,
+        &certificate,
+        order,
+        challenge_type,
+        config,
+    )
+    .await
+}
+
+/// Outcome of presenting DNS-01 challenges and waiting for propagation.
+#[cfg(feature = "acme")]
+enum Dns01Presentation {
+    Presented,
+    Failed(AcmeError),
+    /// The claim was lost; nothing further may run.
+    Lost,
+}
+
+/// Publish every DNS-01 challenge through the operator hook, then wait out the
+/// configured propagation delay — both inside the claim's cancellation scope.
+#[cfg(feature = "acme")]
+async fn present_dns01_challenges_and_wait(
+    keeper: &crate::tls::lease::RenewalLeaseKeeper,
+    command: &str,
+    challenges: &[AcmeDns01ChallengeRecord],
+    propagation: Duration,
+) -> Dns01Presentation {
+    let publication = publish_dns01_challenges_with_hook(command, challenges);
+    match keeper.guarded(publication).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Dns01Presentation::Failed(error),
+        Err(_) => return Dns01Presentation::Lost,
+    }
+    if !propagation.is_zero() {
+        let wait = tokio::time::sleep(propagation);
+        if keeper.guarded(wait).await.is_err() {
+            return Dns01Presentation::Lost;
+        }
+    }
+    Dns01Presentation::Presented
+}
+
+/// Poll, finalize, download, clean up, and publish — the tail every renewal
+/// shares, whether the order was just created or resumed after a takeover.
+///
+/// `challenge_type` is the order's own type, so a resumed order is completed and
+/// cleaned up exactly the way it was prepared.
+#[cfg(feature = "acme")]
+async fn finish_renewal_order(
+    certificate_store: &Arc<AcmeCertificateStore>,
+    order_store: &Arc<AcmeOrderStore>,
+    keeper: &crate::tls::lease::RenewalLeaseKeeper,
+    certificate: &AcmeCertificateRecord,
+    order: AcmeOrderRecord,
+    challenge_type: AcmeRenewalChallengeType,
+    config: &AcmeRenewalSchedulerConfig,
+) -> Result<bool, AcmeError> {
     // Readiness polling, finalization, and certificate download are the longest
     // external stretch on *every* challenge type, HTTP-01 and TLS-ALPN-01
     // included, and are bounded only by FERRUM_ACME_RENEW_POLL_TIMEOUT_SECONDS.
-    let completion = complete_prepared_renewal_order(&order, config);
+    let completion = complete_prepared_renewal_order(&order, challenge_type, config);
     let completion_result = match keeper.guarded(completion).await {
         Ok(result) => result,
         // Deliberately no DNS-01 cleanup here: the instance that took the claim
@@ -2346,7 +2646,7 @@ async fn renew_certificate_once(
     // over a claim lost while a slow hook is in flight. A hook that merely
     // *fails* is logged and processing continues, because the claim is still
     // held.
-    if config.challenge_type == AcmeRenewalChallengeType::Dns01
+    if challenge_type == AcmeRenewalChallengeType::Dns01
         && let Some(command) = config.dns01_hook_command.as_deref()
     {
         let cleanup = cleanup_dns01_challenges_with_hook(command, &order.dns01_challenges);
@@ -2483,6 +2783,7 @@ async fn prepare_renewal_order(
 #[cfg(feature = "acme")]
 async fn complete_prepared_renewal_order(
     order: &AcmeOrderRecord,
+    challenge_type: AcmeRenewalChallengeType,
     config: &AcmeRenewalSchedulerConfig,
 ) -> Result<client::CompletedAcmeHttp01Order, AcmeError> {
     let account_credentials_json = order
@@ -2500,7 +2801,7 @@ async fn complete_prepared_renewal_order(
         poll_timeout: config.poll_timeout,
         dns_cache: config.dns_cache.clone(),
     };
-    match config.challenge_type {
+    match challenge_type {
         AcmeRenewalChallengeType::Http01 => client::complete_http01_order(complete_config).await,
         AcmeRenewalChallengeType::TlsAlpn01 => {
             client::complete_tls_alpn01_order(complete_config).await

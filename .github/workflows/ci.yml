@@ -358,6 +358,14 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+      # Same reason: the renewal-resumption entry point (issue #2409's crash
+      # recovery) only exists behind `acme`, so the takeover/skip decisions it
+      # makes before any ACME networking need the feature on to be gated at all.
+      - name: Run ACME renewal crash-recovery regressions
+        run: cargo test --features acme --lib tls::acme_renewal_resume_tests
+        env:
+          RUST_BACKTRACE: 1
+
   test-secrets:
     name: Secret Backends
     needs: ci-plan
