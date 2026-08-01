@@ -1821,6 +1821,7 @@ pub struct EnvConfig {
     /// Admin API read-only mode (default: false, always true in DP mode)
     pub admin_read_only: bool,
     /// Enable database-backed Admin API mutation audit events. Default: false.
+    /// Does not gate `GET /backup` security-record admission (always on).
     pub admin_audit_enabled: bool,
     /// Optional age-based audit retention in days (`FERRUM_AUDIT_RETENTION_DAYS`).
     /// Unset disables age prune. When set, must be in `1..=36_500`. Distinct from

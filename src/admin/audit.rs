@@ -9,11 +9,12 @@
 //!
 //! Security-sensitive surfaces that must not release unredacted material without
 //! a durable record (notably `GET /backup`) use [`admit_security_sensitive_event`]
-//! instead: that path awaits a synchronous database insert when a backend is
-//! available, and otherwise appends to a bounded local fallback file so capture
-//! does not depend solely on the same unavailable primary used for config load.
-//! General mutation delivery-loss hardening remains issue #2421 and is out of
-//! scope for the backup-specific admit path.
+//! instead. That path is unconditional — independent of
+//! `FERRUM_ADMIN_AUDIT_ENABLED` — and awaits a synchronous database insert when
+//! a backend is available, otherwise appending to a bounded local fallback file
+//! so capture does not depend solely on the same unavailable primary used for
+//! config load. General mutation delivery-loss hardening remains issue #2421 and
+//! is out of scope for the backup-specific admit path.
 
 use crate::admin::jwt_auth::{AdminClaims, AdminRole};
 use crate::config::db_backend::DatabaseBackend;
@@ -588,8 +589,6 @@ pub fn delete_diff(before: Value) -> Value {
 /// Which durable sink admitted a security-sensitive audit event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditAdmitSink {
-    /// Audit disabled — no record required.
-    Disabled,
     /// Synchronous insert into the primary audit store.
     Database,
     /// Bounded local fallback file (used when the primary store is absent or
@@ -690,7 +689,9 @@ pub fn backup_resources_audit_value(filter: Option<&std::collections::HashSet<&s
 
 /// Admit a security-sensitive audit event before releasing unredacted material.
 ///
-/// When auditing is disabled this is a no-op success. Otherwise:
+/// Backup security auditing is unconditional and independent of
+/// `FERRUM_ADMIN_AUDIT_ENABLED` (which gates ordinary mutation audit events
+/// only):
 /// 1. Prefer a synchronous `insert_audit_event` on the provided backend.
 /// 2. If no backend is present or the insert fails, append to the bounded local
 ///    fallback file under `fallback_dir` (or the configured default) on a
@@ -701,15 +702,10 @@ pub fn backup_resources_audit_value(filter: Option<&std::collections::HashSet<&s
 /// This is intentionally narrower than #2421 (general mutation durability): it
 /// only covers surfaces that must not silently export secrets without a record.
 pub async fn admit_security_sensitive_event(
-    enabled: bool,
     db: Option<&Arc<dyn DatabaseBackend>>,
     event: &AuditEvent,
     fallback_dir: Option<&Path>,
 ) -> Result<AuditAdmitSink, anyhow::Error> {
-    if !enabled {
-        return Ok(AuditAdmitSink::Disabled);
-    }
-
     if let Some(db) = db {
         match db.insert_audit_event(event).await {
             Ok(()) => return Ok(AuditAdmitSink::Database),
@@ -747,15 +743,16 @@ pub async fn admit_security_sensitive_event(
 }
 
 /// Best-effort admit for authenticated backup denials/validation failures.
-/// Never changes the caller's HTTP response path on failure — only logs that
-/// the security record could not be stored.
+///
+/// Uses the same unconditional database/local-fallback path as successful
+/// exports. Never changes the caller's HTTP response path on failure — only
+/// logs that the security record could not be stored.
 pub async fn record_backup_attempt_best_effort(
-    enabled: bool,
     db: Option<&Arc<dyn DatabaseBackend>>,
     event: &AuditEvent,
     fallback_dir: Option<&Path>,
 ) {
-    if let Err(_error) = admit_security_sensitive_event(enabled, db, event, fallback_dir).await {
+    if let Err(_error) = admit_security_sensitive_event(db, event, fallback_dir).await {
         warn!(
             audit_event_id = %event.id,
             surface = "backup_audit_attempt",
@@ -775,7 +772,9 @@ struct FallbackFileLock {
 /// Append one event to the bounded local fallback store.
 ///
 /// Enforces a non-symlink directory/data/lock target, owner-only Unix
-/// permissions, collision-resistant temp publication with directory sync, and
+/// permissions, collision-resistant temp publication with same-directory
+/// atomic replace (Unix `rename(2)`; Windows
+/// `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)`), directory sync, and
 /// cross-process exclusion where the platform supports it. In-process and
 /// cross-process locks are acquired without waiting (`try_lock` /
 /// `LOCK_EX|LOCK_NB` on Unix; immediate share denial on Windows): contention
@@ -1011,9 +1010,13 @@ fn write_local_fallback_events_unlocked(
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
-    if let Err(error) = fs::rename(&tmp, path) {
+    // Same-directory replace: never unlink the destination before publish, and
+    // never leave a visibility gap. Unix `rename(2)` replaces atomically;
+    // Windows uses `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)` because
+    // `std::fs::rename` does not replace an existing destination there.
+    if let Err(error) = replace_local_fallback_file(&tmp, path) {
         let _ = fs::remove_file(&tmp);
-        return Err(error.into());
+        return Err(error);
     }
     sync_directory(dir)?;
     #[cfg(unix)]
@@ -1022,6 +1025,87 @@ fn write_local_fallback_events_unlocked(
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+/// Atomically publish `temp` over `destination` in the same directory.
+///
+/// Safety boundary: both paths must already be siblings under the prepared
+/// fallback directory (caller holds the process/cross-process locks and wrote
+/// `temp` via [`write_temp_fallback_file`]). This never removes `destination`
+/// before replacement and never logs path contents.
+fn replace_local_fallback_file(temp: &Path, destination: &Path) -> Result<(), anyhow::Error> {
+    #[cfg(windows)]
+    {
+        return replace_local_fallback_file_windows(temp, destination);
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(temp, destination).map_err(|error| error.into())
+    }
+}
+
+/// Windows same-directory replacement with replace-existing + write-through.
+///
+/// `std::fs::rename` maps to `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`,
+/// so the first append can succeed while every later append fails closed when
+/// the destination already exists. This path uses
+/// `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` and propagates Win32
+/// failures without deleting the live destination first (no visibility gap).
+#[cfg(windows)]
+fn replace_local_fallback_file_windows(
+    temp: &Path,
+    destination: &Path,
+) -> Result<(), anyhow::Error> {
+    use std::os::windows::ffi::OsStrExt;
+
+    // MOVEFILE_REPLACE_EXISTING = 0x1, MOVEFILE_WRITE_THROUGH = 0x8
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    let source: Vec<u16> = temp
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let target: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAFETY: `source`/`target` are NUL-terminated wide paths owned for the
+    // duration of the call. Flags request replace-existing + write-through
+    // durability only; no path bytes are logged on failure.
+    let ok = unsafe {
+        windows_ffi::MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(anyhow!(
+            "failed to replace audit local fallback file: {error}"
+        ));
+    }
+    Ok(())
+}
+
+/// Minimal kernel32 bindings for atomic same-directory file replacement.
+///
+/// Kept local (no `windows-sys` dependency) because this is the only Win32
+/// primitive the backup-audit fallback needs today.
+#[cfg(windows)]
+mod windows_ffi {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub(super) fn MoveFileExW(
+            lp_existing_file_name: *const u16,
+            lp_new_file_name: *const u16,
+            dw_flags: u32,
+        ) -> i32;
+    }
 }
 
 fn write_temp_fallback_file(tmp: &Path, body: &[u8]) -> Result<(), anyhow::Error> {

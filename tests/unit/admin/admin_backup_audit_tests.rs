@@ -349,20 +349,77 @@ fn list_local_fallback_fails_closed_on_cross_process_lock_contention() {
     drop(held);
 }
 
-#[tokio::test]
-async fn admit_security_sensitive_event_disabled_is_noop() {
-    let event = AuditEvent::new(
+#[test]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
+fn local_fallback_multiple_appends_retain_both_events() {
+    let dir = TempDir::new().expect("tempdir");
+    let first = AuditEvent::new(
         &admin_actor(),
         "backup",
         "gateway_config",
         "ferrum",
         "ferrum",
-        json!({}),
+        backup_success_diff("cached", json!("all"), json!({"proxies": 0}), 2),
+    )
+    .with_outcome(audit::outcome::SUCCESS);
+    let second = AuditEvent::new(
+        &admin_actor(),
+        "backup",
+        "gateway_config",
+        "ferrum",
+        "ferrum",
+        backup_failure_diff(audit::failure_category::FORBIDDEN, json!("all")),
+    )
+    .with_outcome(audit::outcome::DENIED);
+
+    append_local_fallback_event(dir.path(), &first).expect("first append");
+    // Second publish must replace the existing destination (Windows
+    // `std::fs::rename` cannot); both events must remain readable.
+    append_local_fallback_event(dir.path(), &second).expect("second append");
+
+    let listed = list_local_fallback_events(dir.path()).expect("list");
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].id, first.id);
+    assert_eq!(listed[0].outcome, "success");
+    assert_eq!(listed[1].id, second.id);
+    assert_eq!(listed[1].outcome, "denied");
+}
+
+#[test]
+fn local_fallback_windows_replace_uses_movefileex_replace_existing() {
+    const AUDIT_SOURCE: &str = include_str!("../../../src/admin/audit.rs");
+    assert!(
+        AUDIT_SOURCE.contains("replace_local_fallback_file"),
+        "fallback publish must go through the platform replace helper"
     );
-    let sink = audit::admit_security_sensitive_event(false, None, &event, None)
-        .await
-        .expect("disabled admit");
-    assert_eq!(sink, AuditAdmitSink::Disabled);
+    assert!(
+        AUDIT_SOURCE.contains("MOVEFILE_REPLACE_EXISTING"),
+        "Windows path must request replace-existing semantics"
+    );
+    assert!(
+        AUDIT_SOURCE.contains("MOVEFILE_WRITE_THROUGH"),
+        "Windows path must request write-through durability"
+    );
+    assert!(
+        AUDIT_SOURCE.contains("MoveFileExW"),
+        "Windows path must use MoveFileExW"
+    );
+    // Never delete the live destination before publish (visibility gap).
+    assert!(
+        !AUDIT_SOURCE.contains("remove_file(path)")
+            && !AUDIT_SOURCE.contains("remove_file(destination)"),
+        "must not unlink the live fallback destination before replace"
+    );
+    // Bare std rename is only allowed on the non-Windows branch.
+    let windows_fn = AUDIT_SOURCE
+        .split("fn replace_local_fallback_file_windows")
+        .nth(1)
+        .unwrap_or("");
+    let windows_body = windows_fn.split("fn write_temp_fallback_file").next().unwrap_or("");
+    assert!(
+        !windows_body.contains("fs::rename("),
+        "Windows replace must not call std::fs::rename"
+    );
 }
 
 #[tokio::test]
@@ -378,7 +435,8 @@ async fn admit_security_sensitive_event_uses_local_fallback_without_db() {
         backup_success_diff("cached", json!("all"), json!({"proxies": 0}), 2),
     )
     .with_outcome(audit::outcome::SUCCESS);
-    let sink = audit::admit_security_sensitive_event(true, None, &event, Some(dir.path()))
+    // No enabled flag: backup security admission is unconditional.
+    let sink = audit::admit_security_sensitive_event(None, &event, Some(dir.path()))
         .await
         .expect("local admit");
     assert_eq!(sink, AuditAdmitSink::LocalFallback);

@@ -3757,13 +3757,14 @@ paths:
         Falls back to the in-memory cached configuration when the database is
         unavailable, indicated by the `X-Data-Source: cached` response header.
 
-        When `FERRUM_ADMIN_AUDIT_ENABLED=true`, a durable security audit record
-        is admitted before the unredacted body is released (synchronous
-        `audit_events` insert, or bounded local fallback under
-        `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` when the primary store is unavailable).
-        If admission fails, the endpoint returns `503` without an attachment.
-        Authenticated denials and validation failures are audited with
-        fixed-cardinality categories only.
+        A durable security audit record is always admitted before the
+        unredacted body is released (independent of
+        `FERRUM_ADMIN_AUDIT_ENABLED`, which gates ordinary mutation audit
+        events only): synchronous `audit_events` insert, or bounded local
+        fallback under `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` when the primary
+        store is unavailable. If admission fails, the endpoint returns `503`
+        without an attachment. Authenticated denials and validation failures
+        are audited with fixed-cardinality categories only.
 
         ### Size guidance
 

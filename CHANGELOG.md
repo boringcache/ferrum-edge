@@ -10,15 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Admin audit events gain optional `source_address`, `request_id`, and
-  `outcome` fields (folded into the baseline `audit_events` schema). When
-  `FERRUM_ADMIN_AUDIT_ENABLED=true`, `GET /backup` admits a durable
-  security record before releasing unredacted configuration: synchronous
+  `outcome` fields (folded into the baseline `audit_events` schema).
+  `GET /backup` always admits a durable security record before releasing
+  unredacted configuration (independent of `FERRUM_ADMIN_AUDIT_ENABLED`,
+  which continues to gate ordinary mutation audit events only): synchronous
   primary insert when available, otherwise the bounded local fallback under
   `FERRUM_ADMIN_AUDIT_FALLBACK_PATH`, failing closed with `503` if neither
   sink admits the event. Authenticated denied/failed backup attempts are
   audited with fixed failure categories only; backup payload bytes and
-  secrets never enter audit events or logs. Local fallback lock acquisition
-  is non-blocking (in-process `try_lock`, Unix `flock(LOCK_EX|LOCK_NB)`,
+  secrets never enter audit events or logs. Local fallback publication uses
+  same-directory atomic replace (Unix `rename(2)`; Windows
+  `MoveFileExW(MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)`) so
+  repeated appends succeed when the destination already exists, without
+  unlinking the live file first. Local fallback lock acquisition is
+  non-blocking (in-process `try_lock`, Unix `flock(LOCK_EX|LOCK_NB)`,
   Windows immediate share denial) so contention fails closed instead of
   hanging a blocking-pool thread. Backup `resources=` filters are
   a closed allow-list; unknown tokens are rejected with static client text

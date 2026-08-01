@@ -76,7 +76,7 @@ async fn make_store(dir: &TempDir) -> DatabaseStore {
         .expect("connect sqlite store")
 }
 
-fn base_admin_state(audit_enabled: bool) -> AdminState {
+fn base_admin_state() -> AdminState {
     AdminState {
         db: None,
         jwt_manager: jwt_manager(),
@@ -85,7 +85,9 @@ fn base_admin_state(audit_enabled: bool) -> AdminState {
         proxy_state: None,
         mode: "database".to_string(),
         read_only: false,
-        admin_audit_enabled: audit_enabled,
+        // Mutation audit remains off by default; backup security auditing is
+        // unconditional and must still admit records in this configuration.
+        admin_audit_enabled: false,
         admin_audit_fallback_dir: None,
         admin_require_namespace_claim: false,
         startup_ready: None,
@@ -111,8 +113,8 @@ fn base_admin_state(audit_enabled: bool) -> AdminState {
     }
 }
 
-fn admin_state(db: DatabaseStore, audit_enabled: bool) -> AdminState {
-    let mut state = base_admin_state(audit_enabled);
+fn admin_state(db: DatabaseStore) -> AdminState {
+    let mut state = base_admin_state();
     state.db = Some(Arc::new(db));
     state
 }
@@ -208,8 +210,8 @@ fn sample_cached_config() -> GatewayConfig {
     }
 }
 
-fn cached_only_state(config: GatewayConfig, audit_enabled: bool) -> AdminState {
-    let mut state = base_admin_state(audit_enabled);
+fn cached_only_state(config: GatewayConfig) -> AdminState {
+    let mut state = base_admin_state();
     state.mode = "file".to_string();
     state.read_only = true;
     state.cached_config = Some(Arc::new(ArcSwap::new(Arc::new(config))));
@@ -289,7 +291,7 @@ fn assert_no_secret_canaries(value: &Value) {
 #[tokio::test]
 async fn backup_success_writes_audit_with_counts_bytes_and_request_id() {
     let tmp = TempDir::new().unwrap();
-    let state = admin_state(make_store(&tmp).await, true);
+    let state = admin_state(make_store(&tmp).await);
     let (base, _shutdown) = start_admin(state).await;
     let admin = token("backup-admin", Some("admin"));
 
@@ -317,7 +319,7 @@ async fn backup_success_writes_audit_with_counts_bytes_and_request_id() {
 #[tokio::test]
 async fn backup_validation_failure_is_audited_without_export_body() {
     let tmp = TempDir::new().unwrap();
-    let state = admin_state(make_store(&tmp).await, true);
+    let state = admin_state(make_store(&tmp).await);
     let (base, _shutdown) = start_admin(state).await;
     let admin = token("backup-admin", Some("admin"));
 
@@ -338,7 +340,7 @@ async fn backup_validation_failure_is_audited_without_export_body() {
 #[tokio::test]
 async fn backup_role_denial_is_audited() {
     let tmp = TempDir::new().unwrap();
-    let state = admin_state(make_store(&tmp).await, true);
+    let state = admin_state(make_store(&tmp).await);
     let (base, _shutdown) = start_admin(state).await;
     let operator = token("ops-user", Some("operator"));
     let admin = token("backup-admin", Some("admin"));
@@ -360,7 +362,7 @@ async fn backup_role_denial_is_audited() {
 #[tokio::test]
 async fn backup_unknown_resources_token_is_rejected_without_persisting_canary() {
     let tmp = TempDir::new().unwrap();
-    let state = admin_state(make_store(&tmp).await, true);
+    let state = admin_state(make_store(&tmp).await);
     let (base, _shutdown) = start_admin(state).await;
     let admin = token("backup-admin", Some("admin"));
     let canary = "canary-secret-token-never-in-audit-or-logs";
@@ -387,7 +389,7 @@ async fn backup_unknown_resources_token_is_rejected_without_persisting_canary() 
 #[serial_test::serial(admin_audit_local_fallback_lock)]
 async fn cached_backup_without_db_uses_local_fallback_audit_sink() {
     let fallback = TempDir::new().unwrap();
-    let mut state = cached_only_state(sample_cached_config(), true);
+    let mut state = cached_only_state(sample_cached_config());
     // Inject an isolated fallback path through AdminState — never mutate
     // process-global environment (which races parallel tests / panics).
     state.admin_audit_fallback_dir = Some(fallback.path().to_path_buf());

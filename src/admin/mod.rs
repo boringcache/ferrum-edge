@@ -299,6 +299,7 @@ pub struct AdminState {
     pub mode: String,
     pub read_only: bool,
     /// Enables database-backed audit events for successful admin mutations.
+    /// Does not gate `GET /backup` security-record admission (always on).
     pub admin_audit_enabled: bool,
     /// Optional override for the local security-audit fallback directory.
     /// When `None`, uses [`audit::audit_local_fallback_dir`] (env/config).
@@ -2254,7 +2255,6 @@ pub async fn handle_admin_request(
             .with_request_context(&audit_request_ctx)
             .with_outcome(audit::outcome::DENIED);
             audit::record_backup_attempt_best_effort(
-                state.admin_audit_enabled,
                 state.db.as_ref(),
                 &event,
                 state.admin_audit_fallback_dir.as_deref(),
@@ -2645,7 +2645,6 @@ pub async fn handle_admin_request(
                 .with_request_context(&audit_request_ctx)
                 .with_outcome(audit::outcome::DENIED);
                 audit::record_backup_attempt_best_effort(
-                    state.admin_audit_enabled,
                     state.db.as_ref(),
                     &event,
                     state.admin_audit_fallback_dir.as_deref(),
@@ -6805,7 +6804,6 @@ async fn finalize_backup_export(
     .with_outcome(audit::outcome::SUCCESS);
 
     match audit::admit_security_sensitive_event(
-        state.admin_audit_enabled,
         state.db.as_ref(),
         &event,
         state.admin_audit_fallback_dir.as_deref(),
@@ -6851,7 +6849,6 @@ async fn audit_backup_failure(
     .with_request_context(request_ctx)
     .with_outcome(outcome);
     audit::record_backup_attempt_best_effort(
-        state.admin_audit_enabled,
         state.db.as_ref(),
         &event,
         state.admin_audit_fallback_dir.as_deref(),
