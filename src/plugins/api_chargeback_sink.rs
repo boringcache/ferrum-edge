@@ -5215,8 +5215,9 @@ fn build_insert_url(base: &Url, cfg: &ClickHouseConfig) -> String {
     let mut url = base.clone();
     url.set_query(None);
     url.set_fragment(None);
-    let pins_durable_async_ack =
-        !cfg.insert_query_params.contains_key(WAIT_FOR_ASYNC_INSERT_PARAM);
+    let pins_durable_async_ack = !cfg
+        .insert_query_params
+        .contains_key(WAIT_FOR_ASYNC_INSERT_PARAM);
     {
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("database", &cfg.database);

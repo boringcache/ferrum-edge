@@ -105,7 +105,11 @@ async fn durable_insert_pins_wait_on_wire_when_async_settings_omitted() {
     plugin.log(&per_event_summary("it-request")).await;
 
     let requests = wait_for_post_requests(&server, 1).await;
-    assert_eq!(requests.len(), 1, "expected exactly one durable INSERT POST");
+    assert_eq!(
+        requests.len(),
+        1,
+        "expected exactly one durable INSERT POST"
+    );
     let request = &requests[0];
 
     let wait_values: Vec<_> = request
