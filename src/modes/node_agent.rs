@@ -31,9 +31,9 @@ use crate::capture::{
     XTABLES_LOCK_WAIT_SECONDS, include_outbound_ports_from_annotations,
 };
 use crate::cni::ownership::{
-    DurableCniOwnershipRecord, cni_ownership_store_is_rejected, configure_cni_ownership_store,
-    is_safe_cni_pod_uid, load_configured_cni_ownership, ownership_store_path_for_socket,
-    persist_configured_cni_ownership,
+    DurableCniCleanupSnapshot, DurableCniOwnershipRecord, cni_ownership_store_is_rejected,
+    configure_cni_ownership_store, is_safe_cni_pod_uid, load_configured_cni_ownership,
+    ownership_store_path_for_socket, persist_configured_cni_ownership,
 };
 use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
 use crate::cni::spec::{
@@ -83,17 +83,21 @@ static PENDING_CAPTURE_FAILURES: LazyLock<DashMap<String, ()>> = LazyLock::new(D
 ///
 /// When CNI is enabled, the same records are mirrored into a crash-safe durable
 /// store beside the configured CNI socket so a process restart can rehydrate
-/// ownership before GC acts. In-memory keys remain scoped by `pod_states`
-/// address so concurrent test harnesses / foreign generations are never swept.
+/// ownership and the exact cleanup snapshot GC needs before acting. In-memory
+/// keys remain scoped by `pod_states` address so concurrent test harnesses /
+/// foreign generations are never swept.
 static CNI_OWNED_ATTACHMENTS: LazyLock<DashMap<String, CniOwnedAttachment>> =
     LazyLock::new(DashMap::new);
 
-/// Attachment identity recorded for Ferrum CNI ADD ownership / GC matching.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Attachment identity recorded for Ferrum CNI ADD ownership / GC matching,
+/// plus the cleanup projection required to tear down Ferrum-owned eBPF state
+/// after a restart when live `pod_states` is empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CniOwnedAttachment {
     container_id: String,
     ifname: String,
     pod_uid: String,
+    cleanup: DurableCniCleanupSnapshot,
 }
 
 const CAPTURE_FAILURE_POD_IP_UPDATE: &str = "pod_ip_update";
@@ -2878,6 +2882,64 @@ fn pod_state_key(pod_states: &DashMap<String, PodAttachmentState>, pod_uid: &str
     format!("{}{pod_uid}", pod_state_key_prefix(pod_states))
 }
 
+fn durable_cleanup_snapshot_from_state(state: &PodAttachmentState) -> DurableCniCleanupSnapshot {
+    DurableCniCleanupSnapshot {
+        attached: state.attached,
+        pod_ip: state.pod_ip,
+        pod_ip6: state.pod_ip6,
+        include_ports_cgroup_ids: state.include_ports_cgroup_ids.clone(),
+        workload_identity_cgroup_ids: state.workload_identity_cgroup_ids.clone(),
+        node_probe_ports: state.node_probe_ports.clone(),
+        inbound_redirect_ports: state.inbound_redirect_ports.clone(),
+    }
+}
+
+fn pod_attachment_state_from_cleanup(
+    pod_uid: &str,
+    cleanup: &DurableCniCleanupSnapshot,
+) -> PodAttachmentState {
+    PodAttachmentState {
+        pod_uid: pod_uid.to_string(),
+        // Name/namespace/cgroup/veth/policy are not consumed by the removal
+        // path; keep placeholders so reconstructed teardown stays bounded.
+        pod_name: String::new(),
+        namespace: String::new(),
+        pod_ip: cleanup.pod_ip,
+        pod_ip6: cleanup.pod_ip6,
+        cgroup_path: None,
+        veth_iface: None,
+        attached: cleanup.attached,
+        include_ports_cgroup_ids: cleanup.include_ports_cgroup_ids.clone(),
+        include_ports_policy: None,
+        workload_identity_cgroup_ids: cleanup.workload_identity_cgroup_ids.clone(),
+        node_probe_ports: cleanup.node_probe_ports.clone(),
+        inbound_redirect_ports: cleanup.inbound_redirect_ports.clone(),
+    }
+}
+
+fn drop_conflicting_cni_owned_attachments(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    container_id: &str,
+    ifname: &str,
+    keep_state_key: &str,
+) {
+    let prefix = pod_state_key_prefix(pod_states);
+    let stale_keys: Vec<String> = CNI_OWNED_ATTACHMENTS
+        .iter()
+        .filter_map(|entry| {
+            let key = entry.key();
+            if key == keep_state_key || !key.starts_with(&prefix) {
+                return None;
+            }
+            let owned = entry.value();
+            (owned.container_id == container_id && owned.ifname == ifname).then(|| key.clone())
+        })
+        .collect();
+    for key in stale_keys {
+        CNI_OWNED_ATTACHMENTS.remove(&key);
+    }
+}
+
 fn remember_cni_owned_attachment(
     pod_states: &DashMap<String, PodAttachmentState>,
     pod_uid: &str,
@@ -2899,11 +2961,25 @@ fn remember_cni_owned_attachment(
             "refusing CNI ownership claim while durable ownership state is rejected".to_string(),
         );
     }
+    let Some(state_entry) = pod_states.get(pod_uid) else {
+        // Cleanup keys cannot be reconstructed after the sandbox dies; refuse
+        // to claim ownership without a live attachment projection.
+        return Err(
+            "refusing CNI ownership claim without live pod attachment state for cleanup".to_string(),
+        );
+    };
+    let cleanup = durable_cleanup_snapshot_from_state(state_entry.value());
+    drop(state_entry);
+
     let state_key = pod_state_key(pod_states, pod_uid);
+    // Replace any prior `(container_id, ifname)` under this generation so a
+    // reused tuple cannot encode a self-rejecting durable document.
+    drop_conflicting_cni_owned_attachments(pod_states, container_id, ifname, &state_key);
     let owned = CniOwnedAttachment {
         container_id: container_id.to_string(),
         ifname: ifname.to_string(),
         pod_uid: pod_uid.to_string(),
+        cleanup,
     };
     let previous = CNI_OWNED_ATTACHMENTS.insert(state_key.clone(), owned);
     if let Err(err) = persist_cni_owned_attachments_for(pod_states) {
@@ -2919,6 +2995,31 @@ fn remember_cni_owned_attachment(
     Ok(())
 }
 
+/// Refresh the durable cleanup snapshot for a CNI-owned pod from live state.
+///
+/// Best-effort: persistence failures leave the prior durable snapshot in place
+/// so crash recovery still has the last successfully stored cleanup keys.
+fn refresh_cni_owned_cleanup_snapshot(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    pod_uid: &str,
+) {
+    let state_key = pod_state_key(pod_states, pod_uid);
+    let Some(state_entry) = pod_states.get(pod_uid) else {
+        return;
+    };
+    let cleanup = durable_cleanup_snapshot_from_state(state_entry.value());
+    drop(state_entry);
+    let Some(mut owned) = CNI_OWNED_ATTACHMENTS.get_mut(&state_key) else {
+        return;
+    };
+    if owned.cleanup == cleanup {
+        return;
+    }
+    owned.cleanup = cleanup;
+    drop(owned);
+    let _ = persist_cni_owned_attachments_for(pod_states);
+}
+
 fn durable_cni_ownership_records_for(
     pod_states: &DashMap<String, PodAttachmentState>,
 ) -> Vec<DurableCniOwnershipRecord> {
@@ -2929,10 +3030,17 @@ fn durable_cni_ownership_records_for(
             continue;
         }
         let owned = entry.value();
+        // Prefer live pod_states when present so mid-life IP/cgroup/port updates
+        // are what crash recovery will tear down.
+        let cleanup = pod_states
+            .get(&owned.pod_uid)
+            .map(|state| durable_cleanup_snapshot_from_state(state.value()))
+            .unwrap_or_else(|| owned.cleanup.clone());
         records.push(DurableCniOwnershipRecord {
             container_id: owned.container_id.clone(),
             ifname: owned.ifname.clone(),
             pod_uid: owned.pod_uid.clone(),
+            cleanup,
         });
     }
     records.sort_by(|a, b| {
@@ -2985,10 +3093,20 @@ fn rehydrate_cni_owned_attachments(
                 container_id: record.container_id,
                 ifname: record.ifname,
                 pod_uid: record.pod_uid,
+                cleanup: record.cleanup,
             },
         );
     }
     Ok(())
+}
+
+fn cni_owned_cleanup_state_for(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    pod_uid: &str,
+) -> Option<PodAttachmentState> {
+    let state_key = pod_state_key(pod_states, pod_uid);
+    let owned = CNI_OWNED_ATTACHMENTS.get(&state_key)?;
+    Some(pod_attachment_state_from_cleanup(pod_uid, &owned.cleanup))
 }
 
 /// Drop Ferrum CNI ownership only after removal-blocking cleanup for this
@@ -3077,8 +3195,8 @@ fn apply_cni_gc(
     for pod_uid in &stale_uids {
         // Drive removal for every stale Ferrum-owned UID. After a process
         // restart, ownership may be rehydrated without a live `pod_states`
-        // entry; `handle_pod_removed` still clears registry/failed-enrollment
-        // residue and retains ownership while removal blockers remain.
+        // entry; `handle_pod_removed` reconstructs teardown from the durable
+        // cleanup snapshot and retains ownership while removal blockers remain.
         handle_pod_removed(backend, pod_states, config, metrics, pod_uid);
     }
     retry_pending_pod_detaches(backend, pod_states, config, metrics);
@@ -5311,6 +5429,7 @@ fn handle_pod_added_inner(
         }
         clear_partial_capture_state_if_recovered(pod_states, metrics);
         pod_states.insert(pod_uid.to_string(), state);
+        refresh_cni_owned_cleanup_snapshot(pod_states, pod_uid);
         // Publish to the in-netns capture registry only AFTER enrollment fully
         // succeeded (programs attached, pod-IP + identity written), so a failed
         // or partial enrollment never leaves a stale entry that would make the
@@ -6537,6 +6656,36 @@ pub fn handle_pod_removed(
                     "Withholding Ambient UDP not-ready acknowledgement because failed-enrollment BPF cleanup is incomplete"
                 );
             }
+        } else if let Some(cleanup_state) = cni_owned_cleanup_state_for(pod_states, pod_uid) {
+            // Process restart / missed DEL: durable ownership rehydrated without
+            // live `pod_states`. Drive the same Ferrum-owned teardown using the
+            // persisted cleanup snapshot before ownership may clear.
+            forget_pod_enrollment_attempt(&state_key);
+            unenroll_pod_attachment_state(
+                backend,
+                pod_states,
+                config,
+                metrics,
+                &state_key,
+                pod_uid,
+                &cleanup_state,
+            );
+        } else if CNI_OWNED_ATTACHMENTS.contains_key(&state_key) {
+            // Ownership without a usable cleanup snapshot must never report
+            // success merely because live `pod_states` is empty. Plant a
+            // removal blocker so GC retains ownership and retries.
+            warn!(
+                pod_uid,
+                "Retaining Ferrum CNI ownership because rehydrated attachment lacks a cleanup snapshot"
+            );
+            remember_pending_capture_failure(
+                &state_key,
+                CAPTURE_FAILURE_POD_DETACH,
+                CAPTURE_FAILURE_DETAIL_POD_DETACH,
+            );
+            forget_pod_enrollment_attempt(&state_key);
+            clear_partial_capture_state_if_recovered(pod_states, metrics);
+            return;
         } else {
             forget_pod_enrollment_attempt(&state_key);
         }
@@ -6546,13 +6695,36 @@ pub fn handle_pod_removed(
     };
 
     forget_pod_enrollment_attempt(&state_key);
+    unenroll_pod_attachment_state(
+        backend,
+        pod_states,
+        config,
+        metrics,
+        &state_key,
+        pod_uid,
+        &state,
+    );
+    clear_partial_capture_state_if_recovered(pod_states, metrics);
+    let _ = forget_cni_owned_attachment_if_removal_complete(pod_states, pod_uid);
+}
 
+/// Shared Ferrum-owned attachment teardown used by live removal and rehydrated
+/// durable cleanup snapshots.
+fn unenroll_pod_attachment_state(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    state_key: &str,
+    pod_uid: &str,
+    state: &PodAttachmentState,
+) {
     let mut udp_gate_cleanup_succeeded = true;
     if state.attached {
         let detach_result = backend.detach_pod(pod_uid);
         udp_gate_cleanup_succeeded &=
-            record_removed_pod_detach_result(&state_key, pod_uid, detach_result, metrics);
-        cleanup_node_probe_ports(backend, pod_states, metrics, pod_uid, &state);
+            record_removed_pod_detach_result(state_key, pod_uid, detach_result, metrics);
+        cleanup_node_probe_ports(backend, pod_states, metrics, pod_uid, state);
         if let Some(ip) = state.pod_ip {
             remove_pod_ip_if_unowned(backend, pod_states, metrics, pod_uid, ip, "pod removed");
         }
@@ -6562,10 +6734,10 @@ pub fn handle_pod_removed(
         // Pair with the enrollment writes using the stashed pod + descendant
         // cgroup inode keys. Failures are removal blockers just like detach and
         // pod-IP failures: retries must clear them before proof/ack is minted.
-        remove_pod_cgroup_maps_recording_failures(backend, metrics, &state_key, pod_uid, &state);
+        remove_pod_cgroup_maps_recording_failures(backend, metrics, state_key, pod_uid, state);
         metrics.pods_unenrolled.fetch_add(1, Ordering::Relaxed);
         info!(pod_uid, pod_name = %state.pod_name, "Pod unenrolled from eBPF capture");
-        udp_gate_cleanup_succeeded &= !has_pending_removal_blocking_failure(&state_key);
+        udp_gate_cleanup_succeeded &= !has_pending_removal_blocking_failure(state_key);
     }
     if udp_readiness_reconcile_enabled(config) {
         if udp_gate_cleanup_succeeded {
@@ -6586,8 +6758,6 @@ pub fn handle_pod_removed(
             );
         }
     }
-    clear_partial_capture_state_if_recovered(pod_states, metrics);
-    let _ = forget_cni_owned_attachment_if_removal_complete(pod_states, pod_uid);
 }
 
 async fn handle_fallback(
@@ -14379,6 +14549,15 @@ mod tests {
                 container_id: "ctr-foreign".to_string(),
                 ifname: "eth0".to_string(),
                 pod_uid: "foreign-uid".to_string(),
+                cleanup: DurableCniCleanupSnapshot {
+                    attached: true,
+                    pod_ip: None,
+                    pod_ip6: None,
+                    include_ports_cgroup_ids: Vec::new(),
+                    workload_identity_cgroup_ids: Vec::new(),
+                    node_probe_ports: Vec::new(),
+                    inbound_redirect_ports: Vec::new(),
+                },
             },
         );
 
@@ -14583,24 +14762,64 @@ mod tests {
     #[test]
     fn cni_ownership_rehydrates_across_restart_and_drives_gc() {
         use crate::cni::ownership::{
-            reset_cni_ownership_store_for_tests, store_durable_cni_ownership,
+            DurableCniCleanupSnapshot, reset_cni_ownership_store_for_tests,
+            store_durable_cni_ownership,
         };
         use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let store_path = dir.path().join("cni-owned-attachments.v1");
+        let store_path = dir.path().join("cni-owned-attachments.test.v2");
+        let stale_ip = std::net::Ipv4Addr::new(10, 244, 0, 55);
+        let stale_ip6 = "fd00::55".parse().unwrap();
         store_durable_cni_ownership(
             &store_path,
             &[DurableCniOwnershipRecord {
                 container_id: "ctr-stale".into(),
                 ifname: "eth0".into(),
                 pod_uid: "stale-uid".into(),
+                cleanup: DurableCniCleanupSnapshot {
+                    attached: true,
+                    pod_ip: Some(stale_ip),
+                    pod_ip6: Some(stale_ip6),
+                    include_ports_cgroup_ids: vec![101],
+                    workload_identity_cgroup_ids: vec![202],
+                    node_probe_ports: vec![8080],
+                    inbound_redirect_ports: vec![80],
+                },
             }],
         )
         .expect("seed durable ownership");
 
         configure_cni_ownership_store(Some(store_path.clone()));
         let mut backend = MockEbpfBackend::default();
+        backend
+            .update_pod_ip(
+                stale_ip,
+                &PodInfo {
+                    proxy_port: 15001,
+                    capture_flags: 0,
+                },
+            )
+            .unwrap();
+        backend
+            .update_pod_ip6(
+                stale_ip6,
+                &PodInfo {
+                    proxy_port: 15001,
+                    capture_flags: 0,
+                },
+            )
+            .unwrap();
+        backend.update_node_probe_port(stale_ip, 8080).unwrap();
+        backend.update_node_probe_port6(stale_ip6, 8080).unwrap();
+        backend
+            .update_pod_include_ports(101, &IncludePortsPolicy::all())
+            .unwrap();
+        backend
+            .update_workload_identity(202, &crate::ebpf::WorkloadIdentity::unknown())
+            .unwrap();
+        backend.update_pod_inbound_ports(stale_ip, &[80]).unwrap();
+
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let metrics = NodeAgentMetrics::default();
         let config = NodeAgentConfig {
@@ -14616,7 +14835,7 @@ mod tests {
         };
 
         // Simulate process restart: empty in-memory ownership + empty pod_states,
-        // durable store still names the missed-DEL attachment.
+        // durable store still names the missed-DEL attachment and cleanup keys.
         rehydrate_cni_owned_attachments(&pod_states).expect("rehydrate");
         let state_key = pod_state_key(&pod_states, "stale-uid");
         assert!(
@@ -14640,6 +14859,38 @@ mod tests {
             CniRpcResponse::Ok
         );
         assert!(
+            backend.detached_pods.contains(&"stale-uid".to_string()),
+            "GC after rehydrate must detach the stale pod via durable cleanup snapshot"
+        );
+        assert!(
+            !backend.pod_ips.contains_key(&stale_ip),
+            "GC after rehydrate must remove the stale pod IPv4 map entry"
+        );
+        assert!(
+            !backend.pod_ips6.contains_key(&stale_ip6),
+            "GC after rehydrate must remove the stale pod IPv6 map entry"
+        );
+        assert!(
+            !backend.node_probe_ports.contains(&(stale_ip, 8080)),
+            "GC after rehydrate must remove node probe-port entries"
+        );
+        assert!(
+            !backend.node_probe_ports6.contains(&(stale_ip6, 8080)),
+            "GC after rehydrate must remove IPv6 node probe-port entries"
+        );
+        assert!(
+            !backend.include_ports.contains_key(&101),
+            "GC after rehydrate must remove includeOutboundPorts cgroup entries"
+        );
+        assert!(
+            !backend.workload_identities.contains_key(&202),
+            "GC after rehydrate must remove workload-identity cgroup entries"
+        );
+        assert!(
+            !backend.pod_inbound_ports.contains(&(stale_ip, 80)),
+            "GC after rehydrate must clear inbound redirect scope"
+        );
+        assert!(
             !CNI_OWNED_ATTACHMENTS.contains_key(&state_key),
             "GC after rehydrate must clear stale ownership once cleanup completes"
         );
@@ -14654,14 +14905,140 @@ mod tests {
     }
 
     #[test]
+    fn cni_ownership_rehydrated_partial_failure_retains_durable_until_retry() {
+        use crate::cni::ownership::{
+            DurableCniCleanupSnapshot, load_durable_cni_ownership,
+            reset_cni_ownership_store_for_tests, store_durable_cni_ownership,
+        };
+        use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("cni-owned-attachments.retry.v2");
+        let stale_ip = std::net::Ipv4Addr::new(10, 244, 0, 77);
+        store_durable_cni_ownership(
+            &store_path,
+            &[DurableCniOwnershipRecord {
+                container_id: "ctr-stale".into(),
+                ifname: "eth0".into(),
+                pod_uid: "stale-uid".into(),
+                cleanup: DurableCniCleanupSnapshot {
+                    attached: true,
+                    pod_ip: Some(stale_ip),
+                    pod_ip6: None,
+                    include_ports_cgroup_ids: Vec::new(),
+                    workload_identity_cgroup_ids: Vec::new(),
+                    node_probe_ports: Vec::new(),
+                    inbound_redirect_ports: Vec::new(),
+                },
+            }],
+        )
+        .expect("seed durable ownership");
+
+        configure_cni_ownership_store(Some(store_path.clone()));
+        let mut backend = MockEbpfBackend {
+            fail_detach_pod: true,
+            ..MockEbpfBackend::default()
+        };
+        backend
+            .update_pod_ip(
+                stale_ip,
+                &PodInfo {
+                    proxy_port: 15001,
+                    capture_flags: 0,
+                },
+            )
+            .unwrap();
+
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+
+        rehydrate_cni_owned_attachments(&pod_states).expect("rehydrate");
+        let state_key = pod_state_key(&pod_states, "stale-uid");
+
+        let req = CniRpcRequest {
+            verb: RpcVerb::Gc,
+            pod_namespace: String::new(),
+            pod_name: String::new(),
+            pod_uid: None,
+            container_id: String::new(),
+            ifname: None,
+            netns_path: None,
+            args: HashMap::new(),
+            valid_attachments: Vec::new(),
+        };
+
+        match apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req) {
+            CniRpcResponse::Error { .. } => {}
+            other => panic!("first GC after rehydrate must fail on detach blocker, got {other:?}"),
+        }
+        assert!(
+            CNI_OWNED_ATTACHMENTS.contains_key(&state_key),
+            "partial teardown must retain in-memory ownership"
+        );
+        assert!(
+            has_pending_removal_blocking_failure(&state_key),
+            "detach failure must remain a removal blocker"
+        );
+        let retained = load_durable_cni_ownership(&store_path).expect("reload");
+        assert_eq!(
+            retained.len(),
+            1,
+            "partial failure must retain the durable cleanup snapshot"
+        );
+        assert!(
+            backend.detached_pods.is_empty(),
+            "failed detach must not record success"
+        );
+
+        backend.fail_detach_pod = false;
+        assert_eq!(
+            apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req),
+            CniRpcResponse::Ok,
+            "GC must succeed once pending detach retry clears"
+        );
+        assert!(
+            backend.detached_pods.contains(&"stale-uid".to_string()),
+            "retry must actually detach the rehydrated stale pod"
+        );
+        assert!(
+            !backend.pod_ips.contains_key(&stale_ip),
+            "retry must remove the stale pod IP map entry"
+        );
+        assert!(
+            !CNI_OWNED_ATTACHMENTS.contains_key(&state_key),
+            "successful cleanup must clear Ferrum CNI ownership"
+        );
+        assert!(
+            load_durable_cni_ownership(&store_path)
+                .expect("reload")
+                .is_empty(),
+            "successful cleanup must clear durable ownership"
+        );
+
+        reset_cni_ownership_store_for_tests();
+    }
+
+    #[test]
     fn cni_ownership_remember_rolls_back_when_durable_persist_fails() {
         use crate::cni::ownership::reset_cni_ownership_store_for_tests;
         use crate::tls::private_file::{PrivateFileFault, inject_private_file_fault_for_tests};
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let store_path = dir.path().join("cni-owned-attachments.v1");
+        let store_path = dir.path().join("cni-owned-attachments.v2");
         configure_cni_ownership_store(Some(store_path));
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        pod_states.insert("pod-uid".to_string(), enrolled_pod_state("pod-uid"));
         let _fault = inject_private_file_fault_for_tests(PrivateFileFault::Sync);
 
         let err = remember_cni_owned_attachment(&pod_states, "pod-uid", "ctr-1", "eth0")
@@ -14684,9 +15061,12 @@ mod tests {
         use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let store_path = dir.path().join("cni-owned-attachments.v1");
-        std::fs::write(&store_path, br#"{"version":1,"attachments":[{"container_id":"../escape","ifname":"eth0","pod_uid":"uid"}]}"#)
-            .expect("seed hostile");
+        let store_path = dir.path().join("cni-owned-attachments.v2");
+        std::fs::write(
+            &store_path,
+            br#"{"version":2,"attachments":[{"container_id":"../escape","ifname":"eth0","pod_uid":"uid","cleanup":{"attached":true}}]}"#,
+        )
+        .expect("seed hostile");
         configure_cni_ownership_store(Some(store_path));
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let err = rehydrate_cni_owned_attachments(&pod_states).expect_err("reject");

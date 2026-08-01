@@ -167,7 +167,7 @@ Keep two things distinct: the **transport** (how a peer is reached on the wire) 
 - Opt in with `ferrum.io/inject=true` or `ferrum.io/mesh=enabled`; opt out with `sidecar.istio.io/inject=false` or `ferrum.io/inject=false`.
 - Node-agent CNI is opt-in with `FERRUM_NODE_AGENT_CNI_ENABLED=false` by default.
 - When enabled, node-agent binds `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` and the `ferrum-cni` binary forwards kubelet ADD/DEL/CHECK/GC over that socket.
-- GC (CNI 1.1.0 only) reconciles Ferrum-owned CNI attachments against `cni.dev/valid-attachments` and never removes watcher-only or foreign-generation state. Ownership is mirrored into a crash-safe durable file beside `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` so GC can rehydrate Ferrum-owned `(containerID, ifname) -> pod UID` identity after node-agent restart; rejected durable state fails closed without sweeping.
+- GC (CNI 1.1.0 only) reconciles Ferrum-owned CNI attachments against `cni.dev/valid-attachments` and never removes watcher-only or foreign-generation state. Ownership is mirrored into a crash-safe durable file beside `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` (bound to the exact socket path identity) so GC can rehydrate Ferrum-owned `(containerID, ifname) -> pod UID` identity and the cleanup snapshot required to tear down stale eBPF state after node-agent restart; rejected durable state fails closed without sweeping.
 - kube-rs watcher remains source of truth; CNI only closes the kubelet-vs-watcher race and does not carry labels or annotations.
 
 ## Kubernetes Controller
