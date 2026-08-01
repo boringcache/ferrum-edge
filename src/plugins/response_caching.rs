@@ -331,7 +331,10 @@ fn request_declares_body(headers: &HashMap<String, String>) -> bool {
     // `parse::<u64>()` accepts a leading `+`, which is not valid HTTP
     // Content-Length syntax. Reuse the canonical 1*DIGIT parser so malformed,
     // overflowing, and non-zero values are never evidence of an empty body.
-    !matches!(parse_content_length(content_length), ContentLength::Exact(0))
+    !matches!(
+        parse_content_length(content_length),
+        ContentLength::Exact(0)
+    )
 }
 
 fn is_auto_sensitive_vary_header(header: &str) -> bool {
