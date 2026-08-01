@@ -2579,9 +2579,7 @@ impl Plugin for AiStreamRouter {
         // both from the private claim rather than from the forgeable
         // `ai_stream_router.model` / `ai_stream_router.tool_choice_none` keys.
         let (model, tools_forbidden) = {
-            let Some((claim, provider)) = self.owned_claim(ctx) else {
-                return None;
-            };
+            let (claim, provider) = self.owned_claim(ctx)?;
             if !provider.normalizes_response(self.normalize_response_stream) {
                 return None;
             }
@@ -2619,9 +2617,7 @@ impl Plugin for AiStreamRouter {
         // (`GHSA-xhp5-hqj8-3mwg`). Scoped so the claim borrow ends before the
         // buffered normalization await.
         let (model, tools_forbidden) = {
-            let Some((claim, provider)) = self.owned_claim(ctx) else {
-                return None;
-            };
+            let (claim, provider) = self.owned_claim(ctx)?;
             if !provider.normalizes_response(self.normalize_response_stream) {
                 return None;
             }
