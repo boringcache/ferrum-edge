@@ -2482,6 +2482,160 @@ fn test_sync_trailer_frame_short_circuits_when_already_identical() {
     assert!(payload.contains("request-id: mutated\r\n"));
 }
 
+/// Final reconciliation must rebuild binary and text trailer suffixes through a
+/// ceiling-bounded sink without materialising a decoded/encoded body beside it
+/// (GHSA-pwcm-6rh8-f2gh root finding on the final reframe).
+#[test]
+fn final_trailer_reconciliation_is_bounded_for_binary_and_text() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use ferrum_edge::_test_support::{
+        RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS, build_trailer_frame,
+        store_charged_grpc_web_reframed_body_for_test,
+        sync_translated_body_trailer_frame_into_for_test,
+    };
+
+    let original_trailers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("request-id".to_string(), "abc".to_string()),
+    ]);
+    let mutated = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("request-id".to_string(), "mutated".to_string()),
+    ]);
+
+    let mut binary = vec![0x00, 0x00, 0x00, 0x00, 0x04];
+    binary.extend_from_slice(b"pong");
+    binary.extend(build_trailer_frame(&original_trailers));
+
+    // Valid binary replacement under a covering ceiling.
+    let replaced = sync_translated_body_trailer_frame_into_for_test(
+        &binary,
+        Some("application/grpc-web"),
+        &mutated,
+        Some(200),
+        binary.len() + 64,
+    )
+    .expect("in-ceiling binary rebuild")
+    .expect("must rebuild when trailers changed");
+    let payload = trailing_grpc_web_trailer_payload(&replaced);
+    assert!(payload.contains("request-id: mutated\r\n"), "{payload}");
+
+    // Exact-ceiling refusal: one byte short of the rebuilt body.
+    let err = sync_translated_body_trailer_frame_into_for_test(
+        &binary,
+        Some("application/grpc-web"),
+        &mutated,
+        Some(200),
+        binary.len().saturating_sub(1).max(1),
+    )
+    .expect_err("over-ceiling binary rebuild must overflow");
+    assert!(err, "overflow is distinct from malformed");
+
+    // Malformed binary draft fails closed without rewriting.
+    let mut malformed = vec![0x00, 0x00, 0x00, 0x00, 0x20, 0x01];
+    malformed.extend(build_trailer_frame(&original_trailers));
+    let malformed_err = sync_translated_body_trailer_frame_into_for_test(
+        &malformed,
+        Some("application/grpc-web"),
+        &mutated,
+        Some(200),
+        4096,
+    )
+    .expect_err("malformed draft must refuse");
+    assert!(!malformed_err, "malformed is not an overflow");
+
+    // Text mode: valid replacement + identity short-circuit + corrupt armouring.
+    let text = BASE64.encode(&binary).into_bytes();
+    let text_replaced = sync_translated_body_trailer_frame_into_for_test(
+        &text,
+        Some("application/grpc-web-text"),
+        &mutated,
+        Some(200),
+        text.len() + 128,
+    )
+    .expect("in-ceiling text rebuild")
+    .expect("must rebuild when trailers changed");
+    let decoded = BASE64.decode(&text_replaced).expect("valid text rebuild");
+    let text_payload = trailing_grpc_web_trailer_payload(&decoded);
+    assert!(
+        text_payload.contains("request-id: mutated\r\n"),
+        "{text_payload}"
+    );
+
+    assert!(
+        sync_translated_body_trailer_frame_into_for_test(
+            &text,
+            Some("application/grpc-web-text"),
+            &original_trailers,
+            Some(200),
+            text.len(),
+        )
+        .expect("identical text suffix")
+        .is_none(),
+        "identical trailer suffix must leave the charged original in place"
+    );
+
+    let corrupt = b"!!!!";
+    let corrupt_err = sync_translated_body_trailer_frame_into_for_test(
+        corrupt,
+        Some("application/grpc-web-text"),
+        &mutated,
+        Some(200),
+        64,
+    )
+    .expect_err("corrupt text armouring must refuse");
+    assert!(!corrupt_err);
+
+    // Publication seam: body already above the retained ceiling installs the
+    // neutral gRPC capacity terminal and releases the oversized payload.
+    let mut oversized = bytes::Bytes::from(vec![0u8; 128]);
+    let mut headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    )]);
+    assert!(
+        store_charged_grpc_web_reframed_body_for_test(
+            &mut oversized,
+            &mut headers,
+            64,
+            Some("application/grpc-web"),
+            &mutated,
+            Some(200),
+        )
+        .is_none()
+    );
+    assert!(oversized.is_empty(), "capacity refusal must drop the body");
+    assert_eq!(
+        headers
+            .get("grpc-status")
+            .and_then(|s| s.parse::<u32>().ok()),
+        Some(RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS)
+    );
+    assert_eq!(headers.get("content-length").map(String::as_str), Some("0"));
+
+    // In-ceiling publication of a binary rebuild keeps content replaceable and
+    // reports the stored length for content-length updates.
+    let mut live = bytes::Bytes::from(binary.clone());
+    let mut live_headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    )]);
+    let (stored_len, reframed) = store_charged_grpc_web_reframed_body_for_test(
+        &mut live,
+        &mut live_headers,
+        4096,
+        Some("application/grpc-web"),
+        &mutated,
+        Some(200),
+    )
+    .expect("in-ceiling publication");
+    assert!(reframed);
+    assert_eq!(stored_len, live.len());
+    let live_payload = trailing_grpc_web_trailer_payload(live.as_ref());
+    assert!(live_payload.contains("request-id: mutated\r\n"));
+}
+
 /// Mesh-mTLS translated path must discard trailer-only names from initial
 /// headers after syncing the body trailer frame (H1/H2/H3 parity).
 #[test]

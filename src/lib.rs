@@ -3901,6 +3901,54 @@ pub mod _test_support {
         )
     }
 
+    /// Ceiling-bounded final trailer reconciliation (GHSA-pwcm-6rh8-f2gh).
+    ///
+    /// `Ok(None)` means the existing body already matched. `Ok(Some(bytes))` is a
+    /// sink-built replacement. `Err(false)` is malformed/non-grpc-web.
+    /// `Err(true)` is a retained-ceiling / frame-length overflow.
+    pub fn sync_translated_body_trailer_frame_into_for_test(
+        body: &[u8],
+        content_type: Option<&str>,
+        reconciled_trailers: &HashMap<String, String>,
+        http_status: Option<u16>,
+        ceiling: usize,
+    ) -> Result<Option<Vec<u8>>, bool> {
+        use crate::plugins::grpc_web::SyncTranslatedTrailerOutcome;
+        match crate::plugins::grpc_web::sync_translated_body_trailer_frame_into(
+            body,
+            content_type,
+            reconciled_trailers,
+            http_status,
+            ceiling,
+        ) {
+            SyncTranslatedTrailerOutcome::Unchanged => Ok(None),
+            SyncTranslatedTrailerOutcome::Replaced(bytes) => Ok(Some(bytes)),
+            SyncTranslatedTrailerOutcome::NoRewrite => Err(false),
+            SyncTranslatedTrailerOutcome::Overflow => Err(true),
+        }
+    }
+
+    /// Production final-reconciliation publisher: keeps the charged original
+    /// alive, builds any replacement through the covering window's sink, and
+    /// installs the neutral gRPC capacity terminal on refusal.
+    pub fn store_charged_grpc_web_reframed_body_for_test(
+        response_body: &mut bytes::Bytes,
+        response_headers: &mut HashMap<String, String>,
+        retained_ceiling: usize,
+        content_type: Option<&str>,
+        reconciled_trailers: &HashMap<String, String>,
+        http_status: Option<u16>,
+    ) -> Option<(usize, bool)> {
+        crate::proxy::store_charged_grpc_web_reframed_body(
+            response_body,
+            response_headers,
+            retained_ceiling,
+            content_type,
+            reconciled_trailers,
+            http_status,
+        )
+    }
+
     pub fn truncate_trailing_trailer_frames_for_test(data: &mut Vec<u8>) -> bool {
         crate::plugins::grpc_web::truncate_trailing_trailer_frames(data)
     }

@@ -26895,18 +26895,16 @@ async fn handle_proxy_request_inner(
                         let content_type =
                             plugin_response_headers.get("content-type").cloned();
                         let retained_ceiling = ctx.effective_max_response_body_size_bytes();
+                        // Keep the charged original body alive while the covering
+                        // window builds any replacement through a bounded sink
+                        // (GHSA-pwcm-6rh8-f2gh).
                         let stored = store_charged_grpc_web_reframed_body(
                             &mut response_body,
                             &mut plugin_response_headers,
                             retained_ceiling,
-                            |owned_body| {
-                                crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
-                                    owned_body,
-                                    content_type.as_deref(),
-                                    &response_trailers,
-                                    http_status,
-                                )
-                            },
+                            content_type.as_deref(),
+                            &response_trailers,
+                            http_status,
                         );
                         if let Some((synced_len, true)) = stored {
                             plugin_response_headers
@@ -28814,26 +28812,18 @@ async fn handle_proxy_request_inner(
             // `&mut response_headers`, so the content type cannot stay borrowed
             // from that map.
             let content_type = response_headers.get("content-type").cloned();
-            // `take_buffered_vec` copies out of the charged owner and drops its
-            // permit, so both that copy and the rewritten frame are fresh
-            // allocations that must be covered BEFORE they exist. The helper
-            // reserves the window first and performs the copy and the reframe
-            // inside it; a refusal fails closed with the neutral gRPC capacity
-            // terminal rather than retaining uncharged bytes
+            // Keep the charged original body alive while the covering window
+            // builds any replacement through a bounded sink; a refusal fails
+            // closed with the neutral gRPC capacity terminal
             // (GHSA-pwcm-6rh8-f2gh).
             let retained_ceiling = ctx.effective_max_response_body_size_bytes();
             let stored = store_charged_grpc_web_reframed_body(
                 data,
                 &mut response_headers,
                 retained_ceiling,
-                |owned_body| {
-                    crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
-                        owned_body,
-                        content_type.as_deref(),
-                        &trailers,
-                        http_status,
-                    )
-                },
+                content_type.as_deref(),
+                &trailers,
+                http_status,
             );
             if let Some((synced_len, true)) = stored {
                 response_headers.insert("content-length".to_string(), synced_len.to_string());
@@ -34367,37 +34357,34 @@ fn mesh_grpc_response_buffer_capacity_response(
     }
 }
 
-/// Reframe a gRPC-Web buffered body under the retained-response budget, copy
-/// included.
+/// Reframe a gRPC-Web buffered body under the retained-response budget.
 ///
-/// `ResponseBody::take_buffered_vec` copies out of the charged owner and drops
-/// its permit, so BOTH the copy and the trailer frame appended to it are fresh,
-/// uncharged allocations — and the copy is made while the original is still
-/// resident. Charging only the finished buffer would leave that whole window
-/// outside the aggregate cap, so the window is reserved FIRST, sized to
-/// `retained_ceiling` (this response's folded retained ceiling), and the copy,
-/// the reframe, and the publication all happen inside it
-/// (GHSA-pwcm-6rh8-f2gh).
+/// The original collected [`Bytes`] and its charge stay alive for the whole
+/// reconciliation. The covering [`response_buffer_budget::ResponseTransformWindow`]
+/// is reserved first; the replacement is constructed from its first byte through
+/// a [`response_buffer_budget::BoundedResponseBodySink`] (via
+/// [`crate::plugins::grpc_web::sync_translated_body_trailer_frame_into`]) and only
+/// then transferred out of the window into the charged owner. The old
+/// `take_buffered_vec` + mutate-in-place shape is deliberately absent: that copy
+/// dropped the original permit while the decode/reframe allocations were still
+/// uncharged beside it (GHSA-pwcm-6rh8-f2gh).
 ///
-/// `reframe` is handed the owned copy and returns whether it actually rewrote
-/// the frame; it must not allocate outside that buffer.
-///
-/// `Some((len, reframed))` on success, where `len` is the stored body length.
-/// `None` means the budget refused: `response_body` holds an empty payload and
-/// `response_headers` carries the neutral gRPC capacity terminal — failing
-/// closed rather than retaining uncharged bytes.
+/// `Some((len, reframed))` on success, where `len` is the stored body length and
+/// `reframed` reports whether the trailer suffix was validated (identical or
+/// replaced). `None` means the budget refused: `response_body` holds an empty
+/// payload and `response_headers` carries the neutral gRPC capacity terminal —
+/// failing closed rather than retaining uncharged bytes.
 pub(crate) fn store_charged_grpc_web_reframed_body(
     response_body: &mut Bytes,
     response_headers: &mut HashMap<String, String>,
     retained_ceiling: usize,
-    reframe: impl FnOnce(&mut Vec<u8>) -> bool,
+    content_type: Option<&str>,
+    reconciled_trailers: &HashMap<String, String>,
+    http_status: Option<u16>,
 ) -> Option<(usize, bool)> {
-    // Pre-allocation upper bound, checked rather than assumed: the copy is the
-    // already-charged body (collected under the same ceiling) and the reframe
-    // only APPENDS one terminal frame, whose size is bounded by the gRPC
-    // terminal-metadata budget. Refusing here when the body is already above the
-    // ceiling keeps that reasoning true even if an earlier phase installed a
-    // larger representation, and does it BEFORE the copy is taken.
+    // Refuse before opening a window when the already-charged body is above the
+    // ceiling — that keeps the "body was collected under this ceiling" reasoning
+    // true even if an earlier phase installed a larger representation.
     if response_body.len() > retained_ceiling {
         grpc_web_reframe_capacity_terminal(response_body, response_headers);
         return None;
@@ -34407,17 +34394,35 @@ pub(crate) fn store_charged_grpc_web_reframed_body(
         grpc_web_reframe_capacity_terminal(response_body, response_headers);
         return None;
     };
-    let mut owned_body = ResponseBody::take_buffered_vec(response_body);
-    let reframed = reframe(&mut owned_body);
-    let stored_len = owned_body.len();
-    match window.charge(owned_body) {
-        Some(charged) => {
-            *response_body = charged;
-            Some((stored_len, reframed))
+    match crate::plugins::grpc_web::sync_translated_body_trailer_frame_into(
+        response_body.as_ref(),
+        content_type,
+        reconciled_trailers,
+        http_status,
+        retained_ceiling,
+    ) {
+        crate::plugins::grpc_web::SyncTranslatedTrailerOutcome::Unchanged => {
+            Some((response_body.len(), true))
         }
-        None => {
+        crate::plugins::grpc_web::SyncTranslatedTrailerOutcome::NoRewrite => {
+            Some((response_body.len(), false))
+        }
+        crate::plugins::grpc_web::SyncTranslatedTrailerOutcome::Overflow => {
             grpc_web_reframe_capacity_terminal(response_body, response_headers);
             None
+        }
+        crate::plugins::grpc_web::SyncTranslatedTrailerOutcome::Replaced(rebuilt) => {
+            let stored_len = rebuilt.len();
+            match window.charge(rebuilt) {
+                Some(charged) => {
+                    *response_body = charged;
+                    Some((stored_len, true))
+                }
+                None => {
+                    grpc_web_reframe_capacity_terminal(response_body, response_headers);
+                    None
+                }
+            }
         }
     }
 }

@@ -2570,6 +2570,49 @@ fn the_root_review_repairs_are_pinned_in_source() {
          value before the counting/final sink sees it"
     );
 
+    // Final trailer reconciliation must keep the charged original alive and
+    // build any replacement through the bounded sink (GHSA-pwcm-6rh8-f2gh).
+    assert!(
+        grpc_web.contains("pub fn sync_translated_body_trailer_frame_into(")
+            && grpc_web.contains("stream_decode_base64_groups")
+            && grpc_web.contains("rebuild_text_grpc_web_trailer_suffix")
+            && grpc_web.contains("rebuild_binary_grpc_web_trailer_suffix"),
+        "final reconciliation must stream-decode/rebuild through a ceiling-bounded sink"
+    );
+    let sync_into = grpc_web
+        .split("pub fn sync_translated_body_trailer_frame_into(")
+        .nth(1)
+        .expect("sync_translated_body_trailer_frame_into");
+    let sync_into_body = sync_into
+        .split("\n/// Locate the start of the contiguous trailer-frame suffix")
+        .next()
+        .expect("sync_into precedes trailing_trailer_suffix_start docs");
+    assert!(
+        !sync_into_body.contains("BASE64.decode(")
+            && !sync_into_body.contains("BASE64.encode(")
+            && !sync_into_body.contains("build_trailer_frame(")
+            && !sync_into_body.contains("std::mem::take(body)"),
+        "final reconciliation must not decode/encode/build-then-measure a complete \
+         body-sized replacement beside the sink"
+    );
+
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let store = proxy
+        .split("pub(crate) fn store_charged_grpc_web_reframed_body(")
+        .nth(1)
+        .expect("store_charged_grpc_web_reframed_body");
+    let store_body = store
+        .split("\n/// The neutral gRPC capacity terminal")
+        .next()
+        .expect("store precedes capacity terminal helper");
+    assert!(
+        !store_body.contains("take_buffered_vec")
+            && store_body.contains("sync_translated_body_trailer_frame_into")
+            && store_body.contains("window.charge("),
+        "final publication must not copy out of the charged owner; it must build \
+         through sync_into and charge the sink-built replacement"
+    );
+
     let stream_router = include_str!("../../../src/plugins/ai_stream_router.rs");
     assert!(
         stream_router.contains("pub(crate) struct NormalizedSseOut"),

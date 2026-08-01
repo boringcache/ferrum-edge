@@ -5323,23 +5323,17 @@ where
                 // `&mut plugin_response_headers`, so the content type cannot
                 // stay borrowed from that map.
                 let content_type = plugin_response_headers.get("content-type").cloned();
-                // The reframe copies out of the charged owner before appending a
-                // trailer frame, so the window that covers both the copy and the
-                // rewritten buffer is reserved before either exists
+                // Keep the charged original body alive while the covering window
+                // builds any replacement through a bounded sink
                 // (GHSA-pwcm-6rh8-f2gh).
                 let retained_ceiling = ctx.effective_max_response_body_size_bytes();
                 let stored = crate::proxy::store_charged_grpc_web_reframed_body(
                     &mut response_body,
                     &mut plugin_response_headers,
                     retained_ceiling,
-                    |owned_body| {
-                        crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
-                            owned_body,
-                            content_type.as_deref(),
-                            &response_trailers,
-                            http_status,
-                        )
-                    },
+                    content_type.as_deref(),
+                    &response_trailers,
+                    http_status,
                 );
                 if let Some((synced_len, true)) = stored {
                     plugin_response_headers
