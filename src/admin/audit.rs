@@ -1140,7 +1140,7 @@ fn write_temp_fallback_file(tmp: &Path, body: &[u8]) -> Result<(), anyhow::Error
             .open(tmp)?;
         file.write_all(body)?;
         file.sync_all()?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(unix))]
     {

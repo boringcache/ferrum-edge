@@ -6790,12 +6790,8 @@ fn backup_counts_audit_value(
     })
 }
 
-async fn finalize_backup_export(
-    state: &AdminState,
-    actor: &AuditActor,
-    namespace: &str,
-    request_ctx: &audit::AuditRequestContext,
-    resource_filter: Option<&HashSet<&str>>,
+struct BackupExportPayload<'filter, 'value> {
+    resource_filter: Option<&'filter HashSet<&'value str>>,
     source: &'static str,
     body_bytes: Vec<u8>,
     proxy_count: usize,
@@ -6803,7 +6799,25 @@ async fn finalize_backup_export(
     plugin_config_count: usize,
     upstream_count: usize,
     api_specs_count: usize,
+}
+
+async fn finalize_backup_export(
+    state: &AdminState,
+    actor: &AuditActor,
+    namespace: &str,
+    request_ctx: &audit::AuditRequestContext,
+    payload: BackupExportPayload<'_, '_>,
 ) -> Response<Full<Bytes>> {
+    let BackupExportPayload {
+        resource_filter,
+        source,
+        body_bytes,
+        proxy_count,
+        consumer_count,
+        plugin_config_count,
+        upstream_count,
+        api_specs_count,
+    } = payload;
     let resources = audit::backup_resources_audit_value(resource_filter);
     let event = audit::AuditEvent::new(
         actor,
@@ -7272,14 +7286,16 @@ async fn handle_backup(
                     actor,
                     namespace,
                     request_ctx,
-                    resource_filter.as_ref(),
-                    "database",
-                    body_bytes,
-                    proxy_count,
-                    consumer_count,
-                    plugin_config_count,
-                    upstream_count,
-                    api_specs_count,
+                    BackupExportPayload {
+                        resource_filter: resource_filter.as_ref(),
+                        source: "database",
+                        body_bytes,
+                        proxy_count,
+                        consumer_count,
+                        plugin_config_count,
+                        upstream_count,
+                        api_specs_count,
+                    },
                 )
                 .await);
             }
@@ -7401,14 +7417,16 @@ async fn handle_backup(
         actor,
         namespace,
         request_ctx,
-        resource_filter.as_ref(),
-        source,
-        body_bytes,
-        proxy_count,
-        consumer_count,
-        plugin_config_count,
-        upstream_count,
-        api_specs_count,
+        BackupExportPayload {
+            resource_filter: resource_filter.as_ref(),
+            source,
+            body_bytes,
+            proxy_count,
+            consumer_count,
+            plugin_config_count,
+            upstream_count,
+            api_specs_count,
+        },
     )
     .await)
 }
