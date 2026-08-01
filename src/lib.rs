@@ -732,6 +732,41 @@ pub mod _test_support {
         ctx.mark_gateway_deadline_response_selected();
     }
 
+    pub fn gateway_capacity_response_selected_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.gateway_capacity_response_selected()
+    }
+
+    pub fn mark_buffered_response_capacity_refusal_pending_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        ctx.mark_buffered_response_capacity_refusal_pending();
+    }
+
+    pub fn take_buffered_response_capacity_refusal_pending_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.take_buffered_response_capacity_refusal_pending()
+    }
+
+    /// Install a pending capacity refusal exactly as every `on_response_body`
+    /// loop does when an inspector marks the one-shot signal.
+    pub fn install_pending_buffered_response_capacity_refusal_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut std::collections::HashMap<String, String>,
+        response_body: &mut bytes::Bytes,
+    ) -> bool {
+        crate::proxy::install_pending_buffered_response_capacity_refusal(
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(&[]),
+        )
+    }
+
     /// Run the buffered request-body stage the way the proxy does: every
     /// `transform_request_body` hook first, then every `on_final_request_body`
     /// hook, over one shared `RequestContext`.

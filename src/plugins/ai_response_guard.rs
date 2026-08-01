@@ -954,9 +954,15 @@ impl AiResponseGuard {
     /// unrewritable content still matches, the caller must reject.
     /// `ceiling` is this response's retained ceiling; the candidate is built
     /// under a budget window of that size, reserved before it exists.
-    fn redact_sse_leaves_residual(&self, body: &[u8], ceiling: usize) -> bool {
+    ///
+    /// Returns `None` when the aggregate retained-response budget refused the
+    /// window — the caller must select the shared capacity terminal rather than
+    /// classify the refusal as residual restricted content. `Some(true)` means
+    /// redaction would leave residual detectable content; `Some(false)` means
+    /// the candidate is clean.
+    fn redact_sse_leaves_residual(&self, body: &[u8], ceiling: usize) -> Option<bool> {
         if self.detection_pattern_count == 0 {
-            return false;
+            return Some(false);
         }
         // The candidate here is a COMPLETE would-be client-visible body, built
         // during INSPECTION — before any producer phase has opened a transform
@@ -966,13 +972,10 @@ impl AiResponseGuard {
         // bypass this advisory closes. So a window sized to THIS response's
         // retained ceiling is reserved first and released as soon as the scan is
         // done, keeping the peak at the documented two ceilings; a budget that
-        // cannot admit it fails closed (treated as residual) rather than
-        // materialising the candidate anyway (GHSA-pwcm-6rh8-f2gh).
-        let Some(window) =
-            crate::proxy::response_buffer_budget::ResponseTransformWindow::open(ceiling)
-        else {
-            return true;
-        };
+        // cannot admit it fails closed as capacity rather than materialising the
+        // candidate anyway (GHSA-pwcm-6rh8-f2gh).
+        let window =
+            crate::proxy::response_buffer_budget::ResponseTransformWindow::open(ceiling)?;
         // Scan the exact bytes the client would receive: transformed output
         // when redaction changed an event, otherwise the original framing.
         // The residual pass masks only preserved top-level structural scalar
@@ -982,7 +985,7 @@ impl AiResponseGuard {
         let residual = self.sse_body_has_residual(redacted.as_deref().unwrap_or(body));
         drop(redacted);
         drop(window);
-        residual
+        Some(residual)
     }
 
     /// Re-scan an SSE body produced by [`Self::redact_sse_body`]. Scan-all
@@ -1789,7 +1792,7 @@ impl AiResponseGuard {
             // ceiling is reserved first and released as soon as the preflight is
             // done — the same shape `redact_sse_leaves_residual` uses, and the
             // same documented two-ceiling peak. A budget that cannot admit the
-            // window is a REFUSAL, not a licence to build the candidate anyway
+            // window is a capacity REFUSAL, not residual restricted content
             // (GHSA-pwcm-6rh8-f2gh).
             let redaction_verified =
                 match crate::proxy::response_buffer_budget::ResponseTransformWindow::open(
@@ -1809,13 +1812,14 @@ impl AiResponseGuard {
                         drop(window);
                         verified
                     }
-                    None => false,
+                    None => {
+                        ctx.mark_buffered_response_capacity_refusal_pending();
+                        return PluginResult::Continue;
+                    }
                 };
             if key_match || cross_boundary_only || !redaction_verified {
                 debug!(
-                    "ai_response_guard: gRPC redaction leaves residual content \
-                     (types: {:?}), rejecting response",
-                    detected
+                    "ai_response_guard: gRPC redaction leaves residual content, rejecting response"
                 );
                 let types_json: Vec<String> = detected
                     .iter()
@@ -3282,26 +3286,36 @@ impl Plugin for AiResponseGuard {
             }
 
             let retained_ceiling = ctx.retained_response_body_ceiling();
-            if self.action == GuardAction::Redact
-                && self.redact_sse_leaves_residual(body, retained_ceiling)
-            {
-                debug!(
-                    "ai_response_guard: redact leaves residual SSE content (types: {:?}), rejecting response",
-                    detected
-                );
-                let types_json: Vec<String> = detected
-                    .iter()
-                    .map(|t| format!("\"{}\"", escape_json_string(t)))
-                    .collect();
-                Self::mark_rejected(ctx, detected.join(","));
-                return PluginResult::Reject {
-                    status_code: 502,
-                    body: format!(
-                        r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
-                        types_json.join(","),
-                    ),
-                    headers: HashMap::new(),
-                };
+            if self.action == GuardAction::Redact {
+                match self.redact_sse_leaves_residual(body, retained_ceiling) {
+                    None => {
+                        // Aggregate retained-memory exhaustion — not restricted
+                        // content. Mark the one-shot pending signal so the
+                        // enclosing on_response_body loop installs the shared
+                        // capacity terminal.
+                        ctx.mark_buffered_response_capacity_refusal_pending();
+                        return PluginResult::Continue;
+                    }
+                    Some(true) => {
+                        debug!(
+                            "ai_response_guard: redact leaves residual SSE content, rejecting response"
+                        );
+                        let types_json: Vec<String> = detected
+                            .iter()
+                            .map(|t| format!("\"{}\"", escape_json_string(t)))
+                            .collect();
+                        Self::mark_rejected(ctx, detected.join(","));
+                        return PluginResult::Reject {
+                            status_code: 502,
+                            body: format!(
+                                r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
+                                types_json.join(","),
+                            ),
+                            headers: HashMap::new(),
+                        };
+                    }
+                    Some(false) => {}
+                }
             }
 
             return self.respond_to_detection(ctx, response_status, &detected);
@@ -3441,41 +3455,43 @@ impl Plugin for AiResponseGuard {
         // response's retained ceiling is reserved before the candidate exists
         // and released as soon as the scan is done, keeping the peak at the
         // documented two ceilings. A budget that cannot admit the window is a
-        // refusal, and a refusal is residual — fail closed rather than build the
-        // candidate anyway (GHSA-pwcm-6rh8-f2gh).
-        let leaves_residual = self.action == GuardAction::Redact
-            && match crate::proxy::response_buffer_budget::ResponseTransformWindow::open(
+        // capacity refusal — not residual restricted content — and must select
+        // the shared health-neutral terminal (GHSA-pwcm-6rh8-f2gh).
+        if self.action == GuardAction::Redact {
+            match crate::proxy::response_buffer_budget::ResponseTransformWindow::open(
                 ctx.retained_response_body_ceiling(),
             ) {
+                None => {
+                    ctx.mark_buffered_response_capacity_refusal_pending();
+                    return PluginResult::Continue;
+                }
                 Some(window) => {
-                    let residual = if self.scan_mode == ScanMode::All {
+                    let leaves_residual = if self.scan_mode == ScanMode::All {
                         self.redact_leaves_residual(&json)
                     } else {
                         self.content_redact_leaves_residual(&json)
                     };
                     drop(window);
-                    residual
+                    if leaves_residual {
+                        debug!(
+                            "ai_response_guard: redact leaves residual content, rejecting response"
+                        );
+                        let types_json: Vec<String> = detected
+                            .iter()
+                            .map(|t| format!("\"{}\"", escape_json_string(t)))
+                            .collect();
+                        Self::mark_rejected(ctx, detected.join(","));
+                        return PluginResult::Reject {
+                            status_code: 502,
+                            body: format!(
+                                r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
+                                types_json.join(","),
+                            ),
+                            headers: HashMap::new(),
+                        };
+                    }
                 }
-                None => true,
-            };
-        if leaves_residual {
-            debug!(
-                "ai_response_guard: redact leaves residual content (types: {:?}), rejecting response",
-                detected
-            );
-            let types_json: Vec<String> = detected
-                .iter()
-                .map(|t| format!("\"{}\"", escape_json_string(t)))
-                .collect();
-            Self::mark_rejected(ctx, detected.join(","));
-            return PluginResult::Reject {
-                status_code: 502,
-                body: format!(
-                    r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
-                    types_json.join(","),
-                ),
-                headers: HashMap::new(),
-            };
+            }
         }
 
         self.respond_to_detection(ctx, response_status, &detected)

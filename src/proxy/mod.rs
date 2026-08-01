@@ -17236,7 +17236,8 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     // later final-body validators must not inspect that error payload and replace
     // the original policy decision with a second rejection. Presentation and
     // protocol transforms still run below so the selected response keeps the
-    // correct client wire shape.
+    // correct client wire shape. A retained-response capacity terminal is
+    // already protocol-correct and skips those later mutating phases.
     let mut terminal_body_response_selected = false;
     let mut response_body_reject = None;
     for plugin in plugins.iter() {
@@ -17249,6 +17250,16 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
         .into_plugin_result(ctx);
         match result {
             PluginResult::Continue => {
+                if install_pending_buffered_response_capacity_refusal(
+                    ctx,
+                    response_status,
+                    response_headers,
+                    response_body,
+                    InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
+                ) {
+                    terminal_body_response_selected = true;
+                    break;
+                }
                 // Inspect-phase header mutations (e.g. ai_rate_limiter
                 // refreshing usage/remaining after reconcile) must enter
                 // deadline provenance the same way after_proxy mutations do.
@@ -17280,6 +17291,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     // serverless terminate, dedup replay), so there is no upstream snapshot and
     // no hidden origin coding — the live headers are the only description of
     // these bytes, and `GatewayGenerated` reads them directly.
+    // Skip when a capacity terminal is already authoritative.
     let owned_grpc_web_response_content_type =
         crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
     let grpc_web_response_content_type = owned_grpc_web_response_content_type.as_deref();
@@ -17287,18 +17299,23 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     // path and applied exactly once by
     // `apply_reject_after_proxy_and_synthetic_body_hooks` over the final
     // response, so running them here would consume one-shot response state twice.
-    let admission = admit_buffered_response_body_transforms(
-        plugins,
-        ctx,
-        crate::plugins::response_representation::RepresentationOrigin::GatewayGenerated,
-        response_status,
-        response_headers,
-        response_body,
-        grpc_web_response_content_type,
-        InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
-        false,
-    )
-    .await;
+    let admission = if ctx.gateway_capacity_response_selected() {
+        terminal_body_response_selected = true;
+        BufferedTransformAdmission::Rejected
+    } else {
+        admit_buffered_response_body_transforms(
+            plugins,
+            ctx,
+            crate::plugins::response_representation::RepresentationOrigin::GatewayGenerated,
+            response_status,
+            response_headers,
+            response_body,
+            grpc_web_response_content_type,
+            InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
+            false,
+        )
+        .await
+    };
     terminal_body_response_selected |= matches!(admission, BufferedTransformAdmission::Rejected);
     // Read after the gate: a decoded body installs fresh representation headers.
     let content_type = response_headers.get("content-type").cloned();
@@ -19068,7 +19085,37 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
             response_body.len().to_string(),
         );
     }
+    // The terminal above is the authoritative client-visible outcome for this
+    // request. Clear any one-shot pending capacity signal defensively and mark
+    // the request so later body/transform/validate/store/trailer phases preserve
+    // these bytes rather than treating normalize's rewrite bool as an ordinary
+    // presentation rewrite (GHSA-pwcm-6rh8-f2gh).
+    let _ = ctx.take_buffered_response_capacity_refusal_pending();
+    ctx.mark_gateway_capacity_response_selected();
     ctx.record_deadline_response_header_mutations(response_headers);
+}
+
+/// If a response-body inspector marked a one-shot retained-response capacity
+/// refusal pending, install the shared health-neutral terminal and return
+/// `true` so the enclosing `on_response_body` loop stops later hooks.
+pub(crate) fn install_pending_buffered_response_capacity_refusal(
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
+) -> bool {
+    if !ctx.take_buffered_response_capacity_refusal_pending() {
+        return false;
+    }
+    replace_buffered_response_with_capacity_refusal_with_policy_source(
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+        initial_response_header_policy_source,
+    );
+    true
 }
 
 /// Client-visible message when a configured response body policy could not be
@@ -19339,6 +19386,12 @@ pub(crate) async fn admit_buffered_response_body_transforms(
         clear_replaced_backend_response_snapshot(ctx);
     }
 
+    // An already-installed capacity terminal is authoritative. Do not re-enter
+    // representation evaluation or decode against those gateway-authored bytes.
+    if ctx.gateway_capacity_response_selected() {
+        return BufferedTransformAdmission::Rejected;
+    }
+
     match evaluate_response_body_policy_posture(
         plugins,
         ctx,
@@ -19484,6 +19537,12 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
             initial_response_header_policy_plugins,
         )
         .as_u16();
+        return (true, false);
+    }
+    // A capacity terminal installed by normalize / an earlier body phase is
+    // already protocol-correct. Do not reopen the representation gate or any
+    // producer window against it.
+    if ctx.gateway_capacity_response_selected() {
         return (true, false);
     }
     let (rewrite_allowed, representation_rewritten) = match admit_buffered_response_body_transforms(
@@ -24146,6 +24205,9 @@ async fn handle_proxy_request_inner(
                     if body_hook_ctx.gateway_deadline_response_selected() {
                         ctx.mark_gateway_deadline_response_selected();
                     }
+                    if body_hook_ctx.gateway_capacity_response_selected() {
+                        ctx.mark_gateway_capacity_response_selected();
+                    }
                     let request_body = ctx.metadata.remove("request_body");
                     ctx.metadata = body_hook_ctx.metadata;
                     ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
@@ -24812,6 +24874,9 @@ async fn handle_proxy_request_inner(
             if let Some(body_hook_ctx) = body_hook_ctx {
                 if body_hook_ctx.gateway_deadline_response_selected() {
                     ctx.mark_gateway_deadline_response_selected();
+                }
+                if body_hook_ctx.gateway_capacity_response_selected() {
+                    ctx.mark_gateway_capacity_response_selected();
                 }
                 // `clone_for_final_request_body_hooks` omits `request_body`; carry
                 // the original across the metadata swap (no on_final hook touches
@@ -26681,54 +26746,79 @@ async fn handle_proxy_request_inner(
                         initial_response_header_policy_plugins.as_ref(),
                     )
                     .await;
-                    for plugin in plugins.iter() {
-                        let deadline = ctx.grpc_deadline_at();
-                        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
-                            deadline,
-                            plugin.on_response_body(
-                                &mut ctx,
-                                response_status,
-                                &mut plugin_response_headers,
-                                &response_body,
-                            ),
-                        )
-                        .await
-                        .into_plugin_result(&mut ctx);
-                        match result {
-                            PluginResult::Continue => {
-                                ctx.record_deadline_response_header_plugin(
-                                    plugin.as_ref(),
-                                    &plugin_response_headers,
-                                );
-                            }
-                            reject @ PluginResult::Reject { .. }
-                            | reject @ PluginResult::RejectBinary { .. } => {
-                                let reject = plugin_result_into_reject_parts(reject)
-                                    .expect("reject result should convert to rejection parts");
-                                debug!(
-                                    plugin = plugin.name(),
-                                    status_code = reject.status_code,
-                                    "Plugin rejected gRPC response body"
-                                );
-                                let normalized =
-                                    normalize_grpc_plugin_rejection_with_after_proxy_hooks(
-                                        &plugins, &mut ctx, reject, false,
-                                    )
-                                    .await;
-                                authoritative_trailers_only_terminal_metadata =
-                                    Some(grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
-                                        &normalized.headers,
-                                    ));
-                                response_status = normalized.http_status.as_u16();
-                                response_headers = normalized.headers;
-                                plugin_response_headers = response_headers.clone();
-                                response_trailers.clear();
-                                response_body = normalized.body;
-                                let _ = ctx.take_buffered_initial_response_header_policy();
-                                response_body_rejected = true;
-                                break;
+                    let mut capacity_terminal = ctx.gateway_capacity_response_selected();
+                    if !capacity_terminal {
+                        for plugin in plugins.iter() {
+                            let deadline = ctx.grpc_deadline_at();
+                            let result =
+                                crate::plugins::await_request_plugin_deadline_with_provenance(
+                                    deadline,
+                                    plugin.on_response_body(
+                                        &mut ctx,
+                                        response_status,
+                                        &mut plugin_response_headers,
+                                        &response_body,
+                                    ),
+                                )
+                                .await
+                                .into_plugin_result(&mut ctx);
+                            match result {
+                                PluginResult::Continue => {
+                                    if install_pending_buffered_response_capacity_refusal(
+                                        &mut ctx,
+                                        &mut response_status,
+                                        &mut plugin_response_headers,
+                                        &mut response_body,
+                                        InitialResponseHeaderPolicySource::Prefiltered(
+                                            initial_response_header_policy_plugins.as_ref(),
+                                        ),
+                                    ) {
+                                        capacity_terminal = true;
+                                        break;
+                                    }
+                                    ctx.record_deadline_response_header_plugin(
+                                        plugin.as_ref(),
+                                        &plugin_response_headers,
+                                    );
+                                }
+                                reject @ PluginResult::Reject { .. }
+                                | reject @ PluginResult::RejectBinary { .. } => {
+                                    let reject = plugin_result_into_reject_parts(reject)
+                                        .expect("reject result should convert to rejection parts");
+                                    debug!(
+                                        plugin = plugin.name(),
+                                        status_code = reject.status_code,
+                                        "Plugin rejected gRPC response body"
+                                    );
+                                    let normalized =
+                                        normalize_grpc_plugin_rejection_with_after_proxy_hooks(
+                                            &plugins, &mut ctx, reject, false,
+                                        )
+                                        .await;
+                                    authoritative_trailers_only_terminal_metadata =
+                                        Some(grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
+                                            &normalized.headers,
+                                        ));
+                                    response_status = normalized.http_status.as_u16();
+                                    response_headers = normalized.headers;
+                                    plugin_response_headers = response_headers.clone();
+                                    response_trailers.clear();
+                                    response_body = normalized.body;
+                                    let _ = ctx.take_buffered_initial_response_header_policy();
+                                    response_body_rejected = true;
+                                    break;
+                                }
                             }
                         }
+                    }
+                    if capacity_terminal {
+                        response_body_rejected = true;
+                        grpc_proxy::select_buffered_grpc_terminal_response(
+                            &plugin_response_headers,
+                            &mut response_trailers,
+                            &mut authoritative_trailers_only_terminal_metadata,
+                        );
+                        let _ = ctx.take_buffered_initial_response_header_policy();
                     }
                     // Capture normalize / inspect header mutations before the
                     // gRPC-Web transform frames trailers from the live view.
@@ -26747,7 +26837,7 @@ async fn handle_proxy_request_inner(
                 let (
                     mut buffered_initial_response_header_policy_state,
                     defer_application_trailer_discard,
-                ) = if !after_proxy_rejected {
+                ) = if !after_proxy_rejected && !ctx.gateway_capacity_response_selected() {
                     let phase_start = Instant::now();
                     // Keep buffered gRPC-Web conversion keyed to the original
                     // request when the hook-visible response headers are still
@@ -27781,6 +27871,9 @@ async fn handle_proxy_request_inner(
             if body_hook_ctx.gateway_deadline_response_selected() {
                 ctx.mark_gateway_deadline_response_selected();
             }
+            if body_hook_ctx.gateway_capacity_response_selected() {
+                ctx.mark_gateway_capacity_response_selected();
+            }
             // `clone_for_final_request_body_hooks` omits `request_body`; carry the
             // original across the metadata swap (no on_final hook touches it).
             // Disjoint field assignments avoid a whole-`ctx` borrow.
@@ -28206,6 +28299,9 @@ async fn handle_proxy_request_inner(
         if let Some(body_hook_ctx) = body_hook_ctx {
             if body_hook_ctx.gateway_deadline_response_selected() {
                 ctx.mark_gateway_deadline_response_selected();
+            }
+            if body_hook_ctx.gateway_capacity_response_selected() {
+                ctx.mark_gateway_capacity_response_selected();
             }
             // `clone_for_final_request_body_hooks` omits `request_body`; carry the
             // original across the metadata swap (no on_final hook touches it).
@@ -28762,16 +28858,18 @@ async fn handle_proxy_request_inner(
     // transforms can emit the correct wire shape, but final-body validators must
     // not replace the selected error. While this is first set by
     // `on_response_body`, it also records a representation-gate or deadline
-    // replacement below.
-    let mut response_body_rejected = false;
+    // replacement below. A retained-response capacity terminal is already
+    // protocol-correct and skips those later mutating phases entirely.
+    let mut response_body_rejected = ctx.gateway_capacity_response_selected();
 
     // on_response_body hooks — only for buffered responses, only when plugins exist.
     // This phase sees the normalized backend body before ordinary response
     // transformations, so guardrails inspect the client-visible protocol shape.
     // A Reject result replaces the response before it reaches the client.
     if !after_proxy_rejected
+        && !response_body_rejected
         && !plugins.is_empty()
-        && let ResponseBody::Buffered(ref data) = response_body
+        && let ResponseBody::Buffered(ref mut data) = response_body
     {
         let phase_start = Instant::now();
         let mut response_body_reject = None;
@@ -28785,6 +28883,18 @@ async fn handle_proxy_request_inner(
             .into_plugin_result(&mut ctx);
             match result {
                 PluginResult::Continue => {
+                    if install_pending_buffered_response_capacity_refusal(
+                        &mut ctx,
+                        &mut response_status,
+                        &mut response_headers,
+                        data,
+                        InitialResponseHeaderPolicySource::Prefiltered(
+                            initial_response_header_policy_plugins.as_ref(),
+                        ),
+                    ) {
+                        response_body_rejected = true;
+                        break;
+                    }
                     ctx.record_deadline_response_header_plugin(plugin.as_ref(), &response_headers);
                 }
                 reject @ PluginResult::Reject { .. }
@@ -28823,7 +28933,10 @@ async fn handle_proxy_request_inner(
     // transform_response_body hooks — only for buffered responses.
     // Allows plugins (e.g., response_transformer with body rules) to rewrite
     // JSON fields in the response body before it is sent to the client.
+    // A capacity terminal is already protocol-correct; do not reopen transforms
+    // or trailer reframing against it.
     if !after_proxy_rejected
+        && !ctx.gateway_capacity_response_selected()
         && !plugins.is_empty()
         && let ResponseBody::Buffered(ref mut data) = response_body
     {

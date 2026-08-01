@@ -665,6 +665,16 @@ fn a_refused_http_replacement_becomes_a_gateway_503_with_clean_metadata() {
         Some("keep-me"),
         "unrelated headers are untouched"
     );
+    assert!(
+        ferrum_edge::_test_support::gateway_capacity_response_selected_for_test(&ctx),
+        "the shared installer must mark the capacity terminal authoritative"
+    );
+    assert!(
+        !ferrum_edge::_test_support::take_buffered_response_capacity_refusal_pending_for_test(
+            &mut ctx
+        ),
+        "installing the terminal must clear any pending capacity signal"
+    );
 
     // The fixed body names no route, header, credential, or response content.
     let rendered = String::from_utf8(body.to_vec()).expect("utf-8");
@@ -921,12 +931,10 @@ fn every_capacity_refusal_uses_the_shared_gateway_terminal() {
         proxy
             .matches("replace_buffered_response_with_capacity_refusal_with_policy_source(")
             .count(),
-        4,
+        5,
         "one definition, the prefiltered delegation, the representation gate's \
-         CapacityRefused decode path, and the install_decoded_response_body \
-         charge refusal — both gate sites are reached from callers holding the \
-         unfiltered protocol plugin list, so they cannot use the prefiltered \
-         wrapper"
+         CapacityRefused decode path, the install_decoded_response_body charge \
+         refusal, and the pending-signal consumer used by on_response_body loops"
     );
     assert!(
         plugins.contains("replace_buffered_response_with_capacity_refusal("),
@@ -2867,4 +2875,81 @@ fn bounded_sink_capacity_never_exceeds_ceiling_on_successful_writes() {
     assert!(!sink.overflowed());
     let finished = sink.finish().expect("in-ceiling writes finish");
     assert!(finished.len() <= 128);
+}
+
+/// An authoritative capacity terminal must be visible to every publication path
+/// that can continue after normalize/admission, so later body hooks, transforms,
+/// final validators, and trailer reframes preserve it.
+#[test]
+fn authoritative_capacity_terminal_is_consulted_before_later_body_phases() {
+    use ferrum_edge::_test_support::{
+        RESPONSE_BUFFER_OVERLOAD_BODY, RESPONSE_BUFFER_OVERLOAD_STATUS,
+        gateway_capacity_response_selected_for_test,
+        install_pending_buffered_response_capacity_refusal_for_test,
+        install_response_buffer_capacity_refusal_for_test,
+        mark_buffered_response_capacity_refusal_pending_for_test,
+        take_buffered_response_capacity_refusal_pending_for_test,
+    };
+
+    let mut ctx = refusal_ctx();
+    let mut status = 200u16;
+    let mut headers = refusal_headers(&[("content-type", "application/json")]);
+    let mut body = bytes::Bytes::from_static(b"backend representation");
+    install_response_buffer_capacity_refusal_for_test(
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    );
+    assert!(gateway_capacity_response_selected_for_test(&ctx));
+    assert_eq!(status, RESPONSE_BUFFER_OVERLOAD_STATUS);
+    assert_eq!(body.as_ref(), RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
+
+    // Pending signal is one-shot: mark → install clears pending and marks
+    // authoritative; a second install with no pending is a no-op.
+    let mut pending_ctx = refusal_ctx();
+    mark_buffered_response_capacity_refusal_pending_for_test(&mut pending_ctx);
+    assert!(take_buffered_response_capacity_refusal_pending_for_test(
+        &mut pending_ctx
+    ));
+    mark_buffered_response_capacity_refusal_pending_for_test(&mut pending_ctx);
+    let mut pending_status = 200u16;
+    let mut pending_headers = refusal_headers(&[("content-type", "application/json")]);
+    let mut pending_body = bytes::Bytes::from_static(b"inspectable");
+    assert!(install_pending_buffered_response_capacity_refusal_for_test(
+        &mut pending_ctx,
+        &mut pending_status,
+        &mut pending_headers,
+        &mut pending_body,
+    ));
+    assert!(gateway_capacity_response_selected_for_test(&pending_ctx));
+    assert_eq!(pending_status, RESPONSE_BUFFER_OVERLOAD_STATUS);
+    assert!(!install_pending_buffered_response_capacity_refusal_for_test(
+        &mut pending_ctx,
+        &mut pending_status,
+        &mut pending_headers,
+        &mut pending_body,
+    ));
+
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let h3_server = include_str!("../../../src/http3/server.rs");
+    let h3_cross = include_str!("../../../src/http3/cross_protocol.rs");
+    for (name, source) in [
+        ("proxy/mod.rs", proxy),
+        ("http3/server.rs", h3_server),
+        ("http3/cross_protocol.rs", h3_cross),
+    ] {
+        assert!(
+            source.contains("gateway_capacity_response_selected()"),
+            "{name} must consult the authoritative capacity flag before later body phases"
+        );
+        assert!(
+            source.contains("install_pending_buffered_response_capacity_refusal("),
+            "{name} must consume the pending capacity signal inside on_response_body"
+        );
+    }
+    assert!(
+        proxy.contains("if ctx.gateway_capacity_response_selected()"),
+        "transform/admit entry must short-circuit on an authoritative capacity terminal"
+    );
 }

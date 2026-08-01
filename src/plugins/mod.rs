@@ -2120,6 +2120,20 @@ pub struct RequestContext {
     /// backend or plugin-controlled `grpc-status`/`grpc-message` text must not
     /// unlock the write-biased terminal H3 completion path.
     gateway_deadline_response_selected: bool,
+    /// Whether the gateway selected the health-neutral retained-response
+    /// capacity terminal (`503` / gRPC `RESOURCE_EXHAUSTED`) for this request.
+    /// Once set, later body hooks, transforms, final validators, cache stores,
+    /// and trailer reframes must preserve that terminal rather than treating
+    /// normalize's rewrite bool as an ordinary body rewrite
+    /// (GHSA-pwcm-6rh8-f2gh).
+    gateway_capacity_response_selected: bool,
+    /// One-shot signal that a response-body inspector could not reserve a
+    /// retained-response transform window and needs the enclosing
+    /// `on_response_body` loop to install the shared capacity terminal.
+    /// Marked by inspection paths (for example `ai_response_guard` residual /
+    /// preflight scans); taken when the shared installer runs so it cannot
+    /// leak into another phase or retry generation (GHSA-pwcm-6rh8-f2gh).
+    buffered_response_capacity_refusal_pending: bool,
     /// Monotonic request-global proof that at least one response-caching
     /// instance served a HIT or REVALIDATED response. Kept outside public
     /// metadata so sibling/custom plugins cannot clear or forge the signal
@@ -2917,6 +2931,8 @@ impl RequestContext {
             grpc_deadline_at: None,
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
+            gateway_capacity_response_selected: false,
+            buffered_response_capacity_refusal_pending: false,
             response_cache_hit: false,
             origin_http_response_status: None,
             metadata: HashMap::new(),
@@ -3149,6 +3165,26 @@ impl RequestContext {
 
     pub(crate) fn gateway_deadline_response_selected(&self) -> bool {
         self.gateway_deadline_response_selected
+    }
+
+    pub(crate) fn mark_gateway_capacity_response_selected(&mut self) {
+        self.gateway_capacity_response_selected = true;
+    }
+
+    pub(crate) fn gateway_capacity_response_selected(&self) -> bool {
+        self.gateway_capacity_response_selected
+    }
+
+    /// Mark that the enclosing `on_response_body` loop must install the shared
+    /// retained-response capacity terminal. Cleared when that terminal is
+    /// installed so the signal cannot leak across phases.
+    pub(crate) fn mark_buffered_response_capacity_refusal_pending(&mut self) {
+        self.buffered_response_capacity_refusal_pending = true;
+    }
+
+    /// Take the one-shot capacity-refusal pending bit.
+    pub(crate) fn take_buffered_response_capacity_refusal_pending(&mut self) -> bool {
+        std::mem::take(&mut self.buffered_response_capacity_refusal_pending)
     }
 
     /// Remaining whole-millisecond gRPC budget, rounded up so a positive
@@ -3831,6 +3867,9 @@ impl RequestContext {
             grpc_deadline_at: self.grpc_deadline_at,
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
+            gateway_capacity_response_selected: self.gateway_capacity_response_selected,
+            buffered_response_capacity_refusal_pending: self
+                .buffered_response_capacity_refusal_pending,
             response_cache_hit: self.response_cache_hit,
             origin_http_response_status: self.origin_http_response_status,
             // Omit `request_body` (the full buffered prompt): no

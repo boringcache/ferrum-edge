@@ -5499,3 +5499,96 @@ async fn test_amplifying_sse_redaction_is_refused_during_event_construction() {
     assert!(!redacted.contains("@b.co"));
     assert!(redacted.contains("[REDACTED:pii:email]"));
 }
+
+/// Aggregate retained-memory exhaustion during an AI residual/preflight window
+/// reservation must select the shared capacity terminal — never the ordinary
+/// residual-content 502 that claims restricted content.
+///
+/// Exhausting the process-global budget under parallel CI is unsafe, so this
+/// test drives the pending-signal + shared-installer contract the three
+/// `ResponseTransformWindow::open(None)` sites mark into, and source-parity
+/// locks those sites to the pending signal rather than residual rejection.
+#[tokio::test]
+async fn window_capacity_refusal_selects_capacity_not_restricted_content_502() {
+    use ferrum_edge::_test_support::{
+        RESPONSE_BUFFER_OVERLOAD_BODY, RESPONSE_BUFFER_OVERLOAD_STATUS,
+        gateway_capacity_response_selected_for_test,
+        install_pending_buffered_response_capacity_refusal_for_test,
+        mark_buffered_response_capacity_refusal_pending_for_test,
+        take_buffered_response_capacity_refusal_pending_for_test,
+    };
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    mark_buffered_response_capacity_refusal_pending_for_test(&mut ctx);
+    assert!(take_buffered_response_capacity_refusal_pending_for_test(&mut ctx));
+    // Re-mark: the enclosing on_response_body loop consumes via install_pending.
+    mark_buffered_response_capacity_refusal_pending_for_test(&mut ctx);
+
+    let mut status = 200u16;
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let mut body = bytes::Bytes::from_static(
+        br#"{"choices":[{"message":{"content":"reach me at user@example.com"}}]}"#,
+    );
+
+    assert!(install_pending_buffered_response_capacity_refusal_for_test(
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    ));
+    assert_eq!(status, RESPONSE_BUFFER_OVERLOAD_STATUS);
+    assert_eq!(body.as_ref(), RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
+    assert!(gateway_capacity_response_selected_for_test(&ctx));
+    assert!(!take_buffered_response_capacity_refusal_pending_for_test(
+        &mut ctx
+    ));
+    let rendered = String::from_utf8(body.to_vec()).expect("utf-8");
+    assert!(
+        !rendered.contains("restricted content"),
+        "capacity must not claim restricted content"
+    );
+    assert!(!rendered.contains("user@example.com"));
+
+    // Ordinary residual content still rejects as 502 restricted content.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    let mut residual_ctx = ctx_with_content_type("POST", "application/json");
+    let residual_body = br#"{"choices":[{"message":{"ssn":123456789}}]}"#;
+    let mut residual_headers = HashMap::new();
+    residual_headers.insert("content-type".to_string(), "application/json".to_string());
+    let result = plugin
+        .on_response_body(&mut residual_ctx, 200, &mut residual_headers, residual_body)
+        .await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("restricted content"));
+            assert!(
+                !gateway_capacity_response_selected_for_test(&residual_ctx),
+                "ordinary residual must not mark the capacity terminal"
+            );
+        }
+        other => panic!("expected residual 502, got {other:?}"),
+    }
+
+    let guard = include_str!("../../../src/plugins/ai_response_guard.rs");
+    assert_eq!(
+        guard
+            .matches("mark_buffered_response_capacity_refusal_pending()")
+            .count(),
+        3,
+        "SSE residual, JSON/content residual, and native-gRPC preflight must \
+         each mark pending on window refusal"
+    );
+    assert!(
+        guard.contains("ResponseTransformWindow::open(ceiling)?"),
+        "SSE residual must propagate window refusal as Option::None rather than \
+         collapsing it into residual=true"
+    );
+}
