@@ -224,6 +224,7 @@ fn xds_ecds_dr_carrier_round_trip() {
         traffic_policy: None,
         port_level_settings: HashMap::new(),
         subsets: Vec::new(),
+        export_to: vec!["*".to_string()],
     });
     let snapshot = translate_mesh_slice_to_snapshot(&slice);
     let ecds = snapshot.resources(ECDS_TYPE_URL);

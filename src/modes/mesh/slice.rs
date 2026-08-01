@@ -6,11 +6,12 @@ use tracing::{debug, warn};
 use crate::config::types::GatewayConfig;
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
-    MeshConfig, MeshDestinationRule, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication,
-    MeshRuntimeOverlay, MeshService, MeshSidecar, MeshSidecarEgress, MeshTelemetryResource,
-    MeshVirtualServiceCorsPolicy, MtlsMode, MultiClusterConfig, OutboundTrafficPolicy,
-    PeerAuthentication, PolicyScope, ResolvedIngressListener, ServiceEntry, SidecarHostPattern,
-    TrustBundleSet, Workload, WorkloadLabels, is_false, is_zero_usize,
+    DestinationRuleLookupTier, MeshConfig, MeshDestinationRule, MeshPolicy, MeshProxyConfig,
+    MeshRequestAuthentication, MeshRuntimeOverlay, MeshService, MeshSidecar, MeshSidecarEgress,
+    MeshTelemetryResource, MeshVirtualServiceCorsPolicy, MtlsMode, MultiClusterConfig,
+    OutboundTrafficPolicy, PeerAuthentication, PolicyScope, ResolvedIngressListener, ServiceEntry,
+    SidecarHostPattern, TrustBundleSet, Workload, WorkloadLabels,
+    destination_rule_exported_to_namespace, destination_rule_lookup_tier, is_false, is_zero_usize,
     policy_scope_applies_to_workload, proxy_config_applies_to_workload, scope_applies_to_workload,
     service_entry_applies_to_workload, virtual_service_cors_policy_exported_to_namespace,
     workload_selector_matches,
@@ -1088,12 +1089,17 @@ impl MeshSlice {
             (Vec::new(), false, 0)
         };
 
-        // Sidecar-only indexes: skip the full scan over `mesh.services` and
-        // `mesh.service_entries` when no Sidecar applies (default-off feature,
-        // or an enforced workload that no Sidecar resource targets). The
-        // destination-rules filter is the only consumer and short-circuits
-        // before reading these when `applicable_sidecar` is `None`.
-        let (mesh_service_identities, service_entry_hosts) = if resolved_sidecar.is_some() {
+        // Host-scoping indexes for policy narrowing. Skipped entirely when no
+        // Sidecar applies AND there is no host-targeting client policy to
+        // scope — but a DestinationRule or VirtualService CORS policy now needs
+        // them unconditionally: resolving `reviews.beta` to its TARGET SERVICE
+        // namespace is what makes Istio's client → service → root lookup tiers
+        // (#2469) correct, and guessing the declaring namespace instead would
+        // silently mis-tier every namespaced short host.
+        let (mesh_service_identities, service_entry_hosts) = if resolved_sidecar.is_some()
+            || !mesh.destination_rules.is_empty()
+            || !mesh.virtual_service_cors_policies.is_empty()
+        {
             (
                 mesh_service_identities(mesh),
                 visible_service_entry_hosts(mesh, effective_namespace, &effective_labels),
@@ -1298,50 +1304,44 @@ impl MeshSlice {
             })
             .cloned()
             .collect();
-        let destination_rules: Vec<MeshDestinationRule> = mesh
-            .destination_rules
-            .iter()
-            .filter(|dr| {
+        // DestinationRule admission is centralized in `admit_destination_rules`:
+        // `exportTo` visibility (#2465) first, then Istio's client → target
+        // service → root lookup tiers (#2469), then this path's own scope gate,
+        // then per-destination tier resolution. The root namespace is resolved
+        // HERE, at slice build, so the data plane never has to know it.
+        let destination_rule_scope = DestinationRuleScope {
+            client_namespace: effective_namespace,
+            root_namespace: mesh.istio_root_namespace.as_str(),
+            cluster_domain: &cluster_domain,
+            mesh_service_identities: &mesh_service_identities,
+            service_entry_hosts: &service_entry_hosts,
+        };
+        let destination_rules: Vec<MeshDestinationRule> = admit_destination_rules(
+            mesh.destination_rules.iter(),
+            &destination_rule_scope,
+            |dr, resource_namespace, host_candidates| {
                 let Some(sidecar) = applicable_sidecar else {
+                    // No applicable Sidecar: the rest of this slice is already
+                    // namespace-local (or waypoint-bound), so keep the same
+                    // resource-namespace visibility rule — but never drop a
+                    // root-namespace rule, which is Istio's mesh-wide default
+                    // tier and applies with or without a Sidecar resource.
                     return resource_namespace_visible(
                         &service_waypoint_namespaces,
                         &dr.namespace,
                         &namespace,
-                    );
+                    ) || dr.namespace.trim() == mesh.istio_root_namespace.trim();
                 };
-                let (resource_namespace, host_candidates) = destination_rule_host_scope(
-                    dr,
-                    &cluster_domain,
-                    &mesh_service_identities,
-                    &service_entry_hosts,
-                );
-                // Istio DestinationRule lookup namespaces are {client (the
-                // workload's own namespace), target service namespace, root
-                // namespace}. Root-namespace plumbing is deferred (see
-                // docs/mesh.md "Known Limitations"), so admit only DRs
-                // declared in the client or the target service namespace.
-                // Without this guard a DR in an unrelated namespace
-                // targeting `reviews.beta` could be imported into an
-                // `alpha` workload's slice merely because the Sidecar
-                // admits `beta/*`, letting a third-party namespace override
-                // client traffic policy.
-                let dr_namespace = dr.namespace.as_str();
-                if dr_namespace != effective_namespace
-                    && dr_namespace != resource_namespace.as_str()
-                {
-                    return false;
-                }
                 let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
                 sidecar_egress_includes_service(
                     sidecar.namespace,
                     sidecar.egress,
-                    &resource_namespace,
+                    resource_namespace,
                     &host_refs,
                     None,
                 )
-            })
-            .cloned()
-            .collect();
+            },
+        );
         // VirtualService-derived CORS policies narrow EXACTLY like
         // DestinationRules: same namespace-visibility default, same
         // client-or-target-namespace guard, same Sidecar egress-scope check —
@@ -1448,6 +1448,7 @@ impl MeshSlice {
                 waypoint,
                 &request.namespace,
                 &request.cluster_domain,
+                mesh.istio_root_namespace.as_str(),
                 &mesh.waypoint_bindings,
                 waypoint_resources,
             )
@@ -1562,6 +1563,7 @@ fn narrow_for_service_waypoint(
     waypoint_name: &str,
     waypoint_namespace: &str,
     cluster_domain: &str,
+    root_namespace: &str,
     bindings: &[crate::modes::mesh::config::MeshWaypointBinding],
     resources: ServiceWaypointNarrowingResources,
 ) -> ServiceWaypointNarrowingResources {
@@ -1603,6 +1605,7 @@ fn narrow_for_service_waypoint(
             destination_rule_matches_admitted_service(
                 dr,
                 waypoint_namespace,
+                root_namespace,
                 cluster_domain,
                 &admitted_services,
                 &admitted_hosts,
@@ -1664,6 +1667,7 @@ fn admitted_service_hosts(services: &[MeshService], cluster_domain: &str) -> BTr
 fn destination_rule_matches_admitted_service(
     dr: &MeshDestinationRule,
     waypoint_namespace: &str,
+    root_namespace: &str,
     cluster_domain: &str,
     admitted_services: &[MeshService],
     admitted_hosts: &BTreeSet<String>,
@@ -1673,6 +1677,7 @@ fn destination_rule_matches_admitted_service(
         && destination_rule_namespace_allowed_for_admitted_service(
             dr,
             waypoint_namespace,
+            root_namespace,
             cluster_domain,
             admitted_services,
             host,
@@ -1682,14 +1687,26 @@ fn destination_rule_matches_admitted_service(
             .any(|service| host == service.name && dr.namespace == service.namespace)
 }
 
+/// Which namespaces may own a DestinationRule for a service-waypoint-admitted
+/// service.
+///
+/// This mirrors Istio's lookup path for the waypoint's client position: the
+/// waypoint's own namespace (client tier), the target Service's namespace
+/// (service tier), and the configured `istio_root_namespace` (root tier,
+/// issue #2469 — omitting it dropped the mesh-wide default entirely). Export
+/// visibility and cross-tier precedence have already been resolved by
+/// `admit_destination_rules`; this pass only re-checks ownership against the
+/// waypoint's narrowed service set.
 fn destination_rule_namespace_allowed_for_admitted_service(
     dr: &MeshDestinationRule,
     waypoint_namespace: &str,
+    root_namespace: &str,
     cluster_domain: &str,
     admitted_services: &[MeshService],
     host: &str,
 ) -> bool {
     let cluster_domain = cluster_domain.trim().trim_end_matches('.');
+    let root_namespace = root_namespace.trim();
     admitted_services.iter().any(|service| {
         let host_matches = host == format!("{}.{}", service.name, service.namespace)
             || host == format!("{}.{}.svc", service.name, service.namespace)
@@ -1699,7 +1716,10 @@ fn destination_rule_namespace_allowed_for_admitted_service(
                         "{}.{}.svc.{}",
                         service.name, service.namespace, cluster_domain
                     ));
-        host_matches && (dr.namespace == service.namespace || dr.namespace == waypoint_namespace)
+        host_matches
+            && (dr.namespace == service.namespace
+                || dr.namespace == waypoint_namespace
+                || (!root_namespace.is_empty() && dr.namespace.trim() == root_namespace))
     })
 }
 
@@ -1903,31 +1923,31 @@ fn build_sidecar_egress_scope_snapshot<L: WorkloadLabels + ?Sized>(
         .filter(|workload| workload.namespace == workload_namespace)
         .cloned()
         .collect();
-    let scoped_destination_rules: Vec<MeshDestinationRule> = mesh
-        .destination_rules
-        .iter()
-        .filter(|dr| {
-            let (resource_namespace, host_candidates) = destination_rule_host_scope(
-                dr,
-                cluster_domain,
-                mesh_service_identities,
-                service_entry_hosts,
-            );
-            let dr_namespace = dr.namespace.as_str();
-            if dr_namespace != workload_namespace && dr_namespace != resource_namespace.as_str() {
-                return false;
-            }
+    // The operator-facing egress-scope snapshot must report the SAME admitted
+    // set the live slice serves, so it runs the one shared admission pass
+    // (`exportTo` visibility → lookup tier → egress scope → tier resolution)
+    // rather than its own copy of the namespace rule (issues #2465, #2469).
+    let destination_rule_scope = DestinationRuleScope {
+        client_namespace: workload_namespace,
+        root_namespace: mesh.istio_root_namespace.as_str(),
+        cluster_domain,
+        mesh_service_identities,
+        service_entry_hosts,
+    };
+    let scoped_destination_rules: Vec<MeshDestinationRule> = admit_destination_rules(
+        mesh.destination_rules.iter(),
+        &destination_rule_scope,
+        |_dr, resource_namespace, host_candidates| {
             let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
             sidecar_egress_includes_service(
                 sidecar.namespace,
                 sidecar.egress,
-                &resource_namespace,
+                resource_namespace,
                 &host_refs,
                 None,
             )
-        })
-        .cloned()
-        .collect();
+        },
+    );
 
     let baseline_local_services = mesh
         .services
@@ -2085,6 +2105,110 @@ fn service_host_aliases(name: &str, namespace: &str, cluster_domain: &str) -> Ve
         candidates.push(format!("{name}.{namespace}.svc.{cluster_domain}"));
     }
     candidates
+}
+
+/// Scoping inputs shared by every DestinationRule narrowing pass.
+///
+/// Bundled so the two Sidecar narrowing paths and the no-Sidecar path cannot
+/// drift apart on which namespace is the client, which is the mesh root, or
+/// how a rule host resolves to its target service.
+pub(crate) struct DestinationRuleScope<'a> {
+    /// The subscribing workload's own namespace — Istio's first lookup tier.
+    pub client_namespace: &'a str,
+    /// `MeshConfig.istio_root_namespace` — Istio's last lookup tier.
+    pub root_namespace: &'a str,
+    pub cluster_domain: &'a str,
+    pub mesh_service_identities: &'a BTreeSet<(String, String)>,
+    pub service_entry_hosts: &'a BTreeSet<String>,
+}
+
+/// THE DestinationRule admission pass: export visibility, then Istio's
+/// client → service → root lookup tier, then the caller's own scope gate,
+/// then per-host tier resolution (issues #2465 + #2469).
+///
+/// Composition order is load-bearing. `exportTo` is evaluated FIRST and is
+/// absolute, so root-namespace fallback can never resurrect a rule the
+/// subscriber was never allowed to see — that is what stops #2469's fallback
+/// from re-opening #2465. A rule outside all three lookup namespaces is
+/// refused outright rather than kept as a low-priority extra.
+///
+/// `extra_admits(rule, target_service_namespace, host_aliases)` carries the
+/// caller-specific gate (Sidecar egress scope, service-waypoint namespace
+/// visibility). It runs after visibility so a hidden rule is never even
+/// offered to it.
+///
+/// Tier resolution groups by the RESOLVED destination — target service
+/// namespace plus canonical host — and keeps only the most specific tier
+/// present in each group. Ordering therefore comes from ownership, never from
+/// how `(namespace, name)` sorts, so renaming a namespace cannot flip which
+/// policy wins. Within one surviving tier every rule is same-namespace by
+/// construction (one owner), so those merge in the materializer's deterministic
+/// order; a group with more than one is reported once, bounded, with no
+/// operator-supplied host or value in the message.
+pub(crate) fn admit_destination_rules<'a, F>(
+    candidates: impl Iterator<Item = &'a MeshDestinationRule>,
+    scope: &DestinationRuleScope<'_>,
+    mut extra_admits: F,
+) -> Vec<MeshDestinationRule>
+where
+    F: FnMut(&MeshDestinationRule, &str, &[String]) -> bool,
+{
+    // (group key, tier, rule)
+    let mut visible: Vec<((String, String), DestinationRuleLookupTier, &MeshDestinationRule)> =
+        Vec::new();
+    for rule in candidates {
+        if !destination_rule_exported_to_namespace(rule, scope.client_namespace) {
+            continue;
+        }
+        let (target_namespace, host_candidates) = destination_rule_host_scope(
+            rule,
+            scope.cluster_domain,
+            scope.mesh_service_identities,
+            scope.service_entry_hosts,
+        );
+        let tier = destination_rule_lookup_tier(
+            &rule.namespace,
+            scope.client_namespace,
+            &target_namespace,
+            scope.root_namespace,
+        );
+        if !tier.is_in_lookup_path() {
+            continue;
+        }
+        if !extra_admits(rule, &target_namespace, &host_candidates) {
+            continue;
+        }
+        let group_host = host_candidates.first().cloned().unwrap_or_default();
+        visible.push(((target_namespace, group_host), tier, rule));
+    }
+
+    let mut winning_tier: BTreeMap<&(String, String), DestinationRuleLookupTier> = BTreeMap::new();
+    for (key, tier, _) in &visible {
+        let slot = winning_tier.entry(key).or_insert(*tier);
+        if *tier < *slot {
+            *slot = *tier;
+        }
+    }
+
+    let mut admitted: Vec<MeshDestinationRule> = Vec::new();
+    let mut per_group_kept: BTreeMap<&(String, String), usize> = BTreeMap::new();
+    for (key, tier, rule) in &visible {
+        if winning_tier.get(key) != Some(tier) {
+            continue;
+        }
+        *per_group_kept.entry(key).or_insert(0) += 1;
+        admitted.push((**rule).clone());
+    }
+    let ambiguous_groups = per_group_kept.values().filter(|count| **count > 1).count();
+    if ambiguous_groups > 0 {
+        warn!(
+            client_namespace = %scope.client_namespace,
+            ambiguous_destinations = ambiguous_groups,
+            "Multiple DestinationRules from the same namespace target one destination; \
+             they merge in deterministic (namespace, name) order"
+        );
+    }
+    admitted
 }
 
 fn destination_rule_host_scope(
@@ -4982,6 +5106,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "other-ns".into(),
@@ -4990,6 +5115,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshConfig::default()
@@ -6853,6 +6979,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "checkout-dr".into(),
@@ -6861,6 +6988,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshConfig::default()
@@ -7388,6 +7516,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         };
@@ -7461,6 +7590,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "checkout-dr".into(),
@@ -7469,6 +7599,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshConfig::default()
@@ -7500,6 +7631,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "checkout-dr".into(),
@@ -7508,6 +7640,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshConfig::default()
@@ -7536,6 +7669,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "gamma-checkout-dr".into(),
@@ -7544,6 +7678,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshConfig::default()
@@ -7570,6 +7705,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         };
@@ -7597,6 +7733,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "gamma-checkout-dr".into(),
@@ -7605,6 +7742,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshConfig::default()
@@ -7632,6 +7770,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         };
@@ -7658,6 +7797,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         };
@@ -7690,6 +7830,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         };
@@ -7721,6 +7862,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         };
@@ -7752,6 +7894,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         };
@@ -7782,6 +7925,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "from-target-ns".into(),
@@ -7790,6 +7934,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "from-unrelated-ns".into(),
@@ -7798,6 +7943,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshConfig::default()
@@ -8619,6 +8765,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshConfig::default()
         };
@@ -8655,6 +8802,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "beta-checkout-dr".into(),
@@ -8663,6 +8811,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "gamma-payments-dr".into(),
@@ -8671,6 +8820,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshConfig::default()

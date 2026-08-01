@@ -52,12 +52,12 @@ use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{DpGrpcTlsReload, GrpcJwtSecret, build_dp_grpc_tls_config};
 use crate::identity::ca::{CaBackend, CertificateAuthority};
 use crate::modes::mesh::config::{
-    AppProtocol, EastWestGateway, MeshConfig, MeshDestinationRule, MeshInboundTcpRoute,
-    MeshJwtRule, MeshLoadBalancer, MeshLocalityLbSetting, MeshOutlierDetection, MeshPolicy,
-    MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig, MeshTrafficPolicy,
-    MeshTrafficPolicyTls, MtlsMode, PolicyAction, PolicyScope, Resolution, ServiceEntry,
-    ServiceEntryLocation, ServiceTargetPort, resolve_target_port,
-    service_entry_exported_to_namespace,
+    AppProtocol, DestinationRuleLookupTier, EastWestGateway, MeshConfig, MeshDestinationRule,
+    MeshInboundTcpRoute, MeshJwtRule, MeshLoadBalancer, MeshLocalityLbSetting,
+    MeshOutlierDetection, MeshPolicy, MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig,
+    MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyAction, PolicyScope, Resolution,
+    ServiceEntry, ServiceEntryLocation, ServiceTargetPort, destination_rule_lookup_tier,
+    resolve_target_port, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
@@ -6747,18 +6747,6 @@ fn mesh_sd_selected_service_port(upstream: &Upstream, mesh_slice: &MeshSlice) ->
         .map(|port| port.port)
 }
 
-/// Apply DestinationRule traffic policies onto matching upstreams.
-///
-/// For each DestinationRule, we find upstreams whose targets match the DR
-/// host and apply:
-/// - `connectionPool.tcp.connectTimeout` onto proxies referencing the upstream
-/// - `outlierDetection` onto the upstream's passive health check
-/// - `loadBalancer` onto the upstream's algorithm
-/// - `subsets` as `SubsetDefinition` entries on the upstream
-///
-/// Multiple DRs targeting the same upstream are applied in a deterministic
-/// order — sorted by `(namespace, name)` — so the last-writer-wins outcome
-/// is reproducible across CP restarts and DP subscribers.
 /// Synthesize per-route `cors` plugin instances onto materialized sidecar
 /// OUTBOUND routes from the slice's VirtualService-derived CORS policies
 /// (issue #1973). Istio applies VirtualService policy on the client sidecar,
@@ -6880,6 +6868,30 @@ fn synthesize_mesh_outbound_cors_plugins(
     }
 }
 
+/// Apply DestinationRule traffic policies onto matching upstreams.
+///
+/// For each DestinationRule, we find upstreams whose targets match the DR
+/// host and apply:
+/// - `connectionPool.tcp.connectTimeout` onto proxies referencing the upstream
+/// - `outlierDetection` onto the upstream's passive health check
+/// - `loadBalancer` onto the upstream's algorithm
+/// - `subsets` as `SubsetDefinition` entries on the upstream
+///
+/// Selection follows Istio's lookup path, NOT resource spelling (issue #2469).
+/// Every upstream first resolves its winning tier — a rule in the subscriber's
+/// own namespace outranks one in the target service's namespace, which
+/// outranks anything else (the slice has already resolved and admitted the
+/// configured `istio_root_namespace` tier, and has already applied `exportTo`
+/// visibility, so only rules this subscriber may see arrive here). Losing-tier
+/// rules are skipped outright for that upstream, so renaming a namespace can
+/// never flip which policy wins.
+///
+/// Within the winning tier every rule is same-namespace by construction — one
+/// owner, Istio's merge case — and those apply in deterministic
+/// `(namespace, name)` order so the last-writer-wins-per-field outcome is
+/// reproducible across CP restarts and DP subscribers. `(namespace, name)`
+/// order is therefore an intra-tier tiebreak only; it is never cross-tier
+/// precedence.
 fn apply_destination_rules(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -6963,13 +6975,42 @@ fn apply_destination_rules(
         );
     }
 
-    for dr in sorted_destination_rules {
+    // Winning Istio lookup tier per upstream (issue #2469), precomputed once
+    // for the whole apply pass — this is cold-path slice-apply work, never per
+    // request. The slice already resolved the configured root namespace and
+    // enforced `exportTo` visibility, so the tiers still distinguishable here
+    // are "the subscriber's own namespace" (Client) and "the target service's
+    // namespace" (Service); everything else — including an admitted
+    // root-namespace default — is the lowest-priority bucket. Skipping
+    // losing-tier rules per upstream is what stops the `(namespace, name)`
+    // ordering below from acting as cross-tier precedence.
+    let client_namespace = mesh_slice.namespace.as_str();
+    let winning_tier_by_upstream: Vec<Option<DestinationRuleLookupTier>> = config
+        .upstreams
+        .iter()
+        .map(|upstream| {
+            sorted_destination_rules
+                .iter()
+                .copied()
+                .filter(|dr| destination_rule_matches_upstream(dr, upstream))
+                .map(|dr| materialization_destination_rule_tier(dr, upstream, client_namespace))
+                .min()
+        })
+        .collect();
+
+    for dr in sorted_destination_rules.iter().copied() {
         let matching_upstream_indices: Vec<usize> = config
             .upstreams
             .iter()
             .enumerate()
             .filter_map(|(idx, upstream)| {
-                destination_rule_matches_upstream(dr, upstream).then_some(idx)
+                if !destination_rule_matches_upstream(dr, upstream) {
+                    return None;
+                }
+                // A rule from a lower-priority tier must not overwrite the
+                // winning tier's policy on this upstream.
+                let tier = materialization_destination_rule_tier(dr, upstream, client_namespace);
+                (winning_tier_by_upstream.get(idx).copied().flatten() == Some(tier)).then_some(idx)
             })
             .collect();
 
@@ -7570,6 +7611,45 @@ fn into_upstream_locality(
                 to: entry.to.clone(),
             })
             .collect(),
+    }
+}
+
+/// Istio lookup tier for a `(DestinationRule, Upstream)` pair on the data
+/// plane (issue #2469).
+///
+/// The upstream's own `namespace` IS the target service namespace for every
+/// materialized mesh upstream (`mesh_outbound_route_upstream` stamps the
+/// service's namespace) and for operator-authored upstreams alike, so it is
+/// the authoritative service tier here. `Root` is deliberately not
+/// distinguished: the configured `istio_root_namespace` lives on the config
+/// source, not on the slice, and slice narrowing already resolved and admitted
+/// that tier — an admitted root rule simply lands in the lowest bucket, which
+/// is exactly its Istio precedence relative to Client and Service.
+///
+/// This is a precedence pass, not an admission pass. Visibility (`exportTo`)
+/// and namespace eligibility are enforced fail-closed at slice construction,
+/// where the client namespace, the mesh root namespace, and the full service
+/// inventory are all known.
+fn materialization_destination_rule_tier(
+    dr: &MeshDestinationRule,
+    upstream: &Upstream,
+    client_namespace: &str,
+) -> DestinationRuleLookupTier {
+    match destination_rule_lookup_tier(
+        &dr.namespace,
+        client_namespace,
+        &upstream.namespace,
+        // Root is resolved at slice build; see the doc comment.
+        "",
+    ) {
+        DestinationRuleLookupTier::Client => DestinationRuleLookupTier::Client,
+        DestinationRuleLookupTier::Service => DestinationRuleLookupTier::Service,
+        // `Root` is unreachable with an empty root namespace, but map it with
+        // `Unscoped` so a future caller that supplies one cannot change the
+        // meaning of this bucket by accident.
+        DestinationRuleLookupTier::Root | DestinationRuleLookupTier::Unscoped => {
+            DestinationRuleLookupTier::Unscoped
+        }
     }
 }
 
@@ -17084,6 +17164,7 @@ mod tests {
                     },
                 )]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -17768,6 +17849,7 @@ mod tests {
                     },
                 )]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -17822,6 +17904,7 @@ mod tests {
                     traffic_policy,
                     port_level_settings,
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 }],
                 ..MeshSlice::default()
             }
@@ -17973,6 +18056,7 @@ mod tests {
                     },
                 )]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -18033,6 +18117,7 @@ mod tests {
                     },
                 )]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -18125,6 +18210,7 @@ mod tests {
                     },
                 )]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -18229,6 +18315,7 @@ mod tests {
                     },
                 )]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -18295,6 +18382,7 @@ mod tests {
                 },
             )]),
             subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
         };
         let slice = MeshSlice {
             namespace: "default".to_string(),
@@ -18364,6 +18452,7 @@ mod tests {
                     ),
                 ]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -20026,6 +20115,7 @@ mod tests {
                 }),
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -20074,6 +20164,7 @@ mod tests {
                         labels: HashMap::from([("version".to_string(), "v2".to_string())]),
                         traffic_policy: None,
                     }],
+                    export_to: vec!["*".to_string()],
                 }],
                 ..MeshConfig::default()
             })),
@@ -20124,6 +20215,7 @@ mod tests {
                     }),
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "a-first".to_string(),
@@ -20136,6 +20228,7 @@ mod tests {
                     }),
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshSlice::default()
@@ -20183,6 +20276,7 @@ mod tests {
                     }),
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "z-no-locality".to_string(),
@@ -20194,6 +20288,7 @@ mod tests {
                     }),
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshSlice::default()
@@ -20895,6 +20990,7 @@ mod tests {
                 }),
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -20972,6 +21068,7 @@ mod tests {
                         ..MeshTrafficPolicy::default()
                     }),
                 }],
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -21067,6 +21164,7 @@ mod tests {
                         ..MeshTrafficPolicy::default()
                     }),
                 }],
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -21120,6 +21218,7 @@ mod tests {
                         ..MeshTrafficPolicy::default()
                     }),
                 }],
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -21191,6 +21290,7 @@ mod tests {
                             ..MeshTrafficPolicy::default()
                         }),
                     }],
+                    export_to: vec!["*".to_string()],
                 },
                 // Later (name "reviews-b"): no subsets, top-level connectTimeout.
                 MeshDestinationRule {
@@ -21203,6 +21303,7 @@ mod tests {
                     }),
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshSlice::default()
@@ -21259,6 +21360,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: port_level,
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -21314,6 +21416,7 @@ mod tests {
                         ..MeshTrafficPolicy::default()
                     }),
                 }],
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -21393,6 +21496,7 @@ mod tests {
                         ..MeshTrafficPolicy::default()
                     }),
                 }],
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -21453,6 +21557,7 @@ mod tests {
                         ..MeshTrafficPolicy::default()
                     }),
                 }],
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -21515,6 +21620,7 @@ mod tests {
                     labels: HashMap::from([("version".to_string(), "v2".to_string())]),
                     traffic_policy: None,
                 }],
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -21617,6 +21723,7 @@ mod tests {
                 }),
                 port_level_settings: port_level,
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -21701,6 +21808,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: port_level,
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -21782,6 +21890,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: first_port_policy,
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "b-partial".to_string(),
@@ -21790,6 +21899,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: second_port_policy,
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshSlice::default()
@@ -21849,6 +21959,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: hash_policy,
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
                 MeshDestinationRule {
                     name: "b-random".to_string(),
@@ -21857,6 +21968,7 @@ mod tests {
                     traffic_policy: None,
                     port_level_settings: random_policy,
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 },
             ],
             ..MeshSlice::default()
@@ -29540,6 +29652,7 @@ mod tests {
                     },
                 )]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -29609,6 +29722,7 @@ mod tests {
                     }),
                     port_level_settings: HashMap::new(),
                     subsets: Vec::new(),
+                    export_to: vec!["*".to_string()],
                 }],
                 ..MeshConfig::default()
             })),
@@ -30396,6 +30510,7 @@ mod tests {
                     ),
                 ]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -30539,6 +30654,7 @@ mod tests {
                     },
                 )]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };
@@ -30622,6 +30738,7 @@ mod tests {
                     ),
                 ]),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };

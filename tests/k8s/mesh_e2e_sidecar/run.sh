@@ -30,6 +30,16 @@ set -euo pipefail
 #                                               DR connectTimeout provably
 #                                               bounds the mesh-mTLS dial
 #                                               (two-phase timing, see below)
+#   sidecar.destination_rule.export_to_namespace_visibility
+#                                               a DestinationRule exported ONLY
+#                                               to another namespace cannot
+#                                               change this client's effective
+#                                               policy (issue #2465)
+#   sidecar.destination_rule.lookup_tier_client_wins
+#                                               a client-namespace rule beats a
+#                                               root-namespace default even
+#                                               though the root namespace sorts
+#                                               LAST lexically (issue #2469)
 #   sidecar.destination_rule.tcp_max_connections
 #                                               DR maxConnections=1 admits one
 #                                               HELD WebSocket session, rejects
@@ -119,6 +129,15 @@ PHASE1_WINDOW_HI=14.0
 CONNECT_TIMEOUT_PHASE2_MS=2000
 PHASE2_WINDOW_LO=1.2
 PHASE2_WINDOW_HI=4.5
+# Phase 3/4 (issues #2465 + #2469). Phase 3 exports the 2000ms rule to a
+# namespace this client is NOT in, so the dial must fall back to the built-in
+# 5000ms default; the window deliberately excludes the 2000ms phase-2 window.
+# Phase 4 restores a client-namespace rule at 2000ms alongside an 8000ms
+# root-namespace rule and must land back in the phase-2 window.
+UNEXPORTED_NAMESPACE="ferrum-other-tenant"
+ROOT_NAMESPACE="${FERRUM_MESH_E2E_ROOT_NAMESPACE:-istio-system}"
+DEFAULT_CONNECT_WINDOW_LO=3.6
+DEFAULT_CONNECT_WINDOW_HI=8.0
 
 # Discovered at runtime.
 SVC_POD_IP=""
@@ -144,6 +163,8 @@ REQUIRED_LIVE_ASSERTIONS=(
   sidecar.request_auth.missing_jwt_rejected
   sidecar.request_auth.invalid_jwt_rejected
   sidecar.destination_rule.tcp_connect_timeout
+  sidecar.destination_rule.export_to_namespace_visibility
+  sidecar.destination_rule.lookup_tier_client_wins
   sidecar.destination_rule.tcp_max_connections
   sidecar.virtual_service.cors_policy
   sidecar.config.native_subscribe_delivered
@@ -634,8 +655,63 @@ YAML
 # routes only exist if the CP-delivered slice materialized. Rendered only
 # after the svc pod IP is known; a svc pod replacement would need a re-render
 # + client restart (this fixture never replaces svc).
+# `slow_dr_mode` selects which DestinationRule shape targets `slowsvc`, so the
+# connect-timeout probe can re-use one black-holed dial to prove three separate
+# contracts (issues #2465 + #2469):
+#   local           the plain rule in this namespace applies (baseline)
+#   unexported      the SAME rule, exported ONLY to a namespace this client is
+#                   not in, must NOT apply -> the dial falls back to the
+#                   built-in 5000ms default
+#   client-vs-root  a client-namespace rule and a root-namespace rule both
+#                   target the host; Istio's lookup order must pick the CLIENT
+#                   one even though `istio-system` sorts LAST lexically
 render_client_config() {
   local svc_pod_ip="$1" wssvc_pod_ip="$2" capp_pod_ip="$3" slow_connect_timeout_ms="$4"
+  local slow_dr_mode="${5:-local}"
+  local slow_destination_rules
+  case "$slow_dr_mode" in
+    unexported)
+      slow_destination_rules="$(cat <<YAML
+    - name: slowsvc-connect-timeout
+      namespace: $NS
+      host: slowsvc.$NS.svc.cluster.local
+      export_to:
+        - "$UNEXPORTED_NAMESPACE"
+      traffic_policy:
+        connect_timeout_ms: $slow_connect_timeout_ms
+YAML
+)"
+      ;;
+    client-vs-root)
+      slow_destination_rules="$(cat <<YAML
+    - name: slowsvc-connect-timeout
+      namespace: $NS
+      host: slowsvc.$NS.svc.cluster.local
+      export_to:
+        - "*"
+      traffic_policy:
+        connect_timeout_ms: $slow_connect_timeout_ms
+    - name: slowsvc-root-default
+      namespace: $ROOT_NAMESPACE
+      host: slowsvc.$NS.svc.cluster.local
+      export_to:
+        - "*"
+      traffic_policy:
+        connect_timeout_ms: $CONNECT_TIMEOUT_PHASE1_MS
+YAML
+)"
+      ;;
+    *)
+      slow_destination_rules="$(cat <<YAML
+    - name: slowsvc-connect-timeout
+      namespace: $NS
+      host: slowsvc.$NS.svc.cluster.local
+      traffic_policy:
+        connect_timeout_ms: $slow_connect_timeout_ms
+YAML
+)"
+      ;;
+  esac
   apply_configmap ferrum-mesh-client "$(cat <<YAML
 mesh:
   workloads:
@@ -742,11 +818,7 @@ mesh:
         max_age_seconds: 600
         unmatched_preflights: forward
   destination_rules:
-    - name: slowsvc-connect-timeout
-      namespace: $NS
-      host: slowsvc.$NS.svc.cluster.local
-      traffic_policy:
-        connect_timeout_ms: $slow_connect_timeout_ms
+$slow_destination_rules
     # maxConnections=1 on the WS service: one held WebSocket session occupies
     # the sole slot (BackendConnectionGuard held for the session in the WS
     # connect loop), a concurrent second upgrade is rejected 503 before
@@ -1340,6 +1412,118 @@ sys.exit(0 if t1 > t2 + 2.0 else 1)
     record_live_assertion sidecar.destination_rule.tcp_connect_timeout fail \
       client slowsvc \
       "timing-did-not-track-configured-timeout phase1=status=$status1,t=${t1}s phase2=status=$status2,t=${t2}s"
+    return 1
+  fi
+
+  probe_export_to_visibility "$t2" || return 1
+}
+
+# Re-render the client with a DIFFERENT slowsvc DestinationRule shape, restart,
+# re-settle the positive route, and time the black-holed dial again. Publishes
+# the result in `REPROBE_STATUS` / `REPROBE_TIME` rather than on stdout — the
+# helpers it calls log to stdout, so a command substitution here would capture
+# their chatter alongside the measurement.
+REPROBE_STATUS=""
+REPROBE_TIME=""
+reprobe_slowsvc_with_dr_mode() {
+  local mode="$1" timeout_ms="$2" assertion_id="$3"
+  render_client_config "$SVC_POD_IP" "$WSSVC_POD_IP" "$CAPP_POD_IP" \
+    "$timeout_ms" "$mode"
+  kubectl --context "$CONTEXT" -n "$NS" rollout restart deploy/client
+  kubectl --context "$CONTEXT" -n "$NS" rollout status deploy/client --timeout=3m
+  local settle settle_status
+  settle="$(drive_settle client / "" 200 "$APP_BODY")"
+  settle_status="${settle%%$'\t'*}"
+  if [[ "$settle_status" != "200" ]]; then
+    record_live_assertion "$assertion_id" fail \
+      client slowsvc "client-did-not-recover-after-restart status=$settle_status"
+    return 1
+  fi
+  local out rest
+  out="$(probe_slowsvc_once)"
+  REPROBE_STATUS="${out%%$'\t'*}"
+  rest="${out#*$'\t'}"
+  REPROBE_TIME="${rest%%$'\t'*}"
+}
+
+# Phases 3 and 4 (issues #2465 + #2469), driven off the SAME black-holed dial
+# the two-phase connectTimeout probe already proved end-to-end. `t2` is the
+# baseline: the observed fail time when the 2000ms rule DOES apply.
+#
+# Phase 3 keeps that rule byte-for-byte but exports it only to
+# `$UNEXPORTED_NAMESPACE`. The client is not in that namespace, so the rule must
+# be invisible and the dial must fall back to the built-in 5000ms default. This
+# is the fail-CLOSED direction: if `exportTo` were ignored, the timing would
+# stay at ~2s.
+#
+# Phase 4 restores a client-namespace rule at 2000ms and adds a
+# root-namespace rule at 8000ms for the same host. Root-namespace rules are now
+# ADMITTED to the slice (issue #2469 — they were dropped entirely before, so
+# the mesh-wide default silently disappeared), and `$ROOT_NAMESPACE`
+# (`istio-system`) sorts AFTER `$NS` (`ferrum`), so layering the admitted set in
+# `(namespace, name)` order would let the ROOT rule win and the dial would take
+# ~8s. Istio's lookup order requires the client-namespace rule, i.e. ~2s.
+#
+# This fixture is single-namespace, so the client and target-service tiers
+# coincide here; the client-beats-SERVICE tier with the namespaces deliberately
+# sorted BOTH ways is covered by
+# `tests/integration/mesh_destination_rule_visibility_tests.rs`.
+probe_export_to_visibility() {
+  local baseline_t2="$1"
+
+  log "DR exportTo phase 3: 2000ms rule exported only to $UNEXPORTED_NAMESPACE (expect the ${DEFAULT_CONNECT_WINDOW_LO}-${DEFAULT_CONNECT_WINDOW_HI}s default window)"
+  local status3 t3
+  reprobe_slowsvc_with_dr_mode unexported "$CONNECT_TIMEOUT_PHASE2_MS" \
+    sidecar.destination_rule.export_to_namespace_visibility || return 1
+  status3="$REPROBE_STATUS"
+  t3="$REPROBE_TIME"
+  log "phase 3: status=$status3 time=${t3}s"
+
+  local ok=true
+  [[ "$status3" =~ ^5[0-9][0-9]$ ]] || ok=false
+  in_window "$t3" "$DEFAULT_CONNECT_WINDOW_LO" "$DEFAULT_CONNECT_WINDOW_HI" || ok=false
+  python3 -c '
+import sys
+baseline, observed = float(sys.argv[1]), float(sys.argv[2])
+sys.exit(0 if observed > baseline + 1.5 else 1)
+' "$baseline_t2" "$t3" || ok=false
+
+  if [[ "$ok" == "true" ]]; then
+    record_live_assertion sidecar.destination_rule.export_to_namespace_visibility pass \
+      client slowsvc \
+      "unexported-rule-not-applied exported_to=$UNEXPORTED_NAMESPACE client_ns=$NS baseline=${baseline_t2}s observed=${t3}s status=$status3"
+  else
+    record_live_assertion sidecar.destination_rule.export_to_namespace_visibility fail \
+      client slowsvc \
+      "unexported-rule-still-applied-or-timing-out-of-window baseline=${baseline_t2}s observed=${t3}s status=$status3"
+    return 1
+  fi
+
+  log "DR lookup phase 4: client-namespace ${CONNECT_TIMEOUT_PHASE2_MS}ms vs root-namespace ${CONNECT_TIMEOUT_PHASE1_MS}ms in $ROOT_NAMESPACE (expect the ${PHASE2_WINDOW_LO}-${PHASE2_WINDOW_HI}s client window)"
+  local status4 t4
+  reprobe_slowsvc_with_dr_mode client-vs-root "$CONNECT_TIMEOUT_PHASE2_MS" \
+    sidecar.destination_rule.lookup_tier_client_wins || return 1
+  status4="$REPROBE_STATUS"
+  t4="$REPROBE_TIME"
+  log "phase 4: status=$status4 time=${t4}s"
+
+  ok=true
+  [[ "$status4" =~ ^5[0-9][0-9]$ ]] || ok=false
+  in_window "$t4" "$PHASE2_WINDOW_LO" "$PHASE2_WINDOW_HI" || ok=false
+  python3 -c '
+import sys
+observed, root = float(sys.argv[1]), float(sys.argv[2]) / 1000.0
+sys.exit(0 if observed < root - 2.0 else 1)
+' "$t4" "$CONNECT_TIMEOUT_PHASE1_MS" || ok=false
+
+  if [[ "$ok" == "true" ]]; then
+    record_live_assertion sidecar.destination_rule.lookup_tier_client_wins pass \
+      client slowsvc \
+      "client-namespace-rule-won client_ns=$NS root_ns=$ROOT_NAMESPACE client=${CONNECT_TIMEOUT_PHASE2_MS}ms root=${CONNECT_TIMEOUT_PHASE1_MS}ms observed=${t4}s status=$status4"
+  else
+    record_live_assertion sidecar.destination_rule.lookup_tier_client_wins fail \
+      client slowsvc \
+      "root-namespace-rule-or-lexical-order-decided client_ns=$NS root_ns=$ROOT_NAMESPACE observed=${t4}s status=$status4"
     return 1
   fi
 }

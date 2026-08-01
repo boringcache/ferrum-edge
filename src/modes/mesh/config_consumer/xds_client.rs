@@ -4681,6 +4681,7 @@ mod tests {
                 }),
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             trust_bundles: Some(TrustBundleSet {
                 local: TrustBundle {
@@ -5169,6 +5170,7 @@ mod tests {
                 traffic_policy: None,
                 port_level_settings: HashMap::new(),
                 subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
             }],
             ..MeshSlice::default()
         };

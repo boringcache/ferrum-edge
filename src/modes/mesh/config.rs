@@ -1183,15 +1183,113 @@ fn labels_match_subset<L: WorkloadLabels + ?Sized>(
 /// may consume the service, so it is deliberately not part of this visibility
 /// check.
 pub fn service_entry_exported_to_namespace(entry: &ServiceEntry, workload_namespace: &str) -> bool {
-    if entry.export_to.is_empty() {
-        return entry.namespace == workload_namespace;
+    export_visibility_admits(&entry.export_to, &entry.namespace, workload_namespace)
+}
+
+/// The ONE `exportTo` visibility evaluator, shared by ServiceEntry,
+/// DestinationRule, and VirtualService-derived CORS policy so the three can
+/// never drift apart.
+///
+/// `.` expands against `declaring_namespace` — which is why every carrier of
+/// an `exportTo` list must also carry its declaring namespace. An EMPTY list
+/// is namespace-local: Ferrum's fail-closed-by-omission convention on the
+/// native/file/carrier sources (Kubernetes translation materializes Istio's
+/// public default as an explicit `["*"]` instead of leaving the list empty).
+///
+/// Entries are trimmed before comparison so a padded carrier value cannot
+/// silently match nothing; anything beyond `*`, `.`, and a well-formed
+/// namespace name is rejected at validation, never interpreted here.
+pub(crate) fn export_visibility_admits(
+    export_to: &[String],
+    declaring_namespace: &str,
+    workload_namespace: &str,
+) -> bool {
+    let declaring_namespace = declaring_namespace.trim();
+    let workload_namespace = workload_namespace.trim();
+    if export_to.is_empty() {
+        return declaring_namespace == workload_namespace;
     }
 
-    entry.export_to.iter().any(|target| {
+    export_to.iter().any(|target| {
+        let target = target.trim();
         target == "*"
             || target == workload_namespace
-            || (target == "." && entry.namespace == workload_namespace)
+            || (target == "." && declaring_namespace == workload_namespace)
     })
+}
+
+/// True when this DestinationRule is exported to `workload_namespace`
+/// (issue #2465).
+///
+/// This is the visibility half of DestinationRule selection and runs BEFORE
+/// [`destination_rule_lookup_tier`]: a rule the subscriber cannot see is never
+/// eligible for any tier, so root-namespace fallback can never resurrect a
+/// namespace-local rule.
+pub fn destination_rule_exported_to_namespace(
+    rule: &MeshDestinationRule,
+    workload_namespace: &str,
+) -> bool {
+    export_visibility_admits(&rule.export_to, &rule.namespace, workload_namespace)
+}
+
+/// Istio's DestinationRule lookup path, most specific first (issue #2469).
+///
+/// Istio resolves the DestinationRule for a destination host by searching the
+/// client's own namespace, then the target service's namespace, then
+/// `meshConfig.rootNamespace` — the FIRST tier that yields a visible rule
+/// wins outright. Derived `Ord` follows the declaration order, so
+/// `Client < Service < Root < Unscoped` and "smallest tier wins" is the
+/// selection rule.
+///
+/// [`Unscoped`](Self::Unscoped) is the lowest-priority bucket for a rule whose
+/// namespace is none of the three: slice narrowing refuses those outright, so
+/// it only ever appears on the data-plane materialization pass, where it keeps
+/// an unexpected rule from outranking a properly scoped one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DestinationRuleLookupTier {
+    /// Declared in the client workload's own namespace.
+    Client,
+    /// Declared in the target service's namespace.
+    Service,
+    /// Declared in the configured `istio_root_namespace`.
+    Root,
+    /// Declared somewhere else entirely.
+    Unscoped,
+}
+
+impl DestinationRuleLookupTier {
+    /// True when this tier is part of Istio's lookup path at all.
+    #[inline]
+    pub fn is_in_lookup_path(self) -> bool {
+        self != DestinationRuleLookupTier::Unscoped
+    }
+}
+
+/// Classify a DestinationRule's declaring namespace into its Istio lookup tier.
+///
+/// Ties resolve to the most specific tier (a rule in a namespace that is both
+/// the client's and the service's is `Client`), so tier assignment never
+/// depends on how `(namespace, name)` happens to sort.
+///
+/// An empty `root_namespace` disables the root tier rather than matching every
+/// rule whose namespace is also empty.
+pub fn destination_rule_lookup_tier(
+    rule_namespace: &str,
+    client_namespace: &str,
+    service_namespace: &str,
+    root_namespace: &str,
+) -> DestinationRuleLookupTier {
+    let rule_namespace = rule_namespace.trim();
+    let root_namespace = root_namespace.trim();
+    if rule_namespace == client_namespace.trim() {
+        DestinationRuleLookupTier::Client
+    } else if rule_namespace == service_namespace.trim() {
+        DestinationRuleLookupTier::Service
+    } else if !root_namespace.is_empty() && rule_namespace == root_namespace {
+        DestinationRuleLookupTier::Root
+    } else {
+        DestinationRuleLookupTier::Unscoped
+    }
 }
 
 pub fn service_entry_applies_to_workload<L: WorkloadLabels + ?Sized>(
@@ -1865,6 +1963,31 @@ pub struct MeshDestinationRule {
     /// overrides. Proxies reference these via `upstream_subset`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subsets: Vec<MeshSubset>,
+    /// Export visibility from Istio `spec.exportTo` (issue #2465).
+    ///
+    /// Supported values are `*` (visible mesh-wide), `.` (visible only in this
+    /// rule's own [`namespace`](Self::namespace)), and explicit namespace
+    /// names. `~` and every other token is unsupported and rejected — see
+    /// [`validate_mesh_export_to`].
+    ///
+    /// Omitted-versus-explicitly-empty is DEFINED, not guessed, and the two
+    /// sources differ deliberately:
+    ///
+    /// * **Kubernetes**: an omitted (or explicitly empty) `spec.exportTo` is
+    ///   translated into an explicit `["*"]`, preserving Istio's public
+    ///   default.
+    /// * **Native / file / xDS carrier**: an EMPTY list is namespace-local,
+    ///   the same fail-closed-by-omission convention
+    ///   [`ServiceEntry::export_to`] and
+    ///   [`MeshVirtualServiceCorsPolicy::export_to`] already use. Write
+    ///   `["*"]` to publish a rule mesh-wide on those sources.
+    ///
+    /// Visibility is evaluated by [`destination_rule_exported_to_namespace`]
+    /// BEFORE lookup-tier selection and before a per-node slice is serialized,
+    /// so a namespace-local rule never reaches a subscriber outside its
+    /// declared visibility.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub export_to: Vec<String>,
 }
 
 /// Traffic policy controlling connection pool, outlier detection, and LB.
@@ -3668,6 +3791,15 @@ fn validate_mesh_config_internal(
             &dr.host,
             &mut errors,
         );
+        // Export visibility is security-relevant (issue #2465): an
+        // unsupported or self-conflicting list must reject the config rather
+        // than be interpreted, so a typo can never widen a namespace-local
+        // rule into a mesh-wide one.
+        validate_mesh_export_to(
+            &format!("MeshDestinationRule '{}'", dr.name),
+            &dr.export_to,
+            &mut errors,
+        );
         // Validate top-level trafficPolicy boundary fields (outlier-detection
         // ranges, client-TLS mode/cert consistency) that the K8s translator
         // enforces but the native/file/xDS slice path otherwise skips.
@@ -3857,6 +3989,81 @@ fn validate_non_empty_string(context: String, value: &str, errors: &mut Vec<Stri
     if value.trim().is_empty() {
         errors.push(format!("{context}: must not be empty"));
     }
+}
+
+/// Upper bound on `exportTo` entries. Visibility lists are authored by hand
+/// and a mesh has far fewer namespaces than this; the cap keeps a hostile
+/// config from turning every visibility check into an unbounded scan.
+pub const MESH_EXPORT_TO_MAX_ENTRIES: usize = 64;
+
+/// Validate an `exportTo` visibility list (issue #2465).
+///
+/// Fail-closed and shared by every source that carries one: an unsupported,
+/// malformed, or self-conflicting list is a config REJECTION, never a silent
+/// downgrade to "visible everywhere". Rejecting before publication leaves the
+/// previously accepted slice live.
+///
+/// Diagnostics name the field and the offending INDEX plus a fixed
+/// classification — the raw value is never echoed, because it is
+/// operator-supplied and can be arbitrarily long or hostile.
+pub fn validate_mesh_export_to(context: &str, export_to: &[String], errors: &mut Vec<String>) {
+    if export_to.len() > MESH_EXPORT_TO_MAX_ENTRIES {
+        errors.push(format!(
+            "{context}.exportTo: must not exceed {MESH_EXPORT_TO_MAX_ENTRIES} entries (got {})",
+            export_to.len()
+        ));
+        return;
+    }
+    let mut has_wildcard = false;
+    for (index, raw) in export_to.iter().enumerate() {
+        let entry = raw.trim();
+        if entry == "*" {
+            has_wildcard = true;
+            continue;
+        }
+        if entry == "." {
+            continue;
+        }
+        if entry.is_empty() {
+            errors.push(format!(
+                "{context}.exportTo[{index}]: must not be empty; use '.', '*', or a namespace name"
+            ));
+            continue;
+        }
+        if entry == "~" {
+            errors.push(format!(
+                "{context}.exportTo[{index}]: '~' is not a supported exportTo value; use '.', '*', or a namespace name"
+            ));
+            continue;
+        }
+        if !is_dns1123_namespace_label(entry) {
+            errors.push(format!(
+                "{context}.exportTo[{index}]: must be '.', '*', or a lowercase RFC 1123 namespace name of at most 63 characters"
+            ));
+        }
+    }
+    if has_wildcard && export_to.len() > 1 {
+        errors.push(format!(
+            "{context}.exportTo: '*' is mesh-wide and conflicts with the other {} entries; declare either '*' alone or an explicit namespace list",
+            export_to.len() - 1
+        ));
+    }
+}
+
+/// RFC 1123 label check used for namespace names inside `exportTo`.
+fn is_dns1123_namespace_label(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > 63 {
+        return false;
+    }
+    if !bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+    {
+        return false;
+    }
+    matches!(bytes.first(), Some(b) if b.is_ascii_lowercase() || b.is_ascii_digit())
+        && matches!(bytes.last(), Some(b) if b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 fn validate_non_zero_port(context: String, port: u16, errors: &mut Vec<String>) {

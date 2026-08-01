@@ -343,6 +343,7 @@ fn destination_rule_in_namespace(namespace: &str, name: &str, host: &str) -> Mes
         traffic_policy: None,
         port_level_settings: HashMap::new(),
         subsets: Vec::new(),
+        export_to: vec!["*".to_string()],
     }
 }
 

@@ -31,6 +31,7 @@ are prepared to fail CI on its regression. The source of truth is
 now enrolled vertically** (semantic assertion → contract row → required live
 assertion): PeerAuthentication STRICT, AuthorizationPolicy ALLOW/DENY,
 RequestAuthentication JWT, DestinationRule `connectTimeout`/`maxConnections`,
+DestinationRule `exportTo` visibility and lookup-namespace resolution,
 and VirtualService CORS, each backed by a `sidecar.*` live assertion the
 `mesh-e2e-sidecar` suite must emit and pass. No row is `live_deferred`: the
 last (VS CORS) closed with issue #1973 — the mesh slice now carries
@@ -63,12 +64,17 @@ CI today."
 - **GA track — Ferrum-native sidecar mesh.** `Sidecar` topology + native
   `MeshSubscribe` + SPIRE/SPIFFE mTLS + `AuthorizationPolicy`/`RequestAuthentication`
   + `ServiceEntry` HTTP egress + `REGISTRY_ONLY` + `VirtualService` routing +
-  `DestinationRule` LB/timeout/outlier. Semantics are pinned, and the sidecar
+  `DestinationRule` LB/timeout/outlier **plus `exportTo` namespace visibility
+  and the client → target-service → root-namespace lookup hierarchy**
+  (issues #2465 / #2469). Semantics are pinned, and the sidecar
   traffic surface **and the native config transport** are now **live-verified
   and blocking**: the `mesh-e2e-sidecar` kind+SPIRE suite drives the real
   captured datapath (STRICT mTLS positive + plaintext-rejected negative,
   destination-side authz 403, JWT valid/missing/invalid, DR connectTimeout
-  two-phase timing, DR maxConnections=1 WebSocket hold/reject/release, and a
+  two-phase timing, a DR exported only to another namespace proving it cannot
+  change this client's effective policy, a client-namespace rule beating a
+  root-namespace default whose namespace sorts LAST lexically,
+  DR maxConnections=1 WebSocket hold/reject/release, and a
   CP + native-subscribe leg proving CP-delivered `MeshSubscribe` config end to
   end) on every relevant PR and every main push, the artifact is
   contract-validated, and both the required CI aggregate and `release.yml`

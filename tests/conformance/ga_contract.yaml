@@ -18,6 +18,57 @@ capabilities:
       - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
       - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
 
+  - id: mesh.destination_rule.export_to_visibility
+    display_name: DestinationRule exportTo visibility
+    maturity: ga
+    topology: sidecar
+    config_protocol: istio
+    semantic_assertions:
+      - category: istio_destination_rule
+        feature: exportTo
+      - category: istio_destination_rule
+        feature: exportTo (unsupported values)
+    live_suite: mesh-e2e-sidecar
+    # Issue #2465. Visibility is enforced BEFORE DestinationRule lookup and
+    # before a per-node slice is serialized, so a namespace-local rule never
+    # reaches a subscriber outside its declared visibility. The live backing is
+    # fail-CLOSED: the same rule that provably bounds the dial at 2000ms is
+    # re-exported to a namespace the client is not in, and the observed connect
+    # time must fall back to the built-in 5000ms default.
+    live_assertions:
+      - sidecar.destination_rule.export_to_namespace_visibility
+    platform_profile: kind-spire-sidecar
+    docs_anchor: docs/mesh.md#destinationrule
+    owner: mesh
+    exclusions:
+      - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+
+  - id: mesh.destination_rule.lookup_hierarchy
+    display_name: DestinationRule lookup hierarchy
+    maturity: ga
+    topology: sidecar
+    config_protocol: istio
+    semantic_assertions:
+      - category: istio_destination_rule
+        feature: "DestinationRule lookup hierarchy (client → service → root namespace)"
+    live_suite: mesh-e2e-sidecar
+    # Issue #2469. Client namespace, then target service namespace, then the
+    # configured istio_root_namespace; the first tier with a visible rule wins
+    # outright. The live backing deliberately INVERTS lexical and semantic
+    # order: the root namespace (`istio-system`) sorts after the client
+    # namespace (`ferrum`), so the retired alphabetical last-writer behaviour
+    # would pick the root rule's 8000ms timeout instead of the client rule's
+    # 2000ms.
+    live_assertions:
+      - sidecar.destination_rule.lookup_tier_client_wins
+    platform_profile: kind-spire-sidecar
+    docs_anchor: docs/mesh.md#destinationrule
+    owner: mesh
+    exclusions:
+      - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+
   - id: mesh.destination_rule.tcp_max_connections
     display_name: DestinationRule TCP max connections
     maturity: ga

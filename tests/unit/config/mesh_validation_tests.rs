@@ -243,6 +243,7 @@ fn mesh_config_validate_rejects_zero_ports_on_full_mesh_resources() {
             traffic_policy: None,
             port_level_settings: HashMap::from([(0, MeshTrafficPolicy::default())]),
             subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
         }],
         sidecars: vec![MeshSidecar {
             name: "sc".into(),
@@ -287,6 +288,7 @@ fn mesh_config_validate_rejects_empty_destination_rule_and_sidecar_fields() {
                 labels: HashMap::new(),
                 traffic_policy: None,
             }],
+            export_to: vec!["*".to_string()],
         }],
         sidecars: vec![MeshSidecar {
             name: "".into(),
@@ -1905,6 +1907,7 @@ fn mesh_config_validate_rejects_destination_rule_outlier_range_gaps() {
             }),
             port_level_settings: HashMap::new(),
             subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
         }],
         ..MeshConfig::default()
     };
@@ -1953,6 +1956,7 @@ fn mesh_config_validate_accepts_zero_consecutive_errors_as_disabled() {
             }),
             port_level_settings: HashMap::new(),
             subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
         }],
         ..MeshConfig::default()
     };
@@ -2006,6 +2010,7 @@ fn mesh_config_validate_rejects_destination_rule_tls_inconsistency() {
                     ..MeshTrafficPolicy::default()
                 }),
             }],
+            export_to: vec!["*".to_string()],
         }],
         ..MeshConfig::default()
     };

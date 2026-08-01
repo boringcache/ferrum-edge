@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Istio `DestinationRule.spec.exportTo` is now honored, and DestinationRules
+  are resolved by Istio's lookup hierarchy — client namespace, then target
+  service namespace, then the configured `istio_root_namespace` (issues #2465
+  and #2469). Previously `exportTo` was discarded at translation, so a rule
+  declared namespace-local with `exportTo: ["."]` could be carried to and
+  applied by a client in another namespace, silently changing that client's
+  TLS/SNI/trust, subset, timeout, pool, load-balancing, locality, and outlier
+  behaviour; and the root namespace was dropped from slice construction while
+  every remaining match was layered in lexical `(namespace, name)` order, so
+  the alphabetically last rule won and renaming a namespace could reverse the
+  result. Visibility is now evaluated during slice construction — before
+  lookup selection and before a per-node slice is serialized — and the winning
+  tier is resolved per destination there and re-applied per upstream at
+  materialization, so `(namespace, name)` order is only ever an intra-tier
+  tiebreak. The two compose in that order: `exportTo` is absolute, so
+  root-namespace fallback cannot resurrect a rule a subscriber was never
+  allowed to see. Supported values are `*`, `.`, and explicit namespace names;
+  `~`, empty entries, non-RFC-1123 namespace names, lists over 64 entries, and
+  `*` combined with an explicit namespace are rejected fail-closed
+  (Kubernetes: `FerrumAccepted=False`/`Invalid`; native/file/xDS: the config is
+  refused and the previously accepted slice stays live), with diagnostics that
+  name the field and index and never echo the operator-supplied value. The
+  behaviour is live-verified by two new blocking `mesh-e2e-sidecar` assertions,
+  `sidecar.destination_rule.export_to_namespace_visibility` and
+  `sidecar.destination_rule.lookup_tier_client_wins`.
+
 - Kubernetes controller watch scopes now rebuild their reflector from an
   authoritative list when they go idle past `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`
   (default `300`, `0` disables, clamped to `0`–`86400`). kube-rs raises an
@@ -113,6 +139,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   address); a distinct backend TLS SNI override is unsupported.
 
 ### Changed
+
+- **Breaking (native/file/xDS mesh sources only):** an omitted or explicitly
+  empty `destination_rules[].export_to` is now **namespace-local**, matching the
+  fail-closed-by-omission convention `ServiceEntry.export_to` and
+  `virtual_service_cors_policies[].export_to` already use. Add
+  `export_to: ["*"]` to any native, file, or carrier-authored DestinationRule
+  that must stay visible outside its own namespace. Kubernetes translation is
+  unaffected: an omitted or empty `spec.exportTo` is materialized as an explicit
+  `["*"]`, preserving Istio's public default.
+- DestinationRules declared outside the client namespace, the target service's
+  namespace, and the configured `istio_root_namespace` are no longer admitted
+  to a subscriber's slice at all, and DestinationRules in the configured root
+  namespace are now admitted (they previously were not).
 
 - Gateway API and Istio status planning now build immutable per-reconcile
   indexes and reuse one primary translation/materialization (plus skip errors)

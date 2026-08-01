@@ -1161,6 +1161,7 @@ fn all_collections(key_suffix: &str, marker: &str) -> MeshConfig {
             traffic_policy: None,
             port_level_settings: HashMap::new(),
             subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
         }],
         virtual_service_cors_policies: vec![MeshVirtualServiceCorsPolicy {
             name: name("cors"),

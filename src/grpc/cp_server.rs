@@ -3327,6 +3327,7 @@ mod tests {
             traffic_policy: None,
             port_level_settings: Default::default(),
             subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {

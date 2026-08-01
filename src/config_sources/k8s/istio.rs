@@ -16,7 +16,7 @@ use crate::modes::mesh::config::{
     Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, SourceNegationMatch,
     TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload, WorkloadPort,
     WorkloadSelector, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
-    mesh_condition_has_values, validate_mesh_condition_ip_block,
+    mesh_condition_has_values, validate_mesh_condition_ip_block, validate_mesh_export_to,
 };
 
 use super::{
@@ -1004,6 +1004,36 @@ fn destination_rule(
         .map(|subset| translate_subset(acc, object, subset))
         .collect::<Result<Vec<_>, _>>()?;
 
+    // `spec.exportTo` visibility (issue #2465). Istio's default for an
+    // omitted — or explicitly empty — list is PUBLIC, so it is materialized as
+    // an explicit `["*"]`: the mesh model's EMPTY `export_to` means
+    // namespace-local on the native/file sources, exactly like ServiceEntry and
+    // the VirtualService CORS carrier, and leaving the list empty here would
+    // silently make every Kubernetes DestinationRule namespace-local.
+    //
+    // `optional_string_array` (not the lossy `string_array`) is deliberate: a
+    // non-array `exportTo`, or a non-string entry, is a REJECTION rather than a
+    // silently dropped visibility constraint. The declaring namespace travels
+    // on the rule itself, which is what lets `.` expand later.
+    let export_to = {
+        let declared = optional_string_array(
+            object,
+            &object.spec,
+            "exportTo",
+            "DestinationRule spec.exportTo",
+        )?;
+        let mut errors = Vec::new();
+        validate_mesh_export_to("DestinationRule spec", &declared, &mut errors);
+        if let Some(first) = errors.first() {
+            return Err(invalid_resource(object, first.clone()));
+        }
+        if declared.is_empty() {
+            vec!["*".to_string()]
+        } else {
+            declared.iter().map(|entry| entry.trim().to_string()).collect()
+        }
+    };
+
     Ok(MeshDestinationRule {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
@@ -1011,6 +1041,7 @@ fn destination_rule(
         traffic_policy,
         port_level_settings,
         subsets,
+        export_to,
     })
 }
 
