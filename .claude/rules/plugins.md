@@ -181,14 +181,18 @@ on a native-gRPC request.
 - A body-consuming policy plugin selects on its configured representation, never
   on the request method, and never degrades to `Continue` for an empty, absent,
   or non-UTF-8 body once a configured rule applies (`GHSA-2vmr-ww8r-mww3`).
-  `body_validator` is the reference: it reads `ctx.request_body_bytes` (not the
-  UTF-8 `request_body` metadata copy, which the proxy removes for non-UTF-8
-  bytes), treats `ctx.replay_request_body_empty_proven()` as the transport's
-  own empty proof, and fails closed otherwise. Native gRPC always runs
-  `parse_grpc_frame`. The only exemptions are protocol-defined: gRPC
-  Trailers-Only replies, and responses with no content by status/method
-  semantics (1xx, 204, 205, 304, `HEAD`). Representation-gap diagnostics are
-  fixed strings and never echo body bytes.
+  `body_validator` is the reference: early `before_proxy` prefers a rewritten
+  UTF-8 `request_body` metadata view when present (composition with
+  `ai_prompt_shield`), falls back to `ctx.request_body_bytes` when no text view
+  exists (retained via `needs_request_body_bytes()` so non-UTF-8 cannot look
+  like "no body"), treats `ctx.replay_request_body_empty_proven()` as the
+  transport's own empty proof, and fails closed otherwise. The final
+  request-body hook still validates the exact backend-visible bytes. Native
+  gRPC always runs `parse_grpc_frame`. The only exemptions are protocol-defined:
+  empty terminal gRPC *error* replies (a single valid non-zero `grpc-status`),
+  and responses with no content by status/method semantics (1xx, 204, 205, 304,
+  `HEAD`). Representation-gap diagnostics are fixed strings and never echo body
+  bytes.
 - A configured finalized-egress plugin forces buffered request-body
   finalization to complete BEFORE backend dispatch (the `has_finalized_request_egress`
   term in `final_request_body_requirements`), because the ordinary ladder

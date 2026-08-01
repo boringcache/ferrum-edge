@@ -2588,8 +2588,9 @@ async fn test_protobuf_empty_or_short_request_transport_body_fails_closed() {
     }
 }
 
-/// The response side runs the same frame validation; only a Trailers-Only reply
-/// legitimately carries no message.
+/// The response side runs the same frame validation; only a Trailers-Only
+/// *error* reply (single valid non-zero `grpc-status`) legitimately carries no
+/// message. Successful unary replies still need a five-byte frame.
 #[tokio::test]
 async fn test_protobuf_empty_response_transport_body_fails_closed() {
     let plugin = BodyValidator::new(&serde_json::json!({
@@ -2618,8 +2619,30 @@ async fn test_protobuf_empty_response_transport_body_fails_closed() {
         Some(502),
     );
 
-    // Trailers-Only: the complete terminal metadata rides in the initial
-    // HEADERS block, so no message frame is expected.
+    // Empty successful unary (`grpc-status: 0`) still requires a frame.
+    let mut ok_status = headers.clone();
+    ok_status.insert("grpc-status".to_string(), "0".to_string());
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &ok_status, b"")
+            .await,
+        Some(502),
+    );
+
+    // Malformed / unparsable / LF-joined duplicate values are not exemptions.
+    for bad in ["", "abc", "5\n14", "5\r\n14", "99"] {
+        let mut hostile = headers.clone();
+        hostile.insert("grpc-status".to_string(), bad.to_string());
+        assert_reject(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &hostile, b"")
+                .await,
+            Some(502),
+        );
+    }
+
+    // Terminal error: a single valid non-zero status and no message frame is
+    // the legitimate empty native-gRPC response body.
     let mut trailers_only = headers.clone();
     trailers_only.insert("grpc-status".to_string(), "5".to_string());
     assert_continue(
@@ -5508,9 +5531,9 @@ async fn protobuf_only_final_request_does_not_json_screen_non_grpc() {
 //  GHSA-2vmr-ww8r-mww3 — body-policy representation must never fail open
 // ═══════════════════════════════════════════════════════════════════════
 
-/// The buffered raw bytes are the authoritative client representation. A body
-/// that is not valid UTF-8 has no shared string copy (the proxy removes it), and
-/// used to make the whole policy `Continue`.
+/// Non-UTF-8 JSON fails closed from the raw-byte fallback when no UTF-8
+/// metadata view exists. A body that is not valid UTF-8 has no shared string
+/// copy (the proxy removes it), and used to make the whole policy `Continue`.
 #[tokio::test]
 async fn advisory_2vmr_non_utf8_json_request_fails_closed_without_echoing_bytes() {
     let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
@@ -5576,6 +5599,47 @@ async fn advisory_2vmr_empty_json_request_fails_closed() {
             .on_final_request_body(&make_json_headers(), b"")
             .await,
         Some(400),
+    );
+}
+
+/// Early `before_proxy` validation prefers a downstream-rewritten metadata text
+/// view (as `ai_prompt_shield` redact writes) over the original raw bytes, so
+/// the shielded/redacted representation is what the early hook decides over.
+/// The final request-body hook still validates the exact backend-visible bytes.
+#[tokio::test]
+async fn advisory_2vmr_before_proxy_prefers_transformed_metadata_over_raw_bytes() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    // Original client bytes lack the required field and would reject.
+    ctx.request_body_bytes = Some(bytes::Bytes::from_static(br#"{"ssn":"123-45-6789"}"#));
+    // Earlier shield/redact rewrite publishes the admission view in metadata.
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        r#"{"ssn":"[REDACTED:ssn]","name":"ok"}"#.to_string(),
+    );
+    let mut headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // Final hook still decides over the backend-visible bytes independently.
+    assert_reject(
+        plugin
+            .on_final_request_body(&make_json_headers(), br#"{"ssn":"123-45-6789"}"#)
+            .await,
+        Some(400),
+    );
+    assert_continue(
+        plugin
+            .on_final_request_body(
+                &make_json_headers(),
+                br#"{"ssn":"[REDACTED:ssn]","name":"ok"}"#,
+            )
+            .await,
     );
 }
 
