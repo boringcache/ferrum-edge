@@ -750,6 +750,15 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         env_config.max_concurrent_fault_delays,
     );
 
+    // Publish the buffered-response bounds before any listener accepts traffic,
+    // so the very first retained response is already charged against the
+    // aggregate budget and can never fall back to an unlimited ceiling
+    // (GHSA-pwcm-6rh8-f2gh).
+    crate::proxy::response_buffer_budget::init(
+        env_config.response_buffer_fallback_max_bytes,
+        env_config.response_buffer_max_total_bytes,
+    );
+
     // Initialize DTLS buffer config from resolved EnvConfig before any DTLS sessions.
     crate::dtls::init_dtls_buf_config(
         env_config.dtls_max_plaintext_bytes,

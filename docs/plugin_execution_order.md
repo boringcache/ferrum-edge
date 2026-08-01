@@ -120,6 +120,11 @@ Request In
 └────────────┬────────────┘
              │
              ▼
+┌──────────────────────────────┐
+│ 7b. on_final_response_headers │ Header-only effects for the selected response
+└────────────┬─────────────────┘
+             │
+             ▼
 ┌─────────────────────────┐
 │ 8. normalize_response_body │ Provider/protocol normalization
 └────────────┬────────────┘
@@ -146,6 +151,8 @@ Request In
              │
              │  Streamed non-buffered bodies skip phases 8-12 and call
              │  on_response_stream_terminated here when the body terminates.
+             │  Phase 7b is the last one they DO run, which is why it owns any
+             │  response-side effect that must not depend on collecting a body.
              │
              ▼
 ┌─────────────────────────┐
@@ -432,6 +439,16 @@ protocol/integrity validation, WAF/OpenAPI/body/size policy, AI request
 guardrails, and mandatory audit admission. TCP/UDP-only early egress does not
 collide with a stream-enabled WAF's separate stream-inspection advertisement.
 The plugin may not also declare `dispatches_finalized_request_egress()`.
+
+### Retained-allocation bounds on the producer boundary
+
+Phases 8 (`normalize_response_body`) and 10 (`transform_response_body`) are the only lifecycle points at which a plugin hands the gateway a *new* response-body allocation, and that allocation is retained. Three rules keep it inside the aggregate retained-response budget (`GHSA-pwcm-6rh8-f2gh`):
+
+1. **Declared production.** `Plugin::response_body_production()` says whether a plugin can replace a body and whether it constructs bounded. Built-in declarations live in a single table; anything outside the built-in inventory defaults to *undeclared*, and an undeclared plugin is **refused rather than invoked** — invoking it is what would let it allocate without a bound. A chain whose plugins all declare "never" reserves no transform window at all, so validators and header-only plugins do not consume a per-response ceiling.
+2. **A full covering window is a precondition of every invocation.** The window is reserved before the first producer runs, and after each accepted replacement it is refilled only once the caller has installed that replacement — which is when the body it replaced drops its charge. If a full window cannot be re-established, the phase installs the neutral capacity terminal *instead of* calling the next producer, so no producer ever allocates under a partial window.
+3. **Bounded construction.** A producer materialises its replacement through a sink bounded by the same per-response retained ceiling, so an output that would exceed it is refused *while it is being written* rather than allocated in full and rejected afterwards.
+
+Peak accounting follows from (2): while a rewrite runs, the body being read from and the covering window are both charged, so a maximum-size rewritten response peaks at **two** ceilings.
 
 When a plugin returns a replacement body from `transform_response_body`, the core first removes representation metadata that can no longer describe the client-visible bytes: range fields, ETag/Last-Modified validators, content digests/checksums, and content-bound signatures. It then calls that plugin's `on_response_body_transformed` callback before the next transform, allowing the plugin to attach metadata it recomputed for the replacement representation. Neither step runs when the transform returns `None`, so unmodified responses retain their original semantics — with one exception: a body the representation gate **decoded** has already had its client-visible bytes changed (encoded in, identity out), so that same metadata invalidation is applied at the decode itself, whether or not a later rule matches. Otherwise a decoded body no rule happened to change would be served as identity bytes carrying the origin's validator for the encoded ones. `206 Partial Content` and `226 IM Used` responses that no configured body policy claims skip provider normalization and presentation transforms entirely: the buffered bytes are only a selected range or delta, so Ferrum cannot rewrite them into a truthful full representation merely by changing headers or status. When a configured body policy *does* claim such a response, skipping the transform would silently forward protected bytes, so the representation gate described below rejects it instead — see [Buffered response representation gate](#buffered-response-representation-gate). Transform-dependent header hooks also decline these statuses: compression does not attach `Content-Encoding`, gRPC-Web does not relabel native gRPC bytes or expose transformed trailers, and SSE does not force a non-SSE representation into event-stream headers when wrapping cannot run. Inspection hooks still run. If an enforcing policy detects content whose safe disposition requires redaction, it rejects the response instead of forwarding the original bytes with false redaction telemetry. This lifecycle rule is shared by buffered H1, H2, H3, gRPC, and synthetic/rejection response paths rather than delegated to individual transformer implementations.
 
@@ -879,13 +896,13 @@ Given all built-in plugins enabled, the execution order is:
 | 53 | `load_testing` | 3070 | before_proxy |
 | 54 | `request_mirror` | 3075 | authorize (pre-buffer mirror admission; never rejects), finalized request egress |
 | 55 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
-| 56 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
+| 56 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_headers, on_final_response_body |
 | 57 | `response_transformer` | 4000 | after_proxy, transform_response_body |
 | 58 | `compression` | 4050 | normalize_buffered_request_body_before_before_proxy, before_proxy, after_proxy, transform_request_body, transform_response_body |
 | 59 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body_with_context, on_final_request_body_with_context |
 | 60 | `ai_semantic_cache` | 4057 | on_final_request_body_with_context, after_proxy, on_final_response_body |
 | 61 | `ai_federation` | 4060 | finalized request egress (HTTP only) |
-| 62 | `ai_response_guard` | 4075 | after_proxy, on_response_body, transform_response_body |
+| 62 | `ai_response_guard` | 4075 | after_proxy, on_response_body, transform_response_body, on_final_response_body |
 | 63 | `security_headers` | 4080 | after_proxy, initial response-header boundary |
 | 64 | `ai_token_metrics` | 4100 | on_response_body |
 | 65 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
