@@ -10608,8 +10608,10 @@ async fn handle_websocket_request_authenticated(
         //
         // Uses the same `resolve_backend_connection_proxy_for_target` helper as
         // the H3 WebSocket bridge (`src/http3/websocket.rs`) so the two protocol
-        // paths cannot drift. Borrowed (zero-alloc) when the selected target has
-        // no per-port override; cloned only when a projected field differs.
+        // paths cannot drift. Borrowed (zero-alloc) only when neither a projected
+        // policy field nor the selected target's host/port differs from the base
+        // proxy; otherwise the dispatch-local clone carries both policy and dial
+        // identity.
         let ws_connection_proxy =
             resolve_backend_connection_proxy_for_target(&proxy, current_target.as_deref());
         let ws_dial_proxy: &Proxy = ws_connection_proxy.as_ref();

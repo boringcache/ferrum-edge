@@ -282,17 +282,17 @@ fn rotation_into_a_port_without_an_override_falls_back_to_the_base_policy() {
     assert_eq!(rotated.resolved_tls, proxy.resolved_tls);
 }
 
-// ── no per-target override: unchanged behavior ──────────────────────────────
+// ── no policy override: borrow only when no target rebase is needed ─────────
 
 #[test]
-fn no_per_target_override_keeps_the_base_proxy_byte_for_byte() {
+fn matching_target_without_override_keeps_the_base_proxy_byte_for_byte() {
     let proxy = base_proxy();
     let selected = target(8443);
     let resolved = resolve_backend_connection_proxy_for_target(&proxy, Some(&selected));
 
     assert!(
         matches!(resolved, Cow::Borrowed(_)),
-        "a target with no per-port override must not allocate a per-attempt clone"
+        "a matching target with no per-port override must not allocate a clone"
     );
     // `Proxy` has no `PartialEq`; compare its serialized form instead.
     assert_eq!(
@@ -307,6 +307,22 @@ fn no_per_target_override_keeps_the_base_proxy_byte_for_byte() {
         serde_json::to_value(none.as_ref()).expect("serialize"),
         serde_json::to_value(&proxy).expect("serialize")
     );
+}
+
+#[test]
+fn different_target_without_policy_override_rebases_the_dial_identity() {
+    let proxy = base_proxy();
+    let selected = target(9443);
+    let resolved = resolve_backend_connection_proxy_for_target(&proxy, Some(&selected));
+
+    assert!(
+        matches!(resolved, Cow::Owned(_)),
+        "a different selected host/port needs a dispatch-local proxy clone"
+    );
+    assert_eq!(resolved.backend_host, selected.host);
+    assert_eq!(resolved.backend_port, 9443);
+    assert_eq!(resolved.backend_connect_timeout_ms, 5_000);
+    assert_eq!(resolved.resolved_tls, proxy.resolved_tls);
 }
 
 #[test]
