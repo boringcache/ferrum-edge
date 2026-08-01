@@ -4207,17 +4207,17 @@ impl Plugin for GrpcWebPlugin {
             allowlist = Some(HashSet::new());
         }
         let translated = match self.transform_grpc_web_response_body(
-                body,
-                content_type,
-                response_headers,
-                TrailerFrameProvenance {
-                    http_status,
-                    trailer_name_allowlist: allowlist.as_ref(),
-                    shadowed_trailers: shadowed_trailers.as_ref(),
-                    policy_state: ctx.buffered_initial_response_header_policy(),
-                },
-                ctx.retained_response_body_ceiling(),
-            ) {
+            body,
+            content_type,
+            response_headers,
+            TrailerFrameProvenance {
+                http_status,
+                trailer_name_allowlist: allowlist.as_ref(),
+                shadowed_trailers: shadowed_trailers.as_ref(),
+                policy_state: ctx.buffered_initial_response_header_policy(),
+            },
+            ctx.retained_response_body_ceiling(),
+        ) {
             crate::plugins::BoundedResponseBodyConstruction::Replaced(bytes) => bytes,
             crate::plugins::BoundedResponseBodyConstruction::Unchanged
             | crate::plugins::BoundedResponseBodyConstruction::CapacityRefused => {

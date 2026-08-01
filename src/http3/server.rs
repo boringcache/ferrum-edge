@@ -7356,9 +7356,7 @@ async fn handle_h3_request(
         // transform_response_body hooks — only for buffered responses.
         // A capacity terminal is already protocol-correct; do not reopen
         // transforms against it.
-        if !after_proxy_rejected
-            && !ctx.gateway_capacity_response_selected()
-            && !plugins.is_empty()
+        if !after_proxy_rejected && !ctx.gateway_capacity_response_selected() && !plugins.is_empty()
         {
             let phase_start = std::time::Instant::now();
             let (response_replaced, body_transformed) =

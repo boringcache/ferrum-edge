@@ -5520,7 +5520,9 @@ async fn window_capacity_refusal_selects_capacity_not_restricted_content_502() {
 
     let mut ctx = ctx_with_content_type("POST", "application/json");
     mark_buffered_response_capacity_refusal_pending_for_test(&mut ctx);
-    assert!(take_buffered_response_capacity_refusal_pending_for_test(&mut ctx));
+    assert!(take_buffered_response_capacity_refusal_pending_for_test(
+        &mut ctx
+    ));
     // Re-mark: the enclosing on_response_body loop consumes via install_pending.
     mark_buffered_response_capacity_refusal_pending_for_test(&mut ctx);
 

@@ -19699,9 +19699,7 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
             response_status,
             response_headers,
             response_body,
-            InitialResponseHeaderPolicySource::Prefiltered(
-                initial_response_header_policy_plugins,
-            ),
+            InitialResponseHeaderPolicySource::Prefiltered(initial_response_header_policy_plugins),
         ) {
             return (true, body_transformed);
         }
@@ -26834,10 +26832,11 @@ async fn handle_proxy_request_inner(
                                             &plugins, &mut ctx, reject, false,
                                         )
                                         .await;
-                                    authoritative_trailers_only_terminal_metadata =
-                                        Some(grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
+                                    authoritative_trailers_only_terminal_metadata = Some(
+                                        grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
                                             &normalized.headers,
-                                        ));
+                                        ),
+                                    );
                                     response_status = normalized.http_status.as_u16();
                                     response_headers = normalized.headers;
                                     plugin_response_headers = response_headers.clone();

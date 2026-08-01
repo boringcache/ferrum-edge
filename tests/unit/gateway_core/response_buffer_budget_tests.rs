@@ -2521,7 +2521,10 @@ fn init_warns_when_startup_configuration_arrives_after_lazy_initialization() {
 fn the_rewrite_concurrency_bound_uses_actual_input_capacity() {
     let ferrum_conf = include_str!("../../../ferrum.conf");
     let configuration = include_str!("../../../docs/configuration.md");
-    for (name, doc) in [("ferrum.conf", ferrum_conf), ("docs/configuration.md", configuration)] {
+    for (name, doc) in [
+        ("ferrum.conf", ferrum_conf),
+        ("docs/configuration.md", configuration),
+    ] {
         assert!(
             doc.contains("FULL ceiling-sized") || doc.contains("**full** per-response"),
             "{name} must state that the producer window is reserved at the full ceiling"
@@ -2924,12 +2927,14 @@ fn authoritative_capacity_terminal_is_consulted_before_later_body_phases() {
     ));
     assert!(gateway_capacity_response_selected_for_test(&pending_ctx));
     assert_eq!(pending_status, RESPONSE_BUFFER_OVERLOAD_STATUS);
-    assert!(!install_pending_buffered_response_capacity_refusal_for_test(
-        &mut pending_ctx,
-        &mut pending_status,
-        &mut pending_headers,
-        &mut pending_body,
-    ));
+    assert!(
+        !install_pending_buffered_response_capacity_refusal_for_test(
+            &mut pending_ctx,
+            &mut pending_status,
+            &mut pending_headers,
+            &mut pending_body,
+        )
+    );
 
     let proxy = include_str!("../../../src/proxy/mod.rs");
     let h3_server = include_str!("../../../src/http3/server.rs");

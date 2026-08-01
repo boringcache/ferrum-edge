@@ -974,8 +974,7 @@ impl AiResponseGuard {
         // done, keeping the peak at the documented two ceilings; a budget that
         // cannot admit it fails closed as capacity rather than materialising the
         // candidate anyway (GHSA-pwcm-6rh8-f2gh).
-        let window =
-            crate::proxy::response_buffer_budget::ResponseTransformWindow::open(ceiling)?;
+        let window = crate::proxy::response_buffer_budget::ResponseTransformWindow::open(ceiling)?;
         // Scan the exact bytes the client would receive: transformed output
         // when redaction changed an event, otherwise the original framing.
         // The residual pass masks only preserved top-level structural scalar

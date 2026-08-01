@@ -2946,7 +2946,9 @@ where
                     crate::proxy::admit_buffered_response_body_transforms(
                         plugins,
                         ctx,
-                        crate::proxy::buffered_response_representation_origin(response_body_rejected),
+                        crate::proxy::buffered_response_representation_origin(
+                            response_body_rejected,
+                        ),
                         &mut response_status,
                         &mut response_headers,
                         &mut response_body,
@@ -5072,8 +5074,7 @@ where
                         &mut authoritative_trailers_only_terminal_metadata,
                     );
                     let _ = ctx.take_buffered_initial_response_header_policy();
-                    terminal_metadata_is_body_framed |=
-                        client_terminal_metadata_is_body_framed;
+                    terminal_metadata_is_body_framed |= client_terminal_metadata_is_body_framed;
                 } else {
                     // Same ordering contract as the transform phase below: the
                     // decode-only normalize rewrite must not let the trailer

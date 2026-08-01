@@ -1,5 +1,5 @@
-use ferrum_edge::config::file_loader::load_config_from_file;
 use ferrum_edge::_test_support::take_buffered_response_capacity_refusal_pending_for_test;
+use ferrum_edge::config::file_loader::load_config_from_file;
 use ferrum_edge::plugins::grpc_web::{GRPC_WEB_CONFIG_KEYS, GrpcWebPlugin};
 use ferrum_edge::plugins::security_headers::SecurityHeaders;
 use ferrum_edge::plugins::{
@@ -4193,7 +4193,9 @@ async fn capacity_refused_grpc_web_transform_installs_body_framed_terminal() {
     assert_eq!(body_buf.first(), Some(&0x80));
     let payload = trailing_grpc_web_trailer_payload(&body_buf);
     assert!(
-        payload.contains(&format!("grpc-status: {RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS}")),
+        payload.contains(&format!(
+            "grpc-status: {RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS}"
+        )),
         "capacity status must ride the gRPC-Web body trailer frame: {payload:?}"
     );
     assert!(
