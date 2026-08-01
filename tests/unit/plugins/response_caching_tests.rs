@@ -5408,7 +5408,13 @@ async fn test_request_declaring_a_body_bypasses_cache() {
     )
     .await;
 
-    for (name, value) in [("content-length", "7"), ("transfer-encoding", "chunked")] {
+    for (name, value) in [
+        ("content-length", "7"),
+        ("content-length", ""),
+        ("content-length", "not-a-length"),
+        ("content-length", "0, 0"),
+        ("transfer-encoding", "chunked"),
+    ] {
         let mut ctx = make_ctx("GET", "/api/items");
         ctx.headers
             .insert("host".to_string(), "a.example.com".to_string());
@@ -5420,19 +5426,19 @@ async fn test_request_declaring_a_body_bypasses_cache() {
                 plugin.before_proxy(&mut ctx, &mut headers).await,
                 PluginResult::Continue
             ),
-            "a declared body must never replay a stored representation ({name})"
+            "unsafe body framing must not replay ({name}={value:?})"
         );
         assert_eq!(
             ctx.metadata
                 .get(&staging_key(&plugin, "cache_status"))
                 .map(String::as_str),
             Some("BYPASS"),
-            "a declared body must bypass ({name})"
+            "unsafe body framing must bypass ({name}={value:?})"
         );
         assert!(
             !ctx.metadata
                 .contains_key(&staging_key(&plugin, "cache_base_key")),
-            "a bypassed request must not stage a storage key ({name})"
+            "a bypassed request must not stage a key ({name}={value:?})"
         );
     }
 

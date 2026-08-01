@@ -322,7 +322,7 @@ fn request_declares_body(headers: &HashMap<String, String>) -> bool {
     };
     let trimmed = content_length.trim();
     if trimmed.is_empty() {
-        return false;
+        return true;
     }
     // An unparsable Content-Length is not proof of an empty body.
     trimmed.parse::<u64>().map_or(true, |length| length > 0)
