@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::Engine;
-use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -129,6 +129,109 @@ pub struct AcmeDns01ChallengeRecord {
     pub key_authorization: String,
 }
 
+/// The deterministic finalization package for one ACME order.
+///
+/// # Why this is persisted rather than generated at finalization time
+///
+/// `instant_acme`'s `Order::finalize()` generates a fresh private key *inside* the
+/// call and only returns it after the finalize POST has already succeeded. A
+/// renewer that dies in that window leaves the CA in `processing` or `valid`
+/// with a certificate it will happily issue — and the only key that certificate
+/// matches gone with the crashed process. The successor cannot pair the
+/// certificate with anything, and it cannot finalize again with a replacement
+/// key either, because RFC 8555 does not accept a second finalize for an order
+/// that has left `ready`.
+///
+/// So Ferrum generates the key and CSR during *preparation*, before the order
+/// record is committed to the shared store and therefore before any finalize
+/// request exists, and finalizes with `Order::finalize_csr`.
+/// Whatever the CA's state turns out to be on resume, the matching key is
+/// already durable.
+///
+/// # Disclosure
+///
+/// This is private-key material. It is deliberately **not** part of
+/// [`AcmeOrderSummary`], so it never reaches an Admin response or `openapi.yaml`,
+/// its `Debug` renders a fixed placeholder so a record logged whole cannot leak
+/// it, and every failure path returns a fixed diagnostic that names neither the
+/// key nor the CSR.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AcmeOrderFinalization {
+    /// PEM-encoded private key the CSR was signed with, and the key the issued
+    /// certificate will be published against.
+    key_pem: String,
+    /// Standard-base64 DER PKCS#10 certificate signing request.
+    csr_der_base64: String,
+}
+
+/// Fixed, redacted diagnostic for unusable finalization material.
+///
+/// Deliberately content-free: the caller knows which order it was driving, and
+/// anything derived from the key or the CSR would be a disclosure.
+const UNUSABLE_FINALIZATION_MATERIAL: &str =
+    "ACME order finalization material is missing or unusable";
+
+impl AcmeOrderFinalization {
+    /// Generate a fresh key and a CSR covering exactly `domains`.
+    ///
+    /// Mirrors what `instant_acme::Order::finalize()` would have generated
+    /// internally (SANs from the order identifiers, empty distinguished name),
+    /// except that it happens early enough to be persisted first.
+    pub fn generate(domains: &[String]) -> Result<Self, AcmeError> {
+        let mut params = rcgen::CertificateParams::new(domains.to_vec())
+            .map_err(|_| AcmeError::InvalidConfiguration(UNUSABLE_FINALIZATION_MATERIAL.into()))?;
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        let key_pair = rcgen::KeyPair::generate()
+            .map_err(|_| AcmeError::InvalidConfiguration(UNUSABLE_FINALIZATION_MATERIAL.into()))?;
+        let csr = params
+            .serialize_request(&key_pair)
+            .map_err(|_| AcmeError::InvalidConfiguration(UNUSABLE_FINALIZATION_MATERIAL.into()))?;
+        Self::from_parts(key_pair.serialize_pem(), csr.der().as_ref())
+    }
+
+    /// Build from an already-generated pair, rejecting anything unusable.
+    pub fn from_parts(key_pem: String, csr_der: &[u8]) -> Result<Self, AcmeError> {
+        if key_pem.trim().is_empty() || csr_der.is_empty() {
+            return Err(AcmeError::Parse(UNUSABLE_FINALIZATION_MATERIAL.to_string()));
+        }
+        Ok(Self {
+            key_pem,
+            csr_der_base64: BASE64_STANDARD.encode(csr_der),
+        })
+    }
+
+    /// The private key the issued certificate must be published against.
+    pub fn key_pem(&self) -> &str {
+        &self.key_pem
+    }
+
+    /// The DER CSR to finalize with. Fails closed on corrupt material.
+    pub fn csr_der(&self) -> Result<Vec<u8>, AcmeError> {
+        if self.key_pem.trim().is_empty() {
+            return Err(AcmeError::Parse(UNUSABLE_FINALIZATION_MATERIAL.to_string()));
+        }
+        let der = BASE64_STANDARD
+            .decode(self.csr_der_base64.as_bytes())
+            .map_err(|_| AcmeError::Parse(UNUSABLE_FINALIZATION_MATERIAL.to_string()))?;
+        if der.is_empty() {
+            return Err(AcmeError::Parse(UNUSABLE_FINALIZATION_MATERIAL.to_string()));
+        }
+        Ok(der)
+    }
+
+    /// Reject material that cannot later be used, at the store boundary, so a
+    /// corrupt package cannot be written in the first place.
+    fn validate(&self) -> Result<(), AcmeError> {
+        self.csr_der().map(|_| ())
+    }
+}
+
+impl std::fmt::Debug for AcmeOrderFinalization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcmeOrderRecord {
     pub id: String,
@@ -149,6 +252,12 @@ pub struct AcmeOrderRecord {
     pub tls_alpn01_challenges: Vec<AcmeTlsAlpn01ChallengeRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns01_challenges: Vec<AcmeDns01ChallengeRecord>,
+    /// Key/CSR generated during preparation and persisted before the first CA
+    /// finalize request, so a successor can finish this order whatever state the
+    /// CA is in. Cleared once the order is durably `Valid` — see
+    /// `commit_final_renewal_publication`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalization: Option<AcmeOrderFinalization>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -191,6 +300,10 @@ pub struct AcmeHttp01OrderInput {
     pub http01_challenges: Vec<AcmeHttp01ChallengeRecord>,
     pub tls_alpn01_challenges: Vec<AcmeTlsAlpn01ChallengeRecord>,
     pub dns01_challenges: Vec<AcmeDns01ChallengeRecord>,
+    /// Deliberately required rather than defaulted: every construction site has
+    /// to say whether this order can be finalized after a crash, so no
+    /// constructor can silently drop the material a successor needs.
+    pub finalization: Option<AcmeOrderFinalization>,
     pub error: Option<String>,
 }
 
@@ -316,6 +429,10 @@ pub enum AcmeError {
     InvalidChallengeToken(String),
     #[error("ACME certificate '{id}' does not contain {kind} material")]
     MissingMaterial { id: String, kind: &'static str },
+    /// Deliberately content-free apart from the order id: this fires on
+    /// private-key/CSR material, so it must not describe what it found.
+    #[error("ACME order '{0}' finalization material is missing or unusable")]
+    UnusableFinalizationMaterial(String),
     #[error("failed to read ACME certificate store: {0}")]
     Read(String),
     #[error("failed to write ACME certificate store: {0}")]
@@ -569,6 +686,9 @@ impl AcmeOrderStore {
         validate_http01_challenges(&record.http01_challenges)?;
         validate_tls_alpn01_challenges(&record.tls_alpn01_challenges)?;
         validate_dns01_challenges(&record.dns01_challenges)?;
+        if let Some(finalization) = record.finalization.as_ref() {
+            finalization.validate()?;
+        }
         self.file.mutate(move |document| {
             let mut record = record;
             let now = Utc::now();
@@ -848,6 +968,9 @@ impl AcmeOrderRecord {
         validate_http01_challenges(&input.http01_challenges)?;
         validate_tls_alpn01_challenges(&input.tls_alpn01_challenges)?;
         validate_dns01_challenges(&input.dns01_challenges)?;
+        if let Some(finalization) = input.finalization.as_ref() {
+            finalization.validate()?;
+        }
         let now = Utc::now();
         Ok(Self {
             id: input.id,
@@ -861,12 +984,20 @@ impl AcmeOrderRecord {
             http01_challenges: input.http01_challenges,
             tls_alpn01_challenges: input.tls_alpn01_challenges,
             dns01_challenges: input.dns01_challenges,
+            finalization: input.finalization,
             error: input.error,
             created_at: now,
             updated_at: now,
         })
     }
 
+    /// Operator-facing projection of an order.
+    ///
+    /// `finalization` is deliberately absent: it is private-key material, this
+    /// is what `GET/POST /tls/acme/orders` serializes, and adding it here would
+    /// both disclose the key and change the Admin response shape. The field list
+    /// below is exhaustive on purpose — a new secret field must not be able to
+    /// join by way of a struct-update shorthand.
     pub fn summary(&self) -> AcmeOrderSummary {
         AcmeOrderSummary {
             id: self.id.clone(),
@@ -2163,6 +2294,17 @@ pub(crate) fn commit_final_renewal_publication(
 ) -> FinalRenewalPublication {
     order.status = AcmeOrderStatus::Valid;
     order.error = None;
+    // Retention is tied to resumability, not to success. The material exists so
+    // a successor can finish an order that is still resumable, and an order is
+    // resumable exactly while it is in an active status: `plan_renewal_order`
+    // treats `Valid` as terminal and plans a fresh order (with fresh material)
+    // instead. So it is dropped in the *same* write that makes the order
+    // terminal, which keeps all four partial-publication outcomes recoverable:
+    // both-committed and order-only-committed reach `Valid` and no longer need
+    // it; the two outcomes where the order write fails never apply this record
+    // at all, so the stored material survives untouched and the still-active
+    // order stays resumable.
+    order.finalization = None;
     // Attempt the order Valid write first, then always attempt certificate
     // publication. Test-only injection hooks scope each fault to its own write
     // so either side (or both) can fail independently through this helper.
@@ -2528,6 +2670,18 @@ pub(crate) async fn resume_persisted_renewal_order(
             order.id
         )));
     }
+    // The same fail-closed check `complete_prepared_renewal_order` performs,
+    // hoisted ahead of the DNS-01 hook: an order whose finalization material is
+    // gone or corrupt can never be completed, so it must not cause a DNS
+    // re-presentation either. It is left untouched and recoverable rather than
+    // replaced with a duplicate order or re-keyed after the fact.
+    if !order
+        .finalization
+        .as_ref()
+        .is_some_and(|finalization| finalization.csr_der().is_ok())
+    {
+        return Err(AcmeError::UnusableFinalizationMaterial(order.id.clone()));
+    }
     tracing::info!(
         certificate_id = %certificate.id,
         order_id = %order.id,
@@ -2769,6 +2923,9 @@ async fn prepare_renewal_order(
         http01_challenges,
         tls_alpn01_challenges,
         dns01_challenges,
+        // Carried into the record the caller commits under the lease fence, so
+        // the material is durable *before* any finalize request can be made.
+        finalization: Some(prepared.finalization),
         error: None,
     })
 }
@@ -2787,12 +2944,21 @@ async fn complete_prepared_renewal_order(
         .order_url
         .clone()
         .ok_or_else(|| AcmeError::InvalidId("ACME order has no order URL".to_string()))?;
+    // Fail closed rather than fall back: without the order's own key and CSR
+    // there is no way to finalize safely (a replacement key cannot match a
+    // certificate the CA may already be issuing) and no way to create a
+    // substitute order without duplicating work with the CA.
+    let finalization = order
+        .finalization
+        .clone()
+        .ok_or_else(|| AcmeError::UnusableFinalizationMaterial(order.id.clone()))?;
     let complete_config = client::CompleteAcmeHttp01OrderConfig {
         directory_url: order.directory_url.clone(),
         account_credentials_json: crate::tls::source::SecretString::new(account_credentials_json),
         order_url,
         poll_timeout: config.poll_timeout,
         dns_cache: config.dns_cache.clone(),
+        finalization,
     };
     match challenge_type {
         AcmeRenewalChallengeType::Http01 => client::complete_http01_order(complete_config).await,
@@ -2991,6 +3157,9 @@ pub mod client {
         pub account_id: String,
         pub account_credentials_json: SecretString,
         pub challenges: Vec<AcmeHttp01Challenge>,
+        /// Generated before the order was created with the CA, so persisting the
+        /// prepared order also persists everything finalization will need.
+        pub finalization: super::AcmeOrderFinalization,
     }
 
     #[derive(Clone)]
@@ -3000,6 +3169,10 @@ pub mod client {
         pub order_url: String,
         pub poll_timeout: Duration,
         pub dns_cache: DnsCache,
+        /// Required, never optional: a completion that cannot present the
+        /// order's own CSR has no safe move left, so callers must resolve the
+        /// persisted material (or fail closed) before they can build this.
+        pub finalization: super::AcmeOrderFinalization,
     }
 
     #[derive(Debug, Clone)]
@@ -3027,6 +3200,10 @@ pub mod client {
         DeserializeCredentials(String),
         #[error("ACME outbound boundary rejected the request: {0}")]
         EgressPolicy(String),
+        /// Fixed and content-free by design: this fires on private-key/CSR
+        /// material, so it must not describe what it found.
+        #[error("ACME order finalization material is missing or unusable")]
+        UnusableFinalizationMaterial,
         #[error("ACME client error: {0}")]
         Client(String),
     }
@@ -3495,6 +3672,11 @@ pub mod client {
         let endpoint_policy = super::AcmeEndpointPolicy::new(&config.account.directory_url)
             .map_err(|error| AcmeClientError::InvalidRequest(error.to_string()))?;
         let domains = normalize_order_domains(config.domains)?;
+        // Generated before the account is resolved and before the order exists
+        // with the CA, so there is no window in which an order is reachable
+        // (persisted or remote) without the key and CSR that finish it.
+        let finalization = super::AcmeOrderFinalization::generate(&domains)
+            .map_err(|_| AcmeClientError::UnusableFinalizationMaterial)?;
         let account =
             resolve_account(&config.account, endpoint_policy.clone(), config.dns_cache).await?;
         let identifiers = domains
@@ -3542,6 +3724,7 @@ pub mod client {
             account_id: account.account.id().to_string(),
             account_credentials_json: account.credentials_json,
             challenges,
+            finalization,
         })
     }
 
@@ -3563,6 +3746,60 @@ pub mod client {
         complete_order(config, ChallengeType::Dns01, "dns-01").await
     }
 
+    /// One step of the remote-state-aware completion plan.
+    ///
+    /// The plan is data rather than control flow on purpose: whether a finalize
+    /// POST is issued for a given remote order state is then a pure, directly
+    /// testable decision, and `complete_order` holds the *only* call to
+    /// `finalize_csr` in the crate.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum AcmeCompletionAction {
+        /// Set every non-valid challenge ready and poll the order to `ready`.
+        DriveChallengesToReady,
+        /// Send exactly one finalize request, carrying the persisted CSR.
+        FinalizeWithPersistedCsr,
+        /// Poll a `processing` order until the CA publishes the certificate.
+        PollCertificate,
+        /// Fetch the certificate of an order that is already `valid`.
+        RetrieveCertificate,
+    }
+
+    /// Decide what a resumed order still needs, from the CA's current state.
+    ///
+    /// The crash window issue #2409 cares about is `processing`/`valid`: the
+    /// prior renewer's finalize POST already landed, so re-finalizing is both
+    /// rejected by RFC 8555 and pointless — the certificate the CA is issuing
+    /// matches the CSR that was already sent, which is the one Ferrum persisted.
+    /// Those states therefore only retrieve. `invalid` (and anything the CA
+    /// reports that is not one of these) fails closed.
+    pub(crate) fn completion_actions(
+        status: OrderStatus,
+    ) -> Result<&'static [AcmeCompletionAction], AcmeClientError> {
+        use AcmeCompletionAction::{
+            DriveChallengesToReady, FinalizeWithPersistedCsr, PollCertificate, RetrieveCertificate,
+        };
+        Ok(match status {
+            OrderStatus::Pending => &[
+                DriveChallengesToReady,
+                FinalizeWithPersistedCsr,
+                PollCertificate,
+            ],
+            OrderStatus::Ready => &[FinalizeWithPersistedCsr, PollCertificate],
+            OrderStatus::Processing => &[PollCertificate],
+            OrderStatus::Valid => &[RetrieveCertificate],
+            OrderStatus::Invalid => {
+                return Err(AcmeClientError::Client(
+                    "ACME order is invalid and cannot be completed".to_string(),
+                ));
+            }
+        })
+    }
+
+    /// Drive a persisted order to a certificate, whatever state the CA is in.
+    ///
+    /// Idempotent across a crash: the private key is never generated here, only
+    /// read from the material preparation already persisted, so every path
+    /// returns the one key the certificate is actually issued against.
     async fn complete_order(
         config: CompleteAcmeHttp01OrderConfig,
         challenge_type: ChallengeType,
@@ -3579,63 +3816,109 @@ pub mod client {
         endpoint_policy
             .validate_endpoint(order_url, "persisted order URL")
             .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
+        // Resolved before any request: material that cannot finalize must not
+        // reach the CA at all, let alone reach it and then fail with a half-run
+        // order. Never regenerated — a replacement key cannot retrieve a
+        // certificate the CA is already issuing against the original CSR.
+        let csr_der = config
+            .finalization
+            .csr_der()
+            .map_err(|_| AcmeClientError::UnusableFinalizationMaterial)?;
+        let key_pem = config.finalization.key_pem().to_string();
+        if key_pem.trim().is_empty() {
+            return Err(AcmeClientError::UnusableFinalizationMaterial);
+        }
         let account = restore_account(
             &config.account_credentials_json,
             endpoint_policy.clone(),
             config.dns_cache,
         )
         .await?;
+        // `Account::order` fetches authoritative state, so this is the CA's
+        // current view rather than whatever Ferrum last persisted.
         let mut order = account
             .order(order_url.to_string())
             .await
             .map_err(|error| AcmeClientError::Client(error.to_string()))?;
-
-        {
-            let mut authorizations = order.authorizations();
-            while let Some(authorization) = authorizations.next().await {
-                let mut authorization =
-                    authorization.map_err(|error| AcmeClientError::Client(error.to_string()))?;
-                let authorization_url = authorization.url().to_string();
-                endpoint_policy
-                    .validate_endpoint(&authorization_url, "authorization URL")
-                    .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
-                let Some(mut challenge) = authorization.challenge(challenge_type.clone()) else {
-                    return Err(AcmeClientError::InvalidRequest(format!(
-                        "ACME authorization does not offer {challenge_name}"
-                    )));
-                };
-                endpoint_policy
-                    .validate_endpoint(&challenge.url, "challenge URL")
-                    .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
-                if challenge.status == ChallengeStatus::Valid {
-                    continue;
-                }
-                challenge
-                    .set_ready()
-                    .await
-                    .map_err(|error| AcmeClientError::Client(error.to_string()))?;
-            }
-        }
+        let actions = completion_actions(order.state().status)?;
 
         let retry_policy = RetryPolicy::new().timeout(config.poll_timeout);
-        let order_status = order
-            .poll_ready(&retry_policy)
-            .await
-            .map_err(|error| AcmeClientError::Client(error.to_string()))?;
-        if order_status != OrderStatus::Ready {
-            return Err(AcmeClientError::Client(format!(
-                "ACME order reached {order_status:?} before finalization"
-            )));
+        let mut cert_pem = None;
+        for action in actions {
+            match action {
+                AcmeCompletionAction::DriveChallengesToReady => {
+                    // Scoped so the authorization stream's borrow of `order`
+                    // ends before the readiness poll reborrows it.
+                    {
+                        let mut authorizations = order.authorizations();
+                        while let Some(authorization) = authorizations.next().await {
+                            let mut authorization = authorization
+                                .map_err(|error| AcmeClientError::Client(error.to_string()))?;
+                            let authorization_url = authorization.url().to_string();
+                            endpoint_policy
+                                .validate_endpoint(&authorization_url, "authorization URL")
+                                .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
+                            let Some(mut challenge) =
+                                authorization.challenge(challenge_type.clone())
+                            else {
+                                return Err(AcmeClientError::InvalidRequest(format!(
+                                    "ACME authorization does not offer {challenge_name}"
+                                )));
+                            };
+                            endpoint_policy
+                                .validate_endpoint(&challenge.url, "challenge URL")
+                                .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
+                            if challenge.status == ChallengeStatus::Valid {
+                                continue;
+                            }
+                            challenge
+                                .set_ready()
+                                .await
+                                .map_err(|error| AcmeClientError::Client(error.to_string()))?;
+                        }
+                    }
+                    let order_status = order
+                        .poll_ready(&retry_policy)
+                        .await
+                        .map_err(|error| AcmeClientError::Client(error.to_string()))?;
+                    if order_status != OrderStatus::Ready {
+                        return Err(AcmeClientError::Client(format!(
+                            "ACME order reached {order_status:?} before finalization"
+                        )));
+                    }
+                }
+                AcmeCompletionAction::FinalizeWithPersistedCsr => {
+                    order
+                        .finalize_csr(&csr_der)
+                        .await
+                        .map_err(|error| AcmeClientError::Client(error.to_string()))?;
+                }
+                AcmeCompletionAction::PollCertificate => {
+                    cert_pem = Some(
+                        order
+                            .poll_certificate(&retry_policy)
+                            .await
+                            .map_err(|error| AcmeClientError::Client(error.to_string()))?,
+                    );
+                }
+                AcmeCompletionAction::RetrieveCertificate => {
+                    cert_pem = Some(
+                        order
+                            .certificate()
+                            .await
+                            .map_err(|error| AcmeClientError::Client(error.to_string()))?
+                            .ok_or_else(|| {
+                                AcmeClientError::Client(
+                                    "ACME order is valid but returned no certificate".to_string(),
+                                )
+                            })?,
+                    );
+                }
+            }
         }
-
-        let key_pem = order
-            .finalize()
-            .await
-            .map_err(|error| AcmeClientError::Client(error.to_string()))?;
-        let cert_pem = order
-            .poll_certificate(&retry_policy)
-            .await
-            .map_err(|error| AcmeClientError::Client(error.to_string()))?;
+        let cert_pem = cert_pem.ok_or_else(|| {
+            AcmeClientError::Client("ACME completion produced no certificate".to_string())
+        })?;
 
         Ok(CompletedAcmeHttp01Order { cert_pem, key_pem })
     }
@@ -4209,11 +4492,115 @@ pub mod client {
                 order_url: "https://acme.example/order/1".to_string(),
                 poll_timeout: Duration::from_secs(1),
                 dns_cache: default_acme_dns_cache(),
+                finalization: test_finalization(),
             };
             let error = complete_order(config, ChallengeType::Http01, "http-01")
                 .await
                 .expect_err("renewal restore must reject credential drift before network");
             assert!(matches!(error, AcmeClientError::EgressPolicy(_)));
+        }
+
+        fn test_finalization() -> super::super::AcmeOrderFinalization {
+            super::super::AcmeOrderFinalization::generate(&["example.com".to_string()])
+                .expect("generate finalization material")
+        }
+
+        /// Completion never regenerates a key or a CSR, so material that cannot
+        /// be used has to stop the whole attempt — and it must stop it *before*
+        /// the account is restored, which is the first network call. Proven by
+        /// pointing the config at an endpoint whose credential drift would
+        /// otherwise be the reported failure: seeing the fixed material error
+        /// instead means the check ran first.
+        #[tokio::test]
+        async fn unusable_finalization_material_fails_before_any_network_call() {
+            let config = CompleteAcmeHttp01OrderConfig {
+                directory_url: "https://acme.example/directory".to_string(),
+                account_credentials_json: SecretString::new(
+                    serde_json::json!({
+                        "id": "https://acme.example/account/1",
+                        "key_pkcs8": "not-reached",
+                        "directory": "https://other.example/directory"
+                    })
+                    .to_string(),
+                ),
+                order_url: "https://acme.example/order/1".to_string(),
+                poll_timeout: Duration::from_secs(1),
+                dns_cache: default_acme_dns_cache(),
+                finalization: corrupt_finalization(),
+            };
+            let error = complete_order(config, ChallengeType::Http01, "http-01")
+                .await
+                .expect_err("corrupt finalization material must fail closed");
+            assert!(
+                matches!(error, AcmeClientError::UnusableFinalizationMaterial),
+                "unexpected error: {error}"
+            );
+            let rendered = error.to_string();
+            assert!(
+                !rendered.contains("PRIVATE KEY") && !rendered.contains(CORRUPT_CSR_BASE64),
+                "the diagnostic must not describe the material: {rendered}"
+            );
+        }
+
+        const CORRUPT_CSR_BASE64: &str = "!!!not-base64!!!";
+
+        /// A record whose CSR survived serialization but is no longer decodable.
+        fn corrupt_finalization() -> super::super::AcmeOrderFinalization {
+            let material = serde_json::json!({
+                "key_pem": "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n",
+                "csr_der_base64": CORRUPT_CSR_BASE64,
+            });
+            serde_json::from_value(material).expect("deserialize corrupt material")
+        }
+
+        /// The completion plan is what decides whether a finalize request is
+        /// sent, and `complete_order` holds the only `finalize_csr` call in the
+        /// crate. So this pins the whole post-crash contract: a CA that is
+        /// already `processing` or `valid` is never finalized a second time.
+        #[test]
+        fn completion_plan_is_remote_state_aware_and_finalizes_at_most_once() {
+            use AcmeCompletionAction as Step;
+
+            assert_eq!(
+                completion_actions(OrderStatus::Pending).expect("pending plan"),
+                &[
+                    Step::DriveChallengesToReady,
+                    Step::FinalizeWithPersistedCsr,
+                    Step::PollCertificate,
+                ],
+                "a pending order drives challenges, then finalizes once"
+            );
+            assert_eq!(
+                completion_actions(OrderStatus::Ready).expect("ready plan"),
+                &[Step::FinalizeWithPersistedCsr, Step::PollCertificate],
+                "a ready order finalizes exactly once with the persisted CSR"
+            );
+            assert_eq!(
+                completion_actions(OrderStatus::Processing).expect("processing plan"),
+                &[Step::PollCertificate],
+                "a processing order was already finalized by the crashed renewer"
+            );
+            assert_eq!(
+                completion_actions(OrderStatus::Valid).expect("valid plan"),
+                &[Step::RetrieveCertificate],
+                "a valid order only needs its certificate retrieved"
+            );
+
+            for status in [OrderStatus::Processing, OrderStatus::Valid] {
+                let plan = completion_actions(status).expect("post-finalize plan");
+                assert!(
+                    !plan.contains(&Step::FinalizeWithPersistedCsr),
+                    "{status:?} must never issue a second finalize request"
+                );
+                assert!(
+                    !plan.contains(&Step::DriveChallengesToReady),
+                    "{status:?} must not re-drive authorizations"
+                );
+            }
+
+            let error = completion_actions(OrderStatus::Invalid)
+                .expect_err("an invalid order must fail closed");
+            assert!(matches!(error, AcmeClientError::Client(_)));
         }
 
         #[tokio::test]
@@ -4502,6 +4889,7 @@ mod tests {
             }],
             tls_alpn01_challenges: Vec::new(),
             dns01_challenges: Vec::new(),
+            finalization: None,
             error: None,
         })
         .expect("order record");
@@ -4542,6 +4930,7 @@ mod tests {
             }],
             tls_alpn01_challenges: Vec::new(),
             dns01_challenges: Vec::new(),
+            finalization: None,
             error: None,
         })
         .expect_err("invalid token rejected");
@@ -4569,6 +4958,7 @@ mod tests {
                 key_authorization: "abc_DEF-123.thumbprint".to_string(),
             }],
             dns01_challenges: Vec::new(),
+            finalization: None,
             error: None,
         })
         .expect("order record");
@@ -4608,6 +4998,7 @@ mod tests {
                 token: "abc_DEF-123".to_string(),
                 key_authorization: "abc_DEF-123.thumbprint".to_string(),
             }],
+            finalization: None,
             error: None,
         })
         .expect("order record");
@@ -4652,6 +5043,7 @@ mod tests {
             http01_challenges: Vec::new(),
             tls_alpn01_challenges: Vec::new(),
             dns01_challenges: Vec::new(),
+            finalization: None,
             error: Some("old failure".to_string()),
         })
         .expect("older order");
@@ -4669,6 +5061,7 @@ mod tests {
             http01_challenges: Vec::new(),
             tls_alpn01_challenges: Vec::new(),
             dns01_challenges: Vec::new(),
+            finalization: None,
             error: None,
         })
         .expect("newer order");
@@ -4714,6 +5107,7 @@ mod tests {
             http01_challenges: Vec::new(),
             tls_alpn01_challenges: Vec::new(),
             dns01_challenges: Vec::new(),
+            finalization: None,
             error: None,
         })
         .expect("order");

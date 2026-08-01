@@ -720,6 +720,17 @@ pub(super) async fn handle_finalize_acme_order(
                 &json!({"error": "ACME order does not have an order_url"}),
             ));
         };
+        // Fail closed before any ACME request. The diagnostic is the fixed,
+        // content-free one: this is private-key/CSR material, so the response
+        // must not describe what was found. Nothing here regenerates material —
+        // a replacement key cannot match a certificate the CA may already be
+        // issuing against the original CSR.
+        let Some(finalization) = order.finalization.clone() else {
+            return Ok(super::json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "ACME order finalization material is missing or unusable"}),
+            ));
+        };
 
         let dns_cache = match acme_dns_cache(state) {
             Ok(dns_cache) => dns_cache,
@@ -740,6 +751,7 @@ pub(super) async fn handle_finalize_acme_order(
                 request.poll_timeout_seconds.unwrap_or(60).clamp(1, 600),
             ),
             dns_cache,
+            finalization,
         };
         let challenge_type = match acme_order_challenge_type(&order) {
             Ok(challenge_type) => challenge_type,
@@ -827,6 +839,10 @@ pub(super) async fn handle_finalize_acme_order(
         updated_order.certificate_id = Some(certificate_id);
         updated_order.status = AcmeOrderStatus::Valid;
         updated_order.error = None;
+        // The certificate is durably published above and the order is about to
+        // become terminal, so the finalization material has nothing left to
+        // recover. Same retention rule as the renewal path.
+        updated_order.finalization = None;
         let stored_order = match offload_store_write("acme_order_upsert", move || {
             order_store.upsert_order(updated_order, true)
         })
@@ -1849,6 +1865,10 @@ fn acme_error_response(error: AcmeError) -> Response<Full<Bytes>> {
         | AcmeError::InvalidChallengeToken(_)
         | AcmeError::BlockedDirectoryUrl(_)
         | AcmeError::MissingMaterial { .. } => StatusCode::BAD_REQUEST,
+        // The stored order cannot be finalized; no retry of this request can
+        // change that, so it is reported to the caller rather than as an outage.
+        // The rendering names the order and nothing about the material itself.
+        AcmeError::UnusableFinalizationMaterial(_) => StatusCode::BAD_REQUEST,
         AcmeError::Read(_)
         | AcmeError::Write(_)
         | AcmeError::Parse(_)
@@ -2123,6 +2143,9 @@ async fn acme_order_record_from_request(
             http01_challenges,
             tls_alpn01_challenges,
             dns01_challenges,
+            // Same prepared order type as the renewal path, so an admin-created
+            // order is retryable through the finalize step too.
+            finalization: Some(prepared.finalization),
             error: None,
         })
         .map_err(|error| error.to_string())?,

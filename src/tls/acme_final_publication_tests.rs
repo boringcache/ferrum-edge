@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::tls::acme::{
     AcmeCertificateRecord, AcmeCertificateStore, AcmeError, AcmeHttp01ChallengeRecord,
-    AcmeHttp01OrderInput, AcmeIssuedCertificateInput, AcmeOrderRecord, AcmeOrderStatus,
-    AcmeOrderStore, FinalRenewalPublication, apply_final_renewal_publication,
+    AcmeHttp01OrderInput, AcmeIssuedCertificateInput, AcmeOrderFinalization, AcmeOrderRecord,
+    AcmeOrderStatus, AcmeOrderStore, FinalRenewalPublication, apply_final_renewal_publication,
     commit_final_renewal_publication, has_active_renewal_order,
     inject_final_publication_certificate_write_fault_for_tests,
     inject_final_publication_order_write_fault_for_tests,
@@ -77,9 +77,17 @@ fn order_with(
         }],
         tls_alpn01_challenges: Vec::new(),
         dns01_challenges: Vec::new(),
+        finalization: Some(test_finalization()),
         error: None,
     })
     .expect("acme order record")
+}
+
+/// Real generated material, so "was it cleared?" is a question about the write
+/// path rather than about a placeholder that was never there.
+fn test_finalization() -> AcmeOrderFinalization {
+    AcmeOrderFinalization::generate(&["example.com".to_string()])
+        .expect("generate finalization material")
 }
 
 fn processing_order(id: &str, certificate_id: &str) -> AcmeOrderRecord {
@@ -671,5 +679,119 @@ fn commit_final_renewal_publication_attempts_certificate_after_order_failure() {
     assert_eq!(
         orders.get_order("edge-order").expect("order").status,
         AcmeOrderStatus::Processing
+    );
+    // The order write failed, so the order is still active and still resumable
+    // — which means its finalization material must have survived untouched.
+    let still_active = orders.get_order("edge-order").expect("order");
+    assert!(
+        still_active.finalization.is_some(),
+        "a still-resumable order must keep the material a successor needs"
+    );
+}
+
+/// Retention is tied to resumability: the material is dropped in exactly the
+/// write that makes the order terminal, and only then.
+#[test]
+fn finalization_material_is_cleared_only_when_the_order_becomes_terminal() {
+    let dir = TempDir::new().expect("tempdir");
+    let certificates = AcmeCertificateStore::open(dir.path()).expect("open cert store");
+    let orders = AcmeOrderStore::open(dir.path()).expect("open order store");
+    let (cert_pem, key_pem) = generated_cert_and_key();
+    let issued = sample_certificate("edge-cert", &cert_pem, &key_pem, Some(ORDER_URL));
+    let order = processing_order("edge-order", "edge-cert");
+    let seeded = order.finalization.clone().expect("seeded material");
+    let persisted_key = seeded.key_pem().to_string();
+    orders
+        .upsert_order(order.clone(), false)
+        .expect("seed processing order");
+    let seeded_back = orders.get_order("edge-order").expect("order");
+    assert!(
+        seeded_back.finalization.is_some(),
+        "the material must be durable before completion, not only in memory"
+    );
+
+    let outcome = commit_final_renewal_publication(&certificates, &orders, issued, order);
+    assert!(matches!(outcome, FinalRenewalPublication::Complete));
+    let published = orders.get_order("edge-order").expect("order");
+    assert_eq!(published.status, AcmeOrderStatus::Valid);
+    assert!(
+        published.finalization.is_none(),
+        "a terminal order can never be resumed, so it must not keep private-key material"
+    );
+    // Nothing about the cleared material may survive in an operator-facing
+    // rendering of the record.
+    let debug = format!("{published:?}");
+    let summary = serde_json::to_string(&published.summary()).expect("serialize summary");
+    for surface in [&debug, &summary] {
+        assert!(
+            !surface.contains(&persisted_key) && !surface.contains("PRIVATE KEY"),
+            "finalization material must not surface: {surface}"
+        );
+    }
+}
+
+/// `Debug` and the Admin summary are the two places a whole order record is
+/// rendered. Neither may disclose the key or the CSR while the order is still
+/// carrying them.
+#[test]
+fn a_live_order_never_discloses_its_finalization_material() {
+    use base64::Engine as _;
+
+    let order = processing_order("edge-order", "edge-cert");
+    let material = order.finalization.clone().expect("seeded material");
+    let key_pem = material.key_pem().to_string();
+    let csr_der = material.csr_der().expect("decodable csr");
+    let csr_base64 = base64::engine::general_purpose::STANDARD.encode(&csr_der);
+
+    let debug = format!("{order:?}");
+    assert!(
+        debug.contains("<redacted>"),
+        "the material's Debug must be a fixed placeholder: {debug}"
+    );
+    let summary = serde_json::to_string(&order.summary()).expect("serialize summary");
+    let summary_value: serde_json::Value =
+        serde_json::from_str(&summary).expect("summary is an object");
+    assert!(
+        summary_value.get("finalization").is_none(),
+        "the Admin order shape must be unchanged by this field"
+    );
+    for surface in [&debug, &summary] {
+        assert!(
+            !surface.contains(&key_pem)
+                && !surface.contains(&csr_base64)
+                && !surface.contains("PRIVATE KEY"),
+            "finalization material must not surface: {surface}"
+        );
+    }
+}
+
+/// Corrupt material cannot be written, and cannot be used. Both checks are
+/// content-free, so neither reveals what was found.
+#[test]
+fn corrupt_finalization_material_fails_closed_without_disclosure() {
+    let material = serde_json::json!({
+        "key_pem": "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n",
+        "csr_der_base64": "!!!not-base64!!!",
+    });
+    let corrupt: AcmeOrderFinalization =
+        serde_json::from_value(material).expect("deserialize corrupt material");
+    let error = corrupt.csr_der().expect_err("corrupt CSR must fail closed");
+    let rendered = error.to_string();
+    assert!(
+        !rendered.contains("PRIVATE KEY") && !rendered.contains("not-base64"),
+        "the diagnostic must not describe the material: {rendered}"
+    );
+
+    let mut order = processing_order("edge-order", "edge-cert");
+    order.finalization = Some(corrupt);
+    let dir = TempDir::new().expect("tempdir");
+    let orders = AcmeOrderStore::open(dir.path()).expect("open order store");
+    let error = orders
+        .upsert_order(order, true)
+        .expect_err("corrupt material must not be storable");
+    assert!(matches!(error, AcmeError::Parse(_)));
+    assert!(
+        !error.to_string().contains("not-base64"),
+        "the store diagnostic must not describe the material"
     );
 }

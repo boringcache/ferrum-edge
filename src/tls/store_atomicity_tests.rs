@@ -74,6 +74,7 @@ fn sample_acme_order(id: &str, token: &str) -> AcmeOrderRecord {
         }],
         tls_alpn01_challenges: Vec::new(),
         dns01_challenges: Vec::new(),
+        finalization: None,
         error: None,
     })
     .expect("acme order record")

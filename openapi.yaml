@@ -678,10 +678,17 @@ paths:
       operationId: finalizeAcmeOrder
       summary: Finalize an ACME HTTP-01, TLS-ALPN-01, or DNS-01 order
       description: |
-        Marks the order's prepared HTTP-01, TLS-ALPN-01, or DNS-01 challenges ready,
-        waits for the ACME directory to accept the authorizations, finalizes
-        the order, fetches the issued certificate, and stores it as an
-        `acme://certificates/{id}` record. The endpoint requires the optional
+        Drives the order from whatever state the ACME directory currently reports
+        it in, and stores the issued certificate as an `acme://certificates/{id}`
+        record. A `pending` order has its prepared HTTP-01, TLS-ALPN-01, or DNS-01
+        challenges marked ready and is polled to `ready`; a `ready` order is
+        finalized exactly once with the CSR generated when the order was created;
+        a `processing` or `valid` order is **not** finalized again — its
+        certificate is retrieved and paired with the private key persisted at
+        creation time. An `invalid` order fails closed. An order whose persisted
+        key/CSR material is missing or unusable is rejected with `400` before any
+        directory request; the response names the order only, never the material.
+        The endpoint requires the optional
         `acme` Cargo feature and returns `501 Not Implemented` without it.
         Persisted order and server-provided authorization, challenge, finalize,
         and certificate URLs remain subject to the directory's HTTPS same-origin

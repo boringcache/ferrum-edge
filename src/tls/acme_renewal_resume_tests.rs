@@ -21,9 +21,10 @@ use std::time::Duration;
 
 use crate::tls::acme::{
     AcmeCertificateRecord, AcmeCertificateStore, AcmeDns01ChallengeRecord,
-    AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput, AcmeIssuedCertificateInput, AcmeOrderRecord,
-    AcmeOrderStatus, AcmeOrderStore, AcmeRenewalChallengeType, AcmeTlsAlpn01ChallengeRecord,
-    RenewalClaim, RenewalOrderPlan, claim_and_plan_renewal, infer_persisted_challenge_type,
+    AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput, AcmeIssuedCertificateInput,
+    AcmeOrderFinalization, AcmeOrderRecord, AcmeOrderStatus, AcmeOrderStore,
+    AcmeRenewalChallengeType, AcmeTlsAlpn01ChallengeRecord, RenewalClaim, RenewalOrderPlan,
+    claim_and_plan_renewal, infer_persisted_challenge_type,
 };
 #[cfg(feature = "acme")]
 use crate::tls::acme::{AcmeRenewalSchedulerConfig, resume_persisted_renewal_order};
@@ -64,6 +65,12 @@ fn issued_certificate(order_url: Option<&str>) -> AcmeCertificateRecord {
     .expect("acme certificate record")
 }
 
+/// Real key/CSR material, generated the way preparation generates it.
+fn test_finalization() -> AcmeOrderFinalization {
+    AcmeOrderFinalization::generate(&["example.com".to_string()])
+        .expect("generate finalization material")
+}
+
 /// A prior renewer's persisted order, described by the state that matters here.
 struct OrderSpec {
     status: AcmeOrderStatus,
@@ -71,6 +78,9 @@ struct OrderSpec {
     http01: bool,
     tls_alpn01: bool,
     dns01: bool,
+    /// `None` models a renewer that persisted an order without the material a
+    /// successor needs — which must fail closed rather than improvise.
+    finalization: Option<AcmeOrderFinalization>,
 }
 
 impl OrderSpec {
@@ -81,6 +91,7 @@ impl OrderSpec {
             http01: true,
             tls_alpn01: false,
             dns01: false,
+            finalization: Some(test_finalization()),
         }
     }
 
@@ -147,6 +158,7 @@ impl OrderSpec {
             http01_challenges,
             tls_alpn01_challenges,
             dns01_challenges,
+            finalization: self.finalization,
             error: None,
         })
         .expect("acme order record")
@@ -475,6 +487,130 @@ fn ambiguous_or_missing_challenge_families_fail_closed() {
         "unexpected inference error: {rendered}"
     );
     assert_no_challenge_disclosure(&rendered);
+}
+
+/// The whole point of persisting the material during preparation: it has to be
+/// on disk before completion begins, and it has to survive the process that
+/// wrote it. A fresh store handle over the same directory is exactly what a
+/// successor opens after a takeover.
+#[tokio::test]
+async fn finalization_material_survives_store_reopen_and_takeover() {
+    let order = OrderSpec::http01().build();
+    let seeded = order.finalization.clone().expect("seeded material");
+    let expected_key = seeded.key_pem().to_string();
+    let expected_csr = seeded.csr_der().expect("decodable csr");
+    let fixture = fixture_with(Some(order), Some(issued_certificate(None)), true);
+
+    // Reopened from scratch, as a successor process would.
+    let reopened = AcmeOrderStore::open(fixture.path()).expect("reopen order store");
+    let reread = reopened.get_order(ORDER_ID).expect("order survives reopen");
+    let persisted = reread.finalization.expect("material survives reopen");
+    assert_eq!(persisted.key_pem(), expected_key);
+    let persisted_csr = persisted.csr_der().expect("decodable csr");
+    assert_eq!(persisted_csr, expected_csr);
+
+    // And the successor that wins the expired claim is handed the same material
+    // by the plan, so completion never has to regenerate anything.
+    let resumed = expect_resume(plan_after_claim(&fixture).await);
+    let material = resumed.finalization.expect("takeover carries the material");
+    assert_eq!(material.key_pem(), expected_key);
+    let resumed_csr = material.csr_der().expect("decodable csr");
+    assert_eq!(resumed_csr, expected_csr);
+}
+
+/// A resumable order whose finalization material is gone cannot be finished and
+/// must not improvise: no new order, no replacement key, no duplicate finalize.
+/// The failure lands *before* the DNS-01 hook runs, so no external side effect
+/// happens either, and the persisted order is left intact for inspection.
+#[cfg(feature = "acme")]
+#[tokio::test]
+async fn a_resumed_order_without_finalization_material_fails_before_any_side_effect() {
+    let order = OrderSpec {
+        finalization: None,
+        ..OrderSpec::dns01()
+    }
+    .build();
+    let fixture = fixture_with(Some(order), Some(issued_certificate(None)), true);
+    let keeper = successor_keeper(&fixture);
+    let certificate = fixture
+        .certificates
+        .get_certificate(CERTIFICATE_ID)
+        .expect("seeded certificate");
+    let persisted = fixture.orders.get_order(ORDER_ID).expect("seeded order");
+    assert!(persisted.finalization.is_none());
+
+    // A hook *is* configured, and it does not exist: if the resume reached it,
+    // the failure would be the hook's, not the material check's.
+    let config = scheduler_config(Some("/nonexistent/ferrum-dns01-hook"));
+    let error = resume_persisted_renewal_order(
+        &fixture.certificates,
+        &fixture.orders,
+        &keeper,
+        certificate,
+        persisted,
+        &config,
+    )
+    .await
+    .expect_err("missing finalization material must fail closed");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("missing or unusable"),
+        "unexpected resume error: {rendered}"
+    );
+    assert!(
+        !rendered.contains("hook"),
+        "the material check must run before the DNS-01 hook: {rendered}"
+    );
+    assert_no_challenge_disclosure(&rendered);
+
+    let untouched = fixture.orders.get_order(ORDER_ID).expect("order preserved");
+    assert_eq!(untouched.status, AcmeOrderStatus::Processing);
+    assert_eq!(untouched.dns01_challenges.len(), 1);
+    let _ = keeper.finish().await;
+}
+
+/// Material that survived serialization but is no longer decodable is treated
+/// exactly like missing material, and the diagnostic stays content-free.
+#[cfg(feature = "acme")]
+#[tokio::test]
+async fn a_resumed_order_with_corrupt_finalization_material_fails_closed() {
+    let material = serde_json::json!({
+        "key_pem": "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n",
+        "csr_der_base64": "!!!not-base64!!!",
+    });
+    let corrupt: AcmeOrderFinalization =
+        serde_json::from_value(material).expect("deserialize corrupt material");
+    let mut order = OrderSpec::dns01().build();
+    order.finalization = Some(corrupt);
+    // Seeded past the store's own guard: this models a document that decayed on
+    // disk, not a write Ferrum would have accepted.
+    let fixture = fixture_with(None, Some(issued_certificate(None)), true);
+    let keeper = successor_keeper(&fixture);
+    let certificate = fixture
+        .certificates
+        .get_certificate(CERTIFICATE_ID)
+        .expect("seeded certificate");
+
+    let error = resume_persisted_renewal_order(
+        &fixture.certificates,
+        &fixture.orders,
+        &keeper,
+        certificate,
+        order,
+        &scheduler_config(Some("/nonexistent/ferrum-dns01-hook")),
+    )
+    .await
+    .expect_err("corrupt finalization material must fail closed");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("missing or unusable"),
+        "unexpected resume error: {rendered}"
+    );
+    assert!(
+        !rendered.contains("not-base64") && !rendered.contains("PRIVATE KEY"),
+        "the diagnostic must not describe the material: {rendered}"
+    );
+    let _ = keeper.finish().await;
 }
 
 fn assert_no_challenge_disclosure(message: &str) {
