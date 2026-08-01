@@ -2184,3 +2184,265 @@ fn a_non_producing_plugin_needs_no_window() {
         "with no window open at all, a non-producer still runs"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Construction-side bounding, per declared producer.
+//
+// A window bounds what is INSTALLED. The two-ceiling peak the module documents
+// (old body + one covering window) is only true if no producer ever holds a
+// complete would-be replacement outside that window — so a producer that builds
+// its output in full and then copies it through `bounded_vec_from` bypasses the
+// aggregate accounting even though the copy is bounded. These guards pin the
+// eight declared producers to construction-side bounding (GHSA-pwcm-6rh8-f2gh).
+// ---------------------------------------------------------------------------
+
+/// Every declared producer, with the source it is implemented in.
+fn declared_producer_sources() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "ai_response_guard",
+            include_str!("../../../src/plugins/ai_response_guard.rs"),
+        ),
+        (
+            "ai_stream_router",
+            include_str!("../../../src/plugins/ai_stream_router.rs"),
+        ),
+        (
+            "ai_tool_governor",
+            include_str!("../../../src/plugins/ai_tool_governor.rs"),
+        ),
+        (
+            "compression",
+            include_str!("../../../src/plugins/compression.rs"),
+        ),
+        ("grpc_web", include_str!("../../../src/plugins/grpc_web.rs")),
+        (
+            "mcp_gateway",
+            include_str!("../../../src/plugins/mcp_gateway.rs"),
+        ),
+        (
+            "response_transformer",
+            include_str!("../../../src/plugins/response_transformer.rs"),
+        ),
+        ("sse", include_str!("../../../src/plugins/sse.rs")),
+    ]
+}
+
+/// The guard table below must cover the declared set exactly, so adding a
+/// producer to `BUILTIN_RESPONSE_BODY_PRODUCERS` without a construction guard
+/// fails here rather than silently.
+#[test]
+fn every_declared_producer_has_a_construction_guard() {
+    use ferrum_edge::plugins::builtin_parity::BUILTIN_RESPONSE_BODY_PRODUCERS;
+
+    let mut guarded: Vec<&str> = declared_producer_sources()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    guarded.sort_unstable();
+    let mut declared: Vec<&str> = BUILTIN_RESPONSE_BODY_PRODUCERS.to_vec();
+    declared.sort_unstable();
+    assert_eq!(
+        guarded, declared,
+        "the construction-side guards must stay set-equal with the declared \
+         response-body producer inventory"
+    );
+}
+
+/// Every declared producer must reach a ceiling-aware writer at all: a producer
+/// with no bounded materialisation point is one that hands the gateway an
+/// arbitrary `Vec`.
+#[test]
+fn every_declared_producer_materialises_through_a_ceiling_aware_writer() {
+    for (name, source) in declared_producer_sources() {
+        assert!(
+            source.contains("BoundedResponseBodySink")
+                || source.contains("bounded_json_vec")
+                || source.contains("serialize_json_bounded")
+                // `response_transformer` reaches the same bounded serializer
+                // through the shared JSON body-rule applier.
+                || source.contains("apply_body_rules_bounded"),
+            "{name} must build its replacement through a ceiling-bounded writer"
+        );
+    }
+
+    // The shared applier that stands in for `response_transformer` above must
+    // itself serialize through the bound, so the indirection stays honest.
+    let body_transform = include_str!("../../../src/plugins/utils/body_transform.rs");
+    assert!(
+        body_transform.contains("bounded_json_vec"),
+        "`apply_body_rules_bounded` must serialize the rewritten document \
+         through the ceiling-bounded writer"
+    );
+}
+
+/// The specific build-then-copy shapes the root review found, pinned absent.
+///
+/// Each entry is a byte sequence that existed before this repair and that
+/// re-introducing would mean a complete (or attacker-amplified) replacement is
+/// materialised before its retained ceiling is enforced.
+#[test]
+fn no_declared_producer_builds_a_complete_replacement_before_the_bound() {
+    let forbidden: &[(&str, &[&str])] = &[
+        (
+            "sse",
+            // The wrapped event was framed from two whole-body `String` copies
+            // (lossy decode, then CR/CRLF normalization) before the sink saw a
+            // byte. It is now written incrementally over the input.
+            &["= String::from_utf8_lossy(body);", "normalized.lines()"],
+        ),
+        (
+            "ai_stream_router",
+            // The upstream-error envelope was built as a complete `Vec` and
+            // copied in, and the buffered normalizer was handed the WHOLE body,
+            // which accumulates the complete normalized stream in a `String`
+            // before returning it.
+            &["bounded_vec_from", "normalizer.on_chunk(body)"],
+        ),
+        (
+            "grpc_web",
+            // Text mode built a complete binary body, then a complete base64
+            // `String`, then copied that into a third bounded buffer.
+            &["BASE64.encode(&output)"],
+        ),
+        (
+            "ai_response_guard",
+            // The rewritten SSE stream, the expanded plain-text redaction, and
+            // the re-encoded protobuf frame were each complete before the bound.
+            &[
+                "bounded_vec_from(output.as_bytes()",
+                "encode_to_vec()",
+                "encode_grpc_frame(",
+            ],
+        ),
+        // The four already-clean producers must stay clean: none of them may
+        // acquire a build-then-copy materialisation.
+        ("ai_tool_governor", &["bounded_vec_from"]),
+        ("compression", &["bounded_vec_from"]),
+        ("mcp_gateway", &["bounded_vec_from"]),
+        ("response_transformer", &["bounded_vec_from"]),
+    ];
+
+    let sources = declared_producer_sources();
+    for (name, needles) in forbidden {
+        let source = sources
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, source)| *source)
+            .unwrap_or_else(|| panic!("{name} must be a declared producer"));
+        for needle in *needles {
+            assert!(
+                !source.contains(needle),
+                "{name}: `{needle}` materialises a complete would-be replacement \
+                 before its retained ceiling is enforced (GHSA-pwcm-6rh8-f2gh)"
+            );
+        }
+    }
+}
+
+/// The construction-side replacements those holes were closed with, pinned
+/// present, so the fix cannot be quietly reverted to an equivalent-looking
+/// bounded copy.
+#[test]
+fn the_repaired_producers_construct_through_the_bound() {
+    let required: &[(&str, &[&str])] = &[
+        ("sse", &["fn write_lossy_sse_data(", "SSE_DATA_FIELD_PREFIX"]),
+        (
+            "ai_stream_router",
+            &[
+                "BUFFERED_NORMALIZE_CHUNK_BYTES",
+                "body.chunks(BUFFERED_NORMALIZE_CHUNK_BYTES)",
+                "serde_json::to_writer(&mut sink, message)",
+            ],
+        ),
+        (
+            "grpc_web",
+            &[
+                "base64::write::EncoderWriter::new(&mut output, &engine)",
+                "fn write_trailer_frame_payload<S: TrailerPayloadSink>(",
+            ],
+        ),
+        (
+            "ai_response_guard",
+            &[
+                "fn rewrite_sse_events_bounded<'a>(",
+                "fn redact_text_bounded(",
+                "fn write_pattern_replaced(",
+                "fn push_reframed_grpc_message(",
+                // The SSE residual candidate is a full would-be client body
+                // built OUTSIDE a producer phase, so it takes a real window.
+                "ResponseTransformWindow::open(ceiling)",
+            ],
+        ),
+    ];
+
+    let sources = declared_producer_sources();
+    for (name, needles) in required {
+        let source = sources
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, source)| *source)
+            .unwrap_or_else(|| panic!("{name} must be a declared producer"));
+        for needle in *needles {
+            assert!(
+                source.contains(needle),
+                "{name}: `{needle}` is the construction-side bound for a hole the \
+                 root review found; it must not be removed"
+            );
+        }
+    }
+}
+
+/// The reserve-then-fill seam: a producer that knows its output length before it
+/// can produce the bytes writes into the sink's OWN buffer, so it never builds a
+/// complete replacement beside it. It is fail-closed on a length disagreement
+/// and on a failing fill.
+#[test]
+fn the_reserve_then_fill_seam_is_bounded_and_fail_closed() {
+    use ferrum_edge::_test_support::BoundedResponseBodySinkProbe;
+
+    let mut sink = BoundedResponseBodySinkProbe::with_ceiling(8);
+    assert!(sink.append_exact(b"abcd"), "an in-ceiling fill is admitted");
+    assert_eq!(sink.len(), 4);
+    assert!(
+        !sink.append_exact(b"efghi"),
+        "the fill that would exceed the ceiling is refused BEFORE the room for \
+         it is reserved"
+    );
+    assert!(sink.overflowed());
+    assert!(sink.finish().is_none());
+
+    // A fill that writes less than it declared cannot publish a short buffer.
+    let mut short = BoundedResponseBodySinkProbe::with_ceiling(8);
+    assert!(!short.append_declaring(4, b"ab"));
+    assert!(short.overflowed());
+    assert!(short.finish().is_none());
+
+    // A fill that writes more than it declared cannot publish either.
+    let mut long = BoundedResponseBodySinkProbe::with_ceiling(8);
+    assert!(!long.append_declaring(2, b"abcd"));
+    assert!(long.overflowed());
+    assert!(long.finish().is_none());
+
+    // A failing fill leaves nothing behind.
+    let mut failed = BoundedResponseBodySinkProbe::with_ceiling(8);
+    assert!(!failed.append_failing(4));
+    assert!(failed.overflowed());
+    assert!(failed.finish().is_none());
+}
+
+/// The module's operator-facing arithmetic is the two-ceiling peak; the doc must
+/// keep saying so, and must keep saying WHY it is exact.
+#[test]
+fn the_two_ceiling_peak_is_documented_as_exact() {
+    let budget = include_str!("../../../src/proxy/response_buffer_budget.rs");
+    assert!(
+        budget.contains("(2 × ceiling)"),
+        "the concurrent-rewrite arithmetic operators are given must stay stated"
+    );
+    assert!(
+        budget.contains("Two is the exact number, not a rounding."),
+        "the peak must be stated as exact, with the construction-side reason, \
+         so a later build-then-copy producer is visibly a doc violation"
+    );
+}

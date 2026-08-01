@@ -80,6 +80,33 @@
 //! prove declares it is treated as potentially unbounded and fails closed rather
 //! than being invoked.
 //!
+//! "Built through the sink" is meant literally, and it is the half a first
+//! reading gets wrong. A bounded COPY of a finished replacement is not a bound on
+//! construction: while the copy is being measured, the complete attacker-shaped
+//! original is already resident beside the old body and the window, so the
+//! aggregate the window exists to enforce is untrue for exactly the bytes most
+//! under a client's influence. Every declared producer therefore writes its
+//! output from the FIRST byte into a [`BoundedResponseBodySink`],
+//! [`bounded_json_vec`], or an equivalently ceiling-aware writer — an SSE event
+//! at a time, a base64 encoder streaming into the sink, a protobuf message
+//! encoded directly into reserved room ([`BoundedResponseBodySink::append_with`])
+//! — rather than assembling a complete `String`/`Vec` and calling
+//! [`bounded_vec_from`] on it afterwards. [`bounded_vec_from`] remains correct
+//! only where its input is not itself a would-be complete replacement.
+//!
+//! Two corollaries follow, and both are load-bearing:
+//!
+//! * a producer that genuinely needs an intermediate representation (the
+//!   `ai_response_guard` regex redactor applies its pattern set in sequential
+//!   passes, because a placeholder one pattern renders may legitimately be
+//!   rewritten by a later one) keeps its live input and its pass output under ONE
+//!   shared ceiling, so the transient scratch never adds a second window's worth;
+//! * a full-size candidate body built OUTSIDE a producer phase is charged like
+//!   one. `ai_response_guard`'s SSE residual check builds the exact bytes the
+//!   client would receive in order to decide whether to fail closed, during
+//!   inspection, where no window is open; it opens a [`ResponseTransformWindow`]
+//!   for the duration of that check and treats a refused window as residual.
+//!
 //! The same rule covers a body a plugin *copies out* into storage that outlives
 //! the request — `response_caching`'s entry copy is a distinct allocation from
 //! the collected body, so it acquires its own charge through
@@ -204,6 +231,14 @@
 //! `total / ceiling`. Responses that are merely buffered (no plugin that can
 //! replace the body) cost one ceiling and no window at all, because a chain with
 //! no declared producer never opens one.
+//!
+//! Two is the exact number, not a rounding. It holds only because no producer
+//! materialises a complete replacement outside the window's ceiling: a producer
+//! that built its output first and copied it in afterwards would peak at three,
+//! and so would one whose intermediate passes each got their own full ceiling.
+//! Both shapes are structurally excluded above, and
+//! `tests/unit/gateway_core/response_buffer_budget_tests.rs` holds static
+//! source guards over the declared producer set so neither can come back.
 //!
 //! # Admission
 //!
@@ -1017,6 +1052,52 @@ impl BoundedResponseBodySink {
             self.data.reserve_exact(target - self.data.len());
         }
         self.data.extend_from_slice(bytes);
+        true
+    }
+
+    /// Append exactly `additional` bytes written by `fill`, or refuse.
+    ///
+    /// The `push`/`Write` surfaces cover producers that already hold their bytes.
+    /// Some do not: a protobuf message knows its encoded length before it can
+    /// produce the bytes, and `prost` needs a `BufMut` to write into. Handing
+    /// such a producer its own `Vec` would materialise a complete would-be
+    /// replacement beside the sink — exactly the shape this module exists to
+    /// stop — so instead the room is checked and reserved FIRST and the producer
+    /// writes into the sink's own buffer.
+    ///
+    /// `additional` must be the exact byte count `fill` will write. A `fill`
+    /// that writes a different length, or fails, is fail-closed: the sink is
+    /// marked overflowed and releases what it held, so nothing partial can be
+    /// published.
+    pub(crate) fn append_with<E>(
+        &mut self,
+        additional: usize,
+        fill: impl FnOnce(&mut Vec<u8>) -> Result<(), E>,
+    ) -> bool {
+        if self.overflowed {
+            return false;
+        }
+        if additional == 0 {
+            return true;
+        }
+        let prospective = prospective_retained_len(self.data.len(), additional);
+        if prospective > self.ceiling {
+            self.overflowed = true;
+            self.data = Vec::new();
+            return false;
+        }
+        if prospective > self.data.capacity() {
+            let target = growth_target(self.data.capacity(), prospective, self.ceiling);
+            self.data.reserve_exact(target - self.data.len());
+        }
+        let wrote = fill(&mut self.data).is_ok();
+        if !wrote || self.data.len() != prospective {
+            // Either the producer failed, or it wrote a length that disagrees
+            // with the room it was admitted for. Neither may be published.
+            self.overflowed = true;
+            self.data = Vec::new();
+            return false;
+        }
         true
     }
 

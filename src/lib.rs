@@ -6439,6 +6439,31 @@ pub mod _test_support {
             self.0.push(bytes)
         }
 
+        /// The PRODUCTION reserve-then-fill seam a producer uses when it knows
+        /// its output length before it can produce the bytes (a protobuf
+        /// re-encode), so it writes into the sink's own buffer instead of
+        /// building a complete replacement beside it.
+        pub fn append_exact(&mut self, bytes: &[u8]) -> bool {
+            self.0.append_with(bytes.len(), |buffer| {
+                buffer.extend_from_slice(bytes);
+                Ok::<(), ()>(())
+            })
+        }
+
+        /// The same seam driven by a `fill` that writes a length other than the
+        /// one it was admitted for — which must fail closed rather than publish.
+        pub fn append_declaring(&mut self, declared: usize, bytes: &[u8]) -> bool {
+            self.0.append_with(declared, |buffer| {
+                buffer.extend_from_slice(bytes);
+                Ok::<(), ()>(())
+            })
+        }
+
+        /// The same seam driven by a `fill` that FAILS.
+        pub fn append_failing(&mut self, declared: usize) -> bool {
+            self.0.append_with(declared, |_buffer| Err::<(), ()>(()))
+        }
+
         pub fn finish(self) -> Option<Vec<u8>> {
             self.0.finish()
         }

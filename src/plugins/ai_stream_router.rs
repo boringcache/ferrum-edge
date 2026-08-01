@@ -2334,16 +2334,47 @@ fn upstream_sse_error_body(message: &str) -> Vec<u8> {
 
 /// [`upstream_sse_error_body`] under the response's retained ceiling.
 ///
-/// The envelope is fixed-shape and small, but it is still a replacement body, so
-/// it is materialised through the same bounded sink as every other producer
-/// output; `None` (leave the response alone) is the fail-closed answer if a
-/// pathologically small ceiling cannot hold it (GHSA-pwcm-6rh8-f2gh).
+/// The envelope shape is fixed, but `message` is derived from upstream-supplied
+/// material (a rejected `Content-Encoding`, a decode diagnostic), so the whole
+/// body is SERIALIZED THROUGH the bounded sink rather than built as a complete
+/// `Vec` that a bounded copy would only measure afterwards: the JSON string is
+/// written by `serde_json` straight into the sink, which stops at the ceiling
+/// (GHSA-pwcm-6rh8-f2gh). `None` (leave the response alone) is the fail-closed
+/// answer if a pathologically small ceiling cannot hold it.
+///
+/// The bytes are identical to `upstream_sse_error_body`'s: `serde_json`'s
+/// compact object rendering emits `message` before `type` under both insertion
+/// and lexicographic member ordering, and `to_writer` applies the same string
+/// escaping `Value`'s `Display` does.
 fn bounded_upstream_sse_error_body(message: &str, ceiling: usize) -> Option<Vec<u8>> {
-    crate::proxy::response_buffer_budget::bounded_vec_from(
-        &upstream_sse_error_body(message),
-        ceiling,
-    )
+    use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+    let mut sink = BoundedResponseBodySink::with_ceiling(ceiling);
+    if !sink.push(br#"data: {"error":{"message":"#) {
+        return None;
+    }
+    // Only the string value goes through `serde_json`, so the escaping is the
+    // canonical one without an intermediate `Value` copy of `message`.
+    if serde_json::to_writer(&mut sink, message).is_err() {
+        return None;
+    }
+    if !sink.push(br#","type":"upstream_error"}}"#) || !sink.push(b"\n\ndata: [DONE]\n\n") {
+        return None;
+    }
+    sink.finish()
 }
+
+/// Bytes fed to the buffered normalizer per `on_chunk` call.
+///
+/// The normalizer is a STREAMING inspector: one call accumulates the normalized
+/// form of every complete event it can drain from what it was given, in an
+/// ordinary `String`, and only then returns it. Handing it the whole buffered
+/// body would therefore build the complete would-be replacement — up to
+/// `MAX_SSE_NORMALIZED_OUTPUT_BYTES`, well above a typical retained ceiling —
+/// before the bounded sink ever sees a byte (GHSA-pwcm-6rh8-f2gh). Driving it in
+/// fixed-size slices, exactly as a provider's own chunking would, keeps that
+/// transient at a CONSTANT independent of the response while the sink enforces
+/// the ceiling on the accumulated output and stops early on refusal.
+const BUFFERED_NORMALIZE_CHUNK_BYTES: usize = 16 * 1024;
 
 fn wrap_anthropic_normalizer(
     model: String,
@@ -3302,6 +3333,14 @@ impl ResponseStreamInspector for ImmediateUpstreamErrorNormalizer {
 /// `ceiling`-bounded sink so a normalized stream that would exceed this
 /// response's retained ceiling is refused while it is being written rather than
 /// after a larger buffer is resident (GHSA-pwcm-6rh8-f2gh).
+///
+/// The normalizer is driven in [`BUFFERED_NORMALIZE_CHUNK_BYTES`] slices — the
+/// same `on_chunk`/`on_end` contract the streaming inspector path uses, so the
+/// normalizer itself is untouched and its cumulative event/byte/output
+/// accounting is identical to a provider that chunked its stream the same way.
+/// What changes is that no single call is asked to build the complete
+/// replacement: the sink observes the output as it is produced and refuses at
+/// the ceiling instead of after a full-size `String` already exists.
 async fn normalize_anthropic_sse_buffered(
     model: String,
     body: &[u8],
@@ -3311,19 +3350,23 @@ async fn normalize_anthropic_sse_buffered(
     let mut normalizer = AnthropicSseNormalizer::new(model, tools_forbidden);
     use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
     let mut out = BoundedResponseBodySink::with_ceiling(ceiling);
-    match normalizer.on_chunk(body).await {
-        ResponseStreamAction::Forward(bytes) => {
-            if !out.push(&bytes) {
-                return None;
+    // `chunks` yields nothing for an empty body, which is the same "no chunk
+    // was ever offered" state a stream that ended immediately presents.
+    for slice in body.chunks(BUFFERED_NORMALIZE_CHUNK_BYTES) {
+        match normalizer.on_chunk(slice).await {
+            ResponseStreamAction::Forward(bytes) => {
+                if !out.push(&bytes) {
+                    return None;
+                }
             }
-        }
-        ResponseStreamAction::Terminate(bytes) => {
-            if let Some(bytes) = bytes
-                && !out.push(&bytes)
-            {
-                return None;
+            ResponseStreamAction::Terminate(bytes) => {
+                if let Some(bytes) = bytes
+                    && !out.push(&bytes)
+                {
+                    return None;
+                }
+                return out.finish();
             }
-            return out.finish();
         }
     }
     match normalizer.on_end().await {

@@ -1041,54 +1041,79 @@ impl GrpcWebPlugin {
         // 1. Keep existing data frames from the body
         // 2. Append a trailer frame with gRPC status metadata
         //
-        // Text mode base64-expands by 4/3, so the binary buffer is built under
-        // the base64 PRE-image of the ceiling. That keeps the final armoured
-        // output inside the ceiling instead of discovering the overrun only
-        // after the expansion has already been allocated.
+        // Text mode base64-expands by 4/3, so the BINARY pre-image is measured
+        // under the base64 pre-image of the ceiling while the armoured bytes are
+        // written straight into a sink bounded by the ceiling itself. Nothing
+        // holds a second complete copy of the encoded replacement.
         let binary_ceiling = if is_text { ceiling / 4 * 3 } else { ceiling };
         use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
-        let mut output = BoundedResponseBodySink::with_ceiling(binary_ceiling);
 
-        // Copy the original response body (data frames)
-        if !output.push(body) {
-            return None;
-        }
-
-        // Build and append trailer frame from response headers. When the
-        // backend omitted a valid grpc-status, synthesize from the stashed
-        // HTTP status (official client mapping). Provenance (when recorded)
-        // keeps initial-header-only fields out of the body trailer block.
-        let trailer_frame = build_trailer_frame_with_full_provenance(
+        // Build the trailer payload from response headers under the room the
+        // data frames and the frame header leave, so upstream-controlled trailer
+        // values cannot materialise an over-ceiling `Vec` before the output bound
+        // applies (GHSA-pwcm-6rh8-f2gh). When the backend omitted a valid
+        // grpc-status, synthesize from the stashed HTTP status (official client
+        // mapping). Provenance (when recorded) keeps initial-header-only fields
+        // out of the body trailer block.
+        let payload_ceiling = binary_ceiling
+            .checked_sub(body.len())?
+            .checked_sub(GRPC_FRAME_HEADER_BYTES)?;
+        let mut payload_sink = BoundedResponseBodySink::with_ceiling(payload_ceiling);
+        if !write_trailer_frame_payload(
+            &mut payload_sink,
             response_headers,
             provenance.http_status,
             provenance.trailer_name_allowlist,
             provenance.shadowed_trailers,
             provenance.policy_state,
-        );
-        if !output.push(&trailer_frame) {
+        ) {
             return None;
         }
-        let output = output.finish()?;
+        let trailer_payload = payload_sink.finish()?;
+        let payload_len = u32::try_from(trailer_payload.len()).ok()?;
+        let mut frame_header = [0u8; GRPC_FRAME_HEADER_BYTES];
+        frame_header[0] = GRPC_FRAME_TRAILER;
+        frame_header[1..].copy_from_slice(&payload_len.to_be_bytes());
+        let binary_len = body.len() + frame_header.len() + trailer_payload.len();
 
-        // For text mode, base64-encode the entire output
+        let mut output = BoundedResponseBodySink::with_ceiling(ceiling);
         if is_text {
-            let encoded = BASE64.encode(&output);
+            // Stream the base64 armouring straight into the bounded sink from
+            // the FIRST encoded byte: the encoder writes through the ceiling, so
+            // neither the binary concatenation nor a complete encoded `String`
+            // is ever materialised beside the output.
+            let engine = BASE64;
+            {
+                use std::io::Write;
+                let mut encoder = base64::write::EncoderWriter::new(&mut output, &engine);
+                encoder.write_all(body).ok()?;
+                encoder.write_all(&frame_header).ok()?;
+                encoder.write_all(&trailer_payload).ok()?;
+                encoder.finish().ok()?;
+            }
+            let encoded = output.finish()?;
             debug!(
                 plugin = "grpc_web",
                 instance = %self.instance_id_str,
-                binary_len = output.len(),
+                binary_len,
                 encoded_len = encoded.len(),
                 "Base64-encoded gRPC-Web text response body"
             );
-            crate::proxy::response_buffer_budget::bounded_vec_from(encoded.as_bytes(), ceiling)
+            Some(encoded)
         } else {
+            for segment in [body, &frame_header[..], &trailer_payload[..]] {
+                if !output.push(segment) {
+                    return None;
+                }
+            }
+            let framed = output.finish()?;
             debug!(
                 plugin = "grpc_web",
                 instance = %self.instance_id_str,
-                body_len = output.len(),
+                body_len = framed.len(),
                 "Built gRPC-Web binary response with trailer frame"
             );
-            Some(output)
+            Some(framed)
         }
     }
 }
@@ -2585,6 +2610,36 @@ pub(crate) fn truncate_trailing_trailer_frames(data: &mut Vec<u8>) -> bool {
     true
 }
 
+/// Append-only sink for the trailer-frame payload.
+///
+/// The payload is built exactly once, by [`write_trailer_frame_payload`], for
+/// two very different destinations: the gateway-authored error frames (which are
+/// fixed-shape and unbounded by construction) and the retained producer frame,
+/// whose upstream-controlled trailer values must not be able to materialise a
+/// complete over-ceiling `Vec` before the output bound applies
+/// (GHSA-pwcm-6rh8-f2gh). One writer, two sinks — so the two can never drift.
+trait TrailerPayloadSink {
+    /// `false` means the append was refused and nothing was written.
+    fn append(&mut self, bytes: &[u8]) -> bool;
+}
+
+impl TrailerPayloadSink for Vec<u8> {
+    fn append(&mut self, bytes: &[u8]) -> bool {
+        self.extend_from_slice(bytes);
+        true
+    }
+}
+
+impl TrailerPayloadSink for crate::proxy::response_buffer_budget::BoundedResponseBodySink {
+    fn append(&mut self, bytes: &[u8]) -> bool {
+        self.push(bytes)
+    }
+}
+
+/// Bytes of the gRPC frame header: one compressed flag plus a 4-byte
+/// big-endian message length.
+const GRPC_FRAME_HEADER_BYTES: usize = 5;
+
 fn build_trailer_frame_with_full_provenance(
     response_headers: &HashMap<String, String>,
     http_status: Option<u16>,
@@ -2592,6 +2647,38 @@ fn build_trailer_frame_with_full_provenance(
     shadowed_trailers: Option<&HashMap<String, [String; 2]>>,
     policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
 ) -> Vec<u8> {
+    let mut payload: Vec<u8> = Vec::new();
+    // A `Vec` sink never refuses, so this is total for the gateway-authored
+    // callers; the bounded producer path uses `write_trailer_frame_payload`
+    // directly against a ceiling-bounded sink.
+    write_trailer_frame_payload(
+        &mut payload,
+        response_headers,
+        http_status,
+        trailer_name_allowlist,
+        shadowed_trailers,
+        policy_state,
+    );
+    let mut frame = Vec::with_capacity(GRPC_FRAME_HEADER_BYTES + payload.len());
+    frame.push(GRPC_FRAME_TRAILER);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend(payload);
+    frame
+}
+
+/// Write the trailer-frame payload (the `name: value\r\n` block that follows the
+/// 5-byte frame header) into `payload`.
+///
+/// Returns `false` only when the sink refused a write, which the bounded
+/// producer path treats as "no translation" and fails closed on.
+fn write_trailer_frame_payload<S: TrailerPayloadSink>(
+    payload: &mut S,
+    response_headers: &HashMap<String, String>,
+    http_status: Option<u16>,
+    trailer_name_allowlist: Option<&HashSet<String>>,
+    shadowed_trailers: Option<&HashMap<String, [String; 2]>>,
+    policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
+) -> bool {
     let connection_listed = parse_connection_listed_from_str_map(response_headers);
     let mut eligible: Vec<(String, String)> = Vec::new();
     // Candidate names are the live view plus any allowlisted trailer that a
@@ -2655,7 +2742,6 @@ fn build_trailer_frame_with_full_provenance(
     // order for duplicates of the same name (stable sort).
     eligible.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut trailer_payload = Vec::new();
     let mut has_grpc_status = false;
     for (name, value) in eligible {
         if name == "grpc-status" {
@@ -2675,15 +2761,21 @@ fn build_trailer_frame_with_full_provenance(
             // Emit the normalized (parsed) value, not the raw header, so the
             // forwarded frame is self-consistent with what was validated
             // (e.g. any surrounding OWS is dropped).
-            trailer_payload.extend_from_slice(b"grpc-status: ");
-            trailer_payload.extend_from_slice(code.to_string().as_bytes());
-            trailer_payload.extend_from_slice(b"\r\n");
+            if !payload.append(b"grpc-status: ")
+                || !payload.append(code.to_string().as_bytes())
+                || !payload.append(b"\r\n")
+            {
+                return false;
+            }
             continue;
         }
-        trailer_payload.extend_from_slice(name.as_bytes());
-        trailer_payload.extend_from_slice(b": ");
-        trailer_payload.extend_from_slice(value.as_bytes());
-        trailer_payload.extend_from_slice(b"\r\n");
+        if !payload.append(name.as_bytes())
+            || !payload.append(b": ")
+            || !payload.append(value.as_bytes())
+            || !payload.append(b"\r\n")
+        {
+            return false;
+        }
     }
 
     // A backend response without a present, numeric grpc-status is malformed /
@@ -2692,17 +2784,14 @@ fn build_trailer_frame_with_full_provenance(
     // collapse to UNKNOWN and break retry classification.
     if !has_grpc_status {
         let mapped = http_response_status_to_grpc_status(http_status.unwrap_or(200));
-        trailer_payload.extend_from_slice(b"grpc-status: ");
-        trailer_payload.extend_from_slice(mapped.to_string().as_bytes());
-        trailer_payload.extend_from_slice(b"\r\n");
+        if !payload.append(b"grpc-status: ")
+            || !payload.append(mapped.to_string().as_bytes())
+            || !payload.append(b"\r\n")
+        {
+            return false;
+        }
     }
-
-    let len = trailer_payload.len() as u32;
-    let mut frame = Vec::with_capacity(5 + trailer_payload.len());
-    frame.push(GRPC_FRAME_TRAILER);
-    frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend(trailer_payload);
-    frame
+    true
 }
 
 /// Parse gRPC length-prefixed frames from a byte buffer.

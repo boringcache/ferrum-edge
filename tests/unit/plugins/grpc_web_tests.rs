@@ -3637,3 +3637,118 @@ async fn test_owner_requires_namespaced_mode_even_when_shared_mode_is_valid() {
         "owner must not fall back to shared mode after losing its namespaced staging"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Text-mode armouring is streamed into the retained-ceiling sink
+// (GHSA-pwcm-6rh8-f2gh).
+//
+// Text mode used to build a complete binary body, then a complete base64
+// `String`, then copy that into a third bounded buffer — three full-size
+// representations of the same replacement, only the last of which the ceiling
+// governed. The armouring now streams into the bounded sink from the first
+// encoded byte, so the wire bytes must still be exactly the base64 of the binary
+// framing.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_text_mode_streamed_armouring_equals_base64_of_the_binary_framing() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let plugin = create_plugin_default();
+    // Several data-frame lengths so the encoder's 3-byte grouping crosses every
+    // padding residue, and a trailer block with sorted/duplicated metadata.
+    let payloads = vec![
+        "a".to_string(),
+        "ab".to_string(),
+        "abc".to_string(),
+        "abcd".to_string(),
+        "z".repeat(4096),
+    ];
+    for payload in &payloads {
+        let mut body = vec![0x00u8];
+        body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        body.extend_from_slice(payload.as_bytes());
+
+        let mut response_headers = HashMap::new();
+        response_headers.insert("grpc-status".to_string(), "0".to_string());
+        response_headers.insert("request-id".to_string(), "one\ntwo".to_string());
+        response_headers.insert("alpha-meta".to_string(), "a".to_string());
+
+        response_headers.insert(
+            "content-type".to_string(),
+            "application/grpc-web".to_string(),
+        );
+        let binary = plugin
+            .transform_response_body(&body, Some("application/grpc-web"), &response_headers)
+            .await
+            .expect("binary transform");
+
+        response_headers.insert(
+            "content-type".to_string(),
+            "application/grpc-web-text".to_string(),
+        );
+        let text = plugin
+            .transform_response_body(&body, Some("application/grpc-web-text"), &response_headers)
+            .await
+            .expect("text transform");
+
+        assert_eq!(
+            String::from_utf8(text).expect("armoured body is ASCII"),
+            BASE64.encode(&binary),
+            "streamed armouring must be byte-identical to encoding the complete \
+             binary framing (payload len {})",
+            payload.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_translation_is_refused_when_the_trailer_frame_cannot_fit_the_ceiling() {
+    let plugin = create_plugin_default();
+    let mut body = vec![0x00u8];
+    body.extend_from_slice(&5u32.to_be_bytes());
+    body.extend_from_slice(b"hello");
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+    response_headers.insert("grpc-status".to_string(), "0".to_string());
+
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+    // Room for the data frames but not for the frame header plus trailers: the
+    // trailer payload must be refused while it is being built, not after an
+    // over-ceiling `Vec` of upstream-controlled values already exists.
+    ctx.max_response_body_size_bytes = body.len() + 2;
+    let translated = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc-web"),
+            &response_headers,
+        )
+        .await;
+    assert!(
+        translated.is_none(),
+        "an over-ceiling translation must fail closed rather than materialise \
+         the trailer block first"
+    );
+
+    // Control: the same staged request with an ample ceiling DOES translate, so
+    // the refusal above is the ceiling and not the ownership gate.
+    let mut roomy = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut roomy).await;
+    let ok = plugin
+        .transform_response_body_with_context(
+            &mut roomy,
+            &body,
+            Some("application/grpc-web"),
+            &response_headers,
+        )
+        .await
+        .expect("an in-ceiling translation must still be produced");
+    assert!(ok.len() > body.len(), "the trailer frame was appended");
+}

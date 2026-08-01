@@ -211,6 +211,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the gateway-local, health-neutral `gateway_buffer_capacity` terminal
   (HTTP `503` / gRPC `RESOURCE_EXHAUSTED`) with a fixed redacted body, so it
   never poisons circuit breaking, passive health, or adaptive concurrency.
+  "Materialises through a ceiling-bounded sink" now holds from the first output
+  byte in every declared producer, not just at the point the finished bytes are
+  installed: `sse` frames its wrapped event incrementally over the input instead
+  of building normalized full-body `String` copies, `ai_response_guard`
+  assembles redacted SSE one event at a time, applies its regex pattern passes
+  under one shared ceiling, and re-frames redacted protobuf straight into the
+  bounded output, `ai_stream_router` serializes its upstream-error envelope
+  through the sink and drives the buffered Anthropic normalizer in fixed-size
+  slices, and `grpc_web` streams base64 armouring into the sink rather than
+  holding a second complete encoded copy. `ai_response_guard`'s SSE
+  fail-closed residual check builds its candidate body under a reserved budget
+  window as well. That keeps the documented worst-case peak of a rewriting
+  response at exactly two ceilings (the old body plus one covering window).
 
 - `body_validator` no longer fails open on unusual methods, empty bodies, or
   uninspectable data (GHSA-2vmr-ww8r-mww3,

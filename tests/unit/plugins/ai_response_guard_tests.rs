@@ -5054,3 +5054,126 @@ async fn grpc_web_request_with_a_bare_json_document_is_still_inspected() {
     assert!(!rewritten.contains("ops@example.com"));
     assert!(rewritten.contains("[REDACTED:pii:email]"));
 }
+
+// ---------------------------------------------------------------------------
+// Construction-side bounding of the redaction producer (GHSA-pwcm-6rh8-f2gh).
+//
+// Three replacement paths used to build a COMPLETE would-be client body before
+// the retained ceiling was enforced: the rewritten SSE stream, the expanded
+// plain-text redaction, and the re-encoded protobuf frame. They now write
+// through ceiling-bounded sinks from the first byte. These tests pin the
+// observable output those rewrites must keep producing.
+// ---------------------------------------------------------------------------
+
+fn plaintext_redactor() -> AiResponseGuard {
+    make_plugin(json!({
+        "pii_patterns": ["email"],
+        "blocked_phrases": ["classified"],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+}
+
+#[tokio::test]
+async fn test_plaintext_redaction_applies_every_pattern_pass_in_order() {
+    let plugin = plaintext_redactor();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+
+    let body = b"mail user@example.com about the classified plan, cc ops@example.com";
+    let redacted = plugin
+        .transform_response_body(body, Some("text/plain"), &headers)
+        .await
+        .expect("a matching plain-text body must be rewritten");
+    let redacted = String::from_utf8(redacted).expect("redacted text is UTF-8");
+
+    // Pattern passes stay sequential and in configured order: PII first, then
+    // blocked phrases, exactly as the unbounded `redact_text` applied them.
+    assert_eq!(
+        redacted,
+        "mail [REDACTED:pii:email] about the [REDACTED:blocked_phrase:0] plan, \
+         cc [REDACTED:pii:email]"
+    );
+    assert!(!redacted.contains("example.com"));
+    assert!(!redacted.contains("classified"));
+}
+
+#[tokio::test]
+async fn test_plaintext_redaction_leaves_a_clean_body_untouched() {
+    let plugin = plaintext_redactor();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+
+    assert!(
+        plugin
+            .transform_response_body(b"nothing to see here", Some("text/plain"), &headers)
+            .await
+            .is_none(),
+        "an unchanged redaction must not install a replacement"
+    );
+}
+
+#[tokio::test]
+async fn test_plaintext_redaction_is_refused_when_it_exceeds_the_retained_ceiling() {
+    let plugin = plaintext_redactor();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    // The placeholder is longer than the match it replaces, so a body just under
+    // the ceiling expands past it. The refusal must happen while the replacement
+    // is being written.
+    ctx.max_response_body_size_bytes = 40;
+
+    let body = b"a@b.com a@b.com a@b.com a@b.com a@b.com";
+    assert!(body.len() < 40);
+    assert!(
+        plugin
+            .transform_response_body_with_context(&mut ctx, body, Some("text/plain"), &headers)
+            .await
+            .is_none(),
+        "an amplifying redaction above the retained ceiling must be refused"
+    );
+
+    // Control: an ample ceiling still redacts the same body.
+    let mut roomy = ctx_with_content_type("POST", "application/json");
+    let redacted = plugin
+        .transform_response_body_with_context(&mut roomy, body, Some("text/plain"), &headers)
+        .await
+        .expect("the same body is rewritten under an ordinary ceiling");
+    assert!(!String::from_utf8(redacted).unwrap().contains("a@b.com"));
+}
+
+#[tokio::test]
+async fn test_sse_redaction_is_assembled_eventwise_and_preserves_framing() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+
+    // Two events: only the second carries PII, so the first must survive
+    // byte-for-byte while the stream framing is preserved.
+    let body = concat!(
+        "data: {\"id\":\"1\",\"text\":\"hello\"}\n\n",
+        "data: {\"id\":\"2\",\"text\":\"mail me at user@example.com\"}\n\n",
+    );
+    let redacted = plugin
+        .transform_response_body(body.as_bytes(), Some("text/event-stream"), &headers)
+        .await
+        .expect("an SSE body with PII must be rewritten");
+    let redacted = String::from_utf8(redacted).expect("redacted SSE is UTF-8");
+
+    assert!(
+        redacted.starts_with("data: {\"id\":\"1\",\"text\":\"hello\"}\n\n"),
+        "an unmodified event must be emitted verbatim: {redacted}"
+    );
+    assert!(!redacted.contains("user@example.com"));
+    assert!(redacted.contains("[REDACTED:pii:email]"));
+    assert_eq!(
+        redacted.matches("\n\n").count(),
+        2,
+        "event framing must be preserved: {redacted}"
+    );
+}

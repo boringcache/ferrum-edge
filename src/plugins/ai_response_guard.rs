@@ -778,6 +778,65 @@ impl AiResponseGuard {
         result
     }
 
+    /// [`Self::redact_text`] for a WHOLE client-visible replacement body, written
+    /// through ceiling-bounded sinks.
+    ///
+    /// `redact_text` is fine for one JSON string or one protobuf field — those are
+    /// scalars of an already-charged document. It is not fine for a plain-text or
+    /// unparseable-JSON response body, where its output IS the replacement: a
+    /// placeholder-expanding pattern set would materialise the complete expanded
+    /// `String` and only then be measured (GHSA-pwcm-6rh8-f2gh).
+    ///
+    /// The pattern passes stay SEQUENTIAL — pass `n+1` reads pass `n`'s output,
+    /// exactly as `redact_text` does, because a placeholder rendered by one
+    /// pattern may legitimately be rewritten by a later one. Two buffers are
+    /// therefore live at once, so they share ONE ceiling: each pass writes under
+    /// the room its still-live input leaves. That keeps this producer's transient
+    /// scratch inside a single retained ceiling, which is what makes the module's
+    /// two-ceiling peak (old body + one window) true for this path as well.
+    ///
+    /// `None` means a pass was refused; the caller leaves the response unchanged,
+    /// the same outcome an over-ceiling final document already had.
+    fn redact_text_bounded(&self, text: &str, ceiling: usize) -> Option<Vec<u8>> {
+        use crate::proxy::response_buffer_budget::{BoundedResponseBodySink, bounded_vec_from};
+
+        let mut current: Option<Vec<u8>> = None;
+        for pattern in self.pii_patterns.iter().chain(self.blocked_phrases.iter()) {
+            // Pass 1 reads the already-charged response body, so the whole
+            // ceiling is available to it; later passes read a scratch buffer that
+            // is still resident, so only the remainder is.
+            let room = match current.as_ref() {
+                Some(buffer) => ceiling.checked_sub(buffer.len())?,
+                None => ceiling,
+            };
+            let mut sink = BoundedResponseBodySink::with_ceiling(room);
+            {
+                let input: &str = match current.as_deref() {
+                    // Every pass writes UTF-8 (matches land on character
+                    // boundaries and placeholders are `str`), so this cannot
+                    // fail; it is checked rather than assumed.
+                    Some(bytes) => std::str::from_utf8(bytes).ok()?,
+                    None => text,
+                };
+                if !write_pattern_replaced(
+                    &mut sink,
+                    &pattern.regex,
+                    pattern.placeholder.as_str(),
+                    input,
+                ) {
+                    return None;
+                }
+            }
+            current = Some(sink.finish()?);
+        }
+        // No configured pattern: the redactor is the identity, exactly as
+        // `redact_text` is, and the caller's unchanged-comparison handles it.
+        match current {
+            Some(redacted) => Some(redacted),
+            None => bounded_vec_from(text.as_bytes(), ceiling),
+        }
+    }
+
     /// Remove every rendered redaction placeholder from `text`.
     ///
     /// The residual re-scan (`redact_leaves_residual`) runs the detection
@@ -888,20 +947,37 @@ impl AiResponseGuard {
     /// performs, then re-scan the client-visible candidate (with the redactor's
     /// own placeholder markers and preserved structural scalars excluded). If
     /// unrewritable content still matches, the caller must reject.
-    fn redact_sse_leaves_residual(&self, body: &[u8]) -> bool {
+    /// `ceiling` is this response's retained ceiling; the candidate is built
+    /// under a budget window of that size, reserved before it exists.
+    fn redact_sse_leaves_residual(&self, body: &[u8], ceiling: usize) -> bool {
         if self.detection_pattern_count == 0 {
             return false;
         }
+        // The candidate here is a COMPLETE would-be client-visible body, built
+        // during INSPECTION — before any producer phase has opened a transform
+        // window. Building it against the process fallback ceiling would leave a
+        // full-size attacker-shaped replacement resident beside the response body
+        // with nothing charged for it, which is exactly the aggregate-bound
+        // bypass this advisory closes. So a window sized to THIS response's
+        // retained ceiling is reserved first and released as soon as the scan is
+        // done, keeping the peak at the documented two ceilings; a budget that
+        // cannot admit it fails closed (treated as residual) rather than
+        // materialising the candidate anyway (GHSA-pwcm-6rh8-f2gh).
+        let Some(window) =
+            crate::proxy::response_buffer_budget::ResponseTransformWindow::open(ceiling)
+        else {
+            return true;
+        };
         // Scan the exact bytes the client would receive: transformed output
         // when redaction changed an event, otherwise the original framing.
         // The residual pass masks only preserved top-level structural scalar
         // spans, so duplicate keys and formatting remain visible and matches in
         // cross-event, key, numeric, or non-data content still fail closed.
-        let redacted = self.redact_sse_body(
-            body,
-            crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
-        );
-        self.sse_body_has_residual(redacted.as_deref().unwrap_or(body))
+        let redacted = self.redact_sse_body(body, window.window_bytes());
+        let residual = self.sse_body_has_residual(redacted.as_deref().unwrap_or(body));
+        drop(redacted);
+        drop(window);
+        residual
     }
 
     /// Re-scan an SSE body produced by [`Self::redact_sse_body`]. Scan-all
@@ -1517,13 +1593,13 @@ impl AiResponseGuard {
             return None;
         }
 
-        let (output, modified) = rewrite_sse_events(body_str, |lines| self.redact_sse_event(lines));
+        // Assembled eventwise through the ceiling-bounded sink, so the rewritten
+        // stream is never materialised in full before the bound applies
+        // (GHSA-pwcm-6rh8-f2gh).
+        let (output, modified) =
+            rewrite_sse_events_bounded(body_str, ceiling, |lines| self.redact_sse_event(lines))?;
 
-        if modified {
-            crate::proxy::response_buffer_budget::bounded_vec_from(output.as_bytes(), ceiling)
-        } else {
-            None
-        }
+        if modified { Some(output) } else { None }
     }
 
     // ───────────────────────── native gRPC inspection ─────────────────────────
@@ -1783,11 +1859,7 @@ impl AiResponseGuard {
                 Some(paths) => redact_paths(&mut message, paths, &mut budget, &mut redact),
             };
             changed |= mutated.ok()?;
-            let encoded = message.encode_to_vec();
-            if encoded.len() > max_bytes {
-                return None;
-            }
-            if !rewritten.push(&encode_grpc_frame(&encoded, frame.compressed)?) {
+            if !push_reframed_grpc_message(&mut rewritten, &message, frame.compressed, max_bytes) {
                 return None;
             }
         }
@@ -2201,22 +2273,84 @@ fn decompress_grpc_gzip(
     Ok(decompressed)
 }
 
-/// Re-frame one protobuf payload, re-compressing when the source frame was
-/// compressed so the response stays consistent with its `grpc-encoding`.
-fn encode_grpc_frame(payload: &[u8], compress: bool) -> Option<Vec<u8>> {
-    let body: Cow<'_, [u8]> = if compress {
-        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(payload).ok()?;
-        Cow::Owned(encoder.finish().ok()?)
-    } else {
-        Cow::Borrowed(payload)
+/// Bytes of the gRPC frame header: one compressed flag plus a 4-byte
+/// big-endian message length.
+const GRPC_FRAME_HEADER_BYTES: usize = 5;
+
+/// Re-frame one redacted protobuf message directly INTO the bounded output,
+/// re-compressing when the source frame was compressed so the response stays
+/// consistent with its `grpc-encoding`.
+///
+/// Every byte is constructed inside a bound. The uncompressed case never builds
+/// a payload buffer at all: the encoded length is known before encoding, so the
+/// per-message limit is checked first, the room is reserved in the output, and
+/// `prost` writes the message straight into it. The compressed case must know
+/// the gzip member's length before it can write the frame header, so the payload
+/// and its member are materialised — but each inside a sink bounded by the
+/// per-message limit and by the room this frame has left, never as an unbounded
+/// `Vec` (GHSA-pwcm-6rh8-f2gh).
+///
+/// `false` means the message could not be framed within those bounds; the caller
+/// abandons the whole redaction rather than emitting a partial wire body.
+fn push_reframed_grpc_message(
+    out: &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+    message: &DynamicMessage,
+    compress: bool,
+    max_bytes: usize,
+) -> bool {
+    use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+
+    let encoded_len = message.encoded_len();
+    if encoded_len > max_bytes {
+        return false;
+    }
+    let Some(room) = out
+        .ceiling()
+        .checked_sub(out.len())
+        .and_then(|left| left.checked_sub(GRPC_FRAME_HEADER_BYTES))
+    else {
+        return false;
     };
-    let length = u32::try_from(body.len()).ok()?;
-    let mut frame = Vec::with_capacity(5 + body.len());
-    frame.push(u8::from(compress));
-    frame.extend_from_slice(&length.to_be_bytes());
-    frame.extend_from_slice(body.as_ref());
-    Some(frame)
+
+    if !compress {
+        let Ok(length) = u32::try_from(encoded_len) else {
+            return false;
+        };
+        if encoded_len > room {
+            return false;
+        }
+        let mut header = [0u8; GRPC_FRAME_HEADER_BYTES];
+        header[1..].copy_from_slice(&length.to_be_bytes());
+        if !out.push(&header) {
+            return false;
+        }
+        return out.append_with(encoded_len, |buffer| message.encode(buffer));
+    }
+
+    let mut payload = BoundedResponseBodySink::with_ceiling(encoded_len);
+    if !payload.append_with(encoded_len, |buffer| message.encode(buffer)) {
+        return false;
+    }
+    let Some(payload) = payload.finish() else {
+        return false;
+    };
+    let mut compressed = BoundedResponseBodySink::with_ceiling(room);
+    {
+        let mut encoder = GzEncoder::new(&mut compressed, flate2::Compression::default());
+        if encoder.write_all(&payload).is_err() || encoder.finish().is_err() {
+            return false;
+        }
+    }
+    let Some(compressed) = compressed.finish() else {
+        return false;
+    };
+    let Ok(length) = u32::try_from(compressed.len()) else {
+        return false;
+    };
+    let mut header = [0u8; GRPC_FRAME_HEADER_BYTES];
+    header[0] = 1;
+    header[1..].copy_from_slice(&length.to_be_bytes());
+    out.push(&header) && out.push(&compressed)
 }
 
 /// Collect every string value and string map key reachable from `message`,
@@ -3094,7 +3228,10 @@ impl Plugin for AiResponseGuard {
                 return PluginResult::Continue;
             }
 
-            if self.action == GuardAction::Redact && self.redact_sse_leaves_residual(body) {
+            let retained_ceiling = ctx.retained_response_body_ceiling();
+            if self.action == GuardAction::Redact
+                && self.redact_sse_leaves_residual(body, retained_ceiling)
+            {
                 debug!(
                     "ai_response_guard: redact leaves residual SSE content (types: {:?}), rejecting response",
                     detected
@@ -3386,14 +3523,11 @@ impl AiResponseGuard {
                     return None;
                 }
                 let text = std::str::from_utf8(body).ok()?;
-                let redacted = self.redact_text(text);
-                if redacted == text {
+                let redacted = self.redact_text_bounded(text, ceiling)?;
+                if redacted == text.as_bytes() {
                     return None;
                 }
-                return crate::proxy::response_buffer_budget::bounded_vec_from(
-                    redacted.as_bytes(),
-                    ceiling,
-                );
+                return Some(redacted);
             }
         }
 
@@ -3401,14 +3535,11 @@ impl AiResponseGuard {
             Ok(json) => json,
             Err(_) if self.scan_mode == ScanMode::All => {
                 let text = std::str::from_utf8(body).ok()?;
-                let redacted = self.redact_text(text);
-                if redacted == text {
+                let redacted = self.redact_text_bounded(text, ceiling)?;
+                if redacted == text.as_bytes() {
                     return None;
                 }
-                return crate::proxy::response_buffer_budget::bounded_vec_from(
-                    redacted.as_bytes(),
-                    ceiling,
-                );
+                return Some(redacted);
             }
             Err(_) => return None,
         };
@@ -3442,6 +3573,30 @@ impl AiResponseGuard {
 
         crate::proxy::response_buffer_budget::bounded_json_vec(&json, ceiling)
     }
+}
+
+/// One `replace_all` pass with a LITERAL replacement, written through `sink`.
+///
+/// Equivalent to `regex.replace_all(text, NoExpand(placeholder))`: `replace_all`
+/// iterates the same non-overlapping match sequence `find_iter` yields, and a
+/// `NoExpand` replacement is emitted verbatim with no capture-group expansion.
+/// The difference is only that the result is written incrementally instead of
+/// being returned as a complete `String` (GHSA-pwcm-6rh8-f2gh).
+fn write_pattern_replaced(
+    sink: &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+    regex: &Regex,
+    placeholder: &str,
+    text: &str,
+) -> bool {
+    let bytes = text.as_bytes();
+    let mut last = 0;
+    for matched in regex.find_iter(text) {
+        if !sink.push(&bytes[last..matched.start()]) || !sink.push(placeholder.as_bytes()) {
+            return false;
+        }
+        last = matched.end();
+    }
+    sink.push(&bytes[last..])
 }
 
 /// Blank scalar values under the root response/event keys whose values are
@@ -3550,6 +3705,92 @@ fn rewrite_sse_events<'a>(
 
     let modified = output != body;
     (output, modified)
+}
+
+/// [`rewrite_sse_events`] writing THROUGH a ceiling-bounded sink.
+///
+/// The client-visible replacement is assembled one event at a time, so the only
+/// full-size representation alive at any moment is the bounded output itself —
+/// never a complete rewritten `String` that a bounded copy would measure
+/// afterwards (GHSA-pwcm-6rh8-f2gh). The per-event `String` a rewriter returns is
+/// bounded by one event of the already-charged input.
+///
+/// `modified` is computed per event (did this event's emitted bytes differ from
+/// its original lines?) rather than by comparing the finished output to `body`.
+/// The two are equivalent: both sides are the concatenation of the same event
+/// partition, so they differ exactly when at least one event's emission does.
+///
+/// `None` means a write was refused; the caller must leave the response
+/// unchanged / fail closed per its own contract.
+fn rewrite_sse_events_bounded<'a>(
+    body: &'a str,
+    ceiling: usize,
+    mut rewrite_event: impl FnMut(&[&'a str]) -> Option<String>,
+) -> Option<(Vec<u8>, bool)> {
+    use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+
+    /// Whether `rewritten` is byte-identical to the concatenation of
+    /// `event_lines`. Allocation-free: the lines are consumed as prefixes.
+    fn event_is_unchanged(event_lines: &[&str], rewritten: &str) -> bool {
+        let mut rest = rewritten;
+        for line in event_lines {
+            match rest.strip_prefix(*line) {
+                Some(remaining) => rest = remaining,
+                None => return false,
+            }
+        }
+        rest.is_empty()
+    }
+
+    fn flush_event(
+        output: &mut BoundedResponseBodySink,
+        modified: &mut bool,
+        event_lines: &[&str],
+        rewritten: Option<String>,
+    ) -> bool {
+        match rewritten {
+            Some(rewritten) => {
+                if !event_is_unchanged(event_lines, &rewritten) {
+                    *modified = true;
+                }
+                output.push(rewritten.as_bytes())
+            }
+            None => {
+                for original in event_lines {
+                    if !output.push(original.as_bytes()) {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    let mut output = BoundedResponseBodySink::with_ceiling(ceiling);
+    let mut modified = false;
+    let mut event_lines: Vec<&'a str> = Vec::new();
+    for line in body.split_inclusive('\n') {
+        event_lines.push(line);
+        let content = line
+            .strip_suffix("\r\n")
+            .or_else(|| line.strip_suffix('\n'))
+            .unwrap_or(line);
+        if content.is_empty() {
+            let rewritten = rewrite_event(&event_lines);
+            if !flush_event(&mut output, &mut modified, &event_lines, rewritten) {
+                return None;
+            }
+            event_lines.clear();
+        }
+    }
+    if !event_lines.is_empty() {
+        let rewritten = rewrite_event(&event_lines);
+        if !flush_event(&mut output, &mut modified, &event_lines, rewritten) {
+            return None;
+        }
+    }
+
+    Some((output.finish()?, modified))
 }
 
 /// Return the byte offset immediately after a JSON string beginning at
