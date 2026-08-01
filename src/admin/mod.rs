@@ -35,8 +35,9 @@ use crate::admin::backup::{
     ApiSpecsBackupSection, BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR,
     BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR, BackupCounts, BackupPayload, RestorePayload,
     clear_api_spec_ownership_tags, filter_config_by_namespace, parse_backup_resources,
-    parse_confirm_api_spec_deletion, parse_restore_confirm, validate_backup_api_specs_resource_filter,
-    validate_backup_resources_allowlist, validate_restore_api_specs_section_with_total_limit,
+    parse_confirm_api_spec_deletion, parse_restore_confirm,
+    validate_backup_api_specs_resource_filter, validate_backup_resources_allowlist,
+    validate_restore_api_specs_section_with_total_limit,
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
@@ -2242,8 +2243,9 @@ pub async fn handle_admin_request(
         && let Some(resp) = enforce_namespace_claim(&auth, &namespace, &path)
     {
         if matches!(segments_peek.as_slice(), ["backup"]) {
-            let resources =
-                audit::backup_resources_audit_value(parse_backup_resources(query.as_deref()).as_ref());
+            let resources = audit::backup_resources_audit_value(
+                parse_backup_resources(query.as_deref()).as_ref(),
+            );
             let event = audit::AuditEvent::new(
                 &auth,
                 "backup",

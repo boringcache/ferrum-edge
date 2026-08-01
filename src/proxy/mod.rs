@@ -1543,8 +1543,17 @@ fn simulate_later_after_proxy_headers(
 
     let mut simulated_ctx = ctx.clone();
     let mut simulated_headers = response_headers.clone();
+    let slice_has_route_response_finalizer = plugins
+        .iter()
+        .any(|plugin| plugin.participates_in_route_response_header_finalization());
     for plugin in plugins {
         plugin.simulate_after_proxy_response_headers(&mut simulated_ctx, &mut simulated_headers);
+    }
+    if slice_has_route_response_finalizer {
+        crate::plugins::utils::route_header_transform::finalize_route_override_response_headers(
+            &mut simulated_ctx,
+            &mut simulated_headers,
+        );
     }
     LaterHeaderSimulation {
         cache_control_no_transform: headers_have_cache_control_directive(
@@ -1635,6 +1644,22 @@ pub(crate) fn refine_stream_response_for_content_type(
         });
         return saw_retry_release_plugin && all_active_plugins_release;
     }
+    // Mirror proxy core's chain-level route-header finalization
+    // (GHSA-3xxr-xhhj-9962) inside this simulation. Enabled transformer
+    // instances no longer apply the matched route list themselves, so without
+    // this the accumulated map would omit route-level writes that a LATER
+    // plugin reads off it — `compression` (priority 4050, after
+    // `response_transformer` at 4000) releases a buffered body once the final
+    // headers carry `no-transform` or a strong `ETag`, and the metadata stamp
+    // above covers only the ORIGINAL backend response. `None` when no route
+    // list is published keeps the ordinary path free of the chain scan.
+    let last_route_response_finalizer = if ctx.route_override_response_transform.is_some() {
+        plugins
+            .iter()
+            .rposition(|plugin| plugin.participates_in_route_response_header_finalization())
+    } else {
+        None
+    };
     let all_active_plugins_can_release_before_content_type_rewrite =
         plugins.iter().enumerate().all(|(index, plugin)| {
             let can_release = if plugin.should_buffer_response_body(&simulated_ctx) {
@@ -1668,6 +1693,17 @@ pub(crate) fn refine_stream_response_for_content_type(
                     &mut simulated_ctx,
                     &mut simulated_response_headers,
                 );
+                // Route list applies exactly once, after the last eligible
+                // simulated transformer — same boundary `run_after_proxy_hooks`
+                // uses. Consuming it from `simulated_ctx` also keeps the later
+                // `simulate_later_after_proxy_headers` clones from re-applying
+                // it, matching the live chain.
+                if last_route_response_finalizer == Some(index) {
+                    crate::plugins::utils::route_header_transform::finalize_route_override_response_headers(
+                        &mut simulated_ctx,
+                        &mut simulated_response_headers,
+                    );
+                }
             }
             can_release
         });
@@ -2485,11 +2521,9 @@ pub(crate) fn supports_native_http3_backend(
 ) -> bool {
     // Cheap gate FIRST — this runs per request and per retry rotation on the
     // H1/H2 dispatch path. `dispatch_kind` is not target-overridable: the
-    // per-target projection (`resolve_effective_proxy_for_target`) writes only
-    // connect timeout / pool knobs / `resolved_tls` / `h2_upgrade_policy`, and
-    // `resolve_backend_connection_proxy_for_target` only rebases host/port —
-    // so the common non-HttpsPool case returns before any per-target
-    // capability-key resolution work.
+    // per-target policy projection and selected-target host/port rebase cannot
+    // change it, so the common non-HttpsPool case returns before any
+    // per-target capability-key resolution work.
     proxy.dispatch_kind == DispatchKind::HttpsPool
         && get_backend_capability_for_target(
             state.backend_capabilities.as_ref(),
@@ -4697,6 +4731,55 @@ async fn run_finalized_request_egress_hooks_inner(
     }
 }
 
+/// Re-assert every configured backend-boundary header policy over the finalized
+/// outbound header map (`GHSA-xhp5-hqj8-3mwg`).
+///
+/// A plugin that installs a third-party credential from `before_proxy` (today:
+/// `ai_stream_router`) is only protected against plugins ordered before it. The
+/// generic `request_transformer` runs later and can add, overwrite, or rename
+/// any header; a `pre_proxy` function's backend overlay and the deferred
+/// routing-header pass can do the same. This pass runs at every point where the
+/// backend-visible header map is complete — after gateway-assertion refresh and
+/// after the egress baggage strip — so the plugin's policy has the last word
+/// regardless of relative priority.
+///
+/// Non-rejecting by contract: the decision was already committed in
+/// `before_proxy`, and the finalized-state rejection lives in
+/// `on_final_request_body*`, which has rejection plumbing on every dispatcher.
+/// Callers should gate on
+/// [`crate::plugin_cache::PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY`]
+/// where the bitset is already in scope; the internal scan keeps the rarely
+/// reached call sites correct without threading the capability set to them.
+pub(crate) fn run_final_backend_header_policy_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    headers: &mut HashMap<String, String>,
+) {
+    for plugin in plugins {
+        if plugin.enforces_final_backend_header_policy() {
+            plugin.enforce_final_backend_header_policy(ctx, headers);
+        }
+    }
+}
+
+/// `Option<HashMap>` clone-on-write variant of
+/// [`run_final_backend_header_policy_hooks`] for the H1/H2 dispatch ladder.
+pub(crate) fn run_effective_final_backend_header_policy_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    owned_proxy_headers: &mut Option<HashMap<String, String>>,
+) {
+    if let Some(headers) = owned_proxy_headers.as_mut() {
+        run_final_backend_header_policy_hooks(plugins, ctx, headers);
+    } else {
+        // No plugin advertised a header mutation, so nothing has been cloned.
+        // Swap rather than clone to keep this allocation-free.
+        let mut headers = std::mem::take(&mut ctx.headers);
+        run_final_backend_header_policy_hooks(plugins, ctx, &mut headers);
+        ctx.headers = headers;
+    }
+}
+
 /// Merge the finalized-request-egress header overlay into the outbound header
 /// map, then restore gateway-owned assertions and re-apply the egress baggage
 /// policy.
@@ -4706,6 +4789,7 @@ async fn run_finalized_request_egress_hooks_inner(
 /// pass: it can never impersonate `x-consumer-*` / `x-geo-country`, and it
 /// cannot re-add a baggage key the operator configured Ferrum to strip.
 pub(crate) fn apply_finalized_request_egress_header_overlay(
+    plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     owned_proxy_headers: &mut Option<HashMap<String, String>>,
     overlay: HashMap<String, String>,
@@ -4724,12 +4808,17 @@ pub(crate) fn apply_finalized_request_egress_header_overlay(
         &ctx.headers,
         strip_baggage_keys,
     );
+    // The overlay is the last thing that can add a backend-visible header, so
+    // a plugin-owned provider credential boundary is re-asserted over it too
+    // (`GHSA-xhp5-hqj8-3mwg`).
+    run_effective_final_backend_header_policy_hooks(plugins, ctx, owned_proxy_headers);
 }
 
 /// Map-based variant of [`apply_finalized_request_egress_header_overlay`] for
 /// the native HTTP/3 frontend, which owns a plain outbound header map instead of
 /// the H1/H2 `Option<HashMap>` clone-on-write shape.
 pub(crate) fn apply_finalized_request_egress_header_overlay_in_map(
+    plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
     overlay: HashMap<String, String>,
@@ -4743,6 +4832,7 @@ pub(crate) fn apply_finalized_request_egress_header_overlay_in_map(
     }
     refresh_backend_gateway_assertion_headers(ctx, headers);
     crate::modes::mesh::hbone::strip_egress_baggage_in_map(headers, strip_baggage_keys);
+    run_final_backend_header_policy_hooks(plugins, ctx, headers);
 }
 
 pub(crate) struct RejectedResponseParts {
@@ -10584,11 +10674,43 @@ async fn handle_websocket_request_authenticated(
             .and_then(|uri| uri.path_and_query().map(|pq| pq.as_str().to_string()))
             .map(std::borrow::Cow::Owned)
             .unwrap_or(std::borrow::Cow::Borrowed("/"));
+        // Per-attempt target-effective backend policy (issue #2416). Every H1/H2
+        // WebSocket attempt — the initial one and each retry-rotated one — dials
+        // under the DestinationRule policy projected for its OWN `current_target`
+        // (per-port `connectTimeout` and `tls` CA / client identity /
+        // verification / SAN allow-list). The unresolved base proxy is never
+        // used for those dial decisions, so selection or rotation onto port
+        // 9443 can no longer ignore that port's trust roots or timeout. DNS
+        // override and TTL are route-level fields retained from the base proxy;
+        // the selected target contributes the resolution hostname.
+        //
+        // POLICY PORT vs TRANSPORT DIAL PORT. Target selection chooses the
+        // POLICY port: `UpstreamTarget::dispatch_policy_port()` (the declared
+        // Service port when a Kubernetes `targetPort` remap made the workload
+        // port differ), which is the projection key here and the key the
+        // `maxConnections` gate above uses. The TRANSPORT dial port is a
+        // separate, transport-owned decision: the direct path dials the target's
+        // own `port` (carried in `current_backend_url`), while a mesh egress
+        // target dials its sidecar `:15006` mesh-mTLS listener or its Ambient
+        // `:15008` HBONE listener and reaches the app port THROUGH that tunnel.
+        // Both mesh pools receive the app/policy ports explicitly, so this
+        // projection never redirects a tunnel dial — it only decides which
+        // port's policy configures it.
+        //
+        // Uses the same `resolve_backend_connection_proxy_for_target` helper as
+        // the H3 WebSocket bridge (`src/http3/websocket.rs`) so the two protocol
+        // paths cannot drift. Borrowed (zero-alloc) only when neither a projected
+        // policy field nor the selected target's host/port differs from the base
+        // proxy; otherwise the dispatch-local clone carries both policy and dial
+        // identity.
+        let ws_connection_proxy =
+            resolve_backend_connection_proxy_for_target(&proxy, current_target.as_deref());
+        let ws_dial_proxy: &Proxy = ws_connection_proxy.as_ref();
         let ws_dial_result: Result<WsBackendHandshake, Box<dyn std::error::Error + Send + Sync>> =
             match (&ws_mesh_egress, current_target.as_deref()) {
                 (Some(egress), Some(target)) => connect_mesh_websocket_backend(
                     &state,
-                    &proxy,
+                    ws_dial_proxy,
                     target,
                     egress,
                     ws_client_host.as_deref(),
@@ -10611,7 +10733,7 @@ async fn handle_websocket_request_authenticated(
                 .map(|handshake| WsBackendHandshake::Mesh(Box::new(handshake))),
                 _ => connect_websocket_backend(
                     &current_backend_url,
-                    &proxy,
+                    ws_dial_proxy,
                     &env_config,
                     &client_headers,
                     state.tls_policy.as_deref(),
@@ -11885,6 +12007,22 @@ pub(crate) fn build_websocket_backend_url_with_target(
     url
 }
 
+/// Whether `proxy`'s resolved backend TLS carries an SNI override the WebSocket
+/// transport cannot apply (issue #2416).
+///
+/// `client_async_tls_with_config` derives the TLS server name from the request
+/// URI, so an SNI override would be silently dropped and the handshake would
+/// verify the URI host instead. Callers must fail the dial closed rather than
+/// verify the wrong server name.
+///
+/// Takes the TARGET-EFFECTIVE proxy, so a DestinationRule port-level `tls.sni`
+/// that applies only to the selected target's policy port is caught for that
+/// target and not for its siblings. Plaintext `ws://` backends carry no server
+/// name to verify, so they are unaffected.
+pub(crate) fn websocket_backend_tls_sni_unsupported(proxy: &Proxy) -> bool {
+    matches!(proxy.backend_scheme, Some(BackendScheme::Https)) && proxy.resolved_tls.sni.is_some()
+}
+
 /// Build a rustls TLS connector for WebSocket backends that respects
 /// proxy-level and global TLS settings (CA bundles, client certs, cert verification).
 /// When `tls_policy` is provided, outbound connections use the same cipher suites,
@@ -12039,6 +12177,30 @@ pub(crate) async fn connect_websocket_backend(
             )
             .into());
         }
+    }
+
+    // Fail closed on a backend TLS SNI override this transport cannot carry
+    // (issue #2416). The WebSocket dial derives both the `Host` header and the
+    // TLS server name from the request URI, so a `resolved_tls.sni` value —
+    // whether it came from the proxy/upstream or from the selected target's
+    // DestinationRule port-level `tls` projection — would be silently dropped
+    // and the handshake would verify the URI host instead of the configured
+    // server name. Refuse the dial rather than trust the wrong name; this
+    // mirrors the reqwest retry path, which also 502s on an unreplayable SNI
+    // override instead of dialing without it. Gateway-side and pre-dial, so the
+    // shared `retry::WS_BACKEND_TLS_SNI_UNSUPPORTED` anchor classifies it as
+    // `DispatchPolicyRejected`: non-retryable and neutral to the circuit
+    // breaker / passive health, exactly like the literal-IP denial above. The
+    // configured SNI value itself is never logged or echoed. Shared by the H1/H2
+    // and H3 WebSocket bridges, which both dial through this function.
+    if websocket_backend_tls_sni_unsupported(proxy) {
+        warn!(
+            proxy_id = %proxy.id,
+            "Refusing WebSocket backend dial: backend TLS SNI override cannot be applied to a \
+             WebSocket transport (server name is derived from the request URI); failing closed \
+             rather than verifying the wrong server name"
+        );
+        return Err(retry::WS_BACKEND_TLS_SNI_UNSUPPORTED.into());
     }
 
     let connector = build_websocket_tls_connector(proxy, env_config, tls_policy, crls)?;
@@ -16334,6 +16496,26 @@ fn spawn_detached_rejection_cleanup(
     }));
 }
 
+fn maybe_finalize_route_override_response_headers(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_headers: &mut HashMap<String, String>,
+) {
+    if ctx.route_override_response_transform.is_none() {
+        return;
+    }
+    if !plugins
+        .iter()
+        .any(|plugin| plugin.participates_in_route_response_header_finalization())
+    {
+        return;
+    }
+    crate::plugins::utils::route_header_transform::finalize_route_override_response_headers(
+        ctx,
+        response_headers,
+    );
+}
+
 async fn run_after_proxy_hooks_on_rejection(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -16360,6 +16542,9 @@ async fn run_after_proxy_hooks_on_rejection(
         .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
     let initial_terminal_gateway_deadline =
         ctx.gateway_deadline_response_selected() || deadline_already_elapsed;
+    let last_route_response_finalizer = plugins
+        .iter()
+        .rposition(|plugin| plugin.participates_in_route_response_header_finalization());
     if initial_terminal_gateway_deadline {
         ctx.mark_gateway_deadline_response_selected();
         replace_rejection_with_gateway_deadline(
@@ -16413,6 +16598,9 @@ async fn run_after_proxy_hooks_on_rejection(
                     response_headers,
                 ),
                 None => {
+                    // Commit route policy before detaching remaining hooks so a
+                    // mid-chain deadline cannot drop matched response transforms.
+                    maybe_finalize_route_override_response_headers(plugins, ctx, response_headers);
                     spawn_detached_rejection_cleanup(
                         future,
                         plugins[index + 1..]
@@ -16451,6 +16639,13 @@ async fn run_after_proxy_hooks_on_rejection(
                         response_body.as_deref_mut(),
                         response_headers,
                     );
+                    // Apply route policy onto the committed deadline map when the
+                    // last eligible transformer never ran (GHSA-3xxr-xhhj-9962).
+                    maybe_finalize_route_override_response_headers(
+                        plugins,
+                        ctx,
+                        response_headers,
+                    );
                     spawn_detached_rejection_cleanup(
                         future,
                         plugins[index + 1..]
@@ -16486,6 +16681,13 @@ async fn run_after_proxy_hooks_on_rejection(
         }
         if matches!(&result, PluginResult::Continue) || !plugin.may_replace_rejection_response() {
             ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
+        }
+        if matches!(&result, PluginResult::Continue) && last_route_response_finalizer == Some(index)
+        {
+            crate::plugins::utils::route_header_transform::finalize_route_override_response_headers(
+                ctx,
+                response_headers,
+            );
         }
         match result {
             PluginResult::Continue => {}
@@ -16596,6 +16798,11 @@ async fn run_after_proxy_hooks_on_rejection(
         replace_rejection_with_gateway_deadline(ctx, status_code, response_body, response_headers);
     }
 
+    // Defense in depth: if every eligible transformer was skipped (for example
+    // only response-replacing hooks ran after a terminal deadline), still apply
+    // the matched route list exactly once onto the committed rejection map.
+    maybe_finalize_route_override_response_headers(plugins, ctx, response_headers);
+
     restore_rejection_response_markers(ctx, previous_marker, previous_replaceable_marker);
 }
 
@@ -16627,7 +16834,7 @@ pub(crate) async fn apply_replaceable_after_proxy_hooks_to_rejection(
 /// Deferring matters because several reject-path `after_proxy` hooks consume
 /// one-shot state on their first invocation — `oidc_relying_party` does
 /// `ctx.metadata.remove(SESSION_SET_COOKIE_METADATA_KEY)` to stage the rotated
-/// session cookie, and `response_transformer` does
+/// session cookie, and the chain-level response route-header finalizer does
 /// `ctx.route_override_response_transform.take()`. If `after_proxy` ran once
 /// over the synthetic 2xx and then again here (after `response_headers.clear()`),
 /// that one-shot state would already be gone and could not be re-applied to the
@@ -17372,6 +17579,9 @@ pub(crate) async fn run_after_proxy_hooks(
         );
     }
 
+    let last_route_response_finalizer = plugins
+        .iter()
+        .rposition(|plugin| plugin.participates_in_route_response_header_finalization());
     for (index, plugin) in plugins.iter().enumerate() {
         if plugin.needs_later_response_cache_control_no_transform()
             || plugin.needs_later_response_strong_etag()
@@ -17418,6 +17628,21 @@ pub(crate) async fn run_after_proxy_hooks(
         };
         match result {
             PluginResult::Continue => {
+                // After the last eligible response_transformer static-rule pass,
+                // apply matched route response-header transforms exactly once so
+                // later same-type instances cannot undo route policy
+                // (GHSA-3xxr-xhhj-9962). Subsequent after_proxy plugins still see
+                // the route-final map.
+                if last_route_response_finalizer == Some(index) {
+                    crate::plugins::utils::route_header_transform::finalize_route_override_response_headers(
+                        ctx,
+                        response_headers,
+                    );
+                }
+                // Snapshot the complete phase, including the chain-level route
+                // finalization above. Recording before finalization would omit
+                // route removals/appends from buffered gRPC trailer policy and
+                // deadline provenance.
                 ctx.record_buffered_initial_response_header_plugin(
                     plugin.as_ref(),
                     response_headers,
@@ -19665,7 +19890,10 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
     backend_path_is_policy_bound: bool,
     pass: BackendPathBeforeProxyPass,
 ) -> PluginResult {
-    for plugin in plugins {
+    let last_route_request_finalizer = plugins
+        .iter()
+        .rposition(|plugin| plugin.participates_in_route_request_header_finalization());
+    for (index, plugin) in plugins.iter().enumerate() {
         let deferred =
             backend_path_is_policy_bound && plugin.defer_before_proxy_until_backend_path_resolved();
         let should_run = match pass {
@@ -19688,7 +19916,17 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
         .await
         .into_plugin_result(ctx)
         {
-            PluginResult::Continue => {}
+            PluginResult::Continue => {
+                // After the last eligible request_transformer static-rule pass,
+                // apply matched route request-header transforms exactly once so
+                // later same-type instances cannot undo route policy
+                // (GHSA-3xxr-xhhj-9962).
+                if last_route_request_finalizer == Some(index) {
+                    crate::plugins::utils::route_header_transform::finalize_route_override_request_headers(
+                        ctx, headers,
+                    );
+                }
+            }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 return reject;
             }
@@ -22560,6 +22798,18 @@ async fn handle_proxy_request_inner(
         &ctx.headers,
         &state.mesh_egress_strip_baggage_keys,
     );
+    // Backend-boundary header policy — the `before_proxy` phase is complete, so
+    // a plugin that owns a third-party credential boundary re-asserts it here,
+    // after every generic header transform, the gateway-assertion refresh, and
+    // the baggage strip (`GHSA-xhp5-hqj8-3mwg`). The deferred `before_proxy`
+    // passes below re-run it because they can mutate the same map again.
+    if capabilities.has(PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY) {
+        run_effective_final_backend_header_policy_hooks(
+            &plugins,
+            &mut ctx,
+            &mut owned_proxy_headers,
+        );
+    }
     let stream_hooks_enabled = plugin_cache_view.requires_response_stream_hooks();
     let maybe_requires_response_body_buffering =
         plugin_cache_view.requires_response_body_buffering();
@@ -22704,6 +22954,15 @@ async fn handle_proxy_request_inner(
                 &ctx.headers,
                 &state.mesh_egress_strip_baggage_keys,
             );
+            // A deferred pass can add or rename headers again, so re-assert the
+            // backend-boundary header policy over the new map.
+            if capabilities.has(PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY) {
+                run_effective_final_backend_header_policy_hooks(
+                    &plugins,
+                    &mut ctx,
+                    &mut owned_proxy_headers,
+                );
+            }
         }
     }
 
@@ -22752,6 +23011,15 @@ async fn handle_proxy_request_inner(
                 &ctx.headers,
                 &state.mesh_egress_strip_baggage_keys,
             );
+            // A deferred pass can add or rename headers again, so re-assert the
+            // backend-boundary header policy over the new map.
+            if capabilities.has(PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY) {
+                run_effective_final_backend_header_policy_hooks(
+                    &plugins,
+                    &mut ctx,
+                    &mut owned_proxy_headers,
+                );
+            }
         }
         match deferred_result {
             PluginResult::Continue => {}
@@ -23015,6 +23283,7 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     apply_finalized_request_egress_header_overlay(
+                        &plugins,
                         &mut ctx,
                         &mut owned_proxy_headers,
                         egress.backend_header_overlay,
@@ -23120,6 +23389,7 @@ async fn handle_proxy_request_inner(
         )
         .await;
         apply_finalized_request_egress_header_overlay(
+            &plugins,
             &mut ctx,
             &mut owned_proxy_headers,
             egress.backend_header_overlay,
@@ -23450,6 +23720,7 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     apply_finalized_request_egress_header_overlay(
+                        &plugins,
                         &mut ctx,
                         &mut owned_proxy_headers,
                         egress.backend_header_overlay,
@@ -24124,6 +24395,7 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 apply_finalized_request_egress_header_overlay(
+                    &plugins,
                     &mut ctx,
                     &mut owned_proxy_headers,
                     egress.backend_header_overlay,
@@ -29484,10 +29756,13 @@ pub(crate) fn cap_proxy_retry_for_target(
 /// [`resolve_effective_proxy_for_target`]: a single field read on the
 /// precomputed `Proxy.dispatch_port_overrides` map, no `ArcSwap` load.
 ///
-/// `dispatch_port` is the port the dial will actually use: the LB-selected
-/// `UpstreamTarget.port` for upstream proxies, or `proxy.backend_port` for a
-/// direct-backend proxy with no upstream. This mirrors how the raw-TCP path
-/// reads the same field via `ResolvedPortOverride.max_connections`.
+/// `dispatch_port` is the DestinationRule policy key: callers with a selected
+/// target pass `UpstreamTarget::dispatch_policy_port()` (the declared Service
+/// port when `targetPort` remapping applies), while a direct-backend proxy with
+/// no selected target passes `proxy.backend_port`. The transport may dial a
+/// different workload or mesh-listener port; that address must not become the
+/// policy source. This mirrors how the raw-TCP path reads the same field via
+/// `ResolvedPortOverride.max_connections`.
 pub(crate) fn resolve_backend_max_connections(proxy: &Proxy, dispatch_port: u16) -> Option<u32> {
     proxy
         .dispatch_port_overrides
@@ -29505,9 +29780,11 @@ pub(crate) fn resolve_backend_max_connections(proxy: &Proxy, dispatch_port: u16)
 /// matches [`resolve_backend_max_connections`]: a single field read on the
 /// precomputed `Proxy.dispatch_port_overrides` map, no `ArcSwap` load.
 ///
-/// `dispatch_port` is the port the dial will actually use: the LB-selected
-/// `UpstreamTarget.port` for upstream proxies, or `proxy.backend_port` for a
-/// direct-backend proxy with no upstream.
+/// `dispatch_port` is the DestinationRule policy key: callers with a selected
+/// target pass `UpstreamTarget::dispatch_policy_port()`, while a direct-backend
+/// proxy with no selected target passes `proxy.backend_port`. A remapped
+/// workload port or mesh listener remains a transport address, not the policy
+/// source.
 ///
 /// FIELD-level fallback (#1806 codex r1): when the per-port entry carries no
 /// `http1_max_pending_requests`, inherit the service-discovery top-level
@@ -32563,7 +32840,19 @@ pub(crate) fn query_string_after_plugin_strips<'a>(
 /// defense in depth for the no-transform path and any residual marked names.
 /// Ordinary no-transform / no-strip requests borrow the raw string with no
 /// allocation.
+///
+/// A provider claim (`ai_stream_router`, `GHSA-xhp5-hqj8-3mwg`) short-circuits
+/// both of these: it froze the exact safe backend-visible query at claim time,
+/// and every later generic query transform — which runs at a HIGHER priority
+/// than the claim and could otherwise append a normal-backend secret to the
+/// third-party provider URL — is discarded here. This is the single funnel
+/// through which the backend-visible query reaches H1/H2 dispatch, native H3
+/// dispatch, retry replay, and the replay/cache partition builders, so the
+/// re-assertion cannot be bypassed by adding a call site.
 pub(crate) fn effective_backend_query_string<'a>(ctx: &'a RequestContext) -> Cow<'a, str> {
+    if let Some(committed) = ctx.committed_provider_query() {
+        return Cow::Borrowed(committed);
+    }
     let base = match ctx.outbound_query_string() {
         Some(q) => q,
         None => ctx.raw_query_string().unwrap_or(""),
@@ -32581,6 +32870,9 @@ pub(crate) fn effective_backend_query_string_with_raw<'a>(
     ctx: &RequestContext,
     raw_query: &'a str,
 ) -> Cow<'a, str> {
+    if let Some(committed) = ctx.committed_provider_query() {
+        return Cow::Owned(committed.to_string());
+    }
     match ctx.outbound_query_string() {
         Some(query) => Cow::Owned(query_string_after_plugin_strips(ctx, query).into_owned()),
         None => query_string_after_plugin_strips(ctx, raw_query),
@@ -43544,6 +43836,41 @@ mod tests {
             &binary_headers,
         ));
 
+        // A route-level `set Cache-Control: no-transform` reaches the final
+        // client-visible headers through the chain-level route finalizer, so
+        // `compression` may release the buffered body — the route-driven twin of
+        // `late_no_transform_plugins` above, where a later static plugin adds the
+        // same directive. The backend response carries neither `no-transform` nor
+        // a strong `ETag`, so `stamp_original_response_metadata` sets no
+        // shortcut key and the directive is observable only through the
+        // simulated header map (GHSA-3xxr-xhhj-9962).
+        let mut route_no_transform_ctx = compression_ctx.clone();
+        route_no_transform_ctx.route_override_response_transform = Some(Arc::new(vec![
+            crate::plugins::utils::route_header_transform::RouteHeaderTransformRule {
+                operation:
+                    crate::plugins::utils::route_header_transform::RouteHeaderTransformOp::Update,
+                key: "cache-control".to_string(),
+                value: Some("no-transform".to_string()),
+            },
+        ]));
+        let route_no_transform_plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(
+                crate::plugins::response_transformer::ResponseTransformer::new(&json!({
+                    "apply_route_overrides": true
+                }))
+                .expect("route override response transformer config should be valid"),
+            ),
+            Arc::new(CompressionPlugin::new(&json!({})).unwrap()),
+        ];
+        assert!(refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &route_no_transform_plugins,
+            Some(&route_no_transform_ctx),
+            200,
+            &json_headers,
+        ));
+
         // An already-streaming response stays streaming.
         assert!(refine_stream_response_for_content_type(
             true,
@@ -46407,6 +46734,7 @@ mod tests {
             trust_bundles: None,
             mesh: None,
             mesh_revision: None,
+            k8s_mesh_overlay: Default::default(),
         }
     }
 

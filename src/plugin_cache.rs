@@ -520,15 +520,39 @@ pub(crate) fn validate_plugin_security_composition(
                 plugin.supported_protocols().contains(&protocol)
                     && plugin.name() != "request_deduplication"
                     && plugin.priority() >= deduplication.priority()
-                    && (plugin.modifies_request_headers() || plugin.modifies_request_query())
+                    && (plugin.modifies_request_headers()
+                        || plugin.modifies_request_query()
+                        || plugin.modifies_request_destination())
             }) {
                 return Err(format!(
                     "request mutation plugin '{}' at effective priority {} must run before \
                      every request_deduplication instance for protocol {:?}; \
-                     request_deduplication priority {} would fingerprint headers/query before \
-                     their backend-visible mutation",
+                     request_deduplication priority {} would fingerprint headers/query/destination \
+                     before their backend-visible mutation",
                     later_mutator.name(),
                     later_mutator.priority(),
+                    protocol,
+                    deduplication.priority()
+                ));
+            }
+
+            // A backend-boundary header policy is re-asserted after EVERY
+            // `before_proxy` hook (`GHSA-xhp5-hqj8-3mwg`), so priority order
+            // cannot make it visible to a fingerprint taken during that phase.
+            // Same population as deduplication (both admit request-body POSTs),
+            // so the composition fails closed rather than retaining an
+            // operation keyed on headers the backend never receives.
+            if let Some(final_header_policy) = plugins.iter().find(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && plugin.name() != "request_deduplication"
+                    && plugin.enforces_final_backend_header_policy()
+            }) {
+                return Err(format!(
+                    "plugin '{}' re-asserts a backend-boundary header policy after every \
+                     before_proxy hook for protocol {:?}; request_deduplication at priority {} \
+                     fingerprints headers during before_proxy and cannot witness that final \
+                     mutation",
+                    final_header_policy.name(),
                     protocol,
                     deduplication.priority()
                 ));
@@ -569,19 +593,27 @@ pub(crate) fn validate_plugin_security_composition(
                     // compression to retain final encoded representations.
                     && plugin.name() != "compression"
                     && plugin.priority() >= response_cache.priority()
-                    && (plugin.modifies_request_headers() || plugin.modifies_request_query())
+                    && (plugin.modifies_request_headers()
+                        || plugin.modifies_request_query()
+                        || plugin.modifies_request_destination())
             }) {
                 return Err(format!(
                     "request mutation plugin '{}' at effective priority {} must run before \
                      every response_caching instance for protocol {:?}; response_caching \
                      priority {} would select a retained response before the final \
-                     backend-visible headers/query exist",
+                     backend-visible headers/query/destination exist",
                     later_mutator.name(),
                     later_mutator.priority(),
                     protocol,
                     response_cache.priority()
                 ));
             }
+            // No separate `enforces_final_backend_header_policy` rule here
+            // (`GHSA-xhp5-hqj8-3mwg`): today's only declarer, `ai_stream_router`,
+            // is already refused by the deferred request-body transformer rule
+            // above, and response caching admits only GET/HEAD with a
+            // transport-proven empty upload — a population no POST JSON claim can
+            // reach. Add one if a body-less plugin ever declares the capability.
         }
 
         for side_effecting_plugin in plugins.iter().filter(|plugin| {
@@ -755,8 +787,19 @@ impl Plugin for PriorityOverridePlugin {
     fn modifies_request_headers(&self) -> bool {
         self.inner.modifies_request_headers()
     }
+    fn participates_in_route_request_header_finalization(&self) -> bool {
+        self.inner
+            .participates_in_route_request_header_finalization()
+    }
+    fn participates_in_route_response_header_finalization(&self) -> bool {
+        self.inner
+            .participates_in_route_response_header_finalization()
+    }
     fn modifies_request_query(&self) -> bool {
         self.inner.modifies_request_query()
+    }
+    fn modifies_request_destination(&self) -> bool {
+        self.inner.modifies_request_destination()
     }
     fn modifies_request_body(&self) -> bool {
         self.inner.modifies_request_body()
@@ -769,6 +812,16 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn dispatches_finalized_request_egress(&self) -> bool {
         self.inner.dispatches_finalized_request_egress()
+    }
+    fn enforces_final_backend_header_policy(&self) -> bool {
+        self.inner.enforces_final_backend_header_policy()
+    }
+    fn enforce_final_backend_header_policy(
+        &self,
+        ctx: &RequestContext,
+        headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        self.inner.enforce_final_backend_header_policy(ctx, headers)
     }
     async fn dispatch_finalized_request_egress(
         &self,
@@ -1375,6 +1428,44 @@ impl Plugin for PriorityOverridePlugin {
     }
 }
 
+/// Plugins whose protection state is one shared admission domain, so more than
+/// one effective instance on a proxy would ambiguously claim that identity.
+///
+/// * `api_chargeback` writes into the exactly-once process-global `/charges`
+///   registry.
+/// * `load_testing` admits at most one detached cohort per policy identity. Two
+///   same-name effective instances would each hold their own admission flag and
+///   could start overlapping high-cost cohorts against one gateway without any
+///   reload at all (GHSA-wmqm-6mxj-gm9p). Rejecting the composition at cache
+///   construction is what makes the shared per-identity guard authoritative.
+const EXCLUSIVE_EFFECTIVE_INSTANCE_PLUGINS: &[(&str, &str)] = &[
+    ("api_chargeback", "shared /charges registry is exactly-once"),
+    (
+        "load_testing",
+        "one detached run cohort is admitted per policy",
+    ),
+];
+
+/// Composition errors for plugins that admit at most one effective instance on
+/// a proxy after global/proxy/proxy_group merge.
+fn exclusive_effective_instance_errors(merged: &[Arc<dyn Plugin>], proxy_id: &str) -> Vec<String> {
+    EXCLUSIVE_EFFECTIVE_INSTANCE_PLUGINS
+        .iter()
+        .filter_map(|(plugin_name, reason)| {
+            let count = merged
+                .iter()
+                .filter(|plugin| plugin.name() == *plugin_name)
+                .count();
+            (count > 1).then(|| {
+                format!(
+                    "proxy_id={proxy_id}: {plugin_name} permits at most one effective instance \
+                     per proxy ({reason}); found {count}"
+                )
+            })
+        })
+        .collect()
+}
+
 fn validate_tcp_connection_throttle_attachment(
     pc: &PluginConfig,
     gateway_config: &GatewayConfig,
@@ -1500,8 +1591,7 @@ fn try_create_plugin(
         .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
     } else if matches!(
         pc.plugin_name.as_str(),
-        "request_deduplication"
-            | "request_mirror"
+        "request_mirror"
             | "api_chargeback_sink"
             | "rate_limiting"
             | "graphql"
@@ -1531,6 +1621,23 @@ fn try_create_plugin(
             http_client.clone(),
             Some(&pc.id),
         )
+    } else if pc.plugin_name == "request_deduplication" {
+        // Share local idempotency state (active leases, retained completions,
+        // execution barriers, and their accounting) across compatible reload
+        // generations for the same plugin-config identity. Without this a
+        // routine plugin-cache rebuild would hand a replacement instance an
+        // empty map while the original request is still executing, and the
+        // retry would re-run the side effect (GHSA-wmqm-6mxj-gm9p).
+        //
+        // The same stable id is still the Redis keyspace partition, so
+        // cross-gateway behavior is unchanged.
+        crate::plugins::request_deduplication::RequestDeduplication::new_with_policy_identity(
+            &pc.config,
+            http_client.clone(),
+            &pc.namespace,
+            &pc.id,
+        )
+        .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
     } else if pc.plugin_name == "tcp_connection_throttle" {
         create_tcp_connection_throttle_plugin(
             pc,
@@ -3404,6 +3511,13 @@ impl PluginCapabilities {
     /// (GHSA-4vr5-4wm3-x5xv). Chains without an egress plugin skip the phase
     /// entirely — no extra scan, clone, or hook pass on the ordinary hot path.
     pub const DISPATCHES_FINALIZED_REQUEST_EGRESS: u32 = 1 << 16;
+    /// At least one plugin declared `enforces_final_backend_header_policy()`,
+    /// so the dispatch ladders must re-assert that plugin's backend-boundary
+    /// header policy over the finalized outbound header map after every generic
+    /// `before_proxy` header transform (`GHSA-xhp5-hqj8-3mwg`). Chains without
+    /// such a plugin skip the pass entirely — no extra scan or hook call on the
+    /// ordinary hot path.
+    pub const ENFORCES_FINAL_BACKEND_HEADER_POLICY: u32 = 1 << 17;
 
     // Bit 31 is the LAST bit of the `u32` backing store. A thirty-third flag
     // must widen `PluginCapabilities` (to `u64`) rather than shift further;
@@ -3657,6 +3771,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.dispatches_finalized_request_egress() {
             caps |= PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS;
+        }
+        if p.enforces_final_backend_header_policy() {
+            caps |= PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY;
         }
         if p.requires_response_committed_hook() {
             caps |= PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK;
@@ -6076,17 +6193,7 @@ impl PluginCache {
             {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
-            let chargeback_count = merged
-                .iter()
-                .filter(|plugin| plugin.name() == "api_chargeback")
-                .count();
-            if chargeback_count > 1 {
-                plugin_errors.push(format!(
-                    "proxy_id={}: api_chargeback permits at most one effective instance per proxy \
-                     (shared /charges registry is exactly-once); found {chargeback_count}",
-                    proxy.id
-                ));
-            }
+            plugin_errors.extend(exclusive_effective_instance_errors(&merged, &proxy.id));
             new_map.insert(proxy_runtime_key(proxy), Arc::new(merged));
         }
 
@@ -6829,17 +6936,7 @@ impl PluginCache {
             {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
-            let chargeback_count = merged
-                .iter()
-                .filter(|plugin| plugin.name() == "api_chargeback")
-                .count();
-            if chargeback_count > 1 {
-                plugin_errors.push(format!(
-                    "proxy_id={}: api_chargeback permits at most one effective instance per proxy \
-                     (shared /charges registry is exactly-once); found {chargeback_count}",
-                    proxy.id
-                ));
-            }
+            plugin_errors.extend(exclusive_effective_instance_errors(&merged, &proxy.id));
 
             // Pre-compute whether any plugin requires response body buffering
             let needs_buffering = merged.iter().any(|p| p.requires_response_body_buffering());

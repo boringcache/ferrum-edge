@@ -920,9 +920,7 @@ fn acquire_fallback_file_lock(lock_path: &Path) -> Result<FallbackFileLock, anyh
         let error = std::io::Error::last_os_error();
         let errno = error.raw_os_error();
         if errno == Some(libc::EWOULDBLOCK) || errno == Some(libc::EAGAIN) {
-            return Err(anyhow!(
-                "audit local fallback cross-process lock contended"
-            ));
+            return Err(anyhow!("audit local fallback cross-process lock contended"));
         }
         return Err(anyhow!(
             "failed to acquire audit local fallback cross-process lock: {error}"
@@ -999,11 +997,7 @@ fn write_local_fallback_events_unlocked(
     events: &[AuditEvent],
 ) -> Result<(), anyhow::Error> {
     let body = serde_json::to_vec_pretty(events)?;
-    let tmp_name = format!(
-        "{}.{}.tmp",
-        AUDIT_LOCAL_FALLBACK_FILE_NAME,
-        Uuid::new_v4()
-    );
+    let tmp_name = format!("{}.{}.tmp", AUDIT_LOCAL_FALLBACK_FILE_NAME, Uuid::new_v4());
     let tmp = dir.join(tmp_name);
     let write_result = write_temp_fallback_file(&tmp, &body);
     if let Err(error) = write_result {

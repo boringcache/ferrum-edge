@@ -1877,6 +1877,31 @@ pub(crate) struct ServerlessGrpcTerminateFrame {
     pub(crate) trailers: HashMap<String, String>,
 }
 
+/// What a direct-backend route override intends for the selected proxy's
+/// inherited `Proxy.dns_override` pin.
+///
+/// Narrow and reusable: any plugin that repoints a request at an endpoint it
+/// resolved itself (rather than at the operator's configured backend) can state
+/// `ClearInherited` so the pin cannot follow the request to a destination the
+/// operator never pinned. Default behavior is unchanged
+/// (`InheritProxy`), so ordinary same-host route rewrites keep their semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum RouteOverrideDnsPolicy {
+    /// Keep the proxy's `dns_override` unless the override changed the backend
+    /// host text. The historical behavior and the default for every route
+    /// rewriter that stays inside the operator's own backend.
+    #[default]
+    InheritProxy,
+    /// Drop the proxy's `dns_override` for this request even when the override
+    /// host text is byte-identical to the configured `backend_host`.
+    ///
+    /// Only meaningful alongside a DIRECT backend override (host / scheme /
+    /// port), which is the only shape that repoints the request away from the
+    /// operator's configured backend. On its own it is a no-op, so setting it
+    /// never changes an upstream-id route or a plain path/authority rewrite.
+    ClearInherited,
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -2646,15 +2671,17 @@ pub struct RequestContext {
     pub route_override_retry: Option<Option<RetryConfig>>,
     /// Per-rule request header transforms published by `mesh_route_dispatch`
     /// when a matching rule carries `request_transform` rules (Istio
-    /// `VirtualService.http[].headers.request.{set,add,remove}`). The
-    /// `request_transformer` plugin applies these after its own static
-    /// header rules. Shared via `Arc` so the dispatch hot path clones a
-    /// pointer rather than the rule list.
+    /// `VirtualService.http[].headers.request.{set,add,remove}`). Enabled
+    /// `request_transformer` instances apply only their static header rules;
+    /// proxy core applies this list exactly once after the last eligible
+    /// transformer in the chain so route-level writes remain authoritative.
+    /// Shared via `Arc` so the dispatch hot path clones a pointer rather than
+    /// the rule list.
     pub route_override_request_transform:
         Option<Arc<Vec<utils::route_header_transform::RouteHeaderTransformRule>>>,
     /// Per-rule response header transforms; counterpart to
-    /// `route_override_request_transform`. Applied by `response_transformer`
-    /// after its own static header rules.
+    /// `route_override_request_transform`. Applied once by proxy core after
+    /// every eligible `response_transformer` has run its static header rules.
     pub route_override_response_transform:
         Option<Arc<Vec<utils::route_header_transform::RouteHeaderTransformRule>>>,
     /// Plugin-set override for the request path forwarded to the backend.
@@ -2683,6 +2710,35 @@ pub struct RequestContext {
     /// rewrites the forwarded `host` header to this value after `before_proxy`.
     /// `None` preserves the request's own authority.
     pub route_override_authority: Option<String>,
+    /// Whether a direct-backend route override also revokes the selected
+    /// proxy's inherited `Proxy.dns_override` pin.
+    ///
+    /// Host-text equality is not destination equality: an operator can pin a
+    /// proxy's `backend_host` to a fixed address with `dns_override`, and a
+    /// plugin that repoints the request at a THIRD-PARTY endpoint whose
+    /// hostname happens to equal that same text would otherwise keep dialing
+    /// the operator's pinned address while carrying the third party's
+    /// credential (`GHSA-xhp5-hqj8-3mwg`). A direct provider claim therefore
+    /// states its DNS intent explicitly instead of relying on host text having
+    /// changed.
+    ///
+    /// Kept `pub(crate)` and typed rather than published through metadata: it is
+    /// a routing decision, not observability, and no custom plugin should be
+    /// able to forge it.
+    pub(crate) route_override_dns_policy: RouteOverrideDnsPolicy,
+    /// Private, typed provider claim published by the winning `ai_stream_router`
+    /// instance (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// Holds the opaque owner identity plus the exact model, destination, TLS,
+    /// DNS, and backend-visible query this request was committed to at claim
+    /// time. It is deliberately NOT metadata: it carries a query string (which
+    /// can contain client secrets a transform relocated), the model that
+    /// selected the provider, and an ownership token — none of which may be
+    /// forgeable from configuration, logs, or a response. The public
+    /// `ai_stream_router.*` metadata keys mirror some of it for observability
+    /// and are never read back for enforcement. Its lifetime is exactly this
+    /// request context.
+    pub(crate) ai_stream_router_claim: Option<Box<ai_stream_router::AiStreamRouterClaim>>,
     /// In node-waypoint mesh topology, the Kubernetes pod UID resolved from
     /// the eBPF socket-cookie record at accept time. Set by the connection
     /// admit path alongside `peer_spiffe_id`; `None` for non-mesh
@@ -2903,6 +2959,8 @@ impl RequestContext {
             authorized_backend_path: None,
             route_override_path_is_absolute: false,
             route_override_authority: None,
+            route_override_dns_policy: RouteOverrideDnsPolicy::InheritProxy,
+            ai_stream_router_claim: None,
             node_waypoint_pod_uid: None,
             node_waypoint_policy_scope: None,
             mesh_direction: None,
@@ -3859,6 +3917,16 @@ impl RequestContext {
             authorized_backend_path: self.authorized_backend_path.clone(),
             route_override_path_is_absolute: self.route_override_path_is_absolute,
             route_override_authority: self.route_override_authority.clone(),
+            route_override_dns_policy: self.route_override_dns_policy,
+            // Carried, not dropped: `on_final_request_body` runs on this
+            // compatibility context and is where the provider claim's
+            // model/destination/TLS/DNS/query witness is verified and where
+            // instance ownership is decided (`GHSA-xhp5-hqj8-3mwg`). The
+            // request-body transform hooks run on this SAME clone, so the
+            // claim's Anthropic-translation witness is recorded and read here
+            // without ever depending on a metadata write-back. A dropped claim
+            // would silently skip the whole revalidation.
+            ai_stream_router_claim: self.ai_stream_router_claim.clone(),
             node_waypoint_pod_uid: self.node_waypoint_pod_uid,
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
             mesh_direction: self.mesh_direction,
@@ -4197,8 +4265,17 @@ impl RequestContext {
         let backend_port_changed = self
             .route_override_backend_port
             .is_some_and(|port| proxy.backend_port != port);
-        let dns_override_changed =
-            direct_backend_override && backend_host_changed && proxy.dns_override.is_some();
+        // A direct-backend override drops the proxy's pinned address when it
+        // moved the host text, and ALSO when the override explicitly revoked the
+        // pin. The explicit form is what keeps a same-host provider claim from
+        // dialing the operator's pinned address with a third-party credential
+        // (`GHSA-xhp5-hqj8-3mwg`); without it, `backend_host_changed` is `false`
+        // precisely in the case where the destination identity changed but the
+        // host text did not.
+        let dns_override_changed = direct_backend_override
+            && proxy.dns_override.is_some()
+            && (backend_host_changed
+                || self.route_override_dns_policy == RouteOverrideDnsPolicy::ClearInherited);
 
         let upstream_tls_override = if upstream_id_changed {
             self.route_override_upstream_id
@@ -4536,6 +4613,50 @@ impl RequestContext {
     #[inline]
     pub fn outbound_query_string(&self) -> Option<&str> {
         self.outbound_query_string.as_deref()
+    }
+
+    /// The exact backend-visible query a provider claim froze at claim time,
+    /// when this request is claimed (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// `Some("")` means "append nothing" — the committed target already carries
+    /// every query pair (an endpoint query folded into the absolute override
+    /// path), so a later generic query transform must not be able to append a
+    /// normal-backend secret to the third-party provider URL. `None` is the
+    /// ordinary unclaimed hot path: one `Option` test, no allocation.
+    ///
+    /// Never log this value. It is a query string, so a transform could have
+    /// relocated a credential into it.
+    #[inline]
+    pub(crate) fn committed_provider_query(&self) -> Option<&str> {
+        self.ai_stream_router_claim
+            .as_deref()
+            .map(ai_stream_router::AiStreamRouterClaim::committed_query)
+    }
+
+    /// Whether an `ai_stream_router` instance successfully claimed this request
+    /// and bound it to a third-party provider (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// This is the AUTHORITATIVE coordination signal for every built-in that
+    /// must stand down on a claimed provider request: `ai_federation`,
+    /// `request_mirror`, `serverless_function`, `mcp_gateway`, and
+    /// `mesh_route_dispatch`. The public `ai_stream_router_claimed` metadata key
+    /// is observability/backward coordination only — it is a plain string in a
+    /// map that any later plugin (or a `request_transformer`-driven metadata
+    /// write) can delete or rewrite, and a built-in that then re-inspected,
+    /// re-routed, mirrored, or federated the provider-bound request would send
+    /// the committed provider credential, model, destination, and query
+    /// somewhere the claim never authorized. The private typed claim cannot be
+    /// forged or erased from outside `ai_stream_router`.
+    ///
+    /// Deliberately exposes NOTHING about the claim — not the owner, model,
+    /// destination, TLS, DNS decision, query, or credential. Only its existence.
+    ///
+    /// Intentionally UNCLAIMED pass-through (the operator disabled fail-closed
+    /// missing/unmatched-model behavior) is a different state with no claim, and
+    /// still coordinates through `ai_stream_router_pass_through` metadata.
+    #[inline]
+    pub(crate) fn has_ai_stream_router_claim(&self) -> bool {
+        self.ai_stream_router_claim.is_some()
     }
 
     /// Publish the transport's proof that the complete request body is empty.
@@ -6597,8 +6718,8 @@ pub mod priority {
     /// and normalizes provider-native SSE to OpenAI `chat.completion.chunk` SSE.
     /// Runs before `ai_semantic_cache` (and before `ai_federation` at 4060) so
     /// cache lookup observes the effective provider destination for streaming
-    /// claims while the non-streaming federation path can still defer via the
-    /// `ai_stream_router_claimed` marker.
+    /// claims while the non-streaming federation path can still defer on the
+    /// private claim (`RequestContext::has_ai_stream_router_claim`).
     pub const AI_STREAM_ROUTER: u16 = 2984;
     /// `mcp_gateway`: parses MCP JSON-RPC bodies and applies MCP-aware route
     /// overrides after generic admission/auth plugins but before final dispatch.
@@ -6968,6 +7089,15 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` if this plugin may rewrite the effective backend,
+    /// upstream, authority, or path during `before_proxy`.
+    ///
+    /// Replay plugins use this to ensure their destination partition is built
+    /// only after routing has reached its final state.
+    fn modifies_request_destination(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin may transform the request body before
     /// it is sent to the backend. The gateway uses this hint to call
     /// `transform_request_body` only when needed.
@@ -7007,6 +7137,51 @@ pub trait Plugin: Send + Sync {
     /// bypassed. TCP/UDP stream protocols are outside this body-lifecycle gate.
     fn enforces_finalized_request_policy(&self) -> bool {
         false
+    }
+
+    /// Returns `true` when this plugin owns a backend-boundary HEADER policy
+    /// that must be re-asserted over the FINAL backend-visible header map,
+    /// after every generic `before_proxy` header transform has run
+    /// (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// `before_proxy` is a shared, ordered phase: a plugin that strips client
+    /// credentials and installs its own third-party credential there is only
+    /// protected against plugins that run BEFORE it. A later generic header
+    /// rule (`request_transformer` at 3000, a `pre_proxy` function's backend
+    /// header overlay, a deferred routing-header hook) can still add, replace,
+    /// or rename that header. Declaring this capability moves the decisive
+    /// application of the policy to the finalized header map instead, so the
+    /// guarantee no longer depends on relative priority.
+    fn enforces_final_backend_header_policy(&self) -> bool {
+        false
+    }
+
+    /// Re-assert this plugin's backend-boundary header policy over the
+    /// finalized outbound header map.
+    ///
+    /// The gateway calls this for plugins that declare
+    /// [`Plugin::enforces_final_backend_header_policy`], in configured priority
+    /// order, at every point where the backend-visible header map is complete:
+    /// after the `before_proxy` pass, after each deferred routing/remaining
+    /// `before_proxy` pass, and after a finalized-request-egress header overlay
+    /// is merged. All of those sites run after gateway-owned assertion refresh
+    /// and the egress baggage strip, so this hook has the last word.
+    ///
+    /// The hook is deliberately synchronous and NON-REJECTING: it exists to
+    /// re-apply a decision the plugin already committed, not to make a new one.
+    /// A plugin that must fail the request on finalized state decides that in
+    /// `on_final_request_body*`, which has the full rejection plumbing on every
+    /// dispatcher. Implementations must be idempotent (the hook runs more than
+    /// once on the deferred ladders), allocation-light, and must never log
+    /// header values.
+    ///
+    /// `ctx` is the real request context, read-only. Mutating the outbound
+    /// header map is the hook's only effect.
+    fn enforce_final_backend_header_policy(
+        &self,
+        _ctx: &RequestContext,
+        _headers: &mut HashMap<String, String>,
+    ) {
     }
 
     /// Returns `true` when this plugin performs irreversible outbound request
@@ -7434,7 +7609,7 @@ pub trait Plugin: Send + Sync {
     /// Only response *body* transforms need enrollment. `after_proxy` header
     /// hooks — including the rejection-path hooks a synthetic replay runs
     /// through — still execute on a finalized replay, so header policy is
-    /// enforced live and is never skipped. (`response_transformer` consuming
+    /// enforced live and is never skipped. (Proxy core consuming
     /// `ctx.route_override_response_transform` without applying it on a
     /// finalized replay is the deliberate counterpart: those route rules are
     /// header-only and are already baked into the stored header map.)
@@ -7613,6 +7788,29 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when this enabled instance participates in the
+    /// request-side route-header finalization chain.
+    ///
+    /// Eligible `request_transformer` instances apply only their static
+    /// header/query rules in `before_proxy`. Proxy core then applies
+    /// [`RequestContext::route_override_request_transform`] exactly once after
+    /// the last eligible instance so route-level policy cannot be undone by a
+    /// later static rule. Disabled RTDS instances must return `false` so they
+    /// neither consume nor suppress the shared route list.
+    fn participates_in_route_request_header_finalization(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this enabled instance participates in the
+    /// response-side route-header finalization chain.
+    ///
+    /// Counterpart to [`Self::participates_in_route_request_header_finalization`]
+    /// for `response_transformer` and
+    /// [`RequestContext::route_override_response_transform`].
+    fn participates_in_route_response_header_finalization(&self) -> bool {
+        false
+    }
+
     /// Applies this plugin's deterministic `after_proxy` response-header
     /// mutations to a simulated header map.
     ///
@@ -7620,7 +7818,10 @@ pub trait Plugin: Send + Sync {
     /// later header hooks without actually running plugin side effects early.
     /// Implementations MUST keep this pure with respect to the real request:
     /// the caller passes a cloned context when mutation is needed to mirror
-    /// runtime consumption of route overrides.
+    /// runtime consumption of route overrides. Route-level response transforms
+    /// are **not** applied here — proxy core applies them once after the last
+    /// eligible simulated transformer via
+    /// [`utils::route_header_transform::finalize_route_override_response_headers`].
     fn simulate_after_proxy_response_headers(
         &self,
         _ctx: &mut RequestContext,
