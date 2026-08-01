@@ -642,7 +642,7 @@ pub fn apply_body_rules(body: &[u8], rules: &[BodyRule]) -> Option<Vec<u8>> {
 /// when a rule set claimed a rewrite but the rewritten document could not be
 /// serialized within the ceiling — distinct from an ordinary semantic no-op
 /// ([`crate::plugins::BoundedResponseBodyConstruction::Unchanged`]).
-pub fn apply_body_rules_bounded(
+pub(crate) fn apply_body_rules_bounded(
     body: &[u8],
     rules: &[BodyRule],
     ceiling: usize,
