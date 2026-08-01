@@ -557,16 +557,16 @@ async fn base_cache_key_for_raw_query(plugin: &ResponseCaching, raw_query: &str)
 async fn base_cache_key_partitions_unannounced_origin_visible_headers() {
     let plugin = default_plugin();
     let mut alpha = make_ctx("GET", "/tenant-data");
-    let alpha_headers = HashMap::from([("x-tenant-id".to_string(), "alpha".to_string())]);
+    let mut alpha_headers = HashMap::from([("x-tenant-id".to_string(), "alpha".to_string())]);
     assert!(matches!(
-        plugin.before_proxy(&mut alpha, &alpha_headers).await,
+        plugin.before_proxy(&mut alpha, &mut alpha_headers).await,
         PluginResult::Continue
     ));
 
     let mut beta = make_ctx("GET", "/tenant-data");
-    let beta_headers = HashMap::from([("x-tenant-id".to_string(), "beta".to_string())]);
+    let mut beta_headers = HashMap::from([("x-tenant-id".to_string(), "beta".to_string())]);
     assert!(matches!(
-        plugin.before_proxy(&mut beta, &beta_headers).await,
+        plugin.before_proxy(&mut beta, &mut beta_headers).await,
         PluginResult::Continue
     ));
 
@@ -574,6 +574,130 @@ async fn base_cache_key_partitions_unannounced_origin_visible_headers() {
         alpha.metadata.get(&staging_key(&plugin, "cache_base_key")),
         beta.metadata.get(&staging_key(&plugin, "cache_base_key")),
         "an origin-visible header must partition the cache even without Vary"
+    );
+}
+
+async fn staged_base_cache_key(
+    plugin: &ResponseCaching,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+) -> Option<String> {
+    let mut ctx = make_ctx("GET", path);
+    let mut headers = HashMap::new();
+    for (name, value) in extra_headers {
+        headers.insert((*name).to_string(), (*value).to_string());
+    }
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    ctx.metadata
+        .get(&staging_key(plugin, "cache_base_key"))
+        .cloned()
+}
+
+#[tokio::test]
+async fn base_cache_key_keeps_supported_entry_operation_headers_reachable() {
+    let plugin = default_plugin();
+    let path = "/entry-ops-reachable";
+    let baseline = staged_base_cache_key(&plugin, path, &[])
+        .await
+        .expect("baseline request must stage a base key");
+
+    let supported = [
+        ("if-none-match", r#""etag-1""#),
+        ("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("cache-control", "no-cache"),
+        ("cache-control", "no-store"),
+        ("cache-control", r#"no-cache="authorization""#),
+        ("range", "bytes=0-3"),
+        ("content-length", "0"),
+    ];
+    for (name, value) in supported {
+        let key = staged_base_cache_key(&plugin, path, &[(name, value)])
+            .await
+            .unwrap_or_else(|| panic!("{name}: {value} must stage a base key"));
+        assert_eq!(
+            key, baseline,
+            "{name}: {value} is a handled entry operation and must stay reachable"
+        );
+    }
+}
+
+#[tokio::test]
+async fn base_cache_key_binds_unsupported_precondition_and_pragma_dimensions() {
+    let plugin = default_plugin();
+    let path = "/unsupported-preconditions";
+    let baseline = staged_base_cache_key(&plugin, path, &[])
+        .await
+        .expect("baseline request must stage a base key");
+
+    let unsupported = [
+        ("if-match", r#""etag-1""#),
+        ("if-unmodified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("if-range", r#""etag-1""#),
+        ("pragma", "no-cache"),
+    ];
+    for (name, value) in unsupported {
+        let key = staged_base_cache_key(&plugin, path, &[(name, value)])
+            .await
+            .unwrap_or_else(|| panic!("{name}: {value} must stage a base key"));
+        assert_ne!(
+            key, baseline,
+            "{name} is not implemented as a cache operation and must not share a replay key"
+        );
+    }
+}
+
+#[tokio::test]
+async fn base_cache_key_cache_control_exclusion_is_value_aware() {
+    let plugin = default_plugin();
+    let path = "/cache-control-value-aware";
+    let baseline = staged_base_cache_key(&plugin, path, &[])
+        .await
+        .expect("baseline request must stage a base key");
+
+    let recognized_refresh = staged_base_cache_key(&plugin, path, &[("cache-control", "no-cache")])
+        .await
+        .expect("recognized no-cache refresh must stage a base key");
+    assert_eq!(
+        recognized_refresh, baseline,
+        "recognized no-cache must remain under the original partition for replacement"
+    );
+
+    let recognized_store = staged_base_cache_key(&plugin, path, &[("cache-control", "no-store")])
+        .await
+        .expect("recognized no-store refresh must stage a base key");
+    assert_eq!(
+        recognized_store, baseline,
+        "recognized no-store must remain under the original partition for replacement"
+    );
+
+    let unrecognized = [
+        ("max-age=0", "request max-age is not a handled refresh"),
+        ("only-if-cached", "only-if-cached is not interpreted by this cache"),
+        ("foo", "arbitrary Cache-Control extensions are backend-visible"),
+        ("public", "public on a request is not a handled refresh"),
+    ];
+    for (value, reason) in unrecognized {
+        let key = staged_base_cache_key(&plugin, path, &[("cache-control", value)])
+            .await
+            .unwrap_or_else(|| panic!("cache-control: {value} must stage a base key"));
+        assert_ne!(
+            key, baseline,
+            "cache-control: {value} must partition ({reason})"
+        );
+    }
+
+    // Mixed recognized refresh + extension still collapses to the refresh
+    // partition so a no-cache replacement stays addressable.
+    let mixed = staged_base_cache_key(
+        &plugin,
+        path,
+        &[("cache-control", "no-cache, max-age=0")],
+    )
+    .await
+    .expect("mixed no-cache refresh must stage a base key");
+    assert_eq!(
+        mixed, baseline,
+        "presence of recognized no-cache keeps the refresh under the original partition"
     );
 }
 

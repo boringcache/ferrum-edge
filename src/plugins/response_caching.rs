@@ -1458,16 +1458,26 @@ impl ResponseCaching {
     /// * **request context** — original authority, `Host`, method, path, the
     ///   *effective outbound* query, so a `request_transformer` query rewrite
     ///   that ran before this plugin is part of the partition. The request
-    ///   header dimension binds every backend-visible header except cache
-    ///   operation headers that address/control the selected entry. This
-    ///   prevents replay across unannounced tenant or policy headers even when
-    ///   an origin omits `Vary`. The complete `Vary` tuple is additionally
-    ///   appended by [`Self::extend_base_key_with_vary`].
+    ///   header dimension binds every backend-visible header except the
+    ///   entry-operation headers whose semantics this plugin actually
+    ///   implements (`If-None-Match` / `If-Modified-Since` revalidation,
+    ///   recognized request `Cache-Control: no-cache` / `no-store` refreshes,
+    ///   `Range`, and zero-length `Content-Length` framing). This prevents
+    ///   replay across unannounced tenant or policy headers even when an
+    ///   origin omits `Vary`. Unsupported precondition / pragma dimensions
+    ///   and arbitrary `Cache-Control` content remain bound. The complete
+    ///   `Vary` tuple is additionally appended by
+    ///   [`Self::extend_base_key_with_vary`].
     ///
-    ///   Conditional, request cache-control, range, and zero-length framing
-    ///   headers are excluded because they operate on an entry rather than
-    ///   select the origin representation. This keeps revalidation,
-    ///   invalidation, and range lookup able to reach the stored entry;
+    ///   Supported entry-operation headers are excluded so revalidation,
+    ///   recognized no-cache/no-store replacement, range lookup, and
+    ///   zero-length framing can still address the stored entry. Unimplemented
+    ///   precondition and pragma headers are *not* treated as operations: a
+    ///   fresh HIT must not ignore a client `If-Match` /
+    ///   `If-Unmodified-Since` / `If-Range` / `Pragma` the plugin does not
+    ///   gate. `Cache-Control` exclusion is value-aware — only the recognized
+    ///   refresh spellings above are omitted; other request directives stay
+    ///   in the partition as backend-visible policy;
     /// * **complete `Vary` tuple** — appended to this base key by
     ///   [`Self::extend_base_key_with_vary`];
     /// * **caller authorization context** — see

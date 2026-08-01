@@ -34,9 +34,13 @@
 //!   plugins whose own key does not already bind an equivalent dimension
 //!   ([`append_request_context_partition`]). Only hop-by-hop/framing fields
 //!   Ferrum provably regenerates are excluded; tracing and correlation headers
-//!   reach the origin and are bound. The shared HTTP cache excludes only entry
-//!   operation headers while conservatively binding every representation and
-//!   policy dimension, including headers absent from `Vary`.
+//!   reach the origin and are bound. The shared HTTP cache
+//!   ([`append_response_cache_request_partition`]) excludes only the entry-
+//!   operation headers whose semantics `response_caching` actually implements
+//!   (`If-None-Match`, `If-Modified-Since`, recognized request `Cache-Control:
+//!   no-cache` / `no-store` refreshes, `Range`, and `Content-Length`) while
+//!   conservatively binding every other representation and policy dimension,
+//!   including headers absent from `Vary`.
 //!
 //! Every component is serialized with typed, length-framed fields
 //! ([`PartitionHasher`]) so no attacker-controlled byte can impersonate a field
@@ -705,50 +709,137 @@ pub fn append_request_context_partition(
     ctx: &RequestContext,
     request_headers: &HashMap<String, String>,
 ) {
-    append_filtered_request_context_partition(hasher, ctx, request_headers, |_| false);
+    append_filtered_request_context_partition(hasher, ctx, request_headers, |_, _| false);
 }
 
 /// Append the request context used by `response_caching`.
 ///
 /// Unlike an RFC cache's optional `Vary` optimization, this fail-closed
 /// partition binds every origin-visible header that could select tenant or
-/// policy state. Cache operation headers are excluded because they address or
-/// control an already selected entry rather than select its representation.
+/// policy state. Only headers whose entry-addressing semantics
+/// `response_caching` actually implements are omitted:
+///
+/// * `If-None-Match` / `If-Modified-Since` — fresh conditional HIT → 304
+/// * recognized request `Cache-Control: no-cache` / `no-store` (bare or
+///   qualified `no-cache="…"`) — bypass + store the replacement under the
+///   same partition as the entry being refreshed
+/// * `Range` — lookup may still address the stored full representation
+/// * `Content-Length` — zero-length framing on an otherwise empty GET/HEAD
+///
+/// Unsupported precondition / cache-directive dimensions (`If-Match`,
+/// `If-Unmodified-Since`, `If-Range`, `Pragma`, and arbitrary / unrecognized
+/// `Cache-Control` content) stay bound so they cannot share a replay key with
+/// a request that did not carry them. Labeling unimplemented semantics as
+/// "cache operations" would let a fresh HIT ignore a client precondition.
 pub fn append_response_cache_request_partition(
     hasher: &mut PartitionHasher,
     ctx: &RequestContext,
     request_headers: &HashMap<String, String>,
 ) {
-    const CACHE_OPERATION_HEADERS: &[&str] = &[
-        "cache-control",
-        "pragma",
-        "if-match",
-        "if-modified-since",
-        "if-none-match",
-        "if-range",
-        "if-unmodified-since",
-        "range",
-        "content-length",
-    ];
-    append_filtered_request_context_partition(hasher, ctx, request_headers, |name| {
-        CACHE_OPERATION_HEADERS
-            .iter()
-            .any(|candidate| name.eq_ignore_ascii_case(candidate))
-    });
+    append_filtered_request_context_partition(
+        hasher,
+        ctx,
+        request_headers,
+        is_response_cache_entry_operation_header,
+    );
+}
+
+/// Whether `name`/`value` is an entry-operation header this response cache
+/// safely omits from the request-header partition.
+///
+/// Name-only exemptions are limited to validators, range, and framing this
+/// plugin handles. `Cache-Control` is value-aware: only recognized request
+/// `no-cache` / `no-store` refreshes are omitted so a replacement remains
+/// addressable under the original partition; every other directive string is
+/// a backend-visible policy dimension and must be bound.
+fn is_response_cache_entry_operation_header(name: &str, value: &str) -> bool {
+    if name.eq_ignore_ascii_case("if-none-match")
+        || name.eq_ignore_ascii_case("if-modified-since")
+        || name.eq_ignore_ascii_case("range")
+        || name.eq_ignore_ascii_case("content-length")
+    {
+        return true;
+    }
+    name.eq_ignore_ascii_case("cache-control")
+        && request_cache_control_is_recognized_refresh(value)
+}
+
+/// True when a request `Cache-Control` value asks for a refresh this cache
+/// implements (`no-cache` / `no-store`, bare or qualified).
+///
+/// Matches the bypass contract in `response_caching`: presence of either
+/// directive (including `no-cache="…"`) is enough. Other request directives
+/// and extensions are not interpreted here and must remain partitioned.
+fn request_cache_control_is_recognized_refresh(header_value: &str) -> bool {
+    let bytes = header_value.as_bytes();
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        while matches!(bytes.get(index), Some(b',' | b' ' | b'\t')) {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+
+        let name_start = index;
+        while !matches!(bytes.get(index), None | Some(b'=' | b',')) {
+            index += 1;
+        }
+        let Some(name) = header_value.get(name_start..index).map(str::trim) else {
+            break;
+        };
+
+        if name.eq_ignore_ascii_case("no-cache") || name.eq_ignore_ascii_case("no-store") {
+            return true;
+        }
+
+        if bytes.get(index) == Some(&b'=') {
+            index += 1;
+            while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+                index += 1;
+            }
+            if bytes.get(index) == Some(&b'"') {
+                index += 1;
+                while let Some(&byte) = bytes.get(index) {
+                    match byte {
+                        b'\\' => index = index.saturating_add(2),
+                        b'"' => {
+                            index += 1;
+                            break;
+                        }
+                        _ => index += 1,
+                    }
+                }
+            } else {
+                while !matches!(bytes.get(index), None | Some(b',')) {
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn append_filtered_request_context_partition(
     hasher: &mut PartitionHasher,
     ctx: &RequestContext,
     request_headers: &HashMap<String, String>,
-    excluded: impl Fn(&str) -> bool,
+    excluded: impl Fn(&str, &str) -> bool,
 ) {
     append_request_target_partition(hasher, ctx, request_headers);
 
     let mut names: Vec<&str> = request_headers
-        .keys()
-        .map(String::as_str)
-        .filter(|name| !is_non_backend_visible_request_header(name) && !excluded(name))
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = name.as_str();
+            if is_non_backend_visible_request_header(name) || excluded(name, value) {
+                None
+            } else {
+                Some(name)
+            }
+        })
         .collect();
     names.sort_unstable();
     hasher.count("req.headers", names.len());

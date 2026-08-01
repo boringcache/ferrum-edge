@@ -66,17 +66,24 @@ paths:
   compatible because its exact final body is published during pre-`before_proxy`
   normalization. Its request-header dimension conservatively binds all
   backend-visible headers, in addition to the complete `Vary` tuple, except
-  cache operation headers that address/control the selected entry. A
-  conditional revalidation, a client `no-cache` refresh, and `Content-Length: 0`
-  are addressed to an entry rather than selecting a different one — keying the
-  raw view would put each of them in a partition the entry cannot be reached
-  from and make the `Vary` index unreachable. Cross-caller isolation is the
-  mandatory caller partition. `Authorization`, `Proxy-Authorization`, and
-  `Cookie` remain mandatory Vary names even for anonymous entries because
-  downstream shared caches cannot observe Ferrum's private caller partition;
-  present values are hashed and absence is a distinct keyed state. The RFC
-  shared-cache authorization admission checks both pristine inbound and live
-  backend-visible `Authorization`, so request transforms cannot erase it.
+  the entry-operation headers whose semantics this plugin actually implements:
+  `If-None-Match` / `If-Modified-Since` revalidation, recognized request
+  `Cache-Control: no-cache` / `no-store` refreshes (bare or qualified
+  `no-cache="…"`), `Range`, and zero-length `Content-Length` framing. A
+  conditional revalidation, a recognized client no-cache/no-store refresh, and
+  `Content-Length: 0` are addressed to an entry rather than selecting a
+  different one — keying the raw view would put each of them in a partition
+  the entry cannot be reached from and make the `Vary` index unreachable.
+  Unsupported precondition / pragma headers (`If-Match`,
+  `If-Unmodified-Since`, `If-Range`, `Pragma`) and arbitrary / unrecognized
+  request `Cache-Control` content stay bound so they cannot share a replay key.
+  Cross-caller isolation is the mandatory caller partition. `Authorization`,
+  `Proxy-Authorization`, and `Cookie` remain mandatory Vary names even for
+  anonymous entries because downstream shared caches cannot observe Ferrum's
+  private caller partition; present values are hashed and absence is a distinct
+  keyed state. The RFC shared-cache authorization admission checks both pristine
+  inbound and live backend-visible `Authorization`, so request transforms cannot
+  erase it.
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order
