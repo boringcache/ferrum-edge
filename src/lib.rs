@@ -1104,8 +1104,8 @@ pub mod _test_support {
     /// Hold the admin audit local-fallback in-process mutex without waiting.
     ///
     /// Used by external tests to prove contention fails closed immediately.
-    pub fn hold_audit_local_fallback_process_lock_for_test()
-    -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    pub fn hold_audit_local_fallback_process_lock_for_test(
+    ) -> Result<std::sync::MutexGuard<'static, ()>, String> {
         crate::admin::audit::hold_local_fallback_process_lock_for_test()
             .map_err(|error| error.to_string())
     }

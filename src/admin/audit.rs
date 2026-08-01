@@ -825,8 +825,8 @@ fn acquire_local_fallback_process_lock() -> Result<MutexGuard<'static, ()>, anyh
 }
 
 /// Test seam: hold the in-process fallback mutex without waiting.
-pub(crate) fn hold_local_fallback_process_lock_for_test()
--> Result<MutexGuard<'static, ()>, anyhow::Error> {
+pub(crate) fn hold_local_fallback_process_lock_for_test(
+) -> Result<MutexGuard<'static, ()>, anyhow::Error> {
     acquire_local_fallback_process_lock()
 }
 

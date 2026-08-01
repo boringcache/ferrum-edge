@@ -3632,8 +3632,8 @@ paths:
       summary: List admin audit events
       description: |
         Returns successful admin API mutation events for the selected namespace,
-        plus security-sensitive backup export and authenticated backup attempt
-        records when auditing is enabled. Requires an admin-role JWT. Each event
+        plus unconditional security-sensitive backup export and authenticated
+        backup-attempt records. Requires an admin-role JWT. Each event
         includes actor, action, resource identity, timestamp, and a JSON diff.
         Events may also include `source_address` (canonical socket peer), a
         bounded `request_id`, and a fixed-cardinality `outcome`. Consumer
@@ -6925,6 +6925,11 @@ components:
             otherwise generated. Omitted when empty.
         outcome:
           type: string
+          enum:
+            - success
+            - denied
+            - validation_failed
+            - unavailable
           description: >-
             Fixed-cardinality result for security-sensitive events:
             `success`, `denied`, `validation_failed`, or `unavailable`.
