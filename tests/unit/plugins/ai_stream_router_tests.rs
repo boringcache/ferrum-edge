@@ -4538,8 +4538,8 @@ async fn test_buffered_normalizer_is_bounded_by_a_route_ceiling_below_the_slice_
     let admitted_text = std::str::from_utf8(&admitted).expect("normalized SSE must be UTF-8");
     let normalized_text = std::str::from_utf8(&normalized).expect("normalized SSE must be UTF-8");
     assert_eq!(
-        strip_created(&admitted_text),
-        strip_created(&normalized_text),
+        strip_created(admitted_text),
+        strip_created(normalized_text),
         "bounding the accumulator must not change the normalized bytes \
          (modulo the per-instance created epoch)"
     );
