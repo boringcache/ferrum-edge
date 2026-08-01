@@ -591,8 +591,14 @@ async fn backup_invalid_namespace_is_audited_in_default_namespace_without_echoin
     assert_eq!(audit_status, 200);
     assert_eq!(audit_body["total"], 1);
     let event = &audit_body["items"][0];
-    assert_eq!(event["namespace"], ferrum_edge::config::types::DEFAULT_NAMESPACE);
-    assert_eq!(event["resource_id"], ferrum_edge::config::types::DEFAULT_NAMESPACE);
+    assert_eq!(
+        event["namespace"],
+        ferrum_edge::config::types::DEFAULT_NAMESPACE
+    );
+    assert_eq!(
+        event["resource_id"],
+        ferrum_edge::config::types::DEFAULT_NAMESPACE
+    );
     assert_eq!(event["outcome"], "validation_failed");
     assert_eq!(event["diff"]["failure_category"], "validation_failed");
     assert_eq!(event["diff"]["namespace_status"], "invalid");
