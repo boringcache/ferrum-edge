@@ -227,24 +227,28 @@ impl Waf {
     }
 
     /// Whether a body in `direction` can actually be blocked by this instance:
-    /// globally enforcing, and either anomaly scoring is on (any monitored hit
-    /// can push the instance over its threshold) or some rule that reads that
-    /// body — including the body-scoped encoding specials, which run on both
-    /// directions — is itself set to enforce.
+    /// globally enforcing, not request-wide exempt, and either anomaly scoring
+    /// can consume an applicable body-rule hit or an applicable rule that reads
+    /// that body — including the body-scoped encoding specials, which run on
+    /// both directions — is itself set to enforce.
     ///
     /// This is the predicate that decides whether an unscannable body is a
     /// protection-mechanism failure or merely a lost observation.
-    fn has_enforcing_body_policy(&self, direction: BodyDirection) -> bool {
-        if self.config.mode != GlobalMode::Enforce {
+    fn has_enforcing_body_policy(
+        &self,
+        direction: BodyDirection,
+        ctx: &RequestContext,
+    ) -> bool {
+        if self.config.mode != GlobalMode::Enforce
+            || self.exemptions.suppresses_rule_for_request(ctx)
+        {
             return false;
         }
-        if self.config.scoring.is_some() {
-            return true;
-        }
+        let scoring_enabled = self.config.scoring.is_some();
         let encoding = self.specials.encoding;
         let overlong_utf8 = self.specials.overlong_utf8;
         self.compiled.rules.iter().enumerate().any(|(index, rule)| {
-            if rule.action != RuleAction::Enforce {
+            if !rule.matches_conditions(ctx) {
                 return false;
             }
             let reads_body = match direction {
@@ -256,12 +260,14 @@ impl Waf {
                     matches!(rule.target, self::rules::RuleTarget::ResponseBody)
                 }
             };
-            reads_body || encoding == Some(index) || overlong_utf8 == Some(index)
+            let reads_direction =
+                reads_body || encoding == Some(index) || overlong_utf8 == Some(index);
+            reads_direction && (scoring_enabled || rule.action == RuleAction::Enforce)
         })
     }
 
-    fn has_enforcing_response_body_policy(&self) -> bool {
-        self.has_enforcing_body_policy(BodyDirection::Response)
+    fn has_enforcing_response_body_policy(&self, ctx: &RequestContext) -> bool {
+        self.has_enforcing_body_policy(BodyDirection::Response, ctx)
     }
 
     fn handle_unbounded_response_stream(&self, ctx: &mut RequestContext) -> PluginResult {
@@ -275,7 +281,7 @@ impl Waf {
             TooLargeAction::Skip => false,
             TooLargeAction::Block => self.config.mode == GlobalMode::Enforce,
             TooLargeAction::FailClosed | TooLargeAction::ScanTruncated => {
-                self.has_enforcing_response_body_policy()
+                self.has_enforcing_response_body_policy(ctx)
             }
         };
         if should_block {
@@ -729,7 +735,7 @@ impl Waf {
         let should_block = match self.config.on_body_too_large {
             // `Skip` short-circuited above; it is listed for exhaustiveness.
             TooLargeAction::Skip | TooLargeAction::ScanTruncated => false,
-            TooLargeAction::FailClosed => self.has_enforcing_body_policy(direction),
+            TooLargeAction::FailClosed => self.has_enforcing_body_policy(direction, ctx),
             TooLargeAction::Block => self.config.mode == GlobalMode::Enforce,
         };
         if should_block {

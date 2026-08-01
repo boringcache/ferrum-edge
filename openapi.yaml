@@ -18738,9 +18738,10 @@ components:
           default: fail_closed
           description: >-
             Behavior when a governed body exceeds max_scan_bytes. fail_closed
-            (default) rejects when that direction has an enforcing body rule or
-            anomaly scoring, and otherwise scans the prefix and records
-            truncation, so monitor-only policy never starts blocking.
+            (default) rejects when that direction has an applicable enforcing
+            body rule or anomaly scoring with an applicable body rule, and
+            otherwise scans the prefix and records truncation, so monitor-only
+            or conditionally out-of-scope policy never starts blocking.
             scan_truncated is the explicit compatibility opt-out that always
             scans only the prefix and forwards the complete body — prefix-only
             inspection lets a padded suffix carry blocked content past an

@@ -4501,6 +4501,127 @@ async fn anomaly_scoring_fails_closed_on_oversize_request_body() {
 }
 
 #[tokio::test]
+async fn scoped_enforcing_body_rule_only_fails_closed_when_conditions_match() {
+    let mut rule = enforcing_request_body_rule();
+    rule["conditions"] = json!({ "paths": ["/admin"] });
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "custom_rules": [rule]
+    }))
+    .unwrap();
+
+    let mut outside_scope = body_ctx();
+    let outside_headers = outside_scope.headers.clone();
+    let outside_result = plugin
+        .on_final_request_body_with_context(
+            &mut outside_scope,
+            &outside_headers,
+            &padded_body("needle"),
+        )
+        .await;
+    assert!(matches!(outside_result, PluginResult::Continue));
+    assert_eq!(
+        outside_scope
+            .metadata
+            .get("waf.scan_truncated")
+            .map(String::as_str),
+        Some("true"),
+        "an out-of-scope enforcing rule must not make unrelated routes block"
+    );
+
+    let mut in_scope = body_ctx();
+    in_scope.path = "/admin".to_string();
+    let in_scope_headers = in_scope.headers.clone();
+    let in_scope_result = plugin
+        .on_final_request_body_with_context(
+            &mut in_scope,
+            &in_scope_headers,
+            &padded_body("needle"),
+        )
+        .await;
+    assert!(matches!(in_scope_result, PluginResult::Reject { .. }));
+    assert_eq!(
+        in_scope
+            .metadata
+            .get("waf.block_reason")
+            .map(String::as_str),
+        Some("body_too_large")
+    );
+}
+
+#[tokio::test]
+async fn scoped_scoring_body_rule_only_fails_closed_when_conditions_match() {
+    let mut rule = monitor_request_body_rule();
+    rule["conditions"] = json!({ "methods": ["PUT"] });
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "scoring": { "enabled": true, "block_threshold": 5 },
+        "custom_rules": [rule]
+    }))
+    .unwrap();
+
+    let mut post = body_ctx();
+    let post_headers = post.headers.clone();
+    let post_result = plugin
+        .on_final_request_body_with_context(&mut post, &post_headers, &padded_body("needle"))
+        .await;
+    assert!(matches!(post_result, PluginResult::Continue));
+    assert_eq!(
+        post.metadata
+            .get("waf.scan_truncated")
+            .map(String::as_str),
+        Some("true"),
+        "scoring cannot block on a body rule whose conditions do not match"
+    );
+
+    let mut put = body_ctx();
+    put.method = "PUT".to_string();
+    let put_headers = put.headers.clone();
+    let put_result = plugin
+        .on_final_request_body_with_context(&mut put, &put_headers, &padded_body("needle"))
+        .await;
+    assert!(matches!(put_result, PluginResult::Reject { .. }));
+    assert_eq!(
+        put.metadata
+            .get("waf.block_reason")
+            .map(String::as_str),
+        Some("body_too_large")
+    );
+}
+
+#[tokio::test]
+async fn request_wide_header_exemption_prevents_oversize_fail_closed_block() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "global_exemptions": {
+            "header_present": { "x-waf-exempt": null }
+        },
+        "custom_rules": [enforcing_request_body_rule()]
+    }))
+    .unwrap();
+    let mut ctx = body_ctx();
+    ctx.headers
+        .insert("x-waf-exempt".to_string(), "true".to_string());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &padded_body("needle"))
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.scan_truncated")
+            .map(String::as_str),
+        Some("true"),
+        "a request-wide rule exemption must not become an oversize block"
+    );
+}
+
+#[tokio::test]
 async fn monitor_only_body_rules_still_prefix_scan_oversize_request_body() {
     // No enforcing body policy: the oversize body is observed, not blocked.
     let plugin = Waf::new(&json!({

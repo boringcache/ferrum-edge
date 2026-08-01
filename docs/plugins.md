@@ -4230,12 +4230,16 @@ is not a body control — a client (or a compromised backend) can pad
 `max_scan_bytes` of benign bytes and place the blocked content in the unscanned
 suffix. The default `on_body_too_large: fail_closed` therefore rejects such a
 body whenever that direction actually carries an enforcing body policy: global
-`mode: enforce` plus either anomaly `scoring` or at least one `action: enforce`
-rule reading `body_text` / `body_json_path` (request) or `response_body`
-(response), including the body-scoped `FE-ENCODING-001` / `FE-ENCODING-002`
-specials, which read both directions. The request and response paths use the
-same decision, so H1, H2, and H3 behave identically. A body whose length is
-*exactly* `max_scan_bytes` is fully scanned and never treated as oversize.
+`mode: enforce` plus either anomaly `scoring` with an applicable body rule or at
+least one applicable `action: enforce` rule reading `body_text` /
+`body_json_path` (request) or `response_body` (response), including the
+body-scoped `FE-ENCODING-001` / `FE-ENCODING-002` specials, which read both
+directions. A rule is applicable only when its path, method, header, and consumer
+conditions match the current request, and a request-wide
+`global_exemptions.header_present` match suppresses the fail-closed decision as
+well as rule hits. The request and response paths use the same decision, so H1,
+H2, and H3 behave identically. A body whose length is *exactly*
+`max_scan_bytes` is fully scanned and never treated as oversize.
 
 Monitor-only operation is unchanged: with `mode: monitor`, or with every body
 rule left at the built-in monitor default, an oversize body is prefix-scanned and

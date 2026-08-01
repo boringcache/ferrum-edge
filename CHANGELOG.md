@@ -104,13 +104,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to the new **`fail_closed`** value: a governed request or response body that
   does not fit inside `max_scan_bytes` is rejected whenever that direction
   actually carries an enforcing body policy — global `mode: enforce` plus either
-  anomaly `scoring` or at least one `action: enforce` rule reading `body_text` /
-  `body_json_path` (request) or `response_body` (response), including the
-  body-scoped `FE-ENCODING-001` / `FE-ENCODING-002` specials. Both directions
-  share one decision on the finalized backend-visible representation, so H1,
-  H2, and H3 behave identically and a request transformer that grows a body
-  past the cap is still governed. A body of exactly `max_scan_bytes` is scanned
-  in full and is not oversize.
+  anomaly `scoring` with an applicable body rule or at least one applicable
+  `action: enforce` rule reading `body_text` / `body_json_path` (request) or
+  `response_body` (response), including the body-scoped `FE-ENCODING-001` /
+  `FE-ENCODING-002` specials. Per-rule path, method, header, and consumer
+  conditions and request-wide `global_exemptions.header_present` suppression are
+  honored, so a scoped or exempted enforcing rule does not block an unrelated
+  request. Both directions share one decision on the finalized backend-visible
+  representation, so H1, H2, and H3 behave identically and a request transformer
+  that grows a body past the cap is still governed. A body of exactly
+  `max_scan_bytes` is scanned in full and is not oversize.
 
   Monitor-only operation is deliberately unaffected: with `mode: monitor`, or
   with every body rule left at the built-in monitor default, an oversize body is

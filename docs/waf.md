@@ -324,15 +324,19 @@ gateway's own default body ceilings (`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` /
 (`GHSA-7jh9-fjqf-jcvf`).
 
 "Carries an enforcing body policy" means global `mode: enforce` **and** either
-anomaly `scoring` is enabled or at least one `action: enforce` rule reads that
-direction's body — `body_text` / `body_json_path` for requests, `response_body`
-for responses, plus the body-scoped `FE-ENCODING-001` / `FE-ENCODING-002`
-specials, which read both. Built-in rules are monitor-only unless you set
-`default_rule_action` or `rule_modes`, so a purely observational WAF (and any
-`mode: monitor` WAF) keeps prefix-scanning and never starts blocking. Requests
-and responses share one decision, so H1, H2, and H3 behave identically, and the
-request decision is made on the finalized backend-visible body — a request
-transformer that grows a body past the cap is still governed.
+anomaly `scoring` has an applicable rule reading that direction's body or at
+least one applicable `action: enforce` rule reads it — `body_text` /
+`body_json_path` for requests, `response_body` for responses, plus the
+body-scoped `FE-ENCODING-001` / `FE-ENCODING-002` specials, which read both. A
+rule is applicable only when its path, method, header, and consumer conditions
+match the current request. A request-wide `global_exemptions.header_present`
+match also suppresses both rule hits and this fail-closed decision. Built-in
+rules are monitor-only unless you set `default_rule_action` or `rule_modes`, so
+a purely observational WAF (and any `mode: monitor` WAF) keeps prefix-scanning
+and never starts blocking. Requests and responses share one decision, so H1,
+H2, and H3 behave identically, and the request decision is made on the finalized
+backend-visible body — a request transformer that grows a body past the cap is
+still governed.
 
 Prefer sizing over rejecting where you can: setting `max_scan_bytes` at or above
 the effective request/response ceiling (including any route-scoped ceiling)
