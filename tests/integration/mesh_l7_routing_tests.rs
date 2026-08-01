@@ -416,12 +416,18 @@ async fn mesh_l7_routing_virtual_service_header_set_emits_request_transform() {
     );
 
     // End-to-end: when the dispatch rule matches, the per-rule Arc lands on
-    // the context, and applying it via the auto-emitted transformer rewrites
-    // headers. We exercise both halves via the plugin classes directly.
-    use ferrum_edge::plugins::request_transformer::RequestTransformer;
-    let mrd = MeshRouteDispatch::new(&dispatch.config).expect("mrd plugin");
-    let req_xform = RequestTransformer::new(&auto_xform.config).expect("auto request_transformer");
+    // the context, and the production before_proxy chain (including route-header
+    // finalization after the last eligible request_transformer) rewrites headers.
+    use ferrum_edge::_test_support::run_before_proxy_hooks_for_test;
+    use ferrum_edge::plugins::create_plugin;
+    let mrd = create_plugin("mesh_route_dispatch", &dispatch.config)
+        .expect("mrd plugin")
+        .expect("mesh_route_dispatch instance");
+    let req_xform = create_plugin("request_transformer", &auto_xform.config)
+        .expect("auto request_transformer")
+        .expect("request_transformer instance");
     assert!(req_xform.modifies_request_headers());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![mrd, req_xform];
 
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -430,8 +436,8 @@ async fn mesh_l7_routing_virtual_service_header_set_emits_request_transform() {
     );
     let mut headers = HashMap::new();
     headers.insert("x-debug".to_string(), "yes".to_string());
-    let _ = mrd.before_proxy(&mut ctx, &mut headers).await;
-    let _ = req_xform.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
     assert_eq!(headers.get("x-api-version").map(String::as_str), Some("v1"));
     assert_eq!(headers.get("x-trace").map(String::as_str), Some("added"));
     assert!(!headers.contains_key("x-debug"));
@@ -2143,10 +2149,16 @@ async fn matchless_virtualservice_preserves_header_transforms() {
     );
 
     // End-to-end: the dispatch catch-all rule matches any request, and the
-    // auto-emitted transformer applies the per-rule header overrides.
-    use ferrum_edge::plugins::request_transformer::RequestTransformer;
-    let mrd = MeshRouteDispatch::new(&dispatch.config).expect("mrd plugin");
-    let req_xform = RequestTransformer::new(&auto_xform.config).expect("auto request_transformer");
+    // production before_proxy chain applies the per-rule header overrides.
+    use ferrum_edge::_test_support::run_before_proxy_hooks_for_test;
+    use ferrum_edge::plugins::create_plugin;
+    let mrd = create_plugin("mesh_route_dispatch", &dispatch.config)
+        .expect("mrd plugin")
+        .expect("mesh_route_dispatch instance");
+    let req_xform = create_plugin("request_transformer", &auto_xform.config)
+        .expect("auto request_transformer")
+        .expect("request_transformer instance");
+    let plugins: Vec<Arc<dyn Plugin>> = vec![mrd, req_xform];
 
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -2155,8 +2167,8 @@ async fn matchless_virtualservice_preserves_header_transforms() {
     );
     let mut headers = HashMap::new();
     headers.insert("x-strip".to_string(), "should-go".to_string());
-    let _ = mrd.before_proxy(&mut ctx, &mut headers).await;
-    let _ = req_xform.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
     assert_eq!(
         headers.get("x-injected").map(String::as_str),
         Some("yes"),
@@ -2211,8 +2223,9 @@ async fn mesh_tier3_mirror_vs_emits_working_request_mirror_plugin() {
     );
     assert_eq!(mirror.config["mirror_port"].as_u64(), Some(9090));
 
-    // The emitted config builds into a real plugin instance, and a 100%
-    // mirror sets up a mirror result channel on the request context.
+    // The emitted config builds into a real plugin instance, and the
+    // finalized-request-egress phase for a 100% mirror sets up a mirror result
+    // channel on the request context.
     let plugin = create_plugin("request_mirror", &mirror.config)
         .expect("plugin builds")
         .expect("plugin is Some");
@@ -2223,9 +2236,13 @@ async fn mesh_tier3_mirror_vs_emits_working_request_mirror_plugin() {
     );
     // A matched_proxy is required so the mirror can derive its timeout budget.
     ctx.matched_proxy = Some(Arc::new(result.config.proxies[0].clone()));
-    let mut headers = HashMap::new();
-    let res = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let headers = HashMap::new();
+    let mut backend_header_overlay = HashMap::new();
+    let res = plugin
+        .dispatch_finalized_request_egress(&mut ctx, &headers, &[], &mut backend_header_overlay)
+        .await;
     assert!(matches!(res, PluginResult::Continue));
+    assert!(backend_header_overlay.is_empty());
     assert!(
         ctx.mirror_result_rxs.len() == 1,
         "a 100% mirror must arm the mirror result channel (request was mirrored)"

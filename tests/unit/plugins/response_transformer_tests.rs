@@ -972,6 +972,58 @@ async fn test_response_transformer_rejects_invalid_header_new_key() {
     assert!(err.contains("valid HTTP header name"), "got: {err}");
 }
 
+#[tokio::test]
+async fn test_response_transformer_rejects_protocol_managed_add_update_and_rename_destinations() {
+    for (operation, name) in [
+        ("add", "Connection"),
+        ("update", "CONTENT-LENGTH"),
+        ("add", "Transfer-Encoding"),
+        ("update", "trailer"),
+        ("add", "Upgrade"),
+        ("update", "Keep-Alive"),
+        ("add", "proxy-connection"),
+        ("update", "TE"),
+        ("add", "Proxy-Authenticate"),
+    ] {
+        let err = ResponseTransformer::new(&json!({
+            "rules": [{
+                "operation": operation,
+                "target": "header",
+                "key": name,
+                "value": "1",
+            }]
+        }))
+        .err()
+        .unwrap_or_else(|| panic!("expected rejection for {operation} {name}"));
+        assert!(
+            err.contains("protocol-managed"),
+            "{operation} {name}: {err}"
+        );
+    }
+
+    let rename_err = ResponseTransformer::new(&json!({
+        "rules": [{
+            "operation": "rename",
+            "target": "header",
+            "key": "x-framing",
+            "new_key": "Transfer-Encoding"
+        }]
+    }))
+    .err()
+    .expect("rename to Transfer-Encoding must be rejected");
+    assert!(rename_err.contains("protocol-managed"), "got: {rename_err}");
+
+    // remove of protocol-managed names remains allowed (harmless after origin strip).
+    ResponseTransformer::new(&json!({
+        "rules": [{
+            "operation": "remove",
+            "target": "header",
+            "key": "Connection"
+        }]
+    }))
+    .expect("remove Connection must remain allowed");
+}
+
 // ── JSON null value preservation on body rules ───────────────────────────
 
 #[tokio::test]
@@ -1282,7 +1334,8 @@ fn test_response_transformer_strong_etag_preflight_reports_conservative_capabili
 // ── Route-level transform overrides (`apply_route_overrides`) ──────────────
 
 use ferrum_edge::plugins::utils::route_header_transform::{
-    RawRouteHeaderTransformRule, parse_route_header_transforms,
+    RawRouteHeaderTransformRule, finalize_route_override_response_headers,
+    parse_route_header_transforms,
 };
 
 #[tokio::test]
@@ -1308,7 +1361,7 @@ async fn test_response_transformer_empty_rules_without_opt_in_still_errors() {
 async fn test_response_transformer_route_override_applies_after_static_rules() {
     // Static rule sets X-Backend=static; route-level override sets
     // X-Backend=route. Per documented precedence (static first, then
-    // per-rule), the route override must win.
+    // chain-level route finalization), the route override must win.
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
             {"operation": "update", "target": "header", "key": "X-Backend", "value": "static"}
@@ -1328,13 +1381,13 @@ async fn test_response_transformer_route_override_applies_after_static_rules() {
     let _ = plugin
         .after_proxy(&mut ctx, 200, &mut response_headers)
         .await;
+    finalize_route_override_response_headers(&mut ctx, &mut response_headers);
 
     assert_eq!(
         response_headers.get("x-backend").map(String::as_str),
         Some("route")
     );
-    // Plugin must consume the Arc so a subsequent response_transformer
-    // instance in the chain does not re-apply the same list.
+    // Chain-level finalization consumes the Arc exactly once.
     assert!(ctx.route_override_response_transform.is_none());
 }
 
@@ -1361,6 +1414,7 @@ async fn test_response_transformer_apply_route_overrides_no_static_rules_applies
     let _ = plugin
         .after_proxy(&mut ctx, 200, &mut response_headers)
         .await;
+    finalize_route_override_response_headers(&mut ctx, &mut response_headers);
     assert_eq!(
         response_headers.get("x-cache").map(String::as_str),
         Some("miss")
