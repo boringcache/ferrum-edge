@@ -2631,9 +2631,16 @@ impl Plugin for AiStreamRouter {
         if !content_type.is_some_and(is_event_stream_content_type) {
             return None;
         }
+        // Every replacement this normalizer produces is materialised inside a
+        // sink bounded by this response's retained ceiling — the same size as
+        // the window the phase reserved before invoking it
+        // (GHSA-pwcm-6rh8-f2gh). Claim-owned model/tools_forbidden above stay
+        // authoritative (`GHSA-xhp5-hqj8-3mwg`); do not re-read them from
+        // mutable metadata.
+        let ceiling = ctx.retained_response_body_ceiling();
         let header_encoding = match content_encoding_value(response_headers) {
             Ok(encoding) => encoding,
-            Err(message) => return Some(upstream_sse_error_body(&message)),
+            Err(message) => return bounded_upstream_sse_error_body(&message, ceiling),
         };
         let encoding = ctx
             .metadata
@@ -2643,10 +2650,10 @@ impl Plugin for AiStreamRouter {
         let plaintext = match prepare_sse_bytes_for_normalization(body, encoding) {
             Ok(bytes) => bytes,
             Err(message) => {
-                return Some(upstream_sse_error_body(&message));
+                return bounded_upstream_sse_error_body(&message, ceiling);
             }
         };
-        normalize_anthropic_sse_buffered(model, &plaintext, tools_forbidden).await
+        normalize_anthropic_sse_buffered(model, &plaintext, tools_forbidden, ceiling).await
     }
 
     /// Bind every field normalized Anthropic SSE invalidates.
@@ -2965,6 +2972,48 @@ fn upstream_sse_error_body(message: &str) -> Vec<u8> {
     format!("data: {err}\n\ndata: [DONE]\n\n").into_bytes()
 }
 
+/// [`upstream_sse_error_body`] under the response's retained ceiling.
+///
+/// The envelope shape is fixed, but `message` is derived from upstream-supplied
+/// material (a rejected `Content-Encoding`, a decode diagnostic), so the whole
+/// body is SERIALIZED THROUGH the bounded sink rather than built as a complete
+/// `Vec` that a bounded copy would only measure afterwards: the JSON string is
+/// written by `serde_json` straight into the sink, which stops at the ceiling
+/// (GHSA-pwcm-6rh8-f2gh). `None` (leave the response alone) is the fail-closed
+/// answer if a pathologically small ceiling cannot hold it.
+///
+/// The bytes are identical to `upstream_sse_error_body`'s: `serde_json`'s
+/// compact object rendering emits `message` before `type` under both insertion
+/// and lexicographic member ordering, and `to_writer` applies the same string
+/// escaping `Value`'s `Display` does.
+fn bounded_upstream_sse_error_body(message: &str, ceiling: usize) -> Option<Vec<u8>> {
+    use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+    let mut sink = BoundedResponseBodySink::with_ceiling(ceiling);
+    if !sink.push(br#"data: {"error":{"message":"#) {
+        return None;
+    }
+    // Only the string value goes through `serde_json`, so the escaping is the
+    // canonical one without an intermediate `Value` copy of `message`.
+    if serde_json::to_writer(&mut sink, message).is_err() {
+        return None;
+    }
+    if !sink.push(br#","type":"upstream_error"}}"#) || !sink.push(b"\n\ndata: [DONE]\n\n") {
+        return None;
+    }
+    sink.finish()
+}
+
+/// Bytes fed to the buffered normalizer per driver call.
+///
+/// This is a WORKING-SET choice, not the memory bound: the bound is
+/// [`NormalizedSseOut`], which every normalized byte is written through from the
+/// first byte under this response's retained ceiling (GHSA-pwcm-6rh8-f2gh).
+/// Slicing the input keeps one call's parse/transcode working set small and
+/// makes the buffered path drive the normalizer exactly as a provider that
+/// chunked its stream this way would, so the shared streaming inspector
+/// contract — cumulative event, byte, and output accounting — is unchanged.
+const BUFFERED_NORMALIZE_CHUNK_BYTES: usize = 16 * 1024;
+
 fn wrap_anthropic_normalizer(
     model: String,
     encoding: Option<&str>,
@@ -3117,6 +3166,110 @@ pub const MAX_SSE_EVENT_JSON_DEPTH: usize = 32;
 /// half the buffer) so total copy work stays linear in input size.
 const SSE_BUFFER_COMPACT_THRESHOLD: usize = 8192;
 
+/// The normalizer's output seam: every normalized byte is written through it,
+/// under a ceiling, from the first byte.
+///
+/// The streaming inspector contract hands one emission back per driver call, so
+/// the obvious implementation accumulates that call's output in a `String` and
+/// returns it — which on the BUFFERED path is a complete would-be replacement
+/// materialised outside any bounded sink (GHSA-pwcm-6rh8-f2gh). Slicing the
+/// input smaller does not fix it: the transcoded expansion of one slice is
+/// bounded by a CONSTANT, not by this response's retained ceiling, so a small
+/// route-effective ceiling could still be exceeded by a transient nobody
+/// measured.
+///
+/// So the accumulator itself is the bound. The buffered path constructs ONE of
+/// these at the response's retained ceiling and drives every call into it, so
+/// the producer's whole transient is the output it is building — one ceiling,
+/// not two — and an over-ceiling normalization is refused while it is being
+/// written. The streaming path constructs an unbounded one per call, which is
+/// byte-for-byte what it did before: nothing is retained there.
+///
+/// `begin_call` / `reset_call` exist for one internal seam: the cumulative
+/// normalized-output bound may replace the CURRENT call's emission with a fixed
+/// diagnostic. That rollback must not discard emissions from earlier calls, so
+/// it truncates to the call's start mark rather than clearing the buffer.
+pub(crate) struct NormalizedSseOut {
+    sink: crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+    /// Length at the start of the current driver call.
+    call_start: usize,
+    /// A write was refused. Sticky across the rest of the call, and cleared only
+    /// by a `reset_call` that abandons the emission the refusal belongs to.
+    refused: bool,
+}
+
+impl NormalizedSseOut {
+    /// A per-call accumulator for the STREAMING path, which retains nothing.
+    fn unbounded() -> Self {
+        Self::with_ceiling(usize::MAX)
+    }
+
+    fn with_ceiling(ceiling: usize) -> Self {
+        Self {
+            sink: crate::proxy::response_buffer_budget::BoundedResponseBodySink::with_ceiling(
+                ceiling,
+            ),
+            call_start: 0,
+            refused: false,
+        }
+    }
+
+    /// Mark the start of one driver (`on_chunk` / `on_end`) emission.
+    fn begin_call(&mut self) {
+        self.call_start = self.sink.len();
+    }
+
+    /// Abandon everything this call emitted, keeping earlier calls intact.
+    fn reset_call(&mut self) {
+        self.sink.truncate(self.call_start);
+        self.refused = self.sink.overflowed();
+    }
+
+    fn push_str(&mut self, text: &str) {
+        if !self.sink.push(text.as_bytes()) {
+            self.refused = true;
+        }
+    }
+
+    /// Emit one `data: <json>\n\n` SSE line without building it as a `String`
+    /// first. `serde_json` writes the compact form straight through the sink,
+    /// which is byte-identical to `Value`'s own `Display`.
+    fn write_sse_data_line(&mut self, payload: &Value) {
+        self.push_str("data: ");
+        if serde_json::to_writer(&mut self.sink, payload).is_err() {
+            self.refused = true;
+        }
+        self.push_str("\n\n");
+    }
+
+    /// Bytes emitted so far in THIS call — what the cumulative-output bound
+    /// measures.
+    fn len(&self) -> usize {
+        self.sink.len().saturating_sub(self.call_start)
+    }
+
+    /// Whether any write was refused by the ceiling. The buffered driver treats
+    /// this as fail-closed; the unbounded streaming accumulator cannot set it.
+    fn refused(&self) -> bool {
+        self.refused
+    }
+
+    /// The bytes this call emitted, for the streaming inspector's per-call
+    /// `Bytes`. An unbounded accumulator never refuses, so the `None` arm is a
+    /// checked impossibility rather than an expected outcome.
+    fn take_call_bytes(self) -> Vec<u8> {
+        self.sink.finish().unwrap_or_default()
+    }
+
+    /// The complete accumulated replacement, or `None` when a write was refused.
+    fn finish(self) -> Option<Vec<u8>> {
+        if self.refused {
+            return None;
+        }
+        self.sink.finish()
+    }
+}
+
 /// How a stream reached its terminal OpenAI sentinel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamTerminal {
@@ -3244,8 +3397,14 @@ impl AnthropicSseNormalizer {
         id
     }
 
-    /// Envelope a single OpenAI streaming `choices[0].delta` as an SSE line.
-    fn chunk_line(&mut self, delta: Value, finish_reason: Option<&str>) -> String {
+    /// Envelope a single OpenAI streaming `choices[0].delta` as an SSE line,
+    /// written straight into the bounded accumulator.
+    fn write_chunk_line(
+        &mut self,
+        delta: Value,
+        finish_reason: Option<&str>,
+        out: &mut NormalizedSseOut,
+    ) {
         let id = self.id();
         let payload = json!({
             "id": id,
@@ -3258,12 +3417,13 @@ impl AnthropicSseNormalizer {
                 "finish_reason": finish_reason,
             }],
         });
-        format!("data: {payload}\n\n")
+        out.write_sse_data_line(&payload);
     }
 
-    fn usage_line(&mut self) -> Option<String> {
+    /// The final usage chunk, written through the same bounded accumulator.
+    fn write_usage_line(&mut self, out: &mut NormalizedSseOut) {
         let (Some(p), Some(c)) = (self.prompt_tokens, self.completion_tokens) else {
-            return None;
+            return;
         };
         let id = self.id();
         let payload = json!({
@@ -3278,20 +3438,20 @@ impl AnthropicSseNormalizer {
                 "total_tokens": p + c,
             },
         });
-        Some(format!("data: {payload}\n\n"))
+        out.write_sse_data_line(&payload);
     }
 
-    fn emit_upstream_error(&mut self, message: &str, out: &mut String) {
+    fn emit_upstream_error(&mut self, message: &str, out: &mut NormalizedSseOut) {
         let err = json!({
             "error": {
                 "message": message,
                 "type": "upstream_error",
             }
         });
-        out.push_str(&format!("data: {err}\n\n"));
+        out.write_sse_data_line(&err);
     }
 
-    fn fail_bound(&mut self, message: &'static str, out: &mut String) {
+    fn fail_bound(&mut self, message: &'static str, out: &mut NormalizedSseOut) {
         self.clear_buffer();
         self.emit_upstream_error(message, out);
         self.finish(StreamTerminal::ProviderError, out);
@@ -3299,7 +3459,7 @@ impl AnthropicSseNormalizer {
 
     /// Transcode one Anthropic event JSON into zero or more OpenAI SSE lines.
     /// Returns whether the upstream inspector driver should terminate now.
-    fn transcode_event(&mut self, event: &Value, out: &mut String) -> bool {
+    fn transcode_event(&mut self, event: &Value, out: &mut NormalizedSseOut) -> bool {
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
                 if self.message_started {
@@ -3323,7 +3483,7 @@ impl AnthropicSseNormalizer {
                 }
                 if !self.role_emitted {
                     self.role_emitted = true;
-                    out.push_str(&self.chunk_line(json!({ "role": "assistant" }), None));
+                    self.write_chunk_line(json!({ "role": "assistant" }), None, out);
                 }
                 false
             }
@@ -3347,7 +3507,7 @@ impl AnthropicSseNormalizer {
                     self.tool_indices.insert(index, tool_index);
                     let id = block.get("id").and_then(Value::as_str).unwrap_or("");
                     let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-                    out.push_str(&self.chunk_line(
+                    self.write_chunk_line(
                         json!({
                             "tool_calls": [{
                                 "index": tool_index,
@@ -3357,7 +3517,8 @@ impl AnthropicSseNormalizer {
                             }]
                         }),
                         None,
-                    ));
+                        out,
+                    );
                 }
                 false
             }
@@ -3371,7 +3532,7 @@ impl AnthropicSseNormalizer {
                     Some("text_delta") => {
                         if let Some(text) = delta.get("text").and_then(Value::as_str) {
                             self.ensure_role(out);
-                            out.push_str(&self.chunk_line(json!({ "content": text }), None));
+                            self.write_chunk_line(json!({ "content": text }), None, out);
                         }
                     }
                     Some("input_json_delta") => {
@@ -3385,7 +3546,7 @@ impl AnthropicSseNormalizer {
                         }
                         if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
                             let tool_index = self.tool_indices.get(&index).copied().unwrap_or(0);
-                            out.push_str(&self.chunk_line(
+                            self.write_chunk_line(
                                 json!({
                                     "tool_calls": [{
                                         "index": tool_index,
@@ -3393,7 +3554,8 @@ impl AnthropicSseNormalizer {
                                     }]
                                 }),
                                 None,
-                            ));
+                                out,
+                            );
                         }
                     }
                     // thinking_delta / signature_delta and unknown deltas carry
@@ -3419,7 +3581,7 @@ impl AnthropicSseNormalizer {
                     return true;
                 }
                 let finish = map_stop_reason(stop_reason);
-                out.push_str(&self.chunk_line(json!({}), Some(finish)));
+                self.write_chunk_line(json!({}), Some(finish), out);
                 false
             }
             Some("message_stop") => {
@@ -3445,14 +3607,14 @@ impl AnthropicSseNormalizer {
         }
     }
 
-    fn ensure_role(&mut self, out: &mut String) {
+    fn ensure_role(&mut self, out: &mut NormalizedSseOut) {
         if !self.role_emitted {
             self.role_emitted = true;
-            out.push_str(&self.chunk_line(json!({ "role": "assistant" }), None));
+            self.write_chunk_line(json!({ "role": "assistant" }), None, out);
         }
     }
 
-    fn require_message_start(&mut self, event_type: &str, out: &mut String) -> bool {
+    fn require_message_start(&mut self, event_type: &str, out: &mut NormalizedSseOut) -> bool {
         if self.message_started {
             return true;
         }
@@ -3466,16 +3628,14 @@ impl AnthropicSseNormalizer {
 
     /// Emit the final usage chunk (when successful) and the OpenAI `[DONE]`
     /// sentinel exactly once.
-    fn finish(&mut self, terminal: StreamTerminal, out: &mut String) {
+    fn finish(&mut self, terminal: StreamTerminal, out: &mut NormalizedSseOut) {
         if self.done_emitted {
             return;
         }
         self.done_emitted = true;
         self.terminal = Some(terminal);
-        if terminal == StreamTerminal::MessageStop
-            && let Some(usage) = self.usage_line()
-        {
-            out.push_str(&usage);
+        if terminal == StreamTerminal::MessageStop {
+            self.write_usage_line(out);
         }
         out.push_str("data: [DONE]\n\n");
     }
@@ -3528,7 +3688,7 @@ impl AnthropicSseNormalizer {
         }
     }
 
-    fn apply_frame_outcome(&mut self, outcome: FrameOutcome, out: &mut String) -> bool {
+    fn apply_frame_outcome(&mut self, outcome: FrameOutcome, out: &mut NormalizedSseOut) -> bool {
         match outcome {
             FrameOutcome::Ignore => false,
             FrameOutcome::Event(event) => self.transcode_event(&event, out),
@@ -3543,7 +3703,7 @@ impl AnthropicSseNormalizer {
     /// Drain every complete in-limit SSE event currently buffered, transcoding
     /// each from a cursor slice (no front-`drain(..).collect()`). Returns
     /// whether the stream should terminate immediately.
-    fn drain_complete(&mut self, out: &mut String) -> bool {
+    fn drain_complete(&mut self, out: &mut NormalizedSseOut) -> bool {
         loop {
             let end = {
                 let scan_start = self.scan_cursor.max(self.cursor).min(self.buf.len());
@@ -3595,7 +3755,7 @@ impl AnthropicSseNormalizer {
         false
     }
 
-    fn normalized_output_exceeded(&mut self, out: &mut String, terminal: bool) -> bool {
+    fn normalized_output_exceeded(&mut self, out: &mut NormalizedSseOut, terminal: bool) -> bool {
         let total = self.normalized_out_bytes.saturating_add(out.len());
         let allowed = if terminal {
             MAX_SSE_NORMALIZED_OUTPUT_BYTES
@@ -3612,7 +3772,13 @@ impl AnthropicSseNormalizer {
         // any provider-controlled error message and an already-appended
         // sentinel, with the fixed bound diagnostic. Prior non-terminal calls
         // always retained enough room for this payload.
-        out.clear();
+        //
+        // On the buffered path the accumulator spans several calls, so this
+        // rolls back to the start of the CURRENT call rather than clearing
+        // everything — the emissions already handed to the client on the
+        // streaming path are the ones a buffered response has already
+        // accumulated, and neither may be rewritten retroactively.
+        out.reset_call();
         self.done_emitted = false;
         self.terminal = None;
         self.fail_bound(SSE_NORMALIZED_OUTPUT_LIMIT_MESSAGE, out);
@@ -3636,7 +3802,7 @@ impl AnthropicSseNormalizer {
 
     /// Ingest `chunk`, enforcing all resource bounds before expensive work.
     /// Returns whether the stream should terminate.
-    fn push_chunk(&mut self, mut chunk: &[u8], out: &mut String) -> bool {
+    fn push_chunk(&mut self, mut chunk: &[u8], out: &mut NormalizedSseOut) -> bool {
         if let Err(message) = self.account_ingested(chunk.len()) {
             self.fail_bound(message, out);
             return true;
@@ -3671,7 +3837,7 @@ impl AnthropicSseNormalizer {
     /// Terminal EOF handling. Always ends the OpenAI stream: every path emits a
     /// terminal frame (or reuses one already emitted), so there is no
     /// "continue reading" outcome to report back.
-    fn finish_stream(&mut self, out: &mut String) {
+    fn finish_stream(&mut self, out: &mut NormalizedSseOut) {
         if self.drain_complete(out) {
             return;
         }
@@ -3746,8 +3912,29 @@ impl AnthropicSseNormalizer {
         let _ = self.normalized_output_exceeded(out, true);
     }
 
-    fn commit_forwarded(&mut self, out: &str) {
+    fn commit_forwarded(&mut self, out: &NormalizedSseOut) {
         self.normalized_out_bytes = self.normalized_out_bytes.saturating_add(out.len());
+    }
+
+    /// One driver call against a caller-owned accumulator. The trait impl below
+    /// binds an unbounded per-call one (streaming retains nothing); the buffered
+    /// path binds ONE ceiling-bounded accumulator across every call, so the
+    /// producer's whole transient is the replacement it is building.
+    ///
+    /// Returns whether the stream should terminate.
+    fn drive_chunk(&mut self, chunk: &[u8], out: &mut NormalizedSseOut) -> bool {
+        out.begin_call();
+        if self.push_chunk(chunk, out) {
+            return true;
+        }
+        self.commit_forwarded(out);
+        false
+    }
+
+    /// [`Self::drive_chunk`] for end-of-stream.
+    fn drive_end(&mut self, out: &mut NormalizedSseOut) {
+        out.begin_call();
+        self.finish_stream(out);
     }
 }
 
@@ -3761,21 +3948,20 @@ impl ResponseStreamInspector for AnthropicSseNormalizer {
         if self.done_emitted {
             return ResponseStreamAction::Terminate(None);
         }
-        let mut out = String::new();
-        if self.push_chunk(chunk, &mut out) {
-            return ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())));
+        let mut out = NormalizedSseOut::unbounded();
+        if self.drive_chunk(chunk, &mut out) {
+            return ResponseStreamAction::Terminate(Some(Bytes::from(out.take_call_bytes())));
         }
-        self.commit_forwarded(&out);
-        ResponseStreamAction::Forward(Bytes::from(out.into_bytes()))
+        ResponseStreamAction::Forward(Bytes::from(out.take_call_bytes()))
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {
         if self.done_emitted {
             return ResponseStreamAction::Terminate(None);
         }
-        let mut out = String::new();
-        self.finish_stream(&mut out);
-        ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())))
+        let mut out = NormalizedSseOut::unbounded();
+        self.drive_end(&mut out);
+        ResponseStreamAction::Terminate(Some(Bytes::from(out.take_call_bytes())))
     }
 }
 
@@ -3808,10 +3994,11 @@ impl ContentDecodingNormalizer {
     }
 
     async fn fail_decode(&mut self, message: String) -> ResponseStreamAction {
-        let mut out = String::new();
+        let mut out = NormalizedSseOut::unbounded();
+        out.begin_call();
         self.inner.emit_upstream_error(&message, &mut out);
         self.inner.finish(StreamTerminal::UpstreamFailure, &mut out);
-        ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())))
+        ResponseStreamAction::Terminate(Some(Bytes::from(out.take_call_bytes())))
     }
 }
 
@@ -3918,29 +4105,47 @@ impl ResponseStreamInspector for ImmediateUpstreamErrorNormalizer {
     }
 }
 
+/// Buffered Anthropic→OpenAI SSE normalization, written into a
+/// `ceiling`-bounded accumulator from the FIRST normalized byte
+/// (GHSA-pwcm-6rh8-f2gh).
+///
+/// The accumulator is constructed once and every driver call writes into it, so
+/// there is no per-call `Bytes` that a bounded copy would only measure
+/// afterwards, and no transient whose size is a constant rather than this
+/// response's retained ceiling. The normalizer's own logic is untouched: it is
+/// driven in [`BUFFERED_NORMALIZE_CHUNK_BYTES`] slices through the same
+/// `push_chunk` / `finish_stream` path the streaming inspector uses, with the
+/// same cumulative event/byte/output accounting, and the same per-call rollback
+/// seam for its cumulative-output bound.
+///
+/// `None` — leave the response unchanged — is the fail-closed answer when a
+/// write is refused, exactly as an over-ceiling final document already was.
 async fn normalize_anthropic_sse_buffered(
     model: String,
     body: &[u8],
     tools_forbidden: bool,
+    ceiling: usize,
 ) -> Option<Vec<u8>> {
     let mut normalizer = AnthropicSseNormalizer::new(model, tools_forbidden);
-    let mut out = Vec::new();
-    match normalizer.on_chunk(body).await {
-        ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
-        ResponseStreamAction::Terminate(bytes) => {
-            if let Some(bytes) = bytes {
-                out.extend_from_slice(&bytes);
-            }
-            return Some(out);
+    let mut out = NormalizedSseOut::with_ceiling(ceiling);
+    // `chunks` yields nothing for an empty body, which is the same "no chunk
+    // was ever offered" state a stream that ended immediately presents.
+    for slice in body.chunks(BUFFERED_NORMALIZE_CHUNK_BYTES) {
+        if normalizer.done_emitted {
+            break;
+        }
+        let terminate = normalizer.drive_chunk(slice, &mut out);
+        if out.refused() {
+            return None;
+        }
+        if terminate {
+            return out.finish();
         }
     }
-    match normalizer.on_end().await {
-        ResponseStreamAction::Forward(bytes) | ResponseStreamAction::Terminate(Some(bytes)) => {
-            out.extend_from_slice(&bytes)
-        }
-        ResponseStreamAction::Terminate(None) => {}
+    if !normalizer.done_emitted {
+        normalizer.drive_end(&mut out);
     }
-    Some(out)
+    out.finish()
 }
 
 fn map_stop_reason(reason: Option<&str>) -> &'static str {
@@ -4068,14 +4273,15 @@ mod sse_buffer_tests {
     fn cursor_compaction_stays_linear_for_many_small_events() {
         let mut normalizer = AnthropicSseNormalizer::new("claude-test".to_string(), false);
         let event = b"data: {\"type\":\"ping\"}\n\n";
-        let mut out = String::new();
+        let mut out = NormalizedSseOut::unbounded();
         let iterations = 4_096usize;
         for _ in 0..iterations {
+            out.begin_call();
             assert!(
                 !normalizer.push_chunk(event, &mut out),
                 "ping flood under event-count cap must not terminate"
             );
-            out.clear();
+            out.reset_call();
         }
         assert_eq!(normalizer.events_seen, iterations);
         assert_eq!(normalizer.unread_len(), 0);

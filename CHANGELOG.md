@@ -197,6 +197,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Buffered response bodies the gateway retains are now bounded per response and
+  in aggregate, and every retained allocation is charged before it exists
+  (GHSA-pwcm-6rh8-f2gh). `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0` ("unlimited")
+  remains a streaming policy but folds to a finite fail-closed ceiling whenever
+  a body is retained, and a new process-wide budget
+  (`FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES`, default 256 MiB, charged in 64 KiB
+  blocks) caps what all concurrent buffered responses hold at once. The charge
+  is owned by the allocation rather than by the request, so it survives the
+  collector's return and is released when the last handle drops — covering
+  retries, plugin replacement, the response cache entry copy, deadlines,
+  disconnects, and cancellation identically. What is charged is CAPACITY, not
+  payload length: collectors pick their own growth target and reserve it before
+  asking the allocator, preallocation hints are charged before they are
+  allocated, and the eager small-response paths collect through that same
+  collector instead of awaiting an opaque whole-body read (a declared
+  `Content-Length` is a backend claim, not proof of the capacity handed out).
+  Representation decodes charge their output capacity, their stacked
+  input+output peak, and a conservative per-codec working-set ceiling. Plugins
+  that replace a buffered response body (`response_transformer` body rules,
+  `compression`, `sse`, `grpc_web`, `mcp_gateway`, and the AI response
+  plugins) now run inside a reserved window: a full covering window is a
+  precondition of every producer invocation, refilled only after the previous
+  replacement was installed, and each producer materialises its output through
+  a ceiling-bounded sink so an oversized replacement is refused while it is
+  written rather than after it is resident. A plugin whose replacement contract
+  the gateway cannot prove — any out-of-tree plugin that does not declare
+  `Plugin::response_body_production()` — is refused rather than invoked, and a
+  chain that cannot rewrite reserves no window at all. Refusals are separated
+  by cause: a body past the per-response ceiling keeps its backend
+  `response_body_too_large` attribution, while an exhausted aggregate budget is
+  the gateway-local, health-neutral `gateway_buffer_capacity` terminal
+  (HTTP `503` / gRPC `RESOURCE_EXHAUSTED`) with a fixed redacted body, so it
+  never poisons circuit breaking, passive health, or adaptive concurrency.
+  "Materialises through a ceiling-bounded sink" now holds from the first output
+  byte in every declared producer, not just at the point the finished bytes are
+  installed: `sse` frames its wrapped event incrementally over the input instead
+  of building normalized full-body `String` copies, `ai_response_guard`
+  assembles redacted SSE one event at a time, applies its regex pattern passes
+  under one shared ceiling, and re-frames redacted protobuf straight into the
+  bounded output, `ai_stream_router` serializes its upstream-error envelope
+  through the sink and drives the buffered Anthropic normalizer in fixed-size
+  slices, and `grpc_web` streams base64 armouring into the sink rather than
+  holding a second complete encoded copy. Multi-pattern whole-body text redaction
+  keeps the prior pass buffer live while building the next inside one
+  ceiling-sized window, so allocator capacity slack can reduce the largest
+  redactable body to well below the per-response ceiling (often on the order of
+  half or less, depending on pattern count) and fail closed rather than
+  forwarding partially redacted bytes. `ai_response_guard`'s SSE
+  fail-closed residual check builds its candidate body under a reserved budget
+  window as well. That keeps the documented worst-case peak of a rewriting
+  response at exactly two ceilings (the old body plus one covering window).
+  Three residual holes in that construction-side bound are closed with it.
+  `grpc_web` no longer builds a complete trailer payload — every eligible,
+  upstream-controlled `(name, value)` cloned into an owned vector — before
+  copying or armouring it: the frame's declared length now comes from a bounded
+  counting pass that retains no value, and a second pass writes the payload
+  straight into the final bounded destination, so neither a complete payload nor
+  a complete binary preimage is ever resident beside the output. gRPC-Web
+  **text**-mode bodies that concatenate independently padded base64 segments
+  (one padded run per upstream flush boundary) are now accepted at reframing time,
+  decoded as one framed stream, and re-emitted as a single canonical standard
+  base64 body — original flush segment boundaries are not preserved on output.
+  The buffered
+  Anthropic SSE normalizer writes every normalized byte through an accumulator
+  bound to the response's own retained ceiling rather than returning a complete
+  expanded emission per call, so a small route-effective ceiling is enforced
+  from the first output byte instead of only after a constant-sized transient.
+  `ai_response_guard` reserves a real budget window for the two remaining
+  full-size candidates it builds during inspection (the JSON/content residual
+  scan and the native-gRPC redaction preflight), treating a refused window as a
+  rejection; and a detected `redact` that never produced a safe replacement is
+  now tracked in typed request state and rejected at the final response-body
+  hook, because a refused construction returns "no replacement", which a
+  transform loop would otherwise read as "unchanged" and forward the original
+  sensitive body. The reserve-then-fill sink seam hands its producer a target
+  limited to exactly the room it was admitted for, and no longer skips the fill
+  and its length check for a zero-length append.
+
 - `ai_stream_router` now enforces its provider credential and model policy
   against the **final** backend-visible request instead of only at claim time
   (GHSA-xhp5-hqj8-3mwg). The plugin selected a provider, stripped client
