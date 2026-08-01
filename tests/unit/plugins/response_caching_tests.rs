@@ -670,9 +670,10 @@ async fn base_cache_key_cache_control_exclusion_is_value_aware() {
         "recognized no-store must remain under the original partition for replacement"
     );
 
-    let pure_pair = staged_base_cache_key(&plugin, path, &[("cache-control", "no-cache, no-store")])
-        .await
-        .expect("pure no-cache/no-store pair must stage a base key");
+    let pure_pair =
+        staged_base_cache_key(&plugin, path, &[("cache-control", "no-cache, no-store")])
+            .await
+            .expect("pure no-cache/no-store pair must stage a base key");
     assert_eq!(
         pure_pair, baseline,
         "a header of only honored refresh members must stay under the original partition"
