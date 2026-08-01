@@ -1944,6 +1944,52 @@ pub(crate) enum RouteOverrideDnsPolicy {
     ClearInherited,
 }
 
+/// Outcome of a claimed, ceiling-bounded response-body construction.
+///
+/// Context-aware production hooks map this back to `Option<Vec<u8>>` while
+/// recording [`RequestContext::mark_buffered_response_capacity_refusal_pending`] on
+/// [`BoundedResponseBodyConstruction::CapacityRefused`]. Ordinary unclaimed /
+/// ineligible / malformed / semantic no-op paths stay
+/// [`BoundedResponseBodyConstruction::Unchanged`] so the shared transform loop
+/// continues to treat them as no-ops.
+#[derive(Debug)]
+pub(crate) enum BoundedResponseBodyConstruction {
+    /// Replacement bytes constructed under the retained ceiling.
+    Replaced(Vec<u8>),
+    /// Ordinary no-op: not claimed, ineligible, malformed, or semantically
+    /// unchanged.
+    Unchanged,
+    /// The producer claimed a rewrite, but the ceiling-bounded sink refused.
+    CapacityRefused,
+}
+
+impl BoundedResponseBodyConstruction {
+    /// Map a private bounded-construction outcome onto the public
+    /// `Option<Vec<u8>>` Plugin surface, marking a pending capacity refusal
+    /// when construction was refused.
+    #[must_use]
+    pub(crate) fn into_transform_option(self, ctx: &mut RequestContext) -> Option<Vec<u8>> {
+        match self {
+            Self::Replaced(bytes) => Some(bytes),
+            Self::Unchanged => None,
+            Self::CapacityRefused => {
+                ctx.mark_buffered_response_capacity_refusal_pending();
+                None
+            }
+        }
+    }
+
+    /// Context-free compatibility mapping: capacity refusals collapse to
+    /// `None` without a request-scoped signal (no `RequestContext` to mark).
+    #[must_use]
+    pub(crate) fn into_option(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Replaced(bytes) => Some(bytes),
+            Self::Unchanged | Self::CapacityRefused => None,
+        }
+    }
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -3868,8 +3914,11 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
             gateway_capacity_response_selected: self.gateway_capacity_response_selected,
-            buffered_response_capacity_refusal_pending: self
-                .buffered_response_capacity_refusal_pending,
+            // Final request-body hooks cannot produce a response-body capacity
+            // refusal. Keep the live response path's one-shot signal on the
+            // original context instead of duplicating it into this compatibility
+            // clone, where it could be consumed or copied back spuriously.
+            buffered_response_capacity_refusal_pending: false,
             response_cache_hit: self.response_cache_hit,
             origin_http_response_status: self.origin_http_response_status,
             // Omit `request_body` (the full buffered prompt): no

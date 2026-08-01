@@ -2970,15 +2970,27 @@ where
                     }
                 ) {
                     for plugin in plugins {
-                        if let Some(transformed) = plugin
+                        let transformed = plugin
                             .transform_response_body_with_context(
                                 &mut *ctx,
                                 &response_body,
                                 content_type_of(&response_headers),
                                 &response_headers,
                             )
-                            .await
-                        {
+                            .await;
+                        if crate::proxy::install_pending_buffered_response_capacity_refusal(
+                            ctx,
+                            &mut response_status,
+                            &mut response_headers,
+                            &mut response_body,
+                            crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(
+                                initial_response_header_policy_plugins,
+                            ),
+                        ) {
+                            response_body_rejected = true;
+                            break;
+                        }
+                        if let Some(transformed) = transformed {
                             response_headers.insert(
                                 "content-length".to_string(),
                                 transformed.len().to_string(),
@@ -5060,6 +5072,8 @@ where
                         &mut authoritative_trailers_only_terminal_metadata,
                     );
                     let _ = ctx.take_buffered_initial_response_header_policy();
+                    terminal_metadata_is_body_framed |=
+                        client_terminal_metadata_is_body_framed;
                 } else {
                     // Same ordering contract as the transform phase below: the
                     // decode-only normalize rewrite must not let the trailer
@@ -5116,6 +5130,8 @@ where
                                     &mut authoritative_trailers_only_terminal_metadata,
                                 );
                                 let _ = ctx.take_buffered_initial_response_header_policy();
+                                terminal_metadata_is_body_framed |=
+                                    client_terminal_metadata_is_body_framed;
                                 response_body_rejected = true;
                                 break;
                             }
@@ -5233,6 +5249,7 @@ where
                     {
                         Ok(transformed) => transformed,
                         Err(()) => {
+                            let _ = ctx.take_buffered_response_capacity_refusal_pending();
                             replace_buffered_grpc_response_with_deadline(
                                 ctx,
                                 &mut response_status,
@@ -5253,6 +5270,26 @@ where
                             break;
                         }
                     };
+                    if crate::proxy::install_pending_buffered_response_capacity_refusal(
+                        ctx,
+                        &mut response_status,
+                        &mut plugin_response_headers,
+                        &mut response_body,
+                        crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(
+                            initial_response_header_policy_plugins,
+                        ),
+                    ) {
+                        crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+                            &plugin_response_headers,
+                            &mut response_trailers,
+                            &mut authoritative_trailers_only_terminal_metadata,
+                        );
+                        let _ = ctx.take_buffered_initial_response_header_policy();
+                        terminal_metadata_is_body_framed |=
+                            grpc_web_response_content_type.is_some();
+                        response_body_rejected = true;
+                        break;
+                    }
                     if let Some(transformed) = transformed {
                         plugin_response_headers
                             .insert("content-length".to_string(), transformed.len().to_string());

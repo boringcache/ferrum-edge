@@ -2952,4 +2952,8 @@ fn authoritative_capacity_terminal_is_consulted_before_later_body_phases() {
         proxy.contains("if ctx.gateway_capacity_response_selected()"),
         "transform/admit entry must short-circuit on an authoritative capacity terminal"
     );
+    assert!(
+        proxy.contains("terminal_gateway_capacity"),
+        "reject-path response replacers must not overwrite an authoritative capacity terminal"
+    );
 }

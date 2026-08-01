@@ -220,13 +220,15 @@ impl ResponseTransformer {
         body: &[u8],
         content_type: Option<&str>,
         ceiling: usize,
-    ) -> Option<Vec<u8>> {
+    ) -> crate::plugins::BoundedResponseBodyConstruction {
+        use crate::plugins::BoundedResponseBodyConstruction;
+
         if !self.rules_enabled {
-            return None;
+            return BoundedResponseBodyConstruction::Unchanged;
         }
         // Framed gRPC is declined explicitly rather than left to fail inside
-        // `apply_body_rules`. Both routes return `None`, but only the explicit
-        // decline makes the media-type condition here symmetric with
+        // `apply_body_rules`. Both routes return `Unchanged`, but only the
+        // explicit decline makes the media-type condition here symmetric with
         // `enforces_response_body_policy` by construction, so the claim
         // predicate and the enforcer cannot drift apart on the `+json` gRPC
         // types that satisfy `is_json_content_type`.
@@ -234,7 +236,7 @@ impl ResponseTransformer {
             && (!body_transform::is_json_content_type(ct)
                 || body_transform::is_framed_grpc_content_type(ct))
         {
-            return None;
+            return BoundedResponseBodyConstruction::Unchanged;
         }
         body_transform::apply_body_rules_bounded(body, &self.body_rules, ceiling)
     }
@@ -1368,6 +1370,7 @@ impl Plugin for ResponseTransformer {
         // refused while the output is written rather than after a larger buffer
         // is already resident (GHSA-pwcm-6rh8-f2gh).
         self.apply_response_body_rules(body, content_type, ctx.retained_response_body_ceiling())
+            .into_transform_option(ctx)
     }
 
     /// The context-free transform. Every buffered call site reaches this through
@@ -1389,6 +1392,7 @@ impl Plugin for ResponseTransformer {
             content_type,
             crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
         )
+        .into_option()
     }
 
     fn on_response_body_transformed(
