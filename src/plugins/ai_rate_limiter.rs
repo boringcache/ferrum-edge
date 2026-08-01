@@ -34,12 +34,16 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tracing::{debug, warn};
 
 use super::utils::ai_providers::{
-    AiProvider, AiTokenUsage, detect_response_provider, extract_response_usage, parse_ai_provider,
+    AiProvider, detect_response_provider, extract_response_usage, parse_ai_provider,
+};
+use super::utils::ai_usage_stream::{
+    UsageAccumulator, UsageStreamExtractor, UsageStreamFormat, is_aws_event_stream_content_type,
 };
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::rate_limit::{
@@ -49,17 +53,18 @@ use super::utils::rate_limit::{
     apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
     validate_window_seconds,
 };
-use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use super::{
+    Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
+    ResponseStreamInspector, allocate_response_stream_handoff_id,
+};
 /// Shared key for the original (pre-rejection) backend HTTP status. Recorded by
 /// the proxy's `run_after_proxy_hooks` *before* the after_proxy loop, and again
 /// by this plugin's own genuine `after_proxy` pass — both write the same value.
 /// Reusing the `crate::proxy` constants (instead of local copies) keeps the
 /// proxy-side and plugin-side writers/readers from drifting apart. See
 /// `should_release_gateway_rejection` (`BACKEND_STATUS_METADATA_KEY`) and the
-/// AI-request gate on the unmetered-response policy (`AI_REQUEST_METADATA_KEY`).
-use crate::proxy::{
-    AI_REQUEST_METADATA_KEY, BACKEND_STATUS_METADATA_KEY, RESERVED_TOKENS_METADATA_KEY,
-};
+/// shared presence marker `RESERVED_TOKENS_METADATA_KEY` that gates it.
+use crate::proxy::{BACKEND_STATUS_METADATA_KEY, RESERVED_TOKENS_METADATA_KEY};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 const MAX_STATE_ENTRIES: usize = 100_000;
@@ -70,62 +75,103 @@ const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// budgets are never force-evicted.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const CAPACITY_REJECT_BODY: &str = r#"{"error":"AI token rate limit exceeded","details":"Rate-limit state capacity exceeded (max 100000 keys)"}"#;
-const RESERVATION_ID_METADATA_KEY: &str = "ai_ratelimit_reservation_id";
-/// Redis sliding-window index the reservation credited (centralized mode only).
-/// Carried back to the reconciliation op so a negative correction debits the
-/// same window even when the request straddles a window rollover. Absent in
-/// local mode (the in-memory window pins the correction via the entry's
-/// timestamp).
-const RESERVED_WINDOW_INDEX_METADATA_KEY: &str = "ai_ratelimit_reserved_window_index";
-const ACTUAL_TOKENS_METADATA_KEY: &str = "ai_ratelimit_actual_tokens";
-const UNMETERED_ACTION_METADATA_KEY: &str = "ai_ratelimit_unmetered_action";
-/// Base prefix for the per-request idempotency flag that marks a federated
-/// response's tokens as already reconciled by `after_proxy` (the sole federation
-/// charger — `on_response_body` always skips federation traffic). The flag guards
-/// the case where `after_proxy` runs twice for one request (a synthetic 2xx
-/// short-circuit followed by a response-body rejection that re-runs the reject
-/// hooks). The full key is per-limiter-instance (see
-/// [`AiRateLimiter::federation_flag_key`]) so that multiple `ai_rate_limiter`
-/// instances on one proxy (e.g. a per-consumer and a per-IP budget) each
-/// reconcile the federation tokens against their own window exactly once, instead
-/// of the first instance's flag suppressing the others.
-const FEDERATION_TOKENS_RECORDED_METADATA_KEY_PREFIX: &str =
-    "ai_ratelimit_federation_tokens_recorded";
-/// Idempotency marker for the reservation-RELEASE paths only: set the first time
-/// this request *releases* its reservation (any `reconcile_usage` call with
-/// `actual_tokens == None`), then checked before a later release so no second
-/// release can apply. A single request can reach a release more than once across
-/// phases — e.g. a non-2xx backend releases the reservation in `on_response_body`,
-/// and a *later* response-body plugin's rejection re-runs `after_proxy` (in
-/// rejection context), where `should_release_gateway_rejection` fires again for
-/// the same non-2xx backend. In local mode the per-entry `reservation_id` already
-/// makes the second release a no-op (the entry is gone), but the Redis backend has
-/// no per-entry id — it only subtracts `reserved` from the shared window, so a
-/// double-release double-subtracts and under-counts the consumer's own window,
-/// permitting oversubscription (the exact bypass class this reservation model
-/// closes). This marker makes the *release* idempotent across BOTH backends,
-/// mirroring the per-instance federation dedup ([`AiRateLimiter::federation_flag_key`]).
-/// Unlike that key it is a plain shared `ctx.metadata` entry (not per-instance) — a
-/// single `ai_rate_limiter` instance owns the reservation lifecycle for a request.
-///
-/// Scope is deliberately narrow: the authoritative actual-token *charge* path
-/// (`reconcile_usage` with `Some(actual_tokens)`) does NOT consult or set this
-/// marker. That path runs at most once per request, and `adjust_usage` advances
-/// the sliding window's running-sum/eviction bookkeeping, so gating it would drop
-/// a legitimate usage record. The dedup is exclusively about a duplicate release,
-/// never about charging real usage or about window maintenance.
-const RESERVATION_RECONCILED_METADATA_KEY: &str = "ai_ratelimit_reservation_reconciled";
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
-/// Marks compressed JSON requests that look like possible AI calls but could not
-/// be estimated before proxying because decompression happens later.
-const COMPRESSED_AI_REQUEST_METADATA_KEY: &str = "ai_ratelimit_compressed_ai_request";
-/// Marks a compressed POST JSON request whose body a co-located `compression`
-/// plugin decompressed: `before_proxy` cannot classify it (the decoded bytes are
-/// not written back into `ctx.metadata["request_body"]`), so it defers the
-/// AI-shape check to `on_final_request_body_with_context`, where the decompressed
-/// body is available. Mirrors `ai_request_guard`'s deferred-compressed handling
-/// (#1919).
-const DEFERRED_COMPRESSED_CLASSIFICATION_KEY: &str = "ai_ratelimit_deferred_compressed_classify";
+
+/// Base names of every per-request reservation-lifecycle metadata entry this
+/// plugin owns. Each is turned into an INSTANCE-SCOPED `ctx.metadata` key by
+/// [`InstanceKeys::new`] (`"<base>#<instance id>"`).
+///
+/// Scoping is load-bearing, not cosmetic (GHSA-wh4p-pmxm-3784). Multiple
+/// `ai_rate_limiter` instances on one proxy are a documented, supported
+/// composition — a per-consumer budget plus a per-IP budget is the canonical
+/// defense-in-depth setup. Every instance runs its OWN admission pass and its
+/// OWN reconciliation, with its own estimate, its own `count_mode`, its own
+/// identity dimension, and possibly its own backend (one local, one Redis). If
+/// those instances share unscoped metadata, the second admission overwrites the
+/// first instance's reserved size, reservation id, Redis window index, and
+/// inferred backend; then each response pass reconciles ITS window against the
+/// LAST instance's reservation, and the first release sets a shared flag that
+/// suppresses every sibling release. One configured budget is then
+/// under-enforced while another is overcharged.
+mod meta {
+    /// Estimate this instance reserved before dispatch. Absent when the
+    /// estimate was 0 (no pre-reservation was taken).
+    pub const RESERVED_TOKENS: &str = "ai_ratelimit_reserved_tokens";
+    /// Local-window reservation id, so reconciliation releases the exact entry
+    /// this instance created under concurrent, out-of-order completions.
+    pub const RESERVATION_ID: &str = "ai_ratelimit_reservation_id";
+    /// Redis sliding-window index this instance's reservation credited
+    /// (centralized mode only). Carried back to the reconciliation op so a
+    /// negative correction debits the same window even when the request
+    /// straddles a window rollover. Absent in local mode (the in-memory window
+    /// pins the correction via the entry's timestamp).
+    pub const RESERVED_WINDOW_INDEX: &str = "ai_ratelimit_reserved_window_index";
+    /// Actual provider usage this instance charged (diagnostic).
+    pub const ACTUAL_TOKENS: &str = "ai_ratelimit_actual_tokens";
+    /// `on_unmetered_response` action this instance applied (diagnostic, and
+    /// read back by this instance's gateway-rejection release gate).
+    pub const UNMETERED_ACTION: &str = "ai_ratelimit_unmetered_action";
+    /// Idempotency flag for a federated response's tokens, already reconciled
+    /// by `after_proxy` (the sole federation charger — `on_response_body`
+    /// always skips federation traffic). Guards the case where `after_proxy`
+    /// runs twice for one request (a synthetic 2xx short-circuit followed by a
+    /// response-body rejection that re-runs the reject hooks).
+    pub const FEDERATION_TOKENS_RECORDED: &str = "ai_ratelimit_federation_tokens_recorded";
+    /// Idempotency marker for the reservation-RELEASE paths only: set the first
+    /// time this instance *releases* its reservation (any `reconcile_usage`
+    /// call with `actual_tokens == None`), then checked before a later release
+    /// so no second release can apply. One request can reach a release more
+    /// than once across phases — a non-2xx release in `after_proxy`, the
+    /// streamed-response terminal hook, a buffered `on_response_body` pass, and
+    /// a later gateway-rejection re-run of `after_proxy` are all reachable for
+    /// the same response. In local mode the per-entry `reservation_id` already
+    /// makes the second release a no-op (the entry is gone), but the Redis
+    /// backend has no per-entry id — it only subtracts `reserved` from the
+    /// shared window, so a double-release double-subtracts and under-counts the
+    /// consumer's own window, permitting oversubscription.
+    ///
+    /// Scope is deliberately narrow: the authoritative actual-token *charge*
+    /// path (`reconcile_usage` with `Some(actual_tokens)`) does NOT consult or
+    /// set this marker. That path runs at most once per request, and
+    /// `adjust_usage` advances the sliding window's running-sum/eviction
+    /// bookkeeping, so gating it would drop a legitimate usage record.
+    pub const RESERVATION_RELEASED: &str = "ai_ratelimit_reservation_reconciled";
+    /// This instance classified the request as an AI call. Gate for the
+    /// `on_unmetered_response` policy AND for response-body/stream inspection:
+    /// a non-AI response is never buffered, inspected, charged, or rejected.
+    pub const AI_REQUEST: &str = "ai_ratelimit_request";
+    /// Marks compressed JSON requests that look like possible AI calls but
+    /// could not be estimated before proxying because decompression happens
+    /// later.
+    pub const COMPRESSED_AI_REQUEST: &str = "ai_ratelimit_compressed_ai_request";
+    /// Marks a compressed POST JSON request whose body a co-located
+    /// `compression` plugin decompressed: `before_proxy` cannot classify it
+    /// (the decoded bytes are not written back into
+    /// `ctx.metadata["request_body"]`), so it defers the AI-shape check to
+    /// `on_final_request_body_with_context`, where the decompressed body is
+    /// available. Mirrors `ai_request_guard`'s deferred-compressed handling
+    /// (#1919).
+    pub const DEFERRED_COMPRESSED_CLASSIFICATION: &str =
+        "ai_ratelimit_deferred_compressed_classify";
+}
+
+/// Process-wide ceiling on concurrently inspected AI response streams.
+///
+/// Streaming accounting replaced unbounded full-response buffering, so the only
+/// state a long-lived stream can now retain is one bounded parser carry plus a
+/// four-scalar accumulator. This cap bounds the AGGREGATE of those parsers as
+/// well (GHSA-q2r2-6r7h-f69x): beyond it no inspector is attached, the response
+/// still streams untouched, and the request is resolved by the configured
+/// `on_unmetered_response` policy — fail-closed by default, because
+/// `charge_estimate` keeps the pre-request reservation charged.
+const MAX_CONCURRENT_STREAM_ACCOUNTING: usize = 4_096;
+
+/// Live [`UsageStreamInspector`] count backing [`MAX_CONCURRENT_STREAM_ACCOUNTING`].
+static ACTIVE_STREAM_ACCOUNTING: AtomicUsize = AtomicUsize::new(0);
+/// Cumulative refusals at that ceiling, used only to sample the operational
+/// warning so saturation cannot become one log line per request.
+static STREAM_ACCOUNTING_REFUSALS: AtomicU64 = AtomicU64::new(0);
+const STREAM_ACCOUNTING_REFUSAL_LOG_INTERVAL: u64 = 1024;
 /// Metadata key the `compression` plugin sets (see `compression.rs::before_proxy`)
 /// when it decompresses a request body. It is written into `ctx.metadata`, which
 /// clients cannot influence, so — unlike the `x-ferrum-original-content-encoding`
@@ -136,11 +182,69 @@ const DEFERRED_COMPRESSED_CLASSIFICATION_KEY: &str = "ai_ratelimit_deferred_comp
 const COMPRESSION_REQUEST_ENCODING_METADATA_KEY: &str = "compression:request_encoding";
 
 /// Process-wide monotonic counter used to give every `AiRateLimiter` instance a
-/// unique id. The id is folded into [`AiRateLimiter::federation_flag_key`] so the
-/// per-request federation idempotency flag is scoped to ONE limiter instance,
-/// never to a budget-config fingerprint that two intentionally-separate budgets
-/// could share. Mirrors the `INSTANCE_ID_COUNTER` idiom in `openapi_validator`.
+/// unique id. The id is folded into every key in [`InstanceKeys`] so the whole
+/// per-request reservation lifecycle is scoped to ONE limiter instance, never to
+/// a budget-config fingerprint that two intentionally-separate budgets could
+/// share. A process-unique counter (rather than the plugin-config id) is the
+/// right discriminator precisely because two instances may carry byte-identical
+/// configuration and still own separate budgets. Mirrors the
+/// `INSTANCE_ID_COUNTER` idiom in `openapi_validator`.
 static INSTANCE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Every `ctx.metadata` key this limiter instance owns, precomputed once at
+/// construction so the request hot path never formats a key.
+///
+/// See the [`meta`] module for what each entry carries and why the scoping is
+/// load-bearing.
+struct InstanceKeys {
+    reserved_tokens: String,
+    reservation_id: String,
+    reserved_window_index: String,
+    actual_tokens: String,
+    unmetered_action: String,
+    federation_tokens_recorded: String,
+    reservation_released: String,
+    ai_request: String,
+    compressed_ai_request: String,
+    deferred_compressed_classification: String,
+    /// `(base name, instance-scoped metadata key, response header name)` for
+    /// `expose_headers`. The header NAMES are fixed by the public contract, but
+    /// the metadata each instance stages them from is instance-owned, so a
+    /// two-instance proxy never publishes instance A's `limit` beside instance
+    /// B's `remaining`.
+    exposed_headers: Vec<(&'static str, String, &'static str)>,
+}
+
+impl InstanceKeys {
+    fn new(instance_id: u64) -> Self {
+        let scoped = |base: &str| format!("{base}#{instance_id}");
+        Self {
+            reserved_tokens: scoped(meta::RESERVED_TOKENS),
+            reservation_id: scoped(meta::RESERVATION_ID),
+            reserved_window_index: scoped(meta::RESERVED_WINDOW_INDEX),
+            actual_tokens: scoped(meta::ACTUAL_TOKENS),
+            unmetered_action: scoped(meta::UNMETERED_ACTION),
+            federation_tokens_recorded: scoped(meta::FEDERATION_TOKENS_RECORDED),
+            reservation_released: scoped(meta::RESERVATION_RELEASED),
+            ai_request: scoped(meta::AI_REQUEST),
+            compressed_ai_request: scoped(meta::COMPRESSED_AI_REQUEST),
+            deferred_compressed_classification: scoped(meta::DEFERRED_COMPRESSED_CLASSIFICATION),
+            exposed_headers: EXPOSED_RATELIMIT_HEADERS
+                .iter()
+                .map(|(base, header_name)| (*base, scoped(base), *header_name))
+                .collect(),
+        }
+    }
+}
+
+/// Terminal usage captured by one response-stream inspector, handed back to
+/// [`Plugin::on_response_stream_terminated`] through the request-owned stream
+/// handoff. Fixed size: three optional counters plus one flag — never response
+/// bytes.
+#[derive(Debug, Default)]
+struct StreamUsageHandoff {
+    usage: std::sync::Mutex<UsageAccumulator>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnUnmeteredResponse {
@@ -168,9 +272,10 @@ impl OnUnmeteredResponse {
     }
 }
 
-/// `(metadata key, response header)` pairs this plugin exposes downstream when
-/// `expose_headers` is set. Single source of truth for both the `after_proxy`
-/// write and the gRPC-deadline ownership declaration.
+/// `(metadata base name, response header)` pairs this plugin exposes downstream
+/// when `expose_headers` is set. Single source of truth for the per-instance
+/// metadata keys ([`InstanceKeys::exposed_headers`]), the `after_proxy` write,
+/// and the gRPC-deadline ownership declaration.
 const EXPOSED_RATELIMIT_HEADERS: &[(&str, &str)] = &[
     ("ai_ratelimit_limit", "x-ai-ratelimit-limit"),
     ("ai_ratelimit_remaining", "x-ai-ratelimit-remaining"),
@@ -238,13 +343,20 @@ pub struct AiRateLimiter {
     expose_headers: bool,
     provider: String,
     on_unmetered_response: OnUnmeteredResponse,
-    /// Per-instance metadata key for the federation-tokens-recorded idempotency
-    /// flag. Scoped to this limiter instance via a process-unique id so that two
-    /// `ai_rate_limiter` instances — even with byte-identical budget config but
-    /// intentionally separate budgets (distinct `sync_mode`/`redis_key_prefix`,
-    /// or simply two local instances) — never share the flag. Each instance
-    /// reconciles the federation tokens against its own window exactly once.
-    federation_flag_key: String,
+    /// Configured provider, resolved once. `None` means `auto` (detect per
+    /// response document).
+    configured_provider: Option<AiProvider>,
+    /// Process-unique identity for this constructed instance. Scopes every
+    /// reservation-lifecycle metadata key so two `ai_rate_limiter` instances —
+    /// even with byte-identical budget config but intentionally separate budgets
+    /// (distinct `sync_mode`/`redis_key_prefix`, or simply two local instances)
+    /// — never read, overwrite, or suppress each other's reservation state.
+    instance_id: u64,
+    keys: InstanceKeys,
+    /// Process-unique key for this instance's per-response stream-usage handoff.
+    /// Allocated once so two instances inspecting the same stream each publish
+    /// and take their own terminal usage.
+    stream_usage_handoff_key: u64,
     limiter: RateLimitBackend<String, AiTokenRateAlgorithm>,
     request_counter: AtomicU64,
     epoch_base: Instant,
@@ -332,12 +444,19 @@ impl AiRateLimiter {
             }
             None => "auto".to_string(),
         };
-        if provider != "auto" && parse_ai_provider(&provider).is_none() {
-            return Err(format!(
-                "ai_rate_limiter: unknown 'provider' value '{}' (expected auto, openai, anthropic, google, cohere, mistral, or bedrock)",
-                provider
-            ));
-        }
+        let configured_provider = if provider == "auto" {
+            None
+        } else {
+            match parse_ai_provider(&provider) {
+                Some(parsed) => Some(parsed),
+                None => {
+                    return Err(format!(
+                        "ai_rate_limiter: unknown 'provider' value '{}' (expected auto, openai, anthropic, google, cohere, mistral, bedrock, or tgi)",
+                        provider
+                    ));
+                }
+            }
+        };
 
         let on_unmetered_response = match optional_string(config, "on_unmetered_response")? {
             Some(raw) => OnUnmeteredResponse::parse(raw).ok_or_else(|| {
@@ -348,23 +467,21 @@ impl AiRateLimiter {
             None => OnUnmeteredResponse::ChargeEstimate,
         };
 
-        // Scope the per-request federation idempotency flag to THIS limiter
+        // Scope the ENTIRE per-request reservation lifecycle to THIS limiter
         // instance via a process-unique id, not to a budget-config fingerprint.
         // Each instance owns its own token window (a separate in-memory map for
         // the local backend, or a distinct `redis_key_prefix` for the centralized
-        // backend), so the idempotency flag — which guards against `after_proxy`
-        // running twice for ONE request — must be per instance too. A
+        // backend), so its reserved estimate, reservation id, Redis window index,
+        // inferred backend, AI classification, unmetered action, release
+        // idempotency, and exposed telemetry must all be per instance too. A
         // config-derived key would be shared by two limiters with identical
         // budget config that are nonetheless SEPARATE budgets (e.g. different
         // `sync_mode`/`redis_key_prefix`, or just two local instances): the first
-        // to run would set the flag and the second would skip its own federation
-        // reconcile, under-counting its own window for `ai_federation` traffic and
-        // contradicting the documented per-instance accounting contract. The id
-        // keeps the within-request, within-instance dedup semantics intact while
-        // never cross-suppressing a sibling instance.
+        // to run would overwrite the second's reservation state and its release
+        // would suppress the sibling's, under-counting one window and
+        // over-counting the other — contradicting the documented per-instance
+        // accounting contract (GHSA-wh4p-pmxm-3784).
         let instance_id = INSTANCE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let federation_flag_key =
-            format!("{FEDERATION_TOKENS_RECORDED_METADATA_KEY_PREFIX}:{instance_id}");
 
         Ok(Self {
             token_limit,
@@ -374,7 +491,10 @@ impl AiRateLimiter {
             expose_headers,
             provider,
             on_unmetered_response,
-            federation_flag_key,
+            configured_provider,
+            instance_id,
+            keys: InstanceKeys::new(instance_id),
+            stream_usage_handoff_key: allocate_response_stream_handoff_id(),
             limiter: RateLimitBackend::from_plugin_config_with_config_id(
                 "ai_rate_limiter",
                 config_id,
@@ -460,6 +580,23 @@ impl AiRateLimiter {
         self.limiter.contains_local_key(&key.to_string())
     }
 
+    /// This instance's process-unique reservation-scoping id. Not a production
+    /// API; external tests use it to assert that two instances never share a
+    /// reservation-lifecycle metadata key.
+    #[doc(hidden)]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub fn instance_id_for_test(&self) -> u64 {
+        self.instance_id
+    }
+
+    /// The instance-scoped `ctx.metadata` key for one reservation-lifecycle
+    /// base name (see the [`meta`] module). Not a production API.
+    #[doc(hidden)]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub fn metadata_key_for_test(&self, base: &str) -> String {
+        format!("{base}#{}", self.instance_id)
+    }
+
     fn rate_key(&self, ctx: &RequestContext) -> String {
         if self.limit_by == "consumer"
             && let Some(identity) = ctx.effective_identity()
@@ -536,25 +673,26 @@ impl AiRateLimiter {
             return;
         }
 
-        ctx.metadata.insert(
-            "ai_ratelimit_limit".to_string(),
-            self.token_limit.to_string(),
-        );
-        ctx.metadata.insert(
-            "ai_ratelimit_window".to_string(),
-            self.window_seconds.to_string(),
-        );
-        ctx.metadata.insert(
-            "ai_ratelimit_remaining".to_string(),
-            outcome.remaining.unwrap_or(0).to_string(),
-        );
-        ctx.metadata.insert(
-            "ai_ratelimit_usage".to_string(),
-            outcome.usage.unwrap_or(0).to_string(),
-        );
+        // Instance-scoped staging keys: with two exposing instances on one
+        // proxy the header NAMES still collide (they are a fixed public
+        // contract, last writer in configured plugin order wins), but each
+        // instance's four values stay internally consistent instead of
+        // interleaving one instance's limit with another's remaining.
+        for (base, meta_key, _) in &self.keys.exposed_headers {
+            let value = match *base {
+                "ai_ratelimit_limit" => self.token_limit.to_string(),
+                "ai_ratelimit_window" => self.window_seconds.to_string(),
+                "ai_ratelimit_remaining" => outcome.remaining.unwrap_or(0).to_string(),
+                "ai_ratelimit_usage" => outcome.usage.unwrap_or(0).to_string(),
+                // Unreachable for the compiled-in table; a new entry that
+                // forgets a value here writes nothing rather than a wrong one.
+                _ => continue,
+            };
+            ctx.metadata.insert(meta_key.clone(), value);
+        }
     }
 
-    /// Copy exposed rate-limit telemetry from request metadata into the
+    /// Copy exposed rate-limit telemetry from THIS instance's metadata into the
     /// client-visible response map. Used by `after_proxy` (admission and
     /// federation/gateway reconcile) and again by `on_response_body` after
     /// buffered usage reconciliation so the final headers match the bucket.
@@ -567,9 +705,9 @@ impl AiRateLimiter {
             return;
         }
 
-        for (meta_key, header_name) in EXPOSED_RATELIMIT_HEADERS {
-            if let Some(value) = ctx.metadata.get(*meta_key) {
-                response_headers.insert(header_name.to_string(), value.clone());
+        for (_, meta_key, header_name) in &self.keys.exposed_headers {
+            if let Some(value) = ctx.metadata.get(meta_key) {
+                response_headers.insert((*header_name).to_string(), value.clone());
             }
         }
     }
@@ -691,52 +829,67 @@ impl AiRateLimiter {
     /// reconciliation arm detect a backend switch — Redis recovering, or going
     /// down, between reserve and reconcile — and avoid corrupting a backend that
     /// never received the reservation.
-    fn reservation_backend(ctx: &RequestContext) -> ReservationBackend {
-        if Self::reserved_window_index(ctx).is_some() {
+    fn reservation_backend(&self, ctx: &RequestContext) -> ReservationBackend {
+        if self.reserved_window_index(ctx).is_some() {
             ReservationBackend::Redis
-        } else if Self::reservation_id(ctx).is_some() {
+        } else if self.reservation_id(ctx).is_some() {
             ReservationBackend::Local
         } else {
             ReservationBackend::Unknown
         }
     }
 
-    fn reserved_tokens(ctx: &RequestContext) -> u64 {
+    fn reserved_tokens(&self, ctx: &RequestContext) -> u64 {
         ctx.metadata
-            .get(RESERVED_TOKENS_METADATA_KEY)
+            .get(&self.keys.reserved_tokens)
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0)
     }
 
-    /// Whether `before_proxy` identified this request as an AI call (it parsed a
-    /// JSON request body that carries a recognized LLM request field — see
-    /// [`json_looks_like_ai_request`]). This is the gate for the
-    /// `on_unmetered_response` policy: without it, that policy would apply to
-    /// EVERY buffered 2xx (the plugin forces full response buffering, and
-    /// `on_response_body` runs for all buffered responses regardless of content
-    /// type), so under `reject` a GET, a 204/empty-body 200, a non-JSON 2xx, or a
-    /// non-LLM JSON 2xx on the same proxy would be turned into a 502. The marker —
-    /// not `reserved_tokens > 0` — is the correct signal: `completion_tokens` mode
-    /// legitimately reserves 0 for valid AI requests with no output cap, so those
-    /// must still be subject to the unmetered policy.
-    fn request_was_ai_call(ctx: &RequestContext) -> bool {
-        ctx.metadata.contains_key(AI_REQUEST_METADATA_KEY)
+    /// Whether THIS instance's `before_proxy` identified the request as an AI
+    /// call (it parsed a JSON request body that carries a recognized LLM request
+    /// field — see [`json_looks_like_ai_request`]). This is the gate for the
+    /// `on_unmetered_response` policy and for response buffering / stream
+    /// inspection: without it, that policy would apply to every 2xx on the proxy
+    /// regardless of method or content type, so under `reject` a GET, a
+    /// 204/empty-body 200, a non-JSON 2xx, or a non-LLM JSON 2xx on the same
+    /// proxy would be turned into a 502. The marker — not `reserved_tokens > 0`
+    /// — is the correct signal: `completion_tokens` mode legitimately reserves 0
+    /// for valid AI requests with no output cap, so those must still be subject
+    /// to the unmetered policy.
+    fn request_was_ai_call(&self, ctx: &RequestContext) -> bool {
+        ctx.metadata.contains_key(&self.keys.ai_request)
     }
 
-    fn request_was_compressed_ai_candidate(ctx: &RequestContext) -> bool {
-        ctx.metadata
-            .contains_key(COMPRESSED_AI_REQUEST_METADATA_KEY)
+    fn request_was_compressed_ai_candidate(&self, ctx: &RequestContext) -> bool {
+        ctx.metadata.contains_key(&self.keys.compressed_ai_request)
     }
 
-    fn reservation_id(ctx: &RequestContext) -> Option<u64> {
+    /// Whether this instance may still need the response representation to
+    /// resolve its own reservation lifecycle.
+    ///
+    /// This is the header-time exclusion of irrelevant traffic
+    /// (GHSA-q2r2-6r7h-f69x): an ordinary non-AI request on a shared proxy is
+    /// never buffered and never stream-inspected by this plugin, so it costs
+    /// nothing. A deferred compressed classification counts as a candidate
+    /// because `on_final_request_body_with_context` may still promote it.
+    fn response_accounting_candidate(&self, ctx: &RequestContext) -> bool {
+        self.request_was_ai_call(ctx)
+            || ctx
+                .metadata
+                .contains_key(&self.keys.deferred_compressed_classification)
+            || ctx.metadata.contains_key(&self.keys.reserved_tokens)
+    }
+
+    fn reservation_id(&self, ctx: &RequestContext) -> Option<u64> {
         ctx.metadata
-            .get(RESERVATION_ID_METADATA_KEY)
+            .get(&self.keys.reservation_id)
             .and_then(|value| value.parse::<u64>().ok())
     }
 
-    fn reserved_window_index(ctx: &RequestContext) -> Option<u64> {
+    fn reserved_window_index(&self, ctx: &RequestContext) -> Option<u64> {
         ctx.metadata
-            .get(RESERVED_WINDOW_INDEX_METADATA_KEY)
+            .get(&self.keys.reserved_window_index)
             .and_then(|value| value.parse::<u64>().ok())
     }
 
@@ -756,7 +909,7 @@ impl AiRateLimiter {
             .and_then(|value| value.parse::<u16>().ok())
     }
 
-    fn should_release_gateway_rejection(ctx: &RequestContext) -> bool {
+    fn should_release_gateway_rejection(&self, ctx: &RequestContext) -> bool {
         // Only release when this is a genuine gateway rejection that never
         // produced a successful backend response. If the backend already
         // returned 2xx and a *later* plugin rejected it — either a response-body
@@ -776,10 +929,10 @@ impl AiRateLimiter {
         ctx.metadata
             .get(REJECTION_RESPONSE_METADATA_KEY)
             .is_some_and(|value| value == "true")
-            && Self::reserved_tokens(ctx) > 0
+            && self.reserved_tokens(ctx) > 0
             && ctx
                 .metadata
-                .get(UNMETERED_ACTION_METADATA_KEY)
+                .get(&self.keys.unmetered_action)
                 .map(String::as_str)
                 != Some(OnUnmeteredResponse::Reject.as_str())
     }
@@ -834,16 +987,19 @@ impl AiRateLimiter {
         actual_tokens: Option<u64>,
         unmetered_detail: &str,
     ) -> PluginResult {
-        let reserved_tokens = Self::reserved_tokens(ctx);
-        let reservation_id = Self::reservation_id(ctx);
-        let reserved_window_index = Self::reserved_window_index(ctx);
-        let reservation_backend = Self::reservation_backend(ctx);
+        let reserved_tokens = self.reserved_tokens(ctx);
+        let reservation_id = self.reservation_id(ctx);
+        let reserved_window_index = self.reserved_window_index(ctx);
+        let reservation_backend = self.reservation_backend(ctx);
 
         // The actual-token charge path (`Some(actual_tokens)`) is the authoritative
         // reconcile and runs at most once per request in production — it is reached
-        // only from `on_response_body`'s 2xx branch (once) or the federation
-        // `after_proxy` branch (once, itself guarded by the per-instance
-        // `federation_flag_key`), and the two are mutually exclusive. It must NOT
+        // from exactly one of three mutually exclusive places: `on_response_body`'s
+        // 2xx branch (buffered response), `on_response_stream_terminated` (streamed
+        // response), or the federation `after_proxy` branch (itself guarded by the
+        // per-instance federation-recorded flag). A response is either buffered or
+        // streamed, never both, and federation traffic is excluded from the other
+        // two by their own guards. It must NOT
         // consult or set the release-dedup marker below: `adjust_usage` advances
         // the sliding window's running-sum/eviction bookkeeping (via
         // `current_usage`), so suppressing it would silently drop a legitimate
@@ -851,10 +1007,8 @@ impl AiRateLimiter {
         // exclusively about the duplicate *release* of a reservation
         // (`actual_tokens == None`), not about charging real usage.
         if let Some(actual_tokens) = actual_tokens {
-            ctx.metadata.insert(
-                ACTUAL_TOKENS_METADATA_KEY.to_string(),
-                actual_tokens.to_string(),
-            );
+            ctx.metadata
+                .insert(self.keys.actual_tokens.clone(), actual_tokens.to_string());
             if let Some(outcome) = self
                 .adjust_usage(
                     self.rate_key(ctx),
@@ -913,16 +1067,11 @@ impl AiRateLimiter {
         // exactly once. This deliberately does NOT gate the `Some(actual_tokens)`
         // charge path above, so independent usage records and the window-eviction
         // maintenance they drive are never suppressed.
-        if ctx
-            .metadata
-            .contains_key(RESERVATION_RECONCILED_METADATA_KEY)
-        {
+        if ctx.metadata.contains_key(&self.keys.reservation_released) {
             return PluginResult::Continue;
         }
-        ctx.metadata.insert(
-            RESERVATION_RECONCILED_METADATA_KEY.to_string(),
-            "true".to_string(),
-        );
+        ctx.metadata
+            .insert(self.keys.reservation_released.clone(), "true".to_string());
 
         if !(200..300).contains(&response_status) {
             if let Some(outcome) = self
@@ -952,17 +1101,17 @@ impl AiRateLimiter {
         // still be subject to the policy. A non-AI response is left untouched
         // (no reject, no charge); any reservation it somehow carries is 0, so the
         // skipped `adjust_usage` is a no-op anyway.
-        if !Self::request_was_ai_call(ctx) {
+        if !self.request_was_ai_call(ctx) {
             return PluginResult::Continue;
         }
 
         match self.on_unmetered_response {
             OnUnmeteredResponse::ChargeEstimate => {
                 ctx.metadata.insert(
-                    UNMETERED_ACTION_METADATA_KEY.to_string(),
+                    self.keys.unmetered_action.clone(),
                     OnUnmeteredResponse::ChargeEstimate.as_str().to_string(),
                 );
-                if reserved_tokens == 0 && Self::request_was_compressed_ai_candidate(ctx) {
+                if reserved_tokens == 0 && self.request_was_compressed_ai_candidate(ctx) {
                     warn!(
                         provider = %self.provider,
                         count_mode = %self.count_mode,
@@ -982,7 +1131,7 @@ impl AiRateLimiter {
             }
             OnUnmeteredResponse::Warn => {
                 ctx.metadata.insert(
-                    UNMETERED_ACTION_METADATA_KEY.to_string(),
+                    self.keys.unmetered_action.clone(),
                     OnUnmeteredResponse::Warn.as_str().to_string(),
                 );
                 if let Some(outcome) = self
@@ -1009,7 +1158,7 @@ impl AiRateLimiter {
             }
             OnUnmeteredResponse::Reject => {
                 ctx.metadata.insert(
-                    UNMETERED_ACTION_METADATA_KEY.to_string(),
+                    self.keys.unmetered_action.clone(),
                     OnUnmeteredResponse::Reject.as_str().to_string(),
                 );
                 warn!(
@@ -1037,96 +1186,79 @@ impl AiRateLimiter {
 
     fn extract_token_count(&self, body: &[u8]) -> Option<u64> {
         let json: Value = serde_json::from_slice(body).ok()?;
-        let usage = if self.provider != "auto" {
-            extract_response_usage(&json, parse_ai_provider(&self.provider)?)
-        } else {
-            extract_response_usage(&json, detect_response_provider(&json)?)
+        let provider = match self.configured_provider {
+            Some(provider) => provider,
+            None => detect_response_provider(&json)?,
         };
+        extract_response_usage(&json, provider).total_for_mode(&self.count_mode)
+    }
+
+    /// Buffered-SSE usage extraction.
+    ///
+    /// Shares [`UsageAccumulator`] with the streaming inspector, so a provider
+    /// event is interpreted identically whether the response was streamed past
+    /// the gateway or collected first. Only reachable when some other plugin
+    /// pinned an event stream onto the buffered path; this limiter no longer
+    /// does (GHSA-q2r2-6r7h-f69x).
+    fn extract_token_count_from_sse(&self, body: &[u8]) -> Option<u64> {
+        let body = std::str::from_utf8(body).ok()?;
+        let mut usage = UsageAccumulator::default();
+        for line in body.lines() {
+            // SSE field names are case-sensitive; the optional single space
+            // after the colon is not part of the value.
+            if let Some(data) = line.strip_prefix("data:") {
+                usage.apply_sse_data(data, self.configured_provider);
+            }
+        }
         usage.total_for_mode(&self.count_mode)
     }
 
-    fn extract_token_count_from_sse(&self, body: &[u8]) -> Option<u64> {
-        let body = std::str::from_utf8(body).ok()?;
-        let mut prompt_tokens: Option<u64> = None;
-        let mut completion_tokens: Option<u64> = None;
-        let mut total_tokens: Option<u64> = None;
-
-        for line in body.lines() {
-            let data = if let Some(stripped) = line.strip_prefix("data: ") {
-                stripped.trim()
-            } else if let Some(stripped) = line.strip_prefix("data:") {
-                stripped.trim()
-            } else {
-                continue;
-            };
-
-            if data == "[DONE]" {
-                continue;
-            }
-
-            let json: Value = match serde_json::from_str(data) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-
-            if let Some(usage) = json.get("usage")
-                && usage.is_object()
-                && !usage.as_object().is_some_and(|object| object.is_empty())
-            {
-                let usage = if self.provider != "auto" {
-                    extract_response_usage(
-                        &json,
-                        parse_ai_provider(&self.provider).unwrap_or(AiProvider::OpenAi),
-                    )
-                } else {
-                    extract_response_usage(
-                        &json,
-                        detect_response_provider(&json).unwrap_or(AiProvider::OpenAi),
-                    )
-                };
-                prompt_tokens = usage.prompt_tokens;
-                completion_tokens = usage.completion_tokens;
-                total_tokens = usage.total_tokens;
-            }
-
-            if json.get("type").and_then(|value| value.as_str()) == Some("message_start")
-                && let Some(message) = json.get("message")
-                && let Some(usage) = message.get("usage")
-            {
-                prompt_tokens = usage.get("input_tokens").and_then(|value| value.as_u64());
-            }
-
-            if json.get("type").and_then(|value| value.as_str()) == Some("message_delta")
-                && let Some(usage) = json.get("usage")
-            {
-                completion_tokens = usage.get("output_tokens").and_then(|value| value.as_u64());
-            }
-
-            // Cohere v2 streaming: message-end event nests counts under
-            // `delta.usage.tokens.*` instead of root `usage`. Reuse
-            // `extract_response_usage` so we share Cohere v2's shape logic.
-            if json.get("type").and_then(|value| value.as_str()) == Some("message-end") {
-                let usage = extract_response_usage(&json, AiProvider::Cohere);
-                if usage.prompt_tokens.is_some() {
-                    prompt_tokens = usage.prompt_tokens;
-                }
-                if usage.completion_tokens.is_some() {
-                    completion_tokens = usage.completion_tokens;
-                }
-                if usage.total_tokens.is_some() {
-                    total_tokens = usage.total_tokens;
-                }
-            }
+    /// Reconcile a STREAMED response's terminal usage.
+    ///
+    /// Headers were committed before the first byte, so this path can neither
+    /// reject nor rewrite the response. `on_unmetered_response: "reject"`
+    /// therefore degrades to its fail-closed accounting half — the pre-request
+    /// reservation stays charged, exactly like `charge_estimate` — instead of
+    /// substituting a 502 that the client already cannot receive. `warn` still
+    /// releases, `charge_estimate` still keeps. Release idempotency is the same
+    /// per-instance marker the buffered path uses, so a stream that also ran a
+    /// gateway-rejection `after_proxy` pass releases exactly once.
+    async fn reconcile_streamed_usage(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        actual_tokens: Option<u64>,
+        unmetered_detail: &str,
+    ) {
+        if actual_tokens.is_none()
+            && (200..300).contains(&response_status)
+            && self.on_unmetered_response == OnUnmeteredResponse::Reject
+            && self.request_was_ai_call(ctx)
+            && !ctx.metadata.contains_key(&self.keys.reservation_released)
+        {
+            // Record the action so a later gateway-rejection pass does not
+            // release a reservation this policy deliberately keeps, and emit the
+            // same bounded warning the buffered reject path emits.
+            ctx.metadata.insert(
+                self.keys.unmetered_action.clone(),
+                OnUnmeteredResponse::Reject.as_str().to_string(),
+            );
+            warn!(
+                limiter_instance = self.instance_id,
+                provider = %self.provider,
+                count_mode = %self.count_mode,
+                detail = %unmetered_detail,
+                "ai_rate_limiter: streamed successful response had no token usage; keeping reservation charged (on_unmetered_response=reject cannot replace a committed streaming response)"
+            );
+            // Mark the release path consumed so nothing later releases it.
+            ctx.metadata
+                .insert(self.keys.reservation_released.clone(), "true".to_string());
+            return;
         }
 
-        AiTokenUsage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-            model: None,
-            provider: None,
-        }
-        .total_for_mode(&self.count_mode)
+        let _ = self
+            .reconcile_usage(ctx, response_status, actual_tokens, unmetered_detail)
+            .await;
     }
 }
 
@@ -1885,12 +2017,112 @@ impl Plugin for AiRateLimiter {
         Some(self.limiter.tracked_keys_count())
     }
 
+    /// Config-time upper bound only. A metered AI response whose usage lives in
+    /// a JSON document still needs the collected body; every other response is
+    /// released by the per-request refinements below.
     fn requires_response_body_buffering(&self) -> bool {
         true
     }
 
-    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
-        true
+    /// Per-request refinement: buffer nothing for a request this instance never
+    /// classified as an AI call.
+    ///
+    /// Before GHSA-q2r2-6r7h-f69x this returned `true` unconditionally, so an
+    /// active limiter pinned EVERY response on its proxy — including SSE and
+    /// other long-lived model streams — onto the buffered path. Incremental
+    /// delivery was destroyed and each concurrent stream retained a growing
+    /// buffer, bounded only per-response by the global response limit and not at
+    /// all in aggregate.
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        self.response_accounting_candidate(ctx)
+    }
+
+    /// Header-time refinement: the ONLY representation this limiter still needs
+    /// collected is a JSON usage document on a successful metered response.
+    ///
+    /// Everything else is released to the streaming path and resolved without a
+    /// buffer:
+    ///   * event streams (SSE) and AWS Bedrock event-stream framing are metered
+    ///     incrementally by [`Self::response_stream_inspector`];
+    ///   * a non-2xx response only needs its reservation released, which is a
+    ///     status-only decision `after_proxy` already made;
+    ///   * framed gRPC-Web and other non-JSON media carry no usage document this
+    ///     plugin can read, so collecting them buys nothing — the terminal
+    ///     stream hook applies `on_unmetered_response` instead.
+    ///
+    /// Contract: this only ever NARROWS [`Self::should_buffer_response_body`].
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+        response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        if !self.should_buffer_response_body(ctx) {
+            return false;
+        }
+        if !(200..300).contains(&response_status) {
+            return false;
+        }
+        content_type.is_some_and(|content_type| {
+            is_json_content_type(content_type) && !is_framed_grpc_content_type(content_type)
+        })
+    }
+
+    /// A retry-eligible response may still be released to the streaming path.
+    ///
+    /// Without this the retry branch of the buffering decision keeps every
+    /// response collected while retries are configured, which would reinstate
+    /// exactly the unbounded SSE buffering this plugin no longer needs. The
+    /// confirmation below is header-complete, so releasing here never discards a
+    /// body a retry could have replayed for THIS plugin.
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        self.should_buffer_response_body(ctx)
+    }
+
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        let content_type = response_headers.get("content-type").map(String::as_str);
+        !self.should_buffer_response_body_for_content_type(
+            ctx,
+            content_type,
+            response_status,
+            response_headers,
+        )
+    }
+
+    /// An event stream can be released even though a later `after_proxy` hook
+    /// may rewrite `Content-Type`.
+    ///
+    /// The conservative default pins a buffered response whenever any later
+    /// plugin might relabel the representation. That guard exists for plugins
+    /// whose body NEED depends on the label; this one's does not for a stream:
+    /// relabelling an unbounded event stream does not bound it, and the usage is
+    /// metered incrementally rather than from a collected body. A JSON-labelled
+    /// response keeps the conservative default, so a relabel can never move a
+    /// usage document off the buffered path.
+    fn should_release_response_body_before_content_type_rewrite(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        if !self.should_buffer_response_body(ctx) {
+            return true;
+        }
+        if !(200..300).contains(&response_status) {
+            return true;
+        }
+        response_headers
+            .get("content-type")
+            .is_some_and(|content_type| {
+                is_event_stream_content_type(content_type)
+                    || is_aws_event_stream_content_type(content_type)
+            })
     }
 
     fn applies_after_proxy_on_reject(&self) -> bool {
@@ -2080,21 +2312,28 @@ impl Plugin for AiRateLimiter {
         //   - Case C / estimated AI: mark from the parsed body.
         if defer_compressed_classification {
             ctx.metadata.insert(
-                DEFERRED_COMPRESSED_CLASSIFICATION_KEY.to_string(),
+                self.keys.deferred_compressed_classification.clone(),
                 "true".to_string(),
             );
         } else if is_ai_request {
             ctx.metadata
-                .insert(AI_REQUEST_METADATA_KEY.to_string(), "true".to_string());
+                .insert(self.keys.ai_request.clone(), "true".to_string());
             if still_compressed {
-                ctx.metadata.insert(
-                    COMPRESSED_AI_REQUEST_METADATA_KEY.to_string(),
-                    "true".to_string(),
-                );
+                ctx.metadata
+                    .insert(self.keys.compressed_ai_request.clone(), "true".to_string());
             }
         }
 
         if reserved_tokens > 0 {
+            ctx.metadata.insert(
+                self.keys.reserved_tokens.clone(),
+                reserved_tokens.to_string(),
+            );
+            // Shared PRESENCE marker consumed only by the proxy's
+            // `run_after_proxy_hooks` gate for recording the genuine backend
+            // status. Its value is this instance's estimate but is never read
+            // back for a decision — every accounting read uses the
+            // instance-scoped key above (GHSA-wh4p-pmxm-3784).
             ctx.metadata.insert(
                 RESERVED_TOKENS_METADATA_KEY.to_string(),
                 reserved_tokens.to_string(),
@@ -2105,7 +2344,7 @@ impl Plugin for AiRateLimiter {
             // Redis reconciliation path ignores it.
             if let Some(reservation_id) = outcome.reservation_id {
                 ctx.metadata.insert(
-                    RESERVATION_ID_METADATA_KEY.to_string(),
+                    self.keys.reservation_id.clone(),
                     reservation_id.to_string(),
                 );
             }
@@ -2115,7 +2354,7 @@ impl Plugin for AiRateLimiter {
             // the matched entry's timestamp instead.
             if let Some(reserved_window_index) = outcome.reserved_window_index {
                 ctx.metadata.insert(
-                    RESERVED_WINDOW_INDEX_METADATA_KEY.to_string(),
+                    self.keys.reserved_window_index.clone(),
                     reserved_window_index.to_string(),
                 );
             }
@@ -2138,7 +2377,7 @@ impl Plugin for AiRateLimiter {
         // sets the marker, so it skips this hook.
         if ctx
             .metadata
-            .remove(DEFERRED_COMPRESSED_CLASSIFICATION_KEY)
+            .remove(&self.keys.deferred_compressed_classification)
             .is_none()
         {
             return PluginResult::Continue;
@@ -2164,11 +2403,9 @@ impl Plugin for AiRateLimiter {
             || is_framed_grpc_content_type(content_type)
         {
             ctx.metadata
-                .insert(AI_REQUEST_METADATA_KEY.to_string(), "true".to_string());
-            ctx.metadata.insert(
-                COMPRESSED_AI_REQUEST_METADATA_KEY.to_string(),
-                "true".to_string(),
-            );
+                .insert(self.keys.ai_request.clone(), "true".to_string());
+            ctx.metadata
+                .insert(self.keys.compressed_ai_request.clone(), "true".to_string());
             return PluginResult::Continue;
         }
 
@@ -2184,11 +2421,9 @@ impl Plugin for AiRateLimiter {
             .is_some_and(json_looks_like_ai_request)
         {
             ctx.metadata
-                .insert(AI_REQUEST_METADATA_KEY.to_string(), "true".to_string());
-            ctx.metadata.insert(
-                COMPRESSED_AI_REQUEST_METADATA_KEY.to_string(),
-                "true".to_string(),
-            );
+                .insert(self.keys.ai_request.clone(), "true".to_string());
+            ctx.metadata
+                .insert(self.keys.compressed_ai_request.clone(), "true".to_string());
         }
 
         PluginResult::Continue
@@ -2219,7 +2454,7 @@ impl Plugin for AiRateLimiter {
             .metadata
             .get(REJECTION_RESPONSE_METADATA_KEY)
             .is_some_and(|value| value == "true");
-        if !in_rejection_context && ctx.metadata.contains_key(RESERVED_TOKENS_METADATA_KEY) {
+        if !in_rejection_context && ctx.metadata.contains_key(&self.keys.reserved_tokens) {
             ctx.metadata.insert(
                 BACKEND_STATUS_METADATA_KEY.to_string(),
                 response_status.to_string(),
@@ -2245,7 +2480,7 @@ impl Plugin for AiRateLimiter {
         // `reconcile_usage`, which charges the actual provider tokens (or releases
         // the reservation on a non-2xx federation response).
         if ctx.metadata.contains_key("ai_federation_provider") {
-            if !ctx.metadata.contains_key(&self.federation_flag_key) {
+            if !ctx.metadata.contains_key(&self.keys.federation_tokens_recorded) {
                 let actual_tokens = self.read_tokens_from_metadata(&ctx.metadata);
                 // Reconcile against the federation provider's ORIGINAL synthetic
                 // status, not the current after_proxy status. `ai_federation`
@@ -2277,12 +2512,32 @@ impl Plugin for AiRateLimiter {
                 if !matches!(result, PluginResult::Continue) {
                     return result;
                 }
-                ctx.metadata
-                    .insert(self.federation_flag_key.clone(), "true".to_string());
+                ctx.metadata.insert(
+                    self.keys.federation_tokens_recorded.clone(),
+                    "true".to_string(),
+                );
             }
-        } else if Self::should_release_gateway_rejection(ctx) {
+        } else if self.should_release_gateway_rejection(ctx) {
             let result = self
                 .reconcile_usage(ctx, 500, None, "gateway_rejection")
+                .await;
+            if !matches!(result, PluginResult::Continue) {
+                return result;
+            }
+        } else if !in_rejection_context
+            && !(200..300).contains(&response_status)
+            && self.reserved_tokens(ctx) > 0
+        {
+            // Release the reservation for a genuine non-2xx backend response
+            // here rather than from a body hook. The decision is status-only, so
+            // it must not depend on collecting a body this plugin no longer
+            // pins onto the buffered path (GHSA-q2r2-6r7h-f69x): `after_proxy`
+            // runs on every H1/H2/H3, buffered and streaming, gRPC and gRPC-Web
+            // response. The per-instance release marker makes the later
+            // buffered `on_response_body` pass and the streamed terminal hook
+            // clean no-ops.
+            let result = self
+                .reconcile_usage(ctx, response_status, None, "non_2xx_response")
                 .await;
             if !matches!(result, PluginResult::Continue) {
                 return result;
@@ -2311,8 +2566,8 @@ impl Plugin for AiRateLimiter {
         if !self.expose_headers {
             return false;
         }
-        for (meta_key, header_name) in EXPOSED_RATELIMIT_HEADERS {
-            if name.eq_ignore_ascii_case(header_name) && ctx.metadata.contains_key(*meta_key) {
+        for (_, meta_key, header_name) in &self.keys.exposed_headers {
+            if name.eq_ignore_ascii_case(header_name) && ctx.metadata.contains_key(meta_key) {
                 return true;
             }
         }
@@ -2329,6 +2584,142 @@ impl Plugin for AiRateLimiter {
         } else {
             super::ResponseTrailerPolicy::None
         }
+    }
+
+    fn requires_response_stream_hooks(&self) -> bool {
+        // Always: a metered AI response can stream on any of H1/H2/H3, and the
+        // terminal hook is also what applies `on_unmetered_response` to a
+        // streamed response that never reported usage. The per-request factory
+        // below declines everything that is not a meterable AI stream, so an
+        // ordinary proxy pays only the capability check.
+        true
+    }
+
+    /// Attach a bounded incremental usage extractor to a meterable AI stream.
+    ///
+    /// Replaces full-response buffering for streamed responses
+    /// (GHSA-q2r2-6r7h-f69x) and is the authoritative usage source for the
+    /// provider-native streaming formats that previously had none
+    /// (GHSA-rxj9-f483-g53f): Gemini SSE `usageMetadata`, AWS Bedrock
+    /// `application/vnd.amazon.eventstream` framing, and TGI
+    /// `details.generated_tokens`, alongside the existing OpenAI, Anthropic, and
+    /// Cohere signals.
+    ///
+    /// Bytes are forwarded unchanged and never held, so SSE delivery latency is
+    /// unaffected. Retention per stream is one bounded parser carry plus a
+    /// four-scalar accumulator, and the process-wide inspector count is capped
+    /// by [`MAX_CONCURRENT_STREAM_ACCOUNTING`]; over that cap no inspector is
+    /// attached and the response resolves through `on_unmetered_response`,
+    /// which is fail-closed by default.
+    fn response_stream_inspector(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        content_type: Option<&str>,
+    ) -> Option<Box<dyn ResponseStreamInspector>> {
+        if !(200..300).contains(&response_status) {
+            return None;
+        }
+        // Only a request THIS instance classified as an AI call. An unrelated
+        // SSE route on a shared proxy is never parsed or accounted.
+        if !self.response_accounting_candidate(ctx) {
+            return None;
+        }
+        let content_type = content_type?;
+        // Framed gRPC-Web wire frames are not a usage representation and are
+        // never charged (they are excluded on the request side too).
+        if is_framed_grpc_content_type(content_type) {
+            return None;
+        }
+        let format = if is_event_stream_content_type(content_type) {
+            UsageStreamFormat::Sse
+        } else if is_aws_event_stream_content_type(content_type) {
+            UsageStreamFormat::AwsEventStream
+        } else {
+            return None;
+        };
+
+        let handoff = ctx.response_stream_handoff()?;
+        let Some(permit) = StreamAccountingPermit::acquire() else {
+            // Aggregate accounting state is saturated. Forward the stream
+            // untouched; the terminal hook applies the configured unmetered
+            // policy exactly once, so the budget is never silently freed.
+            // Sampled so saturation cannot turn every request into a log line.
+            let refused = STREAM_ACCOUNTING_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            if refused.is_multiple_of(STREAM_ACCOUNTING_REFUSAL_LOG_INTERVAL) {
+                warn!(
+                    plugin = "ai_rate_limiter",
+                    limit = MAX_CONCURRENT_STREAM_ACCOUNTING,
+                    refused_total = refused.saturating_add(1),
+                    "streaming token accounting at capacity; responses are resolved by on_unmetered_response until it drains"
+                );
+            }
+            return None;
+        };
+        let shared = Arc::new(StreamUsageHandoff::default());
+        handoff.publish(self.stream_usage_handoff_key, Arc::clone(&shared));
+        Some(Box::new(UsageStreamInspector {
+            extractor: UsageStreamExtractor::new(format, self.configured_provider),
+            shared,
+            _permit: permit,
+        }))
+    }
+
+    /// Reconcile a streamed response's terminal usage exactly once.
+    ///
+    /// Runs on every terminal outcome of a streamed body — normal completion,
+    /// backend error, and the client-disconnect `Drop` safety net — so a stream
+    /// abandoned mid-flight still resolves its reservation instead of leaking it
+    /// to window/TTL expiry.
+    async fn on_response_stream_terminated(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        _outcome: &crate::proxy::deferred_log::BodyOutcome,
+    ) {
+        // Federation reconciles exclusively in `after_proxy`; synthetic
+        // short-circuit bodies consumed no provider tokens. Both mirror the
+        // buffered `on_response_body` guards.
+        if ctx.metadata.contains_key("ai_federation_provider")
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
+        {
+            return;
+        }
+        if !self.response_accounting_candidate(ctx) {
+            return;
+        }
+
+        let captured = ctx
+            .response_stream_handoff()
+            .and_then(|handoff| handoff.take::<StreamUsageHandoff>(self.stream_usage_handoff_key));
+        let (tokens, detail) = match &captured {
+            Some(shared) => {
+                let usage = match shared.usage.lock() {
+                    Ok(usage) => usage.clone(),
+                    Err(poisoned) => poisoned.into_inner().clone(),
+                };
+                if usage.observed() {
+                    (usage.total_for_mode(&self.count_mode), "stream_usage")
+                } else {
+                    (
+                        self.read_tokens_from_metadata(&ctx.metadata),
+                        "stream_without_usage",
+                    )
+                }
+            }
+            // No inspector ran: a non-meterable streamed representation, or the
+            // aggregate accounting cap was reached. A co-located plugin may
+            // still have published authoritative usage into metadata.
+            None => (
+                self.read_tokens_from_metadata(&ctx.metadata),
+                "stream_not_inspected",
+            ),
+        };
+
+        self.reconcile_streamed_usage(ctx, response_status, tokens, detail)
+            .await;
     }
 
     async fn on_response_body(
@@ -2438,6 +2829,21 @@ impl Plugin for AiRateLimiter {
                 return self.extract_token_count_from_sse(body);
             }
 
+            // A Bedrock event stream normally reaches the incremental
+            // inspector; it can still land here when an unrelated plugin pins
+            // the response onto the buffered path. Decode it with the same
+            // bounded framing parser so both paths charge identically.
+            if is_aws_event_stream_content_type(content_type) {
+                unmetered_detail = "event_stream_without_usage";
+                let mut extractor = UsageStreamExtractor::new(
+                    UsageStreamFormat::AwsEventStream,
+                    self.configured_provider,
+                );
+                extractor.push(body);
+                extractor.finish();
+                return extractor.usage().total_for_mode(&self.count_mode);
+            }
+
             if !is_json_content_type(content_type) {
                 unmetered_detail = "unsupported_content_type";
                 return None;
@@ -2460,5 +2866,115 @@ impl Plugin for AiRateLimiter {
             self.apply_exposed_headers(ctx, response_headers);
         }
         result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming response accounting
+// ---------------------------------------------------------------------------
+
+/// RAII slot in the process-wide [`MAX_CONCURRENT_STREAM_ACCOUNTING`] budget.
+///
+/// Acquisition is a bounded CAS loop, so a burst of concurrent streams can
+/// never push the live parser count past the cap, and the slot is returned when
+/// the inspector is dropped — including when the client disconnects mid-stream
+/// and the stream task is torn down.
+struct StreamAccountingPermit;
+
+impl StreamAccountingPermit {
+    fn acquire() -> Option<Self> {
+        let mut current = ACTIVE_STREAM_ACCOUNTING.load(Ordering::Relaxed);
+        loop {
+            if current >= MAX_CONCURRENT_STREAM_ACCOUNTING {
+                return None;
+            }
+            match ACTIVE_STREAM_ACCOUNTING.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Live inspector count. Test/diagnostic accessor.
+    #[allow(dead_code)] // used only by tests/, dead code in the bin target
+    fn active() -> usize {
+        ACTIVE_STREAM_ACCOUNTING.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for StreamAccountingPermit {
+    fn drop(&mut self) {
+        ACTIVE_STREAM_ACCOUNTING.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Live inspector count backing the aggregate stream-accounting bound.
+/// Test-only observability; not a production API.
+#[doc(hidden)]
+#[allow(dead_code)] // used only by tests/, dead code in the bin target
+pub fn active_stream_accounting_for_test() -> usize {
+    StreamAccountingPermit::active()
+}
+
+/// Process-wide ceiling on concurrent streaming token accounting. Test-only.
+#[doc(hidden)]
+#[allow(dead_code)] // used only by tests/, dead code in the bin target
+pub fn max_concurrent_stream_accounting_for_test() -> usize {
+    MAX_CONCURRENT_STREAM_ACCOUNTING
+}
+
+/// Pass-through stream inspector that extracts terminal provider usage.
+///
+/// Every chunk is forwarded byte-for-byte and immediately — the inspector never
+/// holds a window, so SSE event latency and H1/H2/H3 backpressure are exactly
+/// what they would be with no plugin attached. It also never terminates the
+/// stream: response headers are already committed by the time a body flows, so
+/// truncating would only corrupt a generation the client is already paying for.
+struct UsageStreamInspector {
+    extractor: UsageStreamExtractor,
+    shared: Arc<StreamUsageHandoff>,
+    _permit: StreamAccountingPermit,
+}
+
+impl UsageStreamInspector {
+    fn publish(&mut self) {
+        let usage = self.extractor.usage().clone();
+        match self.shared.usage.lock() {
+            Ok(mut slot) => *slot = usage,
+            Err(poisoned) => *poisoned.into_inner() = usage,
+        }
+    }
+}
+
+#[async_trait]
+impl ResponseStreamInspector for UsageStreamInspector {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        self.extractor.push(chunk);
+        ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        self.extractor.finish();
+        self.publish();
+        ResponseStreamAction::Forward(bytes::Bytes::new())
+    }
+
+    /// A later inspector cut the stream: the bytes this one already parsed are
+    /// still the bytes the provider generated and billed, so the accumulated
+    /// usage stays. Publish it now because `on_end` will not run.
+    fn on_downstream_terminated(&mut self) {
+        self.publish();
+    }
+
+    /// Publish before the owning task wakes the terminal hooks, so a stream that
+    /// ends by client disconnect (no `on_end`) still hands back whatever usage
+    /// the provider had already reported.
+    fn on_before_drop(&mut self) {
+        self.publish();
     }
 }

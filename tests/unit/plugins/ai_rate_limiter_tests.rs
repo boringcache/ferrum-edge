@@ -21,6 +21,23 @@ use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 /// with the source constant (a drift would surface as a failing skip assertion).
 const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
 
+/// Every reservation-lifecycle metadata key `ai_rate_limiter` writes is scoped
+/// to the limiter INSTANCE (`<base>#<instance id>`) so two composed budgets on
+/// one proxy cannot overwrite or suppress each other (GHSA-wh4p-pmxm-3784).
+/// Tests that own a single limiter resolve an entry by its base name; tests that
+/// compose two limiters use `AiRateLimiter::metadata_key_for_test` instead.
+fn scoped_meta<'a>(ctx: &'a RequestContext, base: &str) -> Option<&'a String> {
+    let prefix = format!("{base}#");
+    ctx.metadata
+        .iter()
+        .find(|(key, _)| key.starts_with(&prefix))
+        .map(|(_, value)| value)
+}
+
+fn has_scoped_meta(ctx: &RequestContext, base: &str) -> bool {
+    scoped_meta(ctx, base).is_some()
+}
+
 fn json_headers() -> HashMap<String, String> {
     let mut h = HashMap::new();
     h.insert("content-type".to_string(), "application/json".to_string());
@@ -69,19 +86,72 @@ async fn test_plugin_name_and_priority() {
     // the plugin must not advertise (and must not be attachable to) native gRPC.
     assert_eq!(plugin.supported_protocols(), &[ProxyProtocol::Http]);
     assert!(!plugin.supported_protocols().contains(&ProxyProtocol::Grpc));
+    // Config-time upper bound stays true: a JSON usage document still needs the
+    // collected body.
     assert!(plugin.requires_response_body_buffering());
-    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "application/json")));
-    assert!(plugin.should_buffer_response_body(&ctx_with_content_type(
-        "POST",
-        "multipart/form-data; boundary=abc"
-    )));
-    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "text/plain")));
-    assert!(plugin.should_buffer_response_body(&ctx_without_content_type("POST")));
-    // Spec change (PR #956 / commit 55a59396): the POST-only buffering
-    // shortcut was a security bypass — non-POST AI responses (e.g. GET
-    // chat history endpoints) would skip token-budget accounting. The
-    // plugin now buffers every method when it's active.
-    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("GET", "application/json")));
+    assert!(plugin.requires_response_stream_hooks());
+
+    // GHSA-q2r2-6r7h-f69x: buffering is no longer unconditional. A request this
+    // instance never classified as an AI call is not buffered at all, whatever
+    // its method or content type.
+    for ctx in [
+        ctx_with_content_type("POST", "application/json"),
+        ctx_with_content_type("POST", "multipart/form-data; boundary=abc"),
+        ctx_with_content_type("POST", "text/plain"),
+        ctx_without_content_type("POST"),
+        ctx_with_content_type("GET", "application/json"),
+    ] {
+        assert!(
+            !plugin.should_buffer_response_body(&ctx),
+            "an unclassified request must not pin its response onto the buffered path"
+        );
+    }
+
+    // Once classified (the marker `before_proxy` writes), the response is
+    // buffered — but only for the JSON representation that carries a usage
+    // document, and only on success. The method is still irrelevant: PR #956
+    // established that non-POST AI responses (e.g. GET chat-history endpoints)
+    // must not skip token-budget accounting.
+    for method in ["POST", "GET"] {
+        let mut ctx = ctx_with_content_type(method, "application/json");
+        ctx.metadata.insert(
+            plugin.metadata_key_for_test("ai_ratelimit_request"),
+            "true".to_string(),
+        );
+        assert!(plugin.should_buffer_response_body(&ctx));
+        let headers = HashMap::new();
+        assert!(plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/json"),
+            200,
+            &headers
+        ));
+        for released in [
+            "text/event-stream",
+            "application/vnd.amazon.eventstream",
+            "text/plain",
+            "application/grpc-web+json",
+        ] {
+            assert!(
+                !plugin.should_buffer_response_body_for_content_type(
+                    &ctx,
+                    Some(released),
+                    200,
+                    &headers
+                ),
+                "{released} must be released to the streaming path"
+            );
+        }
+        assert!(
+            !plugin.should_buffer_response_body_for_content_type(
+                &ctx,
+                Some("application/json"),
+                500,
+                &headers
+            ),
+            "a non-2xx release is a status-only decision and needs no body"
+        );
+    }
 }
 
 // ─── Basic flow ─────────────────────────────────────────────────────────
@@ -527,10 +597,10 @@ async fn test_expose_headers() {
     let mut headers = HashMap::new();
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
-    assert_eq!(ctx.metadata.get("ai_ratelimit_limit").unwrap(), "1000");
-    assert_eq!(ctx.metadata.get("ai_ratelimit_remaining").unwrap(), "1000");
-    assert_eq!(ctx.metadata.get("ai_ratelimit_window").unwrap(), "60");
-    assert_eq!(ctx.metadata.get("ai_ratelimit_usage").unwrap(), "0");
+    assert_eq!(scoped_meta(&ctx, "ai_ratelimit_limit").unwrap(), "1000");
+    assert_eq!(scoped_meta(&ctx, "ai_ratelimit_remaining").unwrap(), "1000");
+    assert_eq!(scoped_meta(&ctx, "ai_ratelimit_window").unwrap(), "60");
+    assert_eq!(scoped_meta(&ctx, "ai_ratelimit_usage").unwrap(), "0");
 
     // after_proxy should inject headers
     let mut response_headers = HashMap::new();
@@ -908,9 +978,7 @@ async fn test_window_running_sum_matches_after_eviction() {
     let mut ctx2 = create_test_context();
     let mut headers2 = HashMap::new();
     assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
-    let remaining = ctx2
-        .metadata
-        .get("ai_ratelimit_remaining")
+    let remaining = scoped_meta(&ctx2, "ai_ratelimit_remaining")
         .map(|v| v.parse::<u64>().unwrap_or(0))
         .unwrap_or(0);
     assert_eq!(
@@ -1004,8 +1072,7 @@ fn ai_request_ctx(max_tokens: u64, prompt: &str) -> RequestContext {
 }
 
 fn reserved_tokens(ctx: &RequestContext) -> u64 {
-    ctx.metadata
-        .get("ai_ratelimit_reserved_tokens")
+    scoped_meta(&ctx, "ai_ratelimit_reserved_tokens")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0)
 }
@@ -1016,8 +1083,7 @@ async fn observed_usage(plugin: &AiRateLimiter) -> u64 {
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
     plugin.before_proxy(&mut ctx, &mut headers).await;
-    ctx.metadata
-        .get("ai_ratelimit_usage")
+    scoped_meta(&ctx, "ai_ratelimit_usage")
         .map(|v| v.parse::<u64>().unwrap_or(0))
         .unwrap_or(0)
 }
@@ -1201,13 +1267,11 @@ async fn compressed_request_skips_pre_reservation_and_reconciles_actual_usage() 
         "a compressed request must NOT produce a body-derived pre-reservation"
     );
     assert!(
-        !compressed
-            .metadata
-            .contains_key("ai_ratelimit_reserved_tokens"),
+        !has_scoped_meta(&compressed, "ai_ratelimit_reserved_tokens"),
         "compressed request should skip pre-reservation entirely (no reserved-tokens marker)"
     );
     assert!(
-        compressed.metadata.contains_key("ai_ratelimit_request"),
+        has_scoped_meta(&compressed, "ai_ratelimit_request"),
         "compressed POST JSON must stay subject to unmetered-response policy"
     );
 
@@ -1249,7 +1313,7 @@ async fn compressed_unmetered_2xx_reject_mode_returns_502() {
         "compressed request is not pre-reserved"
     );
     assert!(
-        ctx.metadata.contains_key("ai_ratelimit_request"),
+        has_scoped_meta(&ctx, "ai_ratelimit_request"),
         "compressed POST JSON must be marked so reject mode cannot be bypassed"
     );
 
@@ -1315,12 +1379,11 @@ async fn compressed_decompressed_ai_request_classified_in_on_final() {
         "a compressed request is never pre-reserved"
     );
     assert!(
-        !ctx.metadata.contains_key("ai_ratelimit_request"),
+        !has_scoped_meta(&ctx, "ai_ratelimit_request"),
         "Case A must DEFER classification, never mark in before_proxy"
     );
     assert!(
-        ctx.metadata
-            .contains_key("ai_ratelimit_deferred_compressed_classify"),
+        has_scoped_meta(&ctx, "ai_ratelimit_deferred_compressed_classify"),
         "before_proxy must set the deferred-classification marker for Case A"
     );
 
@@ -1336,12 +1399,11 @@ async fn compressed_decompressed_ai_request_classified_in_on_final() {
             .await,
     );
     assert!(
-        ctx.metadata.contains_key("ai_ratelimit_request"),
+        has_scoped_meta(&ctx, "ai_ratelimit_request"),
         "on_final must mark the decompressed AI request"
     );
     assert!(
-        !ctx.metadata
-            .contains_key("ai_ratelimit_deferred_compressed_classify"),
+        !has_scoped_meta(&ctx, "ai_ratelimit_deferred_compressed_classify"),
         "on_final must consume the deferred marker"
     );
 
@@ -1382,8 +1444,7 @@ async fn compressed_decompressed_non_ai_request_not_marked() {
     let mut headers = json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert!(
-        ctx.metadata
-            .contains_key("ai_ratelimit_deferred_compressed_classify"),
+        has_scoped_meta(&ctx, "ai_ratelimit_deferred_compressed_classify"),
         "before_proxy defers compressed POST JSON to on_final"
     );
 
@@ -1395,7 +1456,7 @@ async fn compressed_decompressed_non_ai_request_not_marked() {
             .await,
     );
     assert!(
-        !ctx.metadata.contains_key("ai_ratelimit_request"),
+        !has_scoped_meta(&ctx, "ai_ratelimit_request"),
         "a decompressed NON-AI body must NOT be marked (no false positive)"
     );
 
@@ -1436,8 +1497,7 @@ async fn spoofed_original_encoding_header_without_compression_still_reserves() {
          x-ferrum-original-content-encoding header"
     );
     assert!(
-        !ctx.metadata
-            .contains_key("ai_ratelimit_deferred_compressed_classify"),
+        !has_scoped_meta(&ctx, "ai_ratelimit_deferred_compressed_classify"),
         "a forged client header must not trigger the deferred path"
     );
 }
@@ -1469,12 +1529,11 @@ async fn compressed_framed_grpc_json_not_marked() {
     headers.insert("content-encoding".to_string(), "gzip".to_string());
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert!(
-        !ctx.metadata.contains_key("ai_ratelimit_request"),
+        !has_scoped_meta(&ctx, "ai_ratelimit_request"),
         "a framed gRPC body must not be marked an AI candidate"
     );
     assert!(
-        !ctx.metadata
-            .contains_key("ai_ratelimit_deferred_compressed_classify"),
+        !has_scoped_meta(&ctx, "ai_ratelimit_deferred_compressed_classify"),
         "a framed gRPC body must not be deferred"
     );
 
@@ -1547,7 +1606,7 @@ async fn comma_listed_compression_encoding_skips_pre_reservation() {
         "a comma-listed compression codec must skip the body-derived pre-reservation"
     );
     assert!(
-        !ctx.metadata.contains_key("ai_ratelimit_reserved_tokens"),
+        !has_scoped_meta(&ctx, "ai_ratelimit_reserved_tokens"),
         "comma-listed compression should skip pre-reservation entirely (no reserved-tokens marker)"
     );
 }
@@ -1728,7 +1787,7 @@ async fn non_ai_2xx_is_not_rejected_in_reject_mode() {
     let mut headers = HashMap::new();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert!(
-        !ctx.metadata.contains_key("ai_ratelimit_request"),
+        !has_scoped_meta(&ctx, "ai_ratelimit_request"),
         "a request with no parseable JSON body must not be marked as an AI call"
     );
 
@@ -1788,7 +1847,7 @@ async fn completion_tokens_mode_ai_request_still_subject_to_reject_policy() {
         "completion_tokens mode with no max_* reserves nothing"
     );
     assert!(
-        ctx.metadata.contains_key("ai_ratelimit_request"),
+        has_scoped_meta(&ctx, "ai_ratelimit_request"),
         "a parseable AI request body must be marked even when it reserves 0"
     );
 
@@ -2045,7 +2104,7 @@ async fn reject_mode_does_not_release_on_gateway_rejection() {
     ctx.metadata
         .insert("ferrum:rejection_response".to_string(), "true".to_string());
     ctx.metadata.insert(
-        "ai_ratelimit_unmetered_action".to_string(),
+        plugin.metadata_key_for_test("ai_ratelimit_unmetered_action"),
         "reject".to_string(),
     );
 
@@ -2104,8 +2163,7 @@ async fn non_2xx_release_then_gateway_rejection_reconciles_exactly_once() {
         "the pre-request reservation should be charged to the window"
     );
     assert!(
-        !ctx.metadata
-            .contains_key("ai_ratelimit_reservation_reconciled"),
+        !has_scoped_meta(&ctx, "ai_ratelimit_reservation_reconciled"),
         "the reservation must not be marked reconciled before any response phase"
     );
 
@@ -2118,8 +2176,7 @@ async fn non_2xx_release_then_gateway_rejection_reconciles_exactly_once() {
             .await,
     );
     assert!(
-        ctx.metadata
-            .contains_key("ai_ratelimit_reservation_reconciled"),
+        has_scoped_meta(&ctx, "ai_ratelimit_reservation_reconciled"),
         "the non-2xx release must mark the reservation reconciled"
     );
     assert_eq!(
@@ -5417,7 +5474,7 @@ async fn non_llm_json_post_is_not_treated_as_ai_request() {
         "non-LLM JSON must not reserve tokens"
     );
     assert!(
-        !ctx.metadata.contains_key("ai_ratelimit_request"),
+        !has_scoped_meta(&ctx, "ai_ratelimit_request"),
         "non-LLM JSON must not be marked as an AI request"
     );
 
@@ -5443,7 +5500,7 @@ async fn non_llm_json_post_is_not_treated_as_ai_request() {
     let mut msg_headers = HashMap::new();
     assert_continue(plugin.before_proxy(&mut msg_ctx, &mut msg_headers).await);
     assert!(
-        !msg_ctx.metadata.contains_key("ai_ratelimit_request"),
+        !has_scoped_meta(&msg_ctx, "ai_ratelimit_request"),
         "a bare `message` without `model` must not be marked as an AI request"
     );
 
@@ -5464,7 +5521,7 @@ async fn non_llm_json_post_is_not_treated_as_ai_request() {
             .await,
     );
     assert!(
-        cohere_ctx.metadata.contains_key("ai_ratelimit_request"),
+        has_scoped_meta(&cohere_ctx, "ai_ratelimit_request"),
         "a `message` corroborated by `model` must be marked as an AI request"
     );
 
@@ -5473,7 +5530,7 @@ async fn non_llm_json_post_is_not_treated_as_ai_request() {
     let mut ai_headers = HashMap::new();
     assert_continue(plugin.before_proxy(&mut ai_ctx, &mut ai_headers).await);
     assert!(
-        ai_ctx.metadata.contains_key("ai_ratelimit_request"),
+        has_scoped_meta(&ai_ctx, "ai_ratelimit_request"),
         "an LLM-shaped request must be marked as an AI request"
     );
     let ai_body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
@@ -5513,7 +5570,7 @@ async fn responses_request_without_input_is_treated_as_ai() {
         let mut headers = HashMap::new();
         assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
         assert!(
-            ctx.metadata.contains_key("ai_ratelimit_request"),
+            has_scoped_meta(&ctx, "ai_ratelimit_request"),
             "Responses-without-input must be marked as an AI request: {body}"
         );
     }
@@ -5531,7 +5588,7 @@ async fn responses_request_without_input_is_treated_as_ai() {
     let mut headers = HashMap::new();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert!(
-        !ctx.metadata.contains_key("ai_ratelimit_request"),
+        !has_scoped_meta(&ctx, "ai_ratelimit_request"),
         "bare `instructions` without `model` must not be marked as an AI request"
     );
 }
@@ -5876,9 +5933,7 @@ async fn run_expose_header_lifecycle(
         reserved > 0,
         "lifecycle fixture must take a pre-request reservation"
     );
-    let admission_usage = ctx
-        .metadata
-        .get("ai_ratelimit_usage")
+    let admission_usage = scoped_meta(&ctx, "ai_ratelimit_usage")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     assert_eq!(
@@ -5908,7 +5963,7 @@ async fn run_expose_header_lifecycle(
         response_headers
             .get("x-ai-ratelimit-remaining")
             .map(String::as_str),
-        Some(ctx.metadata.get("ai_ratelimit_remaining").unwrap().as_str())
+        Some(scoped_meta(&ctx, "ai_ratelimit_remaining").unwrap().as_str())
     );
     assert_eq!(
         response_headers
@@ -5988,7 +6043,7 @@ async fn expose_headers_lifecycle_reflects_reconciled_usage_local() {
         "window stays coherent across reconcile"
     );
     assert_eq!(
-        ctx.metadata.get("ai_ratelimit_usage").map(String::as_str),
+        scoped_meta(&ctx, "ai_ratelimit_usage").map(String::as_str),
         Some(actual_str.as_str()),
         "metadata must refresh with the reconciled outcome"
     );
@@ -6186,18 +6241,22 @@ fn unreachable_redis_ai_config(failure_policy: Option<&str>) -> serde_json::Valu
 /// is Redis dying *after* admission — a `fail_closed` plugin whose store is
 /// already unreachable refuses at admission and never reaches reconciliation at
 /// all (see `fail_closed_admission_refuses_when_enforcement_is_unavailable`).
-fn reconcilable_ai_ctx(reserved: u64) -> RequestContext {
+fn reconcilable_ai_ctx(plugin: &AiRateLimiter, reserved: u64) -> RequestContext {
     let mut ctx = ai_request_ctx(200, "hello reconcile");
+    // Reservation state is instance-scoped, so the fixture must seed THIS
+    // limiter's keys — a shared key would no longer be read at all.
     ctx.metadata.insert(
-        "ai_ratelimit_reserved_tokens".to_string(),
+        plugin.metadata_key_for_test("ai_ratelimit_reserved_tokens"),
         reserved.to_string(),
     );
     ctx.metadata.insert(
-        "ai_ratelimit_reserved_window_index".to_string(),
+        plugin.metadata_key_for_test("ai_ratelimit_reserved_window_index"),
         "42".to_string(),
     );
-    ctx.metadata
-        .insert("ai_ratelimit_request".to_string(), "true".to_string());
+    ctx.metadata.insert(
+        plugin.metadata_key_for_test("ai_ratelimit_request"),
+        "true".to_string(),
+    );
     ctx
 }
 
@@ -6265,7 +6324,7 @@ async fn fail_closed_reconcile_refuses_uncharged_successful_response() {
     let config = unreachable_redis_ai_config(None);
     let plugin = AiRateLimiter::new(&config, PluginHttpClient::default()).unwrap();
 
-    let mut ctx = reconcilable_ai_ctx(120);
+    let mut ctx = reconcilable_ai_ctx(&plugin, 120);
     let mut response_headers = json_headers();
     let body = openai_response(40, 60);
     let reconciled = plugin
@@ -6286,7 +6345,7 @@ async fn fail_closed_reconcile_refuses_uncharged_federated_response() {
     let config = unreachable_redis_ai_config(None);
     let plugin = AiRateLimiter::new(&config, PluginHttpClient::default()).unwrap();
 
-    let mut ctx = reconcilable_ai_ctx(120);
+    let mut ctx = reconcilable_ai_ctx(&plugin, 120);
     mark_federated(&mut ctx, "200", "100");
 
     let mut response_headers = json_headers();
@@ -6304,7 +6363,7 @@ async fn fail_closed_reconcile_keeps_an_already_failed_response() {
     let config = unreachable_redis_ai_config(None);
     let plugin = AiRateLimiter::new(&config, PluginHttpClient::default()).unwrap();
 
-    let mut ctx = reconcilable_ai_ctx(120);
+    let mut ctx = reconcilable_ai_ctx(&plugin, 120);
     mark_federated(&mut ctx, "500", "100");
 
     let mut response_headers = json_headers();
@@ -6324,7 +6383,7 @@ async fn local_fallback_reconcile_charges_local_state_instead_of_refusing() {
     let config = unreachable_redis_ai_config(Some("local_fallback"));
     let plugin = AiRateLimiter::new(&config, PluginHttpClient::default()).unwrap();
 
-    let mut ctx = reconcilable_ai_ctx(120);
+    let mut ctx = reconcilable_ai_ctx(&plugin, 120);
     let mut response_headers = json_headers();
     let body = openai_response(40, 60);
     assert_continue(
@@ -6406,7 +6465,7 @@ async fn framed_grpc_requests_are_never_ai_candidates_or_reserved() {
         let mut headers = ctx.headers.clone();
         assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
         assert!(
-            !ctx.metadata.contains_key("ai_ratelimit_request"),
+            !has_scoped_meta(&ctx, "ai_ratelimit_request"),
             "framed body must not be classified as an AI request for {content_type}"
         );
         assert_eq!(
@@ -6415,7 +6474,7 @@ async fn framed_grpc_requests_are_never_ai_candidates_or_reserved() {
             "framed body must not reserve tokens for {content_type}"
         );
         assert!(
-            !ctx.metadata.contains_key("ai_ratelimit_reservation_id"),
+            !has_scoped_meta(&ctx, "ai_ratelimit_reservation_id"),
             "framed body must not hold a reservation for {content_type}"
         );
 
@@ -6426,7 +6485,7 @@ async fn framed_grpc_requests_are_never_ai_candidates_or_reserved() {
                 .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
                 .await,
         );
-        assert!(!ctx.metadata.contains_key("ai_ratelimit_request"));
+        assert!(!has_scoped_meta(&ctx, "ai_ratelimit_request"));
     }
 }
 
@@ -6453,7 +6512,7 @@ async fn framed_grpc_web_response_is_not_charged_as_json_usage() {
     let mut ctx = ai_request_ctx(120, "hello");
     let mut headers = ctx.headers.clone();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
-    assert!(ctx.metadata.contains_key("ai_ratelimit_request"));
+    assert!(has_scoped_meta(&ctx, "ai_ratelimit_request"));
     let reserved = reserved_tokens(&ctx);
     assert!(reserved > 0, "an ordinary JSON AI POST must still reserve");
 
@@ -6471,12 +6530,11 @@ async fn framed_grpc_web_response_is_not_charged_as_json_usage() {
             .await,
     );
     assert!(
-        !ctx.metadata.contains_key("ai_ratelimit_actual_tokens"),
+        !has_scoped_meta(&ctx, "ai_ratelimit_actual_tokens"),
         "a framed gRPC-Web body must never be reconciled as provider-reported usage"
     );
     assert_eq!(
-        ctx.metadata
-            .get("ai_ratelimit_unmetered_action")
+        scoped_meta(&ctx, "ai_ratelimit_unmetered_action")
             .map(String::as_str),
         Some("charge_estimate"),
         "framed gRPC-Web must take the unmetered policy path, not JSON usage extract"
@@ -6510,8 +6568,7 @@ async fn ordinary_json_and_sse_responses_remain_eligible() {
             .await,
     );
     assert_eq!(
-        ctx.metadata
-            .get("ai_ratelimit_actual_tokens")
+        scoped_meta(&ctx, "ai_ratelimit_actual_tokens")
             .map(String::as_str),
         Some("700"),
         "an ordinary JSON usage block must still be charged"
@@ -6538,11 +6595,719 @@ async fn ordinary_json_and_sse_responses_remain_eligible() {
             .await,
     );
     assert_eq!(
-        sse_ctx
-            .metadata
-            .get("ai_ratelimit_actual_tokens")
+        scoped_meta(&sse_ctx, "ai_ratelimit_actual_tokens")
             .map(String::as_str),
         Some("15"),
         "SSE usage extraction must be unchanged"
     );
+}
+
+// ─── GHSA-wh4p-pmxm-3784: composed instances reconcile independently ─────
+
+fn local_limiter(token_limit: u64, count_mode: &str, limit_by: &str) -> AiRateLimiter {
+    AiRateLimiter::new(
+        &json!({
+            "token_limit": token_limit,
+            "window_seconds": 60,
+            "count_mode": count_mode,
+            "limit_by": limit_by,
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap()
+}
+
+/// Reserved estimate recorded by ONE specific instance.
+fn instance_reserved(plugin: &AiRateLimiter, ctx: &RequestContext) -> u64 {
+    ctx.metadata
+        .get(&plugin.metadata_key_for_test("ai_ratelimit_reserved_tokens"))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn instance_released(plugin: &AiRateLimiter, ctx: &RequestContext) -> bool {
+    ctx.metadata
+        .contains_key(&plugin.metadata_key_for_test("ai_ratelimit_reservation_reconciled"))
+}
+
+#[tokio::test]
+async fn two_local_instances_keep_separate_reservation_state() {
+    // A per-consumer budget and a per-IP budget with different count modes and
+    // therefore different estimates: the documented defense-in-depth pairing.
+    let per_consumer = local_limiter(1_000_000, "total_tokens", "consumer");
+    let per_ip = local_limiter(1_000_000, "completion_tokens", "ip");
+    assert_ne!(
+        per_consumer.instance_id_for_test(),
+        per_ip.instance_id_for_test()
+    );
+
+    let mut ctx = ai_request_ctx(300, "a reasonably long prompt for estimation purposes");
+    let mut headers = HashMap::new();
+    assert_continue(per_consumer.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(per_ip.before_proxy(&mut ctx, &mut headers).await);
+
+    let consumer_reserved = instance_reserved(&per_consumer, &ctx);
+    let ip_reserved = instance_reserved(&per_ip, &ctx);
+    assert!(consumer_reserved > 0 && ip_reserved > 0);
+    assert_ne!(
+        consumer_reserved, ip_reserved,
+        "each instance must reserve its OWN estimate (total_tokens vs completion_tokens)"
+    );
+    assert_eq!(
+        ip_reserved, 300,
+        "completion_tokens mode reserves exactly the requested output cap"
+    );
+
+    // Each instance also owns a distinct local reservation id entry.
+    assert!(
+        ctx.metadata
+            .contains_key(&per_consumer.metadata_key_for_test("ai_ratelimit_reservation_id"))
+    );
+    assert!(
+        ctx.metadata
+            .contains_key(&per_ip.metadata_key_for_test("ai_ratelimit_reservation_id"))
+    );
+}
+
+#[tokio::test]
+async fn out_of_order_reconciliation_charges_each_instance_its_own_actual_usage() {
+    let first = local_limiter(1_000_000, "total_tokens", "consumer");
+    let second = local_limiter(1_000_000, "completion_tokens", "ip");
+
+    let mut ctx = ai_request_ctx(500, "prompt for out of order completion");
+    let mut headers = HashMap::new();
+    assert_continue(first.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(second.before_proxy(&mut ctx, &mut headers).await);
+
+    // Response passes complete in REVERSE order relative to admission.
+    let body = openai_response(40, 60);
+    let mut response_headers = json_headers();
+    assert_continue(
+        second
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+    );
+    assert_continue(
+        first
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+    );
+
+    // Each window holds exactly its own count mode's actual usage, never the
+    // sibling's estimate.
+    assert_eq!(observed_usage(&first).await, 100, "total_tokens instance");
+    assert_eq!(
+        observed_usage(&second).await,
+        60,
+        "completion_tokens instance"
+    );
+}
+
+#[tokio::test]
+async fn a_release_by_one_instance_does_not_suppress_its_sibling() {
+    let first = local_limiter(1_000_000, "total_tokens", "consumer");
+    let second = local_limiter(1_000_000, "total_tokens", "ip");
+
+    let mut ctx = ai_request_ctx(200, "prompt whose backend fails");
+    let mut headers = HashMap::new();
+    assert_continue(first.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(second.before_proxy(&mut ctx, &mut headers).await);
+    assert!(observed_usage(&first).await > 0);
+    assert!(observed_usage(&second).await > 0);
+
+    let mut response_headers = HashMap::new();
+    assert_continue(first.after_proxy(&mut ctx, 502, &mut response_headers).await);
+    assert!(instance_released(&first, &ctx));
+    assert!(
+        !instance_released(&second, &ctx),
+        "the first instance's release marker must not be visible to the sibling"
+    );
+    assert_continue(
+        second
+            .after_proxy(&mut ctx, 502, &mut response_headers)
+            .await,
+    );
+    assert!(instance_released(&second, &ctx));
+
+    assert_eq!(observed_usage(&first).await, 0, "first budget released");
+    assert_eq!(observed_usage(&second).await, 0, "second budget released");
+}
+
+#[tokio::test]
+async fn a_repeated_release_pass_is_idempotent_per_instance() {
+    let plugin = local_limiter(1_000_000, "total_tokens", "ip");
+    let mut ctx = ai_request_ctx(200, "prompt whose backend fails");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(instance_reserved(&plugin, &ctx) > 0);
+
+    // Three reachable release paths for one response: the status-only
+    // `after_proxy` release, a buffered body pass, and a gateway-rejection
+    // re-run of `after_proxy`.
+    let mut response_headers = HashMap::new();
+    assert_continue(plugin.after_proxy(&mut ctx, 502, &mut response_headers).await);
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 502, &mut response_headers, b"")
+            .await,
+    );
+    ctx.metadata
+        .insert("ferrum:rejection_response".to_string(), "true".to_string());
+    assert_continue(plugin.after_proxy(&mut ctx, 500, &mut response_headers).await);
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "the reservation must be released exactly once, never double-subtracted"
+    );
+}
+
+#[tokio::test]
+async fn mixed_backend_instances_do_not_share_a_reservation_backend() {
+    // One local instance and one Redis-mode instance on the same request. The
+    // Redis endpoint is unreachable, so admission fails closed for it — the
+    // local instance must be entirely unaffected, and neither may read the
+    // other's reservation markers.
+    let local = local_limiter(1_000_000, "total_tokens", "ip");
+    let centralized = AiRateLimiter::new(
+        &unreachable_redis_ai_config(None),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(200, "mixed backend prompt");
+    let mut headers = HashMap::new();
+    assert_continue(local.before_proxy(&mut ctx, &mut headers).await);
+    let local_reserved = instance_reserved(&local, &ctx);
+    assert!(local_reserved > 0);
+
+    assert_generic_enforcement_unavailable(centralized.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        instance_reserved(&centralized, &ctx),
+        0,
+        "a refused centralized admission must record no reservation"
+    );
+    assert_eq!(
+        instance_reserved(&local, &ctx),
+        local_reserved,
+        "the centralized instance must not overwrite the local reservation"
+    );
+    assert!(
+        !ctx.metadata.contains_key(
+            &centralized.metadata_key_for_test("ai_ratelimit_reserved_window_index")
+        ),
+        "no Redis window index may be recorded for a refused admission"
+    );
+}
+
+#[tokio::test]
+async fn exposed_header_metadata_is_instance_owned() {
+    let small = local_limiter(1_000, "total_tokens", "ip");
+    let large = local_limiter(9_000, "total_tokens", "consumer");
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    assert_continue(small.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(large.before_proxy(&mut ctx, &mut headers).await);
+
+    assert_eq!(
+        ctx.metadata
+            .get(&small.metadata_key_for_test("ai_ratelimit_limit"))
+            .map(String::as_str),
+        Some("1000")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get(&large.metadata_key_for_test("ai_ratelimit_limit"))
+            .map(String::as_str),
+        Some("9000")
+    );
+
+    // The header NAMES collide by public contract (last writer in configured
+    // order wins), but each instance publishes a self-consistent set rather
+    // than an interleaving of two budgets.
+    let mut response_headers = HashMap::new();
+    assert_continue(small.after_proxy(&mut ctx, 200, &mut response_headers).await);
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-limit")
+            .map(String::as_str),
+        Some("1000")
+    );
+    assert_continue(large.after_proxy(&mut ctx, 200, &mut response_headers).await);
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-limit")
+            .map(String::as_str),
+        Some("9000")
+    );
+}
+
+// ─── GHSA-q2r2-6r7h-f69x / GHSA-rxj9-f483-g53f: streamed accounting ──────
+
+use ferrum_edge::plugins::ResponseStreamAction;
+use ferrum_edge::plugins::ai_rate_limiter::{
+    active_stream_accounting_for_test, max_concurrent_stream_accounting_for_test,
+};
+use ferrum_edge::plugins::create_response_stream_inspector;
+use ferrum_edge::proxy::deferred_log::BodyOutcome;
+
+fn streaming_limiter(on_unmetered_response: &str) -> Arc<AiRateLimiter> {
+    Arc::new(
+        AiRateLimiter::new(
+            &json!({
+                "token_limit": 1_000_000,
+                "window_seconds": 60,
+                "limit_by": "ip",
+                "expose_headers": true,
+                "on_unmetered_response": on_unmetered_response
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap(),
+    )
+}
+
+/// Drive one streamed response through the SHARED inspector entry point that
+/// every H1/H2, native H3, and cross-protocol dispatcher funnels through:
+/// `create_response_stream_inspector` → per-chunk `on_chunk` → `on_end` →
+/// `on_response_stream_terminated`. Returns the bytes forwarded downstream.
+async fn drive_stream(
+    plugin: &Arc<AiRateLimiter>,
+    ctx: &mut RequestContext,
+    status: u16,
+    content_type: &str,
+    chunks: &[&[u8]],
+    outcome: BodyOutcome,
+) -> (Vec<u8>, bool) {
+    let chain: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut forwarded = Vec::new();
+    let mut inspected = false;
+    if let Some(mut inspector) =
+        create_response_stream_inspector(&chain, ctx, status, Some(content_type))
+    {
+        inspected = true;
+        for chunk in chunks {
+            match inspector.on_chunk(chunk).await {
+                ResponseStreamAction::Forward(bytes) => forwarded.extend_from_slice(&bytes),
+                ResponseStreamAction::Terminate(_) => {
+                    panic!("ai_rate_limiter must never truncate a committed response stream")
+                }
+            }
+        }
+        if outcome.body_completed {
+            match inspector.on_end().await {
+                ResponseStreamAction::Forward(bytes) => forwarded.extend_from_slice(&bytes),
+                ResponseStreamAction::Terminate(_) => panic!("must not terminate at end of stream"),
+            }
+        }
+        drop(inspector);
+    }
+    plugin
+        .on_response_stream_terminated(ctx, status, &outcome)
+        .await;
+    (forwarded, inspected)
+}
+
+fn sse_frame(value: serde_json::Value) -> Vec<u8> {
+    format!("data: {value}\n\n").into_bytes()
+}
+
+/// One `application/vnd.amazon.eventstream` message (CRCs are not verified).
+fn bedrock_event_stream_message(payload: &[u8]) -> Vec<u8> {
+    let total = 12 + payload.len() + 4;
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&(total as u32).to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    out
+}
+
+#[tokio::test]
+async fn gemini_native_stream_is_charged_from_usage_metadata() {
+    let plugin = streaming_limiter("charge_estimate");
+    let mut ctx = ai_request_ctx(400, "gemini streaming prompt");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = instance_reserved(&plugin, &ctx);
+    assert!(reserved > 0);
+
+    let first = sse_frame(json!({"candidates": [{"content": {"parts": [{"text": "he"}]}}]}));
+    let last = sse_frame(json!({
+        "candidates": [{"content": {"parts": [{"text": "llo"}]}}],
+        "usageMetadata": {"promptTokenCount": 30, "candidatesTokenCount": 20, "totalTokenCount": 50}
+    }));
+    let (forwarded, inspected) = drive_stream(
+        &plugin,
+        &mut ctx,
+        200,
+        "text/event-stream",
+        &[&first, &last],
+        BodyOutcome::success((first.len() + last.len()) as u64),
+    )
+    .await;
+
+    assert!(inspected, "a meterable Gemini SSE stream must be inspected");
+    let mut expected = first.clone();
+    expected.extend_from_slice(&last);
+    assert_eq!(
+        forwarded, expected,
+        "every byte must be forwarded unchanged and in order"
+    );
+    assert_eq!(
+        observed_usage(&plugin).await,
+        50,
+        "the reservation must be reconciled to the reported usageMetadata total"
+    );
+}
+
+#[tokio::test]
+async fn bedrock_event_stream_is_charged_from_invocation_metrics() {
+    let plugin = streaming_limiter("charge_estimate");
+    let mut ctx = ai_request_ctx(400, "bedrock streaming prompt");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(instance_reserved(&plugin, &ctx) > 0);
+
+    let inner = serde_json::to_vec(&json!({
+        "type": "message_stop",
+        "amazon-bedrock-invocationMetrics": {"inputTokenCount": 31, "outputTokenCount": 12}
+    }))
+    .unwrap();
+    let encoded = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(inner)
+    };
+    let payload = serde_json::to_vec(&json!({"bytes": encoded})).unwrap();
+    let message = bedrock_event_stream_message(&payload);
+
+    // Split mid-message to prove the framing parser reassembles across chunks.
+    let (head, tail) = message.split_at(message.len() / 2);
+    let (forwarded, inspected) = drive_stream(
+        &plugin,
+        &mut ctx,
+        200,
+        "application/vnd.amazon.eventstream",
+        &[head, tail],
+        BodyOutcome::success(message.len() as u64),
+    )
+    .await;
+
+    assert!(inspected);
+    assert_eq!(forwarded, message, "event-stream bytes are forwarded intact");
+    assert_eq!(observed_usage(&plugin).await, 43);
+}
+
+#[tokio::test]
+async fn tgi_native_stream_is_charged_from_generated_tokens() {
+    let plugin = Arc::new(
+        AiRateLimiter::new(
+            &json!({
+                "token_limit": 1_000_000,
+                "window_seconds": 60,
+                "limit_by": "ip",
+                "expose_headers": true,
+                "count_mode": "completion_tokens",
+                "provider": "tgi"
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap(),
+    );
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({"inputs": "hello tgi", "parameters": {"max_new_tokens": 64}}).to_string(),
+    );
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        instance_reserved(&plugin, &ctx),
+        64,
+        "the native TGI output cap must size the reservation"
+    );
+
+    let token = sse_frame(json!({"token": {"id": 1, "text": "he"}}));
+    let last = sse_frame(json!({
+        "token": {"id": 2, "text": "llo"},
+        "generated_text": "hello",
+        "details": {"finish_reason": "eos_token", "generated_tokens": 9}
+    }));
+    let (_, inspected) = drive_stream(
+        &plugin,
+        &mut ctx,
+        200,
+        "text/event-stream",
+        &[&token, &last],
+        BodyOutcome::success(0),
+    )
+    .await;
+    assert!(inspected);
+    assert_eq!(
+        observed_usage(&plugin).await,
+        9,
+        "the 64-token reservation must be corrected to the 9 actually generated"
+    );
+}
+
+#[tokio::test]
+async fn streamed_response_without_terminal_usage_keeps_the_reservation() {
+    let plugin = streaming_limiter("charge_estimate");
+    let mut ctx = ai_request_ctx(400, "stream with no usage event");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = instance_reserved(&plugin, &ctx);
+    assert!(reserved > 0);
+
+    let frame = sse_frame(json!({"choices": [{"delta": {"content": "hi"}}]}));
+    let done = b"data: [DONE]\n\n".to_vec();
+    drive_stream(
+        &plugin,
+        &mut ctx,
+        200,
+        "text/event-stream",
+        &[&frame, &done],
+        BodyOutcome::success(0),
+    )
+    .await;
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        reserved,
+        "charge_estimate must keep the pre-request reservation so streaming is not free"
+    );
+}
+
+#[tokio::test]
+async fn streamed_response_without_terminal_usage_releases_under_warn() {
+    let plugin = streaming_limiter("warn");
+    let mut ctx = ai_request_ctx(400, "stream with no usage event");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(instance_reserved(&plugin, &ctx) > 0);
+
+    let frame = sse_frame(json!({"choices": [{"delta": {"content": "hi"}}]}));
+    drive_stream(
+        &plugin,
+        &mut ctx,
+        200,
+        "text/event-stream",
+        &[&frame],
+        BodyOutcome::success(0),
+    )
+    .await;
+
+    assert_eq!(observed_usage(&plugin).await, 0, "warn releases the estimate");
+    assert!(instance_released(&plugin, &ctx));
+}
+
+#[tokio::test]
+async fn reject_mode_keeps_the_charge_on_a_committed_stream() {
+    // Headers are already on the wire, so `reject` cannot substitute a 502. It
+    // must degrade to its fail-closed accounting half rather than releasing.
+    let plugin = streaming_limiter("reject");
+    let mut ctx = ai_request_ctx(400, "stream with no usage event");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = instance_reserved(&plugin, &ctx);
+    assert!(reserved > 0);
+
+    let frame = sse_frame(json!({"choices": [{"delta": {"content": "hi"}}]}));
+    drive_stream(
+        &plugin,
+        &mut ctx,
+        200,
+        "text/event-stream",
+        &[&frame],
+        BodyOutcome::success(0),
+    )
+    .await;
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        reserved,
+        "reject must never make an already-delivered generation free"
+    );
+    // A later gateway-rejection pass must not release it either.
+    let mut response_headers = HashMap::new();
+    ctx.metadata
+        .insert("ferrum:rejection_response".to_string(), "true".to_string());
+    assert_continue(plugin.after_proxy(&mut ctx, 500, &mut response_headers).await);
+    assert_eq!(observed_usage(&plugin).await, reserved);
+}
+
+#[tokio::test]
+async fn client_disconnect_mid_stream_still_charges_the_partial_usage() {
+    let plugin = streaming_limiter("charge_estimate");
+    let mut ctx = ai_request_ctx(4000, "long stream the client abandons");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(instance_reserved(&plugin, &ctx) > 0);
+
+    // Anthropic reports input tokens up front; the client leaves before the
+    // terminal `message_delta`.
+    let start = sse_frame(
+        json!({"type": "message_start", "message": {"usage": {"input_tokens": 77}}}),
+    );
+    drive_stream(
+        &plugin,
+        &mut ctx,
+        200,
+        "text/event-stream",
+        &[&start],
+        BodyOutcome::client_disconnect(start.len() as u64),
+    )
+    .await;
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        77,
+        "an abandoned stream must still charge the counters the provider reported"
+    );
+}
+
+#[tokio::test]
+async fn a_never_ending_stream_forwards_incrementally_without_retaining_the_body() {
+    let plugin = streaming_limiter("charge_estimate");
+    let mut ctx = ai_request_ctx(400, "never ending stream");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = instance_reserved(&plugin, &ctx);
+
+    let chain: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut inspector =
+        create_response_stream_inspector(&chain, &mut ctx, 200, Some("text/event-stream"))
+            .expect("a metered SSE response must attach an inspector");
+
+    // 4 MiB of keep-alive comments and content deltas, never terminated.
+    let chunk = sse_frame(json!({"choices": [{"delta": {"content": "x".repeat(512)}}]}));
+    let mut forwarded_total = 0usize;
+    for _ in 0..(4 * 1024 * 1024 / chunk.len()) {
+        match inspector.on_chunk(&chunk).await {
+            ResponseStreamAction::Forward(bytes) => {
+                assert_eq!(
+                    bytes.len(),
+                    chunk.len(),
+                    "each chunk must be released immediately, never held"
+                );
+                forwarded_total += bytes.len();
+            }
+            ResponseStreamAction::Terminate(_) => panic!("must not truncate"),
+        }
+    }
+    assert!(forwarded_total >= 4 * 1024 * 1024 - chunk.len());
+    drop(inspector);
+
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::client_disconnect(0))
+        .await;
+    assert_eq!(
+        observed_usage(&plugin).await,
+        reserved,
+        "a never-ending stream resolves through the unmetered policy exactly once"
+    );
+}
+
+#[tokio::test]
+async fn non_ai_and_non_meterable_streams_attach_no_inspector() {
+    let plugin = streaming_limiter("charge_estimate");
+
+    // A non-AI request on a shared proxy.
+    let mut plain = create_test_context();
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut plain, &mut headers).await);
+    let chain: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    assert!(
+        create_response_stream_inspector(&chain, &mut plain, 200, Some("text/event-stream"))
+            .is_none(),
+        "an unrelated SSE route must never be parsed or accounted"
+    );
+
+    // An identified AI request whose response is neither SSE nor event-stream.
+    let mut ai = ai_request_ctx(100, "hello");
+    let mut ai_headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ai, &mut ai_headers).await);
+    for content_type in ["application/json", "text/plain", "application/grpc-web+json"] {
+        assert!(
+            create_response_stream_inspector(&chain, &mut ai, 200, Some(content_type)).is_none(),
+            "{content_type} is not an incrementally meterable representation"
+        );
+    }
+    // Nor for a non-2xx, whose release is a status-only decision.
+    assert!(
+        create_response_stream_inspector(&chain, &mut ai, 502, Some("text/event-stream")).is_none()
+    );
+}
+
+#[tokio::test]
+async fn stream_accounting_permits_are_bounded_and_returned() {
+    // The aggregate bound only helps if permits are returned. Deliberately
+    // count-free: the live counter is process-global and other tests in this
+    // binary run concurrently, so leak detection is expressed as "far more
+    // sequential streams than the cap all succeed".
+    let cap = max_concurrent_stream_accounting_for_test();
+    assert_eq!(cap, 4_096);
+
+    let plugin = streaming_limiter("charge_estimate");
+    let chain: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = ai_request_ctx(100, "sequential stream");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    for iteration in 0..(cap * 2) {
+        let inspector =
+            create_response_stream_inspector(&chain, &mut ctx, 200, Some("text/event-stream"));
+        assert!(
+            inspector.is_some(),
+            "stream accounting permit leaked by iteration {iteration}"
+        );
+        drop(inspector);
+    }
+    assert!(active_stream_accounting_for_test() <= cap);
+}
+
+#[tokio::test]
+async fn malformed_and_truncated_stream_frames_apply_the_policy_exactly_once() {
+    let plugin = streaming_limiter("charge_estimate");
+    let mut ctx = ai_request_ctx(400, "malformed stream");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = instance_reserved(&plugin, &ctx);
+
+    let garbage = b"data: {\"usage\": {broken\n\n:keepalive\n\ndata: \n\n".to_vec();
+    let truncated = b"data: {\"usageMetadata\": {\"promptTok".to_vec();
+    drive_stream(
+        &plugin,
+        &mut ctx,
+        200,
+        "text/event-stream",
+        &[&garbage, &truncated],
+        BodyOutcome::error(
+            ferrum_edge::retry::ErrorClass::Timeout,
+            garbage.len() as u64,
+            false,
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        reserved,
+        "a malformed/truncated stream is never charged as zero"
+    );
+    assert!(
+        instance_released(&plugin, &ctx),
+        "the unmetered policy consumes the release path exactly once"
+    );
+
+    // A second terminal pass (e.g. a rejection re-run) must not double-apply.
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(0))
+        .await;
+    assert_eq!(observed_usage(&plugin).await, reserved);
 }

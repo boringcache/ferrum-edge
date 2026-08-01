@@ -22252,8 +22252,8 @@ components:
         provider:
           type: string
           default: auto
-          enum: [auto, openai, anthropic, google, cohere, mistral, bedrock]
-          description: "Exact lowercase LLM provider format; surrounding whitespace and alternate casing are rejected"
+          enum: [auto, openai, anthropic, google, cohere, mistral, bedrock, tgi]
+          description: "Exact lowercase LLM provider format; surrounding whitespace and alternate casing are rejected. `tgi` selects Hugging Face TGI native `/generate` shapes (`details.generated_tokens`)."
         include_model:
           type: boolean
           default: true
@@ -22439,17 +22439,27 @@ components:
             on the rejection-path after_proxy.
         provider:
           type: string
-          enum: [auto, openai, anthropic, google, cohere, mistral, bedrock]
+          enum: [auto, openai, anthropic, google, cohere, mistral, bedrock, tgi]
           default: auto
           description: >-
             LLM provider format for token extraction. Accepted values: auto,
-            openai, anthropic, google, cohere, mistral, bedrock. Gemini/Vertex
-            payloads use `google`.
+            openai, anthropic, google, cohere, mistral, bedrock, tgi.
+            Gemini/Vertex payloads use `google`; Hugging Face TGI native
+            `/generate` and `/generate_stream` shapes use `tgi`, whose
+            authoritative counter is `details.generated_tokens` (TGI's
+            OpenAI-compatible surface stays `openai`).
         on_unmetered_response:
           type: string
           enum: [reject, charge_estimate, warn]
           default: charge_estimate
-          description: Action for successful responses without usage metadata. charge_estimate keeps the pre-request reservation, reject returns a 502 and keeps the reservation, warn logs and releases the reservation.
+          description: >-
+            Action for successful responses without usage metadata.
+            charge_estimate keeps the pre-request reservation, reject returns a
+            502 and keeps the reservation, warn logs and releases the
+            reservation. On a STREAMED response the headers are already
+            committed, so reject cannot substitute a 502; it degrades to its
+            fail-closed accounting half (the reservation stays charged) and logs
+            the violation.
         sync_mode:
           type: string
           enum: [local, redis]

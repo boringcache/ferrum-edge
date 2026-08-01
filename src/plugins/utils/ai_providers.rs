@@ -9,6 +9,13 @@ pub enum AiProvider {
     Cohere,
     Mistral,
     Bedrock,
+    /// Hugging Face Text Generation Inference native `/generate` and
+    /// `/generate_stream` shapes, whose only authoritative usage signal is
+    /// `details.generated_tokens` (plus an optional `details.prefill` token
+    /// array when the caller asked for input details). TGI's OpenAI-compatible
+    /// `/v1/chat/completions` surface reports an ordinary `usage` block and is
+    /// still detected as [`AiProvider::OpenAi`].
+    Tgi,
 }
 
 impl AiProvider {
@@ -20,6 +27,7 @@ impl AiProvider {
             Self::Cohere => "cohere",
             Self::Mistral => "mistral",
             Self::Bedrock => "bedrock",
+            Self::Tgi => "tgi",
         }
     }
 }
@@ -98,6 +106,7 @@ pub fn parse_ai_provider(provider: &str) -> Option<AiProvider> {
         "cohere" => Some(AiProvider::Cohere),
         "mistral" => Some(AiProvider::Mistral),
         "bedrock" => Some(AiProvider::Bedrock),
+        "tgi" => Some(AiProvider::Tgi),
         _ => None,
     }
 }
@@ -152,11 +161,29 @@ pub fn detect_response_provider(json: &Value) -> Option<AiProvider> {
         return Some(AiProvider::Cohere);
     }
 
+    // Hugging Face TGI native `/generate` and the terminal `/generate_stream`
+    // event both report the generated-token count under `details`. No other
+    // supported provider uses that path, so it is an unambiguous discriminator.
+    if json
+        .get("details")
+        .and_then(|details| details.get("generated_tokens"))
+        .is_some()
+    {
+        return Some(AiProvider::Tgi);
+    }
+
     if json
         .get("usage")
         .and_then(|usage| usage.get("inputTokens"))
         .is_some()
     {
+        return Some(AiProvider::Bedrock);
+    }
+
+    // Bedrock `InvokeModelWithResponseStream` reports the authoritative billed
+    // counts in the terminal chunk's `amazon-bedrock-invocationMetrics` object
+    // rather than a `usage` block.
+    if json.get("amazon-bedrock-invocationMetrics").is_some() {
         return Some(AiProvider::Bedrock);
     }
 
@@ -224,6 +251,7 @@ pub fn extract_response_usage(json: &Value, provider: AiProvider) -> AiTokenUsag
         AiProvider::Google => extract_google_usage(json),
         AiProvider::Cohere => extract_cohere_usage(json),
         AiProvider::Bedrock => extract_bedrock_usage(json),
+        AiProvider::Tgi => extract_tgi_usage(json),
     }
 }
 
@@ -523,8 +551,20 @@ fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
         .filter(|results| results.len() == 1)
         .and_then(|results| results[0].get("tokenCount"))
         .and_then(|value| value.as_u64());
-    let prompt = converse_prompt.or(titan_prompt);
-    let completion = converse_completion.or(titan_completion);
+    // `InvokeModelWithResponseStream` terminal chunk. AWS documents these as the
+    // billed counts for the invocation, so they are authoritative for a native
+    // Bedrock event stream that carries no `usage` block at all.
+    let metrics = json.get("amazon-bedrock-invocationMetrics");
+    let metrics_prompt = metrics
+        .and_then(|value| value.get("inputTokenCount"))
+        .and_then(|value| value.as_u64());
+    let metrics_completion = metrics
+        .and_then(|value| value.get("outputTokenCount"))
+        .and_then(|value| value.as_u64());
+    let prompt = converse_prompt.or(titan_prompt).or(metrics_prompt);
+    let completion = converse_completion
+        .or(titan_completion)
+        .or(metrics_completion);
     AiTokenUsage {
         prompt_tokens: prompt,
         completion_tokens: completion,
@@ -534,6 +574,34 @@ fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
             .or_else(|| sum_pair(prompt, completion)),
         model: None,
         provider: Some(AiProvider::Bedrock),
+    }
+}
+
+/// Hugging Face TGI native usage.
+///
+/// `details.generated_tokens` is the only counter TGI always reports, and it is
+/// the completion count. `details.prefill` is the input-token array, present
+/// only when the caller requested input details — an EMPTY array is TGI's
+/// default "not reported" representation, so it must not be read as a prompt
+/// count of zero. Treating it as zero would let a `prompt_tokens`-mode budget
+/// charge nothing for an arbitrarily large prompt; leaving it absent instead
+/// routes the response through the configured `on_unmetered_response` policy.
+fn extract_tgi_usage(json: &Value) -> AiTokenUsage {
+    let details = json.get("details");
+    let completion = details
+        .and_then(|value| value.get("generated_tokens"))
+        .and_then(|value| value.as_u64());
+    let prompt = details
+        .and_then(|value| value.get("prefill"))
+        .and_then(|value| value.as_array())
+        .filter(|tokens| !tokens.is_empty())
+        .map(|tokens| tokens.len() as u64);
+    AiTokenUsage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: sum_pair(prompt, completion),
+        model: None,
+        provider: Some(AiProvider::Tgi),
     }
 }
 

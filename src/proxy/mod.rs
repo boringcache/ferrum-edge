@@ -362,23 +362,19 @@ pub(crate) const ORIGIN_ENCODED_RESPONSE_METADATA_KEY: &str = "ferrum:origin_enc
 /// released as though it were a gateway rejection.
 pub(crate) const BACKEND_STATUS_METADATA_KEY: &str = "ai_ratelimit_backend_status";
 
-/// The token estimate `ai_rate_limiter` reserved for this request in its
-/// `before_proxy` pass. Set only when a body-derived pre-reservation was taken
-/// (non-zero estimate). `run_after_proxy_hooks` reads this to decide whether to
-/// record `BACKEND_STATUS_METADATA_KEY`, and the plugin reads it back during
-/// reconciliation. Shared here (rather than as a private copy in the plugin) so
-/// the proxy-side writer/reader and the plugin-side writer/reader cannot drift.
+/// PRESENCE marker written by `ai_rate_limiter::before_proxy` when a
+/// body-derived pre-reservation was taken (non-zero estimate) by ANY of the
+/// proxy's limiter instances. `run_after_proxy_hooks` reads it to decide whether
+/// to record `BACKEND_STATUS_METADATA_KEY`, so a non-AI proxy gains no metadata
+/// entry (and thus no transaction-log field) per request.
+///
+/// The VALUE is the last writing instance's estimate and is deliberately not
+/// authoritative: every accounting read the plugin performs uses its own
+/// instance-scoped key, so two composed limiter instances cannot corrupt each
+/// other's reservation lifecycle (GHSA-wh4p-pmxm-3784). Shared here (rather than
+/// as a private copy in the plugin) so the proxy-side writer/reader and the
+/// plugin-side writer cannot drift.
 pub(crate) const RESERVED_TOKENS_METADATA_KEY: &str = "ai_ratelimit_reserved_tokens";
-
-/// Marker set by `ai_rate_limiter::before_proxy` whenever it identified the
-/// request as an AI call (a parseable JSON request body it ran the token
-/// estimate over), regardless of whether a non-zero reservation was taken —
-/// `count_mode: "completion_tokens"` legitimately reserves 0 for AI requests
-/// with no output cap. The plugin gates its `on_unmetered_response` policy on
-/// this marker so a non-AI 2xx (GET, empty-body 200/204, non-JSON, etc.) on a
-/// shared proxy is never rejected/charged by that policy. Distinct from
-/// `RESERVED_TOKENS_METADATA_KEY` (which is absent for 0-reservation AI calls).
-pub(crate) const AI_REQUEST_METADATA_KEY: &str = "ai_ratelimit_request";
 
 /// Transient marker set while running `after_proxy` hooks when a later hook may
 /// add `Cache-Control: no-transform`. Compression reads this before committing

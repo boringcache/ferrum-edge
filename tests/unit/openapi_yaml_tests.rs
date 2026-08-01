@@ -9695,7 +9695,8 @@ fn ai_rate_limiter_provider_enum_matches_runtime() {
             "google",
             "cohere",
             "mistral",
-            "bedrock"
+            "bedrock",
+            "tgi"
         ],
         "provider enum must match the runtime accepted set"
     );
@@ -9738,6 +9739,10 @@ fn ai_rate_limiter_provider_enum_matches_runtime() {
     assert!(
         section.contains("`bedrock`"),
         "docs must enumerate bedrock as an accepted provider"
+    );
+    assert!(
+        section.contains("`tgi`"),
+        "docs must enumerate tgi as an accepted provider (GHSA-rxj9-f483-g53f)"
     );
 }
 
