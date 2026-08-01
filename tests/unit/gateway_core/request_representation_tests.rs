@@ -35,8 +35,7 @@ fn headers(content_encoding: Option<&str>) -> HashMap<String, String> {
 }
 
 fn gzip(data: &[u8]) -> Vec<u8> {
-    let mut encoder =
-        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(data).expect("gzip write");
     encoder.finish().expect("gzip finish")
 }
@@ -152,12 +151,8 @@ fn chained_gzip_then_brotli_is_decoded_in_reverse_application_order() {
     let plugins = vec![enforcing_waf()];
     let ctx = ctx_with_json_post();
     let stacked = brotli(&gzip(BLOCKED_JSON.as_bytes()));
-    let outcome = evaluate_final_request_representation(
-        &plugins,
-        &ctx,
-        &headers(Some("gzip, br")),
-        &stacked,
-    );
+    let outcome =
+        evaluate_final_request_representation(&plugins, &ctx, &headers(Some("gzip, br")), &stacked);
     assert_eq!(
         outcome,
         FinalRequestRepresentationOutcome::Decoded(BLOCKED_JSON.as_bytes().to_vec())

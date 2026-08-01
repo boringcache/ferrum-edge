@@ -1349,7 +1349,10 @@ async fn unchanged_envelope_is_not_re_evaluated_in_the_final_phase() {
         .await;
 
     assert_continue(result);
-    assert_eq!(ctx.metadata.get("graphql_depth").cloned(), depth_after_before_proxy);
+    assert_eq!(
+        ctx.metadata.get("graphql_depth").cloned(),
+        depth_after_before_proxy
+    );
 }
 
 /// A request transform that replaces `query` with a deeper document after

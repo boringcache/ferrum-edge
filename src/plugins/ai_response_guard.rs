@@ -3592,9 +3592,8 @@ impl Plugin for AiResponseGuard {
     ) -> bool {
         self.has_validation_rules
             && !ctx.is_native_grpc_request()
-            && !response_content_type.is_some_and(
-                crate::plugins::utils::body_transform::is_framed_grpc_content_type,
-            )
+            && !response_content_type
+                .is_some_and(crate::plugins::utils::body_transform::is_framed_grpc_content_type)
             && ctx
                 .metadata
                 .contains_key(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY)

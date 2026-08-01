@@ -19911,7 +19911,9 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
                 response_status,
                 response_headers,
                 response_body,
-                InitialResponseHeaderPolicySource::Prefiltered(initial_response_header_policy_plugins),
+                InitialResponseHeaderPolicySource::Prefiltered(
+                    initial_response_header_policy_plugins,
+                ),
             ) {
                 return (true, body_transformed);
             }

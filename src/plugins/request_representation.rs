@@ -323,9 +323,9 @@ pub(crate) fn evaluate_final_request_body_posture(
         // coding, so a borrowed result would mean the decoder disagreed about
         // the grammar. Treat that as uninspectable rather than assuming the
         // wire bytes are plaintext.
-        Ok(std::borrow::Cow::Borrowed(_)) => FinalRequestBodyPosture::Reject(
-            RequestRepresentationRejection::UndecodableCoding,
-        ),
+        Ok(std::borrow::Cow::Borrowed(_)) => {
+            FinalRequestBodyPosture::Reject(RequestRepresentationRejection::UndecodableCoding)
+        }
         Ok(std::borrow::Cow::Owned(plaintext)) => FinalRequestBodyPosture::Decoded(plaintext),
         // The decoder's message can echo a hostile coding token, so it is
         // deliberately dropped here: the reason the caller records comes from

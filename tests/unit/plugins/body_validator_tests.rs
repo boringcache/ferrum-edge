@@ -2159,14 +2159,24 @@ async fn test_both_request_and_response_validation() {
     let resp_headers = response_json_headers();
     assert_continue(
         plugin
-            .finalize_client_visible_response_body(&mut resp_ctx, 200, &resp_headers, br#"{"result": "ok"}"#)
+            .finalize_client_visible_response_body(
+                &mut resp_ctx,
+                200,
+                &resp_headers,
+                br#"{"result": "ok"}"#,
+            )
             .await,
     );
 
     // Response with missing field is rejected (502)
     assert_reject(
         plugin
-            .finalize_client_visible_response_body(&mut resp_ctx, 200, &resp_headers, br#"{"other": "value"}"#)
+            .finalize_client_visible_response_body(
+                &mut resp_ctx,
+                200,
+                &resp_headers,
+                br#"{"other": "value"}"#,
+            )
             .await,
         Some(502),
     );
@@ -5438,7 +5448,12 @@ async fn duplicate_member_in_response_body_is_rejected() {
     let mut clean_ctx = make_response_ctx();
     assert_continue(
         plugin
-            .finalize_client_visible_response_body(&mut clean_ctx, 200, &headers, br#"{"role":"safe"}"#)
+            .finalize_client_visible_response_body(
+                &mut clean_ctx,
+                200,
+                &headers,
+                br#"{"role":"safe"}"#,
+            )
             .await,
     );
 }

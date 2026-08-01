@@ -1388,7 +1388,8 @@ impl Plugin for Waf {
             // untouched header set is neither rescanned nor rescored
             // (`GHSA-62jg-v563-4q23`).
             let digest = response_header_map_digest(response_headers);
-            ctx.waf_response_header_digests.insert(self.instance_id, digest);
+            ctx.waf_response_header_digests
+                .insert(self.instance_id, digest);
             let result = self.finish_scan(ctx, outcome);
             if !matches!(&result, PluginResult::Continue) {
                 return result;
@@ -1519,9 +1520,8 @@ impl Plugin for Waf {
         _response_body: &[u8],
     ) -> bool {
         self.response_body_policy_applies(ctx, response_content_type)
-            && !response_content_type.is_some_and(
-                crate::plugins::utils::body_transform::is_framed_grpc_content_type,
-            )
+            && !response_content_type
+                .is_some_and(crate::plugins::utils::body_transform::is_framed_grpc_content_type)
             && ctx
                 .metadata
                 .contains_key(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY)
@@ -1570,9 +1570,8 @@ impl Plugin for Waf {
                 .get(&self.instance_id)
                 .is_some_and(|scanned| *scanned == digest);
             if !unchanged {
-                let outcome = self.run_cheap_with_budget(|| {
-                    self.run_response_header_scan(ctx, response_headers)
-                });
+                let outcome = self
+                    .run_cheap_with_budget(|| self.run_response_header_scan(ctx, response_headers));
                 ctx.waf_response_header_digests
                     .insert(self.instance_id, digest);
                 let result = self.finish_scan(ctx, outcome);

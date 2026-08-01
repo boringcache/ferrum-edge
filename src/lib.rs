@@ -6485,9 +6485,7 @@ pub mod _test_support {
             FinalRequestBodyPosture, evaluate_final_request_body_posture,
         };
         match evaluate_final_request_body_posture(plugins, ctx, headers, body) {
-            FinalRequestBodyPosture::Inspectable => {
-                FinalRequestRepresentationOutcome::Inspectable
-            }
+            FinalRequestBodyPosture::Inspectable => FinalRequestRepresentationOutcome::Inspectable,
             FinalRequestBodyPosture::Decoded(plaintext) => {
                 FinalRequestRepresentationOutcome::Decoded(plaintext)
             }

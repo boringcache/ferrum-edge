@@ -1284,7 +1284,12 @@ async fn response_luhn_and_cidr_rules_scan_decoded_variants() {
 
     let mut cidr_ctx = ctx("GET", "/debug");
     let result = plugin
-        .finalize_client_visible_response_body(&mut cidr_ctx, 200, &headers, b"ip=10&#46;2&#46;3&#46;4")
+        .finalize_client_visible_response_body(
+            &mut cidr_ctx,
+            200,
+            &headers,
+            b"ip=10&#46;2&#46;3&#46;4",
+        )
         .await;
 
     assert!(matches!(result, PluginResult::Reject { .. }));
@@ -3381,7 +3386,12 @@ async fn scoring_preserves_same_instance_accumulation_across_lifecycle_phases() 
 
     assert!(matches!(
         plugin
-            .finalize_client_visible_response_body(&mut ctx, 200, &response_headers, br#"{"out":"rbhit"}"#)
+            .finalize_client_visible_response_body(
+                &mut ctx,
+                200,
+                &response_headers,
+                br#"{"out":"rbhit"}"#
+            )
             .await,
         PluginResult::Continue
     ));
@@ -4811,7 +4821,12 @@ async fn oversize_response_body_fails_closed_by_default() {
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     let result = plugin
-        .finalize_client_visible_response_body(&mut ctx, 200, &response_headers, &padded_body("secret"))
+        .finalize_client_visible_response_body(
+            &mut ctx,
+            200,
+            &response_headers,
+            &padded_body("secret"),
+        )
         .await;
 
     assert!(
@@ -4845,7 +4860,12 @@ async fn monitor_only_response_body_rule_prefix_scans_oversize_response_body() {
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     let result = plugin
-        .finalize_client_visible_response_body(&mut ctx, 200, &response_headers, &padded_body("secret"))
+        .finalize_client_visible_response_body(
+            &mut ctx,
+            200,
+            &response_headers,
+            &padded_body("secret"),
+        )
         .await;
 
     assert!(matches!(result, PluginResult::Continue));
@@ -4877,7 +4897,12 @@ async fn enforcing_request_body_rule_does_not_fail_close_the_response_body() {
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     let result = plugin
-        .finalize_client_visible_response_body(&mut ctx, 200, &response_headers, &padded_body("secret"))
+        .finalize_client_visible_response_body(
+            &mut ctx,
+            200,
+            &response_headers,
+            &padded_body("secret"),
+        )
         .await;
 
     assert!(matches!(result, PluginResult::Continue));
