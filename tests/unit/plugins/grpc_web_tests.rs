@@ -2490,6 +2490,7 @@ fn final_trailer_reconciliation_is_bounded_for_binary_and_text() {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use ferrum_edge::_test_support::{
+        GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY,
         RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS, build_trailer_frame,
         store_charged_grpc_web_reframed_body_for_test,
         sync_translated_body_trailer_frame_into_for_test,
@@ -2589,7 +2590,14 @@ fn final_trailer_reconciliation_is_bounded_for_binary_and_text() {
     assert!(!corrupt_err);
 
     // Publication seam: body already above the retained ceiling installs the
-    // neutral gRPC capacity terminal and releases the oversized payload.
+    // neutral, body-framed gRPC-Web capacity terminal and releases the
+    // oversized payload.
+    let mut refusal_ctx = create_grpc_web_context("application/grpc-web");
+    refusal_ctx.metadata.insert(
+        GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY.to_string(),
+        "application/grpc-web".to_string(),
+    );
+    let mut refusal_status = 200u16;
     let mut oversized = bytes::Bytes::from(vec![0u8; 128]);
     let mut headers = HashMap::from([(
         "content-type".to_string(),
@@ -2597,6 +2605,8 @@ fn final_trailer_reconciliation_is_bounded_for_binary_and_text() {
     )]);
     assert!(
         store_charged_grpc_web_reframed_body_for_test(
+            &mut refusal_ctx,
+            &mut refusal_status,
             &mut oversized,
             &mut headers,
             64,
@@ -2606,23 +2616,39 @@ fn final_trailer_reconciliation_is_bounded_for_binary_and_text() {
         )
         .is_none()
     );
-    assert!(oversized.is_empty(), "capacity refusal must drop the body");
+    assert_eq!(refusal_status, 200);
+    assert_eq!(oversized.first(), Some(&0x80));
+    let refusal_payload = String::from_utf8_lossy(&oversized);
+    assert!(
+        refusal_payload.contains(&format!(
+            "grpc-status: {RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS}"
+        )),
+        "capacity status must ride the gRPC-Web trailer frame: {refusal_payload:?}"
+    );
+    assert!(!headers.contains_key("grpc-status"));
     assert_eq!(
         headers
-            .get("grpc-status")
-            .and_then(|s| s.parse::<u32>().ok()),
-        Some(RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS)
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok()),
+        Some(oversized.len())
     );
-    assert_eq!(headers.get("content-length").map(String::as_str), Some("0"));
 
     // In-ceiling publication of a binary rebuild keeps content replaceable and
     // reports the stored length for content-length updates.
+    let mut live_ctx = create_grpc_web_context("application/grpc-web");
+    live_ctx.metadata.insert(
+        GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY.to_string(),
+        "application/grpc-web".to_string(),
+    );
+    let mut live_status = 200u16;
     let mut live = bytes::Bytes::from(binary.clone());
     let mut live_headers = HashMap::from([(
         "content-type".to_string(),
         "application/grpc-web".to_string(),
     )]);
     let (stored_len, reframed) = store_charged_grpc_web_reframed_body_for_test(
+        &mut live_ctx,
+        &mut live_status,
         &mut live,
         &mut live_headers,
         4096,

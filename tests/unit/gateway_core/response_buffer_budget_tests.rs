@@ -895,10 +895,9 @@ fn every_capacity_refusal_uses_the_shared_gateway_terminal() {
         proxy
             .matches("replace_buffered_response_with_capacity_refusal(")
             .count(),
-        3,
-        "one definition, the body-transform call site, and the refusal taken \
-         when the transform WINDOW itself cannot be reserved — which happens \
-         before any plugin allocates; the normalize call site lives in \
+        5,
+        "one definition, the transform window-open/admission/publication \
+         refusals, and final gRPC-Web reframe; the normalize call site lives in \
          src/plugins/mod.rs"
     );
     assert_eq!(
@@ -2573,14 +2572,14 @@ fn the_root_review_repairs_are_pinned_in_source() {
     // Final trailer reconciliation must keep the charged original alive and
     // build any replacement through the bounded sink (GHSA-pwcm-6rh8-f2gh).
     assert!(
-        grpc_web.contains("pub fn sync_translated_body_trailer_frame_into(")
+        grpc_web.contains("pub(crate) fn sync_translated_body_trailer_frame_into(")
             && grpc_web.contains("stream_decode_base64_groups")
             && grpc_web.contains("rebuild_text_grpc_web_trailer_suffix")
             && grpc_web.contains("rebuild_binary_grpc_web_trailer_suffix"),
         "final reconciliation must stream-decode/rebuild through a ceiling-bounded sink"
     );
     let sync_into = grpc_web
-        .split("pub fn sync_translated_body_trailer_frame_into(")
+        .split("pub(crate) fn sync_translated_body_trailer_frame_into(")
         .nth(1)
         .expect("sync_translated_body_trailer_frame_into");
     let sync_into_body = sync_into
@@ -2608,9 +2607,27 @@ fn the_root_review_repairs_are_pinned_in_source() {
     assert!(
         !store_body.contains("take_buffered_vec")
             && store_body.contains("sync_translated_body_trailer_frame_into")
-            && store_body.contains("window.charge("),
+            && store_body.contains("window.charge(")
+            && store_body.contains("grpc_web_reframe_capacity_terminal("),
         "final publication must not copy out of the charged owner; it must build \
-         through sync_into and charge the sink-built replacement"
+         through sync_into, charge the sink-built replacement, and route every \
+         refusal through the shared protocol-aware terminal"
+    );
+    assert!(
+        store_body.contains(
+            "window = response_buffer_budget::ResponseTransformWindow::open(retained_ceiling);"
+        ),
+        "the final reframe must reserve its covering window from the allocation-admission callback"
+    );
+    let admission = sync_into_body
+        .find("if !admit_replacement()")
+        .expect("replacement admission gate");
+    let output = sync_into_body
+        .find("let mut output = BoundedResponseBodySink::with_ceiling(ceiling);")
+        .expect("bounded output construction");
+    assert!(
+        admission < output,
+        "the covering window must be admitted immediately before bounded output can allocate"
     );
     assert_eq!(
         proxy

@@ -5328,16 +5328,27 @@ where
                 // (GHSA-pwcm-6rh8-f2gh).
                 let retained_ceiling = ctx.retained_response_body_ceiling();
                 let stored = crate::proxy::store_charged_grpc_web_reframed_body(
+                    ctx,
+                    &mut response_status,
                     &mut response_body,
                     &mut plugin_response_headers,
                     retained_ceiling,
                     content_type.as_deref(),
                     &response_trailers,
                     http_status,
+                    initial_response_header_policy_plugins,
                 );
                 if let Some((synced_len, true)) = stored {
                     plugin_response_headers
                         .insert("content-length".to_string(), synced_len.to_string());
+                } else if stored.is_none() {
+                    // The shared capacity refusal is already a complete
+                    // gRPC-Web body-framed terminal. Do not let the backend's
+                    // old native trailers or policy snapshot overwrite it.
+                    terminal_metadata_is_body_framed = true;
+                    response_trailers.clear();
+                    buffered_initial_response_header_policy_state = None;
+                    let _ = ctx.take_buffered_initial_response_header_policy();
                 }
             }
             // Retire compatibility-view application trailers only after the

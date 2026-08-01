@@ -3920,6 +3920,7 @@ pub mod _test_support {
             reconciled_trailers,
             http_status,
             ceiling,
+            || true,
         ) {
             SyncTranslatedTrailerOutcome::Unchanged => Ok(None),
             SyncTranslatedTrailerOutcome::Replaced(bytes) => Ok(Some(bytes)),
@@ -3932,6 +3933,8 @@ pub mod _test_support {
     /// alive, builds any replacement through the covering window's sink, and
     /// installs the neutral gRPC capacity terminal on refusal.
     pub fn store_charged_grpc_web_reframed_body_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
         response_body: &mut bytes::Bytes,
         response_headers: &mut HashMap<String, String>,
         retained_ceiling: usize,
@@ -3940,12 +3943,15 @@ pub mod _test_support {
         http_status: Option<u16>,
     ) -> Option<(usize, bool)> {
         crate::proxy::store_charged_grpc_web_reframed_body(
+            ctx,
+            response_status,
             response_body,
             response_headers,
             retained_ceiling,
             content_type,
             reconciled_trailers,
             http_status,
+            &[],
         )
     }
 

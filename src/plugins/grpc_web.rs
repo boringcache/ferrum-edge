@@ -2563,8 +2563,8 @@ pub(crate) enum SyncTranslatedTrailerOutcome {
     /// Not gRPC-Web, malformed frames, or corrupt text armouring — leave the
     /// original body untouched.
     NoRewrite,
-    /// A write would have exceeded the retained ceiling (or u32 frame length /
-    /// arithmetic overflow while measuring the trailer payload).
+    /// Replacement admission failed, a write would have exceeded the retained
+    /// ceiling, or u32/arithmetic overflow occurred while measuring the frame.
     Overflow,
 }
 
@@ -2601,6 +2601,7 @@ pub(crate) fn sync_translated_body_trailer_frame_from_trailers(
         reconciled_trailers,
         http_status,
         ceiling,
+        || true,
     ) {
         SyncTranslatedTrailerOutcome::Unchanged => true,
         SyncTranslatedTrailerOutcome::Replaced(rebuilt) => {
@@ -2620,12 +2621,18 @@ pub(crate) fn sync_translated_body_trailer_frame_from_trailers(
 /// [`base64::write::EncoderWriter`] so neither a decoded binary preimage, a
 /// separately built trailer frame, nor a complete encoded `String` is ever
 /// resident beside the output (GHSA-pwcm-6rh8-f2gh).
+///
+/// `admit_replacement` is invoked only after a rewrite is proven necessary and
+/// immediately before the bounded sink can allocate. Production uses it to
+/// reserve the covering aggregate-budget window; test-only callers admit
+/// directly while exercising construction bounds.
 pub(crate) fn sync_translated_body_trailer_frame_into(
     body: &[u8],
     content_type: Option<&str>,
     reconciled_trailers: &HashMap<String, String>,
     http_status: Option<u16>,
     ceiling: usize,
+    admit_replacement: impl FnOnce() -> bool,
 ) -> SyncTranslatedTrailerOutcome {
     use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
 
@@ -2708,6 +2715,13 @@ pub(crate) fn sync_translated_body_trailer_frame_into(
         return SyncTranslatedTrailerOutcome::Overflow;
     }
 
+    // The caller reserves the covering aggregate-budget window only once a
+    // replacement is proven necessary, and immediately before the sink can
+    // make its first allocation. NoRewrite/Unchanged therefore cannot become
+    // spurious capacity refusals under aggregate pressure.
+    if !admit_replacement() {
+        return SyncTranslatedTrailerOutcome::Overflow;
+    }
     let mut output = BoundedResponseBodySink::with_ceiling(ceiling);
     let rebuilt_ok = if is_text {
         rebuild_text_grpc_web_trailer_suffix(

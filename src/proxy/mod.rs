@@ -26899,16 +26899,28 @@ async fn handle_proxy_request_inner(
                         // window builds any replacement through a bounded sink
                         // (GHSA-pwcm-6rh8-f2gh).
                         let stored = store_charged_grpc_web_reframed_body(
+                            &mut ctx,
+                            &mut response_status,
                             &mut response_body,
                             &mut plugin_response_headers,
                             retained_ceiling,
                             content_type.as_deref(),
                             &response_trailers,
                             http_status,
+                            initial_response_header_policy_plugins,
                         );
                         if let Some((synced_len, true)) = stored {
                             plugin_response_headers
                                 .insert("content-length".to_string(), synced_len.to_string());
+                        } else if stored.is_none() {
+                            // The shared capacity refusal is already a complete
+                            // gRPC-Web body-framed terminal. Do not let the
+                            // backend's old native trailers or policy snapshot
+                            // overwrite it below.
+                            terminal_metadata_is_body_framed = true;
+                            response_trailers.clear();
+                            buffered_initial_response_header_policy_state = None;
+                            let _ = ctx.take_buffered_initial_response_header_policy();
                         }
                     }
                     // Retire compatibility-view application trailers only after
@@ -28818,12 +28830,15 @@ async fn handle_proxy_request_inner(
             // (GHSA-pwcm-6rh8-f2gh).
             let retained_ceiling = ctx.retained_response_body_ceiling();
             let stored = store_charged_grpc_web_reframed_body(
+                &mut ctx,
+                &mut response_status,
                 data,
                 &mut response_headers,
                 retained_ceiling,
                 content_type.as_deref(),
                 &trailers,
                 http_status,
+                initial_response_header_policy_plugins.as_ref(),
             );
             if let Some((synced_len, true)) = stored {
                 response_headers.insert("content-length".to_string(), synced_len.to_string());
@@ -28837,8 +28852,8 @@ async fn handle_proxy_request_inner(
                 );
             }
             if stored.is_none() {
-                // The neutral gRPC capacity terminal replaced the body, so no
-                // later final-body validator may overwrite it.
+                // The shared gRPC-Web body-framed capacity terminal replaced
+                // the body, so no later final-body validator may overwrite it.
                 response_body_rejected = true;
             }
         } else {
@@ -34371,35 +34386,45 @@ fn mesh_grpc_response_buffer_capacity_response(
 ///
 /// `Some((len, reframed))` on success, where `len` is the stored body length and
 /// `reframed` reports whether the trailer suffix was validated (identical or
-/// replaced). `None` means the budget refused: `response_body` holds an empty
-/// payload and `response_headers` carries the neutral gRPC capacity terminal —
-/// failing closed rather than retaining uncharged bytes.
+/// replaced). `None` means the budget refused: the shared capacity-refusal
+/// builder has replaced the discarded representation with a small, uncharged,
+/// body-framed gRPC-Web terminal — failing closed rather than retaining
+/// uncharged backend bytes.
 pub(crate) fn store_charged_grpc_web_reframed_body(
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
     response_body: &mut Bytes,
     response_headers: &mut HashMap<String, String>,
     retained_ceiling: usize,
     content_type: Option<&str>,
     reconciled_trailers: &HashMap<String, String>,
     http_status: Option<u16>,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Option<(usize, bool)> {
     // Refuse before opening a window when the already-charged body is above the
     // ceiling — that keeps the "body was collected under this ceiling" reasoning
     // true even if an earlier phase installed a larger representation.
     if response_body.len() > retained_ceiling {
-        grpc_web_reframe_capacity_terminal(response_body, response_headers);
+        grpc_web_reframe_capacity_terminal(
+            ctx,
+            response_status,
+            response_body,
+            response_headers,
+            initial_response_header_policy_plugins,
+        );
         return None;
     }
-    let Some(mut window) = response_buffer_budget::ResponseTransformWindow::open(retained_ceiling)
-    else {
-        grpc_web_reframe_capacity_terminal(response_body, response_headers);
-        return None;
-    };
+    let mut window = None;
     match crate::plugins::grpc_web::sync_translated_body_trailer_frame_into(
         response_body.as_ref(),
         content_type,
         reconciled_trailers,
         http_status,
         retained_ceiling,
+        || {
+            window = response_buffer_budget::ResponseTransformWindow::open(retained_ceiling);
+            window.is_some()
+        },
     ) {
         crate::plugins::grpc_web::SyncTranslatedTrailerOutcome::Unchanged => {
             Some((response_body.len(), true))
@@ -34408,18 +34433,30 @@ pub(crate) fn store_charged_grpc_web_reframed_body(
             Some((response_body.len(), false))
         }
         crate::plugins::grpc_web::SyncTranslatedTrailerOutcome::Overflow => {
-            grpc_web_reframe_capacity_terminal(response_body, response_headers);
+            grpc_web_reframe_capacity_terminal(
+                ctx,
+                response_status,
+                response_body,
+                response_headers,
+                initial_response_header_policy_plugins,
+            );
             None
         }
         crate::plugins::grpc_web::SyncTranslatedTrailerOutcome::Replaced(rebuilt) => {
             let stored_len = rebuilt.len();
-            match window.charge(rebuilt) {
+            match window.as_mut().and_then(|window| window.charge(rebuilt)) {
                 Some(charged) => {
                     *response_body = charged;
                     Some((stored_len, true))
                 }
                 None => {
-                    grpc_web_reframe_capacity_terminal(response_body, response_headers);
+                    grpc_web_reframe_capacity_terminal(
+                        ctx,
+                        response_status,
+                        response_body,
+                        response_headers,
+                        initial_response_header_policy_plugins,
+                    );
                     None
                 }
             }
@@ -34430,20 +34467,20 @@ pub(crate) fn store_charged_grpc_web_reframed_body(
 /// The neutral gRPC capacity terminal a refused reframe installs. Fixed
 /// cardinality: no route, header, credential, or response content.
 fn grpc_web_reframe_capacity_terminal(
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
     response_body: &mut Bytes,
     response_headers: &mut HashMap<String, String>,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) {
-    warn!("gRPC-Web trailer reframing refused: aggregate retained-response budget exhausted");
-    *response_body = Bytes::new();
-    response_headers.insert(
-        "grpc-status".to_string(),
-        response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS.to_string(),
+    warn!("gRPC-Web trailer reframing refused: retained-response capacity unavailable");
+    replace_buffered_response_with_capacity_refusal(
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+        initial_response_header_policy_plugins,
     );
-    response_headers.insert(
-        "grpc-message".to_string(),
-        response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE.to_string(),
-    );
-    response_headers.insert("content-length".to_string(), "0".to_string());
 }
 
 fn hbone_response_body_too_large_response(
