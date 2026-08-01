@@ -4633,6 +4633,32 @@ impl RequestContext {
             .map(ai_stream_router::AiStreamRouterClaim::committed_query)
     }
 
+    /// Whether an `ai_stream_router` instance successfully claimed this request
+    /// and bound it to a third-party provider (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// This is the AUTHORITATIVE coordination signal for every built-in that
+    /// must stand down on a claimed provider request: `ai_federation`,
+    /// `request_mirror`, `serverless_function`, `mcp_gateway`, and
+    /// `mesh_route_dispatch`. The public `ai_stream_router_claimed` metadata key
+    /// is observability/backward coordination only — it is a plain string in a
+    /// map that any later plugin (or a `request_transformer`-driven metadata
+    /// write) can delete or rewrite, and a built-in that then re-inspected,
+    /// re-routed, mirrored, or federated the provider-bound request would send
+    /// the committed provider credential, model, destination, and query
+    /// somewhere the claim never authorized. The private typed claim cannot be
+    /// forged or erased from outside `ai_stream_router`.
+    ///
+    /// Deliberately exposes NOTHING about the claim — not the owner, model,
+    /// destination, TLS, DNS decision, query, or credential. Only its existence.
+    ///
+    /// Intentionally UNCLAIMED pass-through (the operator disabled fail-closed
+    /// missing/unmatched-model behavior) is a different state with no claim, and
+    /// still coordinates through `ai_stream_router_pass_through` metadata.
+    #[inline]
+    pub(crate) fn has_ai_stream_router_claim(&self) -> bool {
+        self.ai_stream_router_claim.is_some()
+    }
+
     /// Publish the transport's proof that the complete request body is empty.
     ///
     /// Only the proxy body-drain paths call this in production. A `false`
@@ -6692,8 +6718,8 @@ pub mod priority {
     /// and normalizes provider-native SSE to OpenAI `chat.completion.chunk` SSE.
     /// Runs before `ai_semantic_cache` (and before `ai_federation` at 4060) so
     /// cache lookup observes the effective provider destination for streaming
-    /// claims while the non-streaming federation path can still defer via the
-    /// `ai_stream_router_claimed` marker.
+    /// claims while the non-streaming federation path can still defer on the
+    /// private claim (`RequestContext::has_ai_stream_router_claim`).
     pub const AI_STREAM_ROUTER: u16 = 2984;
     /// `mcp_gateway`: parses MCP JSON-RPC bodies and applies MCP-aware route
     /// overrides after generic admission/auth plugins but before final dispatch.

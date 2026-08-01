@@ -1241,6 +1241,19 @@ pub mod _test_support {
         plugin.mirror_metrics_snapshot_for_test()
     }
 
+    // ── plugins/ai_stream_router ─────────────────────────────────────────────
+    /// Whether an `ai_stream_router` instance successfully claimed this request.
+    ///
+    /// Exposes only the EXISTENCE of the private claim, never its owner, model,
+    /// destination, TLS, DNS decision, query, or credential
+    /// (`GHSA-xhp5-hqj8-3mwg`). Tests use it to distinguish a real claim from
+    /// the public observability marker.
+    pub fn request_has_ai_stream_router_claim_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.has_ai_stream_router_claim()
+    }
+
     // ── plugins/api_chargeback_sink ──────────────────────────────────────────
     pub fn api_chargeback_sink_snapshot_accumulator_for_test(
         plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,

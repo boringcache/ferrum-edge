@@ -146,7 +146,16 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     `RouteOverrideDnsPolicy::ClearInherited` so
     `RequestContext::apply_route_overrides*` drops an inherited `dns_override`
     even when the host TEXT is unchanged; the default `InheritProxy` keeps
-    ordinary same-host route semantics. Multiple same-type instances are allowed
+    ordinary same-host route semantics. The public `ai_stream_router_claimed`
+    metadata key is likewise observability / third-party coordination only:
+    `ai_federation`, `request_mirror`, `serverless_function`, `mcp_gateway`, and
+    `mesh_route_dispatch` all stand down on
+    `RequestContext::has_ai_stream_router_claim()`, so deleting or rewriting that
+    marker cannot re-arm a routing or irreversible-egress decision on a
+    provider-bound request. Do not add a built-in decision back onto the marker.
+    Intentional pass-through is an UNCLAIMED request and still coordinates
+    through `ai_stream_router_pass_through`.
+    Multiple same-type instances are allowed
     and may share a provider NAME, so ownership — not the
     `ai_stream_router.provider` metadata key — gates request transformation,
     final header/query enforcement, final body revalidation, response-header

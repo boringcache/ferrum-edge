@@ -265,6 +265,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     stream inspector / normalizer selection all verify the private owner.
     `fail_on_missing_model` / `fail_on_no_matching_provider` still decide an
     unclaimed request in normal plugin order.
+  - **Built-in coordination follows the private claim.** `ai_federation`,
+    `request_mirror`, `serverless_function`, `mcp_gateway`, and
+    `mesh_route_dispatch` decided whether to skip a claimed provider request
+    from the public `ai_stream_router_claimed` metadata string. Metadata is a
+    mutable map, so a later plugin deleting or rewriting that marker could make
+    those built-ins re-route, mirror, federate, or invoke a function over a
+    request whose third-party provider credential, model, destination, and query
+    were already committed. All five now decide from a crate-private
+    `RequestContext::has_ai_stream_router_claim()`, which exposes only the
+    claim's existence — never its owner, model, destination, TLS, DNS decision,
+    query, or credential. The marker is still published for logs and
+    third-party/custom plugins, and intentionally UNCLAIMED pass-through still
+    coordinates through `ai_stream_router_pass_through`.
 - WAF no longer forwards the unscanned suffix of an oversize body past an
   enforcing body rule (GHSA-7jh9-fjqf-jcvf). `max_scan_bytes` defaults to 1 MiB
   while the gateway admits 10 MiB request and response bodies by default, and
