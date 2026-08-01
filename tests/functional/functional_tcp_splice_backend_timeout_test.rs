@@ -16,8 +16,7 @@
 
 #![cfg(target_os = "linux")]
 
-use crate::common::{TestGateway, gateway_harness::ephemeral_port_excluding};
-use std::collections::HashSet;
+use crate::common::{TestGateway, ephemeral_port};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -95,13 +94,7 @@ async fn start_gateway_with_retry(
 ) -> (TestGateway, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        let mut allocated_ports = HashSet::new();
-        let stream_port = ephemeral_port_excluding(&mut allocated_ports)
-            .await
-            .expect("allocate stream port");
-        let admin_port = ephemeral_port_excluding(&mut allocated_ports)
-            .await
-            .expect("allocate distinct admin port");
+        let stream_port = ephemeral_port().await.expect("allocate stream port");
         let config = tcp_proxy_config(
             proxy_id,
             backend_port,
@@ -115,9 +108,9 @@ async fn start_gateway_with_retry(
             .mode_file(config)
             .skip_auto_build()
             .max_attempts(1)
+            .reserve_listener_port(stream_port)
             // This test exercises only the configured raw stream listener.
-            .env("FERRUM_PROXY_HTTP_PORT", "0")
-            .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string());
+            .env("FERRUM_PROXY_HTTP_PORT", "0");
         for (key, value) in extra_env {
             builder = builder.env(*key, *value);
         }
@@ -126,7 +119,7 @@ async fn start_gateway_with_retry(
             Ok(gateway) => return (gateway, stream_port),
             Err(error) => eprintln!(
                 "Gateway startup attempt {attempt}/{MAX_ATTEMPTS} failed \
-                 (stream={stream_port} admin={admin_port}): {error}"
+                 (stream={stream_port}): {error}"
             ),
         }
         if attempt < MAX_ATTEMPTS {
