@@ -596,6 +596,9 @@ impl Plugin for PriorityOverridePlugin {
     fn modifies_request_query(&self) -> bool {
         self.inner.modifies_request_query()
     }
+    fn modifies_request_destination(&self) -> bool {
+        self.inner.modifies_request_destination()
+    }
     fn modifies_request_body(&self) -> bool {
         self.inner.modifies_request_body()
     }

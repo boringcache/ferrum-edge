@@ -10958,6 +10958,9 @@ fn test_stream_plugins_for_protocol_resolves_by_namespaced_key() {
 // would silently drop an enrolled instance out of the per-proxy fold — a stored
 // `request_deduplication` replay would then keep matching across a redaction
 // rule edit, which is exactly the replay the provenance digest retires.
+// Request-mutation capabilities (`modifies_request_headers`, `modifies_request_query`,
+// `modifies_request_destination`) must delegate too so composition validation
+// sees priority-overridden route dispatch and transformer instances.
 
 fn presentation_digest_for_proxy(config: &GatewayConfig) -> Option<[u8; 32]> {
     PluginCache::new(config)
