@@ -355,19 +355,19 @@ fn authz_translates_and_enforces_not_ports_wildcard_patterns() {
         "action": "ALLOW",
         "rules": [{
             "to": [{"operation": {
-                "ports": ["9080", "9090"],
+                "ports": ["9180", "9090"],
                 "notPorts": ["90*", "8080"]
             }}]
         }]
     }));
     assert_eq!(policy.rules.len(), 1);
     let to = &policy.rules[0].to[0];
-    assert_eq!(to.ports, vec![9080, 9090]);
+    assert_eq!(to.ports, vec![9180, 9090]);
     assert_eq!(to.not_ports, vec![8080]);
     assert_eq!(to.not_port_patterns, vec!["90*".to_string()]);
 
     let allowed = MeshAuthzRequest {
-        port: Some(9080),
+        port: Some(9180),
         ..MeshAuthzRequest::default()
     };
     assert_eq!(
