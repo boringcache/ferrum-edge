@@ -12,11 +12,11 @@ use crate::modes::mesh::config::{
     MeshRequestAuthentication, MeshRule, MeshSidecar, MeshSidecarEgress, MeshSidecarIngress,
     MeshSimpleLb, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
     MeshTrafficPolicy, MeshTrafficPolicyTls, MeshVirtualServiceCorsPolicy, MetricTagOverride,
-    MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
-    Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, SourceNegationMatch,
-    TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload, WorkloadPort,
-    WorkloadSelector, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
-    mesh_condition_has_values, validate_mesh_condition_ip_block,
+    MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PortPatternAdmission,
+    PrincipalMatch, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+    SourceNegationMatch, TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload,
+    WorkloadPort, WorkloadSelector, admit_request_match_port_pattern, is_mesh_condition_ip_key,
+    is_supported_mesh_condition_key, mesh_condition_has_values, validate_mesh_condition_ip_block,
 };
 
 use super::{
@@ -487,9 +487,22 @@ fn operation_ports(
     let mut ports = Vec::new();
     let mut port_patterns = Vec::new();
     for port in string_array(operation, field) {
-        if is_istio_port_pattern(&port) {
-            port_patterns.push(port);
-            continue;
+        match admit_request_match_port_pattern(&port) {
+            PortPatternAdmission::Admissible => {
+                port_patterns.push(port);
+                continue;
+            }
+            PortPatternAdmission::Inadmissible => {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "rules[].to[].operation.{field} contains an inadmissible port pattern \
+                         (expected '*', '<digits>*', or '*<digits>' that can match a \
+                         destination/listener port in 1..=65535)"
+                    ),
+                ));
+            }
+            PortPatternAdmission::NotAPattern => {}
         }
         ports.push(port_from_string(
             object,
@@ -498,19 +511,6 @@ fn operation_ports(
         )?);
     }
     Ok((ports, port_patterns))
-}
-
-fn is_istio_port_pattern(port: &str) -> bool {
-    if port == "*" {
-        return true;
-    }
-    if let Some(prefix) = port.strip_suffix('*') {
-        return !prefix.is_empty() && prefix.bytes().all(|byte| byte.is_ascii_digit());
-    }
-    if let Some(suffix) = port.strip_prefix('*') {
-        return !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit());
-    }
-    false
 }
 
 fn request_match_is_unconstrained(request: &RequestMatch) -> bool {
@@ -5628,6 +5628,73 @@ mod tests {
     }
 
     #[test]
+    fn preserves_authorization_policy_boundary_admissible_port_patterns() {
+        let result = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "to": [{"operation": {
+                            "ports": ["*", "8*", "65535*", "*0", "*443", "*0001"]
+                        }}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("boundary-admissible ports patterns must translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let request = &mesh.mesh_policies[0].rules[0].to[0];
+        assert!(request.ports.is_empty());
+        assert_eq!(
+            request.port_patterns,
+            vec!["*", "8*", "65535*", "*0", "*443", "*0001"]
+        );
+    }
+
+    #[test]
+    fn rejects_authorization_policy_impossible_ports_patterns_without_echoing_raw() {
+        for raw in [
+            "0*",
+            "00001*",
+            "65536*",
+            "70000*",
+            "99999*",
+            "*70000",
+            "*99999",
+        ] {
+            let err = translate_k8s_objects(
+                &[object(
+                    "AuthorizationPolicy",
+                    serde_json::json!({
+                        "action": "ALLOW",
+                        "rules": [{
+                            "to": [{"operation": {"ports": [raw]}}]
+                        }]
+                    }),
+                )],
+                options(),
+            )
+            .expect_err("impossible ports pattern must fail closed");
+            let message = err.to_string();
+            assert!(
+                message.contains("rules[].to[].operation.ports"),
+                "ports diagnostic must name the field for {raw:?}: {message}"
+            );
+            assert!(
+                message.contains("inadmissible port pattern"),
+                "ports diagnostic must use pattern-admission wording for {raw:?}: {message}"
+            );
+            assert!(
+                !message.contains(raw),
+                "ports pattern-admission diagnostic must not echo {raw:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_authorization_policy_mid_string_port_patterns() {
         let err = translate_k8s_objects(
             &[object(
@@ -5938,6 +6005,73 @@ mod tests {
 
         assert!(err.to_string().contains("rules[].to[].operation.notPorts"));
         assert!(err.to_string().contains("70000"));
+    }
+
+    #[test]
+    fn preserves_authorization_policy_not_ports_boundary_admissible_patterns() {
+        let result = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "to": [{"operation": {
+                            "notPorts": ["*", "8*", "65535*", "*0", "*443", "*0001"]
+                        }}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("boundary-admissible notPorts patterns must translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let request = &mesh.mesh_policies[0].rules[0].to[0];
+        assert!(request.not_ports.is_empty());
+        assert_eq!(
+            request.not_port_patterns,
+            vec!["*", "8*", "65535*", "*0", "*443", "*0001"]
+        );
+    }
+
+    #[test]
+    fn rejects_authorization_policy_impossible_not_ports_patterns_without_echoing_raw() {
+        for raw in [
+            "0*",
+            "00001*",
+            "65536*",
+            "70000*",
+            "99999*",
+            "*70000",
+            "*99999",
+        ] {
+            let err = translate_k8s_objects(
+                &[object(
+                    "AuthorizationPolicy",
+                    serde_json::json!({
+                        "action": "ALLOW",
+                        "rules": [{
+                            "to": [{"operation": {"notPorts": [raw]}}]
+                        }]
+                    }),
+                )],
+                options(),
+            )
+            .expect_err("impossible notPorts pattern must fail closed");
+            let message = err.to_string();
+            assert!(
+                message.contains("rules[].to[].operation.notPorts"),
+                "notPorts diagnostic must name the field for {raw:?}: {message}"
+            );
+            assert!(
+                message.contains("inadmissible port pattern"),
+                "notPorts diagnostic must use pattern-admission wording for {raw:?}: {message}"
+            );
+            assert!(
+                !message.contains(raw),
+                "notPorts pattern-admission diagnostic must not echo {raw:?}: {message}"
+            );
+        }
     }
 
     #[test]
