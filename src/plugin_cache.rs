@@ -1428,6 +1428,44 @@ impl Plugin for PriorityOverridePlugin {
     }
 }
 
+/// Plugins whose protection state is one shared admission domain, so more than
+/// one effective instance on a proxy would ambiguously claim that identity.
+///
+/// * `api_chargeback` writes into the exactly-once process-global `/charges`
+///   registry.
+/// * `load_testing` admits at most one detached cohort per policy identity. Two
+///   same-name effective instances would each hold their own admission flag and
+///   could start overlapping high-cost cohorts against one gateway without any
+///   reload at all (GHSA-wmqm-6mxj-gm9p). Rejecting the composition at cache
+///   construction is what makes the shared per-identity guard authoritative.
+const EXCLUSIVE_EFFECTIVE_INSTANCE_PLUGINS: &[(&str, &str)] = &[
+    ("api_chargeback", "shared /charges registry is exactly-once"),
+    (
+        "load_testing",
+        "one detached run cohort is admitted per policy",
+    ),
+];
+
+/// Composition errors for plugins that admit at most one effective instance on
+/// a proxy after global/proxy/proxy_group merge.
+fn exclusive_effective_instance_errors(merged: &[Arc<dyn Plugin>], proxy_id: &str) -> Vec<String> {
+    EXCLUSIVE_EFFECTIVE_INSTANCE_PLUGINS
+        .iter()
+        .filter_map(|(plugin_name, reason)| {
+            let count = merged
+                .iter()
+                .filter(|plugin| plugin.name() == *plugin_name)
+                .count();
+            (count > 1).then(|| {
+                format!(
+                    "proxy_id={proxy_id}: {plugin_name} permits at most one effective instance \
+                     per proxy ({reason}); found {count}"
+                )
+            })
+        })
+        .collect()
+}
+
 fn validate_tcp_connection_throttle_attachment(
     pc: &PluginConfig,
     gateway_config: &GatewayConfig,
@@ -1553,8 +1591,7 @@ fn try_create_plugin(
         .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
     } else if matches!(
         pc.plugin_name.as_str(),
-        "request_deduplication"
-            | "request_mirror"
+        "request_mirror"
             | "api_chargeback_sink"
             | "rate_limiting"
             | "graphql"
@@ -1584,6 +1621,23 @@ fn try_create_plugin(
             http_client.clone(),
             Some(&pc.id),
         )
+    } else if pc.plugin_name == "request_deduplication" {
+        // Share local idempotency state (active leases, retained completions,
+        // execution barriers, and their accounting) across compatible reload
+        // generations for the same plugin-config identity. Without this a
+        // routine plugin-cache rebuild would hand a replacement instance an
+        // empty map while the original request is still executing, and the
+        // retry would re-run the side effect (GHSA-wmqm-6mxj-gm9p).
+        //
+        // The same stable id is still the Redis keyspace partition, so
+        // cross-gateway behavior is unchanged.
+        crate::plugins::request_deduplication::RequestDeduplication::new_with_policy_identity(
+            &pc.config,
+            http_client.clone(),
+            &pc.namespace,
+            &pc.id,
+        )
+        .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
     } else if pc.plugin_name == "tcp_connection_throttle" {
         create_tcp_connection_throttle_plugin(
             pc,
@@ -6139,17 +6193,7 @@ impl PluginCache {
             {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
-            let chargeback_count = merged
-                .iter()
-                .filter(|plugin| plugin.name() == "api_chargeback")
-                .count();
-            if chargeback_count > 1 {
-                plugin_errors.push(format!(
-                    "proxy_id={}: api_chargeback permits at most one effective instance per proxy \
-                     (shared /charges registry is exactly-once); found {chargeback_count}",
-                    proxy.id
-                ));
-            }
+            plugin_errors.extend(exclusive_effective_instance_errors(&merged, &proxy.id));
             new_map.insert(proxy_runtime_key(proxy), Arc::new(merged));
         }
 
@@ -6892,17 +6936,7 @@ impl PluginCache {
             {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
-            let chargeback_count = merged
-                .iter()
-                .filter(|plugin| plugin.name() == "api_chargeback")
-                .count();
-            if chargeback_count > 1 {
-                plugin_errors.push(format!(
-                    "proxy_id={}: api_chargeback permits at most one effective instance per proxy \
-                     (shared /charges registry is exactly-once); found {chargeback_count}",
-                    proxy.id
-                ));
-            }
+            plugin_errors.extend(exclusive_effective_instance_errors(&merged, &proxy.id));
 
             // Pre-compute whether any plugin requires response body buffering
             let needs_buffering = merged.iter().any(|p| p.requires_response_body_buffering());

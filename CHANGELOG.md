@@ -278,6 +278,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     query, or credential. The marker is still published for logs and
     third-party/custom plugins, and intentionally UNCLAIMED pass-through still
     coordinates through `ai_stream_router_pass_through`.
+- Stateful plugin protections are no longer owned by an individual plugin
+  instance, so a qualifying configuration reload can no longer reset them
+  (GHSA-wmqm-6mxj-gm9p). `request_deduplication` in local mode now owns its
+  active idempotency leases, retained completed responses, execution barriers,
+  and their accounting through a **stable policy identity** (`namespace` +
+  plugin-config id) rather than through the instance the plugin cache happened
+  to construct. Previously a routine incremental rebuild handed a replacement
+  instance an empty map while the original request was still executing, so an
+  immediate retry of the same idempotency key re-dispatched a side-effecting
+  operation — a duplicate payment or write during ordinary dynamic
+  configuration change — and a completed entry retained only by the retired
+  instance was likewise forgotten. A compatible reload now inherits the live
+  state; changing `header_name`, switching between `local` and `redis`, or
+  changing `on_redis_unavailable` is a semantic change that isolates onto fresh
+  state, so a retired generation's late completion lands on the state it took
+  its lease from and cannot corrupt the replacement policy. Capacity and TTL
+  changes are compatible without resetting the protection domain. Each
+  admitted operation, completion, and execution barrier retains its original
+  protection window, so a reload cannot shorten an in-flight lease; new
+  operations use the replacement settings. Every still-live semantic
+  generation remains discoverable, so a rapid A → B → A policy sequence
+  recovers A's active protection domain instead of admitting against a third
+  empty state.
+  Retention is bounded to currently configured policies plus whatever in-flight
+  work still holds a reference.
+
+- `load_testing` now admits at most **one** effective instance per proxy after
+  global/proxy/proxy_group merge, rejected at plugin-cache construction
+  (GHSA-wmqm-6mxj-gm9p). Two same-name effective instances each held their own
+  run-admission flag and could start overlapping high-cost cohorts against one
+  gateway with no reload at all, multiplying thousands of loopback requests per
+  instance. Cross-generation admission for one policy identity was already
+  shared; this closes the duplicate-instance half.
+  Compatible-state lookup also retains every still-live semantic generation,
+  so an A → B → A reload cannot lose A's active cohort admission flag.
+
+- `body_validator` no longer fails open on unusual methods, empty bodies, or
+  uninspectable data (GHSA-2vmr-ww8r-mww3,
+  <https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-2vmr-ww8r-mww3>).
+  Request-side applicability now follows the configured representation instead
+  of a hard-coded `GET`/`HEAD`/`OPTIONS`/`DELETE` exclusion, so a body-bearing
+  request under a governed media type is buffered and validated on any method.
+  Once a configured rule applies, an empty JSON/XML document, a body that is not
+  valid UTF-8, and a missing buffered representation are rejections (`400`
+  request, `502` response) rather than silent pass-throughs; the early request
+  hook prefers a downstream-rewritten UTF-8 `request_body` metadata view when
+  present (composition with `ai_prompt_shield`), falls back to raw buffered
+  bytes when no text view exists, then the transport-proven-empty witness, and
+  otherwise fails closed — while the final request-body hook still validates
+  the exact backend-visible bytes. Native gRPC always runs frame validation, so
+  a zero-length transport body or anything shorter than the five-byte frame
+  header is rejected, while a well-formed frame carrying an empty proto3
+  message is validated normally. Response-side no-body exemptions are now
+  explicit and protocol-correct (`1xx`, `204`, `205`, `304`, `HEAD` responses,
+  and empty terminal gRPC *error* replies with a single valid non-zero
+  `grpc-status`); an ordinary body-bearing success such as `200` with an empty
+  body, or an empty `grpc-status: 0` unary reply, is no longer exempt. The new
+  representation-failure diagnostics are fixed strings that never log or echo
+  body bytes.
+
 - WAF no longer forwards the unscanned suffix of an oversize body past an
   enforcing body rule (GHSA-7jh9-fjqf-jcvf). `max_scan_bytes` defaults to 1 MiB
   while the gateway admits 10 MiB request and response bodies by default, and
@@ -385,6 +445,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schemas, always count; collision-shaped reserved spellings outside those
   contexts count fail-closed. The walk remains a conservative `chars/4`
   heuristic, not provider tokenizer parity.
+
 - Irreversible request egress no longer precedes request-body transformation or
   final request policy (GHSA-4vr5-4wm3-x5xv). `request_mirror` and
   `serverless_function` previously ran their external dispatch in

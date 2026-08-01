@@ -89,6 +89,30 @@ paths:
   keyed state. The RFC shared-cache authorization admission checks both pristine
   inbound and live backend-visible `Authorization`, so request transforms cannot
   erase it.
+- Exception: `load_testing` admits at most one effective instance per proxy
+  after merge. Both it and `api_chargeback` are enforced by
+  `exclusive_effective_instance_errors` in `src/plugin_cache.rs`, applied to the
+  merged per-proxy chain in both the full-build and incremental-rebuild paths.
+- Stateful protections are owned by a **stable policy identity**
+  (`namespace` + plugin-config id), never by the plugin instance the cache
+  happened to construct and never by request-controlled data
+  (GHSA-wmqm-6mxj-gm9p). `tcp_connection_throttle` live-connection accounting is
+  carried in a plugin-cache-owned instance map
+  (`TcpConnectionThrottleInstanceMap`); `load_testing` run admission and
+  local-mode `request_deduplication` state use per-plugin weak registries
+  (`SHARED_STATES`, `SHARED_LOCAL_STATES`) whose entries are pruned on insert,
+  so retention is bounded by the currently configured policies plus in-flight
+  holders. A compatible reload inherits live state; a semantic change isolates
+  onto fresh state so a retired generation's late release/completion cannot
+  corrupt the replacement. For deduplication the semantic set is deliberately
+  narrow — `header_name`, `local` vs `redis`, and `on_redis_unavailable` —
+  because everything else is either bound into the logical key or enforced per
+  operation. In-flight operations, completions, and execution barriers retain
+  their admission-time protection windows across reloads; never evaluate an
+  existing lease with a replacement generation's shorter timeout. Weak
+  registries keep every still-live semantic generation for an identity, not
+  just the last one, so A → B → A recovers A's active protection state. Do not
+  reintroduce per-instance ownership for any of these.
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order
@@ -251,6 +275,21 @@ on a native-gRPC request.
 - `PUT /consumers/:id/credentials/:type` replaces the array, `POST` appends one entry, and `DELETE .../:index` removes one entry.
 - Indexable credentials insert all entries into `ConsumerIndex`; secret-based credentials iterate over the array.
 - Body buffering is two-tier: `PluginCache.requires_request/response_body_buffering()` for the upper bound, then per-request `should_buffer_*_body(&RequestContext)`.
+- A body-consuming policy plugin selects on its configured representation, never
+  on the request method, and never degrades to `Continue` for an empty, absent,
+  or non-UTF-8 body once a configured rule applies (`GHSA-2vmr-ww8r-mww3`).
+  `body_validator` is the reference: early `before_proxy` prefers a rewritten
+  UTF-8 `request_body` metadata view when present (composition with
+  `ai_prompt_shield`), falls back to `ctx.request_body_bytes` when no text view
+  exists (retained via `needs_request_body_bytes()` so non-UTF-8 cannot look
+  like "no body"), treats `ctx.replay_request_body_empty_proven()` as the
+  transport's own empty proof, and fails closed otherwise. The final
+  request-body hook still validates the exact backend-visible bytes. Native
+  gRPC always runs `parse_grpc_frame`. The only exemptions are protocol-defined:
+  empty terminal gRPC *error* replies (a single valid non-zero `grpc-status`),
+  and responses with no content by status/method semantics (1xx, 204, 205, 304,
+  `HEAD`). Representation-gap diagnostics are fixed strings and never echo body
+  bytes.
 - A configured finalized-egress plugin forces buffered request-body
   finalization to complete BEFORE backend dispatch (the `has_finalized_request_egress`
   term in `final_request_body_requirements`), because the ordinary ladder
