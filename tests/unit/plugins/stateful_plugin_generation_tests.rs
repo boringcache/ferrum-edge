@@ -13,13 +13,13 @@
 //! process-scoped and the unit suite runs tests in parallel.
 
 use chrono::Utc;
-use ferrum_edge::PluginCache;
 use ferrum_edge::_test_support::{
     load_testing_with_policy_identity_for_test, request_deduplication_backdate_inflight_for_test,
     request_deduplication_with_instance_id_for_test,
     request_deduplication_with_policy_identity_for_test,
     set_response_presentation_policy_digest_for_test,
 };
+use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{
     BackendScheme, GatewayConfig, PluginConfig, PluginScope, Proxy, default_namespace,
 };
@@ -292,7 +292,9 @@ async fn tcp_throttle_moved_policy_scope_keeps_its_accounting() {
             json!({"max_connections_per_key": 1}),
         )],
     );
-    cache.rebuild(&moved).expect("moved throttle scope must reload");
+    cache
+        .rebuild(&moved)
+        .expect("moved throttle scope must reload");
     let after_move = admit(&throttle(&cache, "tcp-move"), "tcp-move", ip).await;
     assert!(
         after_move.is_none(),
@@ -317,7 +319,9 @@ async fn tcp_throttle_removed_policy_late_release_cannot_corrupt_a_replacement()
         vec![tcp_proxy("tcp-swap", &["thr-new"])],
         vec![throttle_config("thr-new", "tcp-swap", 1)],
     );
-    cache.rebuild(&after).expect("replacement policy must reload");
+    cache
+        .rebuild(&after)
+        .expect("replacement policy must reload");
     let replacement = throttle(&cache, "tcp-swap");
 
     // The replacement owns an independent domain, so its own budget applies.
@@ -388,8 +392,7 @@ async fn tcp_throttle_same_name_policies_on_one_proxy_stay_independent() {
         }
     }
     assert_eq!(
-        refusals,
-        1,
+        refusals, 1,
         "the stricter of two same-name policies must refuse the second connection"
     );
 }
@@ -411,7 +414,9 @@ async fn tcp_throttle_unrelated_proxies_keep_separate_budgets_across_reload() {
     let held_x = admit(&throttle(&cache, "tcp-x"), "tcp-x", ip).await;
     assert!(held_x.is_some(), "proxy x admits its connection");
 
-    cache.rebuild(&config).expect("identical config must reload");
+    cache
+        .rebuild(&config)
+        .expect("identical config must reload");
     let on_y = admit(&throttle(&cache, "tcp-y"), "tcp-y", ip).await;
     assert!(
         on_y.is_some(),
@@ -475,7 +480,9 @@ async fn dedup_lookup(
 
 async fn dedup_complete(plugin: &dyn Plugin, ctx: &mut RequestContext, body: &[u8], status: u16) {
     let headers = HashMap::new();
-    let _ = plugin.on_final_response_body(ctx, status, &headers, body).await;
+    let _ = plugin
+        .on_final_response_body(ctx, status, &headers, body)
+        .await;
 }
 
 #[tokio::test]

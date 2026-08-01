@@ -1284,7 +1284,9 @@ impl RequestDeduplication {
                     .unwrap_or(now);
             }
         }
-        self.local.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
+        self.local
+            .last_cleanup
+            .store(CLEANUP_NEVER, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
@@ -1303,7 +1305,9 @@ impl RequestDeduplication {
                     .unwrap_or(now);
             }
         }
-        self.local.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
+        self.local
+            .last_cleanup
+            .store(CLEANUP_NEVER, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
@@ -1315,7 +1319,9 @@ impl RequestDeduplication {
                 *started_at = now.checked_sub(age).unwrap_or(now);
             }
         }
-        self.local.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
+        self.local
+            .last_cleanup
+            .store(CLEANUP_NEVER, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
@@ -1337,7 +1343,9 @@ impl RequestDeduplication {
         self.local
             .execution_barrier_overflow_until_ms
             .store(0, Ordering::SeqCst);
-        self.local.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
+        self.local
+            .last_cleanup
+            .store(CLEANUP_NEVER, Ordering::Relaxed);
     }
 
     /// Build the logical deduplication key from unambiguous framed fields.
@@ -2400,7 +2408,9 @@ impl RequestDeduplication {
     }
 
     fn next_completed_sequence(&self) -> u64 {
-        self.local.completed_sequence.fetch_add(1, Ordering::Relaxed)
+        self.local
+            .completed_sequence
+            .fetch_add(1, Ordering::Relaxed)
     }
 
     /// Evict expired entries from local cache.

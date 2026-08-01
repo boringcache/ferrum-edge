@@ -1402,7 +1402,10 @@ impl Plugin for PriorityOverridePlugin {
 ///   construction is what makes the shared per-identity guard authoritative.
 const EXCLUSIVE_EFFECTIVE_INSTANCE_PLUGINS: &[(&str, &str)] = &[
     ("api_chargeback", "shared /charges registry is exactly-once"),
-    ("load_testing", "one detached run cohort is admitted per policy"),
+    (
+        "load_testing",
+        "one detached run cohort is admitted per policy",
+    ),
 ];
 
 /// Composition errors for plugins that admit at most one effective instance on
