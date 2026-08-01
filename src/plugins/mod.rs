@@ -6970,6 +6970,15 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` if this plugin may rewrite the effective backend,
+    /// upstream, authority, or path during `before_proxy`.
+    ///
+    /// Replay plugins use this to ensure their destination partition is built
+    /// only after routing has reached its final state.
+    fn modifies_request_destination(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin may transform the request body before
     /// it is sent to the backend. The gateway uses this hint to call
     /// `transform_request_body` only when needed.
