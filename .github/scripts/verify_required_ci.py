@@ -421,6 +421,25 @@ def merge_group_self_test() -> list[str]:
     if merge_group_trigger_is_present(branches_filtered):
         failures.append("branches-restricted merge_group must be rejected")
 
+    # A merge queue admits a pull request only after its required checks have
+    # already passed on the pull request itself, so every required owner must
+    # also report unconditionally on the PR event it uses. Trusted Cross Build
+    # Policy reports through `pull_request_target`, not `pull_request`.
+    target_only = "on:\n  pull_request_target:\n    branches:\n      - main\n"
+    if not pull_request_trigger_is_unconditional(target_only):
+        failures.append(
+            "pull_request_target-only workflow must count as an unconditional "
+            "pull-request trigger"
+        )
+    target_path_filtered = (
+        "on:\n  pull_request_target:\n    paths:\n      - src/**\n"
+    )
+    if pull_request_trigger_is_unconditional(target_path_filtered):
+        failures.append("path-filtered pull_request_target must be rejected")
+    no_pr_trigger = "on:\n  push:\n    branches:\n      - main\n"
+    if pull_request_trigger_is_unconditional(no_pr_trigger):
+        failures.append("workflow without any pull-request trigger must be rejected")
+
     # Fork-origin PR provenance still uses base_ref charset validation in the
     # frozen live-suite contract; merge_group uses payload base_sha instead.
     relevance = Path(
@@ -735,6 +754,17 @@ def main() -> int:
                     f"{workflow_path} concurrency must distinguish merge_group "
                     f"runs (missing `{marker}`)"
                 )
+        # A merge queue only admits a pull request whose required checks have
+        # already passed on the pull request itself, so a `paths:` filter that
+        # keeps a required owner from reporting on the PR event would strand
+        # the queue entry precondition, including for the merge-group-only
+        # trusted boundary, whose PR-side run is what keeps a candidate from
+        # rewriting its own gate before the queue executes it.
+        if not pull_request_trigger_is_unconditional(workflow_yml):
+            planner_errors.append(
+                f"{workflow_path} must trigger on every pull request "
+                "(pull_request or pull_request_target) without path filters"
+            )
         # Fail closed: never trust absent pull_request fields as a silent
         # main-only / no-op path for required merge-group validation.
         if workflow_path == ".github/workflows/cross-build-policy.yml":

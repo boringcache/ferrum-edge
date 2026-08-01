@@ -59,9 +59,14 @@ jobs:
               exit 1
             fi
             proposed_commit="$MERGE_GROUP_HEAD_SHA"
-            # The merge-group base is the exact main tip the queue synthesized
-            # against. Pin it and use it as every trusted baseline; do not fall
-            # back to pull_request fields (they are absent on merge_group).
+            # `merge_group.base_sha` is the group's parent commit: the base
+            # branch tip plus any entries already ahead of this one in the
+            # queue, so it is not necessarily the current `main` tip. Every
+            # entry ahead of this one had to clear this same required check
+            # against its own base before it could be queued, so the parent is
+            # still an authenticated baseline. Pin it and use it as every
+            # trusted baseline; do not fall back to pull_request fields (they
+            # are absent on merge_group).
             if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
               git fetch --no-tags origin "${BASE_SHA}"
             fi

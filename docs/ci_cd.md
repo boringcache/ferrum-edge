@@ -117,6 +117,32 @@ the required check fails closed or runs fully.
 Concurrency groups include the event name and a PR number or merge-group head
 SHA so a merge-group run cannot cancel an unrelated PR (or another group).
 
+**`merge_group` runs execute candidate workflow YAML.** GitHub loads workflow
+files for a `merge_group` event from the synthesized queue commit, so unlike
+`pull_request_target` there is no trusted-base copy of the workflow itself.
+Merge-group runs still read their *executable inputs* from the payload base
+(`verify_cross_build_policy.py`, `pr_ci_plan.py`, `live_suite_path_filter.py`
+are all extracted from `merge_group.base_sha`), but the surrounding job
+definition is candidate-supplied. The protected-file boundary therefore rests
+on the queue's entry precondition: a merge queue admits a pull request only
+after its required checks have already passed **on the pull request**, and the
+PR-side `Trusted Cross Build Policy` run executes the base branch's workflow
+under `pull_request_target` and rejects any change to
+`.github/workflows/cross-build-policy.yml` or
+`.github/scripts/verify_cross_build_policy.py`. Consequences for operators:
+
+- Do **not** follow the common "trigger required checks on `merge_group` only"
+  advice for these six owners. Every owner must keep reporting on the pull
+  request as well, and all six must stay *required* so a failing PR-side check
+  blocks queue entry. `verify_required_ci.py` enforces both the `merge_group`
+  trigger and an unfiltered `pull_request` / `pull_request_target` trigger for
+  each owner.
+- `merge_group.base_sha` is the group's parent commit — the base branch tip
+  plus any entries already ahead of this one in the queue — not necessarily the
+  current `main` tip. Every entry ahead of it cleared the same required checks
+  against its own base before being queued, which is what keeps the payload
+  base usable as a trusted baseline.
+
 **Admin / no-bypass intent (settings owned by root, not this workflow change):**
 apply rules to administrators, block force pushes and branch deletion, require
 up-to-date merge-queue results, and document any narrowly scoped automation
@@ -136,8 +162,9 @@ it does **not** enable the merge queue or mutate branch protection.
    `Closes #2458` be used on the settings follow-up.
 
 `.github/scripts/verify_required_ci.py` statically enforces merge_group
-triggers, check-name parity, event-aware SHA/base markers, and concurrency
-markers for all six owners.
+triggers, unfiltered `pull_request` / `pull_request_target` triggers,
+check-name parity, event-aware SHA/base markers, and concurrency markers for
+all six owners.
 
 ### Release Pipeline Flow
 

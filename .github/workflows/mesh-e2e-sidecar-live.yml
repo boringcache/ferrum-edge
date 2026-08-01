@@ -200,6 +200,7 @@ jobs:
           echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
           echo "Relevance decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
+
   mesh-e2e-sidecar-live:
     name: Mesh e2e sidecar live datapath
     needs: changes
