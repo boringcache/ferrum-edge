@@ -164,10 +164,12 @@ fn authorization_policy_with_not_ports(namespace: &str, not_ports: &[&str]) -> K
     if !not_ports.is_empty() {
         operation.insert(
             "notPorts".to_string(),
-            json!(not_ports
-                .iter()
-                .map(|pattern| pattern.to_string())
-                .collect::<Vec<_>>()),
+            json!(
+                not_ports
+                    .iter()
+                    .map(|pattern| pattern.to_string())
+                    .collect::<Vec<_>>()
+            ),
         );
     }
     object(
@@ -391,10 +393,8 @@ fn authorization_policy_wildcard_not_ports_update_and_withdrawal() {
     // delete/withdrawal through the Kubernetes overlay path, not just first
     // construction.
     let managed = managed(&["default"]);
-    let initial = authoritative_translation(&[authorization_policy_with_not_ports(
-        "default",
-        &["8*"],
-    )]);
+    let initial =
+        authoritative_translation(&[authorization_policy_with_not_ports("default", &["8*"])]);
     let active = merge_k8s_translation(&GatewayConfig::default(), &initial, &managed);
     {
         let initial_request = &mesh_of(&active).mesh_policies[0].rules[0].to[0];
@@ -407,10 +407,8 @@ fn authorization_policy_wildcard_not_ports_update_and_withdrawal() {
         );
     }
 
-    let updated = authoritative_translation(&[authorization_policy_with_not_ports(
-        "default",
-        &["*443"],
-    )]);
+    let updated =
+        authoritative_translation(&[authorization_policy_with_not_ports("default", &["*443"])]);
     let after_update = merge_k8s_translation(&active, &updated, &managed);
     {
         let updated_request = &mesh_of(&after_update).mesh_policies[0].rules[0].to[0];
@@ -428,11 +426,8 @@ fn authorization_policy_wildcard_not_ports_update_and_withdrawal() {
         );
     }
 
-    let withdrawn = merge_k8s_translation(
-        &after_update,
-        &authoritative_empty_translation(),
-        &managed,
-    );
+    let withdrawn =
+        merge_k8s_translation(&after_update, &authoritative_empty_translation(), &managed);
     assert!(
         withdrawn.mesh.is_none(),
         "deleting the AuthorizationPolicy must withdraw the modeled wildcard notPorts policy"

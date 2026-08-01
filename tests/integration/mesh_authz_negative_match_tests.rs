@@ -471,9 +471,9 @@ async fn allow_with_not_port_patterns_denies_matching_listener_port() {
     let result = plugin.authorize(&mut ctx).await;
     match result {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
-        other => panic!(
-            "GET on 8080 should be rejected by notPorts 8* → implicit deny, got {other:?}"
-        ),
+        other => {
+            panic!("GET on 8080 should be rejected by notPorts 8* → implicit deny, got {other:?}")
+        }
     }
 }
 
@@ -524,10 +524,7 @@ async fn allow_with_ports_and_not_port_patterns_stays_conjunctive() {
 
     let mut allowed = http_ctx_with_port("GET", "/api", Some(9080));
     assert!(
-        matches!(
-            plugin.authorize(&mut allowed).await,
-            PluginResult::Continue
-        ),
+        matches!(plugin.authorize(&mut allowed).await, PluginResult::Continue),
         "9080 is in ports and outside notPorts 90*"
     );
 

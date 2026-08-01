@@ -12,10 +12,10 @@ use crate::modes::mesh::config::{
     MeshRequestAuthentication, MeshRule, MeshSidecar, MeshSidecarEgress, MeshSidecarIngress,
     MeshSimpleLb, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
     MeshTrafficPolicy, MeshTrafficPolicyTls, MeshVirtualServiceCorsPolicy, MetricTagOverride,
-    MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PortPatternAdmission,
-    PrincipalMatch, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
-    SourceNegationMatch, TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload,
-    WorkloadPort, WorkloadSelector, admit_request_match_port_pattern, is_mesh_condition_ip_key,
+    MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PortPatternAdmission, PrincipalMatch,
+    RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, SourceNegationMatch,
+    TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload, WorkloadPort,
+    WorkloadSelector, admit_request_match_port_pattern, is_mesh_condition_ip_key,
     is_supported_mesh_condition_key, mesh_condition_has_values, validate_mesh_condition_ip_block,
 };
 
@@ -5683,13 +5683,7 @@ mod tests {
     #[test]
     fn rejects_authorization_policy_impossible_ports_patterns_without_echoing_raw() {
         for raw in [
-            "0*",
-            "00001*",
-            "65536*",
-            "70000*",
-            "99999*",
-            "*70000",
-            "*99999",
+            "0*", "00001*", "65536*", "70000*", "99999*", "*70000", "*99999",
         ] {
             let err = translate_k8s_objects(
                 &[object(
@@ -6111,13 +6105,7 @@ mod tests {
     #[test]
     fn rejects_authorization_policy_impossible_not_ports_patterns_without_echoing_raw() {
         for raw in [
-            "0*",
-            "00001*",
-            "65536*",
-            "70000*",
-            "99999*",
-            "*70000",
-            "*99999",
+            "0*", "00001*", "65536*", "70000*", "99999*", "*70000", "*99999",
         ] {
             let err = translate_k8s_objects(
                 &[object(

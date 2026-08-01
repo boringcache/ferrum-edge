@@ -715,9 +715,9 @@ fn mesh_policy_rejects_mid_string_not_port_pattern() {
         ..RequestMatch::default()
     });
     let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
-    let matched = errors.iter().find(|e| {
-        e.contains("not_port_patterns") && e.contains("not an admissible port pattern")
-    });
+    let matched = errors
+        .iter()
+        .find(|e| e.contains("not_port_patterns") && e.contains("not an admissible port pattern"));
     assert!(
         matched.is_some(),
         "expected not_port_patterns field-specific error, got: {:?}",
@@ -736,9 +736,9 @@ fn mesh_policy_rejects_named_not_port_pattern() {
         ..RequestMatch::default()
     });
     let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
-    let matched = errors.iter().find(|e| {
-        e.contains("not_port_patterns") && e.contains("not an admissible port pattern")
-    });
+    let matched = errors
+        .iter()
+        .find(|e| e.contains("not_port_patterns") && e.contains("not an admissible port pattern"));
     assert!(
         matched.is_some(),
         "expected not_port_patterns field-specific error, got: {:?}",
