@@ -1,10 +1,10 @@
 //! Final ACME renewal publication boundary (issue #2409 / PR #3506).
 //!
-//! The already-CA-valid order is persisted as `Valid` first and certificate
-//! material second under one lease-fenced critical section. Partial persistence
-//! failures must never leave published material beside a stale `Processing`
-//! order, must not request reload, and must not be accounted as a successful
-//! renewal.
+//! Both final store writes are attempted under one lease fence even when the
+//! first fails. Partial outcomes must not permanently wedge renewal: a
+//! Valid-without-material order does not block retries, and material-without-
+//! Valid uses the published certificate's exact `order_url` as durable
+//! completion evidence for [`has_active_renewal_order`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,14 +14,18 @@ use crate::tls::acme::{
     AcmeCertificateRecord, AcmeCertificateStore, AcmeError, AcmeHttp01ChallengeRecord,
     AcmeHttp01OrderInput, AcmeIssuedCertificateInput, AcmeOrderRecord, AcmeOrderStatus,
     AcmeOrderStore, FinalRenewalPublication, apply_final_renewal_publication,
-    commit_final_renewal_publication, inject_final_publication_certificate_write_fault_for_tests,
+    commit_final_renewal_publication, has_active_renewal_order,
+    inject_final_publication_certificate_write_fault_for_tests,
+    inject_final_publication_order_write_fault_for_tests,
 };
 use crate::tls::lease::{RenewalLeaseKeeper, TlsLeaseStore, acme_renewal_lease_name};
-use crate::tls::private_file::{PrivateFileFault, inject_private_file_fault_for_tests};
+use crate::tls::private_file::PrivateFileFault;
 use crate::tls::source::subscription::{install_force_reload_probe, remove_force_reload_probe};
 use tempfile::TempDir;
 
 const DIRECTORY_URL: &str = "https://acme.example/directory";
+const ORDER_URL: &str = "https://acme.example/order/1";
+const OTHER_ORDER_URL: &str = "https://acme.example/order/2";
 
 fn generated_cert_and_key() -> (String, String) {
     let key_pair =
@@ -32,13 +36,18 @@ fn generated_cert_and_key() -> (String, String) {
     (cert.pem(), key_pair.serialize_pem())
 }
 
-fn sample_certificate(id: &str, cert_pem: &str, key_pem: &str) -> AcmeCertificateRecord {
+fn sample_certificate(
+    id: &str,
+    cert_pem: &str,
+    key_pem: &str,
+    order_url: Option<&str>,
+) -> AcmeCertificateRecord {
     AcmeCertificateRecord::new_issued(AcmeIssuedCertificateInput {
         id: id.to_string(),
         domains: vec!["example.com".to_string()],
         directory_url: DIRECTORY_URL.to_string(),
         account_id: Some("account-1".to_string()),
-        order_url: Some("https://acme.example/order/1".to_string()),
+        order_url: order_url.map(str::to_string),
         cert_pem: cert_pem.to_string(),
         key_pem: key_pem.to_string(),
         chain_pem: None,
@@ -46,7 +55,12 @@ fn sample_certificate(id: &str, cert_pem: &str, key_pem: &str) -> AcmeCertificat
     .expect("acme certificate record")
 }
 
-fn processing_order(id: &str, certificate_id: &str) -> AcmeOrderRecord {
+fn order_with(
+    id: &str,
+    certificate_id: &str,
+    status: AcmeOrderStatus,
+    order_url: Option<&str>,
+) -> AcmeOrderRecord {
     AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
         id: id.to_string(),
         certificate_id: Some(certificate_id.to_string()),
@@ -54,8 +68,8 @@ fn processing_order(id: &str, certificate_id: &str) -> AcmeOrderRecord {
         directory_url: DIRECTORY_URL.to_string(),
         account_id: Some("account-1".to_string()),
         account_credentials_json: Some(r#"{"redacted":true}"#.to_string()),
-        order_url: Some("https://acme.example/order/1".to_string()),
-        status: AcmeOrderStatus::Processing,
+        order_url: order_url.map(str::to_string),
+        status,
         http01_challenges: vec![AcmeHttp01ChallengeRecord {
             identifier: "example.com".to_string(),
             token: "tok_processing".to_string(),
@@ -66,6 +80,15 @@ fn processing_order(id: &str, certificate_id: &str) -> AcmeOrderRecord {
         error: None,
     })
     .expect("acme order record")
+}
+
+fn processing_order(id: &str, certificate_id: &str) -> AcmeOrderRecord {
+    order_with(
+        id,
+        certificate_id,
+        AcmeOrderStatus::Processing,
+        Some(ORDER_URL),
+    )
 }
 
 fn takeover_document(name: &str) -> String {
@@ -81,6 +104,16 @@ fn takeover_document(name: &str) -> String {
     )
 }
 
+fn assert_no_material_disclosure(message: &str, material: &[&str]) {
+    assert!(
+        !message.contains("BEGIN CERTIFICATE")
+            && !message.contains("BEGIN PRIVATE KEY")
+            && !message.contains("BEGIN EC PRIVATE KEY")
+            && material.iter().all(|value| !message.contains(value)),
+        "error must not disclose certificate or key material: {message}"
+    );
+}
+
 /// Happy path: one fenced commit marks the order Valid then publishes
 /// certificate material, and reload is requested.
 #[tokio::test]
@@ -89,7 +122,7 @@ async fn final_publication_commits_order_then_certificate_under_one_lease_fence(
     let certificates = Arc::new(AcmeCertificateStore::open(dir.path()).expect("open cert store"));
     let orders = Arc::new(AcmeOrderStore::open(dir.path()).expect("open order store"));
     let (cert_pem, key_pem) = generated_cert_and_key();
-    let issued = sample_certificate("edge-cert", &cert_pem, &key_pem);
+    let issued = sample_certificate("edge-cert", &cert_pem, &key_pem, Some(ORDER_URL));
     let order = processing_order("edge-order", "edge-cert");
     orders
         .upsert_order(order.clone(), false)
@@ -106,7 +139,7 @@ async fn final_publication_commits_order_then_certificate_under_one_lease_fence(
         .expect("won");
     let keeper = RenewalLeaseKeeper::start(held, Duration::from_secs(60));
 
-    let surface = "final_publication_order_then_cert_complete_reload";
+    let surface = "final_publication_matrix_complete_reload";
     let mut probe = install_force_reload_probe(surface);
 
     let outcome = keeper
@@ -148,7 +181,7 @@ async fn final_publication_runs_neither_write_when_lease_is_lost() {
     let certificates = Arc::new(AcmeCertificateStore::open(dir.path()).expect("open cert store"));
     let orders = Arc::new(AcmeOrderStore::open(dir.path()).expect("open order store"));
     let (cert_pem, key_pem) = generated_cert_and_key();
-    let issued = sample_certificate("edge-cert", &cert_pem, &key_pem);
+    let issued = sample_certificate("edge-cert", &cert_pem, &key_pem, Some(ORDER_URL));
     let order = processing_order("edge-order", "edge-cert");
     orders
         .upsert_order(order.clone(), false)
@@ -202,80 +235,102 @@ async fn final_publication_runs_neither_write_when_lease_is_lost() {
     let _ = keeper.finish().await;
 }
 
-/// Order-store persistence failure under the lease fence: no certificate is
-/// published, Processing remains, reload is not requested, and accounting is an
-/// explicit failure.
-#[test]
-fn order_store_failure_publishes_no_certificate_and_skips_reload() {
+/// Order-store failure still attempts certificate publication under the same
+/// fence: new material lands, reload is requested, outcome is explicit failure
+/// (not a renewed count), and the published order_url clears the stale active
+/// order on a later scan.
+#[tokio::test]
+async fn order_failure_certificate_success_publishes_reloads_and_clears_active_order() {
     let dir = TempDir::new().expect("tempdir");
-    let certificates = AcmeCertificateStore::open(dir.path()).expect("open cert store");
-    let orders = AcmeOrderStore::open(dir.path()).expect("open order store");
+    let certificates = Arc::new(AcmeCertificateStore::open(dir.path()).expect("open cert store"));
+    let orders = Arc::new(AcmeOrderStore::open(dir.path()).expect("open order store"));
     let (cert_pem, key_pem) = generated_cert_and_key();
-    let issued = sample_certificate("edge-cert", &cert_pem, &key_pem);
+    let issued = sample_certificate("edge-cert", &cert_pem, &key_pem, Some(ORDER_URL));
     let order = processing_order("edge-order", "edge-cert");
     orders
         .upsert_order(order.clone(), false)
         .expect("seed processing order");
 
-    let surface = "final_publication_order_failure_no_reload";
+    let leases = Arc::new(
+        TlsLeaseStore::open_with_holder(dir.path(), "replica-a".to_string())
+            .expect("open lease store"),
+    );
+    let name = acme_renewal_lease_name("edge-cert");
+    let held = leases
+        .try_acquire(&name, Duration::from_secs(60))
+        .expect("claim")
+        .expect("won");
+    let keeper = RenewalLeaseKeeper::start(held, Duration::from_secs(60));
+
+    let surface = "final_publication_matrix_material_without_valid_reload";
     let mut probe = install_force_reload_probe(surface);
-    let _fault = inject_private_file_fault_for_tests(PrivateFileFault::Rename);
-    let outcome = commit_final_renewal_publication(&certificates, &orders, issued, order);
+    let _fault = inject_final_publication_order_write_fault_for_tests(PrivateFileFault::Rename);
+
+    let outcome = keeper
+        .commit_fenced({
+            let certificates = Arc::clone(&certificates);
+            let orders = Arc::clone(&orders);
+            move || commit_final_renewal_publication(&certificates, &orders, issued, order)
+        })
+        .await
+        .expect("lease still held for both attempted writes");
     assert!(matches!(
         outcome,
-        FinalRenewalPublication::OrderNotCommitted(_)
+        FinalRenewalPublication::MaterialPublishedOrderNotCommitted(_)
     ));
 
     let error = apply_final_renewal_publication(outcome).expect_err("order write failed");
     let message = error.to_string();
     assert!(
-        message.contains("marking the ACME order valid failed before certificate publication"),
-        "error must state the order write failed before publication: {message}"
+        message.contains(
+            "renewed certificate material published but marking the ACME order valid failed"
+        ),
+        "error must state material published without Valid: {message}"
     );
+    assert_no_material_disclosure(&message, &[&cert_pem, &key_pem]);
     assert!(
-        !message.contains("BEGIN CERTIFICATE")
-            && !message.contains("BEGIN PRIVATE KEY")
-            && !message.contains(&key_pem)
-            && !message.contains(&cert_pem),
-        "error must not disclose certificate or key material"
+        probe.try_recv().is_ok(),
+        "published material must request reload even when Valid failed"
     );
-    assert!(
-        probe.try_recv().is_err(),
-        "order failure must not request reload"
-    );
-    assert!(matches!(
-        certificates.get_certificate("edge-cert"),
-        Err(AcmeError::NotFound(_))
-    ));
+
+    let stored = certificates
+        .get_certificate("edge-cert")
+        .expect("new material must persist");
+    assert_eq!(stored.cert_pem, cert_pem);
+    assert_eq!(stored.order_url.as_deref(), Some(ORDER_URL));
     assert_eq!(
         orders.get_order("edge-order").expect("order").status,
         AcmeOrderStatus::Processing,
-        "failed order write must leave the prior Processing status"
+        "failed Valid write must leave Processing"
+    );
+    assert!(
+        !has_active_renewal_order(&orders, &certificates, "edge-cert").expect("scan"),
+        "exact published order_url must make the matching stale Processing order non-blocking"
     );
     remove_force_reload_probe(surface);
+    let _ = keeper.finish().await;
 }
 
-/// Certificate-store failure after a successful order Valid write: order is
-/// Valid, prior/no new cert remains, reload is not requested, and the outcome
-/// is an explicit failure (never a successful renewal).
+/// Order succeeds, certificate fails: Valid sticks, prior material remains, no
+/// reload, explicit failure.
 #[test]
-fn certificate_store_failure_after_order_valid_skips_reload() {
+fn order_success_certificate_failure_retains_prior_material_without_reload() {
     let dir = TempDir::new().expect("tempdir");
     let certificates = AcmeCertificateStore::open(dir.path()).expect("open cert store");
     let orders = AcmeOrderStore::open(dir.path()).expect("open order store");
     let (old_cert_pem, old_key_pem) = generated_cert_and_key();
-    let prior = sample_certificate("edge-cert", &old_cert_pem, &old_key_pem);
+    let prior = sample_certificate("edge-cert", &old_cert_pem, &old_key_pem, Some(OTHER_ORDER_URL));
     certificates
         .upsert_certificate(prior, false)
         .expect("seed prior certificate");
     let (new_cert_pem, new_key_pem) = generated_cert_and_key();
-    let issued = sample_certificate("edge-cert", &new_cert_pem, &new_key_pem);
+    let issued = sample_certificate("edge-cert", &new_cert_pem, &new_key_pem, Some(ORDER_URL));
     let order = processing_order("edge-order", "edge-cert");
     orders
         .upsert_order(order.clone(), false)
         .expect("seed processing order");
 
-    let surface = "final_publication_cert_failure_after_order_no_reload";
+    let surface = "final_publication_matrix_valid_without_material_no_reload";
     let mut probe = install_force_reload_probe(surface);
     let _fault =
         inject_final_publication_certificate_write_fault_for_tests(PrivateFileFault::Rename);
@@ -293,13 +348,9 @@ fn certificate_store_failure_after_order_valid_skips_reload() {
         ),
         "error must state order committed without material: {message}"
     );
-    assert!(
-        !message.contains("BEGIN CERTIFICATE")
-            && !message.contains("BEGIN PRIVATE KEY")
-            && !message.contains(&new_key_pem)
-            && !message.contains(&new_cert_pem)
-            && !message.contains(&old_key_pem),
-        "error must not disclose certificate or key material"
+    assert_no_material_disclosure(
+        &message,
+        &[&new_key_pem, &new_cert_pem, &old_key_pem, &old_cert_pem],
     );
     assert!(
         probe.try_recv().is_err(),
@@ -319,36 +370,302 @@ fn certificate_store_failure_after_order_valid_skips_reload() {
         AcmeOrderStatus::Valid,
         "order Valid must stick so Processing cannot block a later retry"
     );
-    // apply_final_renewal_publication returned Err above: this path is never a
-    // successful renewal count.
+    assert!(
+        !has_active_renewal_order(&orders, &certificates, "edge-cert").expect("scan"),
+        "Valid status must not block a later renewal"
+    );
     remove_force_reload_probe(surface);
 }
 
-/// The production helper itself commits order Valid then certificate with no
-/// window for a separate lease release between them.
+/// Both final writes fail: neither lands, no reload, combined failure without
+/// disclosing PEM or keys, and Processing remains active (fail-closed outage).
 #[test]
-fn commit_final_renewal_publication_marks_order_valid_before_certificate() {
+fn both_final_writes_fail_without_reload_or_material_disclosure() {
     let dir = TempDir::new().expect("tempdir");
     let certificates = AcmeCertificateStore::open(dir.path()).expect("open cert store");
     let orders = AcmeOrderStore::open(dir.path()).expect("open order store");
     let (cert_pem, key_pem) = generated_cert_and_key();
-    let issued = sample_certificate("edge-cert", &cert_pem, &key_pem);
+    let issued = sample_certificate("edge-cert", &cert_pem, &key_pem, Some(ORDER_URL));
     let order = processing_order("edge-order", "edge-cert");
     orders
         .upsert_order(order.clone(), false)
         .expect("seed processing order");
 
+    let surface = "final_publication_matrix_both_fail_no_reload";
+    let mut probe = install_force_reload_probe(surface);
+    let _order_fault =
+        inject_final_publication_order_write_fault_for_tests(PrivateFileFault::Rename);
+    let _cert_fault =
+        inject_final_publication_certificate_write_fault_for_tests(PrivateFileFault::Sync);
     let outcome = commit_final_renewal_publication(&certificates, &orders, issued, order);
-    assert!(matches!(outcome, FinalRenewalPublication::Complete));
+    match outcome {
+        FinalRenewalPublication::NeitherCommitted {
+            ref order,
+            ref certificate,
+        } => {
+            let order_message = order.to_string();
+            let certificate_message = certificate.to_string();
+            assert!(
+                !order_message.is_empty() && !certificate_message.is_empty(),
+                "both diagnostics must be preserved"
+            );
+            assert_ne!(
+                order_message, certificate_message,
+                "order and certificate failure diagnostics must remain distinguishable"
+            );
+        }
+        other => panic!("expected NeitherCommitted, got {other:?}"),
+    }
+
+    let error = apply_final_renewal_publication(outcome).expect_err("both writes failed");
+    let message = error.to_string();
+    assert!(
+        message.contains(
+            "ACME final publication failed for both order and certificate stores"
+        ) && message.contains("order:")
+            && message.contains("certificate:"),
+        "combined failure must preserve both diagnostics: {message}"
+    );
+    assert_no_material_disclosure(&message, &[&cert_pem, &key_pem]);
+    assert!(
+        probe.try_recv().is_err(),
+        "both-failure must not request reload"
+    );
+    assert!(matches!(
+        certificates.get_certificate("edge-cert"),
+        Err(AcmeError::NotFound(_))
+    ));
+    assert_eq!(
+        orders.get_order("edge-order").expect("order").status,
+        AcmeOrderStatus::Processing
+    );
+    assert!(
+        has_active_renewal_order(&orders, &certificates, "edge-cert").expect("scan"),
+        "storage-outage both-failure may remain fail-closed on the Processing order"
+    );
+    remove_force_reload_probe(surface);
+}
+
+/// Exact matching published `certificate.order_url` clears only that stale
+/// active order; different/missing URLs and unrelated certificates stay active.
+#[test]
+fn published_order_url_clears_only_exact_matching_active_order() {
+    let dir = TempDir::new().expect("tempdir");
+    let certificates = AcmeCertificateStore::open(dir.path()).expect("open cert store");
+    let orders = AcmeOrderStore::open(dir.path()).expect("open order store");
+    let (cert_pem, key_pem) = generated_cert_and_key();
+
+    // Matching Processing order + published URL → non-blocking.
+    certificates
+        .upsert_certificate(
+            sample_certificate("edge-cert", &cert_pem, &key_pem, Some(ORDER_URL)),
+            false,
+        )
+        .expect("publish matching cert");
+    orders
+        .upsert_order(
+            order_with(
+                "edge-order",
+                "edge-cert",
+                AcmeOrderStatus::Processing,
+                Some(ORDER_URL),
+            ),
+            false,
+        )
+        .expect("matching processing order");
+    assert!(
+        !has_active_renewal_order(&orders, &certificates, "edge-cert").expect("match"),
+        "exact non-empty order_url match must clear the stale active order"
+    );
+
+    // Different URL on the same certificate keeps Ready active.
+    let (other_pem, other_key) = generated_cert_and_key();
+    certificates
+        .upsert_certificate(
+            sample_certificate("edge-cert", &other_pem, &other_key, Some(OTHER_ORDER_URL)),
+            true,
+        )
+        .expect("overwrite with different URL");
+    orders
+        .upsert_order(
+            order_with(
+                "edge-order-ready",
+                "edge-cert",
+                AcmeOrderStatus::Ready,
+                Some(ORDER_URL),
+            ),
+            false,
+        )
+        .expect("ready order with different published URL");
+    assert!(
+        has_active_renewal_order(&orders, &certificates, "edge-cert").expect("different url"),
+        "a different published order_url must keep Ready active"
+    );
+
+    // Missing published URL keeps PendingChallenges active.
+    let dir_missing = TempDir::new().expect("tempdir");
+    let certificates_missing =
+        AcmeCertificateStore::open(dir_missing.path()).expect("open cert store");
+    let orders_missing = AcmeOrderStore::open(dir_missing.path()).expect("open order store");
+    let (missing_pem, missing_key) = generated_cert_and_key();
+    certificates_missing
+        .upsert_certificate(
+            sample_certificate("edge-cert", &missing_pem, &missing_key, None),
+            false,
+        )
+        .expect("cert without order_url");
+    orders_missing
+        .upsert_order(
+            order_with(
+                "pending-order",
+                "edge-cert",
+                AcmeOrderStatus::PendingChallenges,
+                Some(ORDER_URL),
+            ),
+            false,
+        )
+        .expect("pending order");
+    assert!(
+        has_active_renewal_order(&orders_missing, &certificates_missing, "edge-cert")
+            .expect("missing published url"),
+        "missing published order_url must keep PendingChallenges active"
+    );
+
+    // Empty order URLs are not completion evidence.
+    let dir_empty = TempDir::new().expect("tempdir");
+    let certificates_empty = AcmeCertificateStore::open(dir_empty.path()).expect("open cert store");
+    let orders_empty = AcmeOrderStore::open(dir_empty.path()).expect("open order store");
+    let (empty_pem, empty_key) = generated_cert_and_key();
+    certificates_empty
+        .upsert_certificate(
+            sample_certificate("edge-cert", &empty_pem, &empty_key, Some("")),
+            false,
+        )
+        .expect("cert with empty order_url");
+    orders_empty
+        .upsert_order(
+            order_with(
+                "empty-order",
+                "edge-cert",
+                AcmeOrderStatus::Processing,
+                Some(""),
+            ),
+            false,
+        )
+        .expect("processing order with empty url");
+    assert!(
+        has_active_renewal_order(&orders_empty, &certificates_empty, "edge-cert")
+            .expect("empty urls"),
+        "empty order URLs must not clear an active order"
+    );
+
+    // Missing order URL on the order itself keeps Processing active even when
+    // the certificate carries a URL.
+    let dir_missing_order_url = TempDir::new().expect("tempdir");
+    let certificates_missing_order_url =
+        AcmeCertificateStore::open(dir_missing_order_url.path()).expect("open cert store");
+    let orders_missing_order_url =
+        AcmeOrderStore::open(dir_missing_order_url.path()).expect("open order store");
+    let (order_none_pem, order_none_key) = generated_cert_and_key();
+    certificates_missing_order_url
+        .upsert_certificate(
+            sample_certificate(
+                "edge-cert",
+                &order_none_pem,
+                &order_none_key,
+                Some(ORDER_URL),
+            ),
+            false,
+        )
+        .expect("cert with order_url");
+    orders_missing_order_url
+        .upsert_order(
+            order_with(
+                "no-url-order",
+                "edge-cert",
+                AcmeOrderStatus::Processing,
+                None,
+            ),
+            false,
+        )
+        .expect("processing order without url");
+    assert!(
+        has_active_renewal_order(
+            &orders_missing_order_url,
+            &certificates_missing_order_url,
+            "edge-cert"
+        )
+        .expect("missing order url"),
+        "a missing order URL must keep Processing active"
+    );
+
+    // An unrelated certificate carrying the same URL must not clear another
+    // certificate's active order.
+    let dir_unrelated = TempDir::new().expect("tempdir");
+    let certificates_unrelated =
+        AcmeCertificateStore::open(dir_unrelated.path()).expect("open cert store");
+    let orders_unrelated = AcmeOrderStore::open(dir_unrelated.path()).expect("open order store");
+    let (a_pem, a_key) = generated_cert_and_key();
+    let (b_pem, b_key) = generated_cert_and_key();
+    certificates_unrelated
+        .upsert_certificate(
+            sample_certificate("other-cert", &a_pem, &a_key, Some(ORDER_URL)),
+            false,
+        )
+        .expect("unrelated cert with matching URL");
+    certificates_unrelated
+        .upsert_certificate(
+            sample_certificate("edge-cert", &b_pem, &b_key, Some(OTHER_ORDER_URL)),
+            false,
+        )
+        .expect("target cert with different URL");
+    orders_unrelated
+        .upsert_order(
+            order_with(
+                "edge-order",
+                "edge-cert",
+                AcmeOrderStatus::Processing,
+                Some(ORDER_URL),
+            ),
+            false,
+        )
+        .expect("processing order for edge-cert");
+    assert!(
+        has_active_renewal_order(&orders_unrelated, &certificates_unrelated, "edge-cert")
+            .expect("unrelated"),
+        "an unrelated certificate's order_url must not clear this certificate's active order"
+    );
+}
+
+/// The production helper itself attempts both writes: Valid first, certificate
+/// second even after an order-store failure.
+#[test]
+fn commit_final_renewal_publication_attempts_certificate_after_order_failure() {
+    let dir = TempDir::new().expect("tempdir");
+    let certificates = AcmeCertificateStore::open(dir.path()).expect("open cert store");
+    let orders = AcmeOrderStore::open(dir.path()).expect("open order store");
+    let (cert_pem, key_pem) = generated_cert_and_key();
+    let issued = sample_certificate("edge-cert", &cert_pem, &key_pem, Some(ORDER_URL));
+    let order = processing_order("edge-order", "edge-cert");
+    orders
+        .upsert_order(order.clone(), false)
+        .expect("seed processing order");
+
+    let _fault = inject_final_publication_order_write_fault_for_tests(PrivateFileFault::Rename);
+    let outcome = commit_final_renewal_publication(&certificates, &orders, issued, order);
+    assert!(matches!(
+        outcome,
+        FinalRenewalPublication::MaterialPublishedOrderNotCommitted(_)
+    ));
     assert_eq!(
         certificates
             .get_certificate("edge-cert")
-            .expect("published")
+            .expect("published despite order failure")
             .cert_pem,
         cert_pem
     );
     assert_eq!(
         orders.get_order("edge-order").expect("order").status,
-        AcmeOrderStatus::Valid
+        AcmeOrderStatus::Processing
     );
 }
