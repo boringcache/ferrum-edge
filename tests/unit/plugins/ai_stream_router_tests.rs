@@ -2815,8 +2815,7 @@ async fn request_mirror_ignores_a_sabotaged_claim_marker() {
                 .await,
             PluginResult::Continue
         ));
-        let metrics =
-            ferrum_edge::_test_support::request_mirror_metrics_snapshot_for_test(&plugin);
+        let metrics = ferrum_edge::_test_support::request_mirror_metrics_snapshot_for_test(&plugin);
         assert_eq!(
             metrics.dispatched, 0,
             "a provider-bound request must never be mirrored, whatever the marker says"
@@ -2915,7 +2914,9 @@ async fn mcp_gateway_ignores_a_sabotaged_claim_marker() {
              already committed"
         );
         assert!(
-            !ctx.metadata.keys().any(|key| key.starts_with("mcp_gateway")),
+            !ctx.metadata
+                .keys()
+                .any(|key| key.starts_with("mcp_gateway")),
             "mcp_gateway must not even emit base metadata for a claimed request"
         );
     }
@@ -4918,8 +4919,9 @@ fn response_caching_needs_no_added_final_header_policy_rule() {
 
 /// The value the H1/H2 and native-H3 ladders actually capture once per request.
 fn captured_backend_query(ctx: &RequestContext, raw_query: &str) -> String {
-    let with_raw =
-        ferrum_edge::_test_support::effective_backend_query_string_with_raw_for_test(ctx, raw_query);
+    let with_raw = ferrum_edge::_test_support::effective_backend_query_string_with_raw_for_test(
+        ctx, raw_query,
+    );
     // Both funnels must agree; the `_with_raw` form is what the ladders use and
     // the plain form is what the policy/replay consumers use.
     assert_eq!(
@@ -5489,7 +5491,9 @@ async fn only_the_owning_instance_selects_a_response_normalizer() {
     response_headers.insert("content-type".to_string(), "text/event-stream".to_string());
     response_headers.insert("content-length".to_string(), "42".to_string());
     assert!(matches!(
-        second.after_proxy(&mut ctx, 200, &mut response_headers).await,
+        second
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
         PluginResult::Continue
     ));
     assert_eq!(
@@ -5498,7 +5502,9 @@ async fn only_the_owning_instance_selects_a_response_normalizer() {
         "a losing instance must not repair the normalized representation headers"
     );
     assert!(matches!(
-        first.after_proxy(&mut ctx, 200, &mut response_headers).await,
+        first
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
         PluginResult::Continue
     ));
     assert!(
@@ -5716,7 +5722,8 @@ async fn forged_meta_body_stage(
     );
     // A later plugin rewriting public metadata — exactly what the key being
     // observability rather than policy state has to tolerate.
-    ctx.metadata.insert(MODEL_META_KEY.to_string(), forged.to_string());
+    ctx.metadata
+        .insert(MODEL_META_KEY.to_string(), forged.to_string());
     final_header_policy(plugins, &ctx, &mut headers);
     ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
         plugins, &mut ctx, &headers, &raw,
@@ -5894,7 +5901,8 @@ async fn forged_meta_anthropic_ctx(plugin: &AiStreamRouter) -> RequestContext {
         plugin.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
-    ctx.metadata.insert(MODEL_META_KEY.to_string(), "forged-identity".to_string());
+    ctx.metadata
+        .insert(MODEL_META_KEY.to_string(), "forged-identity".to_string());
     ctx
 }
 
@@ -6045,7 +6053,8 @@ async fn only_the_owner_enforces_and_normalizes_under_a_forged_model_key() {
             PluginResult::Continue
         ));
     }
-    ctx.metadata.insert(MODEL_META_KEY.to_string(), "forged-identity".to_string());
+    ctx.metadata
+        .insert(MODEL_META_KEY.to_string(), "forged-identity".to_string());
 
     assert!(
         second

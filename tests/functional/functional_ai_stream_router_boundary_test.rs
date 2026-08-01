@@ -558,7 +558,7 @@ impl BoundaryHarness {
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .header("x-client-token", CLIENT_TOKEN)
-            .header("cookie", format!("session={CLIENT_TOKEN}"))
+                .header("cookie", format!("session={CLIENT_TOKEN}"))
                 .body(Bytes::from(body.to_vec()));
             match client.get_with_options(&url, options).await {
                 Ok(response) => return response.status,
