@@ -234,7 +234,7 @@ fn eager_backend_collection_publishes_charged_bytes_without_a_copy() {
         .split("async fn eager_collect_charged_backend_body(")
         .nth(1)
         .expect("eager charged collector")
-        .split("fn buffered_backend_response_from_eager_collect(")
+        .split("\nfn buffered_backend_response_from_eager_collect(")
         .next()
         .expect("bounded eager charged collector");
     assert!(
@@ -255,7 +255,7 @@ fn eager_backend_collection_publishes_charged_bytes_without_a_copy() {
     );
 
     let reader = proxy
-        .split("fn buffered_backend_response_from_eager_collect(")
+        .split("\nfn buffered_backend_response_from_eager_collect(")
         .nth(1)
         .expect("eager backend response builder")
         .split("fn eager_buffer_body_read_status_and_class(")
