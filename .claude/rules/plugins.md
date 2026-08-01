@@ -55,27 +55,64 @@ paths:
   Deduplication runs at priority 3010, after route dispatch and
   `request_transformer` header/query rules but before terminate-mode
   `serverless_function`. Plugin-cache admission rejects every same-protocol
-  header/query mutator at or after deduplication, including priority overrides,
+  header/query/destination mutator at or after deduplication, including priority
+  overrides,
   and rejects any deferred request-body transformer whose final bytes are not
   exactly the body produced by the pre-`before_proxy` normalization phase.
 - `response_caching` likewise requires the proxy's private proof that the
   complete GET/HEAD upload is empty before lookup, binds the complete
   backend-visible request target (including the effective outbound query),
-  rejects later header/query mutation, and rejects deferred body transforms that
-  could synthesize bytes after lookup. Configured request decompression remains
-  compatible because its exact final body is published during pre-`before_proxy`
-  normalization. Its request-header dimension is the complete `Vary` tuple, not
-  the raw header view: RFC 9111 §4.1 selection is target + `Vary`, and a
-  conditional revalidation, a client `no-cache` refresh, and `Content-Length: 0`
-  are addressed to an entry rather than selecting a different one — keying the
-  raw view would put each of them in a partition the entry cannot be reached
-  from and make the `Vary` index unreachable. Cross-caller isolation is the
-  mandatory caller partition. `Authorization`, `Proxy-Authorization`, and
-  `Cookie` remain mandatory Vary names even for anonymous entries because
-  downstream shared caches cannot observe Ferrum's private caller partition;
-  present values are hashed and absence is a distinct keyed state. The RFC
-  shared-cache authorization admission checks both pristine inbound and live
-  backend-visible `Authorization`, so request transforms cannot erase it.
+  rejects later header/query/destination mutation, and rejects deferred body
+  transforms that could synthesize bytes after lookup. Configured request
+  decompression remains compatible because its exact final body is published
+  during pre-`before_proxy` normalization. Its request-header dimension
+  conservatively binds all backend-visible headers, in addition to the complete
+  `Vary` tuple, except the entry-operation headers whose semantics this plugin
+  actually implements:
+  `If-None-Match` / `If-Modified-Since` revalidation, pure honored request
+  `Cache-Control: no-cache` / `no-store` refreshes (bare and argument-free, only
+  when every meaningful member is such a refresh and only when
+  `respect_no_cache` is enabled), and zero-length `Content-Length`
+  framing. A conditional revalidation, a pure client no-cache/no-store refresh,
+  and `Content-Length: 0` are addressed to an entry rather than selecting a
+  different one — keying the raw view would put each of them in a partition
+  the entry cannot be reached from and make the `Vary` index unreachable.
+  Unsupported precondition / range / pragma headers (`If-Match`,
+  `If-Unmodified-Since`, `If-Range`, `Range`, `Pragma`), mixed / arbitrary /
+  unrecognized or argument-bearing request `Cache-Control` content, and any
+  `Cache-Control` when `respect_no_cache` is false stay bound so they cannot
+  share a replay key.
+  Cross-caller isolation is the mandatory caller partition. `Authorization`,
+  `Proxy-Authorization`, and `Cookie` remain mandatory Vary names even for
+  anonymous entries because downstream shared caches cannot observe Ferrum's
+  private caller partition; present values are hashed and absence is a distinct
+  keyed state. The RFC shared-cache authorization admission checks both pristine
+  inbound and live backend-visible `Authorization`, so request transforms cannot
+  erase it.
+- Exception: `load_testing` admits at most one effective instance per proxy
+  after merge. Both it and `api_chargeback` are enforced by
+  `exclusive_effective_instance_errors` in `src/plugin_cache.rs`, applied to the
+  merged per-proxy chain in both the full-build and incremental-rebuild paths.
+- Stateful protections are owned by a **stable policy identity**
+  (`namespace` + plugin-config id), never by the plugin instance the cache
+  happened to construct and never by request-controlled data
+  (GHSA-wmqm-6mxj-gm9p). `tcp_connection_throttle` live-connection accounting is
+  carried in a plugin-cache-owned instance map
+  (`TcpConnectionThrottleInstanceMap`); `load_testing` run admission and
+  local-mode `request_deduplication` state use per-plugin weak registries
+  (`SHARED_STATES`, `SHARED_LOCAL_STATES`) whose entries are pruned on insert,
+  so retention is bounded by the currently configured policies plus in-flight
+  holders. A compatible reload inherits live state; a semantic change isolates
+  onto fresh state so a retired generation's late release/completion cannot
+  corrupt the replacement. For deduplication the semantic set is deliberately
+  narrow — `header_name`, `local` vs `redis`, and `on_redis_unavailable` —
+  because everything else is either bound into the logical key or enforced per
+  operation. In-flight operations, completions, and execution barriers retain
+  their admission-time protection windows across reloads; never evaluate an
+  existing lease with a replacement generation's shorter timeout. Weak
+  registries keep every still-live semantic generation for an identity, not
+  just the last one, so A → B → A recovers A's active protection state. Do not
+  reintroduce per-instance ownership for any of these.
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order
@@ -177,6 +214,21 @@ on a native-gRPC request.
 - `PUT /consumers/:id/credentials/:type` replaces the array, `POST` appends one entry, and `DELETE .../:index` removes one entry.
 - Indexable credentials insert all entries into `ConsumerIndex`; secret-based credentials iterate over the array.
 - Body buffering is two-tier: `PluginCache.requires_request/response_body_buffering()` for the upper bound, then per-request `should_buffer_*_body(&RequestContext)`.
+- A body-consuming policy plugin selects on its configured representation, never
+  on the request method, and never degrades to `Continue` for an empty, absent,
+  or non-UTF-8 body once a configured rule applies (`GHSA-2vmr-ww8r-mww3`).
+  `body_validator` is the reference: early `before_proxy` prefers a rewritten
+  UTF-8 `request_body` metadata view when present (composition with
+  `ai_prompt_shield`), falls back to `ctx.request_body_bytes` when no text view
+  exists (retained via `needs_request_body_bytes()` so non-UTF-8 cannot look
+  like "no body"), treats `ctx.replay_request_body_empty_proven()` as the
+  transport's own empty proof, and fails closed otherwise. The final
+  request-body hook still validates the exact backend-visible bytes. Native
+  gRPC always runs `parse_grpc_frame`. The only exemptions are protocol-defined:
+  empty terminal gRPC *error* replies (a single valid non-zero `grpc-status`),
+  and responses with no content by status/method semantics (1xx, 204, 205, 304,
+  `HEAD`). Representation-gap diagnostics are fixed strings and never echo body
+  bytes.
 - A configured finalized-egress plugin forces buffered request-body
   finalization to complete BEFORE backend dispatch (the `has_finalized_request_egress`
   term in `final_request_body_requirements`), because the ordinary ladder
