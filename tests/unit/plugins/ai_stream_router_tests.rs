@@ -2917,9 +2917,7 @@ async fn mcp_gateway_ignores_a_sabotaged_claim_marker() {
              already committed"
         );
         assert!(
-            !ctx.metadata
-                .keys()
-                .any(|key| key.starts_with("mcp.")),
+            !ctx.metadata.keys().any(|key| key.starts_with("mcp.")),
             "mcp_gateway must not even emit base metadata for a claimed request"
         );
     }
