@@ -430,7 +430,7 @@ pub struct NodeAgentMetrics {
     /// whether the CNI plugin is the primary enrollment path or the
     /// kube-rs watcher fallback is doing all the work. Read by the
     /// Prometheus render path and reset only on process restart.
-    pub cni_calls: [[AtomicU64; 3]; 3],
+    pub cni_calls: [[AtomicU64; 3]; 4],
     /// CNI socket lifecycle failures split by a closed reason set. These
     /// process-lifetime counters distinguish a refused live-owner overlap from
     /// stale cleanup, publication/identity, and shutdown cleanup failures.
@@ -448,9 +448,9 @@ pub struct NodeAgentMetricsSnapshot {
     pub capture_state: &'static str,
     /// Snapshot of [`NodeAgentMetrics::cni_calls`]. Same `[verb][outcome]`
     /// layout as the source atomics. The outer axis is verb
-    /// (`add`/`del`/`check`); the inner axis is outcome
+    /// (`add`/`del`/`check`/`gc`); the inner axis is outcome
     /// (`success`/`rejected`/`error`).
-    pub cni_calls: [[u64; 3]; 3],
+    pub cni_calls: [[u64; 3]; 4],
     /// Snapshot of [`NodeAgentMetrics::cni_socket_lifecycle`], indexed by
     /// [`CniSocketLifecycleReason`].
     pub cni_socket_lifecycle: [u64; 6],
@@ -464,6 +464,7 @@ pub enum CniCallVerb {
     Add = 0,
     Del = 1,
     Check = 2,
+    Gc = 3,
 }
 
 impl CniCallVerb {
@@ -472,11 +473,12 @@ impl CniCallVerb {
             Self::Add => "add",
             Self::Del => "del",
             Self::Check => "check",
+            Self::Gc => "gc",
         }
     }
 
-    pub fn all() -> [Self; 3] {
-        [Self::Add, Self::Del, Self::Check]
+    pub fn all() -> [Self; 4] {
+        [Self::Add, Self::Del, Self::Check, Self::Gc]
     }
 }
 
@@ -541,7 +543,7 @@ impl CniSocketLifecycleReason {
 
 impl NodeAgentMetrics {
     pub fn snapshot(&self) -> NodeAgentMetricsSnapshot {
-        let mut cni_calls = [[0u64; 3]; 3];
+        let mut cni_calls = [[0u64; 3]; 4];
         for verb in CniCallVerb::all() {
             for outcome in CniCallOutcome::all() {
                 cni_calls[verb as usize][outcome as usize] =
@@ -618,6 +620,7 @@ impl Default for NodeAgentMetrics {
             topology_degraded_reason: ArcSwap::from_pointee(None),
             capture_state: ArcSwap::from_pointee(NODE_AGENT_CAPTURE_STATE_STARTING),
             cni_calls: [
+                [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
                 [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
                 [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
                 [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],

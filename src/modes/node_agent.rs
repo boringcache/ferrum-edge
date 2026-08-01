@@ -31,6 +31,9 @@ use crate::capture::{
     XTABLES_LOCK_WAIT_SECONDS, include_outbound_ports_from_annotations,
 };
 use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
+use crate::cni::spec::{
+    CniValidAttachment, ingest_valid_attachments, is_safe_cni_container_id, is_safe_cni_ifname,
+};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::ebpf::cgroup;
@@ -66,6 +69,21 @@ const VERIFIED_UDP_HANDSHAKE_RETENTION_MULTIPLIER: u32 = 20;
 static FAILED_POD_ENROLLMENT_ATTEMPTS: LazyLock<DashMap<String, FailedPodEnrollmentAttempt>> =
     LazyLock::new(DashMap::new);
 static PENDING_CAPTURE_FAILURES: LazyLock<DashMap<String, ()>> = LazyLock::new(DashMap::new);
+/// Ferrum-CNI-owned attachment identities keyed by [`pod_state_key`].
+///
+/// Only pods whose enrollment was driven by a successful CNI ADD (with both
+/// `container_id` and `ifname`) appear here. GC removes stale Ferrum state by
+/// comparing this index against the runtime's valid-attachment set — never by
+/// sweeping watcher-only enrollments or another node-agent generation's keys.
+static CNI_OWNED_ATTACHMENTS: LazyLock<DashMap<String, CniOwnedAttachment>> =
+    LazyLock::new(DashMap::new);
+
+/// Attachment identity recorded for Ferrum CNI ADD ownership / GC matching.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CniOwnedAttachment {
+    container_id: String,
+    ifname: String,
+}
 
 const CAPTURE_FAILURE_POD_IP_UPDATE: &str = "pod_ip_update";
 const CAPTURE_FAILURE_POD_IP_REMOVE: &str = "pod_ip_remove";
@@ -1945,6 +1963,11 @@ fn apply_cni_add_from_pod(
     } else {
         None
     };
+    if let Some(uid) = enrolled_uid.as_deref()
+        && let Some(ifname) = request.ifname.as_deref()
+    {
+        remember_cni_owned_attachment(pod_states, uid, &request.container_id, ifname);
+    }
     (CniRpcResponse::Ok, enrolled_uid)
 }
 
@@ -2001,6 +2024,19 @@ pub fn apply_cni_request(
                     reason: "pod not currently enrolled".to_string(),
                 }
             }
+        }
+        RpcVerb::Gc => {
+            // Re-validate on the node-agent side so a hostile or buggy CNI
+            // binary cannot expand the GC surface past Ferrum's bounds.
+            let valid = match ingest_valid_attachments(request.valid_attachments.clone()) {
+                Ok(attachments) => attachments,
+                Err(err) => {
+                    return CniRpcResponse::Error {
+                        reason: err.to_string(),
+                    };
+                }
+            };
+            apply_cni_gc(backend, pod_states, config, metrics, &valid)
         }
     }
 }
@@ -2797,6 +2833,100 @@ fn pod_state_key_prefix(pod_states: &DashMap<String, PodAttachmentState>) -> Str
 
 fn pod_state_key(pod_states: &DashMap<String, PodAttachmentState>, pod_uid: &str) -> String {
     format!("{}{pod_uid}", pod_state_key_prefix(pod_states))
+}
+
+fn remember_cni_owned_attachment(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    pod_uid: &str,
+    container_id: &str,
+    ifname: &str,
+) {
+    if pod_uid.is_empty()
+        || !is_safe_cni_container_id(container_id)
+        || !is_safe_cni_ifname(ifname)
+    {
+        return;
+    }
+    CNI_OWNED_ATTACHMENTS.insert(
+        pod_state_key(pod_states, pod_uid),
+        CniOwnedAttachment {
+            container_id: container_id.to_string(),
+            ifname: ifname.to_string(),
+        },
+    );
+}
+
+fn forget_cni_owned_attachment(state_key: &str) {
+    CNI_OWNED_ATTACHMENTS.remove(state_key);
+}
+
+fn forget_cni_owned_attachment_for_pod(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    pod_uid: &str,
+) {
+    forget_cni_owned_attachment(&pod_state_key(pod_states, pod_uid));
+}
+
+/// Reconcile Ferrum-owned CNI attachments against the runtime's valid set.
+///
+/// Fail-closed ownership rules:
+/// - Only entries in [`CNI_OWNED_ATTACHMENTS`] scoped to this `pod_states`
+///   generation are candidates for removal.
+/// - Watcher-only enrollments (no CNI ownership record) are never touched.
+/// - Attachments still present in `valid` are preserved.
+/// - Partial BPF cleanup failures are reported after continuing through the
+///   full candidate set (CNI SPEC: remove as much as possible, then error).
+fn apply_cni_gc(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    valid_attachments: &[CniValidAttachment],
+) -> CniRpcResponse {
+    let valid: HashSet<(String, String)> = valid_attachments
+        .iter()
+        .map(|a| (a.container_id.clone(), a.ifname.clone()))
+        .collect();
+    let prefix = pod_state_key_prefix(pod_states);
+
+    let mut stale_uids = Vec::new();
+    for entry in CNI_OWNED_ATTACHMENTS.iter() {
+        let key = entry.key();
+        if !key.starts_with(&prefix) {
+            // Another node-agent runtime / test harness owns this key.
+            continue;
+        }
+        let Some(pod_uid) = key.strip_prefix(&prefix) else {
+            continue;
+        };
+        if pod_uid.is_empty() {
+            continue;
+        }
+        let owned = entry.value();
+        if !valid.contains(&(owned.container_id.clone(), owned.ifname.clone())) {
+            stale_uids.push(pod_uid.to_string());
+        }
+    }
+
+    let errors_before = metrics.attach_errors.load(Ordering::Relaxed);
+    for pod_uid in &stale_uids {
+        handle_pod_removed(backend, pod_states, config, metrics, pod_uid);
+        // handle_pod_removed clears the ownership index; belt-and-suspenders
+        // for the case where the pod was already absent from pod_states.
+        forget_cni_owned_attachment_for_pod(pod_states, pod_uid);
+    }
+    let errors_after = metrics.attach_errors.load(Ordering::Relaxed);
+    if errors_after > errors_before {
+        CniRpcResponse::Error {
+            reason: format!(
+                "gc removed {} stale attachment(s) with {} cleanup error(s)",
+                stale_uids.len(),
+                errors_after - errors_before
+            ),
+        }
+    } else {
+        CniRpcResponse::Ok
+    }
 }
 
 fn pending_capture_failure_key(state_key: &str, operation: &str, detail: &str) -> String {
@@ -6164,6 +6294,9 @@ pub fn handle_pod_removed(
     pod_uid: &str,
 ) {
     let state_key = pod_state_key(pod_states, pod_uid);
+    // Drop Ferrum CNI ownership before teardown so a concurrent GC cannot
+    // observe a half-removed attachment as still owned.
+    forget_cni_owned_attachment(&state_key);
     // Snapshot before forgetting: a failed attempt may have written partial
     // BPF state without ever entering `pod_states`.
     let failed_attempt = FAILED_POD_ENROLLMENT_ATTEMPTS
@@ -13636,8 +13769,10 @@ mod tests {
             pod_name: "alpha".to_string(),
             pod_uid: Some("pod-uid-1".to_string()),
             container_id: "ctr-1".to_string(),
+            ifname: None,
             netns_path: Some("/var/run/netns/cni-1".to_string()),
             args: HashMap::new(),
+            valid_attachments: Vec::new(),
         };
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
         assert_eq!(resp, CniRpcResponse::Ok);
@@ -13695,8 +13830,10 @@ mod tests {
             pod_name: "alpha".to_string(),
             pod_uid: Some("pod-uid-1".to_string()),
             container_id: "ctr-1".to_string(),
+            ifname: None,
             netns_path: Some("/var/run/netns/cni-1".to_string()),
             args: HashMap::new(),
+            valid_attachments: Vec::new(),
         };
 
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
@@ -13811,8 +13948,10 @@ mod tests {
             pod_name: "alpha".to_string(),
             pod_uid: None,
             container_id: "ctr-1".to_string(),
+            ifname: None,
             netns_path: Some("/var/run/netns/cni-1".to_string()),
             args: HashMap::new(),
+            valid_attachments: Vec::new(),
         };
 
         let (response, enrolled_uid) =
@@ -13857,8 +13996,10 @@ mod tests {
             pod_name: "alpha".to_string(),
             pod_uid: None,
             container_id: "ctr-1".to_string(),
+            ifname: None,
             netns_path: None,
             args: HashMap::new(),
+            valid_attachments: Vec::new(),
         };
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
         match resp {
@@ -13917,8 +14058,10 @@ mod tests {
             pod_name: "alpha".to_string(),
             pod_uid: Some("pod-uid-1".to_string()),
             container_id: "ctr-1".to_string(),
+            ifname: None,
             netns_path: None,
             args: HashMap::new(),
+            valid_attachments: Vec::new(),
         };
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
         assert_eq!(resp, CniRpcResponse::Ok);
@@ -13972,8 +14115,10 @@ mod tests {
             pod_name: "alpha".to_string(),
             pod_uid: Some("pod-uid-1".to_string()),
             container_id: "ctr-1".to_string(),
+            ifname: None,
             netns_path: None,
             args: HashMap::new(),
+            valid_attachments: Vec::new(),
         };
         match apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req) {
             CniRpcResponse::Rejected { reason } => {
@@ -14006,6 +14151,147 @@ mod tests {
         );
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
         assert_eq!(resp, CniRpcResponse::Ok);
+    }
+
+    #[test]
+    fn apply_cni_gc_removes_only_stale_ferrum_owned_attachments_and_is_idempotent() {
+        use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
+        use crate::cni::spec::CniValidAttachment;
+
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+
+        // Stale CNI-owned attachment (missed DEL / crash).
+        pod_states.insert("stale-uid".to_string(), enrolled_pod_state("stale-uid"));
+        remember_cni_owned_attachment(&pod_states, "stale-uid", "ctr-stale", "eth0");
+
+        // Still-valid CNI-owned attachment.
+        pod_states.insert("live-uid".to_string(), enrolled_pod_state("live-uid"));
+        remember_cni_owned_attachment(&pod_states, "live-uid", "ctr-live", "eth0");
+
+        // Watcher-only enrollment: no CNI ownership record → GC must not touch it.
+        pod_states.insert("watcher-uid".to_string(), enrolled_pod_state("watcher-uid"));
+
+        // Foreign generation ownership key must never be swept by this runtime.
+        CNI_OWNED_ATTACHMENTS.insert(
+            "0xdeadbeef:foreign-uid".to_string(),
+            CniOwnedAttachment {
+                container_id: "ctr-foreign".to_string(),
+                ifname: "eth0".to_string(),
+            },
+        );
+
+        let req = CniRpcRequest {
+            verb: RpcVerb::Gc,
+            pod_namespace: String::new(),
+            pod_name: String::new(),
+            pod_uid: None,
+            container_id: String::new(),
+            ifname: None,
+            netns_path: None,
+            args: HashMap::new(),
+            valid_attachments: vec![CniValidAttachment {
+                container_id: "ctr-live".to_string(),
+                ifname: "eth0".to_string(),
+            }],
+        };
+        assert_eq!(
+            apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req),
+            CniRpcResponse::Ok
+        );
+        assert!(
+            !pod_states.contains_key("stale-uid"),
+            "stale Ferrum CNI attachment must be removed"
+        );
+        assert!(
+            backend.detached_pods.contains(&"stale-uid".to_string()),
+            "stale pod must be detached"
+        );
+        assert!(
+            pod_states.contains_key("live-uid"),
+            "valid attachment must be preserved"
+        );
+        assert!(
+            pod_states.contains_key("watcher-uid"),
+            "watcher-only enrollment must be preserved (fail closed)"
+        );
+        assert!(
+            CNI_OWNED_ATTACHMENTS.contains_key("0xdeadbeef:foreign-uid"),
+            "foreign generation ownership must never be removed"
+        );
+
+        // Repeat GC is idempotent.
+        assert_eq!(
+            apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req),
+            CniRpcResponse::Ok
+        );
+        assert!(pod_states.contains_key("live-uid"));
+        assert!(pod_states.contains_key("watcher-uid"));
+
+        CNI_OWNED_ATTACHMENTS.remove("0xdeadbeef:foreign-uid");
+    }
+
+    #[test]
+    fn apply_cni_gc_rejects_malformed_valid_attachments() {
+        use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
+        use crate::cni::spec::CniValidAttachment;
+
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        pod_states.insert("live-uid".to_string(), enrolled_pod_state("live-uid"));
+        remember_cni_owned_attachment(&pod_states, "live-uid", "ctr-live", "eth0");
+
+        let req = CniRpcRequest {
+            verb: RpcVerb::Gc,
+            pod_namespace: String::new(),
+            pod_name: String::new(),
+            pod_uid: None,
+            container_id: String::new(),
+            ifname: None,
+            netns_path: None,
+            args: HashMap::new(),
+            valid_attachments: vec![CniValidAttachment {
+                container_id: "../escape".to_string(),
+                ifname: "eth0".to_string(),
+            }],
+        };
+        match apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req) {
+            CniRpcResponse::Error { reason } => {
+                assert!(
+                    reason.contains("containerID") || reason.contains("forbidden"),
+                    "expected hostile-input rejection, got: {reason}"
+                );
+            }
+            other => panic!("expected Error for malformed GC input, got {other:?}"),
+        }
+        assert!(
+            pod_states.contains_key("live-uid"),
+            "malformed GC must fail closed without removing state"
+        );
     }
 
     #[test]

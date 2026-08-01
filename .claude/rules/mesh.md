@@ -166,7 +166,8 @@ Keep two things distinct: the **transport** (how a peer is reached on the wire) 
 - JWT secrets in injected manifests use `SecretKeyRef`, never plaintext.
 - Opt in with `ferrum.io/inject=true` or `ferrum.io/mesh=enabled`; opt out with `sidecar.istio.io/inject=false` or `ferrum.io/inject=false`.
 - Node-agent CNI is opt-in with `FERRUM_NODE_AGENT_CNI_ENABLED=false` by default.
-- When enabled, node-agent binds `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` and the `ferrum-cni` binary forwards kubelet ADD/DEL/CHECK over that socket.
+- When enabled, node-agent binds `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` and the `ferrum-cni` binary forwards kubelet ADD/DEL/CHECK/GC over that socket.
+- GC (CNI 1.1.0 only) reconciles Ferrum-owned CNI attachments against `cni.dev/valid-attachments` and never removes watcher-only or foreign-generation state.
 - kube-rs watcher remains source of truth; CNI only closes the kubelet-vs-watcher race and does not carry labels or annotations.
 
 ## Kubernetes Controller

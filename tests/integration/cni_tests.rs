@@ -45,8 +45,10 @@ fn build_request(verb: RpcVerb) -> CniRpcRequest {
         pod_name: "alpha".to_string(),
         pod_uid: Some("uid-1".to_string()),
         container_id: "ctr-1".to_string(),
+        ifname: Some("eth0".to_string()),
         netns_path: Some("/var/run/netns/cni-1".to_string()),
         args: std::collections::HashMap::new(),
+        valid_attachments: Vec::new(),
     }
 }
 
@@ -351,6 +353,229 @@ async fn ferrum_cni_binary_check_rejection_exits_nonzero() {
             .as_str()
             .is_some_and(|msg| msg.contains("pod not currently enrolled")),
         "unexpected payload: {payload}"
+    );
+
+    drained.await.expect("drainer joined");
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), listener).await;
+}
+
+/// GC wire round-trip: valid attachments reach the main-loop work item and
+/// an Ok reply maps to a success metric on the `gc` verb.
+#[tokio::test]
+async fn cni_gc_round_trip_forwards_valid_attachments() {
+    use ferrum_edge::cni::spec::CniValidAttachment;
+
+    let dir = tempdir().expect("tempdir");
+    let socket_path = dir.path().join("agent.sock");
+    let socket_path_str = socket_path.to_string_lossy().to_string();
+    let metrics = Arc::new(NodeAgentMetrics::default());
+    let (work_tx, mut work_rx) = cni_work_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let drained = tokio::spawn(async move {
+        let work = work_rx.recv().await.expect("work item arrives");
+        assert_eq!(work.request.verb, RpcVerb::Gc);
+        assert_eq!(work.request.valid_attachments.len(), 1);
+        assert_eq!(work.request.valid_attachments[0].container_id, "ctr-live");
+        assert_eq!(work.request.valid_attachments[0].ifname, "eth0");
+        let _ = work.respond.send(CniRpcResponse::Ok);
+    });
+
+    let listener = spawn_cni_listener(
+        socket_path_str.clone(),
+        work_tx,
+        metrics.clone(),
+        shutdown_rx,
+    );
+
+    let resp = tokio::task::spawn_blocking(move || {
+        let req = CniRpcRequest {
+            verb: RpcVerb::Gc,
+            pod_namespace: String::new(),
+            pod_name: String::new(),
+            pod_uid: None,
+            container_id: String::new(),
+            ifname: None,
+            netns_path: None,
+            args: std::collections::HashMap::new(),
+            valid_attachments: vec![CniValidAttachment {
+                container_id: "ctr-live".to_string(),
+                ifname: "eth0".to_string(),
+            }],
+        };
+        let mut last_err = None;
+        for _ in 0..50 {
+            match send_rpc(&socket_path_str, &req, Duration::from_secs(2)) {
+                Ok(resp) => return Ok::<_, String>(resp),
+                Err(err) => {
+                    last_err = Some(format!("{err}"));
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| "no error captured".to_string()))
+    })
+    .await
+    .expect("blocking task joined")
+    .expect("client RPC eventually succeeds");
+    assert_eq!(resp, CniRpcResponse::Ok);
+
+    drained.await.expect("drainer joined");
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        snapshot.cni_calls[ferrum_edge::ebpf::CniCallVerb::Gc as usize]
+            [ferrum_edge::ebpf::CniCallOutcome::Success as usize],
+        1,
+        "expected one GC success in metrics"
+    );
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), listener).await;
+}
+
+/// Binary-level VERSION negotiation advertises CNI 1.1.0 (GC support).
+#[tokio::test]
+async fn ferrum_cni_binary_version_advertises_1_1() {
+    let output = tokio::task::spawn_blocking(|| {
+        Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
+            .env("CNI_COMMAND", "VERSION")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run ferrum-cni VERSION")
+    })
+    .await
+    .expect("blocking task joined");
+
+    assert!(
+        output.status.success(),
+        "VERSION must succeed, stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("VERSION JSON should parse");
+    let supported = payload["supportedVersions"]
+        .as_array()
+        .expect("supportedVersions array");
+    assert!(
+        supported.iter().any(|v| v.as_str() == Some("1.1.0")),
+        "expected 1.1.0 in supportedVersions: {payload}"
+    );
+}
+
+/// GC on a pre-1.1 configuration must fail closed with unsupported version.
+#[tokio::test]
+async fn ferrum_cni_binary_gc_rejects_pre_1_1_version() {
+    let output = tokio::task::spawn_blocking(|| {
+        let stdin_config = serde_json::json!({
+            "cniVersion": "1.0.0",
+            "name": "ferrum-mesh-chain",
+            "type": "ferrum-cni",
+            "cni.dev/valid-attachments": []
+        })
+        .to_string();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
+            .env("CNI_COMMAND", "GC")
+            .env("CNI_PATH", "/opt/cni/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ferrum-cni");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin pipe")
+            .write_all(stdin_config.as_bytes())
+            .expect("write stdin");
+        child.wait_with_output().expect("wait ferrum-cni")
+    })
+    .await
+    .expect("blocking task joined");
+
+    assert!(
+        !output.status.success(),
+        "GC on 1.0.0 must fail closed, stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("CNI error JSON should parse");
+    assert_eq!(payload["code"], 1);
+}
+
+/// Binary-level GC against a live node-agent socket succeeds with empty stdout.
+#[tokio::test]
+async fn ferrum_cni_binary_gc_exits_zero_on_ok() {
+    let dir = tempdir().expect("tempdir");
+    let socket_path = dir.path().join("agent.sock");
+    let socket_path_str = socket_path.to_string_lossy().to_string();
+    let metrics = Arc::new(NodeAgentMetrics::default());
+    let (work_tx, mut work_rx) = cni_work_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let drained = tokio::spawn(async move {
+        let work = work_rx.recv().await.expect("work item arrives");
+        assert_eq!(work.request.verb, RpcVerb::Gc);
+        let _ = work.respond.send(CniRpcResponse::Ok);
+    });
+
+    let listener = spawn_cni_listener(
+        socket_path_str.clone(),
+        work_tx,
+        metrics.clone(),
+        shutdown_rx,
+    );
+
+    let output = tokio::task::spawn_blocking(move || {
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let stdin_config = serde_json::json!({
+            "cniVersion": "1.1.0",
+            "name": "ferrum-mesh-chain",
+            "type": "ferrum-cni",
+            "ferrum": { "socketPath": socket_path_str },
+            "cni.dev/valid-attachments": [
+                {"containerID": "ctr-live", "ifname": "eth0"}
+            ]
+        })
+        .to_string();
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
+            .env("CNI_COMMAND", "GC")
+            .env("CNI_PATH", "/opt/cni/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ferrum-cni");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin pipe")
+            .write_all(stdin_config.as_bytes())
+            .expect("write stdin");
+        child.wait_with_output().expect("wait ferrum-cni")
+    })
+    .await
+    .expect("blocking task joined");
+
+    assert!(
+        output.status.success(),
+        "GC success must exit 0, stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "GC success must emit no stdout payload"
     );
 
     drained.await.expect("drainer joined");

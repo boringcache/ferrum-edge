@@ -2870,6 +2870,32 @@ impl MetricsRegistry {
                 }
             }
 
+            output.push_str(
+                "# HELP ferrum_node_agent_cni_calls_total Node-agent CNI plugin RPC outcomes by verb.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_cni_calls_total counter\n");
+            for verb in crate::ebpf::CniCallVerb::all() {
+                for outcome in crate::ebpf::CniCallOutcome::all() {
+                    let value = snapshot.cni_calls[verb as usize][outcome as usize];
+                    if ns_label.is_empty() {
+                        output.push_str(&format!(
+                            "ferrum_node_agent_cni_calls_total{{verb=\"{}\",outcome=\"{}\"}} {}\n",
+                            verb.label(),
+                            outcome.label(),
+                            value,
+                        ));
+                    } else {
+                        output.push_str(&format!(
+                            "ferrum_node_agent_cni_calls_total{{verb=\"{}\",outcome=\"{}\"{}}} {}\n",
+                            verb.label(),
+                            outcome.label(),
+                            ns_label,
+                            value,
+                        ));
+                    }
+                }
+            }
+
             // Capture-state gauge — one hot label from a closed set. This is
             // the readiness/condition surface operators alert on; the
             // topology-degraded gauge below explains the first degradation

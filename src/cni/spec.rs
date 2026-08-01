@@ -4,32 +4,46 @@
 //! We implement the CNI spec on the wire directly rather than vendoring a
 //! library because Ferrum's CNI surface is intentionally narrow — we chain
 //! behind the cluster's primary CNI (which already does IP allocation,
-//! interface setup, etc.) and only need the ADD/DEL/CHECK lifecycle hook
+//! interface setup, etc.) and only need the ADD/DEL/CHECK/GC lifecycle hook
 //! so the node-agent can enroll pods into eBPF capture deterministically
 //! at sandbox setup time, instead of racing the kube-rs watcher.
 //!
 //! Spec reference: <https://github.com/containernetworking/cni/blob/main/SPEC.md>
-//! (we target v0.4.0+ which is what every modern kubelet speaks).
+//! (we target v0.4.0+ for ADD/DEL/CHECK; GC requires CNI 1.1.0).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+/// Hard cap on `cni.dev/valid-attachments` entries accepted for one GC call.
+/// Large enough for dense nodes; small enough to keep reconciliation bounded.
+pub const MAX_CNI_GC_ATTACHMENTS: usize = 8192;
+
+/// Per-field byte cap for GC attachment `containerID` / `ifname` values.
+pub const MAX_CNI_ATTACHMENT_FIELD_BYTES: usize = 256;
+
+/// Hard cap on CNI stdin JSON size. Prevents hostile kubelet/runtime input
+/// from forcing unbounded allocation into the short-lived plugin process.
+pub const MAX_CNI_STDIN_BYTES: usize = 512 * 1024;
+
+/// CNI versions Ferrum advertises via VERSION and accepts for lifecycle verbs.
+pub const SUPPORTED_CNI_VERSIONS: &[&str] = &["0.3.0", "0.3.1", "0.4.0", "1.0.0", "1.1.0"];
+
 /// The CNI command verb supplied via the `CNI_COMMAND` environment variable.
 ///
-/// Ferrum implements the three pod-lifecycle verbs (ADD/DEL/CHECK). The
-/// spec also defines VERSION (negotiation handshake — handled inline by the
-/// binary) and GC (CNI 1.1+, optional, not implemented). Unknown verbs map
-/// to [`CniCommand::Unsupported`] so the binary can emit a structured
-/// error result and exit with code 4 ("Try again later") per the spec's
-/// error-code table.
+/// Ferrum implements the pod-lifecycle verbs (ADD/DEL/CHECK) plus GC on CNI
+/// 1.1.0 configurations. VERSION is the negotiation handshake handled inline
+/// by the binary. Unknown verbs map to [`CniCommand::Unsupported`] so the
+/// binary can emit a structured error result and exit with code 4 per the
+/// spec's error-code table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CniCommand {
     Add,
     Del,
     Check,
+    Gc,
     Version,
     Unsupported,
 }
@@ -40,6 +54,7 @@ impl CniCommand {
             Self::Add => "ADD",
             Self::Del => "DEL",
             Self::Check => "CHECK",
+            Self::Gc => "GC",
             Self::Version => "VERSION",
             Self::Unsupported => "UNSUPPORTED",
         }
@@ -54,10 +69,24 @@ impl FromStr for CniCommand {
             "ADD" => Self::Add,
             "DEL" => Self::Del,
             "CHECK" => Self::Check,
+            "GC" => Self::Gc,
             "VERSION" => Self::Version,
             _ => Self::Unsupported,
         })
     }
+}
+
+/// Returns true when `version` is in [`SUPPORTED_CNI_VERSIONS`].
+pub fn is_supported_cni_version(version: &str) -> bool {
+    SUPPORTED_CNI_VERSIONS
+        .iter()
+        .any(|supported| *supported == version.trim())
+}
+
+/// GC is defined by CNI 1.1.0. Older negotiated versions keep ADD/DEL/CHECK
+/// only and must fail closed on GC rather than silently ignoring stale state.
+pub fn cni_version_supports_gc(version: &str) -> bool {
+    version.trim() == "1.1.0"
 }
 
 /// Parsed CNI invocation environment as defined by SPEC §2.1 (Parameters).
@@ -67,6 +96,9 @@ impl FromStr for CniCommand {
 /// instead of poking `std::env` repeatedly. `cni_args` is the raw
 /// semicolon-separated form (e.g. `K8S_POD_NAMESPACE=foo;K8S_POD_NAME=bar`)
 /// — see [`parse_cni_args`] for the parsed map.
+///
+/// GC and VERSION do not carry attachment parameters; those commands leave
+/// `container_id` empty and optional fields unset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CniInvocation {
     pub command: CniCommand,
@@ -97,23 +129,59 @@ impl CniInvocation {
     }
 
     pub fn from_env_for_command(command: CniCommand) -> Result<Self, CniError> {
-        let container_id =
-            env::var("CNI_CONTAINERID").map_err(|_| CniError::missing_env("CNI_CONTAINERID"))?;
-        if container_id.trim().is_empty() {
-            return Err(CniError::missing_env("CNI_CONTAINERID"));
+        match command {
+            CniCommand::Version => Ok(Self {
+                command,
+                container_id: String::new(),
+                netns: None,
+                ifname: None,
+                args: None,
+                path: env::var("CNI_PATH").ok().filter(|v| !v.trim().is_empty()),
+            }),
+            CniCommand::Gc => {
+                // SPEC §2 GC: only CNI_COMMAND + CNI_PATH are required; there
+                // are no attachment parameters.
+                let path = env::var("CNI_PATH").map_err(|_| CniError::missing_env("CNI_PATH"))?;
+                if path.trim().is_empty() {
+                    return Err(CniError::missing_env("CNI_PATH"));
+                }
+                Ok(Self {
+                    command,
+                    container_id: String::new(),
+                    netns: None,
+                    ifname: None,
+                    args: None,
+                    path: Some(path),
+                })
+            }
+            CniCommand::Unsupported => Ok(Self {
+                command,
+                container_id: String::new(),
+                netns: None,
+                ifname: None,
+                args: None,
+                path: None,
+            }),
+            CniCommand::Add | CniCommand::Del | CniCommand::Check => {
+                let container_id = env::var("CNI_CONTAINERID")
+                    .map_err(|_| CniError::missing_env("CNI_CONTAINERID"))?;
+                if container_id.trim().is_empty() {
+                    return Err(CniError::missing_env("CNI_CONTAINERID"));
+                }
+                let netns = env::var("CNI_NETNS").ok().filter(|v| !v.trim().is_empty());
+                let ifname = env::var("CNI_IFNAME").ok().filter(|v| !v.trim().is_empty());
+                let args = env::var("CNI_ARGS").ok().filter(|v| !v.trim().is_empty());
+                let path = env::var("CNI_PATH").ok().filter(|v| !v.trim().is_empty());
+                Ok(Self {
+                    command,
+                    container_id,
+                    netns,
+                    ifname,
+                    args,
+                    path,
+                })
+            }
         }
-        let netns = env::var("CNI_NETNS").ok().filter(|v| !v.trim().is_empty());
-        let ifname = env::var("CNI_IFNAME").ok().filter(|v| !v.trim().is_empty());
-        let args = env::var("CNI_ARGS").ok().filter(|v| !v.trim().is_empty());
-        let path = env::var("CNI_PATH").ok().filter(|v| !v.trim().is_empty());
-        Ok(Self {
-            command,
-            container_id,
-            netns,
-            ifname,
-            args,
-            path,
-        })
     }
 }
 
@@ -179,11 +247,11 @@ impl K8sPodIdentity {
 /// CNI network configuration JSON passed on stdin.
 ///
 /// We accept the full shape but only inspect the fields we care about
-/// (cniVersion, type, name, prevResult). `prevResult` is the chained
-/// CNI's output from the previous plugin in the conflist — Ferrum
-/// passes it through verbatim on ADD so the next plugin (if any) sees
-/// the same shape, and so the kubelet sees the IP/interface allocation
-/// the primary CNI made. We do NOT mutate prevResult.
+/// (cniVersion, type, name, prevResult, valid attachments for GC).
+/// `prevResult` is the chained CNI's output from the previous plugin in the
+/// conflist — Ferrum passes it through verbatim on ADD so the next plugin
+/// (if any) sees the same shape, and so the kubelet sees the IP/interface
+/// allocation the primary CNI made. We do NOT mutate prevResult.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CniNetConfig {
     #[serde(rename = "cniVersion", default = "default_cni_version")]
@@ -201,6 +269,13 @@ pub struct CniNetConfig {
     /// Defaults to `Default` when missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ferrum: Option<FerrumCniOptions>,
+    /// Still-valid attachments supplied on GC (CNI 1.1 `cni.dev/valid-attachments`).
+    #[serde(
+        rename = "cni.dev/valid-attachments",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub valid_attachments: Vec<CniValidAttachment>,
     /// Pass-through for any conflist fields we don't model explicitly
     /// (chained plugins may add fields kubelet round-trips). Preserving
     /// them keeps Ferrum invisible to neighbour plugins.
@@ -210,6 +285,117 @@ pub struct CniNetConfig {
 
 fn default_cni_version() -> String {
     "0.4.0".to_string()
+}
+
+/// One still-valid CNI attachment from a GC request (`containerID`, `ifname`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct CniValidAttachment {
+    #[serde(rename = "containerID")]
+    pub container_id: String,
+    pub ifname: String,
+}
+
+impl CniValidAttachment {
+    /// Validate field shape and reject hostile path-like values.
+    pub fn validate(&self) -> Result<(), CniError> {
+        validate_attachment_field("containerID", &self.container_id)?;
+        validate_attachment_field("ifname", &self.ifname)?;
+        if !is_safe_cni_container_id(&self.container_id) {
+            return Err(CniError::BadConfig(format!(
+                "containerID {:?} is not a valid CNI container id",
+                self.container_id
+            )));
+        }
+        if !is_safe_cni_ifname(&self.ifname) {
+            return Err(CniError::BadConfig(format!(
+                "ifname {:?} is not a valid CNI interface name",
+                self.ifname
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn validate_attachment_field(field: &str, value: &str) -> Result<(), CniError> {
+    if value.is_empty() {
+        return Err(CniError::BadConfig(format!(
+            "cni.dev/valid-attachments entry missing {field}"
+        )));
+    }
+    if value.len() > MAX_CNI_ATTACHMENT_FIELD_BYTES {
+        return Err(CniError::BadConfig(format!(
+            "{field} exceeds {MAX_CNI_ATTACHMENT_FIELD_BYTES} byte cap"
+        )));
+    }
+    if value.contains('\0') || value.contains('/') || value.contains('\\') {
+        return Err(CniError::BadConfig(format!(
+            "{field} contains forbidden path or NUL characters"
+        )));
+    }
+    Ok(())
+}
+
+/// CNI container IDs must start with an alphanumeric character and continue
+/// with alphanumerics, `_`, `.`, or `-` (SPEC §2).
+pub fn is_safe_cni_container_id(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+}
+
+/// Interface names are short host identifiers; reject separators and control
+/// bytes so GC matching cannot be steered by path-like input.
+pub fn is_safe_cni_ifname(value: &str) -> bool {
+    if value.is_empty() || value.len() > 15 {
+        return false;
+    }
+    value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' || c == '@')
+}
+
+/// Bound, validate, and dedupe a GC valid-attachment list. Fail closed on
+/// oversized or hostile input rather than partially applying GC.
+pub fn ingest_valid_attachments(
+    attachments: Vec<CniValidAttachment>,
+) -> Result<Vec<CniValidAttachment>, CniError> {
+    if attachments.len() > MAX_CNI_GC_ATTACHMENTS {
+        return Err(CniError::BadConfig(format!(
+            "cni.dev/valid-attachments has {} entries; cap is {MAX_CNI_GC_ATTACHMENTS}",
+            attachments.len()
+        )));
+    }
+    let mut seen = HashSet::with_capacity(attachments.len());
+    let mut out = Vec::with_capacity(attachments.len());
+    for attachment in attachments {
+        attachment.validate()?;
+        if seen.insert((attachment.container_id.clone(), attachment.ifname.clone())) {
+            out.push(attachment);
+        }
+    }
+    Ok(out)
+}
+
+/// Read stdin with a hard byte cap so GC (and other verbs) cannot force
+/// unbounded allocation from hostile input.
+pub fn read_stdin_bounded(max_bytes: usize) -> Result<String, CniError> {
+    use std::io::Read;
+    let mut limited = std::io::stdin().take(u64::try_from(max_bytes.saturating_add(1)).unwrap_or(u64::MAX));
+    let mut buf = Vec::new();
+    limited
+        .read_to_end(&mut buf)
+        .map_err(|err| CniError::BadConfig(format!("read stdin: {err}")))?;
+    if buf.len() > max_bytes {
+        return Err(CniError::BadConfig(format!(
+            "stdin exceeds {max_bytes} byte cap"
+        )));
+    }
+    String::from_utf8(buf).map_err(|err| CniError::BadConfig(format!("stdin is not UTF-8: {err}")))
 }
 
 /// Plugin-specific options the operator may set on the chained conflist
@@ -332,13 +518,24 @@ mod tests {
         assert_eq!(CniCommand::from_str("ADD"), Ok(CniCommand::Add));
         assert_eq!(CniCommand::from_str("del"), Ok(CniCommand::Del));
         assert_eq!(CniCommand::from_str("Check"), Ok(CniCommand::Check));
+        assert_eq!(CniCommand::from_str("GC"), Ok(CniCommand::Gc));
         assert_eq!(CniCommand::from_str("VERSION"), Ok(CniCommand::Version));
     }
 
     #[test]
     fn parse_cni_command_unknown_maps_to_unsupported() {
         assert_eq!(CniCommand::from_str("STATUS"), Ok(CniCommand::Unsupported));
-        assert_eq!(CniCommand::from_str("GC"), Ok(CniCommand::Unsupported));
+        assert_eq!(CniCommand::from_str("FOO"), Ok(CniCommand::Unsupported));
+    }
+
+    #[test]
+    fn gc_requires_cni_1_1() {
+        assert!(cni_version_supports_gc("1.1.0"));
+        assert!(!cni_version_supports_gc("1.0.0"));
+        assert!(!cni_version_supports_gc("0.4.0"));
+        assert!(is_supported_cni_version("1.1.0"));
+        assert!(is_supported_cni_version("0.4.0"));
+        assert!(!is_supported_cni_version("2.0.0"));
     }
 
     #[test]
@@ -430,6 +627,50 @@ mod tests {
             Some("/tmp/x.sock")
         );
         assert!(cfg.extra.contains_key("extra-key"));
+        assert!(cfg.valid_attachments.is_empty());
+    }
+
+    #[test]
+    fn net_config_parses_gc_valid_attachments() {
+        let raw = serde_json::json!({
+            "cniVersion": "1.1.0",
+            "name": "ferrum-mesh",
+            "type": "ferrum-cni",
+            "cni.dev/valid-attachments": [
+                {"containerID": "ctr-alive", "ifname": "eth0"},
+                {"containerID": "ctr-alive", "ifname": "eth0"},
+                {"containerID": "ctr-other", "ifname": "eth1"}
+            ]
+        });
+        let cfg: CniNetConfig = serde_json::from_value(raw).expect("net config should parse");
+        let ingested = ingest_valid_attachments(cfg.valid_attachments).expect("ingest");
+        assert_eq!(ingested.len(), 2, "duplicate attachments should dedupe");
+        assert_eq!(ingested[0].container_id, "ctr-alive");
+        assert_eq!(ingested[1].container_id, "ctr-other");
+    }
+
+    #[test]
+    fn ingest_valid_attachments_rejects_hostile_and_oversized_input() {
+        let path_like = CniValidAttachment {
+            container_id: "../escape".to_string(),
+            ifname: "eth0".to_string(),
+        };
+        assert!(ingest_valid_attachments(vec![path_like]).is_err());
+
+        let bad_ifname = CniValidAttachment {
+            container_id: "ctr-1".to_string(),
+            ifname: "eth0/../lo".to_string(),
+        };
+        assert!(ingest_valid_attachments(vec![bad_ifname]).is_err());
+
+        let too_many = (0..=MAX_CNI_GC_ATTACHMENTS)
+            .map(|i| CniValidAttachment {
+                container_id: format!("ctr-{i}"),
+                ifname: "eth0".to_string(),
+            })
+            .collect::<Vec<_>>();
+        let err = ingest_valid_attachments(too_many).expect_err("cap exceeded");
+        assert!(err.to_string().contains("cap is"));
     }
 
     #[test]

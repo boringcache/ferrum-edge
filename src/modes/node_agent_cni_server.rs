@@ -3,8 +3,9 @@
 //!
 //! Architecture:
 //! - The CNI binary (`bin/ferrum-cni`) is invoked by kubelet during pod
-//!   sandbox setup. It hands the call (ADD/DEL/CHECK + pod identity) to us
-//!   over a Unix socket using the length-prefixed JSON wire format in
+//!   sandbox setup (and periodically for CNI 1.1 GC). It hands the call
+//!   (ADD/DEL/CHECK/GC + pod identity or valid attachments) to us over a
+//!   Unix socket using the length-prefixed JSON wire format in
 //!   [`crate::cni::rpc`].
 //! - This server runs as a tokio task spawned from
 //!   [`crate::modes::node_agent::run_with_backend`]. It accepts one
@@ -736,6 +737,7 @@ async fn handle_one_connection(
         RpcVerb::Add => CniCallVerb::Add,
         RpcVerb::Del => CniCallVerb::Del,
         RpcVerb::Check => CniCallVerb::Check,
+        RpcVerb::Gc => CniCallVerb::Gc,
     };
 
     let (resp_tx, resp_rx) = oneshot::channel();
@@ -901,8 +903,10 @@ mod tests {
             pod_name: "alpha".to_string(),
             pod_uid: Some("uid-1".to_string()),
             container_id: "ctr-1".to_string(),
+            ifname: None,
             netns_path: Some("/var/run/netns/cni-1".to_string()),
             args: HashMap::new(),
+            valid_attachments: Vec::new(),
         };
         let labels = HashMap::new();
         let annotations = HashMap::new();
@@ -926,8 +930,10 @@ mod tests {
             pod_name: "alpha".to_string(),
             pod_uid: None,
             container_id: "ctr-1".to_string(),
+            ifname: None,
             netns_path: None,
             args: HashMap::new(),
+            valid_attachments: Vec::new(),
         };
         let labels = HashMap::new();
         let annotations = HashMap::new();
@@ -1194,8 +1200,10 @@ mod tests {
                     pod_name: "alpha".to_string(),
                     pod_uid: None,
                     container_id: "c".to_string(),
+                    ifname: None,
                     netns_path: None,
                     args: HashMap::new(),
+                    valid_attachments: Vec::new(),
                 },
                 respond: _resp,
             };
@@ -1209,8 +1217,10 @@ mod tests {
                 pod_name: "overflow".to_string(),
                 pod_uid: None,
                 container_id: "c".to_string(),
+                ifname: None,
                 netns_path: None,
                 args: HashMap::new(),
+                valid_attachments: Vec::new(),
             },
             respond: resp_tx,
         };

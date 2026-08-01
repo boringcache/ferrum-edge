@@ -1,12 +1,14 @@
-//! `ferrum-cni` — minimal CNI plugin that forwards each ADD / DEL / CHECK
+//! `ferrum-cni` — minimal CNI plugin that forwards each ADD / DEL / CHECK / GC
 //! invocation to the long-lived node-agent over a Unix domain socket.
 //!
 //! Wire contract: kubelet invokes us per the CNI spec with stdin JSON
 //! (the chained network configuration) and the `CNI_*` environment
 //! variables (command verb, container id, netns path, args, plugin
 //! search path). We parse those, extract the K8s pod identity from
-//! `CNI_ARGS`, send a [`CniRpcRequest`] to the node-agent, and
-//! translate the response back into CNI-spec JSON on stdout.
+//! `CNI_ARGS` (for attachment verbs), send a [`CniRpcRequest`] to the
+//! node-agent, and translate the response back into CNI-spec JSON on
+//! stdout. GC carries a bounded `cni.dev/valid-attachments` set instead
+//! of a single pod identity.
 //!
 //! Why this is in `src/bin/` and not its own crate:
 //! - The CNI binary needs the same `cni::spec` / `cni::rpc` /
@@ -24,7 +26,7 @@
 
 #[cfg(unix)]
 mod cni_main {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::process::ExitCode;
     use std::time::Duration;
 
@@ -33,7 +35,8 @@ mod cni_main {
     use ferrum_edge::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
     use ferrum_edge::cni::spec::{
         CniCommand, CniError, CniInvocation, CniNetConfig, CniSuccessResult, K8sPodIdentity,
-        build_error_result, parse_cni_args,
+        MAX_CNI_STDIN_BYTES, SUPPORTED_CNI_VERSIONS, build_error_result, cni_version_supports_gc,
+        ingest_valid_attachments, is_supported_cni_version, parse_cni_args, read_stdin_bounded,
     };
 
     /// Default socket path the binary connects to when the chained CNI
@@ -61,7 +64,11 @@ mod cni_main {
         }
 
         let command = match CniInvocation::command_from_env() {
-            Ok(CniCommand::Version) => return emit_version("0.4.0"),
+            Ok(CniCommand::Version) => {
+                // VERSION may arrive without stdin; advertise the full
+                // supported set including CNI 1.1.0 (GC).
+                return emit_version("1.1.0");
+            }
             Ok(CniCommand::Unsupported) => {
                 return emit_error("0.4.0", &CniError::UnsupportedCommand);
             }
@@ -69,15 +76,19 @@ mod cni_main {
             Err(err) => return emit_error("0.4.0", &err),
         };
 
-        let mut stdin_buf = String::new();
-        if let Err(err) = std::io::stdin().read_to_string(&mut stdin_buf) {
-            return emit_error("0.4.0", &CniError::BadConfig(format!("read stdin: {err}")));
-        }
+        let stdin_buf = match read_stdin_bounded(MAX_CNI_STDIN_BYTES) {
+            Ok(buf) => buf,
+            Err(err) => return emit_error("0.4.0", &err),
+        };
         let net_config: CniNetConfig = match serde_json::from_str(&stdin_buf) {
             Ok(cfg) => cfg,
             Err(err) => return emit_error("0.4.0", &CniError::BadConfig(err.to_string())),
         };
         let cni_version = net_config.cni_version.clone();
+
+        if !is_supported_cni_version(&cni_version) {
+            return emit_error(&cni_version, &CniError::UnsupportedVersion);
+        }
 
         let invocation = match CniInvocation::from_env_for_command(command) {
             Ok(inv) => inv,
@@ -87,9 +98,54 @@ mod cni_main {
         match invocation.command {
             CniCommand::Version => emit_version(&cni_version),
             CniCommand::Unsupported => emit_error(&cni_version, &CniError::UnsupportedCommand),
+            CniCommand::Gc => handle_gc(&net_config),
             verb @ (CniCommand::Add | CniCommand::Del | CniCommand::Check) => {
                 handle_verb(verb, &net_config, &invocation)
             }
+        }
+    }
+
+    fn handle_gc(net_config: &CniNetConfig) -> ExitCode {
+        let cni_version = net_config.cni_version.clone();
+        if !cni_version_supports_gc(&cni_version) {
+            // Fail closed: older negotiated versions keep ADD/DEL/CHECK only.
+            return emit_error(&cni_version, &CniError::UnsupportedVersion);
+        }
+
+        let valid_attachments = match ingest_valid_attachments(net_config.valid_attachments.clone())
+        {
+            Ok(attachments) => attachments,
+            Err(err) => return emit_error(&cni_version, &err),
+        };
+
+        let socket_path = net_config
+            .ferrum
+            .as_ref()
+            .and_then(|f| f.socket_path.clone())
+            .unwrap_or_else(|| DEFAULT_CNI_SOCKET_PATH.to_string());
+
+        let request = CniRpcRequest {
+            verb: RpcVerb::Gc,
+            pod_namespace: String::new(),
+            pod_name: String::new(),
+            pod_uid: None,
+            container_id: String::new(),
+            ifname: None,
+            netns_path: None,
+            args: Default::default(),
+            valid_attachments,
+        };
+
+        match send_rpc(&socket_path, &request, rpc_timeout()) {
+            // SPEC: GC success emits no stdout payload.
+            Ok(CniRpcResponse::Ok) => emit_empty_success(),
+            Ok(CniRpcResponse::Rejected { reason }) => {
+                emit_error(&cni_version, &CniError::Rejected(reason))
+            }
+            Ok(CniRpcResponse::Error { reason }) => {
+                emit_error(&cni_version, &CniError::Rejected(reason))
+            }
+            Err(err) => emit_error(&cni_version, &err),
         }
     }
 
@@ -135,8 +191,10 @@ mod cni_main {
             pod_name: identity.name,
             pod_uid: identity.pod_uid,
             container_id: invocation.container_id.clone(),
+            ifname: invocation.ifname.clone(),
             netns_path: invocation.netns.clone(),
             args: args_map,
+            valid_attachments: Vec::new(),
         };
 
         match send_rpc(&socket_path, &request, rpc_timeout()) {
@@ -166,7 +224,7 @@ mod cni_main {
     fn emit_version(cni_version: &str) -> ExitCode {
         let payload = serde_json::json!({
             "cniVersion": cni_version,
-            "supportedVersions": ["0.3.0", "0.3.1", "0.4.0", "1.0.0"],
+            "supportedVersions": SUPPORTED_CNI_VERSIONS,
         });
         write_stdout(&payload);
         ExitCode::SUCCESS
