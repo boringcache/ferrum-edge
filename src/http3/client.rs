@@ -259,6 +259,23 @@ impl From<h3::error::StreamError> for H3BodyDrainError {
     }
 }
 
+/// Map a retained-allocation refusal onto this transport's error shape.
+///
+/// The two arms are deliberately different attributions and must stay so: a
+/// ceiling overrun is the BACKEND sending more than the operator allows to be
+/// retained, while an exhausted aggregate budget is GATEWAY-LOCAL transient
+/// capacity that must not ding the origin's health (GHSA-pwcm-6rh8-f2gh).
+fn h3_body_retain_error(
+    rejection: crate::proxy::response_buffer_budget::RetainRejection,
+    limit: usize,
+) -> H3BodyDrainError {
+    use crate::proxy::response_buffer_budget::RetainRejection;
+    match rejection {
+        RetainRejection::TooLarge => H3BodyDrainError::ResponseTooLarge { limit },
+        RetainRejection::BudgetExhausted => H3BodyDrainError::BufferBudgetExhausted,
+    }
+}
+
 /// A fully buffered HTTP/3 backend response returned by the pool's buffered
 /// request APIs ([`Http3ConnectionPool::request`] /
 /// [`Http3ConnectionPool::request_with_target`]).
@@ -328,7 +345,6 @@ pub(crate) async fn drain_h3_response_body(
     // caller dropping this future — the reservation drops and the blocks return.
     let max_response_body_size_bytes =
         response_buffer_budget::buffered_response_body_ceiling(max_response_body_size_bytes);
-    let mut reservation = response_buffer_budget::ResponseBufferReservation::new();
     if content_length.is_some_and(|len| len > max_response_body_size_bytes as u64) {
         return Err(H3BodyDrainError::ResponseTooLarge {
             limit: max_response_body_size_bytes,
@@ -336,25 +352,23 @@ pub(crate) async fn drain_h3_response_body(
     }
 
     // Preallocation is resident the instant it is requested, so it is charged
-    // BEFORE `Vec::with_capacity`. Without this a flood of responses that
-    // advertise a large `content-length` and then send nothing (or stall) could
-    // each hold up to `H3_BODY_PREALLOC_CAP_BYTES` outside the budget. Later
-    // growth is charged as a delta against this same reservation, so a
-    // preallocated response is never charged twice.
-    let mut body = match content_length {
-        // A declared zero length allocates nothing, so it is deliberately not
-        // charged: charging the one-block rounding for every empty response
-        // would let bodyless traffic consume the budget it never occupies.
-        Some(cl) if cl > 0 => {
-            let prealloc = cl.min(H3_BODY_PREALLOC_CAP_BYTES) as usize;
-            if !reservation.reserve(prealloc) {
-                return Err(H3BodyDrainError::BufferBudgetExhausted);
-            }
-            Vec::with_capacity(prealloc)
-        }
-        Some(_) => Vec::new(),
-        None => Vec::new(),
+    // BEFORE the allocation. Without this a flood of responses that advertise a
+    // large `content-length` and then send nothing (or stall) could each hold up
+    // to `H3_BODY_PREALLOC_CAP_BYTES` outside the budget. A declared zero length
+    // allocates nothing and is deliberately left uncharged: rounding every empty
+    // response up to a block would let bodyless traffic consume budget it never
+    // occupies. Later growth is charged as a delta against the same reservation,
+    // so a preallocated response is never charged twice.
+    let prealloc = match content_length {
+        Some(cl) if cl > 0 => cl.min(H3_BODY_PREALLOC_CAP_BYTES) as usize,
+        _ => 0,
     };
+    let mut body = response_buffer_budget::ChargedBodyCollector::with_preallocation(
+        response_buffer_budget::BudgetRef::global(),
+        max_response_body_size_bytes,
+        prealloc,
+    )
+    .map_err(|rejection| h3_body_retain_error(rejection, max_response_body_size_bytes))?;
     loop {
         let recv_result = if backend_read_timeout_ms > 0 {
             match tokio::time::timeout(
@@ -375,20 +389,13 @@ pub(crate) async fn drain_h3_response_body(
         };
         match recv_result {
             Ok(Some(chunk)) => {
-                let chunk = chunk.chunk();
-                // One prospective length, reused by the ceiling check and the
-                // budget charge (GHSA-pwcm-6rh8-f2gh).
-                let prospective =
-                    response_buffer_budget::prospective_retained_len(body.len(), chunk.len());
-                if prospective > max_response_body_size_bytes {
-                    return Err(H3BodyDrainError::ResponseTooLarge {
-                        limit: max_response_body_size_bytes,
-                    });
+                // The collector owns both bounds: the per-response ceiling and
+                // the aggregate charge, taken over the growth target it is about
+                // to allocate rather than over the post-append length
+                // (GHSA-pwcm-6rh8-f2gh).
+                if let Err(rejection) = body.append(chunk.chunk()) {
+                    return Err(h3_body_retain_error(rejection, max_response_body_size_bytes));
                 }
-                if !reservation.reserve(prospective) {
-                    return Err(H3BodyDrainError::BufferBudgetExhausted);
-                }
-                body.extend_from_slice(chunk);
             }
             Ok(None) => {
                 // Clean FIN. A declared Content-Length that the body did NOT
@@ -456,11 +463,12 @@ pub(crate) async fn drain_h3_response_body(
     // Hand the charge to the retained allocation: from here the permit belongs
     // to the returned `Bytes` (and to every cheap clone of it, exactly once),
     // so it is returned when the payload is dropped rather than when this
-    // function returns.
-    Ok((
-        response_buffer_budget::charged_bytes(body, reservation),
-        trailers,
-    ))
+    // function returns. Publication is gated on the charge covering the buffer's
+    // real CAPACITY, so bytes the budget does not bound are never returned.
+    let Some(body) = body.into_charged_bytes() else {
+        return Err(H3BodyDrainError::BufferBudgetExhausted);
+    };
+    Ok((body, trailers))
 }
 
 /// Read backend response trailers, bounded by `backend_read_timeout_ms`.

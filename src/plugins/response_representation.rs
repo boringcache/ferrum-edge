@@ -916,7 +916,7 @@ impl ChargedDecodedBody {
         if !self.reservation.narrow_to_covered(self.data.capacity()) {
             return None;
         }
-        Some(charged_bytes(self.data, self.reservation))
+        charged_bytes(self.data, self.reservation)
     }
 }
 

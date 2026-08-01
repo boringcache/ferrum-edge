@@ -5304,6 +5304,33 @@ pub async fn normalize_response_body_for_inspection(
         return false;
     }
     let content_type = response_headers.get("content-type").cloned();
+    // A normalizer allocates its replacement itself, so the blocks that will pay
+    // for that allocation are reserved BEFORE the first hook can run — a charge
+    // taken after the fact would let arbitrarily many concurrent replacements
+    // exist outside the aggregate cap. The window is sized to this response's
+    // retained ceiling, and each accepted replacement transfers its covering
+    // blocks out of it (GHSA-pwcm-6rh8-f2gh).
+    let mut window = if plugins.is_empty() {
+        None
+    } else {
+        let ceiling = ctx.effective_max_response_body_size_bytes();
+        match crate::proxy::response_buffer_budget::ResponseTransformWindow::open(ceiling) {
+            Some(window) => Some(window),
+            None => {
+                warn!(
+                    "Response normalization refused: aggregate retained-response budget exhausted"
+                );
+                crate::proxy::replace_buffered_response_with_capacity_refusal(
+                    ctx,
+                    response_status,
+                    response_headers,
+                    response_body,
+                    initial_response_header_policy_plugins,
+                );
+                return true;
+            }
+        }
+    };
     let mut normalized = false;
     for plugin in plugins {
         let deadline = ctx.grpc_deadline_at();
@@ -5340,17 +5367,19 @@ pub async fn normalize_response_body_for_inspection(
         if let Some(body) = body {
             // A normalizer installs a DIFFERENT allocation than the one the
             // collector charged, so the replacement carries its OWN charge,
-            // attached to the replacement allocation rather than to this
-            // request: the permit is returned when the last handle to those
-            // bytes drops, wherever they end up (GHSA-pwcm-6rh8-f2gh).
+            // transferred out of the window reserved above and attached to the
+            // replacement allocation rather than to this request: the permit is
+            // returned when the last handle to those bytes drops, wherever they
+            // end up (GHSA-pwcm-6rh8-f2gh). A replacement larger than the
+            // window — i.e. larger than this response's retained ceiling — is
+            // refused for the same reason a backend body that size would be.
             //
             // Refusal fails closed through the SAME gateway-authored terminal
             // machinery the deadline and representation-error replacements use,
             // so a gRPC-Web refusal is body-framed and no header describing the
             // discarded representation survives.
             let body_len = body.len();
-            let Some(charged) = crate::proxy::response_buffer_budget::charge_replacement_body(body)
-            else {
+            let Some(charged) = window.as_mut().and_then(|window| window.charge(body)) else {
                 warn!(
                     plugin = plugin.name(),
                     "Response normalization refused: aggregate retained-response budget exhausted"

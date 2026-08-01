@@ -19409,6 +19409,35 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     // Read after the gate: a decoded body installs fresh representation headers.
     let content_type = response_headers.get("content-type").cloned();
     let content_type = content_type.as_deref();
+    // A transform allocates its output itself, so the blocks that will pay for
+    // that allocation are reserved BEFORE the first hook can run — charging
+    // afterwards would let arbitrarily many concurrent transform outputs exist
+    // outside the aggregate cap, which is the shape most under a client's
+    // influence. The window is this response's retained ceiling, and each
+    // accepted output transfers its covering blocks out of it
+    // (GHSA-pwcm-6rh8-f2gh).
+    let mut window = if plugins.is_empty() {
+        None
+    } else {
+        let ceiling = ctx.effective_max_response_body_size_bytes();
+        match response_buffer_budget::ResponseTransformWindow::open(ceiling) {
+            Some(window) => Some(window),
+            None => {
+                warn!("Response body transform refused: retained-response budget exhausted");
+                replace_buffered_response_with_capacity_refusal(
+                    ctx,
+                    response_status,
+                    response_headers,
+                    response_body,
+                    initial_response_header_policy_plugins,
+                );
+                // The gate's own decode (if any) already rewrote the
+                // representation, so report it honestly even though no plugin
+                // transform ran.
+                return (true, representation_rewritten);
+            }
+        }
+    };
     let mut body_transformed = representation_rewritten;
     for plugin in plugins {
         let transformed = match crate::plugins::await_grpc_deadline(
@@ -19438,17 +19467,20 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
         if let Some(transformed) = transformed {
             // The transform installs a DIFFERENT allocation than the one the
             // collector charged (and a decode can be far larger than its
-            // input), so the replacement carries its OWN charge, owned by the
-            // replacement allocation rather than by this request: the permit is
-            // returned when the last handle to those bytes drops, wherever they
-            // are copied or stored (GHSA-pwcm-6rh8-f2gh).
+            // input), so the replacement carries its OWN charge, transferred out
+            // of the window reserved above and owned by the replacement
+            // allocation rather than by this request: the permit is returned
+            // when the last handle to those bytes drops, wherever they are
+            // copied or stored (GHSA-pwcm-6rh8-f2gh).
             //
             // Refusal fails closed with the shared gateway-capacity terminal —
             // `503` plus the fixed redaction-safe body, or the gRPC
             // `RESOURCE_EXHAUSTED` terminal for a gRPC-flavored response —
-            // rather than retaining uncharged bytes.
+            // rather than retaining uncharged bytes. An output larger than the
+            // window is refused for the same reason a backend body that size
+            // would be: it is above this response's retained ceiling.
             let transformed_len = transformed.len();
-            let Some(charged) = response_buffer_budget::charge_replacement_body(transformed) else {
+            let Some(charged) = window.as_mut().and_then(|w| w.charge(transformed)) else {
                 warn!(
                     plugin = plugin.name(),
                     "Response body transform refused: aggregate retained-response budget exhausted"
@@ -26725,23 +26757,27 @@ async fn handle_proxy_request_inner(
                             .metadata
                             .get(crate::plugins::grpc_web::META_GRPC_WEB_HTTP_STATUS)
                             .and_then(|value| value.parse::<u16>().ok());
-                        let content_type = plugin_response_headers
-                            .get("content-type")
-                            .map(String::as_str);
-                        let mut owned_body = ResponseBody::take_buffered_vec(&mut response_body);
-                        let synced = crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
-                            &mut owned_body,
-                            content_type,
-                            &response_trailers,
-                            http_status,
-                        );
-                        let synced_len = owned_body.len();
+                        // Owned: the reframe runs inside a call that also takes
+                        // `&mut plugin_response_headers` (the refusal terminal
+                        // writes into it), so the content type cannot stay
+                        // borrowed from that map.
+                        let content_type =
+                            plugin_response_headers.get("content-type").cloned();
+                        let retained_ceiling = ctx.effective_max_response_body_size_bytes();
                         let stored = store_charged_grpc_web_reframed_body(
                             &mut response_body,
                             &mut plugin_response_headers,
-                            owned_body,
+                            retained_ceiling,
+                            |owned_body| {
+                                crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
+                                    owned_body,
+                                    content_type.as_deref(),
+                                    &response_trailers,
+                                    http_status,
+                                )
+                            },
                         );
-                        if stored && synced {
+                        if let Some((synced_len, true)) = stored {
                             plugin_response_headers
                                 .insert("content-length".to_string(), synced_len.to_string());
                         }
@@ -28643,25 +28679,32 @@ async fn handle_proxy_request_inner(
                 .metadata
                 .get(crate::plugins::grpc_web::META_GRPC_WEB_HTTP_STATUS)
                 .and_then(|value| value.parse::<u16>().ok());
-            let content_type = response_headers.get("content-type").map(String::as_str);
-            let mut owned_body = ResponseBody::take_buffered_vec(data);
-            let synced = crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
-                &mut owned_body,
-                content_type,
-                &trailers,
-                http_status,
+            // Owned: the reframe runs inside a call that also takes
+            // `&mut response_headers`, so the content type cannot stay borrowed
+            // from that map.
+            let content_type = response_headers.get("content-type").cloned();
+            // `take_buffered_vec` copies out of the charged owner and drops its
+            // permit, so both that copy and the rewritten frame are fresh
+            // allocations that must be covered BEFORE they exist. The helper
+            // reserves the window first and performs the copy and the reframe
+            // inside it; a refusal fails closed with the neutral gRPC capacity
+            // terminal rather than retaining uncharged bytes
+            // (GHSA-pwcm-6rh8-f2gh).
+            let retained_ceiling = ctx.effective_max_response_body_size_bytes();
+            let stored = store_charged_grpc_web_reframed_body(
+                data,
+                &mut response_headers,
+                retained_ceiling,
+                |owned_body| {
+                    crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
+                        owned_body,
+                        content_type.as_deref(),
+                        &trailers,
+                        http_status,
+                    )
+                },
             );
-            let synced_len = owned_body.len();
-            // `take_buffered_vec` copied out of the charged owner and dropped
-            // its permit, so the rewritten frame is a fresh allocation that has
-            // to be charged before it is retained. The rewrite only reframes an
-            // already-admitted body (it appends a trailer frame), so a refusal
-            // here means the budget is genuinely exhausted; fail closed with the
-            // neutral gRPC capacity terminal rather than retaining uncharged
-            // bytes (GHSA-pwcm-6rh8-f2gh).
-            let stored =
-                store_charged_grpc_web_reframed_body(data, &mut response_headers, owned_body);
-            if stored && synced {
+            if let Some((synced_len, true)) = stored {
                 response_headers.insert("content-length".to_string(), synced_len.to_string());
                 // Mirror H1/H2/H3: after body-framing trailers, retire
                 // trailer-only application metadata from initial headers while
@@ -28672,7 +28715,7 @@ async fn handle_proxy_request_inner(
                     &shadowed_keys,
                 );
             }
-            if !stored {
+            if stored.is_none() {
                 // The neutral gRPC capacity terminal replaced the body, so no
                 // later final-body validator may overwrite it.
                 response_body_rejected = true;
@@ -30930,7 +30973,15 @@ fn buffered_backend_response_from_body_read(
             if !reservation.reserve(b.len()) {
                 return response_buffer_capacity_response(proxy, resolved_ip, transport);
             }
-            let charged = response_buffer_budget::charged_shared_bytes(b, reservation);
+            // A `Bytes` is a view onto an allocation reqwest owns, so the charge
+            // is made exact rather than assumed: sole ownership is proven and the
+            // real capacity charged, or the payload is copied once into an
+            // allocation this gateway sizes and the opaque view dropped. A
+            // refusal is the neutral gateway-capacity response, never a backend
+            // fault (GHSA-pwcm-6rh8-f2gh).
+            let Some(charged) = response_buffer_budget::charged_shared_bytes(b, reservation) else {
+                return response_buffer_capacity_response(proxy, resolved_ip, transport);
+            };
             retry::BackendResponse {
                 status_code: status,
                 body: ResponseBody::buffered(charged),
@@ -33143,33 +33194,20 @@ async fn collect_response_with_limit(
     max_size: usize,
 ) -> Result<(Bytes, usize), BufferedCollectFailure> {
     use futures_util::StreamExt as _;
-    let mut body = Vec::new();
-    let mut reservation = response_buffer_budget::ResponseBufferReservation::new();
+    let mut body = response_buffer_budget::ChargedBodyCollector::new(
+        response_buffer_budget::BudgetRef::global(),
+        max_size,
+    );
     let mut stream = response.bytes_stream();
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
             Ok(chunk) => {
-                // ONE prospective length for the ceiling check, the budget
-                // reservation, and the allocation that follows: a hostile chunk
-                // sequence must not be able to make the bound check and the
-                // charge disagree, and saturation keeps an impossible length
-                // failing every finite ceiling instead of wrapping past it.
-                let prospective =
-                    response_buffer_budget::prospective_retained_len(body.len(), chunk.len());
-                if prospective > max_size {
-                    warn!(
-                        "Backend response truncated: exceeded {} byte limit",
-                        max_size
-                    );
-                    return Err(BufferedCollectFailure::too_large());
+                // The collector owns BOTH bounds. It charges the growth target
+                // it is about to allocate, not the post-append length, so a
+                // reallocation cannot publish capacity the budget never saw.
+                if let Err(rejection) = body.append(&chunk) {
+                    return Err(buffered_collect_retain_failure(rejection, max_size));
                 }
-                if !reservation.reserve(prospective) {
-                    warn!(
-                        "Response buffering refused: aggregate retained-response budget exhausted"
-                    );
-                    return Err(BufferedCollectFailure::budget_exhausted());
-                }
-                body.extend_from_slice(&chunk);
             }
             Err(e) => {
                 error!("Error reading backend response: {}", e);
@@ -33178,10 +33216,38 @@ async fn collect_response_with_limit(
         }
     }
     let len = body.len();
-    Ok((
-        response_buffer_budget::charged_bytes(body, reservation),
-        len,
-    ))
+    match body.into_charged_bytes() {
+        Some(charged) => Ok((charged, len)),
+        None => Err(buffered_collect_retain_failure(
+            response_buffer_budget::RetainRejection::BudgetExhausted,
+            max_size,
+        )),
+    }
+}
+
+/// Map a retained-allocation refusal onto the buffered-collect failure shape.
+///
+/// A ceiling overrun keeps the backend-attributed `ResponseBodyTooLarge`; an
+/// exhausted aggregate budget keeps the neutral gateway-capacity class that must
+/// not feed circuit breaker, passive health, or adaptive concurrency
+/// (GHSA-pwcm-6rh8-f2gh).
+fn buffered_collect_retain_failure(
+    rejection: response_buffer_budget::RetainRejection,
+    max_size: usize,
+) -> BufferedCollectFailure {
+    match rejection {
+        response_buffer_budget::RetainRejection::TooLarge => {
+            warn!(
+                "Backend response truncated: exceeded {} byte limit",
+                max_size
+            );
+            BufferedCollectFailure::too_large()
+        }
+        response_buffer_budget::RetainRejection::BudgetExhausted => {
+            warn!("Response buffering refused: aggregate retained-response budget exhausted");
+            BufferedCollectFailure::budget_exhausted()
+        }
+    }
 }
 
 /// Build a `Set-Cookie` header value for sticky session cookie injection.
@@ -33957,8 +34023,10 @@ async fn collect_hyper_body_and_trailers_with_limit(
     // (including the caller dropping this future) the reservation drops and the
     // blocks return immediately (GHSA-pwcm-6rh8-f2gh).
     let max_size = response_buffer_budget::buffered_response_body_ceiling(max_size);
-    let mut reservation = response_buffer_budget::ResponseBufferReservation::new();
-    let mut body_bytes = Vec::new();
+    let mut body_bytes = response_buffer_budget::ChargedBodyCollector::new(
+        response_buffer_budget::BudgetRef::global(),
+        max_size,
+    );
     let mut trailers: Option<hyper::HeaderMap> = None;
     loop {
         let next_frame = if backend_read_timeout_ms > 0 {
@@ -33980,18 +34048,13 @@ async fn collect_hyper_body_and_trailers_with_limit(
         };
         let frame = frame.map_err(HyperBodyCollectError::Read)?;
         if let Some(data) = frame.data_ref() {
-            // One prospective length, reused by the ceiling check and the
-            // charge, so they cannot disagree (GHSA-pwcm-6rh8-f2gh).
-            let prospective =
-                response_buffer_budget::prospective_retained_len(body_bytes.len(), data.len());
-            if prospective > max_size {
-                return Err(HyperBodyCollectError::TooLarge);
+            // The collector owns the ceiling check and the aggregate charge, and
+            // charges the growth target BEFORE allocating it, so a reallocation
+            // cannot leave capacity resident outside the budget
+            // (GHSA-pwcm-6rh8-f2gh).
+            if let Err(rejection) = body_bytes.append(data) {
+                return Err(hyper_collect_retain_error(rejection));
             }
-            if !reservation.reserve(prospective) {
-                warn!("Response buffering refused: aggregate retained-response budget exhausted");
-                return Err(HyperBodyCollectError::BudgetExhausted);
-            }
-            body_bytes.extend_from_slice(data);
         } else if let Ok(trailer_map) = frame.into_trailers() {
             // A second TRAILERS frame is not legal HTTP/2, but merge whatever
             // hyper surfaces rather than silently dropping trailing metadata.
@@ -34001,10 +34064,25 @@ async fn collect_hyper_body_and_trailers_with_limit(
             }
         }
     }
-    Ok((
-        response_buffer_budget::charged_bytes(body_bytes, reservation),
-        trailers,
-    ))
+    match body_bytes.into_charged_bytes() {
+        Some(charged) => Ok((charged, trailers)),
+        None => Err(HyperBodyCollectError::BudgetExhausted),
+    }
+}
+
+/// Map a retained-allocation refusal onto the hyper-collect error shape,
+/// preserving the backend-vs-gateway attribution split
+/// (GHSA-pwcm-6rh8-f2gh).
+fn hyper_collect_retain_error(
+    rejection: response_buffer_budget::RetainRejection,
+) -> HyperBodyCollectError {
+    match rejection {
+        response_buffer_budget::RetainRejection::TooLarge => HyperBodyCollectError::TooLarge,
+        response_buffer_budget::RetainRejection::BudgetExhausted => {
+            warn!("Response buffering refused: aggregate retained-response budget exhausted");
+            HyperBodyCollectError::BudgetExhausted
+        }
+    }
 }
 
 /// The gateway's aggregate budget for RETAINED response bodies refused this
@@ -34087,42 +34165,68 @@ fn mesh_grpc_response_buffer_capacity_response(
     }
 }
 
-/// Re-store a gRPC-Web-reframed buffered body under the retained-response
-/// budget.
+/// Reframe a gRPC-Web buffered body under the retained-response budget, copy
+/// included.
 ///
 /// `ResponseBody::take_buffered_vec` copies out of the charged owner and drops
-/// its permit, so the reframed buffer is a fresh, uncharged allocation. It is
-/// charged before being retained (GHSA-pwcm-6rh8-f2gh). Returns `true` when the
-/// reframed body was stored; on `false` the budget refused it, `response_body`
-/// holds an empty payload, and `response_headers` carries the neutral gRPC
-/// capacity terminal — failing closed rather than retaining uncharged bytes.
+/// its permit, so BOTH the copy and the trailer frame appended to it are fresh,
+/// uncharged allocations — and the copy is made while the original is still
+/// resident. Charging only the finished buffer would leave that whole window
+/// outside the aggregate cap, so the window is reserved FIRST, sized to
+/// `retained_ceiling` (this response's folded retained ceiling), and the copy,
+/// the reframe, and the publication all happen inside it
+/// (GHSA-pwcm-6rh8-f2gh).
+///
+/// `reframe` is handed the owned copy and returns whether it actually rewrote
+/// the frame; it must not allocate outside that buffer.
+///
+/// `Some((len, reframed))` on success, where `len` is the stored body length.
+/// `None` means the budget refused: `response_body` holds an empty payload and
+/// `response_headers` carries the neutral gRPC capacity terminal — failing
+/// closed rather than retaining uncharged bytes.
 pub(crate) fn store_charged_grpc_web_reframed_body(
     response_body: &mut Bytes,
     response_headers: &mut HashMap<String, String>,
-    reframed: Vec<u8>,
-) -> bool {
-    match response_buffer_budget::charge_replacement_body(reframed) {
+    retained_ceiling: usize,
+    reframe: impl FnOnce(&mut Vec<u8>) -> bool,
+) -> Option<(usize, bool)> {
+    let Some(mut window) = response_buffer_budget::ResponseTransformWindow::open(retained_ceiling)
+    else {
+        grpc_web_reframe_capacity_terminal(response_body, response_headers);
+        return None;
+    };
+    let mut owned_body = ResponseBody::take_buffered_vec(response_body);
+    let reframed = reframe(&mut owned_body);
+    let stored_len = owned_body.len();
+    match window.charge(owned_body) {
         Some(charged) => {
             *response_body = charged;
-            true
+            Some((stored_len, reframed))
         }
         None => {
-            warn!(
-                "gRPC-Web trailer reframing refused: aggregate retained-response budget exhausted"
-            );
-            *response_body = Bytes::new();
-            response_headers.insert(
-                "grpc-status".to_string(),
-                response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS.to_string(),
-            );
-            response_headers.insert(
-                "grpc-message".to_string(),
-                response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE.to_string(),
-            );
-            response_headers.insert("content-length".to_string(), "0".to_string());
-            false
+            grpc_web_reframe_capacity_terminal(response_body, response_headers);
+            None
         }
     }
+}
+
+/// The neutral gRPC capacity terminal a refused reframe installs. Fixed
+/// cardinality: no route, header, credential, or response content.
+fn grpc_web_reframe_capacity_terminal(
+    response_body: &mut Bytes,
+    response_headers: &mut HashMap<String, String>,
+) {
+    warn!("gRPC-Web trailer reframing refused: aggregate retained-response budget exhausted");
+    *response_body = Bytes::new();
+    response_headers.insert(
+        "grpc-status".to_string(),
+        response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS.to_string(),
+    );
+    response_headers.insert(
+        "grpc-message".to_string(),
+        response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE.to_string(),
+    );
+    response_headers.insert("content-length".to_string(), "0".to_string());
 }
 
 fn hbone_response_body_too_large_response(

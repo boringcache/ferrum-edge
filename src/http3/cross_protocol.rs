@@ -915,6 +915,41 @@ fn reqwest_error_response_for_cross_protocol(
     }
 }
 
+/// Map a retained-allocation refusal onto this bridge's `(status, body, class)`
+/// reject shape.
+///
+/// The attributions stay distinct: a ceiling overrun is the origin's `502` with
+/// `ResponseBodyTooLarge`, while an exhausted aggregate budget is the neutral
+/// gateway-local `503` that must not poison the backend's health accounting
+/// (GHSA-pwcm-6rh8-f2gh).
+fn cross_protocol_retain_rejection(
+    rejection: crate::proxy::response_buffer_budget::RetainRejection,
+) -> (u16, Vec<u8>, Option<ErrorClass>) {
+    use crate::proxy::response_buffer_budget::{self, RetainRejection};
+    match rejection {
+        RetainRejection::TooLarge => (
+            502,
+            r#"{"error":"Backend response body exceeds maximum size"}"#
+                .as_bytes()
+                .to_vec(),
+            Some(ErrorClass::ResponseBodyTooLarge),
+        ),
+        RetainRejection::BudgetExhausted => {
+            warn!(
+                "cross-protocol H3→HTTP: response buffering refused, aggregate \
+                 retained-response budget exhausted"
+            );
+            (
+                response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS,
+                response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY
+                    .as_bytes()
+                    .to_vec(),
+                Some(response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS),
+            )
+        }
+    }
+}
+
 /// Collect a cross-protocol (H3 client → HTTP/1.1+2 backend) response body
 /// under both buffered-path bounds.
 ///
@@ -939,45 +974,30 @@ async fn collect_reqwest_response_body_with_limit(
 
     let max_response_body_size_bytes =
         response_buffer_budget::buffered_response_body_ceiling(max_response_body_size_bytes);
-    let mut body = Vec::new();
-    let mut reservation = response_buffer_budget::ResponseBufferReservation::new();
+    let mut body = response_buffer_budget::ChargedBodyCollector::new(
+        response_buffer_budget::BudgetRef::global(),
+        max_response_body_size_bytes,
+    );
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => {
-                // One saturating prospective length shared by the ceiling check
-                // and the budget charge: a hostile response must not be able to
-                // wrap the sum past the ceiling or panic a debug build
+                // The collector owns the ceiling check and the aggregate charge,
+                // and charges the growth target BEFORE allocating it, so a
+                // reallocation cannot leave capacity resident outside the budget
                 // (GHSA-pwcm-6rh8-f2gh).
-                let prospective =
-                    response_buffer_budget::prospective_retained_len(body.len(), chunk.len());
-                if prospective > max_response_body_size_bytes {
-                    return Err((
-                        502,
-                        r#"{"error":"Backend response body exceeds maximum size"}"#
-                            .as_bytes()
-                            .to_vec(),
-                        Some(ErrorClass::ResponseBodyTooLarge),
-                    ));
+                if let Err(rejection) = body.append(&chunk) {
+                    return Err(cross_protocol_retain_rejection(rejection));
                 }
-                if !reservation.reserve(prospective) {
-                    warn!(
-                        "cross-protocol H3→HTTP: response buffering refused, aggregate \
-                         retained-response budget exhausted"
-                    );
-                    return Err((
-                        response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS,
-                        response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY
-                            .as_bytes()
-                            .to_vec(),
-                        Some(response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS),
-                    ));
-                }
-                body.extend_from_slice(&chunk);
             }
             Ok(None) => {
-                // Hand the charge to the retained allocation so it outlives
-                // this collector.
-                return Ok(response_buffer_budget::charged_bytes(body, reservation));
+                // Hand the charge to the retained allocation so it outlives this
+                // collector, gated on the charge covering its real capacity.
+                return match body.into_charged_bytes() {
+                    Some(charged) => Ok(charged),
+                    None => Err(cross_protocol_retain_rejection(
+                        response_buffer_budget::RetainRejection::BudgetExhausted,
+                    )),
+                };
             }
             Err(error) => {
                 warn!("cross-protocol H3→HTTP: failed to read buffered response body: {error}");
@@ -5299,25 +5319,29 @@ where
                     .metadata
                     .get(crate::plugins::grpc_web::META_GRPC_WEB_HTTP_STATUS)
                     .and_then(|value| value.parse::<u16>().ok());
-                let content_type = plugin_response_headers
-                    .get("content-type")
-                    .map(String::as_str);
-                let mut owned_body =
-                    crate::retry::ResponseBody::take_buffered_vec(&mut response_body);
-                let synced =
-                    crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
-                        &mut owned_body,
-                        content_type,
-                        &response_trailers,
-                        http_status,
-                    );
-                let synced_len = owned_body.len();
+                // Owned: the reframe runs inside a call that also takes
+                // `&mut plugin_response_headers`, so the content type cannot
+                // stay borrowed from that map.
+                let content_type = plugin_response_headers.get("content-type").cloned();
+                // The reframe copies out of the charged owner before appending a
+                // trailer frame, so the window that covers both the copy and the
+                // rewritten buffer is reserved before either exists
+                // (GHSA-pwcm-6rh8-f2gh).
+                let retained_ceiling = ctx.effective_max_response_body_size_bytes();
                 let stored = crate::proxy::store_charged_grpc_web_reframed_body(
                     &mut response_body,
                     &mut plugin_response_headers,
-                    owned_body,
+                    retained_ceiling,
+                    |owned_body| {
+                        crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
+                            owned_body,
+                            content_type.as_deref(),
+                            &response_trailers,
+                            http_status,
+                        )
+                    },
                 );
-                if stored && synced {
+                if let Some((synced_len, true)) = stored {
                     plugin_response_headers
                         .insert("content-length".to_string(), synced_len.to_string());
                 }

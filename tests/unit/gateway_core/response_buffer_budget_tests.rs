@@ -24,7 +24,8 @@ use ferrum_edge::_test_support::{
     RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS, RESPONSE_BUFFER_OVERLOAD_STATUS,
     RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT, RESPONSE_DECODE_BROTLI_SCRATCH_BYTES,
     RESPONSE_DECODE_GZIP_SCRATCH_BYTES, ResponseBufferBudgetProbe,
-    error_class_is_backend_failure_for_test, error_class_is_health_neutral_for_test,
+    ResponseBufferRetainRejection, error_class_is_backend_failure_for_test,
+    error_class_is_health_neutral_for_test,
     install_response_buffer_capacity_refusal_for_test,
     projected_decode_output_capacity_for_test, set_request_http_flavor_for_test,
     stamp_original_response_metadata_for_test,
@@ -51,7 +52,9 @@ fn a_charge_survives_the_collectors_successful_return() {
     let body = {
         let mut charge = budget.try_reserve(UNIT).expect("first block admits");
         assert!(budget.grow(&mut charge, 3 * UNIT), "growth admits");
-        budget.attach(vec![0u8; 3 * UNIT], charge)
+        budget
+            .attach(vec![0u8; 3 * UNIT], charge)
+            .expect("a covered allocation publishes")
     };
 
     // The collector frame is gone. If the charge had been a collector local,
@@ -462,7 +465,9 @@ fn eagerly_read_bytes_are_charged_in_place_before_the_read() {
     // to the transport's own allocation.
     let read: bytes::Bytes = bytes::Bytes::from(vec![3u8; 2 * UNIT]);
     assert!(budget.grow(&mut charge, read.len()), "growth admits");
-    let body = budget.attach_shared(read, charge);
+    let body = budget
+        .attach_shared(read, charge)
+        .expect("an exactly charged eager read publishes");
 
     assert_eq!(
         budget.available_bytes(),
@@ -801,13 +806,23 @@ fn the_replacement_charge_is_not_request_scoped() {
         );
     }
     assert!(
-        plugins.contains("charge_replacement_body(body)"),
-        "the normalizer replacement must be charged to the allocation"
+        plugins.contains("window.as_mut().and_then(|window| window.charge(body))"),
+        "the normalizer replacement must be charged out of the window reserved \
+         before the hook ran, not after the plugin already allocated it"
     );
     assert!(
-        proxy.contains("charge_replacement_body(transformed)"),
-        "the body-transform replacement must be charged to the allocation"
+        proxy.contains("window.as_mut().and_then(|w| w.charge(transformed))"),
+        "the body-transform replacement must be charged out of the window \
+         reserved before the hook ran, not after the plugin already allocated it"
     );
+    for source in [plugins, proxy] {
+        assert!(
+            !source.contains("charge_replacement_body("),
+            "charging a plugin-produced buffer on arrival is charging AFTER the \
+             allocation: concurrent transform outputs would exist outside the \
+             aggregate cap (GHSA-pwcm-6rh8-f2gh)"
+        );
+    }
 }
 
 /// Both buffered phases that can be refused after the backend answered must
@@ -829,9 +844,11 @@ fn every_capacity_refusal_uses_the_shared_gateway_terminal() {
         proxy
             .matches("replace_buffered_response_with_capacity_refusal(")
             .count(),
-        2,
-        "one definition plus the body-transform call site; the normalize call \
-         site lives in src/plugins/mod.rs"
+        3,
+        "one definition, the body-transform call site, and the refusal taken \
+         when the transform WINDOW itself cannot be reserved — which happens \
+         before any plugin allocates; the normalize call site lives in \
+         src/plugins/mod.rs"
     );
     assert_eq!(
         proxy
@@ -1624,4 +1641,345 @@ fn the_decoder_working_set_is_reserved_before_the_decoder_is_constructed() {
         "`brotli::Decompressor` builds its state with `large_window = true`, so \
          a handful of header bits can ask it for a 1 GiB ring buffer"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Capacity, not length: what a growing collector actually keeps resident.
+//
+// `Vec` grows by amortised doubling, so a collector that reserves the
+// prospective post-append LENGTH and then calls `extend_from_slice` publishes a
+// buffer whose CAPACITY can be far larger than anything the budget was asked
+// about. Under concurrency that surplus is exactly the resident memory the
+// aggregate cap claims to bound, so the collector must choose its own growth
+// target, charge THAT, and only then allocate.
+//
+// Every test here drives the PRODUCTION collector
+// (`ChargedBodyCollector`, the one all five buffered transports use) against an
+// isolated semaphore.
+// ---------------------------------------------------------------------------
+
+/// The published charge covers the buffer's capacity, not its length.
+///
+/// The chunk sequence is chosen so the two answers differ by a wide margin: a
+/// 3-block append followed by a single byte leaves a length of `3 * UNIT + 1`
+/// (4 blocks if you charge the length) inside a doubled `6 * UNIT` allocation
+/// (6 blocks if you charge what is resident).
+#[test]
+fn a_grown_collector_is_charged_for_its_capacity_not_its_length() {
+    let budget = probe(16);
+    let total = budget.available_bytes();
+
+    let body = {
+        let mut collector = budget.collector(8 * UNIT);
+        collector.append(&vec![0u8; 3 * UNIT]).expect("first append admits");
+        collector.append(&[1u8]).expect("one more byte admits");
+        assert_eq!(
+            collector.len(),
+            3 * UNIT + 1,
+            "the payload is one byte past a three-block boundary"
+        );
+        collector.into_charged_bytes().expect("publishes")
+    };
+
+    let charged = total - budget.available_bytes();
+    assert!(
+        charged >= 6 * UNIT,
+        "the doubled allocation is what stays resident, so it is what must be \
+         charged; charging the {}-byte length would leave {} bytes of resident \
+         capacity outside the aggregate cap (GHSA-pwcm-6rh8-f2gh) — charged \
+         {charged}",
+        3 * UNIT + 1,
+        2 * UNIT
+    );
+    assert_eq!(body.len(), 3 * UNIT + 1);
+
+    drop(body);
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "dropping the published body returns every block it held"
+    );
+}
+
+/// The charge precedes the allocation: a growth the budget cannot cover is
+/// refused INSTEAD of allocated, not discovered after the fact.
+///
+/// With four blocks left, the doubling step to `6 * UNIT` cannot be paid for.
+/// A collector that charged the post-append length would have found `3 * UNIT +
+/// 1` affordable at four blocks and gone on to allocate six.
+#[test]
+fn growth_the_budget_cannot_cover_is_refused_instead_of_allocated() {
+    let budget = probe(4);
+    let total = budget.available_bytes();
+
+    let mut collector = budget.collector(8 * UNIT);
+    collector.append(&vec![0u8; 3 * UNIT]).expect("first append admits");
+    assert_eq!(
+        collector.append(&[1u8]),
+        Err(ResponseBufferRetainRejection::BudgetExhausted),
+        "the growth target must be charged before it is allocated, so an \
+         unaffordable doubling is refused rather than discovered afterwards"
+    );
+
+    drop(collector);
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "a refused collector leaks no partial reservation"
+    );
+}
+
+/// A refusal keeps its attribution. A ceiling overrun is the BACKEND sending
+/// more than the operator retains; an exhausted aggregate budget is
+/// gateway-local transient capacity and must stay health-neutral.
+#[test]
+fn collector_refusals_keep_their_backend_versus_gateway_attribution() {
+    let budget = probe(16);
+
+    let mut collector = budget.collector(2 * UNIT);
+    assert_eq!(
+        collector.append(&vec![0u8; 3 * UNIT]),
+        Err(ResponseBufferRetainRejection::TooLarge),
+        "a body past the per-response ceiling is a backend attribution"
+    );
+
+    let spent = probe(1);
+    let mut starved = spent.collector(8 * UNIT);
+    assert_eq!(
+        starved.append(&vec![0u8; 2 * UNIT]),
+        Err(ResponseBufferRetainRejection::BudgetExhausted),
+        "a body the aggregate budget cannot admit is gateway-local capacity"
+    );
+
+    assert!(
+        error_class_is_health_neutral_for_test(RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS),
+        "the gateway-capacity class must not feed circuit breaker, passive \
+         health, or adaptive concurrency"
+    );
+    assert!(
+        !error_class_is_backend_failure_for_test(RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS),
+        "the gateway-capacity class must never be read as a backend failure"
+    );
+}
+
+/// A preallocation hint is resident the instant it is requested, so it is
+/// charged before the allocation and an unaffordable hint refuses the response
+/// rather than allocating it. A zero hint costs nothing.
+#[test]
+fn a_preallocation_hint_is_charged_before_it_is_allocated() {
+    let budget = probe(4);
+    let total = budget.available_bytes();
+
+    let collector = budget
+        .collector_with_preallocation(8 * UNIT, 3 * UNIT)
+        .expect("an affordable hint admits");
+    assert_eq!(
+        budget.available_bytes(),
+        total - 3 * UNIT,
+        "the hint is charged before the first DATA frame, so a stalled response \
+         cannot hold uncharged capacity"
+    );
+    assert_eq!(collector.len(), 0, "nothing has been appended yet");
+    drop(collector);
+    assert_eq!(budget.available_bytes(), total);
+
+    assert_eq!(
+        budget.collector_with_preallocation(8 * UNIT, 5 * UNIT).err(),
+        Some(ResponseBufferRetainRejection::BudgetExhausted),
+        "an unaffordable hint refuses the response instead of allocating it"
+    );
+
+    let empty = budget
+        .collector_with_preallocation(8 * UNIT, 0)
+        .expect("a zero hint allocates nothing");
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "a bodyless response must not consume budget it never occupies"
+    );
+    assert!(empty.into_charged_bytes().expect("empty publishes").is_empty());
+    assert_eq!(budget.available_bytes(), total);
+}
+
+/// Growth inside an already-reserved capacity re-charges nothing: a
+/// preallocated response is charged once, not once per frame.
+#[test]
+fn growth_within_reserved_capacity_is_not_charged_twice() {
+    let budget = probe(16);
+    let total = budget.available_bytes();
+
+    let mut collector = budget
+        .collector_with_preallocation(8 * UNIT, 4 * UNIT)
+        .expect("hint admits");
+    let reserved_after_hint = total - budget.available_bytes();
+    for _ in 0..4 {
+        collector.append(&vec![7u8; UNIT]).expect("in-hint append");
+    }
+    assert_eq!(
+        total - budget.available_bytes(),
+        reserved_after_hint,
+        "filling preallocated capacity allocates nothing, so it charges nothing"
+    );
+
+    let body = collector.into_charged_bytes().expect("publishes");
+    assert_eq!(body.len(), 4 * UNIT);
+    drop(body);
+    assert_eq!(budget.available_bytes(), total);
+}
+
+// ---------------------------------------------------------------------------
+// The transform window: a plugin's output cannot exist before its charge does.
+// ---------------------------------------------------------------------------
+
+/// The window is reserved BEFORE the producer runs, so an exhausted budget
+/// refuses the phase rather than letting a plugin allocate first and charging
+/// afterwards.
+#[test]
+fn a_transform_window_is_refused_before_the_producer_allocates() {
+    let budget = probe(2);
+    assert!(
+        budget.transform_window(4 * UNIT).is_none(),
+        "a window larger than the remaining budget must be refused up front; \
+         charging after the plugin allocated is the accounting hole \
+         (GHSA-pwcm-6rh8-f2gh)"
+    );
+    assert_eq!(
+        budget.available_bytes(),
+        2 * UNIT,
+        "a refused window leaks no partial reservation"
+    );
+}
+
+/// Charging an output out of the window is a TRANSFER, not a second
+/// acquisition, and the window reopens for the next plugin in the chain.
+#[test]
+fn a_charged_replacement_transfers_blocks_out_of_the_window() {
+    let budget = probe(16);
+    let total = budget.available_bytes();
+
+    let mut window = budget.transform_window(2 * UNIT).expect("the window admits");
+    assert_eq!(
+        budget.available_bytes(),
+        total - 2 * UNIT,
+        "the whole window is reserved before the producer runs"
+    );
+
+    let replacement = window
+        .charge(vec![5u8; UNIT])
+        .expect("an in-window output publishes");
+    assert_eq!(replacement.len(), UNIT);
+    assert_eq!(
+        budget.available_bytes(),
+        total - 3 * UNIT,
+        "the published body holds its own block and the window reopens to full \
+         width for the next plugin in the chain"
+    );
+
+    drop(window);
+    assert_eq!(
+        budget.available_bytes(),
+        total - UNIT,
+        "closing the phase returns the window but not the published body"
+    );
+    drop(replacement);
+    assert_eq!(budget.available_bytes(), total);
+}
+
+/// An output larger than the window — i.e. larger than this response's retained
+/// ceiling — is refused, and nothing uncharged is published.
+#[test]
+fn an_output_larger_than_the_window_is_refused() {
+    let budget = probe(16);
+    let total = budget.available_bytes();
+
+    let mut window = budget.transform_window(UNIT).expect("the window admits");
+    assert!(
+        window.charge(vec![5u8; 2 * UNIT]).is_none(),
+        "a replacement above the per-response retained ceiling must be refused \
+         for the same reason a backend body that size would be"
+    );
+    assert_eq!(
+        budget.available_bytes(),
+        total - UNIT,
+        "a refused replacement neither publishes nor over-releases"
+    );
+
+    drop(window);
+    assert_eq!(budget.available_bytes(), total);
+}
+
+// ---------------------------------------------------------------------------
+// Eagerly read `Bytes`: a view is not an allocation.
+// ---------------------------------------------------------------------------
+
+/// A solely owned handle proves its own capacity, so it is charged exactly and
+/// published without a copy.
+#[test]
+fn a_solely_owned_eager_handle_is_charged_exactly_and_not_copied() {
+    let budget = probe(8);
+    let total = budget.available_bytes();
+
+    let read = bytes::Bytes::from(vec![3u8; 2 * UNIT]);
+    let source_ptr = read.as_ptr();
+    let charge = budget.try_reserve(2 * UNIT).expect("declared length admits");
+    let body = budget
+        .attach_shared(read, charge)
+        .expect("a solely owned handle publishes");
+
+    assert_eq!(
+        body.as_ptr(),
+        source_ptr,
+        "sole ownership makes the backing capacity knowable, so no copy is owed"
+    );
+    assert_eq!(
+        budget.available_bytes(),
+        total - 2 * UNIT,
+        "the eagerly buffered body stays charged after the read frame returns"
+    );
+    drop(body);
+    assert_eq!(budget.available_bytes(), total);
+}
+
+/// A handle that only VIEWS a producer-owned allocation cannot report the size
+/// of what it would pin, so it is copied once into an allocation the gateway
+/// sizes and measures, and the opaque view is dropped.
+#[test]
+fn an_opaque_eager_handle_is_copied_into_a_measured_allocation() {
+    let budget = probe(8);
+    let total = budget.available_bytes();
+
+    // A large producer buffer with a small window handed to the gateway: the
+    // shape a hyper connection read buffer produces. Charging `len()` here
+    // would leave the rest of the producer's allocation pinned and unbudgeted.
+    let producer = bytes::Bytes::from(vec![4u8; 6 * UNIT]);
+    let view = producer.slice(0..UNIT);
+    let view_ptr = view.as_ptr();
+
+    let charge = budget.try_reserve(UNIT).expect("declared length admits");
+    let body = budget
+        .attach_shared(view, charge)
+        .expect("an opaque handle publishes through a measured copy");
+
+    assert_ne!(
+        body.as_ptr(),
+        view_ptr,
+        "an unmeasurable backing must not be retained: the payload is copied \
+         into an allocation this gateway sized (GHSA-pwcm-6rh8-f2gh)"
+    );
+    assert_eq!(body.len(), UNIT);
+    assert!(body.iter().all(|byte| *byte == 4u8), "the copy is faithful");
+    assert_eq!(
+        budget.available_bytes(),
+        total - UNIT,
+        "the measured copy is charged for exactly what it occupies"
+    );
+
+    drop(producer);
+    assert_eq!(
+        body.len(),
+        UNIT,
+        "the published body does not depend on the producer's buffer"
+    );
+    drop(body);
+    assert_eq!(budget.available_bytes(), total);
 }

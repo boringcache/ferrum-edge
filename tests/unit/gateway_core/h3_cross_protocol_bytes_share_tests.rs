@@ -243,9 +243,11 @@ fn buffered_backend_response_from_body_read_keeps_reqwest_bytes() {
     );
     assert!(
         reader.contains("charged_shared_bytes(b, reservation)"),
-        "the eagerly read Bytes must be charged IN PLACE — attaching the \
-         aggregate retained-response permit to reqwest's own allocation, not to \
-         a copy of it (GHSA-pwcm-6rh8-f2gh)"
+        "the eagerly read Bytes must go through the shared charge helper, which \
+         attaches the aggregate retained-response permit to reqwest's own \
+         allocation when sole ownership proves its capacity, and otherwise \
+         copies once into an allocation the gateway measures rather than \
+         charging a view of an opaque buffer (GHSA-pwcm-6rh8-f2gh)"
     );
     assert!(
         reader.contains("ResponseBody::buffered(charged)"),

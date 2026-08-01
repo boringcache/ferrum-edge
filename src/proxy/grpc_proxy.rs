@@ -3482,22 +3482,21 @@ pub(crate) async fn proxy_grpc_request_core(
     use crate::proxy::response_buffer_budget;
     let max_response_body_size_bytes =
         response_buffer_budget::buffered_response_body_ceiling(max_response_body_size_bytes);
-    let mut reservation = response_buffer_budget::ResponseBufferReservation::new();
 
     // The preallocation is resident memory the instant it is requested, so it
-    // is charged BEFORE `Vec::with_capacity` rather than after the first DATA
-    // frame. Otherwise a flood of `content-length`-advertising responses that
-    // send no data (or stall) could each hold up to
+    // is charged BEFORE the allocation rather than after the first DATA frame.
+    // Otherwise a flood of `content-length`-advertising responses that send no
+    // data (or stall) could each hold up to
     // `MAX_GRPC_BUFFERED_PREALLOC_CAPACITY` completely uncharged. Growth past
     // the hint is charged as a delta against this same reservation, so a
     // preallocated response is never charged twice.
     let body_capacity = grpc_buffered_body_capacity_hint(response.headers());
-    if !reservation.reserve(body_capacity) {
-        return Err(GrpcProxyError::ResponseBufferCapacity(
-            response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE.to_string(),
-        ));
-    }
-    let mut body_bytes = Vec::with_capacity(body_capacity);
+    let mut body_bytes = response_buffer_budget::ChargedBodyCollector::with_preallocation(
+        response_buffer_budget::BudgetRef::global(),
+        max_response_body_size_bytes,
+        body_capacity,
+    )
+    .map_err(|rejection| grpc_body_retain_error(rejection, max_response_body_size_bytes))?;
     let mut trailers = HashMap::new();
 
     let body_collection = async {
@@ -3506,25 +3505,16 @@ pub(crate) async fn proxy_grpc_request_core(
             match frame_result {
                 Ok(frame) => {
                     if let Some(data) = frame.data_ref() {
-                        // One prospective length, reused by the ceiling check
-                        // and the budget charge (GHSA-pwcm-6rh8-f2gh).
-                        let prospective = response_buffer_budget::prospective_retained_len(
-                            body_bytes.len(),
-                            data.len(),
-                        );
-                        if prospective > max_response_body_size_bytes {
-                            return Err(GrpcProxyError::ResponseTooLarge(format!(
-                                "gRPC response payload size exceeds maximum of {} bytes",
-                                max_response_body_size_bytes
-                            )));
-                        }
-                        if !reservation.reserve(prospective) {
-                            return Err(GrpcProxyError::ResponseBufferCapacity(
-                                response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE
-                                    .to_string(),
+                        // The collector owns the ceiling check and the aggregate
+                        // charge, and charges the growth target BEFORE
+                        // allocating it, so a reallocation cannot leave capacity
+                        // resident outside the budget (GHSA-pwcm-6rh8-f2gh).
+                        if let Err(rejection) = body_bytes.append(data) {
+                            return Err(grpc_body_retain_error(
+                                rejection,
+                                max_response_body_size_bytes,
                             ));
                         }
-                        body_bytes.extend_from_slice(data);
                     } else if let Ok(trailer_map) = frame.into_trailers() {
                         // Strip RFC 9110 §7.6.1 response-direction
                         // hop-by-hop names from gRPC trailers — same
@@ -3606,16 +3596,44 @@ pub(crate) async fn proxy_grpc_request_core(
         body_collection.await?;
     }
 
+    // Hand the charge to the retained allocation. From here the permit is owned
+    // by the `Bytes` (and by every cheap clone of it, exactly once), so it is
+    // returned when the payload is actually dropped rather than when this
+    // function returns. Publication is gated on the charge covering the buffer's
+    // real CAPACITY, so bytes the budget does not bound are never forwarded.
+    let Some(body) = body_bytes.into_charged_bytes() else {
+        return Err(GrpcProxyError::ResponseBufferCapacity(
+            response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE.to_string(),
+        ));
+    };
     Ok(GrpcResponseKind::Buffered(GrpcResponse {
         status,
         headers: resp_headers,
-        // Hand the charge to the retained allocation. From here the permit is
-        // owned by the `Bytes` (and by every cheap clone of it, exactly once),
-        // so it is returned when the payload is actually dropped rather than
-        // when this function returns.
-        body: response_buffer_budget::charged_bytes(body_bytes, reservation),
+        body,
         trailers,
     }))
+}
+
+/// Map a retained-allocation refusal onto the buffered gRPC error shape.
+///
+/// A ceiling overrun stays `ResponseTooLarge` (a backend attribution), while an
+/// exhausted aggregate budget stays `ResponseBufferCapacity`, which the caller
+/// renders as the health-neutral `RESOURCE_EXHAUSTED` terminal
+/// (GHSA-pwcm-6rh8-f2gh).
+fn grpc_body_retain_error(
+    rejection: crate::proxy::response_buffer_budget::RetainRejection,
+    limit: usize,
+) -> GrpcProxyError {
+    use crate::proxy::response_buffer_budget::{self, RetainRejection};
+    match rejection {
+        RetainRejection::TooLarge => GrpcProxyError::ResponseTooLarge(format!(
+            "gRPC response payload size exceeds maximum of {} bytes",
+            limit
+        )),
+        RetainRejection::BudgetExhausted => GrpcProxyError::ResponseBufferCapacity(
+            response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE.to_string(),
+        ),
+    }
 }
 
 /// Drain a backend `HeaderMap` of gRPC trailers into the buffered-response

@@ -6156,20 +6156,61 @@ pub mod _test_support {
         }
 
         /// Hand an existing claim to `data`, exactly as the collectors do on
-        /// return.
-        pub fn attach(&self, data: Vec<u8>, charge: ResponseBufferChargeProbe) -> bytes::Bytes {
+        /// return. `None` when the claim does not cover the allocation's real
+        /// CAPACITY — the publication gate that keeps a grown `Vec` from
+        /// shipping bytes the budget never saw.
+        pub fn attach(
+            &self,
+            data: Vec<u8>,
+            charge: ResponseBufferChargeProbe,
+        ) -> Option<bytes::Bytes> {
             crate::proxy::response_buffer_budget::charged_bytes(data, charge.0)
         }
 
-        /// Hand an existing claim to bytes the transport already owns, without
-        /// copying — the eager reqwest small-response path
-        /// (`buffered_backend_response_from_body_read`).
+        /// Hand an existing claim to bytes the transport already owns — the
+        /// eager reqwest small-response path
+        /// (`buffered_backend_response_from_body_read`). Zero-copy when sole
+        /// ownership proves the backing capacity, otherwise one measured copy;
+        /// `None` when the budget refuses the exact charge.
         pub fn attach_shared(
             &self,
             data: bytes::Bytes,
             charge: ResponseBufferChargeProbe,
-        ) -> bytes::Bytes {
+        ) -> Option<bytes::Bytes> {
             self.0.attach_shared(data, charge.0)
+        }
+
+        /// The PRODUCTION growing collector bound to this isolated budget —
+        /// same ceiling folding, same charge-before-allocate growth, same
+        /// capacity-gated publication.
+        pub fn collector(&self, effective_limit: usize) -> ResponseBufferCollectorProbe<'_> {
+            ResponseBufferCollectorProbe(self.0.collector(effective_limit))
+        }
+
+        /// The same collector with the preallocation hint the native-H3 and
+        /// gRPC sites pass, charged before the allocation exists.
+        pub fn collector_with_preallocation(
+            &self,
+            effective_limit: usize,
+            hint: usize,
+        ) -> Result<ResponseBufferCollectorProbe<'_>, ResponseBufferRetainRejection> {
+            self.0
+                .collector_with_preallocation(effective_limit, hint)
+                .map(ResponseBufferCollectorProbe)
+                .map_err(ResponseBufferRetainRejection::from_internal)
+        }
+
+        /// The PRODUCTION pre-allocation window a plugin-produced replacement
+        /// body is charged out of. `None` when the budget cannot admit the
+        /// window, which is what makes the refusal happen BEFORE the producer
+        /// allocates.
+        pub fn transform_window(
+            &self,
+            effective_limit: usize,
+        ) -> Option<ResponseBufferTransformWindowProbe<'_>> {
+            self.0
+                .transform_window(effective_limit)
+                .map(ResponseBufferTransformWindowProbe)
         }
 
         /// Charge a COPY that outlives the request which produced it — the
@@ -6281,6 +6322,80 @@ pub mod _test_support {
         /// Whole reserved blocks expressed in bytes.
         pub fn reserved_bytes(&self) -> usize {
             self.0.reserved_bytes()
+        }
+    }
+
+    use crate::proxy::response_buffer_budget::RetainRejection as CrateRetainRejection;
+
+    /// Why a retained allocation was refused, projected for external tests.
+    ///
+    /// The split is load-bearing: `TooLarge` is a BACKEND attribution
+    /// (`ResponseBodyTooLarge`, which feeds passive health), `BudgetExhausted`
+    /// is gateway-local transient capacity and must stay health-neutral
+    /// (`GHSA-pwcm-6rh8-f2gh`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ResponseBufferRetainRejection {
+        TooLarge,
+        BudgetExhausted,
+    }
+
+    impl ResponseBufferRetainRejection {
+        fn from_internal(rejection: CrateRetainRejection) -> Self {
+            match rejection {
+                CrateRetainRejection::TooLarge => Self::TooLarge,
+                CrateRetainRejection::BudgetExhausted => Self::BudgetExhausted,
+            }
+        }
+    }
+
+    /// The PRODUCTION growing retained-response collector every buffered
+    /// transport uses, bound to an isolated budget.
+    pub struct ResponseBufferCollectorProbe<'a>(
+        crate::proxy::response_buffer_budget::ChargedBodyCollector<'a>,
+    );
+
+    impl ResponseBufferCollectorProbe<'_> {
+        /// Bytes collected so far (LENGTH, not capacity).
+        pub fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.0.len() == 0
+        }
+
+        /// Append one wire chunk under both bounds, exactly as every buffered
+        /// transport does per frame.
+        pub fn append(&mut self, chunk: &[u8]) -> Result<(), ResponseBufferRetainRejection> {
+            self.0
+                .append(chunk)
+                .map_err(ResponseBufferRetainRejection::from_internal)
+        }
+
+        /// Publish, moving the charge into the returned handle. `None` when the
+        /// charge does not cover the final CAPACITY.
+        pub fn into_charged_bytes(self) -> Option<bytes::Bytes> {
+            self.0.into_charged_bytes()
+        }
+    }
+
+    /// The PRODUCTION pre-allocation window for plugin-produced replacement
+    /// bodies, bound to an isolated budget.
+    pub struct ResponseBufferTransformWindowProbe<'a>(
+        crate::proxy::response_buffer_budget::ResponseTransformWindow<'a>,
+    );
+
+    impl ResponseBufferTransformWindowProbe<'_> {
+        /// Bytes still reserved by the window.
+        pub fn available_bytes(&self) -> usize {
+            self.0.available_bytes()
+        }
+
+        /// Transfer the blocks covering `data` out of the window and publish it.
+        /// `None` when the producer overran the window (i.e. the per-response
+        /// retained ceiling), which is the fail-closed answer.
+        pub fn charge(&mut self, data: Vec<u8>) -> Option<bytes::Bytes> {
+            self.0.charge(data)
         }
     }
 
