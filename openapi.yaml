@@ -24296,10 +24296,12 @@ components:
                 Durable mode rejects `wait_for_async_insert` values that disable
                 persistence waits (`0`, `false`, `no`, `off`) unless
                 `allow_lossy_async_insert` is true. Recommended durable settings
-                use `async_insert=1` with `wait_for_async_insert=1`. When
-                `async_insert` is enabled and the wait setting is omitted, the
-                sink pins `wait_for_async_insert=1` rather than inheriting the
-                ClickHouse user/profile default.
+                use `async_insert=1` with `wait_for_async_insert=1`. Whenever
+                the wait setting is omitted, the sink pins
+                `wait_for_async_insert=1` on every durable request rather than
+                inheriting a ClickHouse user/profile default, including one
+                that enables `async_insert` while disabling the persistence
+                wait.
 
                 Credential-bearing parameter names are rejected: the exact names
                 `user`, `password`, `access_token`, and `session_id`, plus any

@@ -9875,4 +9875,8 @@ fn observability_sink_endpoint_schemas_document_credential_redaction() {
         params.contains("/redacted"),
         "insert_query_params description must document the redacted diagnostic form: {params}"
     );
+    assert!(
+        params.contains("every durable request") && params.contains("user/profile default"),
+        "insert_query_params description must document the profile-default durability pin: {params}"
+    );
 }

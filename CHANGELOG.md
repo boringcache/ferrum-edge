@@ -72,6 +72,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Durable `api_chargeback_sink` ClickHouse requests now pin
+  `wait_for_async_insert=1` whenever the setting is omitted, even when Ferrum
+  also omits `async_insert`. This prevents a ClickHouse user/profile default
+  from turning an acknowledged export into fire-and-forget buffering before
+  Ferrum advances or deletes durable spool state (#3040). The explicit
+  `allow_lossy_async_insert` opt-in remains available for operators that accept
+  that loss mode.
+
 - H1/H2 WebSocket backend dials now use the effective proxy of the target they
   are actually dialing (#2416). The WebSocket branch previously received only
   the retry-capped base proxy: retry rotation moved the URL, the admission
