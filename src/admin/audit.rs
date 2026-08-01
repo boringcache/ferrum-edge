@@ -746,7 +746,7 @@ pub async fn admit_security_sensitive_event(
     let join = tokio::task::spawn_blocking(move || append_local_fallback_event(&dir, &event)).await;
     match join {
         Ok(Ok(())) => Ok(AuditAdmitSink::LocalFallback),
-        Ok(Err(_error)) | Err(_) => {
+        Ok(Err(_)) | Err(_) => {
             error!(
                 audit_event_id = %event_id,
                 surface = "audit_security_admit_local_fallback",
