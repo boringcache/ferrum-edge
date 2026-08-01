@@ -4321,6 +4321,230 @@ async fn test_anthropic_late_translation_failure_is_rejected_before_dispatch() {
 }
 
 // ---------------------------------------------------------------------------
+// Construction-side bounding of the buffered normalizer (GHSA-pwcm-6rh8-f2gh).
+//
+// The buffered path used to hand the streaming normalizer the WHOLE body in one
+// `on_chunk`, which accumulates the complete normalized stream in an ordinary
+// `String` and only then returns it — a full attacker-amplified replacement
+// built before the ceiling-bounded sink saw a byte. It now drives the same
+// normalizer in fixed-size slices, so these tests pin that the output is still
+// exactly what the streaming path produces across a body large enough to span
+// several slices.
+// ---------------------------------------------------------------------------
+
+/// An Anthropic SSE stream well past the buffered slice size, so the buffered
+/// normalizer must cross slice boundaries mid-event.
+fn long_anthropic_sse(delta_events: usize) -> String {
+    let mut sse = String::new();
+    sse.push_str("event: message_start\n");
+    sse.push_str(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_long\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+    );
+    sse.push_str("event: content_block_start\n");
+    sse.push_str(
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    );
+    for index in 0..delta_events {
+        sse.push_str("event: content_block_delta\n");
+        sse.push_str(&format!(
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"token-{index}-padding-padding-padding\"}}}}\n\n"
+        ));
+    }
+    sse.push_str("event: content_block_stop\n");
+    sse.push_str("data: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
+    sse.push_str("event: message_delta\n");
+    sse.push_str(
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":12}}\n\n",
+    );
+    sse.push_str("event: message_stop\n");
+    sse.push_str("data: {\"type\":\"message_stop\"}\n\n");
+    sse
+}
+
+#[tokio::test]
+async fn test_buffered_normalizer_matches_streaming_across_slice_boundaries() {
+    let body = long_anthropic_sse(600);
+    assert!(
+        body.len() > 64 * 1024,
+        "the fixture must span several buffered slices, got {} bytes",
+        body.len()
+    );
+
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+
+    let mut buffered_ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut buffered_ctx, &mut headers).await;
+    let buffered = plugin
+        .normalize_response_body_with_context(
+            &mut buffered_ctx,
+            200,
+            body.as_bytes(),
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("a long Anthropic SSE body must still normalize");
+    let buffered = String::from_utf8(buffered).unwrap();
+
+    let mut streaming_ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut streaming_ctx, &mut headers).await;
+    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+        .response_stream_inspector(&streaming_ctx, 200, Some("text/event-stream"))
+        .expect("inspector should be created");
+    let mut collected = Vec::new();
+    for chunk in body.as_bytes().chunks(4096) {
+        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let streamed = String::from_utf8(collected).unwrap();
+
+    assert_eq!(
+        strip_created(&buffered),
+        strip_created(&streamed),
+        "slicing the buffered body must not change the normalized stream"
+    );
+    assert!(buffered.contains("token-599-padding"));
+    assert!(buffered.trim_end().ends_with("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn test_upstream_error_envelope_is_serialized_through_the_bound() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    // Two case-variant Content-Encoding headers are rejected before decoding,
+    // and the diagnostic becomes the client-visible SSE error envelope.
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    response_headers.insert("Content-Encoding".to_string(), "br".to_string());
+
+    let out = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            b"data: {}\n\n",
+            Some("text/event-stream"),
+            &response_headers,
+        )
+        .await
+        .expect("an unusable content-encoding must produce the error envelope");
+    let out = String::from_utf8(out).unwrap();
+    assert_eq!(
+        out,
+        "data: {\"error\":{\"message\":\"multiple case-variant Content-Encoding headers\",\"type\":\"upstream_error\"}}\n\ndata: [DONE]\n\n",
+        "the envelope written through the sink must be byte-identical to the \
+         document it replaced"
+    );
+
+    // The same envelope is refused (leaving the response alone) when the
+    // response's retained ceiling cannot hold it, rather than being built first
+    // and measured after.
+    let mut tiny = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut tiny, &mut headers).await;
+    tiny.max_response_body_size_bytes = 8;
+    assert!(
+        plugin
+            .normalize_response_body_with_context(
+                &mut tiny,
+                200,
+                b"data: {}\n\n",
+                Some("text/event-stream"),
+                &response_headers,
+            )
+            .await
+            .is_none(),
+        "an envelope larger than the retained ceiling must be refused during \
+         construction"
+    );
+}
+
+/// A route-effective retained ceiling BELOW the buffered slice size.
+///
+/// Slicing the input at a constant only bounds the input; the normalized
+/// expansion of one slice is still unbounded by this response's ceiling. The
+/// accumulator itself is now the bound, so a normalization whose output crosses
+/// a small route ceiling is refused while it is being written — and a ceiling
+/// that comfortably holds the same output still produces the exact bytes
+/// (GHSA-pwcm-6rh8-f2gh).
+#[tokio::test]
+async fn test_buffered_normalizer_is_bounded_by_a_route_ceiling_below_the_slice_size() {
+    let body = long_anthropic_sse(600);
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+
+    let mut roomy = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut roomy, &mut headers).await;
+    let normalized = plugin
+        .normalize_response_body_with_context(
+            &mut roomy,
+            200,
+            body.as_bytes(),
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("an ample ceiling must still normalize");
+    assert!(
+        normalized.len() > 8 * 1024,
+        "the fixture must normalize to more than the small ceiling below, got {}",
+        normalized.len()
+    );
+
+    for ceiling in [1usize, 512, 8 * 1024, 16 * 1024] {
+        let mut ctx = post_ctx(&claude);
+        let mut headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        ctx.max_response_body_size_bytes = ceiling;
+        assert!(
+            plugin
+                .normalize_response_body_with_context(
+                    &mut ctx,
+                    200,
+                    body.as_bytes(),
+                    Some("text/event-stream"),
+                    &HashMap::new(),
+                )
+                .await
+                .is_none(),
+            "a normalization larger than a {ceiling}-byte retained ceiling must be \
+             refused, including ceilings below the buffered slice size"
+        );
+    }
+
+    // A ceiling that exactly covers the normalized output still admits it, so
+    // the refusals above are the bound and not an unconditional failure.
+    let mut exact = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut exact, &mut headers).await;
+    exact.max_response_body_size_bytes = normalized.len();
+    let admitted = plugin
+        .normalize_response_body_with_context(
+            &mut exact,
+            200,
+            body.as_bytes(),
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("a ceiling equal to the output must admit it");
+    let admitted_text = std::str::from_utf8(&admitted).expect("normalized SSE must be UTF-8");
+    let normalized_text = std::str::from_utf8(&normalized).expect("normalized SSE must be UTF-8");
+    assert_eq!(
+        strip_created(admitted_text),
+        strip_created(normalized_text),
+        "bounding the accumulator must not change the normalized bytes \
+         (modulo the per-instance created epoch)"
+    );
+}
+
 // Final provider boundary (GHSA-xhp5-hqj8-3mwg)
 //
 // `ai_stream_router` claims at priority 2984 while the generic

@@ -14645,6 +14645,7 @@ components:
         - client_disconnect
         - protocol_error
         - response_body_too_large
+        - gateway_buffer_capacity
         - request_body_too_large
         - connection_pool_error
         - port_exhaustion
@@ -14660,6 +14661,14 @@ components:
         terminal gateway decisions taken before any backend dial (for example
         an unsupportable backend TLS SNI override) and is intentionally not a
         connection error, so retry policies do not fire.
+        `gateway_buffer_capacity` is the gateway's process-wide budget for
+        *retained* (buffered) response bodies refusing another response: the
+        backend answered correctly and within every configured per-response
+        ceiling, so the refusal is gateway-local transient capacity. It is
+        health-neutral (no circuit-breaker, passive-health, or
+        adaptive-concurrency effect) and not retried, and it surfaces as HTTP
+        `503` or gRPC `RESOURCE_EXHAUSTED` — never as a backend `502` /
+        `response_body_too_large`.
 
     DisconnectCause:
       type: string
