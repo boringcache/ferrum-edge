@@ -39,7 +39,6 @@ fn challenge() -> AcmeDns01ChallengeRecord {
         key_authorization: "test-token.test-thumbprint".to_string(),
     }
 }
-
 /// Write an executable hook that sleeps and *then* creates `marker`.
 ///
 /// The marker is the side effect under test: if it exists, the hook ran to
@@ -151,4 +150,3 @@ async fn dropping_a_dns01_hook_future_terminates_the_child() {
         "a dropped DNS-01 hook future must not leave a child that completes its side effect"
     );
 }
-
