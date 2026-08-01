@@ -5,6 +5,14 @@ pub struct ControllerMetrics {
     pub full_syncs: AtomicU64,
     pub errors: AtomicU64,
     pub last_reconcile_duration_ms: AtomicU64,
+    /// Rotating Gateway API status-plan cursor (#2397).
+    ///
+    /// Advanced after a successful budgeted planning pass when the update plan
+    /// is empty (fairness must still progress), or after a successful
+    /// status-patch batch on the serialized reconcile path. Patch errors and
+    /// batch timeouts leave the cursor unchanged so the same bounded window is
+    /// retried on the next reconcile.
+    pub gateway_api_status_plan_cursor: AtomicU64,
     /// Reflector generations restarted because a watch scope produced no event
     /// for the configured idle window (`FERRUM_K8S_WATCH_IDLE_RELIST_SECS`), or
     /// because a replacement generation never finished its initial list.
@@ -29,6 +37,7 @@ impl ControllerMetrics {
             full_syncs: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             last_reconcile_duration_ms: AtomicU64::new(0),
+            gateway_api_status_plan_cursor: AtomicU64::new(0),
             watch_idle_relists: AtomicU64::new(0),
         }
     }

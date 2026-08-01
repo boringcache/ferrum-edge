@@ -72,6 +72,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Gateway API and Istio status planning now build immutable per-reconcile
+  indexes and reuse one primary translation/materialization (plus skip errors)
+  instead of retranslating a filtered snapshot once per status object, and
+  borrow included `K8sObject` values rather than deep-cloning `spec`/`status`
+  JSON (#2397). Both paths share that translation/index snapshot; only Gateway
+  API status planning applies the fair deterministic 256-candidate rotating
+  work budget *before* expensive per-object status work so the cap bounds CPU
+  as well as API writes. Istio status planning remains unlimited
+  (`StatusPlanBudget::unlimited(0)`). Fail-closed validation and status parity
+  for every supported Istio/Gateway resource are preserved.
 - Shared `BatchingLogger` flush/retry/fallback now Arc-shares one immutable
   batch payload (`Arc<Vec<T>>`) across every delivery attempt and the optional
   failed-batch hook instead of deep-cloning owned records on each non-final
