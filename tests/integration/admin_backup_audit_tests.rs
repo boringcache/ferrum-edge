@@ -58,7 +58,10 @@ impl<'a> MakeWriter<'a> for SharedBackupAuditLogWriter {
     }
 }
 
-fn capture_backup_audit_logs() -> (SharedBackupAuditLogWriter, tracing::subscriber::DefaultGuard) {
+fn capture_backup_audit_logs() -> (
+    SharedBackupAuditLogWriter,
+    tracing::subscriber::DefaultGuard,
+) {
     let writer = SharedBackupAuditLogWriter::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
@@ -250,10 +253,7 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
 
 fn sample_cached_config() -> GatewayConfig {
     let mut credentials = HashMap::new();
-    credentials.insert(
-        "jwt".to_string(),
-        json!([{ "secret": JWT_CANARY }]),
-    );
+    credentials.insert("jwt".to_string(), json!([{ "secret": JWT_CANARY }]));
     GatewayConfig {
         version: "1".to_string(),
         proxies: vec![create_test_proxy("p1", "/cached")],
@@ -323,6 +323,17 @@ async fn get_backup_with_cookie(
     request_id: Option<&str>,
     cookie: Option<&str>,
 ) -> (u16, Value, Option<String>) {
+    get_backup_with_headers(base, path, bearer, request_id, cookie, None).await
+}
+
+async fn get_backup_with_headers(
+    base: &str,
+    path: &str,
+    bearer: &str,
+    request_id: Option<&str>,
+    cookie: Option<&str>,
+    namespace: Option<&str>,
+) -> (u16, Value, Option<String>) {
     let mut req = reqwest::Client::new()
         .get(format!("{base}{path}"))
         .bearer_auth(bearer);
@@ -331,6 +342,9 @@ async fn get_backup_with_cookie(
     }
     if let Some(cookie) = cookie {
         req = req.header("Cookie", cookie);
+    }
+    if let Some(namespace) = namespace {
+        req = req.header("X-Ferrum-Namespace", namespace);
     }
     let response = req.send().await.expect("GET backup");
     let status = response.status().as_u16();
@@ -445,8 +459,13 @@ async fn backup_unknown_resources_token_is_rejected_without_persisting_canary() 
     let admin = token("backup-admin", Some("admin"));
     let canary = "canary-secret-token-never-in-audit-or-logs";
 
-    let (status, body, _) =
-        get_backup(&base, &format!("/backup?resources=proxies,{canary}"), &admin, None).await;
+    let (status, body, _) = get_backup(
+        &base,
+        &format!("/backup?resources=proxies,{canary}"),
+        &admin,
+        None,
+    )
+    .await;
     assert_eq!(status, 400, "unknown resources body: {body:?}");
     assert_eq!(body["error"], "Unsupported backup resource filter");
     assert!(!body.to_string().contains(canary));
@@ -461,6 +480,133 @@ async fn backup_unknown_resources_token_is_rejected_without_persisting_canary() 
     let rendered = serde_json::to_string(&audit_body).unwrap();
     assert!(!rendered.contains(canary));
     assert_no_secret_canaries(&audit_body);
+}
+
+#[tokio::test]
+async fn backup_key_only_resources_is_rejected_without_widening() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("backup-admin", Some("admin"));
+
+    let (status, body, _) = get_backup(&base, "/backup?resources", &admin, None).await;
+    assert_eq!(status, 400, "key-only resources body: {body:?}");
+    assert_eq!(body["error"], "Unsupported backup resource filter");
+    assert!(body.get("proxies").is_none(), "must not emit a full export");
+
+    let (audit_status, audit_body) = get_audit(&base, &admin).await;
+    assert_eq!(audit_status, 200);
+    assert_eq!(audit_body["total"], 1);
+    let event = &audit_body["items"][0];
+    assert_eq!(event["outcome"], "validation_failed");
+    assert_eq!(event["diff"]["failure_category"], "validation_failed");
+    assert_eq!(event["diff"]["resources"], "invalid");
+    assert_no_secret_canaries(&audit_body);
+}
+
+#[tokio::test]
+async fn backup_duplicate_resources_is_rejected_without_persisting_tokens() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("backup-admin", Some("admin"));
+    let canary = "canary-secret-token-never-in-audit-or-logs";
+
+    let (status, body, _) = get_backup(
+        &base,
+        &format!("/backup?resources=proxies&resources={canary}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, 400, "duplicate resources body: {body:?}");
+    assert_eq!(body["error"], "Unsupported backup resource filter");
+    assert!(!body.to_string().contains(canary));
+    assert!(body.get("proxies").is_none());
+
+    let (audit_status, audit_body) = get_audit(&base, &admin).await;
+    assert_eq!(audit_status, 200);
+    assert_eq!(audit_body["total"], 1);
+    let event = &audit_body["items"][0];
+    assert_eq!(event["outcome"], "validation_failed");
+    assert_eq!(event["diff"]["resources"], "invalid");
+    let rendered = serde_json::to_string(&audit_body).unwrap();
+    assert!(!rendered.contains(canary));
+    assert_no_secret_canaries(&audit_body);
+}
+
+#[tokio::test]
+async fn backup_allowlisted_resources_filter_still_exports() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("backup-admin", Some("admin"));
+
+    let (status, body, _) =
+        get_backup(&base, "/backup?resources=proxies,consumers", &admin, None).await;
+    assert_eq!(status, 200, "allow-listed filter body: {body:?}");
+    assert!(body.get("proxies").is_some());
+    assert!(body.get("consumers").is_some());
+    assert!(body.get("upstreams").is_none() || body["upstreams"].as_array().unwrap().is_empty());
+
+    let (audit_status, audit_body) = get_audit(&base, &admin).await;
+    assert_eq!(audit_status, 200);
+    assert_eq!(audit_body["total"], 1);
+    let event = &audit_body["items"][0];
+    assert_eq!(event["outcome"], "success");
+    assert_eq!(event["diff"]["resources"], json!(["consumers", "proxies"]));
+    assert_no_secret_canaries(&audit_body);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn backup_invalid_namespace_is_audited_in_default_namespace_without_echoing() {
+    let (logs, _guard) = capture_backup_audit_logs();
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("backup-admin", Some("admin"));
+    let hostile_ns = "hostile-ns/../canary-secret-namespace-never-persist!!";
+
+    let (status, body, _) = get_backup_with_headers(
+        &base,
+        "/backup",
+        &admin,
+        Some("ns-invalid-1"),
+        Some(COOKIE_CANARY),
+        Some(hostile_ns),
+    )
+    .await;
+    assert_eq!(status, 400, "invalid namespace body: {body:?}");
+    assert!(body.get("proxies").is_none());
+    // Preserve the existing HTTP rejection shape (may mention validation detail).
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Invalid X-Ferrum-Namespace"),
+        "unexpected rejection body: {body:?}"
+    );
+
+    let (audit_status, audit_body) = get_audit(&base, &admin).await;
+    assert_eq!(audit_status, 200);
+    assert_eq!(audit_body["total"], 1);
+    let event = &audit_body["items"][0];
+    assert_eq!(event["namespace"], ferrum_edge::config::types::DEFAULT_NAMESPACE);
+    assert_eq!(event["resource_id"], ferrum_edge::config::types::DEFAULT_NAMESPACE);
+    assert_eq!(event["outcome"], "validation_failed");
+    assert_eq!(event["diff"]["failure_category"], "validation_failed");
+    assert_eq!(event["diff"]["namespace_status"], "invalid");
+    assert_eq!(event["diff"]["resources"], "all");
+    assert_eq!(event["request_id"], "ns-invalid-1");
+    let rendered = serde_json::to_string(&audit_body).unwrap();
+    assert!(
+        !rendered.contains(hostile_ns),
+        "raw invalid namespace leaked into audit: {rendered}"
+    );
+    assert_no_secret_canaries(&audit_body);
+
+    let captured = logs.contents();
+    assert_logs_omit_hostile_canaries(&captured, &[hostile_ns, &admin]);
 }
 
 #[tokio::test]
@@ -556,7 +702,10 @@ async fn backup_paths_omit_hostile_canaries_from_tracing_output() {
         Some(COOKIE_CANARY),
     )
     .await;
-    assert_eq!(validation_status, 400, "validation body: {validation_body:?}");
+    assert_eq!(
+        validation_status, 400,
+        "validation body: {validation_body:?}"
+    );
     assert!(!validation_body.to_string().contains(RESOURCES_CANARY));
 
     // --- audit-sink failure (no DB + symlink fallback) before releasing body ---
@@ -598,9 +747,8 @@ async fn backup_paths_omit_hostile_canaries_from_tracing_output() {
     {
         assert!(
             captured.contains("audit_security_admit_local_fallback")
-                || captured.contains(
-                    "Failed to admit security-sensitive audit event to local fallback"
-                ),
+                || captured
+                    .contains("Failed to admit security-sensitive audit event to local fallback"),
             "expected audit-sink failure surface in logs:\n{captured}"
         );
         assert!(

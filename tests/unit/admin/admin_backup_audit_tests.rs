@@ -1,7 +1,7 @@
 //! Unit tests for backup security-audit helpers and redaction canaries.
 
 use ferrum_edge::admin::audit::{
-    self, AuditActor, AuditAdmitSink, AuditEvent, AuditRequestContext, AUDIT_REQUEST_ID_MAX_LEN,
+    self, AUDIT_REQUEST_ID_MAX_LEN, AuditActor, AuditAdmitSink, AuditEvent, AuditRequestContext,
     BACKUP_RESOURCES_INVALID_SENTINEL, append_local_fallback_event, backup_failure_diff,
     backup_resources_audit_value, backup_success_diff, extract_or_generate_request_id,
     list_local_fallback_events,
@@ -52,7 +52,10 @@ impl<'a> MakeWriter<'a> for SharedBackupAuditLogWriter {
     }
 }
 
-fn capture_backup_audit_logs() -> (SharedBackupAuditLogWriter, tracing::subscriber::DefaultGuard) {
+fn capture_backup_audit_logs() -> (
+    SharedBackupAuditLogWriter,
+    tracing::subscriber::DefaultGuard,
+) {
     let writer = SharedBackupAuditLogWriter::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
@@ -151,6 +154,20 @@ fn backup_resources_audit_value_never_persists_unknown_raw_token() {
 }
 
 #[test]
+fn backup_namespace_validation_failure_diff_is_fixed_cardinality() {
+    let diff = audit::backup_namespace_validation_failure_diff(json!("all"));
+    assert_eq!(diff["failure_category"], "validation_failed");
+    assert_eq!(diff["resources"], "all");
+    assert_eq!(
+        diff["namespace_status"],
+        audit::BACKUP_NAMESPACE_STATUS_INVALID
+    );
+    assert!(diff.get("namespace").is_none());
+    assert!(diff.get("error").is_none());
+    assert!(diff.get("message").is_none());
+}
+
+#[test]
 fn request_id_accepts_safe_header_and_rejects_hostile_values() {
     let mut headers = HeaderMap::new();
     headers.insert("x-request-id", "req-abc_123.OK:1".parse().unwrap());
@@ -222,7 +239,11 @@ fn local_fallback_persists_event_without_secret_canaries() {
         backup_failure_diff(audit::failure_category::FORBIDDEN, json!("all")),
     )
     .with_outcome(audit::outcome::DENIED);
-    assert!(!serde_json::to_string(&event).unwrap().contains(COOKIE_CANARY));
+    assert!(
+        !serde_json::to_string(&event)
+            .unwrap()
+            .contains(COOKIE_CANARY)
+    );
 
     append_local_fallback_event(dir.path(), &event).expect("append");
     let listed = list_local_fallback_events(dir.path()).expect("list");
@@ -480,7 +501,10 @@ fn local_fallback_windows_replace_uses_movefileex_replace_existing() {
         .split("fn replace_local_fallback_file_windows")
         .nth(1)
         .unwrap_or("");
-    let windows_body = windows_fn.split("fn write_temp_fallback_file").next().unwrap_or("");
+    let windows_body = windows_fn
+        .split("fn write_temp_fallback_file")
+        .next()
+        .unwrap_or("");
     assert!(
         !windows_body.contains("fs::rename("),
         "Windows replace must not call std::fs::rename"
@@ -576,7 +600,8 @@ async fn admit_security_sensitive_failure_logs_omit_hostile_canaries() {
     assert_logs_omit_hostile_canaries(&captured);
     assert!(
         captured.contains("audit_security_admit_local_fallback")
-            || captured.contains("Failed to admit security-sensitive audit event to local fallback"),
+            || captured
+                .contains("Failed to admit security-sensitive audit event to local fallback"),
         "expected local-fallback admit failure surface:\n{captured}"
     );
     assert!(

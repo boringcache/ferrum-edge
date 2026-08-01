@@ -54,6 +54,9 @@ pub const BACKUP_AUDIT_RESOURCE_NAMES: &[&str] = &[
 ];
 /// Fixed non-sensitive sentinel when a filter contained unknown tokens.
 pub const BACKUP_RESOURCES_INVALID_SENTINEL: &str = "invalid";
+/// Fixed-cardinality marker when `X-Ferrum-Namespace` failed validation on an
+/// authenticated backup attempt. The raw invalid namespace is never stored.
+pub const BACKUP_NAMESPACE_STATUS_INVALID: &str = "invalid";
 
 /// Fixed-cardinality outcomes stored on [`AuditEvent::outcome`].
 ///
@@ -658,6 +661,19 @@ pub fn backup_failure_diff(category: BackupFailureCategory, resources: Value) ->
     })
 }
 
+/// Backup attempt rejected because `X-Ferrum-Namespace` failed validation.
+///
+/// Persisted under the valid default audit namespace so the event remains
+/// queryable via `GET /audit`. Carries only fixed-cardinality metadata — never
+/// the raw invalid namespace string.
+pub fn backup_namespace_validation_failure_diff(resources: Value) -> Value {
+    json!({
+        "failure_category": BackupFailureCategory::ValidationFailed.as_str(),
+        "resources": resources,
+        "namespace_status": BACKUP_NAMESPACE_STATUS_INVALID,
+    })
+}
+
 /// Whether `name` is a canonical backup resource filter token.
 pub fn is_canonical_backup_resource(name: &str) -> bool {
     BACKUP_AUDIT_RESOURCE_NAMES.contains(&name)
@@ -737,7 +753,9 @@ pub async fn admit_security_sensitive_event(
                 detail_withheld = true,
                 "Failed to admit security-sensitive audit event to local fallback"
             );
-            Err(anyhow!("security-sensitive audit event could not be admitted"))
+            Err(anyhow!(
+                "security-sensitive audit event could not be admitted"
+            ))
         }
     }
 }
@@ -825,8 +843,8 @@ fn acquire_local_fallback_process_lock() -> Result<MutexGuard<'static, ()>, anyh
 }
 
 /// Test seam: hold the in-process fallback mutex without waiting.
-pub(crate) fn hold_local_fallback_process_lock_for_test(
-) -> Result<MutexGuard<'static, ()>, anyhow::Error> {
+pub(crate) fn hold_local_fallback_process_lock_for_test()
+-> Result<MutexGuard<'static, ()>, anyhow::Error> {
     acquire_local_fallback_process_lock()
 }
 
@@ -908,7 +926,9 @@ fn acquire_fallback_file_lock(lock_path: &Path) -> Result<FallbackFileLock, anyh
         .map_err(|error| anyhow!("failed to open audit local fallback lock: {error}"))?;
     let lock_metadata = file.metadata()?;
     if !lock_metadata.file_type().is_file() {
-        return Err(anyhow!("audit local fallback lock file must be a regular file"));
+        return Err(anyhow!(
+            "audit local fallback lock file must be a regular file"
+        ));
     }
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
 
@@ -959,7 +979,9 @@ fn acquire_fallback_file_lock(lock_path: &Path) -> Result<FallbackFileLock, anyh
         .map_err(|error| anyhow!("failed to open audit local fallback lock: {error}"))?;
     let lock_metadata = file.metadata()?;
     if !lock_metadata.file_type().is_file() {
-        return Err(anyhow!("audit local fallback lock file must be a regular file"));
+        return Err(anyhow!(
+            "audit local fallback lock file must be a regular file"
+        ));
     }
     Ok(FallbackFileLock { _file: file })
 }
@@ -975,10 +997,14 @@ fn read_local_fallback_events_unlocked(path: &Path) -> Result<Vec<AuditEvent>, a
     match fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
-                return Err(anyhow!("audit local fallback data file must not be a symlink"));
+                return Err(anyhow!(
+                    "audit local fallback data file must not be a symlink"
+                ));
             }
             if !meta.file_type().is_file() {
-                return Err(anyhow!("audit local fallback data file must be a regular file"));
+                return Err(anyhow!(
+                    "audit local fallback data file must be a regular file"
+                ));
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1118,10 +1144,7 @@ fn write_temp_fallback_file(tmp: &Path, body: &[u8]) -> Result<(), anyhow::Error
     }
     #[cfg(not(unix))]
     {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(tmp)?;
+        let mut file = OpenOptions::new().write(true).create_new(true).open(tmp)?;
         file.write_all(body)?;
         file.sync_all()?;
         Ok(())

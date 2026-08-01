@@ -3879,10 +3879,14 @@ paths:
             Comma-separated list of resource types to include.
             Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`.
             When omitted, all resource types are included.
-            Unknown tokens are rejected with `400` and a static error message
-            that does not echo the rejected token; they are never persisted in
-            audit events (unknown filters are recorded as the fixed `invalid`
-            sentinel only).
+            The parameter must appear at most once as `resources=<csv>`. A
+            key-only `resources` (no `=`), duplicate/ambiguous occurrences, or
+            other structurally malformed forms are rejected with `400` and the
+            same static error message — they never widen to an unfiltered
+            export. Unknown tokens are likewise rejected with `400` and a
+            static error message that does not echo the rejected token; they
+            are never persisted in audit events (malformed or unknown filters
+            are recorded as the fixed `invalid` sentinel only).
             Including `api_specs` also requires `proxies`, `upstreams`, and
             `plugin_configs` so the export stays directly restorable (owning
             proxy plus generated upstream/plugin relationships). Otherwise the

@@ -2224,7 +2224,33 @@ pub async fn handle_admin_request(
     // Extract namespace from X-Ferrum-Namespace header (defaults to "ferrum")
     let namespace = match extract_namespace(req.headers()) {
         Ok(ns) => ns,
-        Err(resp) => return Ok(resp),
+        Err(resp) => {
+            // Authenticated GET /backup must still leave a queryable security
+            // record when the namespace header fails validation. Store under the
+            // valid default audit namespace with fixed-cardinality metadata only
+            // — never the raw invalid namespace. Audit failure must not change
+            // the original HTTP rejection.
+            if method == Method::GET && path == "/backup" {
+                let resources = backup_resources_query_audit_value(query.as_deref());
+                let event = audit::AuditEvent::new(
+                    &auth,
+                    "backup",
+                    "gateway_config",
+                    crate::config::types::DEFAULT_NAMESPACE,
+                    crate::config::types::DEFAULT_NAMESPACE,
+                    audit::backup_namespace_validation_failure_diff(resources),
+                )
+                .with_request_context(&audit_request_ctx)
+                .with_outcome(audit::outcome::VALIDATION_FAILED);
+                audit::record_backup_attempt_best_effort(
+                    state.db.as_ref(),
+                    &event,
+                    state.admin_audit_fallback_dir.as_deref(),
+                )
+                .await;
+            }
+            return Ok(resp);
+        }
     };
 
     // api-specs routes manage their own body reading (configurable limit,
@@ -2243,9 +2269,7 @@ pub async fn handle_admin_request(
         && let Some(resp) = enforce_namespace_claim(&auth, &namespace, &path)
     {
         if matches!(segments_peek.as_slice(), ["backup"]) {
-            let resources = audit::backup_resources_audit_value(
-                parse_backup_resources(query.as_deref()).as_ref(),
-            );
+            let resources = backup_resources_query_audit_value(query.as_deref());
             let event = audit::AuditEvent::new(
                 &auth,
                 "backup",
@@ -2633,9 +2657,7 @@ pub async fn handle_admin_request(
         (Method::GET, ["backup"]) => {
             // Backup returns unredacted credentials and consul tokens — Admin only.
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
-                let resources = audit::backup_resources_audit_value(
-                    parse_backup_resources(query.as_deref()).as_ref(),
-                );
+                let resources = backup_resources_query_audit_value(query.as_deref());
                 let event = audit::AuditEvent::new(
                     &auth,
                     "backup",
@@ -6837,16 +6859,34 @@ async fn audit_backup_failure(
     category: audit::BackupFailureCategory,
     outcome: audit::AuditOutcome,
 ) {
+    audit_backup_failure_with_resources(
+        state,
+        actor,
+        namespace,
+        request_ctx,
+        audit::backup_resources_audit_value(resource_filter),
+        category,
+        outcome,
+    )
+    .await;
+}
+
+async fn audit_backup_failure_with_resources(
+    state: &AdminState,
+    actor: &AuditActor,
+    namespace: &str,
+    request_ctx: &audit::AuditRequestContext,
+    resources: serde_json::Value,
+    category: audit::BackupFailureCategory,
+    outcome: audit::AuditOutcome,
+) {
     let event = audit::AuditEvent::new(
         actor,
         "backup",
         "gateway_config",
         namespace,
         namespace,
-        audit::backup_failure_diff(
-            category,
-            audit::backup_resources_audit_value(resource_filter),
-        ),
+        audit::backup_failure_diff(category, resources),
     )
     .with_request_context(request_ctx)
     .with_outcome(outcome);
@@ -6856,6 +6896,17 @@ async fn audit_backup_failure(
         state.admin_audit_fallback_dir.as_deref(),
     )
     .await;
+}
+
+/// Canonical audit `resources` value from the raw backup query string.
+///
+/// Absent → `"all"`; structurally malformed or unknown tokens → `"invalid"`;
+/// allow-listed names → sorted array. Never persists raw hostile tokens.
+fn backup_resources_query_audit_value(query: Option<&str>) -> serde_json::Value {
+    match parse_backup_resources(query) {
+        Ok(ref filter) => audit::backup_resources_audit_value(filter.as_ref()),
+        Err(_) => json!(audit::BACKUP_RESOURCES_INVALID_SENTINEL),
+    }
 }
 
 /// Outcome of a database-backed export that includes the versioned
@@ -7072,7 +7123,28 @@ async fn handle_backup(
     namespace: &str,
     request_ctx: &audit::AuditRequestContext,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let resource_filter = parse_backup_resources(query);
+    let resource_filter = match parse_backup_resources(query) {
+        Ok(filter) => filter,
+        Err(_) => {
+            // Key-only / duplicate / ambiguous `resources` must fail closed with
+            // the same static no-echo client text and fixed `invalid` audit
+            // sentinel as unknown tokens — never widen to an unfiltered export.
+            audit_backup_failure_with_resources(
+                state,
+                actor,
+                namespace,
+                request_ctx,
+                json!(audit::BACKUP_RESOURCES_INVALID_SENTINEL),
+                audit::failure_category::VALIDATION_FAILED,
+                audit::outcome::VALIDATION_FAILED,
+            )
+            .await;
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR}),
+            ));
+        }
+    };
     // Reject unknown resources= tokens fail-closed with static client text
     // that never echoes the rejected token.
     if let Err(_error) = validate_backup_resources_allowlist(resource_filter.as_ref()) {
