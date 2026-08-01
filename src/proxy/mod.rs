@@ -1543,8 +1543,17 @@ fn simulate_later_after_proxy_headers(
 
     let mut simulated_ctx = ctx.clone();
     let mut simulated_headers = response_headers.clone();
+    let slice_has_route_response_finalizer = plugins
+        .iter()
+        .any(|plugin| plugin.participates_in_route_response_header_finalization());
     for plugin in plugins {
         plugin.simulate_after_proxy_response_headers(&mut simulated_ctx, &mut simulated_headers);
+    }
+    if slice_has_route_response_finalizer {
+        crate::plugins::utils::route_header_transform::finalize_route_override_response_headers(
+            &mut simulated_ctx,
+            &mut simulated_headers,
+        );
     }
     LaterHeaderSimulation {
         cache_control_no_transform: headers_have_cache_control_directive(
@@ -1635,6 +1644,22 @@ pub(crate) fn refine_stream_response_for_content_type(
         });
         return saw_retry_release_plugin && all_active_plugins_release;
     }
+    // Mirror proxy core's chain-level route-header finalization
+    // (GHSA-3xxr-xhhj-9962) inside this simulation. Enabled transformer
+    // instances no longer apply the matched route list themselves, so without
+    // this the accumulated map would omit route-level writes that a LATER
+    // plugin reads off it — `compression` (priority 4050, after
+    // `response_transformer` at 4000) releases a buffered body once the final
+    // headers carry `no-transform` or a strong `ETag`, and the metadata stamp
+    // above covers only the ORIGINAL backend response. `None` when no route
+    // list is published keeps the ordinary path free of the chain scan.
+    let last_route_response_finalizer = if ctx.route_override_response_transform.is_some() {
+        plugins
+            .iter()
+            .rposition(|plugin| plugin.participates_in_route_response_header_finalization())
+    } else {
+        None
+    };
     let all_active_plugins_can_release_before_content_type_rewrite =
         plugins.iter().enumerate().all(|(index, plugin)| {
             let can_release = if plugin.should_buffer_response_body(&simulated_ctx) {
@@ -1668,6 +1693,17 @@ pub(crate) fn refine_stream_response_for_content_type(
                     &mut simulated_ctx,
                     &mut simulated_response_headers,
                 );
+                // Route list applies exactly once, after the last eligible
+                // simulated transformer — same boundary `run_after_proxy_hooks`
+                // uses. Consuming it from `simulated_ctx` also keeps the later
+                // `simulate_later_after_proxy_headers` clones from re-applying
+                // it, matching the live chain.
+                if last_route_response_finalizer == Some(index) {
+                    crate::plugins::utils::route_header_transform::finalize_route_override_response_headers(
+                        &mut simulated_ctx,
+                        &mut simulated_response_headers,
+                    );
+                }
             }
             can_release
         });
@@ -16404,6 +16440,26 @@ fn spawn_detached_rejection_cleanup(
     }));
 }
 
+fn maybe_finalize_route_override_response_headers(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_headers: &mut HashMap<String, String>,
+) {
+    if ctx.route_override_response_transform.is_none() {
+        return;
+    }
+    if !plugins
+        .iter()
+        .any(|plugin| plugin.participates_in_route_response_header_finalization())
+    {
+        return;
+    }
+    crate::plugins::utils::route_header_transform::finalize_route_override_response_headers(
+        ctx,
+        response_headers,
+    );
+}
+
 async fn run_after_proxy_hooks_on_rejection(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -16430,6 +16486,9 @@ async fn run_after_proxy_hooks_on_rejection(
         .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
     let initial_terminal_gateway_deadline =
         ctx.gateway_deadline_response_selected() || deadline_already_elapsed;
+    let last_route_response_finalizer = plugins
+        .iter()
+        .rposition(|plugin| plugin.participates_in_route_response_header_finalization());
     if initial_terminal_gateway_deadline {
         ctx.mark_gateway_deadline_response_selected();
         replace_rejection_with_gateway_deadline(
@@ -16483,6 +16542,9 @@ async fn run_after_proxy_hooks_on_rejection(
                     response_headers,
                 ),
                 None => {
+                    // Commit route policy before detaching remaining hooks so a
+                    // mid-chain deadline cannot drop matched response transforms.
+                    maybe_finalize_route_override_response_headers(plugins, ctx, response_headers);
                     spawn_detached_rejection_cleanup(
                         future,
                         plugins[index + 1..]
@@ -16521,6 +16583,13 @@ async fn run_after_proxy_hooks_on_rejection(
                         response_body.as_deref_mut(),
                         response_headers,
                     );
+                    // Apply route policy onto the committed deadline map when the
+                    // last eligible transformer never ran (GHSA-3xxr-xhhj-9962).
+                    maybe_finalize_route_override_response_headers(
+                        plugins,
+                        ctx,
+                        response_headers,
+                    );
                     spawn_detached_rejection_cleanup(
                         future,
                         plugins[index + 1..]
@@ -16556,6 +16625,13 @@ async fn run_after_proxy_hooks_on_rejection(
         }
         if matches!(&result, PluginResult::Continue) || !plugin.may_replace_rejection_response() {
             ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
+        }
+        if matches!(&result, PluginResult::Continue) && last_route_response_finalizer == Some(index)
+        {
+            crate::plugins::utils::route_header_transform::finalize_route_override_response_headers(
+                ctx,
+                response_headers,
+            );
         }
         match result {
             PluginResult::Continue => {}
@@ -16666,6 +16742,11 @@ async fn run_after_proxy_hooks_on_rejection(
         replace_rejection_with_gateway_deadline(ctx, status_code, response_body, response_headers);
     }
 
+    // Defense in depth: if every eligible transformer was skipped (for example
+    // only response-replacing hooks ran after a terminal deadline), still apply
+    // the matched route list exactly once onto the committed rejection map.
+    maybe_finalize_route_override_response_headers(plugins, ctx, response_headers);
+
     restore_rejection_response_markers(ctx, previous_marker, previous_replaceable_marker);
 }
 
@@ -16697,7 +16778,7 @@ pub(crate) async fn apply_replaceable_after_proxy_hooks_to_rejection(
 /// Deferring matters because several reject-path `after_proxy` hooks consume
 /// one-shot state on their first invocation — `oidc_relying_party` does
 /// `ctx.metadata.remove(SESSION_SET_COOKIE_METADATA_KEY)` to stage the rotated
-/// session cookie, and `response_transformer` does
+/// session cookie, and the chain-level response route-header finalizer does
 /// `ctx.route_override_response_transform.take()`. If `after_proxy` ran once
 /// over the synthetic 2xx and then again here (after `response_headers.clear()`),
 /// that one-shot state would already be gone and could not be re-applied to the
@@ -17442,6 +17523,9 @@ pub(crate) async fn run_after_proxy_hooks(
         );
     }
 
+    let last_route_response_finalizer = plugins
+        .iter()
+        .rposition(|plugin| plugin.participates_in_route_response_header_finalization());
     for (index, plugin) in plugins.iter().enumerate() {
         if plugin.needs_later_response_cache_control_no_transform()
             || plugin.needs_later_response_strong_etag()
@@ -17488,6 +17572,21 @@ pub(crate) async fn run_after_proxy_hooks(
         };
         match result {
             PluginResult::Continue => {
+                // After the last eligible response_transformer static-rule pass,
+                // apply matched route response-header transforms exactly once so
+                // later same-type instances cannot undo route policy
+                // (GHSA-3xxr-xhhj-9962). Subsequent after_proxy plugins still see
+                // the route-final map.
+                if last_route_response_finalizer == Some(index) {
+                    crate::plugins::utils::route_header_transform::finalize_route_override_response_headers(
+                        ctx,
+                        response_headers,
+                    );
+                }
+                // Snapshot the complete phase, including the chain-level route
+                // finalization above. Recording before finalization would omit
+                // route removals/appends from buffered gRPC trailer policy and
+                // deadline provenance.
                 ctx.record_buffered_initial_response_header_plugin(
                     plugin.as_ref(),
                     response_headers,
@@ -19735,7 +19834,10 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
     backend_path_is_policy_bound: bool,
     pass: BackendPathBeforeProxyPass,
 ) -> PluginResult {
-    for plugin in plugins {
+    let last_route_request_finalizer = plugins
+        .iter()
+        .rposition(|plugin| plugin.participates_in_route_request_header_finalization());
+    for (index, plugin) in plugins.iter().enumerate() {
         let deferred =
             backend_path_is_policy_bound && plugin.defer_before_proxy_until_backend_path_resolved();
         let should_run = match pass {
@@ -19758,7 +19860,17 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
         .await
         .into_plugin_result(ctx)
         {
-            PluginResult::Continue => {}
+            PluginResult::Continue => {
+                // After the last eligible request_transformer static-rule pass,
+                // apply matched route request-header transforms exactly once so
+                // later same-type instances cannot undo route policy
+                // (GHSA-3xxr-xhhj-9962).
+                if last_route_request_finalizer == Some(index) {
+                    crate::plugins::utils::route_header_transform::finalize_route_override_request_headers(
+                        ctx, headers,
+                    );
+                }
+            }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 return reject;
             }
@@ -43617,6 +43729,41 @@ mod tests {
             Some(&route_ctx),
             200,
             &binary_headers,
+        ));
+
+        // A route-level `set Cache-Control: no-transform` reaches the final
+        // client-visible headers through the chain-level route finalizer, so
+        // `compression` may release the buffered body — the route-driven twin of
+        // `late_no_transform_plugins` above, where a later static plugin adds the
+        // same directive. The backend response carries neither `no-transform` nor
+        // a strong `ETag`, so `stamp_original_response_metadata` sets no
+        // shortcut key and the directive is observable only through the
+        // simulated header map (GHSA-3xxr-xhhj-9962).
+        let mut route_no_transform_ctx = compression_ctx.clone();
+        route_no_transform_ctx.route_override_response_transform = Some(Arc::new(vec![
+            crate::plugins::utils::route_header_transform::RouteHeaderTransformRule {
+                operation:
+                    crate::plugins::utils::route_header_transform::RouteHeaderTransformOp::Update,
+                key: "cache-control".to_string(),
+                value: Some("no-transform".to_string()),
+            },
+        ]));
+        let route_no_transform_plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(
+                crate::plugins::response_transformer::ResponseTransformer::new(&json!({
+                    "apply_route_overrides": true
+                }))
+                .expect("route override response transformer config should be valid"),
+            ),
+            Arc::new(CompressionPlugin::new(&json!({})).unwrap()),
+        ];
+        assert!(refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &route_no_transform_plugins,
+            Some(&route_no_transform_ctx),
+            200,
+            &json_headers,
         ));
 
         // An already-streaming response stays streaming.
