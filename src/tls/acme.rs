@@ -2454,10 +2454,22 @@ pub(crate) fn commit_final_renewal_publication(
 pub(crate) fn apply_final_renewal_publication(
     outcome: FinalRenewalPublication,
 ) -> Result<Vec<&'static str>, AcmeError> {
+    map_final_renewal_publication_outcome(
+        outcome,
+        crate::tls::source::subscription::request_all_material_set_reloads,
+    )
+}
+
+/// Same routing as [`apply_final_renewal_publication`], but the reload side
+/// effect is supplied by the caller so focused tests can observe whether this
+/// outcome requested reload without registering in the process-global surface
+/// registry (which parallel lib tests also broadcast to).
+pub(crate) fn map_final_renewal_publication_outcome(
+    outcome: FinalRenewalPublication,
+    request_reloads: impl FnOnce() -> Vec<&'static str>,
+) -> Result<Vec<&'static str>, AcmeError> {
     match outcome {
-        FinalRenewalPublication::Complete => {
-            Ok(crate::tls::source::subscription::request_all_material_set_reloads())
-        }
+        FinalRenewalPublication::Complete => Ok(request_reloads()),
         FinalRenewalPublication::OrderCommittedMaterialNotPublished(error) => {
             Err(AcmeError::Write(format!(
                 "ACME order was marked valid but renewed certificate material failed to publish: {error}"
@@ -2465,7 +2477,7 @@ pub(crate) fn apply_final_renewal_publication(
         }
         FinalRenewalPublication::MaterialPublishedOrderNotCommitted(error) => {
             // New material is authoritative even though the Valid write failed.
-            let _ = crate::tls::source::subscription::request_all_material_set_reloads();
+            let _ = request_reloads();
             Err(AcmeError::Write(format!(
                 "renewed certificate material published but marking the ACME order valid failed: {error}"
             )))

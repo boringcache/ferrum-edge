@@ -13,14 +13,16 @@ use std::time::Duration;
 use crate::tls::acme::{
     AcmeCertificateRecord, AcmeCertificateStore, AcmeError, AcmeHttp01ChallengeRecord,
     AcmeHttp01OrderInput, AcmeIssuedCertificateInput, AcmeOrderFinalization, AcmeOrderRecord,
-    AcmeOrderStatus, AcmeOrderStore, FinalRenewalPublication, apply_final_renewal_publication,
+    AcmeOrderStatus, AcmeOrderStore, FinalRenewalPublication,
     commit_final_renewal_publication, has_active_renewal_order,
     inject_final_publication_certificate_write_fault_for_tests,
-    inject_final_publication_order_write_fault_for_tests,
+    inject_final_publication_order_write_fault_for_tests, map_final_renewal_publication_outcome,
 };
 use crate::tls::lease::{RenewalLeaseKeeper, TlsLeaseStore, acme_renewal_lease_name};
 use crate::tls::private_file::PrivateFileFault;
-use crate::tls::source::subscription::{install_force_reload_probe, remove_force_reload_probe};
+use crate::tls::source::subscription::{
+    install_force_reload_probe, remove_force_reload_probe, request_all_material_set_reloads,
+};
 use base64::Engine as _;
 use tempfile::TempDir;
 
@@ -123,6 +125,19 @@ fn assert_no_material_disclosure(message: &str, material: &[&str]) {
     );
 }
 
+/// Observe whether this outcome requested reload through the injected callback
+/// instead of a process-global probe that parallel lib tests can populate.
+fn track_reload_request(
+    outcome: FinalRenewalPublication,
+) -> (bool, Result<Vec<&'static str>, AcmeError>) {
+    let requested = AtomicBool::new(false);
+    let result = map_final_renewal_publication_outcome(outcome, || {
+        requested.store(true, Ordering::SeqCst);
+        request_all_material_set_reloads()
+    });
+    (requested.load(Ordering::SeqCst), result)
+}
+
 /// Happy path: one fenced commit marks the order Valid then publishes
 /// certificate material, and reload is requested.
 #[tokio::test]
@@ -149,7 +164,7 @@ async fn final_publication_commits_order_then_certificate_under_one_lease_fence(
     let keeper = RenewalLeaseKeeper::start(held, Duration::from_secs(60));
 
     let surface = "final_publication_matrix_complete_reload";
-    let mut probe = install_force_reload_probe(surface);
+    let _probe = install_force_reload_probe(surface);
 
     let outcome = keeper
         .commit_fenced({
@@ -161,14 +176,15 @@ async fn final_publication_commits_order_then_certificate_under_one_lease_fence(
         .expect("lease still held");
     assert!(matches!(outcome, FinalRenewalPublication::Complete));
 
-    let reloaded = apply_final_renewal_publication(outcome).expect("complete publication");
+    let (reload_requested, reloaded) = track_reload_request(outcome);
+    let reloaded = reloaded.expect("complete publication");
     assert!(
-        reloaded.contains(&surface),
+        reload_requested,
         "successful publication must request material reload"
     );
     assert!(
-        probe.try_recv().is_ok(),
-        "the registered surface must observe the reload request"
+        reloaded.contains(&surface),
+        "successful publication must request material reload"
     );
 
     let stored = certificates
@@ -268,9 +284,6 @@ async fn order_failure_certificate_success_publishes_reloads_and_clears_active_o
         .expect("won");
     let keeper = RenewalLeaseKeeper::start(held, Duration::from_secs(60));
 
-    let surface = "final_publication_matrix_material_without_valid_reload";
-    let mut probe = install_force_reload_probe(surface);
-
     let outcome = keeper
         .commit_fenced({
             let certificates = Arc::clone(&certificates);
@@ -288,7 +301,8 @@ async fn order_failure_certificate_success_publishes_reloads_and_clears_active_o
         FinalRenewalPublication::MaterialPublishedOrderNotCommitted(_)
     ));
 
-    let error = apply_final_renewal_publication(outcome).expect_err("order write failed");
+    let (reload_requested, result) = track_reload_request(outcome);
+    let error = result.expect_err("order write failed");
     let message = error.to_string();
     assert!(
         message.contains(
@@ -298,7 +312,7 @@ async fn order_failure_certificate_success_publishes_reloads_and_clears_active_o
     );
     assert_no_material_disclosure(&message, &[&cert_pem, &key_pem]);
     assert!(
-        probe.try_recv().is_ok(),
+        reload_requested,
         "published material must request reload even when Valid failed"
     );
 
@@ -316,7 +330,6 @@ async fn order_failure_certificate_success_publishes_reloads_and_clears_active_o
         !has_active_renewal_order(&orders, &certificates, "edge-cert").expect("scan"),
         "exact published order_url must make the matching stale Processing order non-blocking"
     );
-    remove_force_reload_probe(surface);
     let _ = keeper.finish().await;
 }
 
@@ -344,8 +357,6 @@ fn order_success_certificate_failure_retains_prior_material_without_reload() {
         .upsert_order(order.clone(), false)
         .expect("seed processing order");
 
-    let surface = "final_publication_matrix_valid_without_material_no_reload";
-    let mut probe = install_force_reload_probe(surface);
     let _fault =
         inject_final_publication_certificate_write_fault_for_tests(PrivateFileFault::Rename);
     let outcome = commit_final_renewal_publication(&certificates, &orders, issued, order);
@@ -354,7 +365,8 @@ fn order_success_certificate_failure_retains_prior_material_without_reload() {
         FinalRenewalPublication::OrderCommittedMaterialNotPublished(_)
     ));
 
-    let error = apply_final_renewal_publication(outcome).expect_err("cert write failed");
+    let (reload_requested, result) = track_reload_request(outcome);
+    let error = result.expect_err("cert write failed");
     let message = error.to_string();
     assert!(
         message.contains(
@@ -367,7 +379,7 @@ fn order_success_certificate_failure_retains_prior_material_without_reload() {
         &[&new_key_pem, &new_cert_pem, &old_key_pem, &old_cert_pem],
     );
     assert!(
-        probe.try_recv().is_err(),
+        !reload_requested,
         "certificate failure after order Valid must not request reload"
     );
 
@@ -388,7 +400,6 @@ fn order_success_certificate_failure_retains_prior_material_without_reload() {
         !has_active_renewal_order(&orders, &certificates, "edge-cert").expect("scan"),
         "Valid status must not block a later renewal"
     );
-    remove_force_reload_probe(surface);
 }
 
 /// Both final writes fail: neither lands, no reload, combined failure without
@@ -405,8 +416,6 @@ fn both_final_writes_fail_without_reload_or_material_disclosure() {
         .upsert_order(order.clone(), false)
         .expect("seed processing order");
 
-    let surface = "final_publication_matrix_both_fail_no_reload";
-    let mut probe = install_force_reload_probe(surface);
     let _order_fault =
         inject_final_publication_order_write_fault_for_tests(PrivateFileFault::Rename);
     let _cert_fault =
@@ -431,7 +440,8 @@ fn both_final_writes_fail_without_reload_or_material_disclosure() {
         other => panic!("expected NeitherCommitted, got {other:?}"),
     }
 
-    let error = apply_final_renewal_publication(outcome).expect_err("both writes failed");
+    let (reload_requested, result) = track_reload_request(outcome);
+    let error = result.expect_err("both writes failed");
     let message = error.to_string();
     assert!(
         message.contains("ACME final publication failed for both order and certificate stores")
@@ -441,7 +451,7 @@ fn both_final_writes_fail_without_reload_or_material_disclosure() {
     );
     assert_no_material_disclosure(&message, &[&cert_pem, &key_pem]);
     assert!(
-        probe.try_recv().is_err(),
+        !reload_requested,
         "both-failure must not request reload"
     );
     assert!(matches!(
@@ -456,7 +466,6 @@ fn both_final_writes_fail_without_reload_or_material_disclosure() {
         has_active_renewal_order(&orders, &certificates, "edge-cert").expect("scan"),
         "storage-outage both-failure may remain fail-closed on the Processing order"
     );
-    remove_force_reload_probe(surface);
 }
 
 /// Exact matching published `certificate.order_url` clears only that stale
