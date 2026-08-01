@@ -89,6 +89,30 @@ paths:
   keyed state. The RFC shared-cache authorization admission checks both pristine
   inbound and live backend-visible `Authorization`, so request transforms cannot
   erase it.
+- Exception: `load_testing` admits at most one effective instance per proxy
+  after merge. Both it and `api_chargeback` are enforced by
+  `exclusive_effective_instance_errors` in `src/plugin_cache.rs`, applied to the
+  merged per-proxy chain in both the full-build and incremental-rebuild paths.
+- Stateful protections are owned by a **stable policy identity**
+  (`namespace` + plugin-config id), never by the plugin instance the cache
+  happened to construct and never by request-controlled data
+  (GHSA-wmqm-6mxj-gm9p). `tcp_connection_throttle` live-connection accounting is
+  carried in a plugin-cache-owned instance map
+  (`TcpConnectionThrottleInstanceMap`); `load_testing` run admission and
+  local-mode `request_deduplication` state use per-plugin weak registries
+  (`SHARED_STATES`, `SHARED_LOCAL_STATES`) whose entries are pruned on insert,
+  so retention is bounded by the currently configured policies plus in-flight
+  holders. A compatible reload inherits live state; a semantic change isolates
+  onto fresh state so a retired generation's late release/completion cannot
+  corrupt the replacement. For deduplication the semantic set is deliberately
+  narrow — `header_name`, `local` vs `redis`, and `on_redis_unavailable` —
+  because everything else is either bound into the logical key or enforced per
+  operation. In-flight operations, completions, and execution barriers retain
+  their admission-time protection windows across reloads; never evaluate an
+  existing lease with a replacement generation's shorter timeout. Weak
+  registries keep every still-live semantic generation for an identity, not
+  just the last one, so A → B → A recovers A's active protection state. Do not
+  reintroduce per-instance ownership for any of these.
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order
