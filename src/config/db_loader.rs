@@ -8874,8 +8874,9 @@ impl DatabaseStore {
         let start = std::time::Instant::now();
         let diff = serde_json::to_string(&event.diff)?;
         sqlx::query(&self.q("INSERT INTO audit_events \
-             (id, ts, actor, action, resource_type, resource_id, namespace, diff) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"))
+             (id, ts, actor, action, resource_type, resource_id, namespace, \
+              source_address, request_id, outcome, diff) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
         .bind(&event.id)
         .bind(audit_ts_string(&event.ts))
         .bind(&event.actor)
@@ -8883,6 +8884,9 @@ impl DatabaseStore {
         .bind(&event.resource_type)
         .bind(&event.resource_id)
         .bind(&event.namespace)
+        .bind(&event.source_address)
+        .bind(&event.request_id)
+        .bind(&event.outcome)
         .bind(diff)
         .execute(&self.pool())
         .await?;
@@ -9158,7 +9162,8 @@ impl DatabaseStore {
         let total: i64 = count_query.fetch_one(pool).await?.try_get("cnt")?;
 
         let sql = self.q(&format!(
-            "SELECT id, ts, actor, action, resource_type, resource_id, namespace, diff \
+            "SELECT id, ts, actor, action, resource_type, resource_id, namespace, \
+             source_address, request_id, outcome, diff \
              FROM audit_events WHERE {where_clause} \
              ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?"
         ));
@@ -10686,6 +10691,9 @@ fn row_to_audit_event(row: &AnyRow) -> Result<crate::admin::audit::AuditEvent, a
         resource_type: row.try_get("resource_type")?,
         resource_id: row.try_get("resource_id")?,
         namespace: row.try_get("namespace")?,
+        source_address: row.try_get("source_address")?,
+        request_id: row.try_get("request_id")?,
+        outcome: row.try_get("outcome")?,
         diff,
     })
 }

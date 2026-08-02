@@ -10,8 +10,12 @@
 //!
 //! Request validation for JSON/XML runs in `before_proxy` (rejects with 400).
 //! Request validation for protobuf runs in `on_final_request_body` (rejects with 400).
-//! Response validation runs in `on_final_response_body` (rejects with 502)
-//! and requires response body buffering when configured.
+//! Response validation runs in `finalize_client_visible_response_body` (rejects
+//! with 502) and requires response body buffering when configured. That phase is
+//! after every semantic body transform and before gateway transport encoding, so
+//! the validator reads the exact client-visible plaintext rather than a
+//! representation a later rewrite or a gzip encode produced
+//! (`GHSA-62jg-v563-4q23`, `GHSA-4vqr-427g-5cg7`).
 //!
 //! Applicability is decided by the configured representation, never by the
 //! request method (advisory `GHSA-2vmr-ww8r-mww3`). Once a configured rule
@@ -520,6 +524,64 @@ impl BodyValidator {
             Ok(()) => PluginResult::Continue,
             Err(msg) => protobuf_reject(400, "request", &msg),
         }
+    }
+
+    /// Whether the configured final request-body rules would actually inspect
+    /// this finalized representation.
+    ///
+    /// Mirrors the applicability ladder inside [`Self::validate_final_request_body`]
+    /// exactly, so the shared request representation gate claims precisely the
+    /// requests this plugin enforces on (`GHSA-3973-47g5-4mcx`).
+    fn final_request_body_policy_applies(&self, headers: &HashMap<String, String>) -> bool {
+        if !self.has_request_validation {
+            return false;
+        }
+        let content_type = headers
+            .get("content-type")
+            .map(String::as_str)
+            .unwrap_or("");
+        if is_grpc_content_type(content_type) {
+            // Native gRPC carries its per-message compression in `grpc-encoding`,
+            // not `Content-Encoding`, so this branch is never the one the gate
+            // decodes for. Declining keeps framed bodies out of the gate.
+            return false;
+        }
+        let has_json_validation = self.json_validator.is_some() || !self.required_fields.is_empty();
+        if !has_json_validation && !self.has_xml_request_validation {
+            return false;
+        }
+        if !content_type_matches(&self.content_types, content_type) {
+            return false;
+        }
+        let validate_as_json = is_json_like_content_type(content_type);
+        let validate_as_xml = !validate_as_json
+            && is_xml_like_content_type(content_type)
+            && self.has_xml_request_validation;
+        validate_as_json || validate_as_xml
+    }
+
+    /// Whether the configured JSON/XML response rules would actually inspect this
+    /// client-visible representation. The gRPC branch is excluded for the same
+    /// reason as on the request side.
+    fn final_response_body_policy_applies(&self, content_type: Option<&str>) -> bool {
+        if !self.has_response_validation {
+            return false;
+        }
+        let content_type = content_type.unwrap_or("");
+        if is_grpc_content_type(content_type) {
+            return false;
+        }
+        if !self.has_json_response_validation() && !self.has_xml_response_validation {
+            return false;
+        }
+        if !content_type_matches(&self.response_content_types, content_type) {
+            return false;
+        }
+        let validate_as_json = is_json_like_content_type(content_type);
+        let validate_as_xml = !validate_as_json
+            && is_xml_like_content_type(content_type)
+            && self.has_xml_response_validation;
+        validate_as_json || validate_as_xml
     }
 
     fn validate_json_body(
@@ -2815,6 +2877,35 @@ impl Plugin for BodyValidator {
         self.validate_final_request_body(headers, body, None).await
     }
 
+    /// Claim the finalized request representation whenever the configured
+    /// JSON/XML rules would inspect it, so the shared request representation gate
+    /// decodes a content coding into plaintext or fails the request closed
+    /// (`GHSA-3973-47g5-4mcx`).
+    ///
+    /// Without this, a gzip-encoded `application/json` upload reached the UTF-8
+    /// conversion below as compressed octets, failed it, and — before
+    /// `GHSA-2vmr-ww8r-mww3` tightened it — was skipped; even after that fix it
+    /// produced a confusing non-UTF-8 rejection rather than validating the
+    /// document the backend actually parses.
+    fn enforces_final_request_body_policy(
+        &self,
+        _ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> bool {
+        self.final_request_body_policy_applies(headers)
+    }
+
+    /// The shared backend-visible representation gate stages decoded plaintext
+    /// on the request context before this plugin's final hook runs. Opt in even
+    /// when `body_validator` is the only contextual plugin in the chain; without
+    /// this capability the proxy takes the compatibility hook path with no
+    /// context, so a body-validator-only configuration can never reach either
+    /// the charged decoder or the duplicate-key memo below.
+    fn needs_final_request_body_context(&self) -> bool {
+        self.has_request_validation
+    }
+
     /// Context-aware variant so the duplicate-key screen of the final
     /// backend-visible body is shared with every other governed plugin in this
     /// hook stage (they all receive the same context object).
@@ -2824,6 +2915,15 @@ impl Plugin for BodyValidator {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        // Validate the PLAINTEXT the backend will parse. This is `body` itself
+        // unless the shared gate decoded a content coding; a claimed
+        // representation it could not decode never reaches this hook.
+        // An `O(1)` `Bytes` clone sharing the gate's one charged allocation
+        // rather than a second uncharged copy of the decoded document; the owned
+        // handle exists only to escape the borrow of `ctx` that the memo take
+        // below needs.
+        let decoded_view = ctx.inspectable_final_request_body_owned();
+        let body: &[u8] = decoded_view.as_deref().unwrap_or(body);
         let mut json_scan_memo = std::mem::take(&mut ctx.json_scan_memo);
         let result = self
             .validate_final_request_body(headers, body, Some(&mut json_scan_memo))
@@ -2914,7 +3014,48 @@ impl Plugin for BodyValidator {
         PluginResult::Continue
     }
 
-    async fn on_final_response_body(
+    /// Claim an ORIGIN-ENCODED buffered response so the shared representation
+    /// gate decodes it to plaintext — or fails it closed — before validation
+    /// (`GHSA-4vqr-427g-5cg7`).
+    ///
+    /// Narrow on purpose: only when the configured JSON/XML rules would inspect
+    /// this media type AND the pristine pre-`after_proxy` stamp says the origin
+    /// declared a content coding. An identity-coded response is already the
+    /// representation this plugin validates, so nothing changes for it. Gateway
+    /// compression is not a reason to claim: it now runs in the deferred
+    /// transport-encoding stage, after this plugin has decided.
+    fn enforces_response_body_policy(
+        &self,
+        ctx: &RequestContext,
+        response_content_type: Option<&str>,
+        _response_body: &[u8],
+    ) -> bool {
+        self.final_response_body_policy_applies(response_content_type)
+            && ctx
+                .metadata
+                .contains_key(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY)
+    }
+
+    /// Configuration- and request-only over-approximation, consulted before the
+    /// response `Content-Type` is known.
+    fn may_enforce_response_body_policy(&self, _ctx: &RequestContext) -> bool {
+        self.has_response_validation
+    }
+
+    fn enforces_final_client_visible_response_body(&self, _ctx: &RequestContext) -> bool {
+        self.has_response_validation
+    }
+
+    /// Validate the EXACT representation the client receives.
+    ///
+    /// This decision used to live in `on_final_response_body`, which runs after
+    /// `compression` (priority 4050) has already encoded the body: the UTF-8
+    /// conversion below then failed on gzip/Brotli octets and returned
+    /// `Continue`, delivering a schema-invalid payload the client decompresses
+    /// (`GHSA-4vqr-427g-5cg7`). This phase runs after every semantic transform —
+    /// so a later `response_transformer` rule that removes a required field is
+    /// caught too (`GHSA-62jg-v563-4q23`) — and before transport encoding.
+    async fn finalize_client_visible_response_body(
         &self,
         ctx: &mut RequestContext,
         response_status: u16,
@@ -3033,5 +3174,19 @@ impl Plugin for BodyValidator {
                 response_reject(&detail)
             }
         }
+    }
+
+    /// Preserve the established final-body hook contract for direct callers.
+    /// The proxy skips this compatibility hook after it has invoked the
+    /// authoritative client-visible phase, so production validates once.
+    async fn on_final_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        self.finalize_client_visible_response_body(ctx, response_status, response_headers, body)
+            .await
     }
 }

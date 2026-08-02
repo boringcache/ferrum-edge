@@ -8416,6 +8416,7 @@ fn test_priority_override_delegates_spec_rejection_replacement_capability() {
     assert_eq!(plugins[0].priority(), 211);
     assert!(plugins[0].applies_after_proxy_on_reject());
     assert!(plugins[0].may_replace_rejection_response());
+    assert!(plugins[0].rejection_replacement_is_final_body_policy_terminal());
     assert!(!plugins[0].warn_on_rejection_response_replacement());
 }
 
