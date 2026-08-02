@@ -931,10 +931,11 @@ fn every_capacity_refusal_uses_the_shared_gateway_terminal() {
         proxy
             .matches("replace_buffered_response_with_capacity_refusal_with_policy_source(")
             .count(),
-        5,
-        "one definition, the prefiltered delegation, the representation gate's \
-         CapacityRefused decode path, the install_decoded_response_body charge \
-         refusal, and the pending-signal consumer used by on_response_body loops"
+        6,
+        "one definition, the prefiltered delegation, the final synthetic-policy \
+         redecision, the representation gate's CapacityRefused decode path, the \
+         install_decoded_response_body charge refusal, and the pending-signal \
+         consumer used by on_response_body loops"
     );
     assert!(
         plugins.contains("replace_buffered_response_with_capacity_refusal("),

@@ -413,7 +413,10 @@ fn ctx_for(method: &str, path: &str) -> RequestContext {
         method.to_string(),
         path.to_string(),
     );
-    ctx.max_response_body_size_bytes = 10 * 1024 * 1024;
+    // These fixtures carry only small synthetic bodies. Keep each transform
+    // window to one budget block so parallel coverage tests do not contend for
+    // the process-wide retained-response budget and mask the policy outcome.
+    ctx.max_response_body_size_bytes = 64 * 1024;
     ctx
 }
 
