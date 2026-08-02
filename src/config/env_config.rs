@@ -1791,6 +1791,13 @@ pub struct EnvConfig {
     /// aggregate cap to fit one huge response would hand the memory bound back
     /// to whoever picks the response. Default: 268435456 (256 MiB).
     pub response_buffer_max_total_bytes: usize,
+    /// Aggregate ceiling (bytes) on the working set retained while governed
+    /// compressed requests are decoded for final request-body policy
+    /// inspection. This is deliberately separate from the response-buffer
+    /// budget and is floored at the worst-case peak for one stacked request
+    /// decode. A request that cannot reserve capacity fails closed before its
+    /// encoded body can bypass inspection. Default: 268435456 (256 MiB).
+    pub request_decode_max_total_bytes: usize,
     /// Cutoff (bytes) below which response bodies with a known Content-Length
     /// are eagerly buffered into a single allocation instead of streamed
     /// frame-by-frame. For small JSON API responses the single `bytes().await`
@@ -2783,6 +2790,8 @@ impl Default for EnvConfig {
                 crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_RESPONSE_FALLBACK_BYTES,
             response_buffer_max_total_bytes:
                 crate::proxy::response_buffer_budget::DEFAULT_RESPONSE_BUFFER_TOTAL_BYTES,
+            request_decode_max_total_bytes:
+                crate::proxy::response_buffer_budget::DEFAULT_REQUEST_DECODE_TOTAL_BYTES,
             response_buffer_cutoff_bytes: 65_536,
             h2_coalesce_target_bytes: 131_072,
             max_url_length_bytes: 8_192,
@@ -3912,6 +3921,7 @@ impl EnvConfig {
             max_response_body_size_bytes,
             response_buffer_fallback_max_bytes,
             response_buffer_max_total_bytes,
+            request_decode_max_total_bytes,
             response_buffer_cutoff_bytes,
             h2_coalesce_target_bytes,
             max_url_length_bytes,
