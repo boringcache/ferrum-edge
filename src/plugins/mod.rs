@@ -8975,8 +8975,12 @@ pub trait Plugin: Send + Sync {
     /// `ai_response_guard` binds its redaction metadata to a rewrite that
     /// actually happened.
     ///
-    /// `response_headers` is the final client-visible header map, so header
-    /// policy re-assertion belongs here too.
+    /// `response_headers` is the client-visible header map as it stands at this
+    /// point. It is NOT the final one on every lifecycle — the synthetic /
+    /// short-circuit lifecycle deliberately runs its `after_proxy` chain
+    /// afterwards — so header policy belongs in
+    /// [`Plugin::finalize_client_visible_response_headers`], which is the phase
+    /// that genuinely closes the header map.
     ///
     /// Implementations must be idempotent with respect to charged work: the
     /// phase runs once per published response, but a plugin that also decided in
@@ -8989,6 +8993,53 @@ pub trait Plugin: Send + Sync {
         _response_status: u16,
         _response_headers: &HashMap<String, String>,
         _body: &[u8],
+    ) -> PluginResult {
+        PluginResult::Continue
+    }
+
+    /// Returns `true` when this plugin enforces policy over the FINAL
+    /// client-visible response header map for this request.
+    ///
+    /// The proxy consults this before invoking
+    /// [`Plugin::finalize_client_visible_response_headers`], so a chain with no
+    /// participant pays only a bit test and never allocates a digest.
+    fn enforces_final_client_visible_response_headers(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
+    /// Decide header policy over the EXACT header map the client will receive.
+    ///
+    /// This is the last rejecting phase in the response lifecycle and it exists
+    /// because no earlier one is genuinely final on every path
+    /// (`GHSA-62jg-v563-4q23`):
+    ///
+    /// * on an ordinary backend response, `waf`'s `after_proxy` header scan runs
+    ///   at priority 2930, while `response_transformer` (4000) and the
+    ///   chain-level route response-header finalizer mutate the same map
+    ///   afterwards. This phase closes the `after_proxy` chain, so a later
+    ///   `add`/`update`/`remove`/`rename` rule can no longer create a prohibited
+    ///   header — or erase a required one — behind the enforcing pass;
+    /// * on a synthetic / short-circuit response the reject-path `after_proxy`
+    ///   chain is deliberately run LAST, after the synthetic body hooks, so that
+    ///   one-shot state (the `oidc_relying_party` rotated session cookie, the
+    ///   `response_transformer` route override) lands exactly once on the real
+    ///   final response. That ordering used to put `response_transformer`'s
+    ///   header rules after every enforcing pass. This phase runs after that
+    ///   chain instead, without re-running it.
+    ///
+    /// The phase is REJECTING and NON-REWRITING: return `Continue` to publish the
+    /// map as it stands, or a rejection to replace the response. A rejection is
+    /// rebuilt by the proxy so gateway-owned decorators and one-shot session
+    /// state survive while the stale representation headers of the discarded
+    /// body do not; the proxy then re-runs this phase once over the rebuild, so
+    /// the rejected header can never be resurrected by it.
+    ///
+    /// Implementations must be idempotent and must never log header values.
+    async fn finalize_client_visible_response_headers(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
     ) -> PluginResult {
         PluginResult::Continue
     }

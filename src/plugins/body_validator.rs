@@ -10,8 +10,12 @@
 //!
 //! Request validation for JSON/XML runs in `before_proxy` (rejects with 400).
 //! Request validation for protobuf runs in `on_final_request_body` (rejects with 400).
-//! Response validation runs in `on_final_response_body` (rejects with 502)
-//! and requires response body buffering when configured.
+//! Response validation runs in `finalize_client_visible_response_body` (rejects
+//! with 502) and requires response body buffering when configured. That phase is
+//! after every semantic body transform and before gateway transport encoding, so
+//! the validator reads the exact client-visible plaintext rather than a
+//! representation a later rewrite or a gzip encode produced
+//! (`GHSA-62jg-v563-4q23`, `GHSA-4vqr-427g-5cg7`).
 //!
 //! Applicability is decided by the configured representation, never by the
 //! request method (advisory `GHSA-2vmr-ww8r-mww3`). Once a configured rule

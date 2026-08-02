@@ -125,6 +125,13 @@ Request In
 └────────────┬─────────────────┘
              │
              ▼
+┌───────────────────────────────────────────────┐
+│ 7c. finalize_client_visible_response_headers   │ Authoritative final
+└────────────┬──────────────────────────────────┘   header policy (rejecting).
+             │  Closes the after_proxy chain on streaming AND buffered paths.
+             │  The synthetic/short-circuit lifecycle runs it after its own
+             │  deliberately late reject-path after_proxy chain instead.
+             ▼
 ┌─────────────────────────┐
 │ 8. normalize_response_body │ Provider/protocol normalization
 └────────────┬────────────┘
@@ -516,21 +523,18 @@ output-policy phase between them (`GHSA-62jg-v563-4q23`,
    re-framing, `mcp_gateway` reverse mapping, `response_transformer` body rules
    (4000), `ai_response_guard` redaction (4075).
 2. **`finalize_client_visible_response_body`.** A rejecting, non-rewriting phase
-   over the exact bytes and header map the client will receive. `waf` (response
-   header rules plus the response body scan), `body_validator` (response
-   validation), and `ai_response_guard` (undischarged-redaction check plus a
-   residual re-detection) decide here.
+   over the exact bytes the client will receive. `waf` (response body scan),
+   `body_validator` (response validation), and `ai_response_guard`
+   (undischarged-redaction check plus a residual re-detection) decide here.
+   Header policy is NOT decided here — the header map is not final at this point
+   on the synthetic lifecycle — it is decided in
+   `finalize_client_visible_response_headers` below.
 3. **Transport-encoding stage.** Plugins declaring
    `applies_response_transport_encoding` — `compression` (4050) — generate the
    wire representation last, after every security decision and rewrite.
 
 Why the split matters:
 
-- WAF response-header rules previously ran only in `after_proxy` at priority
-  2930, so a later `response_transformer` `rename` could create a prohibited
-  client-visible header after the only enforcing pass. The re-assertion is gated
-  on an instance-scoped digest of the header map, so an untouched header set is
-  neither rescanned nor rescored.
 - `compression` at 4050 previously encoded the body before WAF's and
   `body_validator`'s final response hooks and before `ai_response_guard`'s
   redaction transform: the WAF matched gzip/Brotli octets, the validator read
@@ -544,6 +548,50 @@ Why the split matters:
 
 The phase also runs when the transform phase is skipped (an unclaimed `206`/`226`
 representation), because it is non-rewriting and must still decide.
+
+### Authoritative final client-visible response HEADER phase
+
+Response HEADER policy is a separate phase
+(`finalize_client_visible_response_headers`) because the body phase above is not
+the last thing that can rewrite the header map. It runs at the two points where
+the client-visible header map genuinely closes:
+
+- **At the END of the `after_proxy` chain**, inside `run_after_proxy_hooks`, so
+  every protocol path — H1/H2, native gRPC, gRPC-Web, buffered and streaming H3 —
+  reaches it identically, on streaming as well as buffered responses. By then
+  `response_transformer`'s header rules (4000) and the chain-level route
+  response-header finalization have already run. A rejection is surfaced as an
+  ordinary `after_proxy` rejection.
+- **At the END of the synthetic / short-circuit finalizer**, after the reject-path
+  `after_proxy` chain that lifecycle deliberately defers to last. That deferral
+  is what keeps one-shot response state (the `oidc_relying_party` rotated session
+  cookie, the consumed `response_transformer` route override) exactly-once and on
+  the response the client actually receives — and it is exactly what used to let
+  a late header `rename` create a prohibited header behind every enforcing pass
+  (`GHSA-62jg-v563-4q23`). This phase closes that window WITHOUT re-running the
+  chain.
+
+`waf` owns this phase. Its re-assertion is gated on an instance-scoped,
+deterministic canonical digest of the header map, so an untouched header set is
+neither rescanned nor rescored, and one instance can never consume another's
+marker.
+
+The phase is rejecting and non-rewriting. A rejection is rebuilt in place from a
+fixed set of gateway-owned decorators plus the rejection's own fields. Carried
+across: the `security_headers` set, the CORS contract, `Vary`,
+request-correlation, and the one-shot rotated `Set-Cookie` — this phase cannot
+re-run the hooks that authored them. Dropped: everything the backend or the
+synthetic producer contributed, including the refused field itself and the stale
+representation metadata of the discarded body, so the rebuild cannot resurrect
+what was just refused. Policy is then re-evaluated exactly once over the rebuild;
+a second refusal collapses to a fixed minimal gateway terminal.
+
+Gateway transport-encoding fields written after the `after_proxy` chain
+(`Content-Encoding` and the recomputed `Content-Length` from the transport stage)
+are gateway-owned and are governed by
+`sanitize_client_response_headers_for_wire`, not by a further policy pass — a
+re-scan there would rescore every already-scanned field on every buffered
+response.
 
 `waf`, `body_validator`, and `ai_response_guard` additionally claim an
 **origin-encoded** buffered response through `enforces_response_body_policy`, so
@@ -975,7 +1023,7 @@ Given all built-in plugins enabled, the execution order is:
 | 34 | `ws_rate_limiting` | 2910 | on_ws_frame, on_ws_reassembly_frames |
 | 35 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 36 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body, on_final_request_body |
-| 37 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, finalize_client_visible_response_body, on_stream_connect, on_udp_datagram |
+| 37 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, finalize_client_visible_response_body, finalize_client_visible_response_headers, on_stream_connect, on_udp_datagram |
 | 38 | `fault_injection` | 2940 | before_proxy, on_stream_connect, on_udp_datagram |
 | 39 | `body_validator` | 2950 | before_proxy, on_final_request_body, after_proxy, finalize_client_visible_response_body |
 | 40 | `openapi_validator` | 2960 | validate_client_request_body_contract, before_proxy, on_final_request_body, after_proxy, on_final_response_body |

@@ -17672,6 +17672,23 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // see the divergence note above.
     apply_replaceable_after_proxy_hooks_to_rejection(plugins, ctx, status, body, headers).await;
 
+    // Authoritative final client-visible HEADER policy, AFTER the deliberately
+    // late reject-path `after_proxy` chain above (`GHSA-62jg-v563-4q23`).
+    //
+    // The synthetic body hooks already ran the final client-visible BODY phase,
+    // but that phase saw a header map the chain above could still rewrite: a
+    // `response_transformer` header `rename` — or a route header rule — can carry
+    // a backend- or synthetic-controlled value into a protected field after every
+    // enforcing pass. This phase closes that window without re-running the chain,
+    // so one-shot state (the rotated session cookie, the consumed route override)
+    // stays exactly-once and stays on the response the client receives.
+    //
+    // Deliberately BEFORE the WebSocket transport strip, the committed-response
+    // observers, and the HEAD/204/205/304 wire preparation, so a rejection here
+    // is normalized by exactly the same boundaries as every other rejection that
+    // flows through this finalizer.
+    enforce_final_client_visible_response_header_policy(plugins, ctx, status, headers, body).await;
+
     // A failed WebSocket handshake is still an ordinary HTTP response, but its
     // transport-owned fields must come only from a successful H1 Upgrade or
     // Extended CONNECT builder. Run this boundary after every ordered reject
@@ -17965,6 +17982,34 @@ pub(crate) async fn run_after_proxy_hooks(
         response_status,
         response_headers,
     );
+
+    // Authoritative final client-visible HEADER policy. The `after_proxy` chain
+    // has now closed — including `response_transformer`'s header rules (4000) and
+    // the chain-level route response-header finalization — so this is the map the
+    // client receives on BOTH the streaming and buffered paths, on every protocol
+    // that reaches this shared function (`GHSA-62jg-v563-4q23`).
+    //
+    // A rejection here is an ordinary `after_proxy`-style rejection to the caller,
+    // but the header map is REBUILT in place rather than re-derived by re-running
+    // the chain: every hook above already ran exactly once and consumed its
+    // one-shot state into this map.
+    let mut rejection_status = response_status;
+    let mut rejection_body = Bytes::new();
+    if enforce_final_client_visible_response_header_policy(
+        plugins,
+        ctx,
+        &mut rejection_status,
+        response_headers,
+        &mut rejection_body,
+    )
+    .await
+    {
+        return Some(AfterProxyReject {
+            status_code: rejection_status,
+            body: rejection_body,
+            headers: response_headers.clone(),
+        });
+    }
     None
 }
 
@@ -19663,11 +19708,21 @@ async fn run_final_client_visible_response_body_policy(
         match result {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-                let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                let reject = match plugin_result_into_reject_parts(reject) {
+                    Some(reject) => reject,
                     // Unreachable: `plugin_result_into_reject_parts` converts
-                    // both rejection shapes. Failing closed on a conversion that
-                    // cannot happen still beats publishing the claimed body.
-                    continue;
+                    // both rejection shapes. Should it ever stop doing so, the
+                    // one outcome this phase must never produce is publishing a
+                    // body a policy just refused — so substitute the fixed,
+                    // non-sensitive gateway terminal rather than continuing.
+                    None => {
+                        warn!(
+                            plugin = plugin.name(),
+                            "Final client-visible response policy rejection could not be \
+                             converted; failing closed"
+                        );
+                        final_response_policy_conversion_failure_parts()
+                    }
                 };
                 debug!(
                     plugin = plugin.name(),
@@ -19684,6 +19739,222 @@ async fn run_final_client_visible_response_body_policy(
     };
     *response_body =
         rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
+    true
+}
+
+/// Client-visible body for the two gateway-authored terminals the final
+/// client-visible response phases author themselves. Fixed and non-sensitive: it
+/// names neither the plugin, the rule, nor any header or body byte.
+const FINAL_RESPONSE_POLICY_FAILURE_BODY: &str =
+    r#"{"error":"response policy could not be applied"}"#;
+
+/// The fail-closed terminal for a rejection this phase could not interpret.
+fn final_response_policy_conversion_failure_parts() -> RejectedResponseParts {
+    RejectedResponseParts {
+        status_code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+        body: Bytes::from_static(FINAL_RESPONSE_POLICY_FAILURE_BODY.as_bytes()),
+        headers: HashMap::new(),
+    }
+}
+
+/// Gateway-owned response decorators that survive a final-header-policy
+/// rejection.
+///
+/// This phase runs after the `after_proxy` chain has already completed and
+/// consumed its one-shot state into the header map, so it cannot re-run those
+/// hooks to restore anything: whatever is not carried across here is lost.
+/// Everything listed is authored by the gateway itself rather than by the
+/// backend or a synthetic producer — the `security_headers` set, the CORS
+/// contract, request-correlation and tracing fields, and the one-shot rotated
+/// session cookie `oidc_relying_party` stages during the reject-path chain.
+///
+/// Everything NOT listed is dropped, which is what keeps the rejected header
+/// from being resurrected by the rebuild: a backend- or synthetic-controlled
+/// field, and the stale representation metadata of the discarded body, are both
+/// outside the set. A policy that objects to something inside the set is still
+/// caught, because the rebuild is re-evaluated once.
+const PRESERVED_GATEWAY_RESPONSE_DECORATORS: [&str; 17] = [
+    "set-cookie",
+    "vary",
+    "access-control-allow-origin",
+    "access-control-allow-credentials",
+    "access-control-allow-methods",
+    "access-control-allow-headers",
+    "access-control-expose-headers",
+    "access-control-max-age",
+    "strict-transport-security",
+    "content-security-policy",
+    "x-content-type-options",
+    "x-frame-options",
+    "referrer-policy",
+    "cross-origin-opener-policy",
+    "cross-origin-resource-policy",
+    "permissions-policy",
+    "x-request-id",
+];
+
+/// Install a final-header-policy rejection over the current response.
+///
+/// `preserve_decorators` is true for the first rebuild and false for the
+/// fail-closed collapse, which keeps nothing at all.
+fn install_final_header_policy_rejection(
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    reject: RejectedResponseParts,
+    preserve_decorators: bool,
+) {
+    if preserve_decorators {
+        response_headers.retain(|name, _| {
+            PRESERVED_GATEWAY_RESPONSE_DECORATORS
+                .iter()
+                .any(|preserved| name.eq_ignore_ascii_case(preserved))
+        });
+    } else {
+        response_headers.clear();
+    }
+    *response_status = reject.status_code;
+    *response_body = reject.body;
+    for (name, value) in reject.headers {
+        response_headers.insert(name, value);
+    }
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    response_headers.insert(
+        "content-length".to_string(),
+        response_body.len().to_string(),
+    );
+    ctx.record_deadline_response_header_mutations(response_headers);
+}
+
+/// Ask every participating plugin to decide policy over the current
+/// client-visible response header map.
+async fn evaluate_final_client_visible_response_header_policy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: u16,
+    response_headers: &HashMap<String, String>,
+) -> Option<RejectedResponseParts> {
+    for plugin in plugins.iter() {
+        if !plugin.enforces_final_client_visible_response_headers(ctx) {
+            continue;
+        }
+        let deadline = ctx.grpc_deadline_at();
+        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
+            deadline,
+            plugin.finalize_client_visible_response_headers(ctx, response_status, response_headers),
+        )
+        .await
+        .into_plugin_result(ctx);
+        match result {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let reject = plugin_result_into_reject_parts(reject)
+                    // Unreachable, and fail-closed if it ever is not: a header
+                    // policy that refused this map must never end with the map
+                    // being published anyway.
+                    .unwrap_or_else(final_response_policy_conversion_failure_parts);
+                debug!(
+                    plugin = plugin.name(),
+                    status_code = reject.status_code,
+                    "Plugin rejected the final client-visible response headers"
+                );
+                return Some(reject);
+            }
+        }
+    }
+    None
+}
+
+/// Run the authoritative final client-visible response HEADER policy phase.
+///
+/// This is the last rejecting phase in the response lifecycle. It runs at the
+/// two points where the client-visible header map genuinely closes:
+///
+/// * the end of the ordinary `after_proxy` chain ([`run_after_proxy_hooks`]),
+///   which is shared by H1/H2, native gRPC, gRPC-Web, and both H3 paths, and
+///   covers streaming as well as buffered responses;
+/// * the end of the synthetic / short-circuit finalizer
+///   ([`apply_reject_after_proxy_and_synthetic_body_hooks`]), AFTER the
+///   reject-path `after_proxy` chain that lifecycle deliberately defers to last.
+///   That deferral is what preserved the one-shot response contract (the
+///   `oidc_relying_party` rotated session cookie, the `response_transformer`
+///   route override) — and it is exactly what used to let a late
+///   `response_transformer` `rename` create a prohibited header behind the only
+///   enforcing pass (`GHSA-62jg-v563-4q23`). This phase closes that window
+///   WITHOUT re-running the chain, so nothing one-shot is consumed twice.
+///
+/// The phase is non-rewriting. A rejection is rebuilt in place: the
+/// gateway-owned decorators and one-shot session state in
+/// [`PRESERVED_GATEWAY_RESPONSE_DECORATORS`] are carried across — this phase
+/// cannot re-run the hooks that authored them — while every backend- or
+/// synthetic-contributed field and all stale representation metadata is dropped,
+/// so the rejected header cannot be resurrected. Policy is then re-evaluated
+/// exactly once over that rebuild; a second refusal collapses to a fixed minimal
+/// map.
+///
+/// Returns `true` when the response was replaced.
+async fn enforce_final_client_visible_response_header_policy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+) -> bool {
+    if !plugins
+        .iter()
+        .any(|plugin| plugin.enforces_final_client_visible_response_headers(ctx))
+    {
+        return false;
+    }
+    let Some(reject) = evaluate_final_client_visible_response_header_policy(
+        plugins,
+        ctx,
+        *response_status,
+        response_headers,
+    )
+    .await
+    else {
+        return false;
+    };
+
+    // First rebuild: keep the gateway's own decorations and one-shot session
+    // state, drop everything the backend or the synthetic producer contributed —
+    // including the field the policy just refused and the stale representation
+    // metadata of the discarded body.
+    install_final_header_policy_rejection(
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+        reject,
+        true,
+    );
+
+    // Re-evaluate exactly once, so a preserved decoration cannot carry a refused
+    // shape past the policy either. A second refusal collapses to the fixed
+    // gateway terminal rather than iterating.
+    if let Some(reject) = evaluate_final_client_visible_response_header_policy(
+        plugins,
+        ctx,
+        *response_status,
+        response_headers,
+    )
+    .await
+    {
+        warn!(
+            "Final client-visible response header policy still refused the rebuilt rejection; \
+             collapsing to the fixed gateway terminal"
+        );
+        install_final_header_policy_rejection(
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            reject,
+            false,
+        );
+    }
     true
 }
 

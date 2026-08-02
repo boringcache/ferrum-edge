@@ -971,32 +971,42 @@ impl Waf {
     }
 }
 
-/// Order-independent digest of a response header map.
+/// Deterministic canonical digest of a response header map.
 ///
-/// Names are lowercased and each `(name, value)` pair is length-prefixed before
-/// being folded in, so neither `HashMap` iteration order nor a `:`/length
-/// ambiguity between adjacent fields can make two different maps digest alike.
-/// Folding is an XOR of per-pair SHA-256 digests: commutative, so it is stable
-/// across iteration orders, and each pair's own digest is still collision-hard.
+/// The map is projected to `(lowercased name, value)` pairs, sorted into one
+/// canonical order, and hashed as a single length-prefixed SHA-256 stream with
+/// the pair COUNT bound in. That makes the digest an injective encoding of the
+/// multiset of client-visible fields: iteration order cannot change it, and
+/// nothing else can make two different maps digest alike.
 ///
-/// Used only to answer "did anything change since `after_proxy`?" — it is never
-/// logged, exported, or compared against attacker-supplied input.
+/// It is deliberately NOT an XOR fold of per-pair digests. XOR is commutative
+/// *and* self-cancelling, so two entries that differ only in name case — `X-Foo`
+/// and `x-foo` are distinct `HashMap` keys that share one canonical name —
+/// annihilate each other. A later hook could then add or remove exactly such a
+/// pair, leave the digest unchanged, and suppress the required recheck.
+///
+/// Sorting allocates, so this is called only where header enforcement is
+/// genuinely active (`response_header_policy_applies`), never on a chain with no
+/// configured response-header rules.
+///
+/// Used only to answer "did anything change since this instance last scanned?" —
+/// it is never logged, exported, or compared against attacker-supplied input.
 fn response_header_map_digest(headers: &HashMap<String, String>) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    let mut folded = [0u8; 32];
-    for (name, value) in headers {
-        let mut hasher = Sha256::new();
-        let lowered = name.to_ascii_lowercase();
-        hasher.update((lowered.len() as u64).to_le_bytes());
-        hasher.update(lowered.as_bytes());
+    let mut canonical: Vec<(String, &str)> = headers
+        .iter()
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.as_str()))
+        .collect();
+    canonical.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update((canonical.len() as u64).to_le_bytes());
+    for (name, value) in &canonical {
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
         hasher.update((value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
-        let digest = hasher.finalize();
-        for (slot, byte) in folded.iter_mut().zip(digest.iter()) {
-            *slot ^= *byte;
-        }
     }
-    folded
+    hasher.finalize().into()
 }
 
 #[async_trait]
@@ -1534,25 +1544,62 @@ impl Plugin for Waf {
     }
 
     fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {
-        self.response_header_policy_applies(ctx) || self.should_buffer_response_body(ctx)
+        self.should_buffer_response_body(ctx)
     }
 
-    /// The authoritative WAF response decision, over the exact representation
-    /// the client receives.
+    fn enforces_final_client_visible_response_headers(&self, ctx: &RequestContext) -> bool {
+        self.response_header_policy_applies(ctx)
+    }
+
+    /// Re-assert WAF response-header rules over the map that actually closes.
     ///
-    /// Two things move here from earlier phases:
+    /// `after_proxy` runs at priority 2930, before `response_transformer` (4000)
+    /// and the chain-level route response-header finalizer can
+    /// `add`/`update`/`remove`/`rename` the same fields — and on the synthetic /
+    /// short-circuit lifecycle that whole reject-path `after_proxy` chain is run
+    /// deliberately LAST. A rename that carries a backend- or synthetic-controlled
+    /// value into a protected header used to land after the only enforcing pass
+    /// (`GHSA-62jg-v563-4q23`).
     ///
-    /// * **Header rules.** `after_proxy` runs at priority 2930, before
-    ///   `response_transformer` (4000) can `add`/`update`/`remove`/`rename` the
-    ///   same fields. A rename that carries a backend-controlled value into a
-    ///   protected header used to land after the only enforcing pass
-    ///   (`GHSA-62jg-v563-4q23`). Re-asserting is gated on the map having
-    ///   actually changed, so an untouched header set is not rescored.
-    /// * **Body rules.** The scan previously ran in `on_final_response_body`,
-    ///   after `compression` (4050) had already encoded the body, so it matched
-    ///   gzip/Brotli octets rather than the document
-    ///   (`GHSA-4vqr-427g-5cg7`). This phase runs before transport encoding, and
-    ///   an origin coding was already decoded by the representation gate.
+    /// Re-asserting is gated on the map having actually changed since this
+    /// instance last scanned it, so an untouched header set is neither rescanned
+    /// nor rescored, and the digest is instance-scoped so one WAF cannot consume
+    /// another's marker.
+    async fn finalize_client_visible_response_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> PluginResult {
+        if self.active {
+            ctx.ensure_waf_metadata_initialized();
+        }
+        if !self.response_header_policy_applies(ctx) {
+            return PluginResult::Continue;
+        }
+        let digest = response_header_map_digest(response_headers);
+        if ctx
+            .waf_response_header_digests
+            .get(&self.instance_id)
+            .is_some_and(|scanned| *scanned == digest)
+        {
+            return PluginResult::Continue;
+        }
+        let outcome =
+            self.run_cheap_with_budget(|| self.run_response_header_scan(ctx, response_headers));
+        ctx.waf_response_header_digests
+            .insert(self.instance_id, digest);
+        self.finish_scan(ctx, outcome)
+    }
+
+    /// The authoritative WAF response BODY decision, over the exact
+    /// representation the client receives.
+    ///
+    /// The scan previously ran in `on_final_response_body`, after `compression`
+    /// (4050) had already encoded the body, so it matched gzip/Brotli octets
+    /// rather than the document (`GHSA-4vqr-427g-5cg7`). This phase runs before
+    /// transport encoding, and an origin coding was already decoded by the
+    /// representation gate.
     async fn finalize_client_visible_response_body(
         &self,
         ctx: &mut RequestContext,
@@ -1563,24 +1610,6 @@ impl Plugin for Waf {
         if self.active {
             ctx.ensure_waf_metadata_initialized();
         }
-        if self.response_header_policy_applies(ctx) {
-            let digest = response_header_map_digest(response_headers);
-            let unchanged = ctx
-                .waf_response_header_digests
-                .get(&self.instance_id)
-                .is_some_and(|scanned| *scanned == digest);
-            if !unchanged {
-                let outcome = self
-                    .run_cheap_with_budget(|| self.run_response_header_scan(ctx, response_headers));
-                ctx.waf_response_header_digests
-                    .insert(self.instance_id, digest);
-                let result = self.finish_scan(ctx, outcome);
-                if !matches!(&result, PluginResult::Continue) {
-                    return result;
-                }
-            }
-        }
-
         if !self.should_buffer_response_body(ctx) {
             return PluginResult::Continue;
         }

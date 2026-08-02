@@ -252,10 +252,11 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     transform first, then this phase, then the TRANSPORT-ENCODING stage
     (`applies_response_transport_encoding` — only `compression`). Rejecting and
     NON-rewriting; a plugin that must rewrite does so in `transform_response_body`
-    and verifies the result here. `waf` (response header re-assertion gated on an
-    instance-scoped header digest, plus the response body scan), `body_validator`
+    and verifies the result here. `waf` (response body scan), `body_validator`
     (response validation), and `ai_response_guard` (undischarged-redaction check
-    plus a residual re-detection; `warn` still passes through) own it. It also
+    plus a residual re-detection; `warn` still passes through) own it. Response
+    HEADER policy is NOT decided here — the header map is not final at this point
+    on the synthetic lifecycle; see 10c. It also
     runs when the transform phase is skipped for an unclaimed `206`/`226`, on both
     the backend buffered lifecycle and the synthetic/short-circuit lifecycle. Do
     not move gateway compression back ahead of it, and do not move these
@@ -265,6 +266,32 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     when their rules apply, only on the pristine `ORIGIN_ENCODED_RESPONSE`
     stamp, never for framed gRPC) so the representation gate decodes it or fails
     it closed.
+10c. `finalize_client_visible_response_headers`: the AUTHORITATIVE final
+    client-visible response HEADER phase, and the LAST rejecting phase in the
+    response lifecycle (`GHSA-62jg-v563-4q23`). Separate from 10b because the
+    header map does not close where the body does. It runs at exactly two points:
+    the END of the `after_proxy` chain inside `run_after_proxy_hooks` (shared by
+    H1/H2, native gRPC, gRPC-Web, and both H3 paths; streaming as well as
+    buffered — a rejection surfaces as an ordinary `after_proxy` rejection), and
+    the END of `apply_reject_after_proxy_and_synthetic_body_hooks`, AFTER the
+    reject-path `after_proxy` chain that lifecycle deliberately defers to last.
+    That deferral keeps one-shot response state (the `oidc_relying_party` rotated
+    session cookie, the consumed `response_transformer` route override)
+    exactly-once and on the real final response; this phase closes the resulting
+    enforcement window WITHOUT re-running the chain. Do not "fix" it by running
+    `after_proxy` twice. `waf` owns it, gated on an instance-scoped DETERMINISTIC
+    CANONICAL digest of the header map (sorted length-prefixed pairs — never an
+    XOR fold, which cancels case-variant duplicate pairs and would suppress the
+    recheck). A rejection is rebuilt IN PLACE from
+    `PRESERVED_GATEWAY_RESPONSE_DECORATORS` (the `security_headers` set, the CORS
+    contract, correlation/tracing, and the one-shot rotated `Set-Cookie`) plus
+    the rejection's own fields: everything the backend or synthetic producer
+    contributed — including the refused field and the stale representation
+    metadata of the discarded body — is dropped, so the rebuild cannot resurrect
+    it. Policy is re-evaluated exactly ONCE over the rebuild, and a second
+    refusal collapses to a fixed minimal gateway terminal. Gateway transport-encoding fields written
+    after the chain are governed by `sanitize_client_response_headers_for_wire`,
+    not by a further policy pass.
 11. `on_final_response_body`: dedup/cache store, size limiting, response cache predictor
 12. `log`: stdout/statsd/http/tcp/kafka/loki/udp/ws/tx_debug/prometheus/chargeback
 13. `on_ws_frame`: WS size, rate, and frame logging
