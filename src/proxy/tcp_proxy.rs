@@ -1687,6 +1687,17 @@ async fn run_tcp_accept_loop(
                             .plugin_cache
                             .proxy_lifecycle_generation(&p.namespace, &p.id)
                     });
+                    // Capture original destination for L4 destinationSubnets
+                    // before any splice/dial. Missing evidence denies the
+                    // predicate rather than matching by absence.
+                    stream_ctx.destination_ip =
+                        crate::socket_opts::original_dst(&stream).map(|addr| addr.ip());
+                    // Gateway binding is process/listener configuration — never
+                    // inferred from wire data. Mesh topologies default to the
+                    // reserved `mesh` token; operators may override with
+                    // `FERRUM_STREAM_GATEWAY_REF`.
+                    stream_ctx.trusted_gateway_ref =
+                        super::stream_match::trusted_stream_gateway_ref();
                     // Populated above from the node-waypoint resolver in
                     // NodeWaypoint topology so `mesh_authz` enforces
                     // namespace/selector-scoped policies per source pod
@@ -2428,33 +2439,101 @@ async fn handle_tcp_connection_inner(
         None
     };
 
-    // --- SNI-based proxy resolution for shared passthrough ports ---
-    // When multiple passthrough proxies share a listen_port, we must peek at
-    // the ClientHello to extract SNI before looking up the proxy config.
-    // A shared passthrough port may host same-ID proxies from different
-    // namespaces, so the match is a full `(namespace, id)` identity and both
-    // halves replace the listener's defaults for the rest of this connection.
+    // --- Shared-port proxy resolution (SNI and/or L4 stream_match) ---
+    // When multiple proxies share a listen_port, candidates arrive in
+    // `sni_proxy_ids`. Passthrough groups peek SNI then apply stream_match;
+    // non-passthrough L4 match groups resolve by stream_match alone.
     let listener_namespace = proxy_namespace;
-    let resolved_identity: Option<NamespacedResourceId> = if let Some(sni_ids) = sni_proxy_ids {
-        let sni = super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
-        stream_ctx.sni_hostname = sni.clone();
+    let source_ip = stream_ctx
+        .direct_client_ip
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .or_else(|| Some(remote_addr.ip()));
+    let peer_spiffe = stream_ctx
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("peer_spiffe_id"))
+        .cloned();
+    let source_namespace_owned = peer_spiffe
+        .as_deref()
+        .and_then(super::stream_match::source_namespace_from_spiffe);
+    let source_labels_owned: Option<std::collections::HashMap<String, String>> = peer_spiffe
+        .as_deref()
+        .and_then(|spiffe| {
+            epoch.config.mesh.as_ref().and_then(|mesh| {
+                mesh.workloads
+                    .iter()
+                    .find(|w| w.spiffe_id.as_str() == spiffe)
+                    .map(|w| w.selector.labels.clone())
+            })
+        });
+    let evidence = super::stream_match::StreamMatchEvidence {
+        source_ip,
+        destination_ip: stream_ctx.destination_ip,
+        source_namespace: source_namespace_owned.as_deref(),
+        source_labels: source_labels_owned
+            .as_ref()
+            .map(|labels| labels as &dyn super::stream_match::SourceLabelLookup),
+        trusted_gateway_ref: stream_ctx.trusted_gateway_ref.as_deref(),
+    };
 
-        let matched = super::sni::resolve_proxy_by_sni_in_epoch(sni.as_deref(), sni_ids, epoch)
+    let resolved_identity: Option<NamespacedResourceId> = if let Some(candidate_ids) = sni_proxy_ids
+    {
+        // Representative proxy tells us whether this shared port is an SNI
+        // passthrough group (peek ClientHello) or a plain L4 match group.
+        let use_sni = epoch
+            .proxy_by_namespaced_id(listener_namespace, proxy_id)
+            .is_some_and(|p| p.passthrough)
+            || candidate_ids.iter().any(|id| {
+                epoch
+                    .proxy_by_namespaced_id(&id.namespace, &id.id)
+                    .is_some_and(|p| p.passthrough)
+            });
+        if use_sni {
+            let sni =
+                super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
+            stream_ctx.sni_hostname = sni.clone();
+            let matched = super::stream_match::resolve_shared_stream_proxy_in_epoch(
+                sni.as_deref(),
+                candidate_ids,
+                &evidence,
+                epoch,
+                true,
+            )
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "No matching passthrough proxy for SNI {:?} on port {}",
                     sni,
                     stream_ctx.listen_port
                 )
-            })?
-            .clone();
-        // Update stream_ctx to reflect the resolved proxy identity.
-        stream_ctx.proxy_namespace = matched.namespace.clone();
-        stream_ctx.proxy_id = matched.id.clone();
-        stream_ctx.proxy_name = epoch
-            .proxy_by_namespaced_id(&matched.namespace, &matched.id)
-            .and_then(|p| p.name.clone());
-        Some(matched)
+            })?;
+            stream_ctx.proxy_namespace = matched.namespace.clone();
+            stream_ctx.proxy_id = matched.id.clone();
+            stream_ctx.proxy_name = epoch
+                .proxy_by_namespaced_id(&matched.namespace, &matched.id)
+                .and_then(|p| p.name.clone());
+            Some(matched)
+        } else {
+            let matched = super::stream_match::resolve_shared_stream_proxy_in_epoch(
+                None,
+                candidate_ids,
+                &evidence,
+                epoch,
+                false,
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No matching L4 stream_match proxy on port {}",
+                    stream_ctx.listen_port
+                )
+            })?;
+            stream_ctx.proxy_namespace = matched.namespace.clone();
+            stream_ctx.proxy_id = matched.id.clone();
+            stream_ctx.proxy_name = epoch
+                .proxy_by_namespaced_id(&matched.namespace, &matched.id)
+                .and_then(|p| p.name.clone());
+            Some(matched)
+        }
     } else {
         None
     };
@@ -2467,6 +2546,24 @@ async fn handle_tcp_connection_inner(
     let proxy = epoch
         .proxy_by_namespaced_id(proxy_namespace, proxy_id)
         .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found in config"))?;
+
+    // Single-listener proxies still enforce stream_match before dialing.
+    // A configured but uncompiled matcher fails closed (never match by
+    // absence of the compiled form).
+    if resolved_identity.is_none() {
+        let criteria = proxy.stream_match.as_ref().filter(|c| !c.is_empty());
+        if criteria.is_some() {
+            match proxy.compiled_stream_match.as_ref() {
+                Some(matcher) if matcher.matches(&evidence) => {}
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Stream proxy {proxy_namespace}/{proxy_id} stream_match denied connection on port {}",
+                        stream_ctx.listen_port
+                    ));
+                }
+            }
+        }
+    }
 
     if resolved_identity.is_some() {
         // The accept loop stamped the generation from the listener's

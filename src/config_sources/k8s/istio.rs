@@ -2415,34 +2415,215 @@ fn dispatch_rules_carry_transform(dispatch_rules: &[Value], field: &str) -> bool
     })
 }
 
-/// Reject the L4 (`tcp[]`/`tls[]`) match predicates Ferrum's stream layer cannot
-/// express. A stream proxy routes by `listen_port` (plus SNI for passthrough
-/// TLS) and has no source-identity or CIDR matching, so silently dropping these
-/// would mis-route — fail closed instead. `sniHosts`/`port` are consumed by the
-/// caller.
-fn reject_unsupported_l4_match(
+/// Parse one VirtualService L4 (`tcp[]`/`tls[]`) match object's optional
+/// identity / CIDR / gateway predicates into a single [`StreamMatchArm`].
+/// Invalid shapes fail closed with field-specific diagnostics — never silently
+/// drop or broaden a route. `sniHosts` / `port` are consumed by the caller.
+fn parse_l4_match_arm(
     object: &K8sObject,
     m: &Value,
     kind: &str,
-) -> Result<(), K8sTranslateError> {
-    for field in [
-        "sourceLabels",
-        "sourceSubnets",
-        "destinationSubnets",
-        "gateways",
-        "sourceNamespace",
-    ] {
-        if m.get(field).is_some() {
+    vs_gateways: &[String],
+) -> Result<Option<crate::proxy::stream_match::StreamMatchArm>, K8sTranslateError> {
+    use crate::proxy::stream_match::{
+        StreamMatchArm, canonicalize_gateway_name, valid_kubernetes_label_key,
+        valid_kubernetes_label_value,
+    };
+
+    let mut arm = StreamMatchArm::default();
+
+    if let Some(labels_val) = m.get("sourceLabels") {
+        let Some(labels) = labels_val.as_object() else {
             return Err(invalid_resource(
                 object,
                 format!(
-                    "VirtualService {kind}[] match.{field} is not supported (Ferrum stream routing keys on port{} only); remove it or model the route as an explicit stream Proxy",
-                    if kind == "tls" { " and SNI" } else { "" }
+                    "VirtualService {kind}[] match.sourceLabels must be an object of string label keys to string values"
+                ),
+            ));
+        };
+        if labels.is_empty() {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[] match.sourceLabels must not be empty when set"
                 ),
             ));
         }
+        for (key, value) in labels {
+            if !valid_kubernetes_label_key(key) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "VirtualService {kind}[] match.sourceLabels key '{key}' is not a valid Kubernetes label key"
+                    ),
+                ));
+            }
+            let Some(value) = value.as_str() else {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "VirtualService {kind}[] match.sourceLabels['{key}'] must be a string"
+                    ),
+                ));
+            };
+            if !valid_kubernetes_label_value(value) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "VirtualService {kind}[] match.sourceLabels['{key}'] is not a valid Kubernetes label value"
+                    ),
+                ));
+            }
+            arm.source_labels.insert(key.clone(), value.to_string());
+        }
     }
-    Ok(())
+
+    if let Some(ns_val) = m.get("sourceNamespace") {
+        let Some(ns) = ns_val.as_str() else {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[] match.sourceNamespace must be a string"
+                ),
+            ));
+        };
+        if ns.is_empty() || ns.chars().all(char::is_whitespace) {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[] match.sourceNamespace must not be empty"
+                ),
+            ));
+        }
+        crate::config::types::validate_namespace(ns).map_err(|e| {
+            invalid_resource(
+                object,
+                format!("VirtualService {kind}[] match.sourceNamespace: {e}"),
+            )
+        })?;
+        arm.source_namespace = Some(ns.to_string());
+    }
+
+    if let Some(subnets_val) = m.get("sourceSubnets") {
+        arm.source_subnets = parse_l4_cidr_list(object, kind, "sourceSubnets", subnets_val)?;
+    }
+
+    if let Some(subnets_val) = m.get("destinationSubnets") {
+        arm.destination_subnets =
+            parse_l4_cidr_list(object, kind, "destinationSubnets", subnets_val)?;
+    }
+
+    // Effective gateways: match-level overrides VS-level; omitted match-level
+    // inherits VS-level; omitted VS-level defaults to mesh (Istio).
+    let match_gateways = m.get("gateways");
+    arm.gateways = if let Some(g) = match_gateways {
+        let Some(arr) = g.as_array() else {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService {kind}[] match.gateways must be an array of strings"),
+            ));
+        };
+        if arr.is_empty() {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[] match.gateways must not be empty when set"
+                ),
+            ));
+        }
+        let mut out = Vec::with_capacity(arr.len());
+        for (i, entry) in arr.iter().enumerate() {
+            let Some(raw) = entry.as_str() else {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "VirtualService {kind}[] match.gateways[{i}] must be a string"
+                    ),
+                ));
+            };
+            let canonical = canonicalize_gateway_name(raw, &object.metadata.namespace)
+                .map_err(|e| {
+                    invalid_resource(
+                        object,
+                        format!("VirtualService {kind}[] match.gateways[{i}]: {e}"),
+                    )
+                })?;
+            out.push(canonical);
+        }
+        out
+    } else if !vs_gateways.is_empty() {
+        let mut out = Vec::with_capacity(vs_gateways.len());
+        for (i, raw) in vs_gateways.iter().enumerate() {
+            let canonical = canonicalize_gateway_name(raw, &object.metadata.namespace)
+                .map_err(|e| {
+                    invalid_resource(
+                        object,
+                        format!("VirtualService spec.gateways[{i}]: {e}"),
+                    )
+                })?;
+            out.push(canonical);
+        }
+        out
+    } else {
+        // Istio default: omitted gateways means the reserved mesh scope.
+        vec![crate::proxy::stream_match::MESH_GATEWAY_TOKEN.to_string()]
+    };
+
+    Ok(Some(arm))
+}
+
+fn parse_l4_cidr_list(
+    object: &K8sObject,
+    kind: &str,
+    field: &str,
+    value: &Value,
+) -> Result<Vec<String>, K8sTranslateError> {
+    let Some(arr) = value.as_array() else {
+        return Err(invalid_resource(
+            object,
+            format!("VirtualService {kind}[] match.{field} must be an array of CIDR strings"),
+        ));
+    };
+    if arr.is_empty() {
+        return Err(invalid_resource(
+            object,
+            format!("VirtualService {kind}[] match.{field} must not be empty when set"),
+        ));
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, entry) in arr.iter().enumerate() {
+        let Some(raw) = entry.as_str() else {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService {kind}[] match.{field}[{i}] must be a string CIDR or IP"),
+            ));
+        };
+        if raw.trim().is_empty() {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService {kind}[] match.{field}[{i}] must not be empty"),
+            ));
+        }
+        crate::util::cidr::CidrSet::parse_strict(raw).map_err(|e| {
+            invalid_resource(
+                object,
+                format!("VirtualService {kind}[] match.{field}[{i}]: {e}"),
+            )
+        })?;
+        out.push(raw.to_string());
+    }
+    Ok(out)
+}
+
+fn attach_l4_stream_match(
+    proxy: &mut Proxy,
+    arm: Option<crate::proxy::stream_match::StreamMatchArm>,
+) {
+    if let Some(arm) = arm {
+        proxy.stream_match = Some(crate::proxy::stream_match::StreamMatchCriteria {
+            arms: vec![arm],
+        });
+    }
 }
 
 /// Resolve the single backend `(host, port)` of an L4 route block. Weighted
@@ -2522,14 +2703,18 @@ fn virtual_service_l4_proxy_id(
 ///   - `spec.tcp[]` → a plain TCP proxy keyed by `listen_port`.
 ///
 /// `match.port` selects the listen port (falling back to the destination port
-/// when omitted). Unsupported match predicates (source-identity / CIDR /
-/// gateways) and weighted splitting fail closed via the helpers above.
+/// when omitted). Optional L4 predicates (`sourceLabels`, `sourceSubnets`,
+/// `destinationSubnets`, `gateways`, `sourceNamespace`) compile onto
+/// `Proxy.stream_match` and are evaluated from trustworthy connection /
+/// workload metadata before route selection. Weighted splitting still fails
+/// closed via `l4_route_destination`.
 fn virtual_service_l4_proxies(
     object: &K8sObject,
     acc: &K8sAccumulator,
 ) -> Result<Vec<Proxy>, K8sTranslateError> {
     let namespace = &object.metadata.namespace;
     let vs_name = &object.metadata.name;
+    let vs_gateways = string_array(&object.spec, "gateways");
     let mut proxies = Vec::new();
 
     if let Some(blocks) = object.spec.get("tls").and_then(Value::as_array) {
@@ -2546,7 +2731,7 @@ fn virtual_service_l4_proxies(
                     )
                 })?;
             for (mi, m) in matches.iter().enumerate() {
-                reject_unsupported_l4_match(object, m, "tls")?;
+                let stream_arm = parse_l4_match_arm(object, m, "tls", &vs_gateways)?;
                 let sni_hosts = string_array(m, "sniHosts");
                 if sni_hosts.is_empty() {
                     return Err(invalid_resource(
@@ -2572,6 +2757,7 @@ fn virtual_service_l4_proxies(
                     backend_read_timeout_ms: None,
                 });
                 proxy.passthrough = true;
+                attach_l4_stream_match(&mut proxy, stream_arm);
                 proxies.push(proxy);
             }
         }
@@ -2580,29 +2766,13 @@ fn virtual_service_l4_proxies(
     if let Some(blocks) = object.spec.get("tcp").and_then(Value::as_array) {
         for (bi, block) in blocks.iter().enumerate() {
             let (backend_host, backend_port) = l4_route_destination(object, block, "tcp", acc)?;
-            let listen_ports: Vec<u16> = match block.get("match").and_then(Value::as_array) {
-                Some(ms) if !ms.is_empty() => {
-                    let mut ports = Vec::with_capacity(ms.len());
-                    for m in ms {
-                        reject_unsupported_l4_match(object, m, "tcp")?;
-                        if m.get("sniHosts").is_some() {
-                            return Err(invalid_resource(
-                                object,
-                                "VirtualService tcp[] match must not set sniHosts; use tls[] for SNI routing",
-                            ));
-                        }
-                        ports.push(
-                            optional_port_field(object, m.get("port"), "tcp[].match.port")?
-                                .unwrap_or(backend_port),
-                        );
-                    }
-                    ports
-                }
-                _ => vec![backend_port],
+            let match_entries: Vec<&Value> = match block.get("match").and_then(Value::as_array) {
+                Some(ms) if !ms.is_empty() => ms.iter().collect(),
+                _ => Vec::new(),
             };
-            for (mi, port) in listen_ports.into_iter().enumerate() {
-                let proxy = super::proxy_for_route(super::RouteProxySpec {
-                    id: virtual_service_l4_proxy_id("tcp", namespace, vs_name, bi, mi),
+            if match_entries.is_empty() {
+                let mut proxy = super::proxy_for_route(super::RouteProxySpec {
+                    id: virtual_service_l4_proxy_id("tcp", namespace, vs_name, bi, 0),
                     namespace: namespace.clone(),
                     hosts: Vec::new(),
                     listen_path: None,
@@ -2612,11 +2782,48 @@ fn virtual_service_l4_proxies(
                     backend_port,
                     upstream_id: None,
                     backend_scheme: crate::config::types::BackendScheme::Tcp,
-                    listen_port: Some(port),
+                    listen_port: Some(backend_port),
                     retry: None,
                     backend_read_timeout_ms: None,
                 });
+                // No match block: still inherit VS-level / default mesh gateways.
+                let arm = parse_l4_match_arm(
+                    object,
+                    &Value::Object(serde_json::Map::new()),
+                    "tcp",
+                    &vs_gateways,
+                )?;
+                attach_l4_stream_match(&mut proxy, arm);
                 proxies.push(proxy);
+            } else {
+                for (mi, m) in match_entries.into_iter().enumerate() {
+                    let stream_arm = parse_l4_match_arm(object, m, "tcp", &vs_gateways)?;
+                    if m.get("sniHosts").is_some() {
+                        return Err(invalid_resource(
+                            object,
+                            "VirtualService tcp[] match must not set sniHosts; use tls[] for SNI routing",
+                        ));
+                    }
+                    let port = optional_port_field(object, m.get("port"), "tcp[].match.port")?
+                        .unwrap_or(backend_port);
+                    let mut proxy = super::proxy_for_route(super::RouteProxySpec {
+                        id: virtual_service_l4_proxy_id("tcp", namespace, vs_name, bi, mi),
+                        namespace: namespace.clone(),
+                        hosts: Vec::new(),
+                        listen_path: None,
+                        strip_listen_path: false,
+                        preserve_host_header: false,
+                        backend_host: backend_host.clone(),
+                        backend_port,
+                        upstream_id: None,
+                        backend_scheme: crate::config::types::BackendScheme::Tcp,
+                        listen_port: Some(port),
+                        retry: None,
+                        backend_read_timeout_ms: None,
+                    });
+                    attach_l4_stream_match(&mut proxy, stream_arm);
+                    proxies.push(proxy);
+                }
             }
         }
     }
@@ -2630,9 +2837,9 @@ fn virtual_service_routes(
 ) -> Result<VsRouteResult, K8sTranslateError> {
     // L4 routing: `spec.tls[]` (SNI passthrough) and `spec.tcp[]` (port) are
     // materialized into Ferrum stream proxies below, reusing the gateway /
-    // east-west stream + SNI machinery. Match predicates Ferrum's stream layer
-    // cannot express (source-identity / CIDR / gateways) and weighted splitting
-    // fail closed inside `virtual_service_l4_proxies`.
+    // east-west stream + SNI machinery. Optional L4 match predicates compile
+    // onto `Proxy.stream_match`; weighted splitting fails closed inside
+    // `virtual_service_l4_proxies`.
     let hosts = string_array(&object.spec, "hosts");
     let mut proxies = virtual_service_l4_proxies(object, acc)?;
     let mut upstreams = Vec::new();
@@ -10025,6 +10232,71 @@ extensionProviders:
         assert!(
             proxy.listen_path.is_none(),
             "stream proxy has no listen_path"
+        );
+        let arm = &proxy
+            .stream_match
+            .as_ref()
+            .expect("default mesh gateways project onto stream_match")
+            .arms[0];
+        assert_eq!(arm.gateways, vec!["mesh".to_string()]);
+    }
+
+    #[test]
+    fn virtual_service_l4_match_predicates_project_onto_stream_match() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["db.example.com"],
+                    "tcp": [{
+                        "match": [{
+                            "port": 3306,
+                            "sourceLabels": {"app": "billing"},
+                            "sourceNamespace": "prod",
+                            "sourceSubnets": ["10.1.0.0/16"],
+                            "destinationSubnets": ["10.2.0.0/16"],
+                            "gateways": ["mesh"]
+                        }],
+                        "route": [{"destination": {"host": "mysql.default.svc.cluster.local", "port": {"number": 3306}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("L4 match predicates translate");
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_port == Some(3306))
+            .expect("tcp proxy");
+        let arm = &proxy.stream_match.as_ref().unwrap().arms[0];
+        assert_eq!(arm.source_labels.get("app").map(String::as_str), Some("billing"));
+        assert_eq!(arm.source_namespace.as_deref(), Some("prod"));
+        assert_eq!(arm.source_subnets, vec!["10.1.0.0/16".to_string()]);
+        assert_eq!(arm.destination_subnets, vec!["10.2.0.0/16".to_string()]);
+        assert_eq!(arm.gateways, vec!["mesh".to_string()]);
+    }
+
+    #[test]
+    fn virtual_service_l4_malformed_cidr_fails_closed() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["db.example.com"],
+                    "tcp": [{
+                        "match": [{"port": 3306, "sourceSubnets": ["999.0.0.0/8"]}],
+                        "route": [{"destination": {"host": "mysql.default.svc.cluster.local", "port": {"number": 3306}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("bad CIDR must fail closed");
+        assert!(
+            format!("{err}").contains("sourceSubnets"),
+            "got {err}"
         );
     }
 

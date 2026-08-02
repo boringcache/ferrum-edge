@@ -905,15 +905,16 @@ fn virtual_service_status(
 
 /// VirtualService HTTP-route fields the translator parses past but never
 /// projects. `tcp` / `tls` route arrays are not listed here: they are
-/// translated to stream proxies (unsupported matches / weighted splitting
-/// surface via the `Invalid` arm, not as deferred). `corsPolicy` is translated
-/// to a `cors` plugin when the complete source combination is representable;
-/// otherwise it is deferred.
+/// translated to stream proxies (L4 match predicates compile onto
+/// `stream_match`; weighted splitting surfaces via the `Invalid` arm, not as
+/// deferred). `corsPolicy` is translated to a `cors` plugin when the complete
+/// source combination is representable; otherwise it is deferred.
 fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     let mut deferred: Vec<&'static str> = Vec::new();
     // `spec.tcp[]` / `spec.tls[]` are NOT listed as deferred: the translator
-    // materializes them as stream proxies, and unsupported matches surface via
-    // the `Invalid` arm of `virtual_service_status`. `mirror` /
+    // materializes them as stream proxies (including L4 match predicates on
+    // `Proxy.stream_match`). Weighted splitting and malformed predicates surface
+    // via the `Invalid` arm of `virtual_service_status`. `mirror` /
     // `mirrorPercentage` / `redirect` / `rewrite` are translated, and
     // `corsPolicy` is translated to a proxy-scoped `cors` plugin when its
     // origins are representable — `allowOrigins[]` `exact`/`prefix`/`regex`
@@ -2713,11 +2714,9 @@ mod tests {
     }
 
     #[test]
-    fn virtual_service_tcp_unsupported_match_rejected() {
-        // `spec.tcp[]` / `spec.tls[]` are translated to Ferrum stream proxies
-        // (port / SNI-passthrough routing), but match predicates the stream
-        // layer cannot express (here `sourceLabels`) fail closed as `Invalid`
-        // rather than mis-routing.
+    fn virtual_service_tcp_source_labels_accepted() {
+        // `spec.tcp[]` / `spec.tls[]` translate L4 match predicates
+        // (`sourceLabels` here) onto `Proxy.stream_match` and accept the VS.
         let obj = object(
             "networking.istio.io/v1",
             "VirtualService",
@@ -2735,13 +2734,37 @@ mod tests {
             updates[0].status["conditions"].as_array().unwrap(),
             "FerrumAccepted",
         );
+        assert_eq!(c["status"].as_str(), Some("True"));
+    }
+
+    #[test]
+    fn virtual_service_tcp_malformed_source_labels_rejected() {
+        // Invalid label keys still fail closed as `Invalid` with field-specific
+        // diagnostics — never silently drop or broaden the route.
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "tcp-bad-labels",
+            json!({
+                "hosts": ["db.default.svc.cluster.local"],
+                "tcp": [ {
+                    "match": [ { "port": 3306, "sourceLabels": { "": "billing" } } ],
+                    "route": [ { "destination": { "host": "db.default.svc.cluster.local", "port": { "number": 3306 } } } ]
+                } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
         assert_eq!(c["status"].as_str(), Some("False"));
         assert_eq!(c["reason"].as_str(), Some("Invalid"));
         let detail = updates[0].ferrum_detail.as_ref().unwrap();
         let error = detail["translation"]["error"].as_str().unwrap();
         assert!(
             error.contains("sourceLabels"),
-            "rejection error should mention the unsupported match, got: {error}"
+            "rejection error should mention sourceLabels, got: {error}"
         );
     }
 

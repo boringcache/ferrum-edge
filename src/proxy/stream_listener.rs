@@ -556,6 +556,9 @@ struct DesiredStreamProxy {
     /// Whether the proxy declares `hosts`; a lone passthrough proxy with hosts
     /// still needs SNI resolution so its host predicates are enforced.
     has_hosts: bool,
+    /// Whether the proxy carries compiled L4 stream_match predicates. Shared
+    /// non-passthrough ports with stream_match form an L4 match group.
+    has_stream_match: bool,
     backend_tls_reload_key: Option<BackendTlsReloadKey>,
 }
 
@@ -1223,6 +1226,10 @@ impl StreamListenerManager {
                                 frontend_tls: p.frontend_tls,
                                 passthrough: p.passthrough,
                                 has_hosts: !p.hosts.is_empty(),
+                                has_stream_match: p
+                                    .stream_match
+                                    .as_ref()
+                                    .is_some_and(|m| !m.is_empty()),
                                 backend_tls_reload_key,
                             },
                         )
@@ -1261,10 +1268,39 @@ impl StreamListenerManager {
             ids.sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
         }
 
-        // Build the effective desired map: individual proxies + SNI group entries.
-        // Proxies in a group are replaced by a single "__sni_{port}" entry.
+        // Non-passthrough TCP L4 match groups: multiple proxies on one port that
+        // carry stream_match predicates share one listener and resolve by
+        // trustworthy connection evidence (not SNI).
+        let mut l4_match_groups: std::collections::HashMap<u16, Vec<NamespacedResourceId>> =
+            std::collections::HashMap::new();
+        for (identity, entry) in &desired {
+            if !entry.passthrough
+                && entry.has_stream_match
+                && matches!(entry.scheme, BackendScheme::Tcp | BackendScheme::Tcps)
+            {
+                l4_match_groups
+                    .entry(entry.port)
+                    .or_default()
+                    .push(identity.clone());
+            }
+        }
+        l4_match_groups.retain(|port, ids| {
+            // Only group when more than one candidate shares the port, or when
+            // a passthrough group does not already own this port.
+            ids.len() > 1 && !passthrough_groups.contains_key(port)
+        });
+        for ids in l4_match_groups.values_mut() {
+            ids.sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
+        }
+
+        // Build the effective desired map: individual proxies + SNI/L4 group entries.
+        // Proxies in a group are replaced by a single shared-port entry.
         let grouped_proxy_ids: std::collections::HashSet<&NamespacedResourceId> =
-            passthrough_groups.values().flatten().collect();
+            passthrough_groups
+                .values()
+                .chain(l4_match_groups.values())
+                .flatten()
+                .collect();
 
         let mut effective_desired: std::collections::HashMap<String, DesiredStreamListener> =
             std::collections::HashMap::new();
@@ -1301,6 +1337,25 @@ impl StreamListenerManager {
                         frontend_tls: entry.frontend_tls,
                         passthrough: entry.passthrough,
                         backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
+                        sni_ids: Some(ids.clone()),
+                    },
+                );
+            }
+        }
+        for (port, ids) in &l4_match_groups {
+            let key = format!("__l4_{}", port);
+            if let Some(entry) = desired.get(&ids[0]) {
+                effective_desired.insert(
+                    key,
+                    DesiredStreamListener {
+                        identity: ids[0].clone(),
+                        port: entry.port,
+                        scheme: entry.scheme,
+                        frontend_tls: entry.frontend_tls,
+                        passthrough: false,
+                        backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
+                        // Reuse the candidate-id channel; tcp_proxy distinguishes
+                        // L4 match groups from SNI groups via passthrough=false.
                         sni_ids: Some(ids.clone()),
                     },
                 );

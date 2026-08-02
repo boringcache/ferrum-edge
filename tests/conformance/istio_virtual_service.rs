@@ -370,7 +370,7 @@ fn vs_tls_l4_sni_passthrough() {
         category = CATEGORY,
         feature = "spec.tls[] SNI L4 routing",
         status = Status::Supported,
-        notes = "Passthrough TCP proxy keyed by sniHosts. Unsupported matches (sourceLabels/subnets/gateways) and weighted splitting fail closed.",
+        notes = "Passthrough TCP proxy keyed by sniHosts. L4 predicates (sourceLabels/sourceSubnets/destinationSubnets/gateways/sourceNamespace) compile onto Proxy.stream_match; weighted splitting fails closed.",
     );
     let result = translate_k8s_objects(
         &[virtual_service(json!({
@@ -401,7 +401,7 @@ fn vs_tcp_l4_port_routing() {
         category = CATEGORY,
         feature = "spec.tcp[] L4 routing",
         status = Status::Supported,
-        notes = "Plain TCP proxy keyed by listen_port. Unsupported matches (sourceLabels/subnets/gateways) and weighted splitting fail closed.",
+        notes = "Plain TCP proxy keyed by listen_port. L4 predicates (sourceLabels/sourceSubnets/destinationSubnets/gateways/sourceNamespace) compile onto Proxy.stream_match; weighted splitting fails closed.",
     );
     let result = translate_k8s_objects(
         &[virtual_service(json!({
@@ -423,6 +423,69 @@ fn vs_tcp_l4_port_routing() {
     assert!(!proxy.passthrough, "plain tcp[] is not passthrough");
     assert_eq!(proxy.backend_host, "mysql.default.svc.cluster.local");
     assert_eq!(proxy.backend_port, 3306);
+}
+
+/// VS `tcp[]`/`tls[]` L4 match predicates compile onto `Proxy.stream_match`
+/// (AND within one match, OR across match blocks / candidates) and are
+/// evaluated from trustworthy connection metadata at accept time.
+#[test]
+fn vs_l4_stream_match_predicates() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "tcp[]/tls[] L4 match predicates",
+        status = Status::Supported,
+        notes = "sourceLabels, sourceSubnets, destinationSubnets, gateways, and sourceNamespace compile onto Proxy.stream_match; missing evidence denies; malformed values fail closed at translation.",
+    );
+    let result = translate_k8s_objects(
+        &[virtual_service(json!({
+            "hosts": ["db.example.com"],
+            "tcp": [{
+                "match": [{
+                    "port": 3306,
+                    "sourceLabels": {"app": "billing"},
+                    "sourceNamespace": "prod",
+                    "sourceSubnets": ["10.0.0.0/8"],
+                    "destinationSubnets": ["192.168.0.0/16"],
+                    "gateways": ["mesh"]
+                }],
+                "route": [{"destination": {"host": "mysql.default.svc.cluster.local", "port": {"number": 3306}}}]
+            }]
+        }))],
+        options(),
+    )
+    .expect("L4 match predicates translate");
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_port == Some(3306))
+        .expect("tcp[] materializes a stream proxy");
+    let arm = &proxy
+        .stream_match
+        .as_ref()
+        .expect("stream_match projected")
+        .arms[0];
+    assert_eq!(arm.source_labels.get("app").map(String::as_str), Some("billing"));
+    assert_eq!(arm.source_namespace.as_deref(), Some("prod"));
+    assert_eq!(arm.source_subnets, vec!["10.0.0.0/8".to_string()]);
+    assert_eq!(arm.destination_subnets, vec!["192.168.0.0/16".to_string()]);
+    assert_eq!(arm.gateways, vec!["mesh".to_string()]);
+
+    let err = translate_k8s_objects(
+        &[virtual_service(json!({
+            "hosts": ["db.example.com"],
+            "tcp": [{
+                "match": [{"port": 3306, "sourceSubnets": ["not-a-cidr"]}],
+                "route": [{"destination": {"host": "mysql.default.svc.cluster.local", "port": {"number": 3306}}}]
+            }]
+        }))],
+        options(),
+    )
+    .expect_err("malformed sourceSubnets must fail closed");
+    assert!(
+        format!("{err}").contains("sourceSubnets"),
+        "got {err}"
+    );
 }
 
 /// VS predicate: `uri.exact`. The translator collapses this onto a single

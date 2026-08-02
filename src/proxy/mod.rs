@@ -61,6 +61,7 @@ pub(crate) mod response_buffer_budget;
 pub mod sni;
 pub mod stream_error;
 pub mod stream_listener;
+pub mod stream_match;
 pub mod tcp_proxy;
 pub mod udp_batch;
 pub mod udp_proxy;

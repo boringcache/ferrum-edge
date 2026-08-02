@@ -83,6 +83,8 @@ fn create_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
         stream_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };

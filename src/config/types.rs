@@ -2280,6 +2280,16 @@ pub struct Proxy {
     /// Default: `false` (PROXY protocol disabled; socket peer is always used).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_proxy_protocol: Option<bool>,
+    /// Optional VirtualService L4 (`tcp[]`/`tls[]`) match predicates evaluated
+    /// from trustworthy connection / workload metadata before the stream route
+    /// is selected. `None` / empty arms = port (and SNI for passthrough) alone.
+    /// Compiled into [`compiled_stream_match`] during `normalize_fields`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_match: Option<crate::proxy::stream_match::StreamMatchCriteria>,
+    /// Hot-path compiled form of [`stream_match`]. Populated by
+    /// `normalize_fields`; never serialized.
+    #[serde(skip)]
+    pub compiled_stream_match: Option<crate::proxy::stream_match::CompiledStreamMatch>,
     /// WebSocket relay idle timeout in seconds for upgraded sessions on this
     /// proxy. After this duration with no activity in EITHER direction (frames,
     /// including Ping/Pong, or transport bytes), the session is closed. Applies
@@ -4962,17 +4972,27 @@ impl GatewayConfig {
                 continue; // No conflict for single-proxy ports
             }
 
-            // All proxies sharing a port must have passthrough: true
             let all_passthrough = proxies_on_port.iter().all(|p| p.passthrough);
-            if !all_passthrough {
+            let stream_match_group = proxies_on_port.iter().all(|p| {
+                matches!(
+                    p.dispatch_kind,
+                    DispatchKind::TcpRaw | DispatchKind::TcpTls
+                )
+            }) && proxies_on_port.iter().any(|p| {
+                p.stream_match
+                    .as_ref()
+                    .is_some_and(|m| !m.is_empty())
+            });
+
+            if !all_passthrough && !stream_match_group {
                 let non_pt: Vec<&str> = proxies_on_port
                     .iter()
                     .filter(|p| !p.passthrough)
                     .map(|p| p.id.as_str())
                     .collect();
                 errors.push(format!(
-                    "Duplicate listen_port {} — all proxies sharing a port must have passthrough: true, \
-                     but {} do not",
+                    "Duplicate listen_port {} — all proxies sharing a port must have passthrough: true \
+                     (SNI routing), or participate in an L4 stream_match group, but {} do not",
                     port,
                     non_pt.join(", ")
                 ));
@@ -4981,8 +5001,8 @@ impl GatewayConfig {
 
             // All proxies sharing a port must agree on stream_proxy_protocol:
             // the PROXY header is read from the raw stream BEFORE the TLS
-            // ClientHello, so SNI-based proxy resolution has not happened yet
-            // and the accept loop can only apply one per-listener decision.
+            // ClientHello / L4 match resolution, so the accept loop can only
+            // apply one per-listener decision.
             let pp_enabled: Vec<&str> = proxies_on_port
                 .iter()
                 .filter(|p| p.stream_proxy_protocol == Some(true))
@@ -4991,14 +5011,37 @@ impl GatewayConfig {
             if !pp_enabled.is_empty() && pp_enabled.len() != proxies_on_port.len() {
                 errors.push(format!(
                     "Shared listen_port {} mixes stream_proxy_protocol settings ({} enable it) — \
-                     the PROXY header is parsed before SNI resolution, so every proxy sharing a \
+                     the PROXY header is parsed before SNI/L4 match resolution, so every proxy sharing a \
                      port must agree on stream_proxy_protocol",
                     port,
                     pp_enabled.join(", ")
                 ));
             }
 
-            // At most one proxy per port may have empty hosts (catch-all)
+            if stream_match_group && !all_passthrough {
+                // Non-passthrough L4 match groups: at most one catch-all
+                // (empty / absent stream_match) so OR selection stays deterministic.
+                let catch_all = proxies_on_port
+                    .iter()
+                    .filter(|p| {
+                        p.stream_match
+                            .as_ref()
+                            .map(|m| m.is_empty())
+                            .unwrap_or(true)
+                    })
+                    .count();
+                if catch_all > 1 {
+                    errors.push(format!(
+                        "L4 stream_match port {} has {catch_all} catch-all proxies — at most one unconstrained match is allowed",
+                        port
+                    ));
+                }
+                continue;
+            }
+
+            // Passthrough SNI groups: at most one empty-hosts catch-all, and
+            // host overlap is forbidden unless the overlapping proxies carry
+            // distinct non-empty stream_match criteria (SNI + L4 AND).
             let catch_all_count = proxies_on_port
                 .iter()
                 .filter(|p| p.hosts.is_empty())
@@ -5010,16 +5053,22 @@ impl GatewayConfig {
                 ));
             }
 
-            // Check for host overlap between every pair
             for (i, a) in proxies_on_port.iter().enumerate() {
                 for b in &proxies_on_port[i + 1..] {
-                    if hosts_overlap(&a.hosts, &b.hosts) {
-                        errors.push(format!(
-                            "Passthrough proxies '{}' and '{}' on port {} have overlapping hosts — \
-                             each SNI hostname must route to exactly one proxy",
-                            a.id, b.id, port
-                        ));
+                    if !hosts_overlap(&a.hosts, &b.hosts) {
+                        continue;
                     }
+                    let a_match = a.stream_match.as_ref().filter(|m| !m.is_empty());
+                    let b_match = b.stream_match.as_ref().filter(|m| !m.is_empty());
+                    if a_match.is_some() && b_match.is_some() && a_match != b_match {
+                        // Distinct L4 predicates discriminate the same SNI.
+                        continue;
+                    }
+                    errors.push(format!(
+                        "Passthrough proxies '{}' and '{}' on port {} have overlapping hosts — \
+                         each SNI hostname must route to exactly one proxy (or distinct stream_match criteria)",
+                        a.id, b.id, port
+                    ));
                 }
             }
         }
@@ -6727,6 +6776,14 @@ impl Proxy {
         self.backend_host = self.backend_host.to_ascii_lowercase();
 
         self.resolve_dispatch_kind_fields();
+
+        // Compile L4 stream match predicates once so the accept path stays
+        // allocation-free. Invalid criteria clear the compiled form; validation
+        // surfaces the error separately so we never run with a partial matcher.
+        self.compiled_stream_match = match self.stream_match.as_ref() {
+            Some(criteria) if !criteria.is_empty() => criteria.compile().ok(),
+            _ => None,
+        };
     }
 
     /// Human-readable scheme for error messages. Returns `"<unset>"` before
@@ -6851,6 +6908,20 @@ impl Proxy {
                 "stream_proxy_protocol is only valid for tcp/tcps stream proxies                  (PROXY protocol is TCP-borne)"
                     .to_string(),
             );
+        }
+
+        // L4 stream match predicates are stream-proxy only and must compile.
+        if let Some(criteria) = self.stream_match.as_ref() {
+            if !is_stream_proxy {
+                errors.push(
+                    "stream_match is only valid for stream proxies (tcp, tcps, udp, dtls)"
+                        .to_string(),
+                );
+            } else if !criteria.is_empty() {
+                if let Err(e) = criteria.compile() {
+                    errors.push(format!("stream_match: {e}"));
+                }
+            }
         }
 
         // Passthrough mode validation

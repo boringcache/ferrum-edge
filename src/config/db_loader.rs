@@ -10231,6 +10231,11 @@ fn row_to_proxy_inner(
         stream_proxy_protocol: row
             .try_get::<Option<i32>, _>("stream_proxy_protocol")?
             .map(|v| v != 0),
+        // L4 VirtualService match predicates ride JSON file/admin/K8s
+        // carriers today; the SQL proxy row has no dedicated column, so DB
+        // loads start empty and normalize leaves compiled_stream_match clear.
+        stream_match: None,
+        compiled_stream_match: None,
         // api_spec_id: PRESERVE here. This row mapper is shared between
         // admin GET/list paths (which need the real owning spec id to
         // serialise per the OpenAPI schema) and the runtime config loader

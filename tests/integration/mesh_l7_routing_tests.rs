@@ -2716,11 +2716,12 @@ fn mesh_tier3_l4_tls_virtual_service_materializes_sni_passthrough_proxy() {
     assert_eq!(proxy.backend_port, 8443);
 }
 
-/// VirtualService L4 routing still fails closed on match predicates Ferrum's
-/// stream layer cannot express (here `sourceLabels`), rather than mis-routing.
+/// VirtualService L4 routing carries `sourceLabels` (and sibling L4 predicates)
+/// onto the stream proxy as precomputed `stream_match` criteria rather than
+/// rejecting the VirtualService.
 #[test]
-fn mesh_tier3_l4_virtual_service_unsupported_match_fails_closed() {
-    let err = translate_k8s_objects(
+fn mesh_tier3_l4_virtual_service_source_labels_materialize_stream_match() {
+    let result = translate_k8s_objects(
         &[object(
             "VirtualService",
             serde_json::json!({
@@ -2733,7 +2734,27 @@ fn mesh_tier3_l4_virtual_service_unsupported_match_fails_closed() {
         )],
         options(),
     )
-    .expect_err("unsupported L4 match predicate must fail closed");
-    let msg = format!("{err}");
-    assert!(msg.contains("sourceLabels"), "got: {msg}");
+    .expect("sourceLabels L4 match must translate");
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_port == Some(3306))
+        .expect("tcp[] route materializes a stream proxy");
+    let criteria = proxy
+        .stream_match
+        .as_ref()
+        .expect("sourceLabels must project onto stream_match");
+    assert_eq!(criteria.arms.len(), 1);
+    assert_eq!(
+        criteria.arms[0].source_labels.get("app").map(String::as_str),
+        Some("billing")
+    );
+    assert!(
+        criteria.arms[0]
+            .gateways
+            .iter()
+            .any(|g| g == "mesh"),
+        "omitted gateways default to mesh"
+    );
 }
