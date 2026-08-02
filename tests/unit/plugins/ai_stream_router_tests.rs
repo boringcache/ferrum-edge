@@ -558,25 +558,60 @@ async fn test_non_post_continues() {
 }
 
 #[tokio::test]
-async fn test_claim_keeps_final_body_context_after_content_type_transform() {
+async fn test_claim_preserves_final_body_buffering_after_content_type_relabel() {
     let plugin = build(openai_and_anthropic_config());
+
+    // Unclaimed non-JSON POST must not select buffering.
+    let mut unclaimed_plain = post_ctx(&json!({
+        "model": "gpt-4o",
+        "stream": true,
+        "messages": []
+    }));
+    unclaimed_plain
+        .headers
+        .insert("content-type".to_string(), "text/plain".to_string());
+    assert!(
+        !ferrum_edge::_test_support::request_has_ai_stream_router_claim_for_test(
+            &unclaimed_plain
+        ),
+        "fixture must stay unclaimed"
+    );
+    assert!(
+        !plugin.should_buffer_request_body(&unclaimed_plain),
+        "unclaimed text/plain must not request buffering"
+    );
+
+    // Claim a valid streaming JSON request, then relabel as a later
+    // request_transformer would before the dispatcher recomputes requirements.
     let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
     let mut ctx = post_ctx(&body);
     let mut headers = json_headers();
-
     assert!(matches!(
         plugin.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
     assert!(ferrum_edge::_test_support::request_has_ai_stream_router_claim_for_test(&ctx));
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "claimed JSON requests must buffer before relabel"
+    );
 
-    // A later request_transformer can relabel the effective outbound body
-    // before the dispatcher recomputes final body requirements. The private
-    // claim must keep contextual final revalidation selected; the router's
-    // boundary policy will restore application/json before body transforms.
     ctx.headers
         .insert("content-type".to_string(), "text/plain".to_string());
-    assert!(plugin.should_buffer_request_body(&ctx));
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "private claim must keep buffering after Content-Type relabel"
+    );
+    assert!(plugin.needs_final_request_body_context());
+
+    // Mirror `final_request_body_requirements` for a contextual final hook.
+    let requires_buffering = plugin.should_buffer_request_body(&ctx);
+    let needs_final_context =
+        requires_buffering && plugin.needs_final_request_body_context();
+    assert!(
+        requires_buffering && needs_final_context,
+        "recomputed final-body requirements must keep buffering and RequestContext"
+    );
 }
 
 #[tokio::test]
@@ -4847,6 +4882,46 @@ async fn final_header_policy_does_not_touch_unclaimed_requests() {
     assert_eq!(
         headers.get("authorization").map(String::as_str),
         Some("Bearer client")
+    );
+}
+
+#[tokio::test]
+async fn transformer_content_type_relabel_keeps_final_body_requirements() {
+    let plugins = router_then_transformer(json!([{
+        "operation": "update",
+        "target": "header",
+        "key": "Content-Type",
+        "value": "text/plain"
+    }]));
+    let body = streaming_request("gpt-4o");
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        run_before_proxy_chain(&plugins, &mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(ferrum_edge::_test_support::request_has_ai_stream_router_claim_for_test(&ctx));
+    // The proxy swaps the effective outbound header map back onto the context
+    // before recomputing `final_request_body_requirements`.
+    ctx.headers = headers.clone();
+    assert_eq!(
+        ctx.headers.get("content-type").map(String::as_str),
+        Some("text/plain"),
+        "transformer must relabel the effective outbound Content-Type"
+    );
+
+    let mut requires_buffering = false;
+    let mut needs_final_context = false;
+    for plugin in &plugins {
+        if plugin.should_buffer_request_body(&ctx) {
+            requires_buffering = true;
+            needs_final_context |= plugin.needs_final_request_body_context();
+        }
+    }
+    assert!(
+        requires_buffering && needs_final_context,
+        "claimed request must keep buffering and contextual final revalidation \
+         after a later Content-Type relabel"
     );
 }
 
