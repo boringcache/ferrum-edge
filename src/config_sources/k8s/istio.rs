@@ -26,12 +26,12 @@ use super::{
     mesh_route_dispatch_can_emit_rule, mesh_route_dispatch_has_unsupported_predicate,
     mesh_route_dispatch_plugin_from_rules, mesh_route_dispatch_rules_for_proxy,
     optional_port_field, optional_target_weight_field, parse_istio_duration_ms, port_from_u64,
-    proxy_for_route, request_termination_plugin_for_proxy, resource_id,
+    proxy_for_route, request_termination_plugin_for_proxy,
+    resolve_workload_entry_service_attachment, resource_id,
     route_backends_require_node_waypoint_authz, route_local_fault_delay_for_rule,
     route_local_fault_value_for_rule, route_request_transformer_plugin_for_proxy,
     route_response_transformer_plugin_for_proxy, sidecar_selector_from_istio, string_array,
-    resolve_workload_entry_service_attachment, string_field, string_map, upstream_for_route,
-    workload_selector_from_istio,
+    string_field, string_map, upstream_for_route, workload_selector_from_istio,
 };
 use crate::config::types::{
     BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
@@ -2180,8 +2180,7 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         .get("service")
         .and_then(Value::as_str)
         .unwrap_or(&object.metadata.name);
-    let service_key =
-        resolve_workload_entry_service_attachment(acc, object, service_raw)?;
+    let service_key = resolve_workload_entry_service_attachment(acc, object, service_raw)?;
     let service_namespace = service_key.as_ref().and_then(|key| {
         (key.namespace != object.metadata.namespace).then(|| key.namespace.clone())
     });
@@ -6509,7 +6508,8 @@ mod tests {
             "MeshService.workloads must reference the cross-namespace WorkloadEntry"
         );
 
-        let matched = crate::modes::mesh::matched_local_service_workloads(service, &mesh.workloads, None);
+        let matched =
+            crate::modes::mesh::matched_local_service_workloads(service, &mesh.workloads, None);
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].addresses, vec!["10.9.0.5".to_string()]);
     }

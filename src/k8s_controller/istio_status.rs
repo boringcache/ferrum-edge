@@ -1171,6 +1171,17 @@ fn workload_entry_status(
             })
         })
     });
+    // Keep the fallback key alive for the full status scope so name/namespace
+    // borrows remain valid after the branch (avoids E0597 on temporary Option).
+    let fallback_service_key = if stamped.is_none() {
+        workload_entry_service_key_from_host(
+            service_host,
+            &object.metadata.namespace,
+            cluster_domain,
+        )
+    } else {
+        None
+    };
     let (service_name, service_namespace, cross_namespace) = if let Some(workload) = stamped {
         let service_namespace = workload.attached_service_namespace();
         (
@@ -1179,16 +1190,11 @@ fn workload_entry_status(
             service_namespace != object.metadata.namespace.as_str(),
         )
     } else {
-        let service_key = workload_entry_service_key_from_host(
-            service_host,
-            &object.metadata.namespace,
-            cluster_domain,
-        );
-        let service_name = service_key
+        let service_name = fallback_service_key
             .as_ref()
             .map(|key| key.name.as_str())
             .unwrap_or(service_host);
-        let service_namespace = service_key
+        let service_namespace = fallback_service_key
             .as_ref()
             .map(|key| key.namespace.as_str())
             .unwrap_or(object.metadata.namespace.as_str());
@@ -3357,7 +3363,10 @@ mod tests {
             .iter()
             .find(|update| update.kind == "WorkloadEntry")
             .expect("WorkloadEntry status update");
-        let c = find_condition(update.status["conditions"].as_array().unwrap(), "FerrumAccepted");
+        let c = find_condition(
+            update.status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
         assert_eq!(c["status"].as_str(), Some("True"));
         let detail = update.ferrum_detail.as_ref().unwrap();
         assert_eq!(

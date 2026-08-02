@@ -1322,11 +1322,7 @@ pub(crate) fn resolve_workload_entry_service_attachment(
                 "WorkloadEntry.service '{service_raw}' references Service '{}/{}' across namespaces \
                  (cross-namespace); a ReferenceGrant in namespace '{}' must permit from \
                  WorkloadEntry in '{}' to Service '{}'",
-                key.namespace,
-                key.name,
-                key.namespace,
-                object.metadata.namespace,
-                key.name
+                key.namespace, key.name, key.namespace, object.metadata.namespace, key.name
             ),
         ));
     }
