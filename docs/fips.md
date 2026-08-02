@@ -231,7 +231,7 @@ walks through, so all of the following are refused:
 | Injector admission webhook | `FERRUM_INJECTOR_ALLOW_PLAINTEXT=true` |
 | Mesh stream egress | `FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT=true` |
 | Mesh identity | `FERRUM_MESH_ALLOW_NO_CA`, `FERRUM_MESH_ALLOW_STATIC_ID`, `FERRUM_MESH_CA_BOOTSTRAP_DEV` |
-| Config database | `FERRUM_DB_TLS_MODE=require` (MongoDB `allow_invalid_certificates`), and the `tlsInsecure` / `tlsAllowInvalidCertificates` / `tlsAllowInvalidHostnames` / `tlsDisableOCSPEndpointCheck` URI options in `FERRUM_DB_URL` |
+| Config database | MongoDB config stores are refused in their entirety; SQL config stores still refuse their applicable verification opt-outs |
 | Backend, per upstream/proxy | `backend_tls_verify_server_cert: false` (this also covers the mesh `DestinationRule.trafficPolicy.tls.insecureSkipVerify` override, which is projected onto it before admission) |
 | `spec_expose` | `tls_no_verify: true` |
 | `load_testing` | `gateway_tls_no_verify` — refused when `gateway_tls` is on and it is not explicitly `false`, because it **defaults open** |
@@ -427,6 +427,7 @@ than being allowed to run outside the boundary:
 
 | Capability | Why | Alternative |
 |---|---|---|
+| MongoDB config database | the driver performs authentication and protocol cryptography through independent HMAC, PBKDF2, SHA-1, SHA-2, and MD5 implementations; its AWS-LC rustls feature routes only TLS | PostgreSQL, MySQL, SQLite, or file mode |
 | `kafka_logging` | librdkafka performs TLS through OpenSSL, which Ferrum cannot route onto the module | `tcp_logging`, `ws_logging`, `http_logging` (all rustls-based) |
 | **DTLS** (frontend listener, `backend_scheme: dtls`, `udp_logging` `dtls: true`) | the vendored `dimpl` stack draws its handshake and record randomness from the `rand` crate, not the module DRBG | a TLS-terminating listener or a rustls-based sink |
 | `soap_ws_security` `rsa-sha1` / `sha1` | SHA-1 is disallowed for signatures (SP 800-131A Rev. 2) | `rsa-sha256` / `sha256` |

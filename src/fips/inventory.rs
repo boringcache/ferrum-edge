@@ -221,12 +221,11 @@ pub const INVENTORY: &[CryptoOperation] = &[
     CryptoOperation {
         operation: "MongoDB config database",
         location: "src/config/mongo_store.rs",
-        implementation: "mongodb driver, rustls",
-        disposition: Disposition::ModuleRoutable,
-        rationale: "mongodb is declared with default-features = false; the `fips` feature \
-                    selects mongodb/rustls-tls-aws-lc while aws-lc-rs/fips binds the same \
-                    resolved backend to the selected AWS-LC FIPS implementation, and the \
-                    feature-policy gate rejects any resolved mongodb/rustls-tls Ring edge",
+        implementation: "mongodb driver",
+        disposition: Disposition::Rejected,
+        rationale: "the driver performs authentication and protocol cryptography with its own \
+                    hmac, pbkdf2, sha1, sha2, and md-5 dependencies; selecting its AWS-LC \
+                    rustls feature routes TLS only, so policy refuses every MongoDB config store",
     },
     // ── JWT / JWK ───────────────────────────────────────────────────────
     CryptoOperation {
