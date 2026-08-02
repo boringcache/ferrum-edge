@@ -163,7 +163,10 @@ fn under_strength_rsa_is_refused_and_approved_rsa_is_admitted() {
 
     let unmeasurable = keys::check_rsa_modulus_bits(0, "backend TLS CA bundle")
         .expect_err("a modulus whose strength cannot be established must fail closed");
-    assert!(unmeasurable.contains("could not be measured"), "{unmeasurable}");
+    assert!(
+        unmeasurable.contains("could not be measured"),
+        "{unmeasurable}"
+    );
 }
 
 #[test]
@@ -443,8 +446,9 @@ fn mongodb_uri_verification_bypass_is_refused_without_echoing_the_url() {
 fn a_mongodb_uri_that_explicitly_disables_the_bypass_is_admitted() {
     policy::check_env_config_enforced(&env_with(|c| {
         c.db_type = Some("mongodb".to_string());
-        c.db_url =
-            Some("mongodb://db.internal:27017/ferrum?tlsAllowInvalidCertificates=false".to_string());
+        c.db_url = Some(
+            "mongodb://db.internal:27017/ferrum?tlsAllowInvalidCertificates=false".to_string(),
+        );
     }))
     .expect("`=false` is not a bypass and must not be reported as one");
 }
@@ -521,7 +525,10 @@ fn a_proxy_verification_opt_out_is_refused() {
 fn every_plugin_owned_verification_opt_out_is_refused() {
     let cases: &[(&str, serde_json::Value)] = &[
         ("spec_expose", json!({ "tls_no_verify": true })),
-        ("udp_logging", json!({ "dtls": true, "dtls_no_verify": true })),
+        (
+            "udp_logging",
+            json!({ "dtls": true, "dtls_no_verify": true }),
+        ),
         (
             "api_chargeback_sink",
             json!({ "clickhouse": { "tls": { "insecure_skip_verify": true } } }),
@@ -600,7 +607,10 @@ fn load_testing_insecure_default_is_refused_even_when_the_key_is_absent() {
 
     // Without `gateway_tls` the key cannot bypass anything, and here the gate is
     // a value in the same document rather than an inference about another one.
-    let no_tls = config_with_plugins(vec![plugin("load_testing", json!({ "gateway_tls": false }))]);
+    let no_tls = config_with_plugins(vec![plugin(
+        "load_testing",
+        json!({ "gateway_tls": false }),
+    )]);
     policy::check_gateway_config_enforced(&no_tls)
         .expect("a disabled TLS client has no peer to leave unverified");
 }
@@ -646,7 +656,10 @@ fn peer_verification_diagnostics_are_bounded() {
         "a large document must not turn one refusal into an unbounded record: {error}"
     );
     assert!(
-        error.contains(&format!("and {} more", 64 - policy::MAX_REPORTED_VIOLATIONS)),
+        error.contains(&format!(
+            "and {} more",
+            64 - policy::MAX_REPORTED_VIOLATIONS
+        )),
         "the remainder must still be counted: {error}"
     );
 }

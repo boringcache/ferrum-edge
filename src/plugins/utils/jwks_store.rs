@@ -428,11 +428,7 @@ impl JwksKeyStore {
         let y_bytes = URL_SAFE_NO_PAD
             .decode(y)
             .map_err(|e| format!("invalid base64url in 'y': {e}"))?;
-        crate::fips::keys::check_jwk_ec_public_key(
-            jwk.crv.as_deref(),
-            &x_bytes,
-            &y_bytes,
-        )?;
+        crate::fips::keys::check_jwk_ec_public_key(jwk.crv.as_deref(), &x_bytes, &y_bytes)?;
 
         let algorithm = match jwk.crv.as_deref() {
             Some("P-384") => Algorithm::ES384,

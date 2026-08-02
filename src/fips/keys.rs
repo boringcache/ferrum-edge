@@ -153,11 +153,7 @@ pub fn check_certificate_public_key_enforced(
                          curves: P-256, P-384, P-521."
                     )
                 })?;
-            check_ec_curve_oid_and_point_enforced(
-                &curve_oid.to_string(),
-                point.data(),
-                &label,
-            )
+            check_ec_curve_oid_and_point_enforced(&curve_oid.to_string(), point.data(), &label)
         }
         // Everything else is a definite "no", not an unclassified maybe. DSA is
         // withdrawn for signature generation by FIPS 186-5; the GOST curves are
@@ -295,10 +291,7 @@ pub fn check_jwk_rsa_public_key(modulus: &[u8], exponent: &[u8]) -> Result<(), S
 }
 
 /// The enforced half of [`check_jwk_rsa_public_key`].
-pub fn check_jwk_rsa_public_key_enforced(
-    modulus: &[u8],
-    exponent: &[u8],
-) -> Result<(), String> {
+pub fn check_jwk_rsa_public_key_enforced(modulus: &[u8], exponent: &[u8]) -> Result<(), String> {
     check_jwk_rsa_modulus_enforced(modulus)?;
     check_rsa_public_exponent_enforced(exponent, "JWKS RSA signing key")
 }
@@ -360,11 +353,7 @@ pub fn check_jwk_ec_curve_enforced(curve: &str) -> Result<(), String> {
 }
 
 /// Admit the complete public portion of an EC JWK.
-pub fn check_jwk_ec_public_key(
-    curve: Option<&str>,
-    x: &[u8],
-    y: &[u8],
-) -> Result<(), String> {
+pub fn check_jwk_ec_public_key(curve: Option<&str>, x: &[u8], y: &[u8]) -> Result<(), String> {
     if !super::is_enforcing() {
         return Ok(());
     }

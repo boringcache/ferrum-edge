@@ -459,13 +459,11 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
     // the mode that turns CA and hostname verification off
     // (`DbTlsMode::allows_invalid_certificates`).
     if env_config.mongodb_tls_allows_invalid_certs() {
-        return Err(
-            "FERRUM_DB_TLS_MODE=require maps to the MongoDB driver's \
+        return Err("FERRUM_DB_TLS_MODE=require maps to the MongoDB driver's \
              `allow_invalid_certificates`, which encrypts the config-database connection but \
              disables CA and hostname verification. It is refused while FIPS mode is enforced; \
              use `verify-ca` or `verify-full`."
-                .to_string(),
-        );
+            .to_string());
     }
 
     // A MongoDB connection string can carry the same opt-out as a URI option,
@@ -567,9 +565,7 @@ pub fn check_external_secret_sources() -> Result<(), String> {
 /// The enforced half of [`check_external_secret_sources`], over an already
 /// collected suffix set so it is directly testable without mutating the
 /// process environment.
-pub fn check_external_secret_sources_enforced(
-    configured: Vec<&'static str>,
-) -> Result<(), String> {
+pub fn check_external_secret_sources_enforced(configured: Vec<&'static str>) -> Result<(), String> {
     if configured.is_empty() {
         return Ok(());
     }
@@ -923,7 +919,10 @@ fn collect_unauthenticated_peer_keys(plugin: &PluginConfig, out: &mut Vec<String
         let values = lookup_path_all(&plugin.config, key.path);
         if values.is_empty() {
             if key.absent_is_bypass {
-                out.push(format!("{}.{} (unset, defaults open)", key.plugin, key.path));
+                out.push(format!(
+                    "{}.{} (unset, defaults open)",
+                    key.plugin, key.path
+                ));
             }
             continue;
         }
