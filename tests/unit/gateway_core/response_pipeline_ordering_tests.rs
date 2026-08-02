@@ -44,6 +44,10 @@ const PROTECTED_HEADER: &str = "x-public-secret";
 /// pending signal previously reached publication unconsumed.
 struct FinalPolicyCapacityRefusal;
 
+/// Later ordinary `after_proxy` rejection whose gateway-owned replacement
+/// exposes a rename source to the still-later response transformer.
+struct LateHeaderBearingReject;
+
 #[async_trait::async_trait]
 impl Plugin for FinalPolicyCapacityRefusal {
     fn name(&self) -> &str {
@@ -67,6 +71,33 @@ impl Plugin for FinalPolicyCapacityRefusal {
     ) -> ferrum_edge::plugins::PluginResult {
         mark_buffered_response_capacity_refusal_pending_for_test(ctx);
         ferrum_edge::plugins::PluginResult::Continue
+    }
+}
+
+#[async_trait::async_trait]
+impl Plugin for LateHeaderBearingReject {
+    fn name(&self) -> &str {
+        "late_header_bearing_reject"
+    }
+
+    fn priority(&self) -> u16 {
+        3500
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> ferrum_edge::plugins::PluginResult {
+        ferrum_edge::plugins::PluginResult::Reject {
+            status_code: 502,
+            body: r#"{"error":"upstream rejected"}"#.to_string(),
+            headers: HashMap::from([(
+                "x-pending-secret".to_string(),
+                "value".to_string(),
+            )]),
+        }
     }
 }
 
@@ -438,6 +469,29 @@ async fn late_header_rename_cannot_bypass_waf_on_backend_response() {
         "the refused header must not survive onto the rejection: {:?}",
         reject.2
     );
+}
+
+/// A later ordinary `after_proxy` hook can replace the backend response, after
+/// which reject-path response transforms still run. The authoritative header
+/// phase must close that replacement too; otherwise the early return from the
+/// ordinary chain leaves this lifecycle behind the synthetic fix.
+#[tokio::test]
+async fn late_header_rename_cannot_bypass_waf_on_backend_rejection_replacement() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        waf_blocking_protected_header("CUSTOM-RESP-HEADER-BACKEND-REJECT"),
+        Arc::new(LateHeaderBearingReject),
+        response_transformer_renaming_header(),
+    ];
+    let mut ctx = ctx_for("GET", "/orders");
+    let mut headers = json_headers();
+
+    let reject = run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut headers)
+        .await
+        .expect("the transformed rejection header must be refused");
+
+    assert_eq!(reject.0, 403);
+    assert!(!header_names_contain(&reject.2, PROTECTED_HEADER));
+    assert!(!header_names_contain(&reject.2, "x-pending-secret"));
 }
 
 /// Both shared funnels must reach the same conclusion for the same chain — the

@@ -17953,6 +17953,20 @@ pub(crate) async fn run_after_proxy_hooks(
                     &mut headers,
                 )
                 .await;
+                // The reject-path hooks above can run later header transforms
+                // (notably `response_transformer`) over the replacement. Close
+                // that map with the same authoritative policy as the accepted
+                // path; returning here without it would leave ordinary backend
+                // rejections as the one lifecycle where a protected header can
+                // be introduced after WAF's only pass.
+                enforce_final_client_visible_response_header_policy(
+                    plugins,
+                    ctx,
+                    &mut status_code,
+                    &mut headers,
+                    &mut body,
+                )
+                .await;
                 return Some(AfterProxyReject {
                     status_code,
                     body,
