@@ -12,9 +12,7 @@ use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::{ConsumerIndex, PluginCache, RouterCache};
 use tracing::info;
 
-use crate::scaffolding::clients::{
-    bind_quinn_client_endpoint, bind_quinn_server_endpoint,
-};
+use crate::scaffolding::clients::{bind_quinn_client_endpoint, bind_quinn_server_endpoint};
 
 // Initialize rustls crypto provider for tests
 fn init_crypto_provider() {

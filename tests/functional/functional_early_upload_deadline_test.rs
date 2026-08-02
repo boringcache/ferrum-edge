@@ -307,8 +307,7 @@ async fn h3_post_stalled_body_with_origin(
     client_tls.alpn_protocols = vec![b"h3".to_vec()];
     let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls)
         .map_err(|e| format!("QuicClientConfig: {e}"))?;
-    let mut endpoint =
-        bind_quinn_client_endpoint(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let mut endpoint = bind_quinn_client_endpoint(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_config)));
 
     let conn = tokio::time::timeout(Duration::from_secs(10), endpoint.connect(addr, host)?)

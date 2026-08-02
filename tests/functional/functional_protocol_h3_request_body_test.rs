@@ -187,8 +187,7 @@ async fn h3_post_bytes(
     let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls)
         .map_err(|e| format!("QuicClientConfig build failed: {e}"))?;
     let client_config = ClientConfig::new(Arc::new(quic_config));
-    let mut endpoint =
-        bind_quinn_client_endpoint(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let mut endpoint = bind_quinn_client_endpoint(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     endpoint.set_default_client_config(client_config);
 
     let conn = tokio::time::timeout(Duration::from_secs(15), endpoint.connect(addr, &host)?)

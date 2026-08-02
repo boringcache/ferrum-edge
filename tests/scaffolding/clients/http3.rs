@@ -129,8 +129,7 @@ impl Http3Client {
 
         // Bind ephemeral local UDP. quinn picks an IPv4 endpoint by default
         // which matches the gateway's IPv4 bind in test mode.
-        let mut endpoint =
-            bind_quinn_client_endpoint(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+        let mut endpoint = bind_quinn_client_endpoint(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
         endpoint.set_default_client_config(client_config);
         Ok(Self { endpoint })
     }
