@@ -1322,15 +1322,24 @@ impl AiResponseGuard {
         }
     }
 
+    /// Whether this instance's configuration can actually refuse a response.
+    ///
+    /// `require_json` / `required_fields` reject independently of `action`; the
+    /// detection rules only reject or redact when `action` is not `warn`. A
+    /// `warn`-only instance is pass-through by construction, which is why it
+    /// neither rejects an uninspectable representation nor CLAIMS one at the
+    /// shared representation gate.
+    fn has_enforcing_disposition(&self) -> bool {
+        self.require_json || !self.required_fields.is_empty() || self.action != GuardAction::Warn
+    }
+
     fn respond_to_uninspectable(
         &self,
         ctx: &mut RequestContext,
         reason: &'static str,
         message: &'static str,
     ) -> PluginResult {
-        let must_reject = self.require_json
-            || !self.required_fields.is_empty()
-            || self.action != GuardAction::Warn;
+        let must_reject = self.has_enforcing_disposition();
         if must_reject {
             Self::mark_rejected(ctx, reason);
             PluginResult::Reject {
@@ -3584,6 +3593,11 @@ impl Plugin for AiResponseGuard {
     /// coding is `grpc-encoding` rather than `Content-Encoding`; and gateway
     /// compression is not a reason to claim, because it now runs in the deferred
     /// transport-encoding stage, after every decision and rewrite here.
+    ///
+    /// Disposition-aware for the same reason the uninspectable-response answer
+    /// is: a `warn`-only instance passes every finding through, so claiming on
+    /// its behalf would turn an origin coding this gateway cannot decode into a
+    /// `502` for a configuration that was never allowed to refuse anything.
     fn enforces_response_body_policy(
         &self,
         ctx: &RequestContext,
@@ -3591,6 +3605,7 @@ impl Plugin for AiResponseGuard {
         _response_body: &[u8],
     ) -> bool {
         self.has_validation_rules
+            && self.has_enforcing_disposition()
             && !ctx.is_native_grpc_request()
             && !response_content_type
                 .is_some_and(crate::plugins::utils::body_transform::is_framed_grpc_content_type)
@@ -3602,7 +3617,9 @@ impl Plugin for AiResponseGuard {
     /// Configuration- and request-only over-approximation, consulted before the
     /// response `Content-Type` is known.
     fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
-        self.has_validation_rules && !ctx.is_native_grpc_request()
+        self.has_validation_rules
+            && self.has_enforcing_disposition()
+            && !ctx.is_native_grpc_request()
     }
 
     fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {

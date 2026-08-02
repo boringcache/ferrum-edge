@@ -27,6 +27,14 @@
 //!   before a single output byte exists. A stacked coding list holds one pass's
 //!   input and the next pass's output at once, so the caller passes the
 //!   still-resident `concurrent_bytes` and the peak is what stays charged.
+//!   What is charged here is the DECODE's own working set. The first pass's
+//!   INPUT — the encoded bytes handed in — is owned and already bounded by the
+//!   caller's collection limit, but whether it additionally holds a budget
+//!   charge is gate-specific: a buffered response's wire bytes carry their
+//!   retained-body charge, while a request's wire bytes are bounded per request
+//!   and are not charged to `FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES`. Neither
+//!   gate may therefore treat its input as a substitute for reserving the
+//!   output.
 //!
 //! Nothing here decides a posture. A refusal is reported as a
 //! [`ChargedDecodeError`] and each gate maps it onto its own client-visible
@@ -219,8 +227,9 @@ pub(crate) enum ChargedDecodeError {
 /// instead, which pins `large_window = false` and makes that header a format
 /// error.
 ///
-/// Feeding the whole encoded body in at once (it is already resident and
-/// collector-charged) also removes the decoder's own input buffer and makes the
+/// Feeding the whole encoded body in at once (it is already resident, owned by
+/// the caller and bounded by its collection limit) also removes the decoder's
+/// own input buffer and makes the
 /// failure classification exact: with no more input to come, `NeedsMoreInput`
 /// can only mean a truncated stream.
 pub(crate) struct StrictBrotliReader<'a> {
@@ -314,7 +323,10 @@ impl Read for StrictBrotliReader<'_> {
 /// `concurrent_bytes` is what the caller is holding resident alongside this
 /// output for the duration of the pass — the previous pass's decoded buffer on a
 /// stacked `Content-Encoding`, and zero on the first pass, which reads straight
-/// from the already-charged wire bytes. Charging `concurrent_bytes + capacity`
+/// from wire bytes this decoder does not own. Those bytes are bounded by the
+/// caller's collection limit; whether they ALSO hold a charge is gate-specific
+/// (a buffered response's do, a request's do not), so this accounting never
+/// leans on them. Charging `concurrent_bytes + capacity`
 /// is what keeps a stacked decode from escaping the aggregate bound in the
 /// window where both allocations exist. The active decoder's own heap is charged
 /// separately by [`decode_one_coding`], so the semaphore sees scratch + input +

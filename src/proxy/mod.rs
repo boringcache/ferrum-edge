@@ -4655,10 +4655,35 @@ pub(crate) async fn run_final_request_body_hooks(
 
 pub(crate) async fn run_final_request_body_hooks_with_provenance(
     plugins: &[Arc<dyn Plugin>],
+    ctx: Option<&mut RequestContext>,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> crate::plugins::RequestPluginDeadlineResult {
+    run_final_request_body_hooks_with_provenance_in(
+        plugins,
+        ctx,
+        grpc_deadline_at,
+        headers,
+        body,
+        crate::proxy::response_buffer_budget::BudgetRef::request_decode(),
+    )
+    .await
+}
+
+/// The same phase, with the aggregate request-decode budget named explicitly.
+///
+/// Production always passes the process-global budget through the wrapper above;
+/// external tests bind an isolated one so they can observe admission and — the
+/// property this stage owns — RELEASE deterministically without mutating a
+/// process-global semaphore under a parallel test binary.
+pub(crate) async fn run_final_request_body_hooks_with_provenance_in(
+    plugins: &[Arc<dyn Plugin>],
     mut ctx: Option<&mut RequestContext>,
     grpc_deadline_at: Option<tokio::time::Instant>,
     headers: &HashMap<String, String>,
     body: &[u8],
+    budget: crate::proxy::response_buffer_budget::BudgetRef<'_>,
 ) -> crate::plugins::RequestPluginDeadlineResult {
     let deadline_expired = grpc_deadline_at
         .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
@@ -4686,13 +4711,7 @@ pub(crate) async fn run_final_request_body_hooks_with_provenance(
             FinalRequestBodyPosture, REQUEST_REPRESENTATION_REJECTED_METADATA_KEY,
             REQUEST_REPRESENTATION_UNINSPECTABLE_MESSAGE, evaluate_final_request_body_posture,
         };
-        match evaluate_final_request_body_posture(
-            plugins,
-            ctx,
-            headers,
-            body,
-            crate::proxy::response_buffer_budget::BudgetRef::request_decode(),
-        ) {
+        match evaluate_final_request_body_posture(plugins, ctx, headers, body, budget) {
             FinalRequestBodyPosture::Inspectable => {}
             FinalRequestBodyPosture::Decoded(plaintext) => {
                 // The charge travels INSIDE `plaintext`, so staging it is a move
@@ -4717,6 +4736,14 @@ pub(crate) async fn run_final_request_body_hooks_with_provenance(
                 // would claim the backend is down.
                 use crate::proxy::response_buffer_budget as budget;
                 warn!("Governed request body decode refused: request-decode budget exhausted");
+                // The SAME gateway-capacity terminal state the retained-response
+                // refusal uses. Without it this fixed `503` is an ordinary
+                // rejection with no provenance, and the response-side finalizer
+                // that publishes it — the route response-size policy, the
+                // rejection-replacement hooks, and the body-policy pipeline
+                // wherever it reaches these bytes — could restate the gateway's
+                // own health-neutral capacity answer as a policy failure.
+                ctx.mark_gateway_capacity_response_selected();
                 let mut reject_headers = HashMap::new();
                 if ctx.is_native_grpc_request()
                     || crate::plugins::grpc_web::client_grpc_framing_representation(ctx).is_some()
@@ -4749,6 +4776,14 @@ pub(crate) async fn run_final_request_body_hooks_with_provenance(
                     REQUEST_REPRESENTATION_REJECTED_METADATA_KEY.to_string(),
                     rejection.reason().to_string(),
                 );
+                // Trusted, typed provenance for the fixed `400`, alongside the
+                // metadata reason (which a plugin can write and therefore cannot
+                // authorize anything). The gateway authored this terminal over a
+                // representation no policy was able to read; the response-side
+                // finalizer must publish it as written rather than re-deciding
+                // the gateway's own error payload against a response schema,
+                // response-body rule, AI guard, or route response-size ceiling.
+                ctx.mark_gateway_representation_response_selected();
                 return crate::plugins::RequestPluginDeadlineResult::Completed(
                     PluginResult::Reject {
                         status_code: 400,
@@ -4761,6 +4796,38 @@ pub(crate) async fn run_final_request_body_hooks_with_provenance(
             }
         }
     }
+    let result = run_final_request_body_hook_chain(
+        plugins,
+        ctx.as_deref_mut(),
+        grpc_deadline_at,
+        headers,
+        body,
+    )
+    .await;
+    // The staged plaintext — and the aggregate request-decode charge it owns —
+    // is scoped to THIS hook stage and nothing later. On H1/H2 the hooks receive
+    // a throwaway clone, so the view dies with it; on native H3 they receive the
+    // real context, which would otherwise keep an attacker-amplified decode (and
+    // its budget block) resident until request teardown. Clearing here, after
+    // every return path of the chain, makes the charge lifetime identical on
+    // every ladder and equal to the documented hook-stage boundary.
+    if let Some(ctx) = ctx {
+        ctx.clear_governed_request_body_plaintext();
+    }
+    result
+}
+
+/// The `on_final_request_body` chain itself, split out so the caller can release
+/// the staged plaintext on every one of its exits — acceptance, rejection, and
+/// deadline alike — without a `Drop` guard over a `&mut` it also needs to lend
+/// to each hook.
+async fn run_final_request_body_hook_chain(
+    plugins: &[Arc<dyn Plugin>],
+    mut ctx: Option<&mut RequestContext>,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> crate::plugins::RequestPluginDeadlineResult {
     for plugin in plugins {
         let deadline = ctx
             .as_deref()
@@ -16986,6 +17053,12 @@ async fn run_after_proxy_hooks_on_rejection(
                             .or_insert_with(|| "Origin".to_string());
                     }
                     ctx.record_deadline_response_header_mutations(response_headers);
+                    // This response is now authored by the rejection path, not
+                    // by the backend or the synthetic producer whose bytes the
+                    // body-policy witness was captured over. The synthetic
+                    // lifecycle's re-decision consumes this exactly once and
+                    // skips re-judging it (`.claude/rules/plugins.md` 10b).
+                    ctx.mark_rejection_response_replaced();
                     if plugin.warn_on_rejection_response_replacement() {
                         warn!(
                             rejecting_plugin = plugin.name(),
@@ -17201,10 +17274,12 @@ fn enforce_synthetic_response_body_limit(
 ) -> bool {
     use crate::plugins::utils::synthetic_response::synthetic_response_omits_body;
 
-    // The shared retained-response terminal is already the authoritative
-    // gateway outcome. A smaller route body-size ceiling must not recategorize
-    // that fixed, redaction-safe error as a backend representation failure.
-    if ctx.gateway_capacity_response_selected() {
+    // A gateway-authored terminal is already the authoritative outcome — the
+    // shared retained-response capacity refusal, or the fixed request
+    // representation `400`. A smaller route body-size ceiling must not
+    // recategorize either fixed, redaction-safe error as a backend
+    // representation failure.
+    if ctx.gateway_capacity_response_selected() || ctx.gateway_representation_response_selected() {
         return false;
     }
     if body.is_empty() || synthetic_response_omits_body(&ctx.method, *status) {
@@ -17579,11 +17654,29 @@ async fn reenforce_final_synthetic_client_visible_response_body_policy(
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Bytes,
     witness: FinalSyntheticBodyPolicyWitness,
+    late_rejection_replacement: bool,
 ) -> bool {
     // These gateway terminals are already the authoritative, redaction-safe
     // answer. Re-deciding policy against a gateway error payload is exactly what
     // the first-pass loops refuse to do.
-    if ctx.gateway_capacity_response_selected() || ctx.gateway_deadline_response_selected() {
+    if ctx.gateway_capacity_response_selected()
+        || ctx.gateway_deadline_response_selected()
+        || ctx.gateway_representation_response_selected()
+    {
+        return false;
+    }
+
+    // A hook on the deliberately-late reject-path `after_proxy` chain replaced
+    // the rejection body/status/representation. That replacement IS the gateway's
+    // (or an opted-in plugin's) final answer for an already-rejected request, and
+    // section 10b of `.claude/rules/plugins.md` is explicit that a gateway
+    // terminal and an earlier rejection are never re-decided. Re-judging it here
+    // would let an operator's response schema turn, say, `spec_expose`'s HEAD
+    // body strip into a second rejection. Narrow by construction: the marker is
+    // set only on that trusted replacement path, and taken exactly once, so a
+    // backend/application representation that some other late hook mutated is
+    // still re-checked below.
+    if late_rejection_replacement {
         return false;
     }
 
@@ -17796,7 +17889,8 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     // serverless terminate, dedup replay), so there is no upstream snapshot and
     // no hidden origin coding — the live headers are the only description of
     // these bytes, and `GatewayGenerated` reads them directly.
-    // Skip when a capacity terminal is already authoritative.
+    // Skip when a gateway terminal — the capacity refusal or the fixed
+    // request-representation `400` — is already authoritative.
     let owned_grpc_web_response_content_type =
         crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
     let grpc_web_response_content_type = owned_grpc_web_response_content_type.as_deref();
@@ -17804,7 +17898,9 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     // path and applied exactly once by
     // `apply_reject_after_proxy_and_synthetic_body_hooks` over the final
     // response, so running them here would consume one-shot response state twice.
-    let admission = if ctx.gateway_capacity_response_selected() {
+    let admission = if ctx.gateway_capacity_response_selected()
+        || ctx.gateway_representation_response_selected()
+    {
         terminal_body_response_selected = true;
         BufferedTransformAdmission::Rejected
     } else {
@@ -18179,7 +18275,15 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // one-shot response state (rotated session cookie, route overrides) is
     // emitted onto whatever the client actually receives. Runs LAST by design —
     // see the ordering note above.
+    // Discard any record left by an earlier rejection chain: only a replacement
+    // authored by THIS chain, over the response the witness was captured from,
+    // may suppress the re-decision below.
+    let _ = ctx.take_rejection_response_replaced();
     apply_replaceable_after_proxy_hooks_to_rejection(plugins, ctx, status, body, headers).await;
+    // Consume the one-shot record of whether that chain's replacement path
+    // actually authored this response. Taken here — at the single trusted site,
+    // immediately after the chain — so it can never survive into another phase.
+    let late_rejection_replacement = ctx.take_rejection_response_replaced();
 
     // Authoritative final client-visible BODY policy, re-decided over the exact
     // header map the chain above just closed (`GHSA-62jg-v563-4q23`). No-ops
@@ -18189,7 +18293,13 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // by the same boundaries as every other rejection in this finalizer.
     if let Some(witness) = synthetic_body_policy_witness {
         reenforce_final_synthetic_client_visible_response_body_policy(
-            plugins, ctx, status, headers, body, witness,
+            plugins,
+            ctx,
+            status,
+            headers,
+            body,
+            witness,
+            late_rejection_replacement,
         )
         .await;
     }
@@ -25228,6 +25338,11 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 if let Some(body_hook_ctx) = body_hook_ctx {
+                    // Typed gateway terminals selected by the representation gate
+                    // inside the hook stage. Adopted BEFORE the metadata move so the
+                    // finalizer on the real context knows it is publishing a
+                    // gateway-authored error payload rather than an application one.
+                    ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
                     let request_body = ctx.metadata.remove("request_body");
                     ctx.metadata = body_hook_ctx.metadata;
                     if let Some(body) = request_body {
@@ -25669,6 +25784,11 @@ async fn handle_proxy_request_inner(
                     if body_hook_ctx.gateway_deadline_response_selected() {
                         ctx.mark_gateway_deadline_response_selected();
                     }
+                    // Typed gateway terminals selected by the representation gate
+                    // inside the hook stage. Adopted BEFORE the metadata move so the
+                    // finalizer on the real context knows it is publishing a
+                    // gateway-authored error payload rather than an application one.
+                    ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
                     let request_body = ctx.metadata.remove("request_body");
                     ctx.metadata = body_hook_ctx.metadata;
                     ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
@@ -26339,6 +26459,11 @@ async fn handle_proxy_request_inner(
                 // `clone_for_final_request_body_hooks` omits `request_body`; carry
                 // the original across the metadata swap (no on_final hook touches
                 // it). Disjoint field assignments avoid a whole-`ctx` borrow.
+                // Typed gateway terminals selected by the representation gate
+                // inside the hook stage. Adopted BEFORE the metadata move so the
+                // finalizer on the real context knows it is publishing a
+                // gateway-authored error payload rather than an application one.
+                ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
                 let request_body = ctx.metadata.remove("request_body");
                 ctx.metadata = body_hook_ctx.metadata;
                 ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
@@ -29338,6 +29463,11 @@ async fn handle_proxy_request_inner(
             // `clone_for_final_request_body_hooks` omits `request_body`; carry the
             // original across the metadata swap (no on_final hook touches it).
             // Disjoint field assignments avoid a whole-`ctx` borrow.
+            // Typed gateway terminals selected by the representation gate
+            // inside the hook stage. Adopted BEFORE the metadata move so the
+            // finalizer on the real context knows it is publishing a
+            // gateway-authored error payload rather than an application one.
+            ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
             let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
             ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
@@ -29764,6 +29894,11 @@ async fn handle_proxy_request_inner(
             // `clone_for_final_request_body_hooks` omits `request_body`; carry the
             // original across the metadata swap (no on_final hook touches it).
             // Disjoint field assignments avoid a whole-`ctx` borrow.
+            // Typed gateway terminals selected by the representation gate
+            // inside the hook stage. Adopted BEFORE the metadata move so the
+            // finalizer on the real context knows it is publishing a
+            // gateway-authored error payload rather than an application one.
+            ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
             let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
             ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
@@ -43476,6 +43611,7 @@ mod tests {
 
         // Mirror the handler's writeback: take the hook context's metadata + WAF
         // state, carrying the omitted request_body across the swap.
+        ctx.adopt_final_request_body_hook_terminals(&hook_ctx);
         let request_body = ctx.metadata.remove("request_body");
         ctx.metadata = hook_ctx.metadata;
         if let Some(body) = request_body {

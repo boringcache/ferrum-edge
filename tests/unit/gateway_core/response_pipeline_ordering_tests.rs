@@ -28,8 +28,10 @@ use ferrum_edge::_test_support::{
     transform_buffered_response_body_with_deadline_full_for_test,
 };
 use ferrum_edge::plugins::{
-    Plugin, RequestContext, ResponseBodyProduction, body_validator::BodyValidator,
-    compression::CompressionPlugin, response_transformer::ResponseTransformer, waf::Waf,
+    Plugin, PluginHttpClient, RequestContext, ResponseBodyProduction,
+    ai_response_guard::AiResponseGuard, body_validator::BodyValidator,
+    compression::CompressionPlugin, response_transformer::ResponseTransformer,
+    spec_expose::SpecExpose, waf::Waf,
 };
 use serde_json::json;
 
@@ -1650,4 +1652,224 @@ async fn sibling_instances_recheck_independently_after_a_change() {
         .expect("the second instance must recheck the changed map");
 
     assert_eq!(reject.0, 403);
+}
+
+// ─────── 7. claiming an origin-encoded response is DISPOSITION-AWARE ────────
+//
+// `enforces_response_body_policy` is a fail-closed assertion: a claimed
+// representation the gateway cannot decode becomes a `502`. A configuration
+// whose configured outcome is observe-only could never have refused anything, so
+// an undecodable origin coding costs it an observation and must not cost the
+// client the response. These drive the production buffered transform funnel, so
+// they assert what is published rather than what a predicate returns.
+
+/// The coding this gateway does not implement, so no codec or budget accident
+/// can decide these cases instead of the claim.
+const UNDECODABLE_ORIGIN_CODING: &str = "zstd";
+
+fn origin_encoded_headers() -> HashMap<String, String> {
+    let mut headers = json_headers();
+    headers.insert(
+        "content-encoding".to_string(),
+        UNDECODABLE_ORIGIN_CODING.to_string(),
+    );
+    headers
+}
+
+/// A WAF that OBSERVES response bodies: `monitor` globally, so no rule of its
+/// can refuse a response.
+fn waf_monitoring_response_body() -> Arc<dyn Plugin> {
+    Arc::new(
+        Waf::new(&json!({
+            "mode": "monitor",
+            "include_default_rules": false,
+            "scan_budget_ms": 0,
+            "response_inspection": true,
+            "response_body_inspection": true,
+            "custom_rules": [{
+                "id": "CUSTOM-RESP-BODY-MONITOR",
+                "name": "observed response payload",
+                "category": "custom",
+                "severity": "high",
+                "target": "response_body",
+                "match_kind": "contains",
+                "pattern": BLOCKED_TOKEN,
+                "action": "enforce"
+            }]
+        }))
+        .expect("monitor waf response-body config"),
+    )
+}
+
+/// Globally enforcing, but the only rule that reads the response body is itself
+/// `monitor` and no anomaly scoring can promote it — the rule-level half of the
+/// same question.
+fn waf_with_monitor_only_response_rule() -> Arc<dyn Plugin> {
+    Arc::new(
+        Waf::new(&json!({
+            "mode": "enforce",
+            "include_default_rules": false,
+            "scan_budget_ms": 0,
+            "response_inspection": true,
+            "response_body_inspection": true,
+            "custom_rules": [{
+                "id": "CUSTOM-RESP-BODY-RULE-MONITOR",
+                "name": "observed response payload",
+                "category": "custom",
+                "severity": "high",
+                "target": "response_body",
+                "match_kind": "contains",
+                "pattern": BLOCKED_TOKEN,
+                "action": "monitor"
+            }]
+        }))
+        .expect("monitor-rule waf response-body config"),
+    )
+}
+
+async fn publish_origin_encoded_response(
+    plugins: &[Arc<dyn Plugin>],
+) -> (bool, u16, HashMap<String, String>, Vec<u8>) {
+    let mut ctx = ctx_for("GET", "/origin-encoded");
+    let headers = origin_encoded_headers();
+    // The pristine origin stamp is what the gate reads; force it so the coding
+    // is judged as the ORIGIN's rather than as a gateway coding.
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &headers);
+    set_original_response_content_encoding_for_test(&mut ctx, UNDECODABLE_ORIGIN_CODING);
+    run_buffered_transform(plugins, &mut ctx, 200, headers, b"opaque-octets".to_vec()).await
+}
+
+/// The fail-closed baseline the two observe-only cases are measured against.
+#[tokio::test]
+async fn an_enforcing_waf_refuses_an_undecodable_origin_encoded_response() {
+    let (replaced, status, _, body) =
+        publish_origin_encoded_response(&[waf_blocking_response_body()]).await;
+
+    assert!(replaced, "a claimed representation must not be served opaque");
+    assert_ne!(status, 200);
+    assert_ne!(
+        body,
+        b"opaque-octets".to_vec(),
+        "the unscanned octets must not reach the client"
+    );
+}
+
+#[tokio::test]
+async fn a_monitor_mode_waf_does_not_refuse_an_undecodable_origin_encoded_response() {
+    let (replaced, status, headers, body) =
+        publish_origin_encoded_response(&[waf_monitoring_response_body()]).await;
+
+    assert!(
+        !replaced,
+        "an observe-only WAF loses an observation on an unscannable response; \
+         it must not cost the client the response"
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, b"opaque-octets".to_vec());
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some(UNDECODABLE_ORIGIN_CODING),
+        "the origin representation is forwarded untouched"
+    );
+}
+
+#[tokio::test]
+async fn a_monitor_only_response_rule_does_not_refuse_an_undecodable_response() {
+    let (replaced, status, _, body) =
+        publish_origin_encoded_response(&[waf_with_monitor_only_response_rule()]).await;
+
+    assert!(
+        !replaced,
+        "a rule that can only log is not a protection mechanism to fail closed"
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, b"opaque-octets".to_vec());
+}
+
+/// `ai_response_guard` in `warn` passes every finding through, exactly as its
+/// own uninspectable-response answer already concedes. Claiming on its behalf
+/// would turn an origin coding this gateway cannot decode into a gateway error
+/// for a configuration that was never allowed to refuse anything.
+#[tokio::test]
+async fn a_warn_only_ai_response_guard_does_not_refuse_an_undecodable_response() {
+    let warner: Arc<dyn Plugin> = Arc::new(
+        AiResponseGuard::new(&json!({
+            "pii_patterns": ["email"],
+            "action": "warn",
+        }))
+        .expect("warn ai_response_guard config"),
+    );
+    let rejecter: Arc<dyn Plugin> = Arc::new(
+        AiResponseGuard::new(&json!({
+            "pii_patterns": ["email"],
+            "action": "reject",
+        }))
+        .expect("reject ai_response_guard config"),
+    );
+
+    let (replaced, status, _, body) = publish_origin_encoded_response(&[warner]).await;
+    assert!(!replaced, "a warn-only guard is pass-through by construction");
+    assert_eq!(status, 200);
+    assert_eq!(body, b"opaque-octets".to_vec());
+
+    let (replaced, status, _, _) = publish_origin_encoded_response(&[rejecter]).await;
+    assert!(
+        replaced,
+        "an enforcing guard must still fail an unreadable representation closed"
+    );
+    assert_ne!(status, 200);
+}
+
+// ─────── 8. a late GATEWAY-authored rejection replacement is not rejudged ────
+//
+// The synthetic lifecycle re-decides its body policy after the deliberately-late
+// reject-path `after_proxy` chain, because that chain can relabel a BACKEND or
+// synthetic producer's representation. A hook that opted into
+// `may_replace_rejection_response` and actually replaced the response is a
+// different thing: that replacement is the final answer for an already-rejected
+// request, and `.claude/rules/plugins.md` 10b keeps gateway terminals and an
+// earlier rejection out of the re-decision.
+
+/// The `spec_expose` HEAD marker: its reject-path `after_proxy` strips the wire
+/// body while retaining the GET status and representation metadata.
+const SPEC_EXPOSE_HEAD_MARKER: &str = "ferrum:spec_expose_head_response";
+
+fn spec_expose_plugin() -> Arc<dyn Plugin> {
+    Arc::new(
+        SpecExpose::new(
+            &json!({ "spec_url": "https://example.com/openapi.yaml" }),
+            PluginHttpClient::default(),
+        )
+        .expect("spec_expose config"),
+    )
+}
+
+#[tokio::test]
+async fn a_late_rejection_replacement_is_not_rejudged_by_the_body_policy() {
+    // Configured priority order: spec_expose (210) before body_validator (2950).
+    let plugins = vec![spec_expose_plugin(), body_validator_requiring_approved()];
+    // The marker `spec_expose` stages for its own HEAD reply, set directly so
+    // this exercises the shared finalizer rather than the plugin's spec fetch.
+    // The request method is deliberately GET: HTTP's own bodyless exemption for
+    // HEAD would otherwise excuse the emptied body and prove nothing.
+    let mut ctx = ctx_for("GET", "/specz");
+    ctx.metadata
+        .insert(SPEC_EXPOSE_HEAD_MARKER.to_string(), "true".to_string());
+    let mut status = 200u16;
+    let mut headers = json_headers();
+    // Conforming under the schema: the first, authoritative pass accepts it.
+    let mut body = bytes::Bytes::from_static(br#"{"approved":true}"#);
+
+    finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)
+        .await;
+
+    assert_eq!(
+        status, 200,
+        "the gateway-authored replacement must survive: {headers:?}"
+    );
+    assert!(
+        body.is_empty(),
+        "the replacement is published as authored, not re-decided against a \
+         response schema no bodyless envelope can satisfy"
+    );
 }

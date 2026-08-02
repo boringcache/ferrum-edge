@@ -12,11 +12,15 @@ use ferrum_edge::_test_support::{
     FinalRequestRepresentationOutcome, MAX_DECODED_REQUEST_INSPECTION_BYTES,
     REQUEST_DECODE_OVERLOAD_BODY, REQUEST_DECODE_OVERLOAD_GRPC_MESSAGE,
     REQUEST_DECODE_OVERLOAD_GRPC_STATUS, REQUEST_DECODE_OVERLOAD_STATUS,
-    REQUEST_DECODE_WORST_CASE_PEAK_BYTES, RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT,
-    RESPONSE_DECODE_BROTLI_SCRATCH_BYTES, RESPONSE_DECODE_GZIP_SCRATCH_BYTES,
-    ResponseBufferBudgetProbe, charged_request_plaintext_in, clear_final_request_body_plaintext,
-    evaluate_final_request_representation, evaluate_final_request_representation_in,
-    projected_decode_output_capacity_for_test,
+    REQUEST_DECODE_WORST_CASE_PEAK_BYTES, REQUEST_REPRESENTATION_UNINSPECTABLE_MESSAGE,
+    RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT, RESPONSE_DECODE_BROTLI_SCRATCH_BYTES,
+    RESPONSE_DECODE_GZIP_SCRATCH_BYTES, ResponseBufferBudgetProbe, charged_request_plaintext_in,
+    clear_final_request_body_plaintext, evaluate_final_request_representation,
+    evaluate_final_request_representation_in, final_request_body_plaintext_staged_for_test,
+    finalize_synthetic_response_for_test, gateway_capacity_response_selected_for_test,
+    gateway_representation_response_selected_for_test, projected_decode_output_capacity_for_test,
+    run_request_body_stage_with_context_for_test,
+    run_request_body_stage_with_context_in_budget_for_test,
 };
 use ferrum_edge::plugins::body_validator::BodyValidator;
 use ferrum_edge::plugins::waf::Waf;
@@ -770,4 +774,316 @@ fn the_staged_plaintext_never_reaches_metadata_or_transaction_output() {
              the charged plaintext into a second, uncharged allocation"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Claiming is DISPOSITION-AWARE.
+//
+// A claim is a fail-closed assertion: it converts an undecodable representation
+// into a fixed `400`. A configuration that could never have blocked the request
+// has nothing to fail closed about — an unscannable body there is a lost
+// observation, not a protection-mechanism failure — so it must not claim. These
+// drive the authoritative shared funnel
+// (`run_final_request_body_hooks_with_provenance`), not the claim predicate, so
+// they assert the behavior the client actually receives.
+// ---------------------------------------------------------------------------
+
+/// A WAF that OBSERVES request bodies: globally `monitor`, so no rule of its can
+/// block anything.
+fn monitoring_waf() -> Arc<dyn Plugin> {
+    Arc::new(
+        Waf::new(&json!({
+            "mode": "monitor",
+            "request_body_inspection": true,
+            "default_rule_action": "enforce",
+        }))
+        .expect("monitor waf config"),
+    )
+}
+
+/// A WAF whose operator opted bodies above `max_scan_bytes` out of scanning
+/// entirely (`on_body_too_large: skip`).
+fn skip_on_large_waf() -> Arc<dyn Plugin> {
+    Arc::new(
+        Waf::new(&json!({
+            "mode": "enforce",
+            "request_body_inspection": true,
+            "default_rule_action": "enforce",
+            "on_body_too_large": "skip",
+            "max_scan_bytes": 32,
+        }))
+        .expect("skip-on-large waf config"),
+    )
+}
+
+fn headers_with_length(
+    content_encoding: Option<&str>,
+    content_length: usize,
+) -> HashMap<String, String> {
+    let mut headers = headers(content_encoding);
+    headers.insert("content-length".to_string(), content_length.to_string());
+    headers
+}
+
+/// An encoding this gateway does not implement: the strongest possible
+/// uninspectable case, since no budget or codec accident can decode it.
+const UNSUPPORTED_CODING: &str = "zstd";
+
+async fn run_final_request_stage(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    request_headers: &HashMap<String, String>,
+    body: &[u8],
+) -> PluginResult {
+    run_request_body_stage_with_context_for_test(
+        plugins,
+        ctx,
+        request_headers,
+        body,
+    )
+    .await
+    .1
+}
+
+/// The fail-closed baseline this pair is measured against.
+#[tokio::test]
+async fn an_enforcing_waf_still_refuses_an_undecodable_request_representation() {
+    let plugins = vec![enforcing_waf()];
+    let mut ctx = ctx_with_json_post();
+
+    let result = run_final_request_stage(
+        &plugins,
+        &mut ctx,
+        &headers(Some(UNSUPPORTED_CODING)),
+        BLOCKED_JSON.as_bytes(),
+    )
+    .await;
+
+    assert!(
+        matches!(&result, PluginResult::Reject { status_code: 400, .. }),
+        "an enforcing body policy must not forward a representation it could \
+         not read, got {result:?}"
+    );
+}
+
+/// A `monitor`-mode WAF cannot block, so it must not turn an ordinary encoded
+/// upload into a `400` it would never have rejected on its own.
+#[tokio::test]
+async fn a_monitor_mode_waf_does_not_refuse_an_undecodable_request_representation() {
+    let plugins = vec![monitoring_waf()];
+    let mut ctx = ctx_with_json_post();
+
+    let result = run_final_request_stage(
+        &plugins,
+        &mut ctx,
+        &headers(Some(UNSUPPORTED_CODING)),
+        BLOCKED_JSON.as_bytes(),
+    )
+    .await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "an observe-only WAF loses an observation on an unscannable body; it \
+         must not convert one into a client error"
+    );
+    assert!(
+        !gateway_representation_response_selected_for_test(&ctx),
+        "no gateway representation terminal may be selected for an unclaimed \
+         request"
+    );
+}
+
+/// `on_body_too_large: skip` is an explicit operator opt-out of scanning bodies
+/// this large. No scan means no claim: exactly the applicability terms
+/// `should_buffer_request_body` already applies.
+#[tokio::test]
+async fn a_skip_on_large_waf_does_not_claim_a_body_it_would_not_scan() {
+    let plugins = vec![skip_on_large_waf()];
+    let mut ctx = ctx_with_json_post();
+    let encoded = gzip(BLOCKED_JSON.as_bytes());
+
+    let skipped = run_final_request_stage(
+        &plugins,
+        &mut ctx,
+        &headers_with_length(Some(UNSUPPORTED_CODING), 1_048_576),
+        &encoded,
+    )
+    .await;
+    assert!(
+        matches!(skipped, PluginResult::Continue),
+        "a body the policy declined to scan cannot be a fail-closed claim"
+    );
+
+    // The same instance still claims a body inside its scan window, so the
+    // opt-out narrows the claim rather than disabling it.
+    let mut small_ctx = ctx_with_json_post();
+    let claimed = run_final_request_stage(
+        &plugins,
+        &mut small_ctx,
+        &headers_with_length(Some(UNSUPPORTED_CODING), 8),
+        &encoded,
+    )
+    .await;
+    assert!(
+        matches!(&claimed, PluginResult::Reject { status_code: 400, .. }),
+        "a body within the scan window is still claimed, got {claimed:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Charge LIFETIME: the staged plaintext belongs to the hook stage, not to the
+// request.
+//
+// On H1/H2 the final hooks receive a throwaway clone, so the decode dies with
+// it. Native H3 hands them the REAL `RequestContext`, which would otherwise
+// hold an attacker-amplified decode — and its aggregate budget block — until
+// request teardown. The stage releases it on every exit instead.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_hook_stage_releases_the_decode_charge_when_it_returns() {
+    let plugins = vec![enforcing_waf()];
+    // The native-H3 shape: the hooks mutate this very context.
+    let mut ctx = ctx_with_json_post();
+    let document = large_json_document();
+    let wire = gzip(&document);
+    let budget = probe(
+        blocks(decode_capacity(document.len())) + blocks(RESPONSE_DECODE_GZIP_SCRATCH_BYTES) + 4,
+    );
+    let baseline = budget.available_bytes();
+
+    let (_, result) = run_request_body_stage_with_context_in_budget_for_test(
+        &budget,
+        &plugins,
+        &mut ctx,
+        &headers(Some("gzip")),
+        &wire,
+    )
+    .await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "the decoded document carries no blocked marker"
+    );
+    assert!(
+        !final_request_body_plaintext_staged_for_test(&ctx),
+        "the staged plaintext must not outlive the hook stage that decoded it"
+    );
+    assert_eq!(
+        budget.available_bytes(),
+        baseline,
+        "the aggregate request-decode charge must return at the hook-stage \
+         boundary, not at request teardown"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The request gate's two terminals are GATEWAY-authored, and the synthetic
+// response-body policy pipeline that finalizes them must publish them as
+// written (`.claude/rules/plugins.md` 10b).
+// ---------------------------------------------------------------------------
+
+/// A `body_validator` whose RESPONSE schema no gateway error payload satisfies.
+/// Without terminal provenance it rewrites the gateway's own answer.
+fn body_validator_requiring_approved_response() -> Arc<dyn Plugin> {
+    Arc::new(
+        BodyValidator::new(&json!({
+            "response_required_fields": ["approved"],
+            "response_content_types": ["application/json"],
+        }))
+        .expect("body_validator response config"),
+    )
+}
+
+async fn finalize_rejection(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    rejection: PluginResult,
+) -> (u16, Vec<u8>) {
+    let (mut status, mut body, mut response_headers) = match rejection {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => (status_code, bytes::Bytes::from(body), headers),
+        other => panic!("expected a rejection, got {other:?}"),
+    };
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    // A route response-body ceiling far below the terminal's own JSON. A
+    // gateway-authored terminal must not be recategorized as an oversized
+    // backend representation by the size policy this finalizer applies.
+    ctx.max_response_body_size_bytes = 8;
+    finalize_synthetic_response_for_test(
+        plugins,
+        ctx,
+        &mut status,
+        &mut response_headers,
+        &mut body,
+    )
+    .await;
+    (status, body.to_vec())
+}
+
+/// The fixed `400` for an unreadable request representation must reach the
+/// client as the gateway wrote it: neither the response-schema validator in the
+/// chain nor the finalizer's route response-size policy may restate it.
+#[tokio::test]
+async fn the_request_representation_terminal_survives_the_response_policy_finalizer() {
+    let plugins = vec![enforcing_waf(), body_validator_requiring_approved_response()];
+    let mut ctx = ctx_with_json_post();
+
+    let rejection = run_final_request_stage(
+        &plugins,
+        &mut ctx,
+        &headers(Some(UNSUPPORTED_CODING)),
+        BLOCKED_JSON.as_bytes(),
+    )
+    .await;
+    assert!(
+        gateway_representation_response_selected_for_test(&ctx),
+        "the gate must stamp trusted provenance for its own fixed terminal"
+    );
+
+    let (status, body) = finalize_rejection(&plugins, &mut ctx, rejection).await;
+    assert_eq!(
+        status, 400,
+        "a response validator must not restate the gateway's request-side \
+         terminal as a backend representation failure"
+    );
+    let body = String::from_utf8_lossy(&body).to_string();
+    assert!(
+        body.contains(REQUEST_REPRESENTATION_UNINSPECTABLE_MESSAGE),
+        "the fixed gateway body must be published verbatim, got {body}"
+    );
+}
+
+/// The same for the capacity terminal, which is the gateway's health-neutral
+/// `503` and likewise never a policy verdict about an application response.
+#[tokio::test]
+async fn the_request_decode_capacity_terminal_survives_the_response_policy_finalizer() {
+    let plugins = vec![enforcing_waf(), body_validator_requiring_approved_response()];
+    let mut ctx = ctx_with_json_post();
+    let document = large_json_document();
+    let wire = gzip(&document);
+    // One block: far below the decode's working set, so the gate refuses on
+    // capacity rather than on the bytes.
+    let budget = probe(1);
+
+    let (_, rejection) = run_request_body_stage_with_context_in_budget_for_test(
+        &budget,
+        &plugins,
+        &mut ctx,
+        &headers(Some("gzip")),
+        &wire,
+    )
+    .await;
+    assert!(
+        gateway_capacity_response_selected_for_test(&ctx),
+        "a request-decode capacity refusal is the shared gateway-capacity \
+         terminal, so the finalizer can recognize it"
+    );
+
+    let (status, body) = finalize_rejection(&plugins, &mut ctx, rejection).await;
+    assert_eq!(status, REQUEST_DECODE_OVERLOAD_STATUS);
+    assert_eq!(String::from_utf8_lossy(&body), REQUEST_DECODE_OVERLOAD_BODY);
 }

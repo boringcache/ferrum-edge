@@ -963,6 +963,44 @@ impl Waf {
             && self.request_body_eligible_for_scan(headers.get("content-type").map(String::as_str))
     }
 
+    /// Whether the request-body scan this instance would run could actually
+    /// BLOCK the request, which is what a representation CLAIM asserts.
+    ///
+    /// `request_body_policy_applies` answers "would this be scanned"; claiming
+    /// additionally requires a disposition that can refuse. A `monitor`-mode
+    /// instance — or one whose only applicable body rules are `monitor` without
+    /// anomaly scoring — observes and logs, so an unscannable body there is a
+    /// lost observation, never a protection-mechanism failure. Claiming it would
+    /// convert a non-blocking configuration into a fail-closed `400` on an
+    /// ordinary compressed upload.
+    ///
+    /// The `on_body_too_large: skip` exemption folds in on exactly the terms
+    /// `should_buffer_request_body` uses: an operator who opted a body of this
+    /// declared size out of scanning gets no scan and therefore no claim.
+    fn request_body_policy_enforces(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+    ) -> bool {
+        self.request_body_policy_applies(ctx, headers)
+            && !self.request_body_scan_skipped_as_too_large(headers)
+            && self.has_enforcing_body_policy(BodyDirection::Request, ctx)
+    }
+
+    /// The `should_buffer_request_body` size opt-out, evaluated over the
+    /// FINALIZED backend-visible header map rather than the inbound one.
+    ///
+    /// Only a declared `Content-Length` is consulted, exactly as the buffering
+    /// decision does: an absent or unparsable length is not evidence of size,
+    /// and treating it as one would silently drop the claim.
+    fn request_body_scan_skipped_as_too_large(&self, headers: &HashMap<String, String>) -> bool {
+        self.config.on_body_too_large == TooLargeAction::Skip
+            && headers
+                .get("content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .is_some_and(|length| length > self.config.max_scan_bytes)
+    }
+
     /// Whether the configured response-body policy would actually scan this
     /// response's client-visible representation.
     fn response_body_policy_applies(
@@ -971,6 +1009,19 @@ impl Waf {
         content_type: Option<&str>,
     ) -> bool {
         self.should_buffer_response_body(ctx) && self.response_body_eligible_for_scan(content_type)
+    }
+
+    /// The response-side counterpart of [`Self::request_body_policy_enforces`]:
+    /// the scan would run AND its verdict could actually refuse the response.
+    /// A `monitor`-mode response scan must not turn an undecodable origin
+    /// coding into a gateway `502`.
+    fn response_body_policy_enforces(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+    ) -> bool {
+        self.response_body_policy_applies(ctx, content_type)
+            && self.has_enforcing_response_body_policy(ctx)
     }
 
     /// Whether response-header policy is configured and applies to this request.
@@ -1386,17 +1437,21 @@ impl Plugin for Waf {
     }
 
     /// Claim the finalized request representation whenever the configured body
-    /// policy would scan it, so the shared request representation gate decodes a
-    /// content coding into plaintext or fails the request closed rather than
-    /// letting this scan run over opaque compressed octets
-    /// (`GHSA-3973-47g5-4mcx`).
+    /// policy would scan it AND could refuse it, so the shared request
+    /// representation gate decodes a content coding into plaintext or fails the
+    /// request closed rather than letting this scan run over opaque compressed
+    /// octets (`GHSA-3973-47g5-4mcx`).
+    ///
+    /// Disposition-aware on purpose: claiming is a fail-closed assertion, and a
+    /// `monitor`-mode instance cannot block anything. See
+    /// `Waf::request_body_policy_enforces`.
     fn enforces_final_request_body_policy(
         &self,
         ctx: &RequestContext,
         headers: &HashMap<String, String>,
         _body: &[u8],
     ) -> bool {
-        self.request_body_policy_applies(ctx, headers)
+        self.request_body_policy_enforces(ctx, headers)
     }
 
     async fn on_final_request_body_with_context(
@@ -1565,11 +1620,13 @@ impl Plugin for Waf {
     /// origin `Content-Encoding` into plaintext — or fails the response closed —
     /// before any scan reads it (`GHSA-4vqr-427g-5cg7`).
     ///
-    /// The claim is deliberately narrow on three axes, because claiming is not
+    /// The claim is deliberately narrow on four axes, because claiming is not
     /// free: it converts an uninspectable representation into a `502`.
     ///
     /// * the configured response-body rules must actually scan this media type
-    ///   on this request;
+    ///   on this request, AND their verdict must be able to refuse it. A
+    ///   `monitor`-mode instance never blocks, so an undecodable origin coding
+    ///   there costs an observation, not the response;
     /// * the ORIGIN must have declared a content coding
     ///   ([`crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY`], the pristine
     ///   pre-`after_proxy` stamp). An identity-coded response is already the
@@ -1587,7 +1644,7 @@ impl Plugin for Waf {
         response_content_type: Option<&str>,
         _response_body: &[u8],
     ) -> bool {
-        self.response_body_policy_applies(ctx, response_content_type)
+        self.response_body_policy_enforces(ctx, response_content_type)
             && !response_content_type
                 .is_some_and(crate::plugins::utils::body_transform::is_framed_grpc_content_type)
             && ctx
@@ -1596,9 +1653,11 @@ impl Plugin for Waf {
     }
 
     /// Over-approximation used before the response `Content-Type` is known.
-    /// Depends only on configuration and request state, as the contract requires.
+    /// Depends only on configuration and request state, as the contract requires
+    /// — including the enforcing-disposition term, which is itself decided from
+    /// configuration and the request alone.
     fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
-        self.should_buffer_response_body(ctx)
+        self.should_buffer_response_body(ctx) && self.has_enforcing_response_body_policy(ctx)
     }
 
     fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {

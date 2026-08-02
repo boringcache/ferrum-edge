@@ -802,6 +802,62 @@ pub mod _test_support {
         (transformed, result)
     }
 
+    /// The same production stage, with the aggregate request-decode budget bound
+    /// to an ISOLATED semaphore.
+    ///
+    /// This is how a test observes the CHARGE LIFETIME of a governed request
+    /// decode end to end: the gate charges while staging the plaintext, the
+    /// claiming hooks read it, and the stage releases it on its way out — the
+    /// native-H3 shape, where the hooks receive the real `RequestContext` rather
+    /// than a throwaway clone.
+    pub async fn run_request_body_stage_with_context_in_budget_for_test(
+        probe: &ResponseBufferBudgetProbe,
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> (Vec<u8>, crate::plugins::PluginResult) {
+        let deadline = ctx.grpc_deadline_at();
+        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            plugins,
+            Some(&mut *ctx),
+            deadline,
+            headers,
+            body.to_vec(),
+        )
+        .await;
+        let result = crate::proxy::run_final_request_body_hooks_with_provenance_in(
+            plugins,
+            Some(&mut *ctx),
+            deadline,
+            headers,
+            &transformed,
+            probe.0.handle(),
+        )
+        .await
+        .into_plugin_result(ctx);
+        (transformed, result)
+    }
+
+    /// Whether the gateway selected the fixed request-representation terminal
+    /// (`400`) for this request — the typed provenance that keeps the synthetic
+    /// response-body policy pipeline from re-deciding the gateway's own error
+    /// payload.
+    pub fn gateway_representation_response_selected_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.gateway_representation_response_selected()
+    }
+
+    /// Whether the final request-body hook stage left a decoded plaintext view
+    /// staged on this context. Production clears it as the stage returns, so an
+    /// assertion here is an assertion about the charge's lifetime.
+    pub fn final_request_body_plaintext_staged_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.final_request_body_was_decoded()
+    }
+
     /// Run the shared final backend-header-policy pass exactly as every dispatch
     /// ladder does: after all `before_proxy` header transforms, over the
     /// finalized backend-visible header map (`GHSA-xhp5-hqj8-3mwg`).
@@ -6655,6 +6711,11 @@ pub mod _test_support {
     /// Fixed `grpc-message` for the same refusal.
     pub const REQUEST_DECODE_OVERLOAD_GRPC_MESSAGE: &str =
         crate::proxy::response_buffer_budget::REQUEST_DECODE_OVERLOAD_GRPC_MESSAGE;
+
+    /// Fixed, redaction-safe client message for a request representation the
+    /// gate could not reduce to plaintext.
+    pub const REQUEST_REPRESENTATION_UNINSPECTABLE_MESSAGE: &str =
+        crate::plugins::request_representation::REQUEST_REPRESENTATION_UNINSPECTABLE_MESSAGE;
 
     /// The decode ceiling the request gate applies when no smaller route
     /// request-body limit is active.

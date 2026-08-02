@@ -480,7 +480,12 @@ final request-body policy is entitled to inspect (`GHSA-3973-47g5-4mcx`).
 
 A plugin opts in by returning `true` from `enforces_final_request_body_policy`
 for a given request. `waf`, `body_validator`, and `graphql` do so whenever their
-configured rules would actually inspect the finalized representation.
+configured rules would actually inspect the finalized representation **and could
+refuse it**. Claiming is a fail-closed assertion, so the configured disposition
+is part of the question: a `monitor`-mode WAF, a rule set whose applicable body
+rules only log, or a body the operator opted out of scanning with
+`on_body_too_large: skip` all lose an observation when a body is unscannable,
+which is not a protection-mechanism failure and does not become a `400`.
 
 - **Nothing claims the request, or the finalized bytes are identity-coded.**
   Nothing changes. Ordinary compressed uploads keep flowing to backends that
@@ -514,11 +519,27 @@ decoder is *constructed* because it is allocated from the stream header before
 any output exists. The charge travels with the staged plaintext and is released
 when the last handle drops, which covers completion, a later hook's rejection, a
 gRPC deadline, client disconnect, cancellation, and a retry that re-finalizes
-the body. A request the budget cannot admit is refused with the gateway-local
+the body. The staged view is also released when the final request-body hook
+stage returns, on every one of its exits, so the charge lifetime is the hook
+stage rather than the request — identical on the ladders that hand the hooks a
+throwaway context clone (H1/H2) and the one that hands them the real request
+context (native H3). A request the budget cannot admit is refused with the
+gateway-local
 capacity terminal (`503` with a fixed body; native gRPC and gRPC-Web get
 `RESOURCE_EXHAUSTED`) rather than a `400`: the upload was well formed and no
 backend was contacted. The encoded body is still never forwarded, because
 forwarding it is the bypass this gate closes.
+
+Both of this phase's terminals — the fixed `400` and the capacity `503` — are
+GATEWAY-authored, and both carry typed provenance on the request context (the
+`400` its own request-representation marker, the `503` the shared
+retained-response capacity terminal). The response-side policy finalizer reads
+that provenance and publishes the fixed error payload as written: a configured
+response schema, response-body rule, AI guard, or route response-size ceiling
+never restates the gateway's own answer as a backend representation failure. On
+the ladders that run the hook stage against a throwaway context clone, the two
+markers are carried back to the live request context with the stage's other
+results.
 
 The decoded bytes are an **inspection view only** — the backend still receives
 the exact octets and headers the client sent, so `Content-Length`,
@@ -608,8 +629,18 @@ to the fixed, decorator-free gateway terminal. Re-sweeping instead would judge a
 gateway-authored error payload against operator rules written for application
 responses, which is exactly what every other phase here refuses to do (and would
 turn any configured JSON response schema into a permanent `500`). Gateway-authored
-terminals (capacity, deadline, an earlier rejection, a route body-size refusal)
-are likewise never re-decided: they are already the answer.
+terminals (capacity, deadline, an earlier rejection, a route body-size refusal,
+the request-representation `400`) are likewise never re-decided: they are already
+the answer.
+
+One more thing on that list is authored by the late chain itself. A hook that
+opted into `may_replace_rejection_response` and actually replaced the rejection's
+body, status, or representation — `spec_expose`'s HEAD body strip,
+`mcp_gateway`'s JSON-RPC error shaping — has written the final answer for a
+request that was already refused, so the re-decision skips it. The record of that
+replacement is typed, set only on that trusted rejection path, and consumed
+exactly once, so an ordinary late mutation of a backend or synthetic-producer
+representation is still re-checked.
 
 ### Authoritative final client-visible response HEADER phase
 

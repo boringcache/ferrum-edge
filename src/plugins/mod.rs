@@ -2175,6 +2175,30 @@ pub struct RequestContext {
     /// normalize's rewrite bool as an ordinary body rewrite
     /// (GHSA-pwcm-6rh8-f2gh).
     gateway_capacity_response_selected: bool,
+    /// Whether the gateway selected the fixed request-representation terminal
+    /// (`400`) because a claimed backend-visible request body could not be
+    /// reduced to plaintext (`GHSA-3973-47g5-4mcx`).
+    ///
+    /// Same role as `gateway_capacity_response_selected`, for the other terminal
+    /// the request gate can author: once set, the response-body policy pipeline
+    /// that finalizes the rejection must publish the gateway's error payload as
+    /// written instead of re-deciding it against operator rules meant for
+    /// application responses. Typed and private, because the metadata reason
+    /// beside it is plugin-writable and can authorize nothing.
+    gateway_representation_response_selected: bool,
+    /// One-shot record that a hook opted into `may_replace_rejection_response`
+    /// actually replaced an uncommitted rejection's body/status/representation
+    /// from the deliberately-late reject-path `after_proxy` chain.
+    ///
+    /// The synthetic lifecycle re-decides its final client-visible body policy
+    /// after that chain, because the chain can relabel a BACKEND or synthetic
+    /// producer's representation. A replacement authored ON the rejection path
+    /// is a different thing: it is the gateway's own final answer for a request
+    /// that was already refused, and `.claude/rules/plugins.md` 10b keeps
+    /// gateway terminals and an earlier rejection out of that re-decision.
+    /// Scoped to that one trusted path and taken exactly once, so an ordinary
+    /// late mutation of an application representation is still re-checked.
+    rejection_response_replaced: bool,
     /// One-shot signal that a response-body inspector could not reserve a
     /// retained-response transform window and needs the enclosing
     /// `on_response_body` loop to install the shared capacity terminal.
@@ -2344,17 +2368,6 @@ pub struct RequestContext {
     /// `ai_response_guard_replay_redactions`. Instance scoping prevents one
     /// governor from consuming another instance's transform requirement.
     pub(crate) ai_tool_governor_replay_redactions: HashSet<u64>,
-    /// Per-request memo of duplicate-object-member screens over governed JSON
-    /// bodies (advisory `GHSA-c78j-5w9p-cpq6`). `openapi_validator`,
-    /// `body_validator`, and `ai_tool_governor` can all inspect the same
-    /// buffered body in one hook stage; the first screen's verdict is staged
-    /// here so the chain scans it once.
-    ///
-    /// Entries are keyed on the body's SHA-256 digest and length — never on an
-    /// assertion a client, a backend, or `ctx.metadata` can write — so a
-    /// transform that rewrites the body is re-screened rather than inheriting a
-    /// stale verdict. Private for the same reason as the hash ledgers above: a
-    /// body digest must not reach transaction logs.
     /// Per-`graphql`-instance digest of the request envelope that instance
     /// actually parsed, charged, and admitted in `before_proxy` (priority 2850).
     ///
@@ -2384,6 +2397,17 @@ pub struct RequestContext {
     /// rather than `metadata` because a digest of response headers must not enter
     /// a transaction log.
     pub(crate) waf_response_header_digests: HashMap<u64, [u8; 32]>,
+    /// Per-request memo of duplicate-object-member screens over governed JSON
+    /// bodies (advisory `GHSA-c78j-5w9p-cpq6`). `openapi_validator`,
+    /// `body_validator`, and `ai_tool_governor` can all inspect the same
+    /// buffered body in one hook stage; the first screen's verdict is staged
+    /// here so the chain scans it once.
+    ///
+    /// Entries are keyed on the body's SHA-256 digest and length — never on an
+    /// assertion a client, a backend, or `ctx.metadata` can write — so a
+    /// transform that rewrites the body is re-screened rather than inheriting a
+    /// stale verdict. Private for the same reason as the digest ledgers above: a
+    /// body digest must not reach transaction logs.
     pub(crate) json_scan_memo: crate::util::json_dup_keys::JsonScanMemo,
     /// Bounded plaintext view of the backend-visible request body, staged by the
     /// shared request representation gate
@@ -3042,6 +3066,8 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
             gateway_capacity_response_selected: false,
+            gateway_representation_response_selected: false,
+            rejection_response_replaced: false,
             buffered_response_capacity_refusal_pending: false,
             response_cache_hit: false,
             origin_http_response_status: None,
@@ -3286,6 +3312,42 @@ impl RequestContext {
 
     pub(crate) fn gateway_capacity_response_selected(&self) -> bool {
         self.gateway_capacity_response_selected
+    }
+
+    pub(crate) fn mark_gateway_representation_response_selected(&mut self) {
+        self.gateway_representation_response_selected = true;
+    }
+
+    pub(crate) fn gateway_representation_response_selected(&self) -> bool {
+        self.gateway_representation_response_selected
+    }
+
+    /// Record that a reject-path `after_proxy` hook replaced this rejection's
+    /// body/status/representation. Set only by the rejection-replacement path in
+    /// `run_after_proxy_hooks_on_rejection`.
+    pub(crate) fn mark_rejection_response_replaced(&mut self) {
+        self.rejection_response_replaced = true;
+    }
+
+    /// Take the one-shot rejection-replacement record.
+    pub(crate) fn take_rejection_response_replaced(&mut self) -> bool {
+        std::mem::take(&mut self.rejection_response_replaced)
+    }
+
+    /// Adopt the gateway terminals the final request-body hook stage selected on
+    /// the throwaway clone (`clone_for_final_request_body_hooks`).
+    ///
+    /// The stage's other results travel back through `metadata`, which a plugin
+    /// can write. These two cannot: they authorize the finalizer to publish a
+    /// gateway-authored error payload unchanged, so they are carried as typed
+    /// state and only ever set, never cleared, by the gateway itself.
+    pub(crate) fn adopt_final_request_body_hook_terminals(&mut self, hook_ctx: &RequestContext) {
+        if hook_ctx.gateway_capacity_response_selected() {
+            self.mark_gateway_capacity_response_selected();
+        }
+        if hook_ctx.gateway_representation_response_selected() {
+            self.mark_gateway_representation_response_selected();
+        }
     }
 
     /// Mark that the enclosing `on_response_body` loop must install the shared
@@ -3941,8 +4003,9 @@ impl RequestContext {
     ///
     /// `#[allow(dead_code)]`: claiming plugins now take the owned handle above
     /// (which answers the same question by returning `None`), so the only
-    /// remaining callers are external tests, and a `pub` item reachable solely
-    /// from `tests/` is dead in the separately compiled binary unit.
+    /// remaining callers are external tests (through `_test_support`), and a
+    /// `pub` item reachable solely from `tests/` is dead in the separately
+    /// compiled binary unit.
     #[allow(dead_code)]
     pub fn final_request_body_was_decoded(&self) -> bool {
         self.governed_request_body_plaintext.is_some()
@@ -4054,6 +4117,8 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
             gateway_capacity_response_selected: self.gateway_capacity_response_selected,
+            gateway_representation_response_selected: self.gateway_representation_response_selected,
+            rejection_response_replaced: self.rejection_response_replaced,
             // Final request-body hooks cannot produce a response-body capacity
             // refusal. Keep the live response path's one-shot signal on the
             // original context instead of duplicating it into this compatibility
@@ -8780,6 +8845,12 @@ pub trait Plugin: Send + Sync {
     /// inspected converts benign compressed uploads into `400`s; failing to claim
     /// one it would have inspected reopens the bypass.
     ///
+    /// "Would inspect" is not enough on its own: the claim must also be able to
+    /// REFUSE. A non-blocking disposition — a `monitor`-mode WAF, a rule set that
+    /// only logs — loses an observation when a body is unscannable, which is not
+    /// a protection-mechanism failure and must not become a `400`. Decide the
+    /// claim from configuration and request state, never by decoding `body`.
+    ///
     /// `headers` is the finalized backend-visible header map and `body` the
     /// finalized backend-visible bytes — exactly what
     /// [`Plugin::on_final_request_body_with_context`] is about to receive. The
@@ -8895,6 +8966,12 @@ pub trait Plugin: Send + Sync {
     /// the media type is outside the policy's document model). Claiming a
     /// response the policy would not have touched converts benign traffic into
     /// errors; failing to claim one it would have touched reopens the bypass.
+    ///
+    /// As on the request side, the disposition is part of the question: a
+    /// policy whose configured outcome is observe-only (`monitor` mode, an
+    /// `ai_response_guard` in `warn`) cannot fail anything closed, so an origin
+    /// coding the gateway cannot decode must stay an ordinary pass-through for
+    /// it rather than becoming a `502`.
     ///
     /// `response_content_type` is the live `Content-Type`, matching what
     /// [`Plugin::transform_response_body_with_context`] will receive.
