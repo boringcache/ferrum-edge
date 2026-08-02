@@ -655,6 +655,24 @@ fn local_fallback_read_path_uses_nofollow_handle_and_byte_ceiling() {
         AUDIT_SOURCE.contains("validate_opened_fallback_data_metadata"),
         "fallback read must validate opened-handle metadata"
     );
+    assert!(
+        AUDIT_SOURCE.contains("FILE_FLAG_OPEN_REPARSE_POINT"),
+        "Windows fallback opens must not traverse reparse-point targets"
+    );
+    let lock_fn = AUDIT_SOURCE
+        .split("fn acquire_fallback_file_lock(lock_path")
+        .nth(1)
+        .unwrap_or("");
+    let identity_check = lock_fn
+        .find("validate_fallback_lock_path_identity(lock_path, &lock_metadata)")
+        .expect("lock path identity must be checked");
+    let chmod = lock_fn
+        .find("file.set_permissions")
+        .expect("lock permissions must be enforced");
+    assert!(
+        identity_check < chmod,
+        "lock identity must be verified before chmod can affect the opened inode"
+    );
     let read_fn = AUDIT_SOURCE
         .split("fn read_local_fallback_events_unlocked")
         .nth(1)

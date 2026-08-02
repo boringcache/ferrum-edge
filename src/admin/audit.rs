@@ -50,6 +50,8 @@ pub const AUDIT_LOCAL_FALLBACK_MAX_BYTES: usize = AUDIT_LOCAL_FALLBACK_CAPACITY 
 const AUDIT_LOCAL_FALLBACK_FILE_NAME: &str = "admin-audit-fallback.json";
 const AUDIT_LOCAL_FALLBACK_LOCK_FILE_NAME: &str = "admin-audit-fallback.lock";
 const AUDIT_LOCAL_FALLBACK_DEFAULT_DIR: &str = "./ferrum-admin-audit";
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 /// Closed allow-list of backup resource filter names persisted in audit events.
 pub const BACKUP_AUDIT_RESOURCE_NAMES: &[&str] = &[
@@ -947,6 +949,7 @@ fn acquire_fallback_file_lock(lock_path: &Path) -> Result<FallbackFileLock, anyh
             "audit local fallback lock file must be a single-link regular file"
         ));
     }
+    validate_fallback_lock_path_identity(lock_path, &lock_metadata)?;
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
 
     // SAFETY: `file` owns a valid descriptor for the lifetime of this guard.
@@ -964,19 +967,30 @@ fn acquire_fallback_file_lock(lock_path: &Path) -> Result<FallbackFileLock, anyh
         ));
     }
 
+    validate_fallback_lock_path_identity(lock_path, &lock_metadata)?;
+
+    Ok(FallbackFileLock { _file: file })
+}
+
+#[cfg(unix)]
+fn validate_fallback_lock_path_identity(
+    lock_path: &Path,
+    opened: &fs::Metadata,
+) -> Result<(), anyhow::Error> {
+    use std::os::unix::fs::MetadataExt;
+
     let path_metadata = fs::symlink_metadata(lock_path)?;
     if path_metadata.file_type().is_symlink()
         || !path_metadata.file_type().is_file()
         || path_metadata.nlink() != 1
-        || path_metadata.dev() != lock_metadata.dev()
-        || path_metadata.ino() != lock_metadata.ino()
+        || path_metadata.dev() != opened.dev()
+        || path_metadata.ino() != opened.ino()
     {
         return Err(anyhow!(
             "audit local fallback lock file changed identity during acquisition"
         ));
     }
-
-    Ok(FallbackFileLock { _file: file })
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -993,6 +1007,7 @@ fn acquire_fallback_file_lock(lock_path: &Path) -> Result<FallbackFileLock, anyh
         .create(true)
         .truncate(false)
         .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(lock_path)
         .map_err(|error| anyhow!("failed to open audit local fallback lock: {error}"))?;
     let lock_metadata = file.metadata()?;
@@ -1079,7 +1094,15 @@ fn open_fallback_data_file_nofollow(path: &Path) -> std::io::Result<File> {
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(path)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         OpenOptions::new().read(true).open(path)
     }
