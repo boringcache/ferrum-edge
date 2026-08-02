@@ -139,6 +139,46 @@ async fn test_run_pending_restores_route_lock_table_on_existing_v001_db() {
 }
 
 #[tokio::test]
+async fn test_run_pending_adds_audit_context_columns_on_existing_v001_db() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+
+    runner.run_pending().await.unwrap();
+    for column in ["source_address", "request_id", "outcome"] {
+        let sql = format!("ALTER TABLE audit_events DROP COLUMN {column}");
+        sqlx::query(&sql).execute(&pool).await.unwrap();
+    }
+
+    let applied = runner.run_pending().await.unwrap();
+    assert!(applied.is_empty(), "V001 must remain already applied");
+
+    sqlx::query(
+        "INSERT INTO audit_events \
+         (id, ts, actor, action, resource_type, resource_id, namespace, \
+          source_address, request_id, outcome, diff) \
+         VALUES ('event-1', '2026-01-01T00:00:00Z', 'admin', 'backup', \
+                 'backup', 'export', 'ferrum', '127.0.0.1', 'request-1', \
+                 'success', '{}')",
+    )
+    .execute(&pool)
+    .await
+    .expect("upgraded audit_events must accept context-aware audit inserts");
+
+    let row = sqlx::query(
+        "SELECT source_address, request_id, outcome FROM audit_events WHERE id = 'event-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row.try_get::<String, _>("source_address").unwrap(),
+        "127.0.0.1"
+    );
+    assert_eq!(row.try_get::<String, _>("request_id").unwrap(), "request-1");
+    assert_eq!(row.try_get::<String, _>("outcome").unwrap(), "success");
+}
+
+#[tokio::test]
 async fn test_run_pending_restores_config_change_indexes_on_existing_v001_db() {
     let pool = test_pool().await;
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());

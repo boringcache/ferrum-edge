@@ -67,7 +67,7 @@
 //! aid `ALTER TABLE DROP CONSTRAINT` but do not change enforcement behavior.
 //! The inline tests below regression-guard this cross-dialect consistency.
 
-use sqlx::AnyConnection;
+use sqlx::{AnyConnection, Row};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SqlDialect {
@@ -139,9 +139,86 @@ impl V001SqlBuilder {
         sqlx::query(self.create_config_changes_sql())
             .execute(&mut *connection)
             .await?;
+        self.ensure_audit_event_context_columns(connection).await?;
         self.create_full_load_indexes(connection).await?;
         self.create_config_change_indexes(connection).await?;
         Ok(())
+    }
+
+    async fn ensure_audit_event_context_columns(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
+        let columns = if self.is_mysql() {
+            [
+                (
+                    "source_address",
+                    "VARCHAR(128) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''",
+                ),
+                (
+                    "request_id",
+                    "VARCHAR(128) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''",
+                ),
+                (
+                    "outcome",
+                    "VARCHAR(64) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''",
+                ),
+            ]
+        } else {
+            [
+                ("source_address", "TEXT NOT NULL DEFAULT ''"),
+                ("request_id", "TEXT NOT NULL DEFAULT ''"),
+                ("outcome", "TEXT NOT NULL DEFAULT ''"),
+            ]
+        };
+
+        for (name, definition) in columns {
+            if self.audit_event_column_exists(connection, name).await? {
+                continue;
+            }
+
+            let sql = format!("ALTER TABLE audit_events ADD COLUMN {name} {definition}");
+            if let Err(error) = sqlx::query(&sql).execute(&mut *connection).await {
+                // Concurrent gateway startups can both observe an old schema.
+                // Accept a racing ALTER only after confirming the column now exists.
+                if !self.audit_event_column_exists(connection, name).await? {
+                    return Err(error.into());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn audit_event_column_exists(
+        &self,
+        connection: &mut AnyConnection,
+        column: &str,
+    ) -> Result<bool, anyhow::Error> {
+        if self.is_sqlite() {
+            let rows = sqlx::query("PRAGMA table_info(audit_events)")
+                .fetch_all(&mut *connection)
+                .await?;
+            return Ok(rows.iter().any(|row| {
+                row.try_get::<String, _>("name")
+                    .is_ok_and(|name| name == column)
+            }));
+        }
+
+        let sql = if self.is_mysql() {
+            "SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = 'audit_events' \
+             AND column_name = ?"
+        } else {
+            "SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = 'audit_events' \
+             AND column_name = ?"
+        };
+        Ok(sqlx::query(sql)
+            .bind(column)
+            .fetch_optional(&mut *connection)
+            .await?
+            .is_some())
     }
 
     async fn enable_sqlite_foreign_keys(
