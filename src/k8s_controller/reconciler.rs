@@ -660,6 +660,20 @@ pub fn publish_k8s_reconcile(
     mesh_registry: &MeshNodeRegistry,
 ) -> Option<Arc<GatewayConfig>> {
     publication_gate.publish(|| {
+        // Validate the exact composed candidate before retaining the overlay
+        // or making it visible. Kubernetes translation can synthesize plugin
+        // configurations, so without this gate it could bypass the CP full and
+        // incremental admission paths. The publication gate keeps the base
+        // stable between this composition and the CAS below.
+        let candidate = merge_k8s_translation(
+            config_arc.load().as_ref(),
+            translation,
+            managed_namespaces,
+        );
+        if let Err(error) = crate::fips::policy::check_gateway_config(&candidate) {
+            error!("Kubernetes configuration rejected — FIPS policy: {}", error);
+            return None;
+        }
         // Persist the translation independently of `config_arc` so CP DB full
         // reloads can re-merge it instead of broadcasting a wipe (#2982).
         store_accepted_k8s_overlay(

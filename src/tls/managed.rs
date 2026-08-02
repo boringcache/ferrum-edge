@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
+use crate::fips::approved::Sha256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::prelude::*;

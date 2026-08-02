@@ -7,13 +7,13 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use crate::fips::approved::Sha256;
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use regex::Regex;
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

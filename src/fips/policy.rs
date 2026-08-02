@@ -9,6 +9,7 @@
 //! | file-mode SIGHUP reload | [`check_gateway_config`] |
 //! | database poll apply | [`check_gateway_config`] |
 //! | CP publication / DP apply | [`check_gateway_config`] |
+//! | CP/DP namespace trust-bundle load | [`is_approved_jwt_algorithm`] |
 //! | rustls policy construction | [`check_tls_policy`] |
 //!
 //! Every diagnostic is bounded: it names the setting, states the rule, and — for
@@ -44,11 +45,24 @@ pub const APPROVED_JWT_ALGORITHMS: &[&str] = &[
     "ES384", "ES512",
 ];
 
+/// Whether a configured JWS algorithm is in Ferrum's FIPS-approved set.
+///
+/// This helper is public because not every JWT admission surface lives inside
+/// [`GatewayConfig`]. In particular, the CP/DP namespace trust bundle is an
+/// environment-selected JSON document loaded directly by the control-plane
+/// runtime and must apply the identical algorithm policy at its own parser.
+pub fn is_approved_jwt_algorithm(algorithm: &str) -> bool {
+    APPROVED_JWT_ALGORITHMS
+        .iter()
+        .any(|approved| approved.eq_ignore_ascii_case(algorithm.trim()))
+}
+
 /// Minimum HMAC key length, in bytes, for an approved JWT/JWS MAC key.
 ///
 /// SP 800-107 requires an HMAC key at least as long as the security strength
 /// being claimed. Ferrum already enforces 32 characters on admin and CP/DP JWT
-/// secrets; FIPS mode makes that a hard floor everywhere rather than a default.
+/// secrets; FIPS mode applies that same floor to the operator-owned JWT and
+/// stored-password MAC keys it admits at the environment boundary.
 pub const MIN_HMAC_KEY_BYTES: usize = 32;
 
 /// Plugins whose cryptography is provided by a library outside the selected
@@ -176,23 +190,22 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
     // ── Config-database TLS ─────────────────────────────────────────────
     // The SQL config store rides sqlx, whose rustls provider is selectable at
     // build time. The MongoDB driver instead pins `rustls/ring` in its own
-    // manifest and constructs its client config from that provider, so its
-    // transport can never be routed onto Ferrum's module however the gateway is
-    // built. Refuse an encrypted Mongo config channel rather than imply
-    // coverage; see docs/fips.md for the supported config stores.
+    // manifest and can enable TLS from the connection URI independently of
+    // FERRUM_DB_TLS_MODE (including implicitly for mongodb+srv). Ferrum cannot
+    // exhaustively prove that every effective Mongo transport is plaintext, so
+    // refuse the Mongo config store outright rather than admit a URI-controlled
+    // non-validated TLS path. See docs/fips.md for supported config stores.
     if env_config
         .db_type
         .as_deref()
         .is_some_and(|db_type| db_type.eq_ignore_ascii_case("mongodb"))
-        && let Some(mode) = env_config.db_tls_mode.as_ref()
-        && !matches!(mode, crate::config::env_config::DbTlsMode::Disable)
     {
         return Err(
-            "FERRUM_DB_TYPE=mongodb with FERRUM_DB_TLS_MODE other than `disable` is refused while \
-             FIPS mode is enforced: the MongoDB driver builds its TLS stack on its own bundled \
-             non-validated provider, which Ferrum cannot route through the selected module. Use a \
-             SQL config store (postgres/mysql/sqlite), file mode, or CP/DP distribution. See \
-             docs/fips.md."
+            "FERRUM_DB_TYPE=mongodb is refused while FIPS mode is enforced: the MongoDB driver \
+             builds its TLS stack on its own bundled non-validated provider and connection-URI \
+             options can enable that TLS path independently of FERRUM_DB_TLS_MODE. Ferrum cannot \
+             route or exhaustively exclude that transport. Use a SQL config store \
+             (postgres/mysql/sqlite), file mode, or CP/DP distribution. See docs/fips.md."
                 .to_string(),
         );
     }
@@ -206,6 +219,10 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
         (
             "FERRUM_CP_DP_GRPC_JWT_SECRET",
             env_config.cp_dp_grpc_jwt_secret.as_deref(),
+        ),
+        (
+            "FERRUM_BASIC_AUTH_HMAC_SECRET",
+            env_config.basic_auth_hmac_secret.as_deref(),
         ),
     ] {
         if let Some(secret) = secret.filter(|s| !s.is_empty())
@@ -268,10 +285,15 @@ pub fn check_gateway_config_enforced(config: &GatewayConfig) -> Result<(), Strin
         .consumers
         .iter()
         .filter(|consumer| {
-            consumer.credentials.values().any(|value| {
-                stored_password_hashes(value)
-                    .any(|hash| !hash.starts_with(APPROVED_PASSWORD_HASH_PREFIX))
-            })
+            consumer
+                .credentials
+                .get("basic_auth")
+                .is_some_and(|value| {
+                    stored_password_hash_representations(value).any(|hash| match hash {
+                        Some(hash) => !is_approved_password_hash(hash),
+                        None => true,
+                    })
+                })
         })
         .count();
     if unclassified_hashes > 0 {
@@ -322,19 +344,35 @@ pub fn check_gateway_config_enforced(config: &GatewayConfig) -> Result<(), Strin
 ///
 /// A credential is either a single object or an array of objects (multi-
 /// credential rotation), so both shapes are walked. Only the `password_hash`
-/// member is read, and only its *prefix* is ever compared — the value itself
-/// never leaves this function.
-fn stored_password_hashes(value: &serde_json::Value) -> impl Iterator<Item = &str> {
+/// member is read and its representation is checked in place — the value
+/// itself never leaves this function.
+fn stored_password_hash_representations(
+    value: &serde_json::Value,
+) -> impl Iterator<Item = Option<&str>> {
     let entries: Vec<&serde_json::Value> = match value {
         serde_json::Value::Array(entries) => entries.iter().collect(),
         other => vec![other],
     };
     entries
         .into_iter()
-        .filter_map(|entry| entry.get("password_hash"))
-        .filter_map(|hash| hash.as_str())
+        .map(|entry| {
+            entry
+                .get("password_hash")
+                .and_then(serde_json::Value::as_str)
+        })
         .collect::<Vec<_>>()
         .into_iter()
+}
+
+fn is_approved_password_hash(value: &str) -> bool {
+    value
+        .strip_prefix(APPROVED_PASSWORD_HASH_PREFIX)
+        .is_some_and(|hex_hash| {
+            hex_hash.len() == 64
+                && hex_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
 }
 
 /// Collect non-approved algorithm names a plugin's configuration selects.
@@ -403,6 +441,30 @@ fn collect_jwt_algorithm_violations(plugin: &PluginConfig, out: &mut Vec<String>
             _ => {}
         }
     }
+
+    // OIDC RP and OAuth2 introspection can sign private_key_jwt client
+    // assertions. Their algorithm selector is nested per provider rather than
+    // at the plugin root, so inspect that production shape explicitly. EdDSA
+    // is valid ordinary configuration but is outside the algorithm set routed
+    // through the selected module and must fail FIPS admission.
+    if matches!(
+        plugin.plugin_name.as_str(),
+        "oidc_relying_party" | "oauth2_introspection"
+    ) && let Some(providers) = plugin
+        .config
+        .get("providers")
+        .and_then(serde_json::Value::as_array)
+    {
+        for provider in providers {
+            if let Some(algorithm) = provider
+                .get("client_auth")
+                .and_then(|value| value.get("private_key_jwt_alg"))
+                .and_then(serde_json::Value::as_str)
+            {
+                push_if_not_approved(algorithm, out);
+            }
+        }
+    }
 }
 
 fn push_if_not_approved(alg: &str, out: &mut Vec<String>) {
@@ -418,10 +480,7 @@ fn push_if_not_approved(alg: &str, out: &mut Vec<String>) {
     if !looks_like_jws_algorithm(candidate) {
         return;
     }
-    if !APPROVED_JWT_ALGORITHMS
-        .iter()
-        .any(|approved| approved.eq_ignore_ascii_case(candidate))
-    {
+    if !is_approved_jwt_algorithm(candidate) {
         out.push(candidate.to_ascii_uppercase());
     }
 }

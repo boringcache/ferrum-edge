@@ -53,11 +53,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use crate::fips::approved::Sha256;
 use dashmap::DashMap;
 use http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};

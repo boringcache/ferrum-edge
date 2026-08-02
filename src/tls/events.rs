@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
+use crate::fips::approved::Sha256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::tls::source::subscription::{MaterialFingerprintEntry, WatchedMaterialSource};

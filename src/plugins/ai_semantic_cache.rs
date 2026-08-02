@@ -58,10 +58,8 @@ use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
-use hmac::{Hmac, KeyInit, Mac};
 use instant_distance::{Builder as HnswBuilder, HnswMap, Point as HnswPoint, Search as HnswSearch};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::mem;
@@ -86,9 +84,8 @@ use super::utils::redis_rate_limiter::{
 use super::utils::replay_partition::{self, AnonymousCallerScope, PartitionHasher};
 use super::utils::response_body::read_response_body_bounded;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use crate::fips::approved::{HmacSha256, Sha256};
 use crate::util::unknown_keys::reject_unknown_keys;
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// The single response field this plugin writes, in the bounded form
 /// `Plugin::response_trailer_policy` hands to the plugin cache. Built once per

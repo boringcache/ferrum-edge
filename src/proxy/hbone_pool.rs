@@ -5,12 +5,12 @@
 //! and then speaks ordinary HTTP over the resulting byte tunnel.
 
 use bytes::{Buf, Bytes};
+use crate::fips::approved::Sha256;
 use dashmap::DashMap;
 use futures_util::FutureExt;
 use h2::client::SendRequest;
 use h2::{RecvStream, SendStream};
 use http::{Method, Request, StatusCode, Version};
-use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::fmt::Write;
 use std::pin::Pin;

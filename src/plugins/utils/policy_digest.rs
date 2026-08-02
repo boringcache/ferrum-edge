@@ -21,8 +21,8 @@
 //! Both helpers run on cold paths only (plugin construction and plugin-cache
 //! rebuild), never per request.
 
+use crate::fips::approved::Sha256;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 /// Type tags keeping distinct JSON shapes from digesting to the same bytes
 /// (for example the string `"1"` and the number `1`).

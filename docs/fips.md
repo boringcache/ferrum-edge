@@ -60,12 +60,11 @@ Prerequisites (in addition to Ferrum's usual `protoc`):
 cargo build --release --no-default-features --features fips --bin ferrum-edge
 ```
 
-**Lockfile.** The FIPS module's crates are deliberately **not** in the committed
-`Cargo.lock`: adding them would put a second cryptographic supply chain on every
-developer and every ordinary release artifact for no benefit. The FIPS build
-therefore resolves without `--locked`. A FIPS *release* must pin its own
-lockfile and keep it with the deployment record — that lockfile, the toolchain
-version, and the container base image are part of the evidence an auditor needs.
+**Lockfile.** The committed `Cargo.lock` pins both profiles, including the
+FIPS-only module package. A lockfile entry does not compile or link that package
+into an ordinary artifact; feature selection still controls the build. FIPS
+builds use `--locked`, and a FIPS release must retain that lockfile, the exact
+toolchain version, and the container base image with its deployment evidence.
 
 **Container images.** The published Ferrum images are ordinary-profile builds.
 A FIPS deployment builds its own image; the base image and its kernel must be on
@@ -155,11 +154,13 @@ reload, which rebuilds through the same constructor.
 **Keys and algorithms**
 
 - JWT/JWS algorithms restricted to HS256/384/512, RS256/384/512, PS256/384/512,
-  ES256/384/512. `none` is always rejected. `EdDSA` is rejected — Ed25519 is
+  ES256/384/512 across gateway plugins and CP/DP namespace trust bundles.
+  `none` is always rejected. `EdDSA` is rejected — Ed25519 is
   approved by FIPS 186-5 but is not part of the algorithm set Ferrum routes
   through the selected module, so admitting it would be an unbacked claim.
-- `FERRUM_ADMIN_JWT_SECRET` and `FERRUM_CP_DP_GRPC_JWT_SECRET` must be at least
-  32 bytes (SP 800-107 HMAC key strength).
+- `FERRUM_ADMIN_JWT_SECRET`, `FERRUM_CP_DP_GRPC_JWT_SECRET`, and
+  `FERRUM_BASIC_AUTH_HMAC_SECRET` must be at least 32 bytes (SP 800-107 HMAC
+  key strength).
 
 **Digests, MACs, and stored passwords**
 
@@ -167,11 +168,13 @@ reload, which rebuilds through the same constructor.
   (`hmac_auth`), stored-password MACs (`basic_auth`), LDAP bind-cache keying,
   DPoP proofs and JWK thumbprints, client-certificate thumbprints, PKCE
   challenges, OIDC session context, AWS SigV4 signing, ACME key
-  authorizations, keyed PII redaction, replay partitioning, and workload
-  attestation — run through `crate::fips::approved`, which is backed by the
-  selected module. They were migrated off the RustCrypto `sha2`/`hmac` crates
-  for exactly this reason: an approved *algorithm* computed by an unvalidated
-  *implementation* is still outside the boundary.
+  authorizations, keyed PII redaction, replay partitioning, workload
+  attestation, semantic-cache Redis envelope authentication, trust-material
+  rotation, duplicate-JSON verdict memoization, policy provenance, and
+  identity-bound connection-pool keys — run through `crate::fips::approved`,
+  which is backed by the selected module. They were migrated off the RustCrypto
+  `sha2`/`hmac` crates for exactly this reason: an approved *algorithm* computed
+  by an unvalidated *implementation* is still outside the boundary.
 - Ferrum's only stored-password representation is `hmac_sha256:<64 hex>`, an
   approved keyed MAC. A stored hash in any other representation is refused: it
   would be a KDF Ferrum has not classified. The unreferenced `argon2`
@@ -191,10 +194,11 @@ reload, which rebuilds through the same constructor.
 - `kafka_logging`: librdkafka performs its TLS through OpenSSL, outside the
   selected module. Use `tcp_logging`, `ws_logging`, or `http_logging`, which are
   rustls-based.
-- `FERRUM_DB_TYPE=mongodb` with `FERRUM_DB_TLS_MODE` other than `disable`: the
-  MongoDB driver pins its own non-validated rustls provider in its manifest and
-  builds its client config from it, so Ferrum cannot route that transport. Use a
-  SQL config store, file mode, or CP/DP distribution.
+- `FERRUM_DB_TYPE=mongodb`: the MongoDB driver pins its own non-validated rustls
+  provider, and URI options (including `mongodb+srv` defaults) can enable that
+  TLS path independently of `FERRUM_DB_TLS_MODE`. Ferrum cannot route or
+  exhaustively exclude that transport. Use a SQL config store, file mode, or
+  CP/DP distribution.
 
 Every diagnostic is bounded — at most 8 offending entries are named, followed by
 a count — and carries no secret, key material, path, or free-form
@@ -263,13 +267,14 @@ Dispositions:
   rejected, never as a standing residual-work list.
 
 A note on the last two, because the distinction is the whole point of the table:
-33 source modules still use RustCrypto `sha2` for cache keys, deduplication keys,
-ETags, configuration-drift digests, xDS nonces, and spec-codec identities. Those
-are recorded as `outside-boundary` with that rationale, not relabelled approved.
-They carry no key, protect no secret, and authenticate nothing — forging one
-causes a cache or rebuild decision, not an authentication or confidentiality
-failure. The digests and MACs that *do* back a security control were migrated to
-`crate::fips::approved` instead.
+Ferrum-owned production source no longer imports RustCrypto `sha2` or `hmac`.
+Even non-security SHA-256 work such as ETags, telemetry identities,
+configuration-drift summaries, and xDS nonces uses the selected-provider seam,
+so there is no second Ferrum-owned implementation to misclassify later. Those
+operations remain recorded as `outside-boundary`: they carry no key, protect no
+secret, and authenticate nothing, so executing them inside the module does not
+turn them into a FIPS security service. RustCrypto remains a dev dependency only
+for independent test vectors and request-signing fixtures.
 
 ## Self-test and key-management assumptions
 
@@ -303,7 +308,7 @@ than being allowed to run outside the boundary:
 | Capability | Why | Alternative |
 |---|---|---|
 | `kafka_logging` | librdkafka performs TLS through OpenSSL, which Ferrum cannot route onto the module | `tcp_logging`, `ws_logging`, `http_logging` (all rustls-based) |
-| MongoDB config store with TLS | the driver pins its own non-validated rustls provider in its manifest | a SQL config store, file mode, or CP/DP distribution |
+| MongoDB config store | the driver pins its own non-validated rustls provider and URI options can independently enable its TLS path | a SQL config store, file mode, or CP/DP distribution |
 | `soap_ws_security` `rsa-sha1` / `sha1` | SHA-1 is disallowed for signatures (SP 800-131A Rev. 2) | `rsa-sha256` / `sha256` |
 | `EdDSA` JWTs | approved by FIPS 186-5, but not in the algorithm set Ferrum routes through the selected module | ES256/384/512, RS/PS256/384/512, HS256/384/512 |
 | ChaCha20-Poly1305, X25519 | not an approved AEAD / not an approved SP 800-56A scheme | AES-GCM suites, secp256r1 / secp384r1 |
@@ -362,7 +367,7 @@ To verify the *build* independently of the running process:
 ```bash
 # The resolved feature graph must carry aws-lc-rs/fips and rustls/fips, and no
 # ring arm. This is the same audit CI runs.
-cargo tree -e features --no-dev-dependencies --no-default-features --features fips \
+cargo tree -e features,no-dev --locked --no-default-features --features fips \
   > /tmp/tree-fips.txt
 python3 .github/scripts/check_fips_feature_policy.py \
   --tree /tmp/tree-fips.txt --profile fips

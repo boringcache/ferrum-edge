@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use sha2::{Digest, Sha256};
+use crate::fips::approved::Sha256;
 
 use crate::modes::mesh::config::MeshRuntimeOverlay;
 

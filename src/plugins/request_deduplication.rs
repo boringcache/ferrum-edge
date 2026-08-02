@@ -97,11 +97,11 @@
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
+use crate::fips::approved::Sha256;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use http::{HeaderName, Method};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Read;

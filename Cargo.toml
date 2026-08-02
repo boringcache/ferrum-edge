@@ -230,8 +230,6 @@ zstd = "0.13"
 clap = { version = "4", features = ["derive"] }
 
 # Crypto
-sha2 = "0.11.0"
-hmac = "0.13.0"
 hex = "0.4"
 # `verify` enables PKCS#10 CSR / X.509 signature verification (proof-of-possession
 # in the internal CA CSR issuance path). Backed by the same `ring` provider already
@@ -357,8 +355,9 @@ crypto-ring = [
 # check reads.
 #
 # Building this profile requires a C toolchain, CMake, Go, and Perl for
-# `aws-lc-fips-sys`, and it resolves dependencies that the default profile's
-# `Cargo.lock` does not pin. See docs/fips.md §"Building the FIPS profile".
+# `aws-lc-fips-sys`. The committed lockfile pins both profiles; feature
+# selection still keeps the FIPS-only module out of ordinary artifacts. See
+# docs/fips.md §"Building the FIPS profile".
 #
 # Selecting this feature does NOT make Ferrum Edge a validated cryptographic
 # module and does not make any deployment FIPS-certified. It selects the
@@ -443,6 +442,11 @@ panic = "abort"         # skip unwind tables — smaller binary, faster panics
 tonic-prost-build = "0.14.6"
 
 [dev-dependencies]
+# Independent reference implementations for cryptographic test vectors and
+# request-signing fixtures. Production code routes SHA-2/HMAC-SHA-2 through
+# `crate::fips::approved` and must not depend on these RustCrypto crates.
+sha2 = "0.11.0"
+hmac = "0.13.0"
 # `tempfile` is intentionally also declared in `[dependencies]` for
 # `src/config/mongo_store.rs`. Keeping it dev-only would re-introduce the
 # `cargo check --lib` break (see the dependency-section comment).
@@ -466,8 +470,8 @@ rcgen = { version = "0.14", features = ["aws_lc_rs"] }
 # the whole suite compiling under both `--features crypto-ring` and
 # `--no-default-features --features fips`, without letting a fixture's provider
 # choice reach a deployment. The FIPS build/lint gate in
-# `.github/workflows/fips-build.yml` audits the resolved graph with
-# `--no-dev-dependencies` for exactly this reason.
+# `.github/workflows/fips-build.yml` audits the resolved graph with the
+# `features,no-dev` edge filter for exactly this reason.
 ring = "0.17"
 rustls = { version = "0.23", features = ["ring"] }
 rstest = "0.26"

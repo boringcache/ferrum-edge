@@ -198,12 +198,13 @@ pub const INVENTORY: &[CryptoOperation] = &[
                     with it",
     },
     CryptoOperation {
-        operation: "MongoDB config-database TLS",
+        operation: "MongoDB config database",
         location: "src/config/mongo_store.rs",
         implementation: "mongodb driver (pins rustls/ring in its own manifest)",
         disposition: Disposition::Rejected,
-        rationale: "fips::policy refuses FERRUM_DB_TYPE=mongodb with FERRUM_DB_TLS_MODE other \
-                    than `disable`",
+        rationale: "fips::policy refuses FERRUM_DB_TYPE=mongodb outright because URI options \
+                    can enable the driver's non-validated TLS stack independently of \
+                    FERRUM_DB_TLS_MODE",
     },
     // ── JWT / JWK ───────────────────────────────────────────────────────
     CryptoOperation {
@@ -214,8 +215,8 @@ pub const INVENTORY: &[CryptoOperation] = &[
         rationale: "the `fips` cargo feature selects jsonwebtoken/aws_lc_rs",
     },
     CryptoOperation {
-        operation: "Request-path JWT and JWKS verification (plugins)",
-        location: "src/plugins/jwt_auth.rs, src/plugins/jwks_auth.rs",
+        operation: "Request-path and CP/DP trust-bundle JWT/JWKS verification",
+        location: "src/plugins/jwt_auth.rs, src/plugins/jwks_auth.rs, src/grpc/cp_trust.rs",
         implementation: "jsonwebtoken (aws_lc_rs backend on a fips build)",
         disposition: Disposition::ModuleRoutable,
         rationale: "algorithms are screened against fips::policy::APPROVED_JWT_ALGORITHMS at \
@@ -224,7 +225,7 @@ pub const INVENTORY: &[CryptoOperation] = &[
     // ── Hash / MAC / randomness ─────────────────────────────────────────
     CryptoOperation {
         operation: "HMAC-SHA256/512 request authentication",
-        location: "src/plugins/hmac_auth.rs",
+        location: "src/plugins/hmac_auth.rs, src/proxy/mod.rs",
         implementation: "crate::fips::approved (module-backed HMAC-SHA-256/512)",
         disposition: Disposition::ModuleRoutable,
         rationale: "migrated off RustCrypto hmac/sha2 onto fips::approved; the request body digest \
@@ -232,7 +233,7 @@ pub const INVENTORY: &[CryptoOperation] = &[
     },
     CryptoOperation {
         operation: "Password verification (basic auth) and LDAP bind-cache keying",
-        location: "src/plugins/basic_auth.rs, src/plugins/ldap_auth.rs",
+        location: "src/config/types.rs, src/plugins/basic_auth.rs, src/plugins/ldap_auth.rs",
         implementation: "crate::fips::approved (module-backed HMAC-SHA-256)",
         disposition: Disposition::ModuleRoutable,
         rationale: "Ferrum's only stored-password representation is `hmac_sha256:<hex>`, an \
@@ -254,6 +255,30 @@ pub const INVENTORY: &[CryptoOperation] = &[
         implementation: "ring / aws-lc-rs via crate::fips::backend",
         disposition: Disposition::ModuleRoutable,
         rationale: "routed through the backend alias",
+    },
+    CryptoOperation {
+        operation: "AI semantic-cache Redis envelope authentication",
+        location: "src/plugins/ai_semantic_cache.rs",
+        implementation: "crate::fips::approved (module-backed HMAC-SHA-256)",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "the HMAC that authenticates untrusted Redis envelopes is routed through the \
+                    selected module; cache-key-only digests in the same plugin are not security \
+                    claims but use the same seam to avoid a second implementation in this file",
+    },
+    CryptoOperation {
+        operation: "Security-policy, identity, and trust-material fingerprints",
+        location: "src/util/json_dup_keys.rs, src/plugins/utils/policy_digest.rs, \
+                   src/plugins/utils/runtime_bool_gate.rs, src/plugins/response_caching.rs, \
+                   src/plugins/request_deduplication.rs, src/plugins/ai_semantic_firewall.rs, \
+                   src/plugins/ai_tool_governor.rs, src/plugins/mcp_gateway.rs, \
+                   src/grpc/configsync_lifecycle.rs, src/tls/source/, \
+                   src/proxy/{hbone_pool,stream_listener}.rs, \
+                   src/modes/mesh/node_waypoint.rs",
+        implementation: "crate::fips::approved (module-backed SHA-256)",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "these digests prevent stale or cross-policy reuse, bind trust and identity \
+                    generations, or memoize hostile-input validation; a collision could affect a \
+                    security decision, so every operation is routed through the selected module",
     },
     CryptoOperation {
         operation: "Security-relevant random values (nonces, state, salts, IDs)",
@@ -329,19 +354,17 @@ pub const INVENTORY: &[CryptoOperation] = &[
         operation: "Non-security SHA-256 digests (cache keys, deduplication \
                     keys, ETags, config/policy drift digests, xDS nonces, spec \
                     codec identities, statsd/chargeback row identities)",
-        location: "src/plugins/response_caching.rs, src/plugins/request_deduplication.rs, \
-                   src/plugins/utils/policy_digest.rs, src/xds/, src/admin/spec_codec.rs, \
-                   src/tls/inventory.rs, src/tls/events.rs (33 modules)",
-        implementation: "RustCrypto sha2",
+        location: "src/xds/, src/admin/spec_codec.rs, src/admin/mesh_config_drift.rs, \
+                   src/tls/inventory.rs, src/tls/events.rs, src/plugins/statsd_logging.rs",
+        implementation: "crate::fips::approved (module-backed SHA-256)",
         disposition: Disposition::OutsideBoundary,
         rationale: "these digests carry no key, protect no secret, and authenticate nothing: they \
                     are content-addressing and change-detection identities over data that was \
                     already admitted and, where applicable, already cryptographically verified. \
                     Forging one causes a cache or rebuild decision, not an authentication or \
-                    confidentiality failure, so relabelling them approved would be the exact \
-                    'uses a FIPS-capable library' claim this table exists to refuse. The \
-                    security-relevant digests and MACs were migrated to crate::fips::approved \
-                    instead",
+                    confidentiality failure. They still use the provider seam so Ferrum-owned \
+                    production code carries no second SHA-2 implementation, but their disposition \
+                    remains outside-boundary rather than relabelling them as a security claim",
     },
     CryptoOperation {
         operation: "X.509 / PKCS#10 signature verification helper (proof-of-possession)",

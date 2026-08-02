@@ -1,7 +1,7 @@
 use arc_swap::ArcSwap;
+use crate::fips::approved::Sha256;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;

@@ -15,11 +15,14 @@
 //! This covers the operations that are load-bearing for an authentication,
 //! integrity, or confidentiality control: request MAC verification, password
 //! MACs, certificate and JWK thumbprints, PKCE, DPoP, SigV4 signing, keyed
-//! redaction, replay/partition keying, and workload attestation. Digests that
-//! are *not* a security service — cache keys, deduplication keys, ETags,
-//! configuration-drift digests, xDS nonces — deliberately stay on RustCrypto
-//! and are recorded as [`crate::fips::inventory::Disposition::OutsideBoundary`]
-//! with that rationale, rather than being relabelled approved.
+//! redaction, replay/partition keying, workload attestation, trust-material
+//! rotation, and security-policy provenance. Digests that are *not* a security
+//! service — ordinary ETags, telemetry identities, configuration-drift
+//! summaries, and xDS nonces — use this same seam too, eliminating a second
+//! Ferrum-owned SHA-2 implementation. They remain recorded as
+//! [`crate::fips::inventory::Disposition::OutsideBoundary`] because routing a
+//! non-security operation through the module does not turn it into a FIPS
+//! security claim.
 //!
 //! # API shape
 //!

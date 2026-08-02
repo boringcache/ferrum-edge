@@ -10,9 +10,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
+use crate::fips::approved::Sha256;
 use semver::Version;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::config::types::GatewayConfig;
 use crate::identity::{TrustBundle, TrustBundleSet as RuntimeTrustBundleSet};

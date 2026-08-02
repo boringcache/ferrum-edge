@@ -16,8 +16,8 @@
 //! Supports all proxy protocols (HTTP, gRPC, WebSocket, TCP, UDP).
 
 use async_trait::async_trait;
+use crate::fips::approved::Sha256;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt;
 use std::net::SocketAddr;

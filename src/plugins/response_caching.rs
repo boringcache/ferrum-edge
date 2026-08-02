@@ -61,11 +61,11 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDateTime, Utc};
+use crate::fips::approved::Sha256;
 use dashmap::DashMap;
 use http::{HeaderName, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

@@ -65,8 +65,8 @@
 //!   headers. Compression is deterministic, so all paths agree.
 
 use async_trait::async_trait;
+use crate::fips::approved::Sha256;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};

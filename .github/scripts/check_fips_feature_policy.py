@@ -18,9 +18,9 @@ Usage:
 
     check_fips_feature_policy.py --tree <path-to-cargo-tree-output> --profile fips
     check_fips_feature_policy.py --tree <path> --profile crypto-ring
-        Audit `cargo tree -e features --no-dev-dependencies` output for that profile.
+        Audit `cargo tree -e features,no-dev` output for that profile.
 
-`--no-dev-dependencies` is load-bearing: test fixtures pin `ring` and `rustls/ring` as
+The `no-dev` edge filter is load-bearing: test fixtures pin `ring` and `rustls/ring` as
 dev-dependencies so the suite compiles under both profiles, and a dev-dependency
 is never linked into the shipped binary. Auditing with dev-deps included would
 report a ring edge that no deployment can reach.
@@ -118,6 +118,17 @@ FORBIDDEN_RESOLVED_RING = {
     ("rustls", "fips"),
 }
 
+# Ferrum-owned production code must not bypass `crate::fips::approved` by
+# importing the independent RustCrypto reference implementations. Test code is
+# deliberately exempt: it uses those crates to verify module-backed outputs
+# against an implementation that does not share the production seam.
+FORBIDDEN_PRODUCTION_CRATE_PATTERNS = (
+    re.compile(r"\buse\s+sha2(?:::|\s*;)"),
+    re.compile(r"\bsha2::"),
+    re.compile(r"\buse\s+hmac(?:::|\s*;)"),
+    re.compile(r"\bhmac::Hmac\b"),
+)
+
 
 def read_manifest() -> str:
     return MANIFEST.read_text(encoding="utf-8")
@@ -199,6 +210,35 @@ def check_manifest() -> list[str]:
                 "default feature set selects a cryptographic backend"
             )
 
+    dependency_table = re.search(
+        r"^\[dependencies\]\s*$\n(.*?)(?=^\[)", manifest, re.M | re.S
+    )
+    if dependency_table is None:
+        failures.append("Cargo.toml has no `[dependencies]` table")
+    else:
+        for reference_crate in ("sha2", "hmac"):
+            if re.search(
+                rf"^{re.escape(reference_crate)}\s*=",
+                dependency_table.group(1),
+                re.M,
+            ):
+                failures.append(
+                    f"RustCrypto reference crate {reference_crate!r} must be dev-only; "
+                    "production SHA-2/HMAC uses crate::fips::approved"
+                )
+
+    for source_path in sorted((REPO_ROOT / "src").rglob("*.rs")):
+        # This module intentionally names the old API in rustdoc while
+        # implementing the provider-backed compatibility surface itself.
+        if source_path == REPO_ROOT / "src/fips/approved.rs":
+            continue
+        source = source_path.read_text(encoding="utf-8")
+        if any(pattern.search(source) for pattern in FORBIDDEN_PRODUCTION_CRATE_PATTERNS):
+            failures.append(
+                f"{source_path.relative_to(REPO_ROOT)} imports a RustCrypto SHA-2/HMAC "
+                "implementation; route it through crate::fips::approved"
+            )
+
     return failures
 
 
@@ -216,7 +256,7 @@ def check_tree(path: Path, profile: str) -> list[str]:
     if not selections:
         return [
             f"no feature edges parsed from {path}; expected the output of "
-            "`cargo tree -e features --no-dev-dependencies`"
+            "`cargo tree -e features,no-dev`"
         ]
 
     if profile == "fips":

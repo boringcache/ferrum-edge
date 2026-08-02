@@ -37,7 +37,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use dashmap::DashMap;
-use sha2::{Digest, Sha256};
+use crate::fips::approved::Sha256;
 use sqlx::Executor;
 use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};

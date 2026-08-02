@@ -25,9 +25,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use crate::fips::approved::Sha256;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::modes::mesh::config::MeshRuntimeOverlay;
 use crate::modes::mesh::revision::MeshRevisionDiagnostics;

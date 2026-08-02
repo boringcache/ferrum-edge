@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use crate::fips::approved::Sha256;
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{

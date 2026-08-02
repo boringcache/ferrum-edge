@@ -280,21 +280,37 @@ fn env_policy_rejects_disabled_backend_certificate_verification() {
 }
 
 #[test]
-fn env_policy_rejects_encrypted_mongodb_config_store() {
-    // The MongoDB driver pins its own non-validated rustls provider, so its
-    // transport can never be routed onto Ferrum's module.
-    let mut env_config = EnvConfig {
-        db_type: Some("mongodb".to_string()),
-        db_tls_mode: Some(ferrum_edge::config::env_config::DbTlsMode::Require),
-        ..EnvConfig::default()
-    };
-    let err = policy::check_env_config_enforced(&env_config).expect_err("mongo TLS is rejected");
-    assert!(err.contains("mongodb"), "{err}");
-    assert!(err.contains("docs/fips.md"), "{err}");
+fn env_policy_rejects_every_mongodb_config_store_shape() {
+    use ferrum_edge::config::env_config::DbTlsMode;
 
-    // `disable` is admitted: there is no TLS stack to attest to.
-    env_config.db_tls_mode = Some(ferrum_edge::config::env_config::DbTlsMode::Disable);
-    policy::check_env_config_enforced(&env_config).expect("plaintext mongo is admitted");
+    // Mongo URI options (and mongodb+srv defaults) can enable the driver's
+    // non-validated TLS stack independently of FERRUM_DB_TLS_MODE. Reject the
+    // backend for every explicit mode, including `disable`, and when unset.
+    for mode in [
+        None,
+        Some(DbTlsMode::Disable),
+        Some(DbTlsMode::Allow),
+        Some(DbTlsMode::Prefer),
+        Some(DbTlsMode::Require),
+        Some(DbTlsMode::VerifyCa),
+        Some(DbTlsMode::VerifyFull),
+    ] {
+        let env_config = EnvConfig {
+            db_type: Some("mongodb".to_string()),
+            db_url: Some("mongodb://db.example/ferrum?tls=true".to_string()),
+            db_tls_mode: mode,
+            ..EnvConfig::default()
+        };
+        let err = policy::check_env_config_enforced(&env_config)
+            .expect_err("every MongoDB config store shape is rejected");
+        assert!(err.contains("mongodb"), "{err}");
+        assert!(err.contains("FERRUM_DB_TLS_MODE"), "{err}");
+        assert!(err.contains("docs/fips.md"), "{err}");
+        assert!(
+            !err.contains("db.example"),
+            "the connection URI must not be echoed: {err}"
+        );
+    }
 }
 
 #[test]
@@ -312,6 +328,12 @@ fn env_policy_floors_hmac_key_length() {
 
     env_config.admin_jwt_secret = Some("x".repeat(policy::MIN_HMAC_KEY_BYTES));
     policy::check_env_config_enforced(&env_config).expect("32-byte key is admitted");
+
+    env_config.basic_auth_hmac_secret = Some("short".to_string());
+    let err = policy::check_env_config_enforced(&env_config)
+        .expect_err("short Basic-auth HMAC key is rejected");
+    assert!(err.contains("FERRUM_BASIC_AUTH_HMAC_SECRET"));
+    assert!(!err.contains("short"), "the secret must not be echoed: {err}");
 }
 
 // ── Gateway configuration policy ────────────────────────────────────────────
@@ -347,6 +369,23 @@ fn gateway_policy_rejects_non_approved_jwt_algorithms() {
 }
 
 #[test]
+fn shared_jwt_algorithm_policy_covers_external_admission_surfaces() {
+    for algorithm in ["HS256", "RS384", "PS512", "ES256"] {
+        assert!(policy::is_approved_jwt_algorithm(algorithm), "{algorithm}");
+    }
+    for algorithm in ["none", "EdDSA", "HS999", ""] {
+        assert!(!policy::is_approved_jwt_algorithm(algorithm), "{algorithm}");
+    }
+
+    let cp_trust = include_str!("../../../src/grpc/cp_trust.rs");
+    assert!(
+        cp_trust.contains("crate::fips::is_enforcing()")
+            && cp_trust.contains("crate::fips::policy::is_approved_jwt_algorithm("),
+        "the environment-selected CP/DP trust bundle must enforce the shared algorithm policy"
+    );
+}
+
+#[test]
 fn gateway_policy_accepts_approved_jwt_algorithms_in_both_config_shapes() {
     let scalar = config_with(vec![plugin("jwt_auth", json!({ "algorithm": "RS256" }))]);
     policy::check_gateway_config_enforced(&scalar).expect("RS256 scalar is approved");
@@ -356,6 +395,34 @@ fn gateway_policy_accepts_approved_jwt_algorithms_in_both_config_shapes() {
         json!({ "algorithms": ["RS256", "ES384", "PS512"] }),
     )]);
     policy::check_gateway_config_enforced(&array).expect("approved array is admitted");
+}
+
+#[test]
+fn gateway_policy_checks_nested_private_key_jwt_algorithms() {
+    for plugin_name in ["oidc_relying_party", "oauth2_introspection"] {
+        let rejected = config_with(vec![plugin(
+            plugin_name,
+            json!({
+                "providers": [{
+                    "client_auth": { "private_key_jwt_alg": "EdDSA" }
+                }]
+            }),
+        )]);
+        let err = policy::check_gateway_config_enforced(&rejected)
+            .expect_err("nested EdDSA client assertions are rejected");
+        assert!(err.contains("EDDSA"), "{plugin_name}: {err}");
+
+        let approved = config_with(vec![plugin(
+            plugin_name,
+            json!({
+                "providers": [{
+                    "client_auth": { "private_key_jwt_alg": "RS256" }
+                }]
+            }),
+        )]);
+        policy::check_gateway_config_enforced(&approved)
+            .expect("nested RS256 client assertions are approved");
+    }
 }
 
 #[test]
@@ -522,20 +589,43 @@ fn gateway_policy_rejects_sha1_xml_signature_selections() {
 
 #[test]
 fn gateway_policy_rejects_an_unclassified_stored_password_representation() {
-    let consumer = consumer_with(json!({
-        "password_hash": "argon2id$v=19$m=65536,t=3,p=4$abc$def"
-    }));
-    let config = GatewayConfig {
-        consumers: vec![consumer],
-        ..GatewayConfig::default()
-    };
-    let err = policy::check_gateway_config_enforced(&config)
-        .expect_err("an unclassified stored hash is rejected");
-    assert!(err.contains(policy::APPROVED_PASSWORD_HASH_PREFIX), "{err}");
-    assert!(
-        !err.contains("argon2id"),
-        "the stored value must never be echoed: {err}"
-    );
+    for value in [
+        "argon2id$v=19$m=65536,t=3,p=4$abc$def".to_string(),
+        "hmac_sha256:abc".to_string(),
+        format!("hmac_sha256:{}", "A".repeat(64)),
+        format!("hmac_sha256:{}g", "a".repeat(63)),
+    ] {
+        let consumer = consumer_with(json!({ "password_hash": value }));
+        let config = GatewayConfig {
+            consumers: vec![consumer],
+            ..GatewayConfig::default()
+        };
+        let err = policy::check_gateway_config_enforced(&config)
+            .expect_err("an unclassified or malformed stored hash is rejected");
+        assert!(err.contains(policy::APPROVED_PASSWORD_HASH_PREFIX), "{err}");
+        assert!(
+            !err.contains("argon2id") && !err.contains("hmac_sha256:abc"),
+            "the stored value must never be echoed: {err}"
+        );
+    }
+
+    for malformed in [
+        json!({ "password": "plaintext-must-not-be-stored" }),
+        json!({ "password_hash": 7 }),
+        json!("not-a-basic-auth-credential-object"),
+    ] {
+        let config = GatewayConfig {
+            consumers: vec![consumer_with(malformed)],
+            ..GatewayConfig::default()
+        };
+        let err = policy::check_gateway_config_enforced(&config)
+            .expect_err("missing or non-string stored hashes are unclassified");
+        assert!(err.contains(policy::APPROVED_PASSWORD_HASH_PREFIX), "{err}");
+        assert!(
+            !err.contains("plaintext-must-not-be-stored"),
+            "the credential must not be echoed: {err}"
+        );
+    }
 }
 
 #[test]
@@ -549,6 +639,60 @@ fn gateway_policy_admits_the_approved_stored_password_representation() {
         ..GatewayConfig::default()
     };
     policy::check_gateway_config_enforced(&config).expect("HMAC-SHA256 hashes are approved");
+}
+
+#[test]
+fn gateway_document_policy_is_wired_to_every_runtime_publication_boundary() {
+    // A default-profile external test cannot establish global FIPS
+    // enforcement, so pin the production wiring statically while the semantic
+    // `_enforced` tests above exercise the policy itself.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let incremental_start = proxy
+        .find("pub async fn apply_incremental(")
+        .expect("incremental apply boundary");
+    let staging_start = proxy[incremental_start..]
+        .find("let prospective_delta =")
+        .map(|offset| incremental_start + offset)
+        .expect("incremental cache staging boundary");
+    assert!(
+        proxy[incremental_start..staging_start]
+            .contains("crate::fips::policy::check_gateway_config(&new_config)"),
+        "database and CP/DP deltas must be rejected before request-epoch cache staging"
+    );
+
+    let validation = include_str!("../../../src/config/validation_pipeline.rs");
+    assert!(
+        validation.contains("crate::fips::policy::check_gateway_config(config)"),
+        "database full loads and CP composition must share the FIPS document gate"
+    );
+
+    let mesh = include_str!("../../../src/grpc/mesh_server.rs");
+    assert!(
+        mesh.matches("crate::fips::policy::check_gateway_config(")
+            .count()
+            >= 3,
+        "initial, full/recovery, and incremental mesh stream candidates must all be gated"
+    );
+
+    let reconciler = include_str!("../../../src/k8s_controller/reconciler.rs");
+    let publish_start = reconciler
+        .find("pub fn publish_k8s_reconcile(")
+        .expect("Kubernetes publication boundary");
+    let reconcile_start = reconciler[publish_start..]
+        .find("async fn do_reconcile(")
+        .map(|offset| publish_start + offset)
+        .expect("end of Kubernetes publication boundary");
+    let publish_body = &reconciler[publish_start..reconcile_start];
+    let fips_gate = publish_body
+        .find("crate::fips::policy::check_gateway_config(&candidate)")
+        .expect("Kubernetes composed-candidate FIPS gate");
+    let overlay_store = publish_body
+        .find("store_accepted_k8s_overlay(")
+        .expect("accepted Kubernetes overlay store");
+    assert!(
+        fips_gate < overlay_store,
+        "a rejected Kubernetes candidate must not replace the last accepted overlay"
+    );
 }
 
 #[test]
