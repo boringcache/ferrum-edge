@@ -5433,8 +5433,16 @@ impl SpoolUsageCounters {
     }
 
     fn account_add(&self, files: u64, bytes: u64) {
-        self.files.fetch_add(files, Ordering::Relaxed);
-        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        let _ = self
+            .files
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(files))
+            });
+        let _ = self
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(bytes))
+            });
     }
 
     fn account_sub(&self, files: u64, bytes: u64) {

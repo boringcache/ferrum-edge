@@ -8008,10 +8008,18 @@ async fn large_spool_status_and_prometheus_use_cached_gauges_without_inventory()
         let before = active_spool_inventory_walks_for_tests();
         tokio::time::sleep(Duration::from_millis(10)).await;
         let after = active_spool_inventory_walks_for_tests();
-        if after == before && before > 0 {
+        // The first committed tick performs one prepare inventory and then one
+        // absolute reconcile inventory. Waiting for both avoids mistaking the
+        // short gap between them for quiescence and makes the later zero-growth
+        // assertion independent of scheduler timing.
+        if after == before && before >= 2 {
             break;
         }
     }
+    assert!(
+        active_spool_inventory_walks_for_tests() >= 2,
+        "startup prepare and reconcile inventories must complete before the scrape proof"
+    );
 
     let day = namespace_root.join("20260524");
     fs::create_dir_all(&day).unwrap();
