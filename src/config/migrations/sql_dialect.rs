@@ -209,16 +209,7 @@ impl V001SqlBuilder {
             }));
         }
 
-        let sql = if self.is_mysql() {
-            "SELECT 1 FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = 'audit_events' \
-             AND column_name = ?"
-        } else {
-            "SELECT 1 FROM information_schema.columns \
-             WHERE table_schema = current_schema() AND table_name = 'audit_events' \
-             AND column_name = ?"
-        };
-        Ok(sqlx::query(sql)
+        Ok(sqlx::query(self.audit_event_column_exists_sql())
             .bind(column)
             .fetch_optional(&mut *connection)
             .await?
@@ -440,6 +431,20 @@ impl V001SqlBuilder {
 
     fn is_sqlite(&self) -> bool {
         matches!(self.dialect, SqlDialect::Sqlite)
+    }
+
+    fn audit_event_column_exists_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            "SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = 'audit_events' \
+             AND column_name = ?"
+        } else {
+            // Postgres native placeholders are $1..$n; a trailing `?` is parsed
+            // as an incomplete operator and fails with "syntax error at end of input".
+            "SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = 'audit_events' \
+             AND column_name = $1"
+        }
     }
 
     fn api_specs_title_index_sql(&self) -> &'static str {
@@ -1214,6 +1219,29 @@ mod tests {
     // MongoDB's `partialFilterExpression: {enabled: true}`), full on
     // MySQL which lacks SQL-standard partial indexes.
     // ------------------------------------------------------------------
+
+    #[test]
+    fn test_audit_event_column_exists_sql_uses_dialect_placeholders() {
+        let mysql_sql = V001SqlBuilder::new("mysql").audit_event_column_exists_sql();
+        assert!(
+            mysql_sql.contains("column_name = ?"),
+            "MySQL information_schema probe must use `?` placeholders"
+        );
+        assert!(
+            !mysql_sql.contains("$1"),
+            "MySQL information_schema probe must not use Postgres `$1` placeholders"
+        );
+
+        let postgres_sql = V001SqlBuilder::new("postgres").audit_event_column_exists_sql();
+        assert!(
+            postgres_sql.contains("column_name = $1"),
+            "Postgres information_schema probe must use `$1` placeholders"
+        );
+        assert!(
+            !postgres_sql.contains("column_name = ?"),
+            "Postgres information_schema probe must not leave a trailing `?` operator"
+        );
+    }
 
     #[test]
     fn test_mysql_mesh_route_dispatch_index_is_full() {
