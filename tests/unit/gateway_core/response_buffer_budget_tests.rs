@@ -1673,9 +1673,10 @@ fn the_final_decode_handoff_is_checked_rather_than_only_narrowed() {
             && representation.contains("fn into_charged_bytes(mut self) -> Option<Bytes>"),
         "publication must be gated on the charge covering the ACTUAL capacity"
     );
+    let decode = include_str!("../../../src/plugins/charged_decode.rs");
     assert!(
-        representation.contains("out.reserve_exact(grown - out.len());")
-            && representation.contains(
+        decode.contains("out.reserve_exact(grown - out.len());")
+            && decode.contains(
                 "let allocated = prospective_retained_len(concurrent_bytes, out.capacity());"
             ),
         "`reserve_exact` guarantees at least the requested capacity, so the \
@@ -1690,16 +1691,16 @@ fn the_final_decode_handoff_is_checked_rather_than_only_narrowed() {
 /// fixed scratch ceiling could honestly cover.
 #[test]
 fn the_decoder_working_set_is_reserved_before_the_decoder_is_constructed() {
-    let representation = include_str!("../../../src/plugins/response_representation.rs");
+    let decode = include_str!("../../../src/plugins/charged_decode.rs");
 
-    let scratch = representation
+    let scratch = decode
         .find("if !scratch.reserve_in(budget, coding.scratch_bytes())")
         .expect("the codec working set must be reserved against the aggregate budget");
     for decoder in [
         "flate2::read::MultiGzDecoder::new(data)",
         "StrictBrotliReader::new(data)",
     ] {
-        let constructed = representation
+        let constructed = decode
             .find(decoder)
             .unwrap_or_else(|| panic!("`{decoder}` must be the decoder that is constructed"));
         assert!(
@@ -1710,15 +1711,49 @@ fn the_decoder_working_set_is_reserved_before_the_decoder_is_constructed() {
         );
     }
     assert!(
-        representation.contains("brotli::BrotliState::new_strict("),
+        decode.contains("brotli::BrotliState::new_strict("),
         "the `br` decoder must pin `large_window = false`, or its ring buffer is \
          bounded by 1 GiB and the scratch ceiling is fiction"
     );
     assert!(
-        !representation.contains("brotli::Decompressor::new("),
+        !decode.contains("brotli::Decompressor::new("),
         "`brotli::Decompressor` builds its state with `large_window = true`, so \
          a handful of header bits can ask it for a 1 GiB ring buffer"
     );
+}
+
+/// BOTH representation gates must reach that strict, charged decoder — and
+/// neither may reach the permissive generic one.
+///
+/// `utils::content_encoding` builds `BrotliState::new`, which the pinned
+/// dependency source constructs with `large_window = true`. It is the right
+/// decoder for an advisory inspection helper and the wrong one for a security
+/// gate: a handful of header bits can ask it for a 1 GiB ring buffer, and it
+/// charges nothing to any aggregate budget, so concurrent governed decodes could
+/// multiply attacker-amplified memory without bound.
+#[test]
+fn both_representation_gates_decode_through_the_shared_strict_charged_decoder() {
+    for (name, source) in [
+        (
+            "request",
+            include_str!("../../../src/plugins/request_representation.rs"),
+        ),
+        (
+            "response",
+            include_str!("../../../src/plugins/response_representation.rs"),
+        ),
+    ] {
+        assert!(
+            source.contains("use super::charged_decode::{ChargedDecodeError, decode_one_coding};"),
+            "the {name} gate must decode through the shared strict, charged decoder"
+        );
+        assert!(
+            !source.contains("decode_content_encoding("),
+            "the {name} gate must not reach the permissive generic decoder: it \
+             builds `BrotliState::new` with `large_window = true` and takes no \
+             aggregate charge"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

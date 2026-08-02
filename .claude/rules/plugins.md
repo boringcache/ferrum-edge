@@ -194,13 +194,29 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     for a claimed request whose finalized `Content-Encoding` names a transforming
     coding, the ordered `#content-coding` list is parsed and decoded in reverse
     application order into a staged PLAINTEXT INSPECTION VIEW, and anything
-    unsupported / malformed / over-4-layers / over-limit / over-1024:1 is a fixed
+    unsupported / malformed / Large-Window-Brotli / over-4-layers / over-limit /
+    over-1024:1 is a fixed
     `400` with a low-cardinality reason that never echoes a token or a body byte.
     The backend still receives the exact client octets and headers — the decode
     is never installed. Claiming hooks MUST read through
-    `RequestContext::inspectable_final_request_body`; reading the raw slice
-    reopens the bypass. This phase is independent of `compression`: an enforcing
+    `RequestContext::inspectable_final_request_body` (or the owned
+    `inspectable_final_request_body_owned`, an `O(1)` share of the same charged
+    allocation); reading the raw slice reopens the bypass, and copying the view
+    out with `to_vec()` mints an uncharged duplicate of an attacker-amplified
+    body. This phase is independent of `compression`: an enforcing
     policy may not silently depend on a separately configured decompressor.
+    Codec strictness and charge ordering come from `plugins::charged_decode`,
+    shared with the response gate — the permissive
+    `utils::content_encoding` decoder (`BrotliState::new`, `large_window = true`)
+    is deliberately unreachable from this security gate. The complete decode
+    working set (output capacity, stacked-pass concurrency window, and the ACTIVE
+    decoder's own heap, reserved before the decoder is CONSTRUCTED) is charged to
+    a process-wide `FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES` budget before
+    allocation; the charge is owned by the staged `Bytes` so every disposal path
+    releases it by drop and a `RequestContext` clone shares it rather than
+    duplicating it. A budget refusal is the GATEWAY-local capacity terminal
+    (`503` / `RESOURCE_EXHAUSTED`), never a `400` and never a backend fault, and
+    still never forwards the encoded body.
 6. `on_final_request_body`: body validator, gRPC-Web validation, WAF body rules, OpenAPI request schema (backend-final fallback), post-transform request-size ceiling, `ai_prompt_compressor` staged marker-sanitization rejection (4055), and `ai_semantic_cache` exact/semantic lookup (4057). `ai_semantic_cache` looks up here — not in `before_proxy` — so its replay partition binds the finalized outbound headers/query/destination and fully transformed request body, and a hit cannot bypass fail-closed final-body policy.
 6b. `dispatch_finalized_request_egress`: irreversible outbound request egress
     (`request_mirror`, `serverless_function`, `ai_federation`) over the immutable

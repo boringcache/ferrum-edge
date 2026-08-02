@@ -67,6 +67,7 @@ pub mod body_validator;
 pub mod bot_detection;
 pub mod builtin_parity;
 pub mod chargeback;
+pub(crate) mod charged_decode;
 pub mod compression;
 pub mod correlation_id;
 pub mod cors;
@@ -2400,7 +2401,23 @@ pub struct RequestContext {
     /// Typed and outside `metadata` deliberately: this is decoded client body
     /// content, so it must never reach a transaction log, and no plugin may
     /// fabricate or clear it.
-    governed_request_body_plaintext: Option<Vec<u8>>,
+    ///
+    /// [`bytes::Bytes`] rather than `Vec<u8>` because the allocation OWNS its
+    /// share of the aggregate request-decode budget
+    /// ([`crate::proxy::response_buffer_budget`], `GHSA-pwcm-6rh8-f2gh`). Three
+    /// properties follow from that and all three are load-bearing:
+    ///
+    /// * the charge is released exactly when the last handle drops, so
+    ///   completion, rejection, deadline, cancellation, and re-finalization are
+    ///   all just drops and no path has to remember to release;
+    /// * `RequestContext` derives `Clone`, and a `Vec` clone would duplicate an
+    ///   attacker-amplified allocation with no second charge behind it. A
+    ///   `Bytes` clone shares the one owner, so the plaintext is charged exactly
+    ///   once however many contexts reference it;
+    /// * a claiming hook can take a cheap owned handle
+    ///   ([`RequestContext::inspectable_final_request_body_owned`]) instead of
+    ///   copying the plaintext out to escape a borrow of `ctx`.
+    governed_request_body_plaintext: Option<bytes::Bytes>,
     /// Per-instance governed-call identity multisets (identity hash -> count),
     /// the one-for-one skip ledgers final re-checks consume. Kept off
     /// `metadata` for the same reason as the response hashes.
@@ -3868,15 +3885,23 @@ impl RequestContext {
     /// Called only by [`crate::proxy::run_final_request_body_hooks_with_provenance`]
     /// after the shared request representation gate proved the complete ordered
     /// `Content-Encoding` chain decodes (`GHSA-3973-47g5-4mcx`).
-    pub(crate) fn stage_governed_request_body_plaintext(&mut self, plaintext: Vec<u8>) {
+    ///
+    /// `plaintext` arrives already carrying its aggregate request-decode charge
+    /// (the gate publishes it through
+    /// [`crate::proxy::response_buffer_budget::charged_bytes`]), so staging it
+    /// here is a move of an owned charge and never a second acquisition.
+    pub(crate) fn stage_governed_request_body_plaintext(&mut self, plaintext: bytes::Bytes) {
         self.governed_request_body_plaintext = Some(plaintext);
     }
 
-    /// Drop any staged plaintext view.
+    /// Drop any staged plaintext view, returning its budget charge.
     ///
     /// The gate calls this at the start of every final-request-body hook run so
     /// a view decoded for one `(headers, body)` pair can never be read against a
-    /// different one — a retry, a deferred pass, or a second finalization.
+    /// different one — a retry, a deferred pass, or a second finalization. The
+    /// release is the drop itself: whatever the previous run reserved goes back
+    /// to the aggregate budget here, and again wherever the last surviving
+    /// handle to those bytes falls out of scope.
     pub(crate) fn clear_governed_request_body_plaintext(&mut self) {
         self.governed_request_body_plaintext = None;
     }
@@ -3899,8 +3924,26 @@ impl RequestContext {
         }
     }
 
+    /// An OWNED handle on the staged plaintext, or `None` when the finalized
+    /// bytes are already the plaintext.
+    ///
+    /// This exists so a claiming hook whose later work needs `&mut ctx` does not
+    /// have to copy the decoded document out to escape the borrow. A `Bytes`
+    /// clone is `O(1)` and shares the one charged allocation, whereas the
+    /// `to_vec()` it replaces produced a second, UNCHARGED copy of an
+    /// attacker-amplified body for every claiming plugin in the chain.
+    pub fn inspectable_final_request_body_owned(&self) -> Option<bytes::Bytes> {
+        self.governed_request_body_plaintext.clone()
+    }
+
     /// Whether the final request-body representation was decoded from a content
     /// coding rather than received as plaintext.
+    ///
+    /// `#[allow(dead_code)]`: claiming plugins now take the owned handle above
+    /// (which answers the same question by returning `None`), so the only
+    /// remaining callers are external tests, and a `pub` item reachable solely
+    /// from `tests/` is dead in the separately compiled binary unit.
+    #[allow(dead_code)]
     pub fn final_request_body_was_decoded(&self) -> bool {
         self.governed_request_body_plaintext.is_some()
     }

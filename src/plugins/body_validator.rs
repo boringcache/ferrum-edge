@@ -2908,9 +2908,11 @@ impl Plugin for BodyValidator {
         // Validate the PLAINTEXT the backend will parse. This is `body` itself
         // unless the shared gate decoded a content coding; a claimed
         // representation it could not decode never reaches this hook.
-        let decoded_view = ctx
-            .final_request_body_was_decoded()
-            .then(|| ctx.inspectable_final_request_body(body).to_vec());
+        // An `O(1)` `Bytes` clone sharing the gate's one charged allocation
+        // rather than a second uncharged copy of the decoded document; the owned
+        // handle exists only to escape the borrow of `ctx` that the memo take
+        // below needs.
+        let decoded_view = ctx.inspectable_final_request_body_owned();
         let body: &[u8] = decoded_view.as_deref().unwrap_or(body);
         let mut json_scan_memo = std::mem::take(&mut ctx.json_scan_memo);
         let result = self

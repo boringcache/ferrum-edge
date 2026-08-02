@@ -4686,10 +4686,57 @@ pub(crate) async fn run_final_request_body_hooks_with_provenance(
             FinalRequestBodyPosture, REQUEST_REPRESENTATION_REJECTED_METADATA_KEY,
             REQUEST_REPRESENTATION_UNINSPECTABLE_MESSAGE, evaluate_final_request_body_posture,
         };
-        match evaluate_final_request_body_posture(plugins, ctx, headers, body) {
+        match evaluate_final_request_body_posture(
+            plugins,
+            ctx,
+            headers,
+            body,
+            crate::proxy::response_buffer_budget::BudgetRef::request_decode(),
+        ) {
             FinalRequestBodyPosture::Inspectable => {}
             FinalRequestBodyPosture::Decoded(plaintext) => {
+                // The charge travels INSIDE `plaintext`, so staging it is a move
+                // of an owned permit. Every way this request can end from here —
+                // a later hook's rejection, a deadline, cancellation, a retry
+                // that clears and re-decodes, or ordinary completion — releases
+                // it by dropping the context or replacing the staged view.
                 ctx.stage_governed_request_body_plaintext(plaintext);
+            }
+            FinalRequestBodyPosture::CapacityRefused => {
+                // A GATEWAY-local transient-capacity terminal, not a client
+                // error and not a backend fault: the upload was well formed and
+                // no backend has been contacted. Forwarding the encoded body
+                // would still be the bypass this gate exists to close, so the
+                // request is refused rather than passed through.
+                //
+                // The reject travels the same shared funnel every dispatch
+                // ladder uses, so H1/H2 emit the fixed `503` JSON body while
+                // native gRPC, gRPC-Web, H3, and the H3 bridge turn it into
+                // their own terminal — carrying `RESOURCE_EXHAUSTED` rather than
+                // the `UNAVAILABLE` a bare `503` would otherwise map to, which
+                // would claim the backend is down.
+                use crate::proxy::response_buffer_budget as budget;
+                warn!("Governed request body decode refused: request-decode budget exhausted");
+                let mut reject_headers = HashMap::new();
+                if ctx.is_native_grpc_request()
+                    || crate::plugins::grpc_web::client_grpc_framing_representation(ctx).is_some()
+                {
+                    reject_headers.insert(
+                        "grpc-status".to_string(),
+                        budget::REQUEST_DECODE_OVERLOAD_GRPC_STATUS.to_string(),
+                    );
+                    reject_headers.insert(
+                        "grpc-message".to_string(),
+                        budget::REQUEST_DECODE_OVERLOAD_GRPC_MESSAGE.to_string(),
+                    );
+                }
+                return crate::plugins::RequestPluginDeadlineResult::Completed(
+                    PluginResult::Reject {
+                        status_code: budget::REQUEST_DECODE_OVERLOAD_STATUS,
+                        body: budget::REQUEST_DECODE_OVERLOAD_BODY.to_string(),
+                        headers: reject_headers,
+                    },
+                );
             }
             FinalRequestBodyPosture::Reject(rejection) => {
                 // Fixed-cardinality reason only: no coding token, no header

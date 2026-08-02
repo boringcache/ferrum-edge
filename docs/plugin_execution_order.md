@@ -494,10 +494,31 @@ configured rules would actually inspect the finalized representation.
   `malformed_content_coding`, `too_many_content_codings`,
   `undecodable_content_coding`) that never echoes a coding token or a body byte.
 
-Bounds: at most 4 stacked codings; at most the smaller of 10 MiB and any active
-route request-body ceiling per layer and in aggregate; at most 1024:1 expansion
-per layer and end-to-end. `gzip`, `x-gzip`, and `br` are supported; `identity`
-alone is a no-op and `identity` mixed with a transforming coding is malformed.
+Per-request bounds: at most 4 stacked codings; at most the smaller of 10 MiB and
+any active route request-body ceiling per layer and in aggregate; at most 1024:1
+expansion per layer and end-to-end. `gzip`, `x-gzip`, and `br` are supported;
+`identity` alone is a no-op and `identity` mixed with a transforming coding is
+malformed. `br` is decoded strictly: Large Window Brotli is refused, because
+RFC 7932 caps the `br` window at 24 bits and an LWB stream would ask for a
+decoder working set (up to a 1 GiB ring buffer) for a coding no client
+negotiated.
+
+Aggregate bound across concurrent requests: a per-request ceiling still
+multiplies by concurrency, so the complete decode working set is reserved
+**before** it is allocated against a process-wide budget
+(`FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES`) — the output buffer's capacity, the
+window in which a stacked chain holds one pass's input and the next pass's
+output at once, and a conservative ceiling on the active decoder's own heap
+(256 KiB for `gzip`, 24 MiB for `br`), the last of which is reserved before the
+decoder is *constructed* because it is allocated from the stream header before
+any output exists. The charge travels with the staged plaintext and is released
+when the last handle drops, which covers completion, a later hook's rejection, a
+gRPC deadline, client disconnect, cancellation, and a retry that re-finalizes
+the body. A request the budget cannot admit is refused with the gateway-local
+capacity terminal (`503` with a fixed body; native gRPC and gRPC-Web get
+`RESOURCE_EXHAUSTED`) rather than a `400`: the upload was well formed and no
+backend was contacted. The encoded body is still never forwarded, because
+forwarding it is the bypass this gate closes.
 
 The decoded bytes are an **inspection view only** — the backend still receives
 the exact octets and headers the client sent, so `Content-Length`,

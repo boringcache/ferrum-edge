@@ -9,7 +9,14 @@ use std::io::Write;
 use std::sync::Arc;
 
 use ferrum_edge::_test_support::{
-    FinalRequestRepresentationOutcome, evaluate_final_request_representation,
+    FinalRequestRepresentationOutcome, MAX_DECODED_REQUEST_INSPECTION_BYTES,
+    REQUEST_DECODE_OVERLOAD_BODY, REQUEST_DECODE_OVERLOAD_GRPC_MESSAGE,
+    REQUEST_DECODE_OVERLOAD_GRPC_STATUS, REQUEST_DECODE_OVERLOAD_STATUS,
+    REQUEST_DECODE_WORST_CASE_PEAK_BYTES, RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT,
+    RESPONSE_DECODE_BROTLI_SCRATCH_BYTES, RESPONSE_DECODE_GZIP_SCRATCH_BYTES,
+    ResponseBufferBudgetProbe, charged_request_plaintext_in, clear_final_request_body_plaintext,
+    evaluate_final_request_representation, evaluate_final_request_representation_in,
+    projected_decode_output_capacity_for_test,
 };
 use ferrum_edge::plugins::body_validator::BodyValidator;
 use ferrum_edge::plugins::waf::Waf;
@@ -399,4 +406,365 @@ async fn body_validator_validates_the_staged_plaintext() {
         matches!(result, PluginResult::Reject { .. }),
         "a missing required field in the decoded document must be rejected"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The aggregate request-decode budget (GHSA-3973-47g5-4mcx + GHSA-pwcm-6rh8-f2gh).
+//
+// A per-request ceiling bounds one decode; it does not bound the sum of the
+// decodes many concurrent clients can start at once. These tests drive the
+// PRODUCTION gate against an isolated semaphore — the same `Budget` type,
+// clamping, non-blocking admission, and charge attachment the process-global
+// budget uses — so they cannot pass against a parallel implementation of the
+// rules and they do not race the process-global budget under a parallel test
+// binary.
+// ---------------------------------------------------------------------------
+
+/// A probe budget of `total_blocks` reservation blocks, with a one-block
+/// per-item floor so the clamp does not dominate the total.
+fn probe(total_blocks: usize) -> ResponseBufferBudgetProbe {
+    ResponseBufferBudgetProbe::new(UNIT, total_blocks * UNIT)
+}
+
+fn blocks(bytes: usize) -> usize {
+    bytes.div_ceil(UNIT)
+}
+
+/// The output-buffer capacity one decode pass ends up holding for `decoded_len`
+/// bytes, computed with the PRODUCTION growth rule rather than a hardcoded block
+/// count, so a change to that rule fails with arithmetic rather than looking
+/// flaky.
+fn decode_capacity(decoded_len: usize) -> usize {
+    projected_decode_output_capacity_for_test(decoded_len, MAX_DECODED_REQUEST_INSPECTION_BYTES)
+}
+
+/// A JSON document large enough that its decode needs several growth steps, and
+/// compressible enough that the encoded form is trivially small.
+fn large_json_document() -> Vec<u8> {
+    let filler = "a".repeat(64 * 1024);
+    format!(r#"{{"note":"{filler}","approved":false}}"#).into_bytes()
+}
+
+/// Large Window Brotli asks a non-strict decoder for a ring buffer bounded by
+/// 1 GiB rather than 16 MiB, from six header bits, for a coding no client
+/// negotiated. RFC 7932 caps the `br` window at 24 bits, so the request gate
+/// must treat the LWB marker as a format error — and must reach that conclusion
+/// while the budget can comfortably afford an ordinary `br` decode, so a refusal
+/// here can only be the strict decoder and never a capacity accident.
+#[test]
+fn large_window_brotli_is_refused_by_the_request_gate() {
+    const LWB_MARKER_BODY: [u8; 8] = [0x11, 0x1e, 0, 0, 0, 0, 0, 0];
+    let plugins = vec![enforcing_waf()];
+    let ctx = ctx_with_json_post();
+    let budget = probe(blocks(RESPONSE_DECODE_BROTLI_SCRATCH_BYTES) + 8);
+    let total = budget.available_bytes();
+
+    let outcome = evaluate_final_request_representation_in(
+        &budget,
+        &plugins,
+        &ctx,
+        &headers(Some("br")),
+        &LWB_MARKER_BODY,
+    );
+
+    assert_eq!(
+        outcome,
+        FinalRequestRepresentationOutcome::Rejected("undecodable_content_coding"),
+        "the LWB window extension must be a representation error, not a \
+         capacity refusal and certainly not an admitted decode"
+    );
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "every permit the refused decode took is released"
+    );
+}
+
+/// The `br` decoder allocates its ring buffer from the stream header on the
+/// FIRST read, before any output byte exists. A budget that cannot cover that
+/// working set must refuse BEFORE the decoder is constructed, which is only
+/// observable as: nothing decoded, nothing charged.
+#[test]
+fn a_budget_that_cannot_cover_the_brotli_scratch_refuses_before_construction() {
+    let plugins = vec![enforcing_waf()];
+    let ctx = ctx_with_json_post();
+    // One block short of the codec working set, so the scratch reservation is
+    // the thing that cannot be satisfied.
+    let budget = probe(blocks(RESPONSE_DECODE_BROTLI_SCRATCH_BYTES) - 1);
+    let total = budget.available_bytes();
+
+    let outcome = evaluate_final_request_representation_in(
+        &budget,
+        &plugins,
+        &ctx,
+        &headers(Some("br")),
+        &brotli(BLOCKED_JSON.as_bytes()),
+    );
+
+    assert_eq!(
+        outcome,
+        FinalRequestRepresentationOutcome::CapacityRefused,
+        "a decoder heap the aggregate budget cannot admit is a GATEWAY capacity \
+         refusal, not a malformed client representation"
+    );
+    assert_eq!(budget.available_bytes(), total);
+}
+
+/// Past the decoder, the OUTPUT allocation is charged before each growth too, so
+/// a budget that affords the codec scratch but not the plaintext still refuses
+/// instead of allocating and being rejected afterwards.
+#[test]
+fn a_budget_that_cannot_cover_the_output_refuses_before_the_allocation() {
+    let plugins = vec![enforcing_waf()];
+    let ctx = ctx_with_json_post();
+    let document = large_json_document();
+    // Room for the gzip working set plus exactly one output block: enough to
+    // construct the decoder and take the first growth, never enough for the
+    // document.
+    let budget = probe(blocks(RESPONSE_DECODE_GZIP_SCRATCH_BYTES) + 1);
+    let total = budget.available_bytes();
+    assert!(
+        decode_capacity(document.len()) > UNIT,
+        "the document must need more than the one output block the budget affords"
+    );
+
+    let outcome = evaluate_final_request_representation_in(
+        &budget,
+        &plugins,
+        &ctx,
+        &headers(Some("gzip")),
+        &gzip(&document),
+    );
+
+    assert_eq!(outcome, FinalRequestRepresentationOutcome::CapacityRefused);
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "the partially grown buffer and its permits are dropped together"
+    );
+}
+
+/// The charge is not a decode-local. It has to be alive for exactly as long as
+/// the staged inspection view can be read by a final request-body hook, and it
+/// has to come back by DROP rather than by anyone remembering to release it.
+#[test]
+fn the_reservation_is_held_for_as_long_as_the_plaintext_is_readable() {
+    let plugins = vec![enforcing_waf()];
+    let ctx = ctx_with_json_post();
+    let budget = probe(blocks(RESPONSE_DECODE_GZIP_SCRATCH_BYTES) + 64);
+    let total = budget.available_bytes();
+
+    let plaintext = charged_request_plaintext_in(
+        &budget,
+        &plugins,
+        &ctx,
+        &headers(Some("gzip")),
+        &gzip(BLOCKED_JSON.as_bytes()),
+    )
+    .expect("a well-formed governed gzip body decodes");
+    assert_eq!(plaintext.as_bytes(), BLOCKED_JSON.as_bytes());
+
+    // The decode has returned. Had the charge been a decode-local, the budget
+    // would be fully available here while the plaintext stays resident — which
+    // is exactly how concurrent decodes escape an aggregate cap.
+    let held_after_decode = total - budget.available_bytes();
+    assert!(
+        held_after_decode > 0,
+        "the staged plaintext must still be charged after the decode returns"
+    );
+    assert!(
+        held_after_decode <= blocks(decode_capacity(BLOCKED_JSON.len())) * UNIT,
+        "the transient decode peak must be narrowed back to the surviving \
+         allocation, not held for the whole request"
+    );
+
+    // Staging transfers the same charge onto the context; it does not mint a
+    // second one, and it does not release the first.
+    let mut ctx = ctx_with_json_post();
+    plaintext.stage_on(&mut ctx);
+    assert_eq!(
+        total - budget.available_bytes(),
+        held_after_decode,
+        "staging moves the charge rather than duplicating or dropping it"
+    );
+
+    // A `RequestContext` clone shares the one owner. A `Vec` field would have
+    // duplicated an attacker-amplified allocation with no second permit.
+    let cloned = ctx.clone();
+    assert_eq!(
+        total - budget.available_bytes(),
+        held_after_decode,
+        "a context clone shares the charged allocation instead of copying it"
+    );
+    drop(cloned);
+
+    // This is what the gate does at the start of every final-request-body hook
+    // run, which is how a retry or second finalization releases the previous
+    // decode.
+    clear_final_request_body_plaintext(&mut ctx);
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "re-finalization must return the previous decode's charge in full"
+    );
+}
+
+/// A representation rejection is not a partial charge. Everything the failed
+/// decode took goes back, so a client that floods malformed codings cannot
+/// exhaust the budget for everyone else.
+#[test]
+fn a_rejected_representation_charges_nothing() {
+    let plugins = vec![enforcing_waf()];
+    let ctx = ctx_with_json_post();
+    let budget = probe(blocks(RESPONSE_DECODE_GZIP_SCRATCH_BYTES) + 64);
+    let total = budget.available_bytes();
+
+    let mut encoded = gzip(&large_json_document());
+    encoded.truncate(encoded.len() / 2);
+    let outcome = evaluate_final_request_representation_in(
+        &budget,
+        &plugins,
+        &ctx,
+        &headers(Some("gzip")),
+        &encoded,
+    );
+
+    assert_eq!(
+        outcome,
+        FinalRequestRepresentationOutcome::Rejected("undecodable_content_coding")
+    );
+    assert_eq!(budget.available_bytes(), total);
+}
+
+/// A stacked `Content-Encoding` holds one pass's input and the next pass's
+/// output at the SAME time, so the budget has to see the peak rather than the
+/// larger of the two. The pair of assertions below is what makes that concrete:
+/// a budget sized for the peak admits the decode, and a budget one block short
+/// of it refuses — even though it is comfortably larger than the surviving
+/// plaintext, which is all a non-concurrent accounting would have charged.
+#[test]
+fn a_stacked_decode_is_charged_at_its_concurrent_peak() {
+    let plugins = vec![enforcing_waf()];
+    let ctx = ctx_with_json_post();
+    let document = large_json_document();
+    let inner = gzip(&document);
+    let wire = gzip(&inner);
+
+    // Pass 1 decodes the wire bytes to `inner`; pass 2 decodes `inner` to the
+    // document while `inner`'s buffer is still resident. Only one decoder is
+    // active at a time, so exactly one gzip scratch reservation overlaps.
+    let peak_reservation = decode_capacity(inner.len()) + decode_capacity(document.len());
+    let peak_blocks = blocks(peak_reservation) + blocks(RESPONSE_DECODE_GZIP_SCRATCH_BYTES);
+    assert!(
+        blocks(decode_capacity(document.len())) < blocks(peak_reservation),
+        "the intermediate buffer must be a real part of the peak, or this test \
+         proves nothing about concurrency"
+    );
+
+    let short = probe(peak_blocks - 1);
+    assert_eq!(
+        evaluate_final_request_representation_in(
+            &short,
+            &plugins,
+            &ctx,
+            &headers(Some("gzip, gzip")),
+            &wire,
+        ),
+        FinalRequestRepresentationOutcome::CapacityRefused,
+        "a budget short of the CONCURRENT peak must refuse, even though it \
+         exceeds the surviving plaintext's own allocation"
+    );
+    assert_eq!(short.available_bytes(), peak_blocks.saturating_sub(1) * UNIT);
+
+    let exact = probe(peak_blocks);
+    let total = exact.available_bytes();
+    let plaintext =
+        charged_request_plaintext_in(&exact, &plugins, &ctx, &headers(Some("gzip, gzip")), &wire)
+            .expect("a budget sized for the peak admits the stacked decode");
+    assert_eq!(plaintext.as_bytes(), document.as_slice());
+    assert_eq!(
+        total - exact.available_bytes(),
+        blocks(decode_capacity(document.len())) * UNIT,
+        "once the intermediate buffer is gone the peak is narrowed back to the \
+         surviving allocation"
+    );
+    drop(plaintext);
+    assert_eq!(exact.available_bytes(), total);
+}
+
+/// The budget is floored at one worst-case governed request — `br` scratch plus
+/// two decode ceilings — so no configuration can leave the gateway unable to run
+/// a single governed decode at all.
+#[test]
+fn the_request_decode_budget_floor_admits_one_worst_case_request() {
+    assert_eq!(
+        REQUEST_DECODE_WORST_CASE_PEAK_BYTES,
+        RESPONSE_DECODE_BROTLI_SCRATCH_BYTES + 2 * MAX_DECODED_REQUEST_INSPECTION_BYTES,
+        "the floor must cover the active decoder's heap plus the stacked-pass \
+         input and output that are resident beside it"
+    );
+}
+
+/// The refusal is a GATEWAY-local capacity terminal, and it has to stay
+/// redaction-safe and protocol-correct through the shared final-request funnel:
+/// a fixed body naming no route, header, coding, or body byte; `503` rather than
+/// a `400` blaming a valid upload; and `RESOURCE_EXHAUSTED` rather than the
+/// `UNAVAILABLE` a bare `503` would otherwise map to, which would claim the
+/// backend is down.
+#[test]
+fn the_capacity_terminal_is_fixed_redaction_safe_and_protocol_correct() {
+    assert_eq!(REQUEST_DECODE_OVERLOAD_STATUS, 503);
+    assert_eq!(REQUEST_DECODE_OVERLOAD_GRPC_STATUS, 8); // RESOURCE_EXHAUSTED
+    assert_eq!(
+        REQUEST_DECODE_OVERLOAD_BODY,
+        r#"{"error":"Request inspection capacity exceeded"}"#
+    );
+    assert_eq!(
+        REQUEST_DECODE_OVERLOAD_GRPC_MESSAGE,
+        "Request inspection capacity exceeded"
+    );
+
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert!(
+        proxy.contains("FinalRequestBodyPosture::CapacityRefused => {"),
+        "the shared final-request funnel — the one every dispatch ladder uses — \
+         must handle the capacity posture itself, so H1/H2, native gRPC, \
+         gRPC-Web, H3, and the H3 bridge cannot disagree about it"
+    );
+    assert!(
+        proxy.contains("status_code: budget::REQUEST_DECODE_OVERLOAD_STATUS,")
+            && proxy.contains("body: budget::REQUEST_DECODE_OVERLOAD_BODY.to_string(),"),
+        "the terminal must be the fixed gateway-local one"
+    );
+    assert!(
+        proxy.contains("budget::REQUEST_DECODE_OVERLOAD_GRPC_STATUS.to_string(),")
+            && proxy.contains("client_grpc_framing_representation(ctx).is_some()"),
+        "native gRPC and gRPC-Web clients must receive RESOURCE_EXHAUSTED, and \
+         only they — a plain HTTP 503 must not carry gRPC trailer fields"
+    );
+}
+
+/// The staged plaintext is decoded client body content. It must never be copied
+/// into `metadata` (which is what a transaction log serializes) and no plugin
+/// may fabricate or clear it.
+#[test]
+fn the_staged_plaintext_never_reaches_metadata_or_transaction_output() {
+    let plugins = include_str!("../../../src/plugins/mod.rs");
+    assert!(
+        plugins.contains("governed_request_body_plaintext: Option<bytes::Bytes>,"),
+        "the staged view must be typed and outside `metadata`, and must own its \
+         budget charge so a context clone shares it rather than duplicating an \
+         attacker-amplified allocation"
+    );
+    for claimant in [
+        include_str!("../../../src/plugins/waf/mod.rs"),
+        include_str!("../../../src/plugins/body_validator.rs"),
+        include_str!("../../../src/plugins/graphql.rs"),
+    ] {
+        assert!(
+            !claimant.contains("inspectable_final_request_body(body).to_vec()"),
+            "a claiming hook must take the O(1) owned handle rather than copying \
+             the charged plaintext into a second, uncharged allocation"
+        );
+    }
 }

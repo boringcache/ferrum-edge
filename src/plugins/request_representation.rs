@@ -33,8 +33,14 @@
 //!   ordered `#content-coding` list is parsed, each supported coding is
 //!   boundedly decoded in reverse application order, and anything that cannot be
 //!   reduced to one complete plaintext document — an unsupported coding, a
-//!   malformed or truncated stream, too many stacked layers, an over-limit or
-//!   over-amplified decode — is **rejected** with a fixed `400`, never forwarded.
+//!   malformed or truncated stream, Large Window Brotli, too many stacked
+//!   layers, an over-limit or over-amplified decode — is **rejected** with a
+//!   fixed `400`, never forwarded.
+//! * If a policy claims it and the gateway's own aggregate decode budget cannot
+//!   admit the working set, the request is refused with the gateway-local
+//!   capacity terminal (`503` / gRPC `RESOURCE_EXHAUSTED`) rather than a `400`.
+//!   The client did nothing wrong, but forwarding the encoded body would still
+//!   be the bypass, so this is a refusal and never a pass-through.
 //!
 //! # What is and is not rewritten
 //!
@@ -55,7 +61,9 @@
 //! # Bounds
 //!
 //! Decoding attacker-supplied compressed input is an amplification vector, so
-//! every decode is bounded three ways before a single inspection byte exists:
+//! every decode is bounded four ways before a single inspection byte exists.
+//!
+//! Three of them are PER REQUEST:
 //!
 //! * at most [`MAX_STACKED_REQUEST_CODINGS`] coding layers;
 //! * at most [`decoded_inspection_limit`] bytes per layer and in aggregate —
@@ -65,18 +73,51 @@
 //! * at most [`MAX_REQUEST_DECODE_AMPLIFICATION_RATIO`]:1 expansion, per layer
 //!   and end-to-end.
 //!
-//! All three are enforced inside the shared
-//! [`crate::plugins::utils::content_encoding`] decoder, which is the same parser
-//! and the same codec-strictness `compression`, `openapi_validator`, and
-//! `ai_token_metrics` already use — so one request cannot be inspectable to one
-//! plugin and opaque to another.
+//! The fourth is ACROSS CONCURRENT REQUESTS, and it is the one a per-request
+//! ceiling cannot express (`GHSA-pwcm-6rh8-f2gh`). The complete working set of a
+//! governed decode is charged against a process-wide aggregate budget
+//! ([`crate::proxy::response_buffer_budget`], `FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES`)
+//! BEFORE any of it is allocated:
+//!
+//! * the decoded output buffer's CAPACITY, reserved before each growth and
+//!   topped up to whatever the allocator actually returned;
+//! * on a stacked `Content-Encoding`, the previous pass's buffer concurrently
+//!   with the next pass's output, because both are resident at once;
+//! * a conservative ceiling on the ACTIVE decoder's own heap, reserved before
+//!   that decoder is CONSTRUCTED — a `br` decoder allocates its ring buffer from
+//!   the stream header before it emits a single byte, so a charge taken
+//!   afterwards would be a charge taken after the allocation.
+//!
+//! When the aggregate budget cannot admit that, the answer is the GATEWAY's own
+//! transient-capacity terminal ([`FinalRequestBodyPosture::CapacityRefused`]),
+//! not a `400`: the client's upload was well formed and the backend is
+//! uninvolved.
+//!
+//! The codec strictness and the charge ordering are not reimplemented here. Both
+//! come from [`crate::plugins::charged_decode`], the module the already-reviewed
+//! response gate uses, so a `br` request body is decoded by the same
+//! Large-Window-refusing [`crate::plugins::charged_decode::StrictBrotliReader`]
+//! that bounds a `br` response body. The permissive generic decoder in
+//! [`crate::plugins::utils::content_encoding`] — which builds `BrotliState::new`
+//! with `large_window = true`, i.e. admits a decoder working set up to 1 GiB for
+//! a coding no client negotiated — is deliberately NOT reachable from this
+//! security gate.
+//!
+//! The coding-list GRAMMAR is still the shared one: [`classify_codings`] mirrors
+//! [`crate::plugins::utils::content_encoding::parse_content_codings`] exactly, so
+//! one request cannot be inspectable to one plugin and opaque to another.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use super::Plugin;
 use super::RequestContext;
-use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
+use super::charged_decode::{ChargedDecodeError, decode_one_coding};
+use crate::proxy::response_buffer_budget::{
+    BudgetRef, ResponseBufferReservation, charged_bytes, prospective_retained_len,
+};
 
 /// Hard ceiling on the plaintext produced for one governed request body.
 ///
@@ -161,10 +202,27 @@ pub(crate) enum FinalRequestBodyPosture {
     Inspectable,
     /// A policy claims these bytes and the complete ordered coding chain was
     /// decoded. The caller stages this plaintext as the inspection view.
-    Decoded(Vec<u8>),
+    ///
+    /// The [`Bytes`] OWNS the aggregate-budget charge that paid for it, so
+    /// staging it is a move rather than a second acquisition and every disposal
+    /// path — success, a later hook's rejection, deadline, cancellation, a retry
+    /// that re-finalizes, a caller that simply drops the posture — releases it
+    /// by drop.
+    Decoded(Bytes),
     /// A policy claims these bytes and they cannot be reduced to plaintext.
     /// The caller must reject; forwarding the encoded body is the bypass.
     Reject(RequestRepresentationRejection),
+    /// A policy claims these bytes, but the aggregate request-decode budget
+    /// could not admit the working set needed to decode them.
+    ///
+    /// Distinct from [`Self::Reject`] on purpose: nothing is wrong with the
+    /// client's upload and no backend was involved, so the caller must install
+    /// the GATEWAY-LOCAL transient-capacity terminal
+    /// ([`crate::proxy::response_buffer_budget::REQUEST_DECODE_OVERLOAD_STATUS`]
+    /// / `RESOURCE_EXHAUSTED`) rather than a `400` that would blame the client
+    /// for the gateway's own budget. Forwarding the encoded body is still the
+    /// bypass, so this never falls through to the backend.
+    CapacityRefused,
 }
 
 /// Fixed client-visible message for a rejected governed request representation.
@@ -272,16 +330,181 @@ fn classify_codings(encoding: &str) -> Result<(), RequestRepresentationRejection
     Ok(())
 }
 
+/// Why a charged request decode did not produce a staged plaintext view.
+///
+/// Split from [`RequestRepresentationRejection`] because the two have different
+/// client-visible terminals: a rejection is a statement about the client's
+/// REPRESENTATION (`400`, fixed message), while a capacity refusal is a
+/// statement about the GATEWAY (`503` / gRPC `RESOURCE_EXHAUSTED`). Collapsing
+/// them would tell a client its valid upload was malformed.
+enum RequestDecodeFailure {
+    Rejected(RequestRepresentationRejection),
+    CapacityRefused,
+}
+
+impl From<ChargedDecodeError> for RequestDecodeFailure {
+    fn from(error: ChargedDecodeError) -> Self {
+        match error {
+            // The grammar was already classified before any decode ran, so an
+            // unsupported token cannot reach the decoder; if it somehow did, the
+            // shared gate's answer is the same fail-closed refusal.
+            ChargedDecodeError::Unsupported => {
+                Self::Rejected(RequestRepresentationRejection::UnsupportedCoding)
+            }
+            // One reason for every byte-level failure — truncated, corrupt,
+            // Large Window Brotli, trailing data, over the ceiling — because the
+            // reason string is client- and log-visible and must stay
+            // low-cardinality and free of any coding token or body byte.
+            ChargedDecodeError::Malformed | ChargedDecodeError::TooLarge => {
+                Self::Rejected(RequestRepresentationRejection::UndecodableCoding)
+            }
+            ChargedDecodeError::CapacityRefused => Self::CapacityRefused,
+        }
+    }
+}
+
+/// Whether `decoded_len` is within `ratio`:1 of `raw_len`.
+///
+/// Mirrors [`crate::plugins::utils::content_encoding`]'s amplification rule
+/// exactly, including its two deliberate exemptions: a zero ratio disables the
+/// check, and a zero-length input has no meaningful ratio (the absolute ceiling
+/// still applies to both). An overflowing product means the absolute ceiling is
+/// the binding bound, so the ratio abstains rather than wrapping into a smaller
+/// one.
+fn amplification_is_within_bounds(raw_len: usize, decoded_len: usize, ratio: u32) -> bool {
+    if ratio == 0 || raw_len == 0 {
+        return true;
+    }
+    match raw_len.checked_mul(ratio as usize) {
+        Some(limit) => decoded_len <= limit,
+        None => true,
+    }
+}
+
+/// Decode a governed request's complete ordered coding chain into a charged
+/// plaintext view.
+///
+/// `Content-Encoding` lists codings in the order they were applied, so they are
+/// undone in reverse. [`classify_codings`] has already proven the list is a
+/// well-formed, supported, non-`identity`-mixed list of at most
+/// [`MAX_STACKED_REQUEST_CODINGS`] members, so this function's job is the bounded
+/// arithmetic and the budget:
+///
+/// * `limit` bounds every intermediate pass, not just the final output, so a
+///   stacked chain cannot exceed the ceiling partway through;
+/// * the SUM of every layer's output is bounded by the same `limit`, which is
+///   what the previous generic decoder expressed as `max_cumulative_bytes`;
+/// * each layer, and the end-to-end result, is bounded by
+///   [`MAX_REQUEST_DECODE_AMPLIFICATION_RATIO`]:1 against its input;
+/// * one growing `reservation` covers the PEAK across passes — a reservation
+///   only grows, and the previous pass's still-resident buffer is passed as the
+///   concurrent charge — and is narrowed to the surviving allocation when the
+///   plaintext is published.
+///
+/// The wire bytes are never copied: the first pass decodes straight out of
+/// `body`, whose allocation the request-body collector already bounded.
+fn decode_governed_request_body(
+    encoding: &str,
+    body: &[u8],
+    limit: usize,
+    budget: BudgetRef<'_>,
+) -> Result<Bytes, RequestDecodeFailure> {
+    let codings: Vec<String> = encoding
+        .split(',')
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| token.as_str() != "identity")
+        .collect();
+    if codings.is_empty() {
+        // `classify_codings` admits an identity-only list only when the caller
+        // already decided a decode was owed, and `requires_decode_judgment`
+        // excludes that case. Reaching here would mean the two disagreed, so the
+        // fail-closed answer is a refusal rather than an unproven pass-through.
+        return Err(RequestDecodeFailure::Rejected(
+            RequestRepresentationRejection::UndecodableCoding,
+        ));
+    }
+
+    let mut reservation = ResponseBufferReservation::new();
+    let mut current: Option<Vec<u8>> = None;
+    let mut cumulative = 0usize;
+    for coding in codings.iter().rev() {
+        // The previous pass's buffer is this pass's input and stays resident for
+        // the whole of it, so it is charged concurrently with this pass's
+        // output.
+        let (input, concurrent) = match current.as_ref() {
+            Some(previous) => (previous.as_slice(), previous.capacity()),
+            None => (body, 0),
+        };
+        let input_len = input.len();
+        let decoded =
+            decode_one_coding(coding, input, limit, concurrent, &mut reservation, budget)?;
+        if !amplification_is_within_bounds(
+            input_len,
+            decoded.len(),
+            MAX_REQUEST_DECODE_AMPLIFICATION_RATIO,
+        ) {
+            return Err(RequestDecodeFailure::Rejected(
+                RequestRepresentationRejection::UndecodableCoding,
+            ));
+        }
+        cumulative = prospective_retained_len(cumulative, decoded.len());
+        if cumulative > limit {
+            return Err(RequestDecodeFailure::Rejected(
+                RequestRepresentationRejection::UndecodableCoding,
+            ));
+        }
+        current = Some(decoded);
+    }
+
+    let Some(plaintext) = current else {
+        // Unreachable: the list is non-empty and every pass assigns.
+        return Err(RequestDecodeFailure::Rejected(
+            RequestRepresentationRejection::UndecodableCoding,
+        ));
+    };
+    // End-to-end amplification against the ORIGINAL coded body, which a
+    // per-layer check alone does not bound for a stacked chain.
+    if !amplification_is_within_bounds(
+        body.len(),
+        plaintext.len(),
+        MAX_REQUEST_DECODE_AMPLIFICATION_RATIO,
+    ) {
+        return Err(RequestDecodeFailure::Rejected(
+            RequestRepresentationRejection::UndecodableCoding,
+        ));
+    }
+    // Fit the peak reservation to the surviving allocation's ACTUAL capacity
+    // before it leaves this function. The loop already topped up after every
+    // allocation, so this only ever confirms; keeping it a real reservation
+    // (which can refuse) rather than an assertion means the invariant fails
+    // closed instead of staging bytes the budget does not bound.
+    if !reservation.reserve_in(budget, plaintext.capacity()) {
+        return Err(RequestDecodeFailure::CapacityRefused);
+    }
+    // Moves the buffer and the permit into one owner, so the charge lives
+    // exactly as long as any handle to the plaintext does. `None` means the held
+    // charge does not cover the real capacity, which the top-ups above exclude —
+    // but it is checked, because the alternative is staging bytes the budget
+    // does not bound.
+    charged_bytes(plaintext, reservation).ok_or(RequestDecodeFailure::CapacityRefused)
+}
+
 /// Evaluate the shared request representation gate for one finalized body.
 ///
 /// Called from [`crate::proxy::run_final_request_body_hooks_with_provenance`],
 /// the single funnel every dispatch ladder uses, so a frontend protocol cannot
 /// reach a different conclusion about the same bytes and the same configuration.
+///
+/// `budget` is the aggregate request-decode budget the decode charges against.
+/// Production passes [`BudgetRef::request_decode`]; it is a parameter only so
+/// external tests can bind an isolated semaphore rather than mutating the
+/// process-global one from a parallel test binary.
 pub(crate) fn evaluate_final_request_body_posture(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
     headers: &HashMap<String, String>,
     body: &[u8],
+    budget: BudgetRef<'_>,
 ) -> FinalRequestBodyPosture {
     let Some(encoding) = headers
         .get("content-encoding")
@@ -312,26 +535,17 @@ pub(crate) fn evaluate_final_request_body_posture(
     }
 
     let limit = decoded_inspection_limit(ctx);
-    let limits = DecodeLimits {
-        max_decoded_bytes: limit,
-        max_cumulative_bytes: limit,
-        max_codings: MAX_STACKED_REQUEST_CODINGS,
-        max_amplification_ratio: MAX_REQUEST_DECODE_AMPLIFICATION_RATIO,
-    };
-    match decode_content_encoding(Some(encoding), body, limits) {
-        // `classify_codings` already proved this list names a transforming
-        // coding, so a borrowed result would mean the decoder disagreed about
-        // the grammar. Treat that as uninspectable rather than assuming the
-        // wire bytes are plaintext.
-        Ok(std::borrow::Cow::Borrowed(_)) => {
-            FinalRequestBodyPosture::Reject(RequestRepresentationRejection::UndecodableCoding)
+    match decode_governed_request_body(encoding, body, limit, budget) {
+        Ok(plaintext) => FinalRequestBodyPosture::Decoded(plaintext),
+        // The failure carries no coding token, header value, or body byte — the
+        // reason the caller records is one of the four fixed classifications
+        // above.
+        Err(RequestDecodeFailure::Rejected(rejection)) => {
+            FinalRequestBodyPosture::Reject(rejection)
         }
-        Ok(std::borrow::Cow::Owned(plaintext)) => FinalRequestBodyPosture::Decoded(plaintext),
-        // The decoder's message can echo a hostile coding token, so it is
-        // deliberately dropped here: the reason the caller records comes from
-        // the fixed classification above.
-        Err(_) => {
-            FinalRequestBodyPosture::Reject(RequestRepresentationRejection::UndecodableCoding)
-        }
+        // Every block the refused decode had already taken is released with the
+        // reservation dropped on the way out, so a refusal costs the budget
+        // nothing.
+        Err(RequestDecodeFailure::CapacityRefused) => FinalRequestBodyPosture::CapacityRefused,
     }
 }

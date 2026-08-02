@@ -3244,6 +3244,7 @@ impl EnvConfig {
             max_response_body_size_bytes: usize = "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES" => 10_485_760usize;
             response_buffer_fallback_max_bytes: usize = "FERRUM_RESPONSE_BUFFER_FALLBACK_MAX_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_RESPONSE_FALLBACK_BYTES;
             response_buffer_max_total_bytes: usize = "FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_RESPONSE_BUFFER_TOTAL_BYTES;
+            request_decode_max_total_bytes: usize = "FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_REQUEST_DECODE_TOTAL_BYTES;
             response_buffer_cutoff_bytes: usize = "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES" => 65_536usize;
             h2_coalesce_target_bytes: usize = "FERRUM_H2_COALESCE_TARGET_BYTES" => 131_072usize, clamp(16_384usize, 1_048_576usize);
             max_url_length_bytes: usize = "FERRUM_MAX_URL_LENGTH_BYTES" => 8_192usize;

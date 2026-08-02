@@ -1574,8 +1574,16 @@ impl Plugin for GraphqlPlugin {
         // itself unless the shared request representation gate decoded a content
         // coding, and a claimed representation it could not decode never reaches
         // this hook (`GHSA-3973-47g5-4mcx`).
-        let envelope = ctx.inspectable_final_request_body(body).to_vec();
-        if graphql_envelope_digest(&envelope) == previous {
+        //
+        // The owned handle is an `O(1)` `Bytes` clone sharing the gate's one
+        // charged allocation — it exists to escape the borrow of `ctx` that
+        // `enforce_graphql_envelope` needs, not to copy the document. When
+        // nothing was decoded there is no handle at all and the wire slice is
+        // used directly, so an ordinary identity-coded request allocates nothing
+        // here.
+        let decoded_view = ctx.inspectable_final_request_body_owned();
+        let envelope: &[u8] = decoded_view.as_deref().unwrap_or(body);
+        if graphql_envelope_digest(envelope) == previous {
             return PluginResult::Continue;
         }
 
@@ -1599,8 +1607,8 @@ impl Plugin for GraphqlPlugin {
             );
         }
         ctx.graphql_request_envelope_hashes
-            .insert(self.instance_id, graphql_envelope_digest(&envelope));
-        self.enforce_graphql_envelope(ctx, &envelope).await
+            .insert(self.instance_id, graphql_envelope_digest(envelope));
+        self.enforce_graphql_envelope(ctx, envelope).await
     }
 
     fn needs_final_request_body_context(&self) -> bool {

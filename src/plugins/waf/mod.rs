@@ -1415,12 +1415,12 @@ impl Plugin for Waf {
         // octets. `inspectable_final_request_body` returns `body` itself unless
         // the gate decoded a content coding, and the gate rejected the request
         // outright if it could not — so reaching here always means these bytes
-        // are the document the policy is configured about. The copy is taken
-        // only on the decoded path (`clamp_body` needs `&mut ctx`, which cannot
-        // coexist with a borrow of the staged view).
-        let decoded_view = ctx
-            .final_request_body_was_decoded()
-            .then(|| ctx.inspectable_final_request_body(body).to_vec());
+        // are the document the policy is configured about. An OWNED handle is
+        // taken only on the decoded path (`clamp_body` needs `&mut ctx`, which
+        // cannot coexist with a borrow of the staged view); it is an `O(1)`
+        // `Bytes` clone sharing the gate's one charged allocation, not a second
+        // uncharged copy of an attacker-amplified body.
+        let decoded_view = ctx.inspectable_final_request_body_owned();
         let body: &[u8] = decoded_view.as_deref().unwrap_or(body);
         let (body, truncated) = match self.clamp_body(ctx, BodyDirection::Request, body) {
             Ok(value) => value,

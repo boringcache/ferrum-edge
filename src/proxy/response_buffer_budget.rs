@@ -292,6 +292,38 @@
 //! No lock is taken on the streaming hot path — a released response never
 //! constructs a reservation — and the state is one process-global semaphore, so
 //! there is no per-route or per-client cardinality.
+//!
+//! # The second budget: governed request decodes
+//!
+//! Everything above is about bytes the gateway retains on behalf of a
+//! RESPONSE. The request representation gate
+//! ([`crate::plugins::request_representation`], `GHSA-3973-47g5-4mcx`) decodes
+//! attacker-supplied `gzip`/`br` request bodies so a configured final
+//! request-body policy has a plaintext document to enforce over, and that decode
+//! has exactly the same shape of exposure: a few kilobytes on the wire can
+//! inflate to the per-request decode ceiling, the `br` decoder allocates a ring
+//! buffer chosen by the stream header before producing any output, and a
+//! per-request ceiling still multiplies by concurrency.
+//!
+//! So the same reservation, charge-before-allocate, and charge-travels-with-the-
+//! allocation machinery in this module is reused for it — the SAME [`Budget`],
+//! [`ResponseBufferReservation`], and [`charged_bytes`] code, differing only in
+//! which semaphore is charged. It is a SEPARATE semaphore
+//! (`FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES`, [`BudgetRef::request_decode`])
+//! rather than a share of the retained-response budget, because the two bound
+//! different allocations with different lifetimes and an operator tuning one
+//! must not silently starve the other — and because charging request bytes to a
+//! knob documented as a response bound would be a misleading operator contract.
+//!
+//! The request-side charge lifetime is the staged plaintext itself:
+//! [`crate::plugins::RequestContext::inspectable_final_request_body`] reads
+//! through a [`Bytes`] whose owner holds the permit, so success, rejection,
+//! deadline, cancellation, retry re-finalization, and every early return release
+//! it by drop, and a `RequestContext` clone shares the one charge instead of
+//! duplicating the allocation. Refusal is a GATEWAY-local capacity terminal
+//! ([`REQUEST_DECODE_OVERLOAD_STATUS`] /
+//! [`REQUEST_DECODE_OVERLOAD_GRPC_STATUS`]), never a `400` blaming a client
+//! whose upload was perfectly valid.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -311,6 +343,40 @@ pub(crate) const DEFAULT_BUFFERED_RESPONSE_FALLBACK_BYTES: usize = 10 * 1024 * 1
 
 /// Aggregate ceiling on bytes retained by concurrent buffered responses.
 pub(crate) const DEFAULT_RESPONSE_BUFFER_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+
+/// Aggregate ceiling on the working set concurrent governed REQUEST decodes
+/// hold at once (`FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES`).
+///
+/// A separate semaphore from the retained-response budget on purpose. The two
+/// bound different allocations with different lifetimes — a decoded request
+/// plaintext lives for the final request-body hook stage, a retained response
+/// body lives until the client has it — and an operator who tunes one should not
+/// silently starve the other. Charging request bytes to a knob whose name and
+/// documentation say "response" would also be exactly the misleading operator
+/// contract this budget exists to avoid.
+pub(crate) const DEFAULT_REQUEST_DECODE_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+
+/// Status returned when the aggregate request-decode budget cannot admit the
+/// working set a governed request's decode needs. `503` for the same reason the
+/// response refusal is `503`: the client's request is well formed and the
+/// backend is uninvolved, so this is transient GATEWAY capacity.
+pub(crate) const REQUEST_DECODE_OVERLOAD_STATUS: u16 = 503;
+
+/// gRPC status for the same refusal. `RESOURCE_EXHAUSTED` is the resource /
+/// capacity status; `UNAVAILABLE` would claim the backend is down and
+/// `INVALID_ARGUMENT` would blame the client's perfectly valid upload.
+pub(crate) const REQUEST_DECODE_OVERLOAD_GRPC_STATUS: u32 =
+    crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED;
+
+/// Client-visible body for a request-decode capacity refusal. Fixed bytes: it
+/// names no route, header, coding, credential, or body content.
+pub(crate) const REQUEST_DECODE_OVERLOAD_BODY: &str =
+    r#"{"error":"Request inspection capacity exceeded"}"#;
+
+/// Fixed `grpc-message` for the same refusal, redaction-safe for the same
+/// reason.
+pub(crate) const REQUEST_DECODE_OVERLOAD_GRPC_MESSAGE: &str =
+    "Request inspection capacity exceeded";
 
 /// Status returned when the aggregate budget cannot admit another buffered
 /// response. `503` (not `502`) because the backend behaved correctly and the
@@ -356,26 +422,45 @@ struct Budget {
 
 static BUDGET: OnceLock<Budget> = OnceLock::new();
 
+static REQUEST_DECODE_BUDGET: OnceLock<Budget> = OnceLock::new();
+
 /// Which aggregate budget one charge is taken against.
 ///
-/// Production always resolves to the process-global budget, so this costs a
-/// null check and nothing else. External tests bind an [`IsolatedBudget`]
-/// instead ([`IsolatedBudget::handle`]), which is what lets a parallel test
-/// binary observe admission and release deterministically without mutating the
-/// process-global semaphore under its neighbors.
+/// Production resolves to one of the two process-global budgets, so this costs a
+/// discriminant check and nothing else. External tests bind an
+/// [`IsolatedBudget`] instead ([`IsolatedBudget::handle`]), which is what lets a
+/// parallel test binary observe admission and release deterministically without
+/// mutating a process-global semaphore under its neighbors.
 #[derive(Clone, Copy)]
-pub(crate) struct BudgetRef<'a>(Option<&'a Budget>);
+enum BudgetTarget<'a> {
+    /// Bytes the gateway RETAINS on behalf of a buffered response.
+    RetainedResponse,
+    /// The working set a governed REQUEST decode holds while the final
+    /// request-body hooks inspect its plaintext.
+    RequestDecode,
+    /// A test-bound isolated semaphore.
+    Bound(&'a Budget),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BudgetRef<'a>(BudgetTarget<'a>);
 
 impl<'a> BudgetRef<'a> {
-    /// The process-global budget every production path charges.
+    /// The process-global retained-response budget.
     pub(crate) const fn global() -> Self {
-        Self(None)
+        Self(BudgetTarget::RetainedResponse)
+    }
+
+    /// The process-global request-decode budget.
+    pub(crate) const fn request_decode() -> Self {
+        Self(BudgetTarget::RequestDecode)
     }
 
     fn resolve(self) -> &'a Budget {
         match self.0 {
-            Some(budget) => budget,
-            None => budget(),
+            BudgetTarget::Bound(budget) => budget,
+            BudgetTarget::RetainedResponse => budget(),
+            BudgetTarget::RequestDecode => request_decode_budget(),
         }
     }
 }
@@ -387,6 +472,52 @@ fn budget() -> &'static Budget {
             DEFAULT_RESPONSE_BUFFER_TOTAL_BYTES,
         )
     })
+}
+
+/// The floor the request-decode budget is clamped to, and the reason it is not
+/// simply the per-request decode ceiling.
+///
+/// One governed decode's PEAK is not one ceiling. While a stacked
+/// `Content-Encoding` is being undone, three things are charged at once: the
+/// active decoder's own heap (up to
+/// [`crate::plugins::charged_decode::BROTLI_DECODER_SCRATCH_BYTES`]), the
+/// previous pass's still-resident buffer, and the current pass's output. So the
+/// floor is `br` scratch + two decode ceilings, which is what guarantees that a
+/// worst-case single governed request is always admissible on an otherwise idle
+/// gateway rather than being refused by a budget too small to ever run it.
+pub(crate) const REQUEST_DECODE_WORST_CASE_PEAK_BYTES: usize =
+    crate::plugins::charged_decode::BROTLI_DECODER_SCRATCH_BYTES
+        + 2 * crate::plugins::request_representation::MAX_DECODED_REQUEST_INSPECTION_BYTES;
+
+fn request_decode_budget() -> &'static Budget {
+    REQUEST_DECODE_BUDGET.get_or_init(|| {
+        Budget::new(
+            REQUEST_DECODE_WORST_CASE_PEAK_BYTES,
+            DEFAULT_REQUEST_DECODE_TOTAL_BYTES,
+        )
+    })
+}
+
+/// Publish the operator-configured request-decode bound. Called once during
+/// startup, before any listener accepts traffic, for the same reason and with
+/// the same restart-to-change semantics as [`init`].
+///
+/// `#[allow(dead_code)]`: the binary calls this from `main`, but the same
+/// module is separately compiled into the library crate where that binary-only
+/// call site is invisible.
+#[allow(dead_code)] // binary startup caller; dead in the separately compiled library unit
+pub(crate) fn init_request_decode(total_bytes: usize) {
+    if REQUEST_DECODE_BUDGET
+        .set(Budget::new(REQUEST_DECODE_WORST_CASE_PEAK_BYTES, total_bytes))
+        .is_err()
+    {
+        tracing::warn!(
+            requested_total_bytes = total_bytes,
+            "FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES startup configuration was ignored because the \
+             request-decode budget was already initialized; the earlier request-decode budget \
+             remains active"
+        );
+    }
 }
 
 impl Budget {
@@ -1304,7 +1435,7 @@ impl IsolatedBudget {
     /// drives the *same* admission code against an isolated semaphore.
     #[allow(dead_code)]
     pub(crate) fn handle(&self) -> BudgetRef<'_> {
-        BudgetRef(Some(&self.0))
+        BudgetRef(BudgetTarget::Bound(&self.0))
     }
 
     pub(crate) fn buffered_response_body_ceiling(&self, effective_limit: usize) -> usize {
