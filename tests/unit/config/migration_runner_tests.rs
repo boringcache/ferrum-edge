@@ -138,6 +138,61 @@ async fn test_run_pending_restores_route_lock_table_on_existing_v001_db() {
     .expect("restored proxy_route_locks must be writable");
 }
 
+/// Regression test for the audit_events compatibility pass.
+///
+/// `audit_events` was folded into the V001 baseline after databases could
+/// already have V001 recorded in `_ferrum_migrations`. The migration loop skips
+/// V001 once version 1 is tracked, so without an idempotent compatibility pass
+/// the table and its indexes would never be created on those databases.
+#[tokio::test]
+async fn test_run_pending_restores_audit_events_table_on_existing_v001_db() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+
+    runner.run_pending().await.unwrap();
+    assert!(table_exists(&pool, "audit_events").await);
+
+    sqlx::query("DROP TABLE audit_events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(!table_exists(&pool, "audit_events").await);
+
+    let applied = runner.run_pending().await.unwrap();
+    assert!(
+        applied.is_empty(),
+        "V001 is already tracked, so no migration should be newly applied"
+    );
+    assert!(
+        table_exists(&pool, "audit_events").await,
+        "run_pending must restore audit_events on an existing V001 database"
+    );
+
+    let index_names = get_index_names(&pool).await;
+    for index_name in [
+        "idx_audit_events_namespace_ts_id",
+        "idx_audit_events_actor",
+        "idx_audit_events_resource_type",
+    ] {
+        assert!(
+            index_names.iter().any(|n| n == index_name),
+            "compatibility pass must restore {index_name}"
+        );
+    }
+
+    sqlx::query(
+        "INSERT INTO audit_events \
+         (id, ts, actor, action, resource_type, resource_id, namespace, \
+          source_address, request_id, outcome, diff) \
+         VALUES ('event-1', '2026-01-01T00:00:00Z', 'admin', 'backup', \
+                 'backup', 'export', 'ferrum', '127.0.0.1', 'request-1', \
+                 'success', '{}')",
+    )
+    .execute(&pool)
+    .await
+    .expect("restored audit_events must be writable");
+}
+
 #[tokio::test]
 async fn test_run_pending_adds_audit_context_columns_on_existing_v001_db() {
     let pool = test_pool().await;

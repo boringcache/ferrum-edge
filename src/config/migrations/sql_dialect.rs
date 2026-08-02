@@ -139,7 +139,11 @@ impl V001SqlBuilder {
         sqlx::query(self.create_config_changes_sql())
             .execute(&mut *connection)
             .await?;
+        sqlx::query(self.create_audit_events_sql())
+            .execute(&mut *connection)
+            .await?;
         self.ensure_audit_event_context_columns(connection).await?;
+        self.create_audit_event_indexes(connection).await?;
         self.create_full_load_indexes(connection).await?;
         self.create_config_change_indexes(connection).await?;
         Ok(())
@@ -326,14 +330,12 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_proxies_api_spec_id ON proxies (api_spec_id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_api_spec_id ON plugin_configs (api_spec_id)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_api_spec_id ON upstreams (api_spec_id)",
-            "CREATE INDEX IF NOT EXISTS idx_audit_events_namespace_ts_id ON audit_events (namespace, ts, id)",
-            "CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events (actor)",
-            "CREATE INDEX IF NOT EXISTS idx_audit_events_resource_type ON audit_events (resource_type)",
         ];
 
         for idx_sql in indexes {
             self.execute_index_sql(connection, idx_sql).await?;
         }
+        self.create_audit_event_indexes(connection).await?;
 
         Ok(())
     }
@@ -364,6 +366,25 @@ impl V001SqlBuilder {
         }
 
         Ok(())
+    }
+
+    async fn create_audit_event_indexes(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
+        for idx_sql in self.audit_event_index_sqls() {
+            self.execute_index_sql(connection, idx_sql).await?;
+        }
+
+        Ok(())
+    }
+
+    fn audit_event_index_sqls(&self) -> &'static [&'static str] {
+        &[
+            "CREATE INDEX IF NOT EXISTS idx_audit_events_namespace_ts_id ON audit_events (namespace, ts, id)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events (actor)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_events_resource_type ON audit_events (resource_type)",
+        ]
     }
 
     async fn create_full_load_indexes(
