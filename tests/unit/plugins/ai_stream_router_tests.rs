@@ -571,9 +571,7 @@ async fn test_claim_preserves_final_body_buffering_after_content_type_relabel() 
         .headers
         .insert("content-type".to_string(), "text/plain".to_string());
     assert!(
-        !ferrum_edge::_test_support::request_has_ai_stream_router_claim_for_test(
-            &unclaimed_plain
-        ),
+        !ferrum_edge::_test_support::request_has_ai_stream_router_claim_for_test(&unclaimed_plain),
         "fixture must stay unclaimed"
     );
     assert!(
@@ -606,8 +604,7 @@ async fn test_claim_preserves_final_body_buffering_after_content_type_relabel() 
 
     // Mirror `final_request_body_requirements` for a contextual final hook.
     let requires_buffering = plugin.should_buffer_request_body(&ctx);
-    let needs_final_context =
-        requires_buffering && plugin.needs_final_request_body_context();
+    let needs_final_context = requires_buffering && plugin.needs_final_request_body_context();
     assert!(
         requires_buffering && needs_final_context,
         "recomputed final-body requirements must keep buffering and RequestContext"
