@@ -141,8 +141,9 @@ pub const INVENTORY: &[CryptoOperation] = &[
         location: "src/tls/backend.rs",
         implementation: "rustls, passed to reqwest via use_preconfigured_tls",
         disposition: Disposition::ModuleRoutable,
-        rationale: "Ferrum builds the ClientConfig from the seam; reqwest 0.13's rustls feature \
-                    is already aws-lc-rs backed and receives the preconfigured config",
+        rationale: "Ferrum builds the ClientConfig from the seam and passes it to reqwest; \
+                    provider-constructing internal clients use reqwest's mutually exclusive \
+                    Ring/AWS-LC feature arm selected by the Ferrum build profile",
     },
     CryptoOperation {
         operation: "SPIFFE/SVID backend identity and trust-bundle verification",

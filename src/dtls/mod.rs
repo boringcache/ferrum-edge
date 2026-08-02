@@ -1715,7 +1715,7 @@ pub(crate) fn load_dtls_certificate_with_key_drop_hook(
     // Ferrum-managed DER owner without relying on manual zeroize call sites.
     let key_der = ZeroizingDtlsKeyDer::adopt(parsed_key, drop_hook)?;
 
-    // Ferrum pins rustls's ring provider. Parse from a borrow — do not
+    // Ferrum pins rustls's build-selected provider. Parse from a borrow — do not
     // `clone_key()` into `CertifiedKey::from_der`, which would create another
     // owned DER allocation that ring drops without clearing.
     let borrowed_key = key_der.private_key_der();

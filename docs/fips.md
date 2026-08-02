@@ -29,10 +29,10 @@ Selecting both, or neither, is a `compile_error!`.
 | Ordinary (default) | `cargo build --release` | `ring` + `rustls/ring` | `false` |
 | FIPS | `cargo build --release --no-default-features --features fips` | `aws-lc-fips-sys` via `aws-lc-rs/fips` + `rustls/fips` | `true` |
 
-The ordinary profile is byte-for-byte the build Ferrum has always shipped; the
-existence of the FIPS profile changes nothing about it. `FERRUM_FIPS_MODE=enforce`
-on an ordinary build refuses to start, with a diagnostic that names the missing
-module. It never downgrades to `ring`.
+The ordinary profile retains Ferrum's existing Ring-backed behavior; the
+existence of the FIPS profile does not opt an ordinary deployment into a new
+provider. `FERRUM_FIPS_MODE=enforce` on an ordinary build refuses to start, with
+a diagnostic that names the missing module. It never downgrades to `ring`.
 
 Exclusivity is not stylistic. `sqlx-core`, `quinn-proto`, `tonic`, `ldap3`, and
 `hyper-rustls` each gate their aws-lc arm on the *absence* of their ring arm, so
@@ -180,10 +180,11 @@ reload, which rebuilds through the same constructor.
   would be a KDF Ferrum has not classified. The unreferenced `argon2`
   dependency was **removed** from the build rather than policy-gated, so no
   non-approved KDF is linked at all.
-- SHA-1 remains present for two non-security uses that are documented as such:
-  the RFC 6455 `Sec-WebSocket-Accept` handshake value (a cache-poisoning guard
-  over a fixed public GUID — it carries no key and protects nothing), and
-  content-addressing digests listed in the inventory as `outside-boundary`.
+- SHA-1 remains present for the RFC 6455 `Sec-WebSocket-Accept` handshake value,
+  a non-security cache-poisoning guard over a fixed public GUID that carries no
+  key and protects no secret. Non-security content-addressing digests listed in
+  the inventory use the selected provider's SHA-256 seam but remain classified
+  as `outside-boundary` because they are not security services.
 - Reqwest, Kubernetes, and MongoDB clients have their provider-selecting default
   features disabled. Their rustls transports follow the same mutually exclusive
   `crypto-ring` / `fips` feature pair as Ferrum's frontend, backend, and control

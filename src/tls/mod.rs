@@ -1685,8 +1685,8 @@ pub fn backend_client_config_builder(
             .with_protocol_versions(&policy.protocol_versions)
             .map_err(|e| anyhow::anyhow!("Failed to set TLS protocol versions for backend: {}", e)),
         None => {
-            // Use the ring default provider explicitly so this works even when
-            // no global CryptoProvider is installed (e.g., in unit tests).
+            // Use the build-selected provider explicitly so this works even
+            // when no global CryptoProvider is installed (e.g., in unit tests).
             let provider = Arc::new(crate::fips::base_crypto_provider());
             rustls::ClientConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions()
@@ -1704,8 +1704,8 @@ pub fn build_server_verifier_with_crls(
     root_store: rustls::RootCertStore,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<rustls::client::WebPkiServerVerifier>, anyhow::Error> {
-    // Use ring provider explicitly so this works even when no global CryptoProvider
-    // is installed (e.g., in unit/integration tests).
+    // Use the build-selected provider explicitly so this works even when no
+    // global CryptoProvider is installed (e.g., in unit/integration tests).
     let provider = Arc::new(crate::fips::base_crypto_provider());
     let mut builder =
         rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(root_store), provider);

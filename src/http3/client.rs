@@ -3780,7 +3780,18 @@ mod h3_pool_health_tests {
             .expect("quic server config");
         let server_config = ServerConfig::with_crypto(Arc::new(quic_server));
 
-        Endpoint::server(server_config, addr).expect("server endpoint")
+        let socket = std::net::UdpSocket::bind(addr).expect("bind server UDP socket");
+        socket
+            .set_nonblocking(true)
+            .expect("set server UDP socket nonblocking");
+        let runtime = quinn::default_runtime().expect("Tokio runtime");
+        Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime,
+        )
+        .expect("server endpoint")
     }
 
     fn make_client_endpoint() -> Endpoint {
@@ -3839,8 +3850,18 @@ mod h3_pool_health_tests {
             .expect("quic client config");
         let client_config = ClientConfig::new(Arc::new(quic_client));
 
-        let mut endpoint = Endpoint::client("127.0.0.1:0".parse::<SocketAddr>().unwrap())
-            .expect("client endpoint");
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind client UDP socket");
+        socket
+            .set_nonblocking(true)
+            .expect("set client UDP socket nonblocking");
+        let runtime = quinn::default_runtime().expect("Tokio runtime");
+        let mut endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            runtime,
+        )
+        .expect("client endpoint");
         endpoint.set_default_client_config(client_config);
         endpoint
     }

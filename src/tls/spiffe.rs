@@ -489,8 +489,8 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-/// Build a [`rustls::sign::CertifiedKey`] from a `SvidBundle`, using ring's
-/// signing-key abstraction.
+/// Build a [`rustls::sign::CertifiedKey`] from a `SvidBundle`, using the
+/// build-selected provider's signing-key abstraction.
 fn certified_key_from_bundle(bundle: &SvidBundle) -> Result<rustls::sign::CertifiedKey, String> {
     if bundle.cert_chain_der.is_empty() {
         return Err("SVID bundle has empty cert chain".to_string());
@@ -504,7 +504,7 @@ fn certified_key_from_bundle(bundle: &SvidBundle) -> Result<rustls::sign::Certif
         bundle.private_key_pkcs8_der.to_vec(),
     ));
     let signing_key = crate::fips::any_supported_signing_key(&key)
-        .map_err(|e| format!("ring sign init failed: {e}"))?;
+        .map_err(|e| format!("crypto provider sign init failed: {e}"))?;
     Ok(rustls::sign::CertifiedKey::new(chain, signing_key))
 }
 
