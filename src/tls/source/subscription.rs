@@ -9,10 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use crate::fips::approved::Sha256;
 use dashmap::DashMap;
 use futures_util::TryStreamExt;
 use futures_util::future::BoxFuture;
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::watch;

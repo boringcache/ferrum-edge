@@ -21,8 +21,8 @@
 //! Both helpers run on cold paths only (plugin construction and plugin-cache
 //! rebuild), never per request.
 
+use crate::fips::approved::Sha256;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 /// Type tags keeping distinct JSON shapes from digesting to the same bytes
 /// (for example the string `"1"` and the number `1`).
@@ -50,7 +50,7 @@ pub fn static_config_digest(domain: &str, config: &Value) -> [u8; 32] {
     hasher.update((domain.len() as u64).to_be_bytes());
     hasher.update(domain.as_bytes());
     hash_canonical_value(&mut hasher, config);
-    hasher.finalize().into()
+    hasher.finalize()
 }
 
 /// Fold every enrolled plugin instance's static digest, **in configured
@@ -79,7 +79,7 @@ pub fn presentation_policy_digest<'a>(
         hasher.update(digest);
     }
     hasher.update(count.to_be_bytes());
-    hasher.finalize().into()
+    hasher.finalize()
 }
 
 /// Hash a JSON value canonically.

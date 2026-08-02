@@ -3,6 +3,7 @@
 //! Run: `cargo test --test functional_tests functional_h3_request_body -- --ignored --nocapture`
 
 use crate::common::TestGateway;
+use crate::scaffolding::clients::bind_quinn_client_endpoint;
 
 use bytes::{Buf, Bytes};
 use http::{Request, StatusCode};
@@ -11,7 +12,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request as HyperRequest, Response};
 use hyper_util::rt::TokioIo;
-use quinn::{ClientConfig, Endpoint};
+use quinn::ClientConfig;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use serde_json::Value;
@@ -186,7 +187,7 @@ async fn h3_post_bytes(
     let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls)
         .map_err(|e| format!("QuicClientConfig build failed: {e}"))?;
     let client_config = ClientConfig::new(Arc::new(quic_config));
-    let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let mut endpoint = bind_quinn_client_endpoint(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     endpoint.set_default_client_config(client_config);
 
     let conn = tokio::time::timeout(Duration::from_secs(15), endpoint.connect(addr, &host)?)

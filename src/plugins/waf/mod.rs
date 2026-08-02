@@ -19,6 +19,7 @@ mod normalize;
 mod rules;
 mod scan;
 mod stream;
+mod websocket;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -42,7 +43,7 @@ use super::utils::sse::{is_text_event_stream_media_type, original_response_is_ev
 use super::{
     ALL_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext,
     ResponseTrailerPolicy, StreamBytesKind, StreamConnectionContext, UdpDatagramContext,
-    UdpDatagramDirection, UdpDatagramVerdict,
+    UdpDatagramDirection, UdpDatagramVerdict, WebSocketFrameDirection,
 };
 use crate::config::types::BackendScheme;
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -922,12 +923,151 @@ impl Waf {
         );
     }
 
+    /// Whether this instance governs WebSocket application messages at all.
+    ///
+    /// Exactly the body-inspection posture it already applies to HTTP bodies:
+    /// a WAF with no body rule set (or with body inspection disabled in both
+    /// directions) keeps the pre-existing handshake-only behavior and never
+    /// forces the parsed relay.
+    fn websocket_message_inspection_active(&self) -> bool {
+        self.requires_request_body_buffering() || self.requires_response_body_buffering()
+    }
+
     fn response_body_eligible_for_scan(&self, content_type: Option<&str>) -> bool {
         // Response bodies with missing or malformed content-type are still
         // eligible when binary inspection is explicit; request bodies are
         // gated earlier by `should_buffer_request_body`.
         self.config.inspect_binary_body || self.should_inspect_body_content_type(content_type)
     }
+
+    /// Whether the configured request-body policy would actually inspect this
+    /// request's finalized representation.
+    ///
+    /// Exactly the predicate `on_final_request_body_with_context` uses to decide
+    /// whether to scan, factored out so the shared request representation gate
+    /// asks the same question (`GHSA-3973-47g5-4mcx`). Over-claiming here would
+    /// turn benign compressed uploads into `400`s; under-claiming would let an
+    /// encoded body reach the scanner as opaque octets.
+    fn request_body_policy_applies(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+    ) -> bool {
+        self.requires_request_body_buffering()
+            && !self.exemptions.request_short_circuits(ctx)
+            && self
+                .config
+                .body_methods
+                .iter()
+                .any(|method| method.eq_ignore_ascii_case(&ctx.method))
+            && self.request_body_eligible_for_scan(headers.get("content-type").map(String::as_str))
+    }
+
+    /// Whether the request-body scan this instance would run could actually
+    /// BLOCK the request, which is what a representation CLAIM asserts.
+    ///
+    /// `request_body_policy_applies` answers "would this be scanned"; claiming
+    /// additionally requires a disposition that can refuse. A `monitor`-mode
+    /// instance — or one whose only applicable body rules are `monitor` without
+    /// anomaly scoring — observes and logs, so an unscannable body there is a
+    /// lost observation, never a protection-mechanism failure. Claiming it would
+    /// convert a non-blocking configuration into a fail-closed `400` on an
+    /// ordinary compressed upload.
+    ///
+    /// The `on_body_too_large: skip` exemption folds in on exactly the terms
+    /// `should_buffer_request_body` uses: an operator who opted a body of this
+    /// declared size out of scanning gets no scan and therefore no claim.
+    fn request_body_policy_enforces(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+    ) -> bool {
+        self.request_body_policy_applies(ctx, headers)
+            && !self.request_body_scan_skipped_as_too_large(headers)
+            && self.has_enforcing_body_policy(BodyDirection::Request, ctx)
+    }
+
+    /// The `should_buffer_request_body` size opt-out, evaluated over the
+    /// FINALIZED backend-visible header map rather than the inbound one.
+    ///
+    /// Only a declared `Content-Length` is consulted, exactly as the buffering
+    /// decision does: an absent or unparsable length is not evidence of size,
+    /// and treating it as one would silently drop the claim.
+    fn request_body_scan_skipped_as_too_large(&self, headers: &HashMap<String, String>) -> bool {
+        self.config.on_body_too_large == TooLargeAction::Skip
+            && headers
+                .get("content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .is_some_and(|length| length > self.config.max_scan_bytes)
+    }
+
+    /// Whether the configured response-body policy would actually scan this
+    /// response's client-visible representation.
+    fn response_body_policy_applies(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx) && self.response_body_eligible_for_scan(content_type)
+    }
+
+    /// The response-side counterpart of [`Self::request_body_policy_enforces`]:
+    /// the scan would run AND its verdict could actually refuse the response.
+    /// A `monitor`-mode response scan must not turn an undecodable origin
+    /// coding into a gateway `502`.
+    fn response_body_policy_enforces(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+    ) -> bool {
+        self.response_body_policy_applies(ctx, content_type)
+            && self.has_enforcing_response_body_policy(ctx)
+    }
+
+    /// Whether response-header policy is configured and applies to this request.
+    fn response_header_policy_applies(&self, ctx: &RequestContext) -> bool {
+        self.active
+            && self.config.response_inspection
+            && self.compiled.response_header_rules_active
+            && !self.exemptions.request_short_circuits(ctx)
+    }
+}
+
+/// Deterministic canonical digest of a response header map.
+///
+/// The map is projected to `(lowercased name, value)` pairs, sorted into one
+/// canonical order, and hashed as a single length-prefixed SHA-256 stream with
+/// the pair COUNT bound in. That makes the digest an injective encoding of the
+/// multiset of client-visible fields: iteration order cannot change it, and
+/// nothing else can make two different maps digest alike.
+///
+/// It is deliberately NOT an XOR fold of per-pair digests. XOR is commutative
+/// *and* self-cancelling, so two entries that differ only in name case — `X-Foo`
+/// and `x-foo` are distinct `HashMap` keys that share one canonical name —
+/// annihilate each other. A later hook could then add or remove exactly such a
+/// pair, leave the digest unchanged, and suppress the required recheck.
+///
+/// Sorting allocates, so this is called only where header enforcement is
+/// genuinely active (`response_header_policy_applies`), never on a chain with no
+/// configured response-header rules.
+///
+/// Used only to answer "did anything change since this instance last scanned?" —
+/// it is never logged, exported, or compared against attacker-supplied input.
+fn response_header_map_digest(headers: &HashMap<String, String>) -> [u8; 32] {
+    let mut canonical: Vec<(String, &str)> = headers
+        .iter()
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.as_str()))
+        .collect();
+    canonical.sort_unstable();
+    let mut hasher = crate::fips::approved::Sha256::new();
+    hasher.update((canonical.len() as u64).to_le_bytes());
+    for (name, value) in &canonical {
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.finalize()
 }
 
 #[async_trait]
@@ -1194,6 +1334,53 @@ impl Plugin for Waf {
         }
     }
 
+    /// Opt into the parsed WebSocket relay whenever this instance governs
+    /// application messages, so an upgraded session is never tunnelled past
+    /// inspection as raw bytes (`GHSA-6j3m-vf5h-pgcx`).
+    fn requires_ws_frame_hooks(&self) -> bool {
+        self.active && self.websocket_message_inspection_active()
+    }
+
+    /// Resolve every request-scoped predicate once, at upgrade admission, and
+    /// hand the relay a session-bound instance. See `waf::websocket`.
+    fn bind_ws_session(self: Arc<Self>, ctx: &RequestContext) -> Option<Arc<dyn Plugin>> {
+        if !self.active {
+            return None;
+        }
+        websocket::WafWsSession::bind(self, ctx)
+    }
+
+    /// Unbound fallback. Reaching this means a relay path collected frame
+    /// hooks without running `bind_ws_session`, so this instance has no
+    /// admission-time policy snapshot and cannot evaluate rule conditions or
+    /// exemptions. Application messages fail closed rather than forwarding
+    /// unscanned; control frames keep their protocol semantics.
+    async fn on_ws_frame(
+        &self,
+        proxy_id: &str,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        message: &tokio_tungstenite::tungstenite::Message,
+    ) -> Option<tokio_tungstenite::tungstenite::Message> {
+        use tokio_tungstenite::tungstenite::Message;
+        let is_control = matches!(
+            message,
+            Message::Ping(_) | Message::Pong(_) | Message::Close(_)
+        );
+        if is_control || !self.requires_ws_frame_hooks() {
+            return None;
+        }
+        warn!(
+            target: "waf",
+            plugin = "waf",
+            proxy = %proxy_id,
+            connection_id,
+            direction = websocket::direction_label(direction),
+            "WAF WebSocket message policy is unbound for this session; closing"
+        );
+        Some(websocket::unbound_policy_close())
+    }
+
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         if self.active {
             ctx.ensure_waf_metadata_initialized();
@@ -1248,6 +1435,24 @@ impl Plugin for Waf {
         self.requires_request_body_buffering()
     }
 
+    /// Claim the finalized request representation whenever the configured body
+    /// policy would scan it AND could refuse it, so the shared request
+    /// representation gate decodes a content coding into plaintext or fails the
+    /// request closed rather than letting this scan run over opaque compressed
+    /// octets (`GHSA-3973-47g5-4mcx`).
+    ///
+    /// Disposition-aware on purpose: claiming is a fail-closed assertion, and a
+    /// `monitor`-mode instance cannot block anything. See
+    /// `Waf::request_body_policy_enforces`.
+    fn enforces_final_request_body_policy(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> bool {
+        self.request_body_policy_enforces(ctx, headers)
+    }
+
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
@@ -1257,17 +1462,20 @@ impl Plugin for Waf {
         if self.active {
             ctx.ensure_waf_metadata_initialized();
         }
-        if !self.requires_request_body_buffering()
-            || self.exemptions.request_short_circuits(ctx)
-            || !self
-                .config
-                .body_methods
-                .iter()
-                .any(|method| method.eq_ignore_ascii_case(&ctx.method))
-            || !self.request_body_eligible_for_scan(headers.get("content-type").map(String::as_str))
-        {
+        if !self.request_body_policy_applies(ctx, headers) {
             return PluginResult::Continue;
         }
+        // Scan the PLAINTEXT the backend will end up parsing, not the wire
+        // octets. `inspectable_final_request_body` returns `body` itself unless
+        // the gate decoded a content coding, and the gate rejected the request
+        // outright if it could not — so reaching here always means these bytes
+        // are the document the policy is configured about. An OWNED handle is
+        // taken only on the decoded path (`clamp_body` needs `&mut ctx`, which
+        // cannot coexist with a borrow of the staged view); it is an `O(1)`
+        // `Bytes` clone sharing the gate's one charged allocation, not a second
+        // uncharged copy of an attacker-amplified body.
+        let decoded_view = ctx.inspectable_final_request_body_owned();
+        let body: &[u8] = decoded_view.as_deref().unwrap_or(body);
         let (body, truncated) = match self.clamp_body(ctx, BodyDirection::Request, body) {
             Ok(value) => value,
             Err(result) => return result,
@@ -1297,6 +1505,13 @@ impl Plugin for Waf {
         if self.compiled.response_header_rules_active {
             let outcome =
                 self.run_cheap_with_budget(|| self.run_response_header_scan(ctx, response_headers));
+            // Record exactly what this instance scanned. The final client-visible
+            // phase re-asserts policy only if a later hook changed the map, so an
+            // untouched header set is neither rescanned nor rescored
+            // (`GHSA-62jg-v563-4q23`).
+            let digest = response_header_map_digest(response_headers);
+            ctx.waf_response_header_digests
+                .insert(self.instance_id, digest);
             let result = self.finish_scan(ctx, outcome);
             if !matches!(&result, PluginResult::Continue) {
                 return result;
@@ -1400,7 +1615,108 @@ impl Plugin for Waf {
             && self.response_body_eligible_for_scan(content_type)
     }
 
-    async fn on_final_response_body(
+    /// Claim the buffered response so the shared representation gate decodes an
+    /// origin `Content-Encoding` into plaintext — or fails the response closed —
+    /// before any scan reads it (`GHSA-4vqr-427g-5cg7`).
+    ///
+    /// The claim is deliberately narrow on four axes, because claiming is not
+    /// free: it converts an uninspectable representation into a `502`.
+    ///
+    /// * the configured response-body rules must actually scan this media type
+    ///   on this request, AND their verdict must be able to refuse it. A
+    ///   `monitor`-mode instance never blocks, so an undecodable origin coding
+    ///   there costs an observation, not the response;
+    /// * the ORIGIN must have declared a content coding
+    ///   ([`crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY`], the pristine
+    ///   pre-`after_proxy` stamp). An identity-coded response is already the
+    ///   plaintext this plugin scans, so there is nothing for the gate to prove
+    ///   and ordinary traffic keeps its pre-existing behavior exactly. Gateway
+    ///   compression is not a reason to claim either: it now runs in the deferred
+    ///   transport-encoding stage, after this plugin has decided;
+    /// * framed gRPC bodies are declined. They are length-prefixed frames rather
+    ///   than a document, the gate's gRPC-Web re-encode rule would reject a
+    ///   translated route wholesale, and their transfer coding is `grpc-encoding`
+    ///   rather than `Content-Encoding` anyway.
+    fn enforces_response_body_policy(
+        &self,
+        ctx: &RequestContext,
+        response_content_type: Option<&str>,
+        _response_body: &[u8],
+    ) -> bool {
+        self.response_body_policy_enforces(ctx, response_content_type)
+            && !response_content_type
+                .is_some_and(crate::plugins::utils::body_transform::is_framed_grpc_content_type)
+            && ctx
+                .metadata
+                .contains_key(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY)
+    }
+
+    /// Over-approximation used before the response `Content-Type` is known.
+    /// Depends only on configuration and request state, as the contract requires
+    /// — including the enforcing-disposition term, which is itself decided from
+    /// configuration and the request alone.
+    fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
+        self.should_buffer_response_body(ctx) && self.has_enforcing_response_body_policy(ctx)
+    }
+
+    fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {
+        self.should_buffer_response_body(ctx)
+    }
+
+    fn enforces_final_client_visible_response_headers(&self, ctx: &RequestContext) -> bool {
+        self.response_header_policy_applies(ctx)
+    }
+
+    /// Re-assert WAF response-header rules over the map that actually closes.
+    ///
+    /// `after_proxy` runs at priority 2930, before `response_transformer` (4000)
+    /// and the chain-level route response-header finalizer can
+    /// `add`/`update`/`remove`/`rename` the same fields — and on the synthetic /
+    /// short-circuit lifecycle that whole reject-path `after_proxy` chain is run
+    /// deliberately LAST. A rename that carries a backend- or synthetic-controlled
+    /// value into a protected header used to land after the only enforcing pass
+    /// (`GHSA-62jg-v563-4q23`).
+    ///
+    /// Re-asserting is gated on the map having actually changed since this
+    /// instance last scanned it, so an untouched header set is neither rescanned
+    /// nor rescored, and the digest is instance-scoped so one WAF cannot consume
+    /// another's marker.
+    async fn finalize_client_visible_response_headers(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> PluginResult {
+        if self.active {
+            ctx.ensure_waf_metadata_initialized();
+        }
+        if !self.response_header_policy_applies(ctx) {
+            return PluginResult::Continue;
+        }
+        let digest = response_header_map_digest(response_headers);
+        if ctx
+            .waf_response_header_digests
+            .get(&self.instance_id)
+            .is_some_and(|scanned| *scanned == digest)
+        {
+            return PluginResult::Continue;
+        }
+        let outcome =
+            self.run_cheap_with_budget(|| self.run_response_header_scan(ctx, response_headers));
+        ctx.waf_response_header_digests
+            .insert(self.instance_id, digest);
+        self.finish_scan(ctx, outcome)
+    }
+
+    /// The authoritative WAF response BODY decision, over the exact
+    /// representation the client receives.
+    ///
+    /// The scan previously ran in `on_final_response_body`, after `compression`
+    /// (4050) had already encoded the body, so it matched gzip/Brotli octets
+    /// rather than the document (`GHSA-4vqr-427g-5cg7`). This phase runs before
+    /// transport encoding, and an origin coding was already decoded by the
+    /// representation gate.
+    async fn finalize_client_visible_response_body(
         &self,
         ctx: &mut RequestContext,
         _response_status: u16,
@@ -1427,6 +1743,20 @@ impl Plugin for Waf {
             .await;
         outcome.truncated = truncated;
         self.finish_scan(ctx, outcome)
+    }
+
+    /// Preserve the established final-body hook contract for direct callers.
+    /// The proxy skips this compatibility hook after it has invoked the
+    /// authoritative client-visible phase, so production scans once.
+    async fn on_final_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        self.finalize_client_visible_response_body(ctx, response_status, response_headers, body)
+            .await
     }
 }
 

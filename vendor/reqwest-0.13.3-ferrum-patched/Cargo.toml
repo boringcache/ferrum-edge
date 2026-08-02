@@ -89,6 +89,12 @@ __rustls-aws-lc-rs = [
     "rustls?/aws-lc-rs",
     "quinn?/rustls-aws-lc-rs",
 ]
+__rustls-ring = [
+    "hyper-rustls?/ring",
+    "tokio-rustls?/ring",
+    "rustls?/ring",
+    "quinn?/rustls-ring",
+]
 __tls = [
     "dep:rustls-pki-types",
     "tokio/io-util",

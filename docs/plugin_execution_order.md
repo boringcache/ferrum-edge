@@ -125,6 +125,13 @@ Request In
 └────────────┬─────────────────┘
              │
              ▼
+┌───────────────────────────────────────────────┐
+│ 7c. finalize_client_visible_response_headers   │ Authoritative final
+└────────────┬──────────────────────────────────┘   header policy (rejecting).
+             │  Closes the after_proxy chain on streaming AND buffered paths.
+             │  The synthetic/short-circuit lifecycle runs it after its own
+             │  deliberately late reject-path after_proxy chain instead.
+             ▼
 ┌─────────────────────────┐
 │ 8. normalize_response_body │ Provider/protocol normalization
 └────────────┬────────────┘
@@ -136,12 +143,22 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 10. transform_response_body │ Buffered presentation rewrites
+│ 10. transform_response_body │ Buffered presentation rewrites (semantic stage)
 └────────────┬────────────┘
              │
              ▼
+┌─────────────────────────────────────┐
+│ 10b. finalize_client_visible_response_body │ Authoritative output policy
+└────────────┬────────────────────────┘        over the exact client bytes
+             │
+             ▼
+┌─────────────────────────────────────┐
+│ 10c. transform_response_body │ Transport encoding stage (compression)
+└────────────┬────────────────────────┘
+             │
+             ▼
 ┌─────────────────────────┐
-│ 11. on_final_response_body │ Buffered body validation/storage
+│ 11. on_final_response_body │ Buffered body storage/size accounting
 └────────────┬────────────┘
              │
              ▼
@@ -454,6 +471,237 @@ When a plugin returns a replacement body from `transform_response_body`, the cor
 
 Gateway-generated synthetic responses normally skip the body pipeline when they contain zero bytes. A validator whose contract distinguishes an empty representation from a valid one can opt into zero-byte processing; `openapi_validator` does so for matching response contracts, keeping empty synthetic and buffered backend responses under the same final-schema rule. HEAD and 1xx/204/205/304 responses retain their no-body semantics and do not enter this path.
 
+### Authoritative backend-visible request representation phase
+
+Immediately before the first `on_final_request_body*` hook — on every dispatch
+ladder (H1/H2 terminal and ordinary preparation, the native-gRPC branch, native
+H3, the H3 cross-protocol bridge) — one shared gate establishes the plaintext a
+final request-body policy is entitled to inspect (`GHSA-3973-47g5-4mcx`).
+
+A plugin opts in by returning `true` from `enforces_final_request_body_policy`
+for a given request. `waf`, `body_validator`, and `graphql` do so whenever their
+configured rules would actually inspect the finalized representation **and could
+refuse it**. Claiming is a fail-closed assertion, so the configured disposition
+is part of the question: a `monitor`-mode WAF, a rule set whose applicable body
+rules only log, or a body the operator opted out of scanning with
+`on_body_too_large: skip` all lose an observation when a body is unscannable,
+which is not a protection-mechanism failure and does not become a `400`.
+
+- **Nothing claims the request, or the finalized bytes are identity-coded.**
+  Nothing changes. Ordinary compressed uploads keep flowing to backends that
+  understand them.
+- **A policy claims a request whose finalized `Content-Encoding` names a
+  transforming coding.** The ordered `#content-coding` list (RFC 9110 §8.4) is
+  parsed, each supported coding is decoded in reverse application order, and the
+  plaintext is staged for the claiming hooks. Anything that cannot be reduced to
+  one complete plaintext document is rejected with a fixed `400` and a
+  low-cardinality reason (`unsupported_content_coding`,
+  `malformed_content_coding`, `too_many_content_codings`,
+  `undecodable_content_coding`) that never echoes a coding token or a body byte.
+
+Per-request bounds: at most 4 stacked codings; at most the smaller of 10 MiB and
+any active route request-body ceiling per layer and in aggregate; at most 1024:1
+expansion per layer and end-to-end. `gzip`, `x-gzip`, and `br` are supported;
+`identity` alone is a no-op and `identity` mixed with a transforming coding is
+malformed. `br` is decoded strictly: Large Window Brotli is refused, because
+RFC 7932 caps the `br` window at 24 bits and an LWB stream would ask for a
+decoder working set (up to a 1 GiB ring buffer) for a coding no client
+negotiated.
+
+Aggregate bound across concurrent requests: a per-request ceiling still
+multiplies by concurrency, so the complete decode working set is reserved
+**before** it is allocated against a process-wide budget
+(`FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES`) — the output buffer's capacity, the
+window in which a stacked chain holds one pass's input and the next pass's
+output at once, and a conservative ceiling on the active decoder's own heap
+(256 KiB for `gzip`, 24 MiB for `br`), the last of which is reserved before the
+decoder is *constructed* because it is allocated from the stream header before
+any output exists. The charge travels with the staged plaintext and is released
+when the last handle drops, which covers completion, a later hook's rejection, a
+gRPC deadline, client disconnect, cancellation, and a retry that re-finalizes
+the body. The staged view is also released when the final request-body hook
+stage returns, on every one of its exits, so the charge lifetime is the hook
+stage rather than the request — identical on the ladders that hand the hooks a
+throwaway context clone (H1/H2) and the one that hands them the real request
+context (native H3). A request the budget cannot admit is refused with the
+gateway-local
+capacity terminal (`503` with a fixed body; native gRPC and gRPC-Web get
+`RESOURCE_EXHAUSTED`) rather than a `400`: the upload was well formed and no
+backend was contacted. The encoded body is still never forwarded, because
+forwarding it is the bypass this gate closes.
+
+Both of this phase's terminals — the fixed `400` and the capacity `503` — are
+GATEWAY-authored, and both carry typed provenance on the request context (the
+`400` its own request-representation marker, the `503` the shared
+retained-response capacity terminal). The response-side policy finalizer reads
+that provenance and publishes the fixed error payload as written: a configured
+response schema, response-body rule, AI guard, or route response-size ceiling
+never restates the gateway's own answer as a backend representation failure. On
+the ladders that run the hook stage against a throwaway context clone, the two
+markers are carried back to the live request context with the stage's other
+results.
+
+The decoded bytes are an **inspection view only** — the backend still receives
+the exact octets and headers the client sent, so `Content-Length`,
+`Content-Encoding`, and request signing stay intact. Claiming plugins read the
+view through `RequestContext::inspectable_final_request_body`, which returns the
+finalized bytes themselves whenever no decode was owed.
+
+This phase is deliberately independent of the optional `compression` plugin. When
+`compression` is configured with `decompress_request: true` it has already
+rewritten the body and stripped `Content-Encoding` during
+`normalize_buffered_request_body_before_before_proxy`, so this gate sees an
+identity representation and does no work; when it is absent, disabled, or scoped
+elsewhere, the security policy still gets plaintext or the request is refused.
+An enforcing policy never silently depends on that composition.
+
+### Authoritative final client-visible response phase
+
+The buffered body-transform phase runs in **two stages**, with an authoritative
+output-policy phase between them (`GHSA-62jg-v563-4q23`,
+`GHSA-4vqr-427g-5cg7`). Configured plugin order is preserved inside each stage:
+
+1. **Semantic stage.** Every ordinary representation rewrite — `grpc_web`
+   re-framing, `mcp_gateway` reverse mapping, `response_transformer` body rules
+   (4000), `ai_response_guard` redaction (4075).
+2. **`finalize_client_visible_response_body`.** A rejecting, non-rewriting phase
+   over the exact bytes the client will receive. `waf` (response body scan),
+   `body_validator` (response validation), and `ai_response_guard`
+   (undischarged-redaction check plus a residual re-detection) decide here.
+   Header policy is NOT decided here — the header map is not final at this point
+   on the synthetic lifecycle — it is decided in
+   `finalize_client_visible_response_headers` below.
+3. **Transport-encoding stage.** Plugins declaring
+   `applies_response_transport_encoding` — `compression` (4050) — generate the
+   wire representation last, after every security decision and rewrite.
+
+Why the split matters:
+
+- `compression` at 4050 previously encoded the body before WAF's and
+  `body_validator`'s final response hooks and before `ai_response_guard`'s
+  redaction transform: the WAF matched gzip/Brotli octets, the validator read
+  them as non-UTF-8 and skipped, and a promised redaction could not parse them
+  while its metadata already claimed one.
+- `ai_response_guard` inspects at phase 9, before `response_transformer`. Its
+  residual scan here is what binds redaction metadata to a rewrite that actually
+  happened *and* to the representation actually delivered; a `redact`
+  disposition with nothing left to discharge it becomes a rejection, while
+  `warn` still passes through.
+
+The phase also runs when the transform phase is skipped (an unclaimed `206`/`226`
+representation), because it is non-rewriting and must still decide.
+
+#### Re-decision on the synthetic / short-circuit lifecycle
+
+On that lifecycle the reject-path `after_proxy` chain runs LAST — it has to, so
+one-shot response state (the `oidc_relying_party` rotated session cookie, the
+consumed `response_transformer` route override) is emitted exactly once onto the
+response the client actually receives. That chain is therefore also the last
+thing that can change the header map, and the representation fields in that map
+are what decide whether a body policy applies at all. A late header `rename` or
+route header rule relabelling a `text/plain` body as `application/json` would
+otherwise activate JSON policies over bytes they were never asked about under the
+published header map.
+
+So the body-hook phase returns a **witness** of what it decided over — the HTTP
+status, exact plaintext bytes, and policy-scope headers it read them under — and
+the finalizer re-decides once the chain has closed the map, before the header
+phase below. The scope is every `Content-*` field except `Content-Length`
+(derived from bytes the witness already pins) and the `Content-Security-Policy`
+family (a client directive and a gateway decorator, not a description of these
+bytes), plus `grpc-status` / `grpc-message` (which decide `body_validator`'s
+empty-terminal-error exemption). HTTP status is compared exactly; headers are
+compared after normalizing the gateway's own transport encoding back out, so
+`compression` adding `Content-Encoding: gzip` is not a scope change: an unchanged
+representation is never re-inspected, re-called-out-to, or re-charged. Both the
+authoritative phase and the legacy `on_final_response_body` participants
+(`ai_semantic_firewall`) are re-decided together.
+
+A refusal here cannot re-run the chain that authored the current header map, so
+it rebuilds through the same path the header phase uses — only
+`PRESERVED_GATEWAY_RESPONSE_DECORATORS` survive, no stale representation metadata
+and no backend/synthetic-producer field carried across on a trusted-looking name.
+The rebuild is then checked **structurally** rather than re-swept through the
+policies: it must carry exactly the representation the gateway authored
+(`Content-Type: application/json` and nothing else in scope), and anything else —
+a plugin-supplied rejection header re-opening a representation scope — collapses
+to the fixed, decorator-free gateway terminal. Re-sweeping instead would judge a
+gateway-authored error payload against operator rules written for application
+responses, which is exactly what every other phase here refuses to do (and would
+turn any configured JSON response schema into a permanent `500`). Gateway-authored
+terminals (capacity, deadline, an earlier rejection, a route body-size refusal,
+the request-representation `400`) are likewise never re-decided: they are already
+the answer.
+
+One more thing on that list is authored by the late chain itself. A replacement
+skips re-decision only when the built-in explicitly declares
+`rejection_replacement_is_final_body_policy_terminal`: `spec_expose`'s HEAD body
+strip, compression's fixed negotiation `406`, and `mcp_gateway`'s sanitized
+JSON-RPC error shaping. Mere `may_replace_rejection_response` is not enough: an
+ordinary fail-closed/custom replacement remains subject to status and
+representation-scope comparison. The final-terminal record is typed, set only
+on that trusted rejection path, and consumed exactly once, so an ordinary late
+mutation of a backend or synthetic-producer representation is still re-checked.
+
+### Authoritative final client-visible response HEADER phase
+
+Response HEADER policy is a separate phase
+(`finalize_client_visible_response_headers`) because the body phase above is not
+the last thing that can rewrite the header map. It runs at the three points where
+the client-visible header map genuinely closes:
+
+- **At the END of the `after_proxy` chain**, inside `run_after_proxy_hooks`, so
+  every protocol path — H1/H2, native gRPC, gRPC-Web, buffered and streaming H3 —
+  reaches it identically, on streaming as well as buffered responses. By then
+  `response_transformer`'s header rules (4000) and the chain-level route
+  response-header finalization have already run. A rejection is surfaced as an
+  ordinary `after_proxy` rejection.
+- **At the END of the synthetic / short-circuit finalizer**, after the reject-path
+  `after_proxy` chain that lifecycle deliberately defers to last. That deferral
+  is what keeps one-shot response state (the `oidc_relying_party` rotated session
+  cookie, the consumed `response_transformer` route override) exactly-once and on
+  the response the client actually receives — and it is exactly what used to let
+  a late header `rename` create a prohibited header behind every enforcing pass
+  (`GHSA-62jg-v563-4q23`). This phase closes that window WITHOUT re-running the
+  chain.
+- **At the OUTER buffered transform boundary**, after semantic rewrites and the
+  transport-encoding stage. Every return from the inner transform funnel — an
+  admitted response, a body-policy rejection, a representation refusal, a
+  capacity terminal, or a deadline terminal — crosses this boundary. This is
+  the actual final map for buffered H1/H2, native gRPC, gRPC-Web, and H3.
+
+`waf` owns this phase. Its re-assertion is gated on an instance-scoped,
+deterministic canonical digest of the header map, so an untouched header set is
+neither rescanned nor rescored, and one instance can never consume another's
+marker.
+
+The phase is rejecting and non-rewriting. A rejection is rebuilt in place from a
+fixed set of gateway-owned decorators plus the rejection's own fields. Carried
+across: the `security_headers` set, the CORS contract, `Vary`,
+request-correlation, and the one-shot rotated `Set-Cookie` — this phase cannot
+re-run the hooks that authored them. Dropped: everything the backend or the
+synthetic producer contributed, including the refused field itself and the stale
+representation metadata of the discarded body, so the rebuild cannot resurrect
+what was just refused. Policy is then re-evaluated exactly once over the rebuild;
+a second refusal collapses to a fixed minimal gateway terminal. Buffered body
+and header rejections are normalized through the immutable inbound request
+flavor: native gRPC receives a trailers-only error and gRPC-Web receives a
+terminal trailer frame, never a bare JSON HTTP response. The buffered rebuild
+retains gateway decorators through line-aware provenance, so a same-named
+backend field cannot cross onto the terminal.
+
+Gateway transport-encoding fields written after the `after_proxy` chain
+(`Content-Encoding` and the recomputed `Content-Length`) are evaluated at the
+outer buffered boundary. Untouched fields are still skipped by WAF's
+instance-scoped digest, so the extra boundary does not rescore an unchanged map.
+
+`waf`, `body_validator`, and `ai_response_guard` additionally claim an
+**origin-encoded** buffered response through `enforces_response_body_policy`, so
+the gate below decodes it to plaintext or fails it closed. The claim is narrow by
+design: only when the configured rules would inspect this media type, only when
+the pristine pre-`after_proxy` snapshot says the origin declared a content
+coding, and never for framed gRPC bodies.
+
 ### Buffered response representation gate
 
 Before any buffered body transform runs, one shared gate decides whether a configured body policy — a plugin returning `true` from `enforces_response_body_policy`, such as a `response_transformer` with `body_rules` — can genuinely be applied to the representation the backend produced. The same gate runs on every path that publishes a buffered response: H1/H2, buffered gRPC, native H3, both H3 cross-protocol bridges, and the synthetic/replay short-circuit.
@@ -584,7 +832,7 @@ Body-aware plugins such as `graphql`, request-side `body_validator`, `openapi_va
 
 "Matching" is the plugin's own configured representation, not the request method. `body_validator` in particular selects on `content_types` / `application/grpc` alone: a body-bearing `DELETE`, `PUT`, `PATCH`, `OPTIONS`, `GET`, or non-standard method carrying a governed media type is buffered and validated exactly like a `POST` (advisory `GHSA-2vmr-ww8r-mww3`). Once a configured rule applies, an empty, absent, or non-UTF-8 representation is a rejection rather than a skip; the only exemptions are the ones the protocol defines (empty terminal gRPC *error* replies with a single valid non-zero `grpc-status`, and `1xx` / `204` / `205` / `304` / `HEAD` response semantics). Early `before_proxy` prefers a rewritten UTF-8 metadata view when present, falls back to raw bytes / transport-proven emptiness, and fails closed otherwise; the final request-body hook still validates the exact backend-visible bytes. The gateway still never materializes a body the transport proved absent — H1/H2 validate that proven-empty representation directly, and H3 reaches the same decision from its always-drained empty buffer.
 
-`waf` request metadata inspection (path, query, headers, cookies, and method) runs in the `authorize` phase at priority 2930, after authentication and earlier authorization plugins such as `access_control`, `mesh_authz`, `opa`, and consumer-aware `rate_limiting`. Authenticated proxies that reject during auth/authz therefore avoid WAF scan cost, while public/no-auth proxies still run WAF before backend dispatch. WAF request-body inspection remains on the final backend-visible request body.
+`waf` request metadata inspection (path, query, headers, cookies, and method) runs in the `authorize` phase at priority 2930, after authentication and earlier authorization plugins such as `access_control`, `mesh_authz`, `opa`, and consumer-aware `rate_limiting`. Authenticated proxies that reject during auth/authz therefore avoid WAF scan cost, while public/no-auth proxies still run WAF before backend dispatch. WAF request-body inspection remains on the final backend-visible request body. On an upgraded WebSocket session the same body rule sets continue to apply to complete application messages in both directions — see [WebSocket Message Inspection](#websocket-message-inspection-waf).
 
 **Phase 1 — `on_stream_connect`**: Runs after the client connection is accepted (TCP) or the first datagram from a new client creates a session (UDP). For TCP+TLS and UDP+DTLS listeners it runs after the frontend TLS/DTLS handshake and before the backend connection/session is opened, so plugins can inspect the client certificate without spending upstream capacity first. Frontend TLS/DTLS handshake failures do not fire stream plugins; plugin rejects close the frontend connection/session immediately and do not dial the backend. Plugins can also insert metadata (e.g., trace IDs) into `ctx.metadata`, which is carried through to `on_stream_disconnect`. Built-in correlation IDs remain in private lifecycle state and are authoritatively projected into terminal metadata after plugin-writable merges. Built-in admission plugins can instead attach opaque connection permits; TCP runners release all permits in reverse order immediately when a later plugin rejects, and normal connection teardown releases any remaining permits exactly once.
 
@@ -735,6 +983,77 @@ under a short bound. Parser-level size rejections
 (`ws_message_size_limiting` via `websocket_size_limits`) never enter the
 post-reassembly hook chain and use the same dual-peer Close path with code 1009.
 
+### Session-Bound Message Policy (`bind_ws_session`)
+
+`on_ws_frame` deliberately carries no request context, because a WebSocket
+session *is* one upgraded request. A plugin whose per-message decision depends
+on request-scoped state resolves it **once**, at upgrade admission, through
+`Plugin::bind_ws_session`: the relay's per-session plugin collection calls it
+with the finalized upgrade `RequestContext` and substitutes the returned
+instance positionally in both the parser-policy and frame-hook lists. Configured
+priority order is unchanged, binding happens exactly once per plugin per
+session, and each configured instance still sees every message exactly once.
+Implementations must return an immutable snapshot and must not retain request
+headers, bodies, or credentials.
+
+`waf` owns this phase. Its snapshot holds the `global_exemptions` verdict for
+the upgrade, one `conditions` verdict per compiled rule, and whether each
+direction can actually block — all bounded by the configured rule count, none of
+it attacker-controlled at message time.
+
+### WebSocket Message Inspection (`waf`)
+
+`waf` inspects complete **Text and Binary application messages** in both
+directions (advisory `GHSA-6j3m-vf5h-pgcx`; before it, WAF participated only in
+the upgrade handshake). Body targets map to complete messages, not wire frames:
+
+- **client → backend** messages run the **request** body rule set (`body_text`,
+  `body_json_path`, body Luhn/CIDR rules, and the body-scoped encoding
+  specials), gated by `request_inspection` + `request_body_inspection`.
+- **backend → client** messages run the **response** body rule set
+  (`response_body`, response Luhn/CIDR rules, the same encoding specials), gated
+  by `response_inspection` + `response_body_inspection`.
+
+Both Text and Binary are inspected. The HTTP media-type selectors
+(`body_methods`, `body_content_types`, `inspect_multipart`,
+`inspect_binary_body`) do not apply — a WebSocket message carries no
+`Content-Type`, so honoring them would let a client bypass an enforcing rule by
+choosing the Binary opcode. **Control frames (Ping/Pong/Close) are never scanned
+as application payload.**
+
+Fragmentation and compression need no WAF-side state. Tungstenite reassembles
+Text/Binary continuations before the hook, incomplete messages are bounded by
+`FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES` /
+`FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS`, and `permessage-deflate` is
+never negotiated end to end (the client's `Sec-WebSocket-Extensions` offer is
+stripped before the backend handshake and no negotiated extension is echoed
+back), so payloads reaching the hook are complete and uncompressed on H1
+upgrade and on H2/H3 Extended CONNECT alike.
+
+Fail-closed behavior mirrors the HTTP body path. A message larger than
+`max_scan_bytes` is decided by `on_body_too_large`: `fail_closed` (default)
+closes the connection when that direction carries an enforcing body policy and
+otherwise prefix-scans; `scan_truncated` always prefix-scans; `skip` forwards
+uninspected; `block` closes whenever the instance is globally enforcing. An
+uninspectable message representation closes the connection when the direction
+enforces. `on_scan_timeout: block` closes; `allow` / `log_and_allow` forward.
+Every close is a fixed RFC 6455 code 1008 with a compiled-in reason that never
+echoes message bytes.
+
+Anomaly scoring is evaluated **per complete message** rather than accumulated
+across the session: a long-lived connection has no request-scoped accumulator,
+and carrying one would let an unbounded, attacker-driven counter decide
+admission. Multiple configured `waf` instances each bind and scan independently;
+the shared first-terminal-Close rule then applies, so one message can be blocked
+only once. Because a closed session has no transaction-summary surface of its
+own, WebSocket message findings are emitted as fixed-cardinality `waf`-target
+log events (every block; every matched rule when `log_to_stdout` is enabled)
+rather than as `waf.*` transaction metadata.
+
+Note that configuring an enforcing WAF body rule on a WebSocket proxy opts that
+proxy into the parsed relay: raw tunnel mode (`copy_bidirectional`) cannot
+inspect messages and is therefore not used for those sessions.
+
 ### Execution Order
 
 Plugins execute in priority order (lower number runs first):
@@ -872,14 +1191,14 @@ Given all built-in plugins enabled, the execution order is:
 | 29 | `ai_transcript_audit` | 2740 | before_proxy, on_final_request_body, on_final_response_body, on_response_committed, response_stream_inspector, on_response_stream_terminated, log |
 | 30 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
 | 31 | `ws_message_size_limiting` | 2810 | parser-level frame/message limits |
-| 32 | `graphql` | 2850 | before_proxy |
+| 32 | `graphql` | 2850 | before_proxy, on_final_request_body |
 | 33 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
 | 34 | `ws_rate_limiting` | 2910 | on_ws_frame, on_ws_reassembly_frames |
 | 35 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 36 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body, on_final_request_body |
-| 37 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body, on_stream_connect, on_udp_datagram |
+| 37 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, finalize_client_visible_response_body, finalize_client_visible_response_headers, on_ws_frame, on_stream_connect, on_udp_datagram |
 | 38 | `fault_injection` | 2940 | before_proxy, on_stream_connect, on_udp_datagram |
-| 39 | `body_validator` | 2950 | before_proxy, on_final_request_body, after_proxy, on_final_response_body |
+| 39 | `body_validator` | 2950 | before_proxy, on_final_request_body, after_proxy, finalize_client_visible_response_body |
 | 40 | `openapi_validator` | 2960 | validate_client_request_body_contract, before_proxy, on_final_request_body, after_proxy, on_final_response_body |
 | 41 | `ai_semantic_firewall` | 2968 | before_proxy, on_final_request_body, on_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
 | 42 | `ai_request_guard` | 2975 | before_proxy, transform_request_body, on_final_request_body |
@@ -902,10 +1221,10 @@ Given all built-in plugins enabled, the execution order is:
 | 59 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body_with_context, on_final_request_body_with_context |
 | 60 | `ai_semantic_cache` | 4057 | on_final_request_body_with_context, after_proxy, on_final_response_body |
 | 61 | `ai_federation` | 4060 | finalized request egress (HTTP only) |
-| 62 | `ai_response_guard` | 4075 | after_proxy, on_response_body, transform_response_body, on_final_response_body |
+| 62 | `ai_response_guard` | 4075 | after_proxy, on_response_body, transform_response_body, finalize_client_visible_response_body |
 | 63 | `security_headers` | 4080 | after_proxy, initial response-header boundary |
 | 64 | `ai_token_metrics` | 4100 | on_response_body |
-| 65 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
+| 65 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body, response_stream_inspector, on_response_stream_terminated |
 | 66 | `stdout_logging` | 9000 | log, on_stream_disconnect |
 | 67 | `ws_frame_logging` | 9050 | on_ws_frame |
 | 68 | `statsd_logging` | 9075 | log, on_stream_disconnect, on_ws_disconnect |
@@ -1033,7 +1352,7 @@ The AI plugins are ordered to compose correctly:
 8. **`ai_semantic_cache` (4057)** performs exact and semantic lookup in `on_final_request_body_with_context`, not `before_proxy`. That places it after every `before_proxy` admission guardrail, after `request_transformer` (3000) header/query rewrites, after every `transform_request_body` hook (`compression` request decode at 4050, `ai_prompt_compressor` at 4055), and after `ai_prompt_compressor`'s final hook enforces its staged marker-sanitization rejection — so a hit can never answer a request the gateway had already decided to refuse, and the replay partition binds the finalized outbound headers, the effective query, the post-routing destination, and the exact prompt bytes the provider would receive. Its decision remains ahead of `ai_federation` (4060), so a hit short-circuits before the later finalized-request-egress phase. Store stays in `on_final_response_body`.
 9. **`ai_federation` (4060)** is HTTP-only and handles non-streaming provider routing from the finalized-request-egress phase, after all request transforms and every final request-policy hook. It translates OpenAI-format requests to the matched provider, normalizes bounded non-streaming responses, and returns via `RejectBinary` before backend egress/admission/transport. Matched requests with `"stream": true` are rejected with `501` unless `ai_stream_router` already recorded its private claim for the request (or explicitly passed it through via `ai_stream_router_pass_through=true`). Successful synthetic federation responses pass through the response-side body hooks before the client receives them, including `ai_semantic_firewall`, `ai_response_guard`, response transforms, final-response hooks, and committed observers when configured. `ai_token_metrics` is the deliberate exception: it skips synthetic short-circuit bodies, so `ai_federation` writes token metadata and a trusted typed usage snapshot directly.
 10. **`ai_token_metrics` (4100)** runs after the response comes back from the backend — it parses supported HTTP JSON/SSE provider usage (prompt, completion, total, model) and writes it to `ctx.metadata`. Native gRPC protobuf messages are explicitly unsupported because no generic method/schema contract exists. Provider normalization runs before inspection; origin `gzip`/`br` coding chains are decoded only into a bounded inspection copy, leaving the encoded client response and headers unchanged. Public metadata flows into `TransactionSummary` for downstream logging, while bounded-label `prometheus_metrics` token/cost counters consume a separate typed usage snapshot that backend/operator metadata cannot mint. When several token-metrics instances publish different prefixes, Prometheus selects one most-complete token snapshot and at most one independently selected trusted cost per request instead of summing duplicates. It is observability-only and never enforces budget policy. When `ai_federation` is active, `ai_federation` publishes the same authoritative usage representation directly, and `ai_rate_limiter` reconciles usage from the public metadata on the rejection path.
-11. **`ai_rate_limiter` (4200)** reserves estimated token usage before proxying JSON `POST` requests, based on output-token caps plus estimated prompt tokens. It runs after `ai_token_metrics` on the response body path, reconciles the reservation to actual usage when usage metadata is available, and keeps/rejects/releases unmetered 2xx responses according to `on_unmetered_response`. Synthetic short-circuit bodies (cache/dedup/mock/etc.) are never charged or released — the limiter exempts them via the internal `ferrum:synthetic_short_circuit` marker. When `ai_federation` is active, the rate limiter uses `applies_after_proxy_on_reject()` to reconcile token usage from federation metadata on the rejection path (the sole federation charger, scoped per limiter instance).
+11. **`ai_rate_limiter` (4200)** reserves estimated token usage before proxying JSON `POST` requests, based on output-token caps plus estimated prompt tokens. It runs after `ai_token_metrics` on the response body path, reconciles the reservation to actual usage when usage metadata is available, and keeps/rejects/releases unmetered 2xx responses according to `on_unmetered_response`. It requests response buffering only for a request it classified as an AI call and only for a successful JSON representation; streaming responses (SSE and AWS Bedrock `application/vnd.amazon.eventstream`) are metered by a bounded pass-through `response_stream_inspector` that forwards bytes unchanged — Bedrock event-stream prelude and message CRC32 values are verified before any declared length or usage payload is trusted — and their reservation is reconciled once from `on_response_stream_terminated` — which also fires on client disconnect and backend error. A non-2xx backend response releases its reservation from the status-only `after_proxy` phase. A genuine pre-provider / failed-dispatch gateway rejection releases on the reject-replay `after_proxy` pass; a later body-policy or after_proxy rejection of a provider-consumed 2xx keeps the charge. Window/TTL is only the backstop for cancellation-only cases that cannot await those hooks. Every reservation-lifecycle metadata key is scoped to the limiter instance, so composed per-consumer and per-IP budgets reconcile and release independently. Synthetic short-circuit bodies (cache/dedup/mock/etc.) are never charged or released — the limiter exempts them via the internal `ferrum:synthetic_short_circuit` marker. When `ai_federation` is active, the rate limiter uses `applies_after_proxy_on_reject()` to reconcile token usage from federation metadata on the rejection path (the sole federation charger, scoped per limiter instance).
 
 ### Streaming AI: ai_stream_router (2984) claims `stream: true`, ai_federation (4060) owns the rest
 
@@ -1239,7 +1558,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `udp_rate_limiting` | | | | | ✓ | Per-client-IP datagram and byte rate limiting for UDP proxies |
 | `ai_transcript_audit` | ✓ | | | | | HTTP-only AI transcript capture to a configured sink |
 | `ai_prompt_shield` | ✓ | | | | | HTTP-only PII detection/redaction for bare JSON prompts; native gRPC unsupported (gRPC-Web framed bodies are skipped) |
-| `waf` | ✓ | ✓ | ✓ | ✓ | ✓ | HTTP-family always; TCP/UDP first-bytes and datagram inspection when a `stream` block is configured |
+| `waf` | ✓ | ✓ | ✓ | ✓ | ✓ | HTTP-family always, including complete WebSocket text/binary application messages in both directions; TCP/UDP first-bytes and datagram inspection when a `stream` block is configured |
 | `fault_injection` | ✓ | ✓ | ✓ | ✓ | ✓ | Probabilistic aborts and delays across HTTP-family, TCP stream connect, and UDP/DTLS session + datagram hooks |
 | `body_validator` | ✓ | ✓ | | | | Validates request and response bodies |
 | `openapi_validator` | ✓ | | | | | Validates bodies against generated OpenAPI operation schemas |

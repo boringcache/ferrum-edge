@@ -102,7 +102,10 @@ fn h3_early_data_uses_the_bounded_stateful_resumption_cache() {
     let ticketer_block = &source[conditional..cache];
 
     assert!(
-        ticketer_block.contains("rustls::crypto::ring::Ticketer::new()"),
+        // Provider selection moved behind the single `crate::fips` seam
+        // (issue #3510); the assertion is still that a *stateless* ticketer is
+        // what appears in this branch.
+        ticketer_block.contains("crate::fips::ticketer()"),
         "stateless tickets must be used only when server early data is disabled"
     );
     assert!(

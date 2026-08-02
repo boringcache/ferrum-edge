@@ -592,6 +592,11 @@ pub struct RequestMatch {
     /// Istio `notPorts` — conjunctive negative-match for the request port.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_ports: Vec<u16>,
+    /// Glob port patterns for Istio string-match `notPorts` such as `"8*"`.
+    /// Compiled/normalized at config load; conjunctive with `not_ports` and
+    /// positive fields in the same rule (never split into a separate deny).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_port_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -3448,7 +3453,8 @@ fn validate_mesh_config_internal(
                 let any_not = !request.not_methods.is_empty()
                     || !request.not_paths.is_empty()
                     || !request.not_hosts.is_empty()
-                    || !request.not_ports.is_empty();
+                    || !request.not_ports.is_empty()
+                    || !request.not_port_patterns.is_empty();
                 if !(any_method || any_path || any_host || any_header || any_port || any_not) {
                     errors.push(format!(
                         "MeshPolicy '{}'.rules[{}].to[{}]: at least one of \
@@ -3483,9 +3489,21 @@ fn validate_mesh_config_internal(
                     if !is_valid_request_match_port_pattern(pattern) {
                         errors.push(format!(
                             "MeshPolicy '{}'.rules[{}].to[{}].port_patterns[{}] \
-                             '{}' is not a valid port pattern \
-                             (expected '*', '<digits>*', or '*<digits>')",
-                            policy.name, i, j, k, pattern
+                             is not an admissible port pattern \
+                             (expected '*', '<digits>*', or '*<digits>' that can \
+                             match a destination/listener port in 1..=65535)",
+                            policy.name, i, j, k
+                        ));
+                    }
+                }
+                for (k, pattern) in request.not_port_patterns.iter().enumerate() {
+                    if !is_valid_request_match_port_pattern(pattern) {
+                        errors.push(format!(
+                            "MeshPolicy '{}'.rules[{}].to[{}].not_port_patterns[{}] \
+                             is not an admissible port pattern \
+                             (expected '*', '<digits>*', or '*<digits>' that can \
+                             match a destination/listener port in 1..=65535)",
+                            policy.name, i, j, k
                         ));
                     }
                 }
@@ -4412,6 +4430,12 @@ fn normalize_mesh_policy_fields(policies: &mut [MeshPolicy]) {
                         *pattern = trimmed.to_string();
                     }
                 }
+                for pattern in &mut request.not_port_patterns {
+                    let trimmed = pattern.trim();
+                    if trimmed.len() != pattern.len() {
+                        *pattern = trimmed.to_string();
+                    }
+                }
                 normalize_mesh_policy_header_map(&mut request.headers);
             }
         }
@@ -4442,19 +4466,115 @@ pub(crate) fn normalize_request_match_host_pattern(pattern: &str) -> String {
         .unwrap_or(pattern)
 }
 
-/// True when `pattern` is one of the three Istio-allowed port wildcard forms:
-/// `*`, `<digits>*`, or `*<digits>`. Mirrors `is_istio_port_pattern` in the
-/// Istio translator so direct-config and translated configs validate
-/// identically.
-pub(crate) fn is_valid_request_match_port_pattern(pattern: &str) -> bool {
+/// Cold-path admission outcome for Istio/Ferrum port wildcard patterns.
+///
+/// Shared by the Istio AuthorizationPolicy translator (`ports` / `notPorts`)
+/// and native MeshPolicy validation (`port_patterns` / `not_port_patterns`) so
+/// grammar and semantic checks cannot drift across surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PortPatternAdmission {
+    /// Pattern is one of `*` / `<digits>*` / `*<digits>` and matches at least
+    /// one ordinary decimal port in `1..=65535`.
+    Admissible,
+    /// Pattern has the wildcard grammar above but cannot match any port in
+    /// `1..=65535` (for example `70000*` or `0*`).
+    Inadmissible,
+    /// Not a port wildcard pattern; callers may attempt literal `u16` parse.
+    NotAPattern,
+}
+
+/// Canonical bounded port-pattern admissibility helper.
+///
+/// Accepts only `*`, `<digits>*`, or `*<digits>`, and only when the pattern can
+/// match at least one ordinary decimal port in `1..=65535` (no leading zeroes
+/// in port representations). Mid-string stars, named ports, empty values, and
+/// semantically impossible digit wildcards are not admissible. Cold-path only.
+pub(crate) fn admit_request_match_port_pattern(pattern: &str) -> PortPatternAdmission {
     if pattern == "*" {
-        return true;
+        return PortPatternAdmission::Admissible;
     }
     if let Some(prefix) = pattern.strip_suffix('*') {
-        return !prefix.is_empty() && prefix.bytes().all(|byte| byte.is_ascii_digit());
+        // Reject mid-string stars such as `8*9` (prefix still contains `*`).
+        if prefix.is_empty() || prefix.contains('*') {
+            return PortPatternAdmission::NotAPattern;
+        }
+        if !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+            return PortPatternAdmission::NotAPattern;
+        }
+        return if port_prefix_pattern_is_admissible(prefix) {
+            PortPatternAdmission::Admissible
+        } else {
+            PortPatternAdmission::Inadmissible
+        };
     }
     if let Some(suffix) = pattern.strip_prefix('*') {
-        return !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit());
+        if suffix.is_empty() || suffix.contains('*') {
+            return PortPatternAdmission::NotAPattern;
+        }
+        if !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+            return PortPatternAdmission::NotAPattern;
+        }
+        return if port_suffix_pattern_is_admissible(suffix) {
+            PortPatternAdmission::Admissible
+        } else {
+            PortPatternAdmission::Inadmissible
+        };
+    }
+    PortPatternAdmission::NotAPattern
+}
+
+/// True when `pattern` is an admissible Istio/Ferrum port wildcard.
+pub(crate) fn is_valid_request_match_port_pattern(pattern: &str) -> bool {
+    admit_request_match_port_pattern(pattern) == PortPatternAdmission::Admissible
+}
+
+/// Prefix form `<digits>*`: ordinary decimal ports never use leading zeroes, so
+/// a zero-prefixed digit string can never match `1..=65535`. A non-zero prefix
+/// is admissible iff it is itself the decimal form of some port in range
+/// (longer ports that share the prefix are then also covered).
+fn port_prefix_pattern_is_admissible(prefix: &str) -> bool {
+    if prefix.as_bytes().first().copied() == Some(b'0') {
+        return false;
+    }
+    match prefix.parse::<u32>() {
+        Ok(value) => (1..=65535).contains(&value),
+        Err(_) => false,
+    }
+}
+
+/// Suffix form `*<digits>`: admissible when some port in `1..=65535` has a
+/// decimal representation ending with `suffix` (leading zeroes in the suffix
+/// are meaningful, e.g. `*0001` is witnessed by `10001`).
+fn port_suffix_pattern_is_admissible(suffix: &str) -> bool {
+    let len = suffix.len();
+    if len > 5 {
+        return false;
+    }
+    let modulus = 10u32.pow(len as u32);
+    let Ok(target) = suffix.parse::<u32>() else {
+        return false;
+    };
+    // Smallest port whose decimal form has at least `len` digits.
+    let min_with_len = if len == 1 {
+        1u32
+    } else {
+        10u32.pow((len - 1) as u32)
+    };
+    let rem = min_with_len % modulus;
+    let first = if rem <= target {
+        min_with_len + (target - rem)
+    } else {
+        min_with_len + (modulus - rem) + target
+    };
+    let mut candidate = first;
+    while candidate <= 65535 {
+        if candidate >= 1 {
+            return true;
+        }
+        match candidate.checked_add(modulus) {
+            Some(next) => candidate = next,
+            None => break,
+        }
     }
     false
 }

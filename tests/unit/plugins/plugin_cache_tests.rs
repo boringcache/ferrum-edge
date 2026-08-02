@@ -7632,6 +7632,47 @@ fn ai_rate_limiter_excluded_from_native_grpc_protocol_view() {
 
 // ---- WebSocket per-frame plugin hook infrastructure ----
 
+#[test]
+fn test_priority_override_delegates_ws_session_binding() {
+    // A priority-overridden `waf` must still bind its per-session WebSocket
+    // policy. Without delegation the wrapper falls back to the trait default
+    // (`None`), every message reaches the WAF's fail-closed unbound path, and
+    // healthy sessions are closed (GHSA-6j3m-vf5h-pgcx).
+    let mut plugin = make_plugin_config_with_json(
+        "waf-1",
+        "waf",
+        json!({
+            "include_default_rules": false,
+            "custom_rules": [{
+                "id": "CUSTOM-WS",
+                "name": "prohibited token",
+                "category": "custom",
+                "target": "body_text",
+                "match_kind": "contains",
+                "pattern": "prohibited",
+                "action": "enforce"
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin.priority_override = Some(2500);
+    let config = make_config(vec![make_proxy("p1", "/ws", vec!["waf-1"])], vec![plugin]);
+    let cache = PluginCache::new(&config).expect("plugin cache must build");
+
+    let plugins = cache.get_plugins("ferrum", "p1");
+    let wrapper = plugins.first().expect("waf instance");
+    assert_eq!(wrapper.priority(), 2500);
+    assert!(wrapper.requires_ws_frame_hooks());
+
+    let ctx = RequestContext::new("203.0.113.10".into(), "GET".into(), "/ws".into());
+    let bound = Arc::clone(wrapper)
+        .bind_ws_session(&ctx)
+        .expect("the priority wrapper must delegate WebSocket session binding");
+    assert_eq!(bound.name(), "waf");
+    assert!(bound.requires_ws_frame_hooks());
+}
+
 #[tokio::test]
 async fn test_requires_ws_frame_hooks_defaults_false_for_all_plugins() {
     use ferrum_edge::plugins::available_plugins;
@@ -7640,7 +7681,11 @@ async fn test_requires_ws_frame_hooks_defaults_false_for_all_plugins() {
     // Every non-message-hook built-in plugin must return false for
     // requires_ws_frame_hooks(). Parser-only policies use the independent
     // requires_websocket_framing() aggregate.
-    const WS_FRAME_PLUGINS: &[&str] = &["ws_frame_logging", "ws_rate_limiting"];
+    //
+    // `waf` opts in whenever it governs application messages, so that an
+    // upgraded session is never tunnelled past body-rule inspection
+    // (GHSA-6j3m-vf5h-pgcx); a WAF with no body rule set still returns false.
+    const WS_FRAME_PLUGINS: &[&str] = &["waf", "ws_frame_logging", "ws_rate_limiting"];
 
     for name in available_plugins() {
         if WS_FRAME_PLUGINS.contains(&name) {
@@ -8371,6 +8416,7 @@ fn test_priority_override_delegates_spec_rejection_replacement_capability() {
     assert_eq!(plugins[0].priority(), 211);
     assert!(plugins[0].applies_after_proxy_on_reject());
     assert!(plugins[0].may_replace_rejection_response());
+    assert!(plugins[0].rejection_replacement_is_final_body_policy_terminal());
     assert!(!plugins[0].warn_on_rejection_response_replacement());
 }
 

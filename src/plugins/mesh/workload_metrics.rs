@@ -4,8 +4,8 @@
 //! existing logging and metrics sinks then pick them up without plugin-trait
 //! changes.
 
+use crate::fips::backend::rand::{SecureRandom, SystemRandom};
 use async_trait::async_trait;
-use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::Value;
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};

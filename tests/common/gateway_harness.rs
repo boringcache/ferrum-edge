@@ -18,6 +18,9 @@
 //!   so a bind-drop-rebind reservation outside the harness defeats the retry.
 //!   Prefer letting the harness allocate and reading [`TestGateway::proxy_port`]
 //!   after a successful spawn unless a coordinated fixed port is required.
+//!   When other listener ports are pinned (e.g. `FERRUM_PROXY_HTTPS_PORT` for
+//!   H3), the harness excludes them from its automatic admin/proxy allocations
+//!   within each attempt so plaintext and TLS listeners cannot collide.
 //! - **`Stdio::null()`** on stdin/stdout/stderr unless
 //!   [`TestGatewayBuilder::capture_output`] is enabled. Piped stdout without
 //!   reading causes pipe-buffer deadlock; see CLAUDE.md "Functional test
@@ -64,7 +67,7 @@ use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use reqwest::Client;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -471,6 +474,10 @@ pub struct TestGatewayBuilder {
     auto_build: bool,
     prefer_release: bool,
     extra_env: Vec<(String, String)>,
+    /// Listener ports carried outside `extra_env` (for example, raw stream
+    /// ports embedded in file-mode YAML). Automatic allocations must not reuse
+    /// them within a spawn attempt.
+    reserved_listener_ports: HashSet<u16>,
     /// Extra env vars to **remove** before spawning. Handy when the caller's
     /// parent shell has `FERRUM_*` set.
     scrub_env: Vec<String>,
@@ -499,6 +506,7 @@ impl Default for TestGatewayBuilder {
             auto_build: true,
             prefer_release: false,
             extra_env: Vec::new(),
+            reserved_listener_ports: HashSet::new(),
             scrub_env: Vec::new(),
             clear_env: false,
             capture_output: false,
@@ -623,6 +631,17 @@ impl TestGatewayBuilder {
         self
     }
 
+    /// Reserve a nonzero listener port that is configured outside the
+    /// builder's environment map, such as a raw TCP/UDP `listen_port` embedded
+    /// in file-mode YAML. Automatic admin, proxy HTTP, and CP gRPC allocations
+    /// will not reuse it within a spawn attempt.
+    pub fn reserve_listener_port(mut self, port: u16) -> Self {
+        if port != 0 {
+            self.reserved_listener_ports.insert(port);
+        }
+        self
+    }
+
     /// Remove a var from the subprocess environment. Useful when the parent
     /// shell has `FERRUM_*` vars set that would override builder defaults.
     pub fn scrub_env(mut self, key: impl Into<String>) -> Self {
@@ -729,16 +748,24 @@ impl TestGatewayBuilder {
 
     async fn try_spawn(&mut self) -> Result<TestGateway, Box<dyn std::error::Error + Send + Sync>> {
         let temp_dir = TempDir::new()?;
-        let admin_port = ephemeral_port().await?;
-        let proxy_port = ephemeral_port().await?;
+        let mut excluded_ports = collect_builder_pinned_ports(self);
+        let admin_port = ephemeral_port_excluding(&mut excluded_ports).await?;
+        let proxy_port = ephemeral_port_excluding(&mut excluded_ports).await?;
         // Fresh per *attempt*, not per builder: a previous attempt's child may
         // still be winding down, and a retry must never be satisfiable by it.
         let identity = InstanceIdentity::mint(self);
 
         let binary = locate_binary(self.prefer_release)?;
 
-        let (mut env, mut db_url, config_path) =
-            build_env(self, &identity, &temp_dir, admin_port, proxy_port).await?;
+        let (mut env, mut db_url, config_path) = build_env(
+            self,
+            &identity,
+            &temp_dir,
+            admin_port,
+            proxy_port,
+            &mut excluded_ports,
+        )
+        .await?;
 
         // Caller overrides win — append after defaults so they replace keys.
         for (k, v) in &self.extra_env {
@@ -875,12 +902,20 @@ impl TestGatewayBuilder {
         timeout: Duration,
     ) -> Result<FailedGatewayStart, Box<dyn std::error::Error + Send + Sync>> {
         let temp_dir = TempDir::new()?;
-        let admin_port = ephemeral_port().await?;
-        let proxy_port = ephemeral_port().await?;
+        let mut excluded_ports = collect_builder_pinned_ports(self);
+        let admin_port = ephemeral_port_excluding(&mut excluded_ports).await?;
+        let proxy_port = ephemeral_port_excluding(&mut excluded_ports).await?;
         let identity = InstanceIdentity::mint(self);
         let binary = locate_binary(self.prefer_release)?;
-        let (mut env, db_url, config_path) =
-            build_env(self, &identity, &temp_dir, admin_port, proxy_port).await?;
+        let (mut env, db_url, config_path) = build_env(
+            self,
+            &identity,
+            &temp_dir,
+            admin_port,
+            proxy_port,
+            &mut excluded_ports,
+        )
+        .await?;
         for (k, v) in &self.extra_env {
             env.insert(k.clone(), v.clone());
         }
@@ -1065,6 +1100,7 @@ async fn build_env(
     temp: &TempDir,
     admin_port: u16,
     proxy_port: u16,
+    excluded_ports: &mut HashSet<u16>,
 ) -> Result<
     (HashMap<String, String>, Option<String>, Option<PathBuf>),
     Box<dyn std::error::Error + Send + Sync>,
@@ -1175,7 +1211,7 @@ async fn build_env(
             let addr = match grpc_listen_addr {
                 Some(a) => a.clone(),
                 None => {
-                    let port = ephemeral_port().await?;
+                    let port = ephemeral_port_excluding(excluded_ports).await?;
                     format!("127.0.0.1:{port}")
                 }
             };
@@ -1223,6 +1259,62 @@ fn resolve_db(db: &DbType, temp: &TempDir) -> (String, String) {
     }
 }
 
+/// Env vars that pin a gateway listener port when set via
+/// [`TestGatewayBuilder::env`]. Automatic allocations within one spawn attempt
+/// must not reuse these values, or a bind-drop-rebind reservation outside the
+/// harness can collide with an auto-picked plaintext port (issue: ACME policy
+/// path flake — TLS alert bytes on a raw H1 client).
+const LISTENER_PORT_ENV_KEYS: &[&str] = &[
+    "FERRUM_PROXY_HTTP_PORT",
+    "FERRUM_PROXY_HTTPS_PORT",
+    "FERRUM_ADMIN_HTTP_PORT",
+    "FERRUM_ADMIN_HTTPS_PORT",
+];
+
+/// Ports explicitly pinned through [`TestGatewayBuilder::env`] before spawn.
+fn collect_env_pinned_ports(extra_env: &[(String, String)]) -> HashSet<u16> {
+    let mut pinned = HashSet::new();
+    for (key, value) in extra_env {
+        if LISTENER_PORT_ENV_KEYS.contains(&key.as_str()) {
+            if let Ok(port) = value.parse::<u16>()
+                && port != 0
+            {
+                pinned.insert(port);
+            }
+        } else if key == "FERRUM_CP_GRPC_LISTEN_ADDR"
+            && let Some(port) = parse_listen_addr_port(value)
+            && port != 0
+        {
+            pinned.insert(port);
+        }
+    }
+    pinned
+}
+
+/// Every listener port known to the builder before automatic allocation.
+/// Explicit CP addresses are part of the mode rather than `extra_env`; raw
+/// stream ports embedded in file config are supplied through
+/// [`TestGatewayBuilder::reserve_listener_port`].
+fn collect_builder_pinned_ports(builder: &TestGatewayBuilder) -> HashSet<u16> {
+    let mut pinned = builder.reserved_listener_ports.clone();
+    pinned.extend(collect_env_pinned_ports(&builder.extra_env));
+    if let GatewayMode::ControlPlane {
+        grpc_listen_addr: Some(addr),
+        ..
+    } = &builder.mode
+        && let Some(port) = parse_listen_addr_port(addr)
+        && port != 0
+    {
+        pinned.insert(port);
+    }
+    pinned
+}
+
+fn parse_listen_addr_port(addr: &str) -> Option<u16> {
+    let (_, port_str) = addr.rsplit_once(':')?;
+    port_str.parse().ok()
+}
+
 /// Bind an ephemeral port, then drop the listener. Not race-free — the
 /// caller must retry if the gateway binds fail. This is what the
 /// `max_attempts` loop in [`TestGatewayBuilder::spawn`] exists for.
@@ -1231,6 +1323,25 @@ pub async fn ephemeral_port() -> Result<u16, std::io::Error> {
     let port = l.local_addr()?.port();
     drop(l);
     Ok(port)
+}
+
+/// Like [`ephemeral_port`], but never returns a port already present in
+/// `excluded`. On success, inserts the chosen port into `excluded` so later
+/// allocations in the same spawn attempt stay distinct.
+pub async fn ephemeral_port_excluding(excluded: &mut HashSet<u16>) -> Result<u16, std::io::Error> {
+    const MAX_ATTEMPTS: u32 = 50;
+    for _ in 0..MAX_ATTEMPTS {
+        let port = ephemeral_port().await?;
+        if excluded.contains(&port) {
+            continue;
+        }
+        excluded.insert(port);
+        return Ok(port);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        "exhausted ephemeral port allocation while excluding pinned ports",
+    ))
 }
 
 /// Field that `/health` emits only in the authenticated (detail) tier. The
@@ -1593,4 +1704,56 @@ fn truncate_utf8_suffix(text: &str, max_bytes: usize) -> String {
         start += 1;
     }
     format!("…[truncated]…\n{}", &text[start..])
+}
+
+#[cfg(test)]
+mod port_allocation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ephemeral_port_excluding_skips_pinned_port() {
+        let mut excluded = HashSet::from([42424u16]);
+        let port = ephemeral_port_excluding(&mut excluded)
+            .await
+            .expect("allocate excluding pinned port");
+        assert_ne!(port, 42424, "must not reuse an env-pinned listener port");
+        assert!(excluded.contains(&port));
+    }
+
+    #[tokio::test]
+    async fn ephemeral_port_excluding_keeps_allocations_distinct() {
+        let mut excluded = HashSet::new();
+        let first = ephemeral_port_excluding(&mut excluded)
+            .await
+            .expect("first allocation");
+        let second = ephemeral_port_excluding(&mut excluded)
+            .await
+            .expect("second allocation");
+        assert_ne!(first, second, "ports within one spawn attempt must differ");
+    }
+
+    #[test]
+    fn collect_env_pinned_ports_reads_listener_overrides() {
+        let extra_env = vec![
+            ("FERRUM_PROXY_HTTPS_PORT".to_string(), "3443".to_string()),
+            (
+                "FERRUM_CP_GRPC_LISTEN_ADDR".to_string(),
+                "127.0.0.1:9090".to_string(),
+            ),
+            ("FERRUM_PROXY_HTTP_PORT".to_string(), "0".to_string()),
+        ];
+        let pinned = collect_env_pinned_ports(&extra_env);
+        assert_eq!(pinned, HashSet::from([3443, 9090]));
+    }
+
+    #[test]
+    fn collect_builder_pinned_ports_includes_mode_and_reserved_listeners() {
+        let builder = TestGateway::builder()
+            .mode_cp(DbType::Sqlite, Some("127.0.0.1:9443".to_string()))
+            .reserve_listener_port(7443)
+            .reserve_listener_port(0)
+            .env("FERRUM_PROXY_HTTPS_PORT", "3443");
+        let pinned = collect_builder_pinned_ports(&builder);
+        assert_eq!(pinned, HashSet::from([3443, 7443, 9443]));
+    }
 }

@@ -3,11 +3,8 @@
 //! This module provides a reusable SigV4 implementation for any AWS service.
 //! Used by `serverless_function` (Lambda) and `ai_federation` (Bedrock).
 
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::{Digest, Sha256};
+use crate::fips::approved::{HmacSha256, Sha256};
 use url::Url;
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// AWS credentials and region for SigV4 signing.
 #[derive(Debug, Clone)]
