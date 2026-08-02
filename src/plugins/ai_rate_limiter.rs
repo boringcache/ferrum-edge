@@ -144,13 +144,11 @@ mod meta {
     /// could not be estimated before proxying because decompression happens
     /// later.
     pub const COMPRESSED_AI_REQUEST: &str = "ai_ratelimit_compressed_ai_request";
-    /// Marks a compressed POST JSON request whose body a co-located
-    /// `compression` plugin decompressed: `before_proxy` cannot classify it
-    /// (the decoded bytes are not written back into
-    /// `ctx.metadata["request_body"]`), so it defers the AI-shape check to
-    /// `on_final_request_body_with_context`, where the decompressed body is
-    /// available. Mirrors `ai_request_guard`'s deferred-compressed handling
-    /// (#1919).
+    /// Marks the rare fallback where a co-located `compression` plugin decoded
+    /// a POST JSON body without a mutable pre-`before_proxy` buffer. The normal
+    /// buffered path refreshes `ctx.metadata["request_body"]` to plaintext and
+    /// is classified and pre-reserved immediately; only the fallback defers the
+    /// AI-shape check to `on_final_request_body_with_context`.
     pub const DEFERRED_COMPRESSED_CLASSIFICATION: &str =
         "ai_ratelimit_deferred_compressed_classify";
 }
@@ -176,9 +174,10 @@ const STREAM_ACCOUNTING_REFUSAL_LOG_INTERVAL: u64 = 1024;
 /// when it decompresses a request body. It is written into `ctx.metadata`, which
 /// clients cannot influence, so — unlike the `x-ferrum-original-content-encoding`
 /// header, which is only sanitized when `compression` actually runs — it is a
-/// trustworthy signal that the body WAS compressed and will be available
-/// decompressed in `on_final_request_body`. Detecting the deferred (Case A) path
-/// from a client-settable header would let a spoofed header skip pre-reservation.
+/// trustworthy signal that the body WAS compressed. On the normal buffered
+/// path the shared normalizer also refreshes `ctx.metadata["request_body"]` to
+/// plaintext before this plugin runs. Only the rare fallback without that text
+/// view must defer classification to the final request-body hook.
 const COMPRESSION_REQUEST_ENCODING_METADATA_KEY: &str = "compression:request_encoding";
 
 /// Process-wide monotonic counter used to give every `AiRateLimiter` instance a
@@ -952,11 +951,19 @@ impl AiRateLimiter {
     /// cap), which is why callers must track the AI-request signal separately from
     /// `reserved_tokens > 0`. Parses the body exactly once.
     fn estimate_request_tokens(&self, ctx: &RequestContext) -> (bool, u64) {
+        self.classify_request_tokens(ctx).unwrap_or((false, 0))
+    }
+
+    /// Parse the staged request text once, distinguishing an unavailable or
+    /// malformed view (`None`) from valid non-AI JSON (`Some((false, 0))`). The
+    /// distinction lets pre-`before_proxy` decompression reserve immediately
+    /// from refreshed plaintext while retaining the rare final-body fallback.
+    fn classify_request_tokens(&self, ctx: &RequestContext) -> Option<(bool, u64)> {
         let Some(body) = ctx.metadata.get("request_body") else {
-            return (false, 0);
+            return None;
         };
         let Ok(json) = serde_json::from_str::<Value>(body) else {
-            return (false, 0);
+            return None;
         };
         // Gate the AI-request marker on LLM shape, not mere JSON parseability: the
         // plugin forces full response buffering, so `reconcile_usage` runs for
@@ -964,10 +971,10 @@ impl AiRateLimiter {
         // (and `charge_estimate` would bill) an ordinary non-LLM JSON `POST` that
         // happens to share the proxy. See `request_was_ai_call`.
         if !json_looks_like_ai_request(&json) {
-            return (false, 0);
+            return Some((false, 0));
         }
 
-        (true, self.estimate_request_tokens_from_json(&json))
+        Some((true, self.estimate_request_tokens_from_json(&json)))
     }
 
     fn estimate_request_tokens_from_json(&self, json: &Value) -> u64 {
@@ -1982,14 +1989,13 @@ impl Plugin for AiRateLimiter {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        // A compressed body can't be estimated at `before_proxy` (decompression
-        // runs later in `transform_request_body`), so `before_proxy` forces
-        // `reserved_tokens = 0` and takes the reconcile-only path for it. Buffering
-        // it here would only spend memory/latency (and risk the pre-buffer size
-        // cap) for a reservation this plugin will never compute. Returning `false`
-        // just withdraws *this* plugin's buffering request — the handler still
-        // buffers if a co-located plugin (e.g. `ai_request_guard`) needs the body.
-        // See `has_non_identity_content_encoding` and `before_proxy` limitation #4.
+        // This plugin cannot decode a compressed body itself. Withdraw its own
+        // buffering vote: a co-located `compression` plugin that supports the
+        // coding requests the pre-`before_proxy` buffer, normalizes it, and
+        // refreshes the plaintext view this limiter then reserves from. Without
+        // such a decoder the body stays encoded and takes the reconcile-only,
+        // fail-closed candidate path. Avoid buffering bytes this plugin cannot
+        // interpret merely to discover that they are encoded.
         if has_non_identity_content_encoding(&ctx.headers) {
             return false;
         }
@@ -2005,12 +2011,10 @@ impl Plugin for AiRateLimiter {
     }
 
     fn needs_final_request_body_context(&self) -> bool {
-        // A compressed POST JSON body decompressed by a co-located `compression`
-        // plugin is classified in `on_final_request_body_with_context` (the
-        // decompressed bytes are only available there). See `before_proxy`
-        // Case A. `requires_request_body_buffering()` is already true (this
-        // plugin overrides `requires_request_body_before_before_proxy`), so the
-        // proxy passes the mutable context to the final-body hook.
+        // The normal pre-`before_proxy` decompression path refreshes plaintext
+        // early. Retain final-body context for the rare fallback where a decoder
+        // could only stage plaintext for the later transform; its instance-owned
+        // deferred marker is consumed there.
         true
     }
 
@@ -2147,18 +2151,15 @@ impl Plugin for AiRateLimiter {
         // handled the body:
         //
         //   Case A — `compression` with `decompress_request: true` already
-        //     decoded the body: it strips `content-encoding`, records the
-        //     `compression:request_encoding` metadata key, and decodes the body in
-        //     its later `transform_request_body`. The decoded bytes are NOT written
-        //     back into `ctx.metadata["request_body"]`, so we cannot classify here
-        //     — but `on_final_request_body` receives the decompressed body, so
-        //     classification is DEFERRED to there. We detect this from the
-        //     compression-owned METADATA key (not the `x-ferrum-original-content-`
-        //     `encoding` header, which a client can forge when `compression` is
-        //     absent or ordered after this plugin — that would let a forged header
-        //     skip pre-reservation). Without deferral the bare `content-encoding`
-        //     check below misses the request (the header is gone) and a usage-less
-        //     compressed AI 2xx would bypass the policy in the common setup.
+        //     decoded the normal buffered body in the shared pre-`before_proxy`
+        //     normalization phase: it strips `content-encoding`, records the
+        //     `compression:request_encoding` metadata key, and refreshes
+        //     `ctx.metadata["request_body"]` to the plaintext the backend will
+        //     receive. Classify and pre-reserve that plaintext normally. On the
+        //     rare fallback where the trusted marker exists but no parseable text
+        //     view was refreshed, defer classification to `on_final_request_body`.
+        //     Detect this only from compression-owned metadata, never from the
+        //     client-settable `x-ferrum-original-content-encoding` header.
         //   Case B — the body stays compressed end to end (no co-located
         //     decompression, or an encoding `compression` does not support):
         //     `content-encoding` is still present and the body is never
@@ -2197,7 +2198,11 @@ impl Plugin for AiRateLimiter {
             && ctx
                 .metadata
                 .contains_key(COMPRESSION_REQUEST_ENCODING_METADATA_KEY);
-        let defer_compressed_classification = decompressed_by_compression && is_post_json;
+        let normalized_request_tokens = (decompressed_by_compression && is_post_json)
+            .then(|| self.classify_request_tokens(ctx))
+            .flatten();
+        let defer_compressed_classification =
+            decompressed_by_compression && is_post_json && normalized_request_tokens.is_none();
         let (is_ai_request, reserved_tokens) = if is_framed_grpc {
             // Framed gRPC-Web: out of scope for this JSON policy entirely.
             (false, 0)
@@ -2205,8 +2210,12 @@ impl Plugin for AiRateLimiter {
             // Case B: uninspectable compressed body — fail closed for POST JSON.
             (is_post_json, 0)
         } else if defer_compressed_classification {
-            // Case A: defer to `on_final_request_body` (decompressed body there).
+            // Case A fallback: defer to `on_final_request_body` (plaintext there).
             (false, 0)
+        } else if let Some(classification) = normalized_request_tokens {
+            // Case A normal buffered decode: the shared normalizer refreshed
+            // the text view, so classify and reserve from that plaintext now.
+            classification
         } else {
             // Case C: uncompressed — estimate over the buffered inbound body.
             self.estimate_request_tokens(ctx)
@@ -2253,20 +2262,14 @@ impl Plugin for AiRateLimiter {
         //    documented under `count_mode` / `request_transformer` interaction
         //    in docs/plugins.md.
         //
-        // 4. Compressed request bodies are never pre-reserved: `reserved_tokens`
-        //    is forced to 0 above (an estimate over the still-compressed bytes
-        //    would be wrong/tiny), so they fall through to the `CheckBudget` path
-        //    (which still enforces an already-exhausted budget) and post-response
-        //    reconciliation charges the actual provider-reported usage. They are
-        //    NOT exempt from `on_unmetered_response`, however: a body a co-located
-        //    `compression` plugin decompressed is classified in
-        //    `on_final_request_body` against the decoded bytes (Case A above), and
-        //    an uninspectable still-compressed POST JSON body is marked a
-        //    fail-closed AI candidate (Case B), so a usage-less compressed AI 2xx
-        //    cannot bypass `reject`/`charge_estimate` enforcement. This matches
-        //    how `ai_request_guard` treats compressed bodies (#1919) and is
-        //    documented under `count_mode` / `on_unmetered_response` in
-        //    docs/plugins.md.
+        // 4. A body normalized by a co-located `compression` plugin is classified
+        //    and pre-reserved from the refreshed plaintext view (Case A). A body
+        //    that stays compressed cannot be estimated safely: it falls through
+        //    to `CheckBudget`, is marked as a fail-closed AI candidate for a JSON
+        //    POST, and post-response reconciliation charges authoritative usage
+        //    (Case B). The rare decoded fallback without a refreshed text view
+        //    defers classification to `on_final_request_body`; a usage-less 2xx
+        //    can therefore never turn the missing estimate into a free call.
         // Advance sampled idle reclamation before admission so an exactly-full
         // map of expired keys cannot remain pinned closed when only new
         // identities arrive. Cleanup never removes live budgets.
@@ -2308,9 +2311,9 @@ impl Plugin for AiRateLimiter {
         }
 
         // Record this request's `on_unmetered_response` classification:
-        //   - Case A (decompressed-by-compression): DEFER. `on_final_request_body`
-        //     inspects the decompressed body and sets the markers there, so a
-        //     non-AI JSON body is never falsely subjected to the policy.
+        //   - Case A normal buffered decode: classify and reserve from the
+        //     refreshed plaintext above. Only its rare no-text-view fallback
+        //     defers to `on_final_request_body`.
         //   - Case B (uninspectable compressed POST JSON): `is_ai_request` is the
         //     fail-closed candidate; also tag it compressed so the default
         //     `charge_estimate` path rejects a usage-less 2xx (no safe estimate).
@@ -2372,12 +2375,12 @@ impl Plugin for AiRateLimiter {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        // Only act on a request `before_proxy` deferred (Case A: a compressed
-        // POST JSON body a co-located `compression` plugin decompressed). The
-        // marker is shared across co-located `ai_rate_limiter` instances —
-        // whichever runs first sets the (idempotent) AI markers for all; the rest
-        // observe a cleared marker and no-op. The common uncompressed path never
-        // sets the marker, so it skips this hook.
+        // Only act on the rare Case A fallback where a co-located `compression`
+        // plugin decoded a POST JSON body but the pre-`before_proxy` phase had no
+        // parseable text view to refresh. The normal buffered decode is already
+        // classified and pre-reserved from plaintext in `before_proxy`. Keys are
+        // instance-scoped, so each co-located limiter consumes only its own
+        // deferred marker.
         if ctx
             .metadata
             .remove(&self.keys.deferred_compressed_classification)
@@ -2414,10 +2417,10 @@ impl Plugin for AiRateLimiter {
 
         // The decompressed body is available now. Mark the request as an AI call
         // ONLY when it actually parses as one, so a non-AI JSON body on a shared
-        // proxy is never subjected to the `on_unmetered_response` policy (the
-        // false-positive the bare `before_proxy` header check would cause). Tag it
-        // compressed so the default `charge_estimate` path rejects a usage-less
-        // 2xx — there is no safe pre-request estimate for a compressed body.
+        // proxy is never subjected to the `on_unmetered_response` policy. This
+        // fallback could not take a safe pre-reservation, so tag it compressed;
+        // default `charge_estimate` rejects a usage-less 2xx instead of treating
+        // an absent estimate as a free charge.
         if serde_json::from_slice::<Value>(body)
             .ok()
             .as_ref()

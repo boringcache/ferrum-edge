@@ -337,6 +337,18 @@ impl UsageStreamExtractor {
                 self.carry.clear();
                 continue;
             }
+            // Enforce the line cap before parsing a complete unit too. The
+            // unterminated-tail check below bounds retained carry, but without
+            // this check a hostile backend could place an arbitrarily large
+            // newline-terminated `data:` field in one body chunk, or complete
+            // a near-cap carry with one large following segment. The former
+            // would hand the whole borrowed slice to serde_json and the latter
+            // would allocate their combined size, bypassing the bounded-parser
+            // guarantee even though neither survives after this iteration.
+            if self.carry.len().saturating_add(line.len()) > MAX_SSE_EVENT_BYTES {
+                self.carry.clear();
+                continue;
+            }
             if self.carry.is_empty() {
                 self.apply_sse_line(line);
             } else {

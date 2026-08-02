@@ -496,6 +496,47 @@ fn oversized_sse_line_resynchronizes_and_still_captures_a_later_usage_event() {
 }
 
 #[test]
+fn complete_oversized_sse_line_in_one_chunk_is_not_parsed() {
+    let mut body = br#"data: {"usage":{"total_tokens":999},"padding":""#.to_vec();
+    body.extend(std::iter::repeat_n(
+        b'x',
+        MAX_SSE_EVENT_BYTES.saturating_add(1),
+    ));
+    body.extend_from_slice(b"\"}\n");
+
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&body);
+    extractor.finish();
+    assert!(
+        !extractor.usage().observed(),
+        "a complete SSE line above the cap must not reach JSON parsing"
+    );
+    assert_eq!(extractor.retained_bytes(), 0);
+}
+
+#[test]
+fn complete_oversized_sse_line_split_at_the_cap_is_not_merged_or_parsed() {
+    let mut body = br#"data: {"usage":{"total_tokens":999},"padding":""#.to_vec();
+    body.extend(std::iter::repeat_n(
+        b'y',
+        MAX_SSE_EVENT_BYTES.saturating_add(1),
+    ));
+    body.extend_from_slice(b"\"}\n");
+    let split = MAX_SSE_EVENT_BYTES.saturating_sub(1);
+
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&body[..split]);
+    assert!(extractor.retained_bytes() <= MAX_SSE_EVENT_BYTES);
+    extractor.push(&body[split..]);
+    extractor.finish();
+    assert!(
+        !extractor.usage().observed(),
+        "a line completed across chunks must still obey the parser cap"
+    );
+    assert_eq!(extractor.retained_bytes(), 0);
+}
+
+#[test]
 fn sse_events_split_across_chunk_boundaries_are_reassembled() {
     let body = sse(&[
         &json!({"usageMetadata": {"promptTokenCount": 4, "candidatesTokenCount": 6}}).to_string(),
