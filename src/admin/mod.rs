@@ -1930,12 +1930,11 @@ async fn handle_admin_request_inner(
             }
         }
 
-        // Admin audit delivery pipeline (issue #2421). An unavailable pipeline
-        // degrades `status` so a stuck audit backlog is not invisible behind an
-        // otherwise green probe. This check is a lock-free atomic read: the
-        // detailed projection below is what pays the bounded backlog rescan, so
-        // an unauthenticated probe cannot drive filesystem work.
-        // Both checks are single atomic loads. `pipeline_degraded()` is sticky
+        // Admin audit delivery pipeline (issue #2421). An unavailable or
+        // degraded pipeline degrades `status` so a stuck audit backlog is not
+        // invisible behind an otherwise green probe. Both checks are single
+        // atomic loads, and so is the detailed projection below, so no probe
+        // tier can drive filesystem work. `pipeline_degraded()` is sticky
         // evidence that records were corrupted, retained as unrecoverable, or
         // permanently discarded: a later successful delivery must not clear it,
         // so it stays visible until the evidence itself is resolved.
@@ -2061,9 +2060,11 @@ async fn handle_admin_request_inner(
         // timestamps while operators using the established observability auth
         // paths can diagnose stdout/stderr independently.
         if detailed {
-            // Counts, bounded backlog, retained/unrecoverable state, and a
-            // closed-set reason label only — never an actor subject, token,
-            // diff, resource id, or spool path (issue #2421).
+            // Counts, backlog, retained/unrecoverable state, sticky
+            // degradation, and closed-set reason labels only — never an actor
+            // subject, token, diff, resource id, connection string, or spool
+            // path (issue #2421). Every field is an atomic or cached background
+            // value, so this projection is O(1).
             if state.admin_audit_enabled {
                 health_status["audit_pipeline"] =
                     serde_json::to_value(audit::pipeline_status()).unwrap_or_default();

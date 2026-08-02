@@ -11254,16 +11254,14 @@ components:
         `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed` audited admin
         mutations are refused with `503` **before** they are performed.
       required:
-        [
-          enabled,
-          durability,
-          policy,
-          available,
-          last_unavailable_reason,
-          degraded,
-          degraded_reason,
-          evidence_lost,
-        ]
+        - enabled
+        - durability
+        - policy
+        - available
+        - last_unavailable_reason
+        - degraded
+        - degraded_reason
+        - evidence_lost
       properties:
         enabled:
           type: boolean

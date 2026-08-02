@@ -952,7 +952,14 @@ fn record_ids_are_the_path_traversal_boundary() {
 #[test]
 fn hostile_request_context_is_sanitized_before_it_becomes_evidence() {
     assert_eq!(sanitize_audit_path("/proxies/abc-1"), "/proxies/abc-1");
-    for hostile in ["/proxies/../../etc/passwd", "/a\nb", "/a b", &"x".repeat(600)] {
+    let overlong = format!("/{}", "x".repeat(600));
+    for hostile in [
+        "/proxies/../../etc/passwd",
+        "/a\nb",
+        "/a b",
+        "/a?b=<script>",
+        overlong.as_str(),
+    ] {
         assert_eq!(sanitize_audit_path(hostile), "invalid", "path: {hostile}");
     }
     assert_eq!(sanitize_audit_namespace("ferrum"), "ferrum");
