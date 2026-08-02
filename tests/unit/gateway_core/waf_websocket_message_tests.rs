@@ -8,9 +8,9 @@
 //! Everything here drives the PRODUCTION composition path — the per-session
 //! plugin collection (`Plugin::bind_ws_session` substitution) followed by the
 //! shared `on_ws_frame` applicator. H1 Upgrade, H2 Extended CONNECT (RFC 8441)
-//! and H3 Extended CONNECT (RFC 9220) all funnel through those exact two
-//! helpers inside `run_websocket_proxy`, so a decision proven here is the
-//! decision all three frontends make.
+//! and H3 Extended CONNECT (RFC 9220) all use those helpers inside
+//! `run_websocket_proxy`; transport-entry tests separately pin the request
+//! context each frontend supplies to the shared session binder.
 
 use std::sync::Arc;
 
@@ -298,6 +298,65 @@ async fn rule_conditions_are_resolved_from_the_upgrade_request() {
         other, original,
         "a rule whose upgrade-time conditions did not match cannot block"
     );
+}
+
+#[tokio::test]
+async fn header_conditions_are_resolved_from_the_upgrade_request() {
+    let plugins = vec![waf(json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-WS-HEADER-COND",
+            "name": "tenant-conditioned token",
+            "category": "custom",
+            "target": "body_text",
+            "match_kind": "contains",
+            "pattern": PROHIBITED,
+            "action": "enforce",
+            "conditions": { "headers": { "x-tenant": "acme" } }
+        }]
+    }))];
+    let original = Message::Text(PROHIBITED.into());
+
+    let mut governed_ctx = upgrade_ctx("/ws");
+    governed_ctx
+        .headers
+        .insert("x-tenant".to_string(), "acme".to_string());
+    let governed = relay_to_backend(&plugins, &governed_ctx, original.clone()).await;
+    assert_policy_close(&governed);
+
+    let mut other_ctx = upgrade_ctx("/ws");
+    other_ctx
+        .headers
+        .insert("x-tenant".to_string(), "other".to_string());
+    let other = relay_to_backend(&plugins, &other_ctx, original.clone()).await;
+    assert_eq!(
+        other, original,
+        "a header-conditioned rule must not govern a different tenant"
+    );
+}
+
+#[tokio::test]
+async fn header_present_exemption_is_bound_for_the_whole_session() {
+    let mut config = enforcing_request_rule();
+    config["global_exemptions"] = json!({
+        "header_present": { "x-skip-waf": null }
+    });
+    let plugins = vec![waf(config)];
+    let original = Message::Text(PROHIBITED.into());
+
+    let mut exempt_ctx = upgrade_ctx("/ws");
+    exempt_ctx
+        .headers
+        .insert("x-skip-waf".to_string(), "1".to_string());
+    let exempt = relay_to_backend(&plugins, &exempt_ctx, original.clone()).await;
+    assert_eq!(
+        exempt, original,
+        "a header-exempt upgrade must suppress message rules for the session"
+    );
+
+    let governed_ctx = upgrade_ctx("/ws");
+    let governed = relay_to_backend(&plugins, &governed_ctx, original).await;
+    assert_policy_close(&governed);
 }
 
 // ---------------------------------------------------------------------------

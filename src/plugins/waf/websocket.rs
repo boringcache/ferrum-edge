@@ -112,10 +112,17 @@ pub(super) struct WsSessionPolicy {
 
 impl WsSessionPolicy {
     fn from_upgrade(waf: &Waf, ctx: &RequestContext) -> Self {
+        // `ctx.headers` must still contain the admitted upgrade request here:
+        // rule conditions and `global_exemptions.header_present` are resolved
+        // once into this session snapshot. H1/H2 retain them naturally; the H3
+        // dispatch handoff explicitly clones rather than takes them for a
+        // WebSocket upgrade.
         // A request-wide exemption on the upgrade short-circuits the whole
         // session exactly as it would short-circuit the equivalent HTTP
         // request: nothing is inspected and nothing can block.
         let exempt = waf.exemptions.request_short_circuits(ctx);
+        let inspect_client_to_backend = !exempt && waf.requires_request_body_buffering();
+        let inspect_backend_to_client = !exempt && waf.requires_response_body_buffering();
         Self {
             suppressed_by_request: waf.exemptions.suppresses_rule_for_request(ctx),
             rule_conditions: waf
@@ -124,11 +131,11 @@ impl WsSessionPolicy {
                 .iter()
                 .map(|rule| rule.matches_conditions(ctx))
                 .collect(),
-            inspect_client_to_backend: !exempt && waf.requires_request_body_buffering(),
-            inspect_backend_to_client: !exempt && waf.requires_response_body_buffering(),
-            enforcing_client_to_backend: !exempt
+            inspect_client_to_backend,
+            inspect_backend_to_client,
+            enforcing_client_to_backend: inspect_client_to_backend
                 && waf.has_enforcing_body_policy(BodyDirection::Request, ctx),
-            enforcing_backend_to_client: !exempt
+            enforcing_backend_to_client: inspect_backend_to_client
                 && waf.has_enforcing_body_policy(BodyDirection::Response, ctx),
         }
     }
@@ -145,7 +152,10 @@ impl WsSessionPolicy {
                 .rule_conditions
                 .get(rule_index)
                 .copied()
-                .unwrap_or(false)
+                // A foreign index is an internal invariant violation. Release
+                // builds still fail closed by treating the condition as
+                // matched rather than silently skipping an enforcing rule.
+                .unwrap_or(true)
     }
 
     fn inspects(&self, direction: BodyDirection) -> bool {
@@ -171,7 +181,7 @@ fn body_direction(direction: WebSocketFrameDirection) -> BodyDirection {
     }
 }
 
-fn direction_label(direction: WebSocketFrameDirection) -> &'static str {
+pub(super) fn direction_label(direction: WebSocketFrameDirection) -> &'static str {
     match direction {
         WebSocketFrameDirection::ClientToBackend => "client->backend",
         WebSocketFrameDirection::BackendToClient => "backend->client",
@@ -353,6 +363,7 @@ impl WafWsSession {
                 proxy = %proxy_id,
                 connection_id,
                 direction = direction_label(direction),
+                waf_instance = %self.waf.identity,
                 rule = %rule_id,
                 severity = %highest.as_str(),
                 block_reason = "rule",

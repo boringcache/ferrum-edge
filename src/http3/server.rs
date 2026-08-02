@@ -3319,6 +3319,7 @@ async fn handle_h3_request(
         owned_proxy_headers,
         &mut ctx,
         needs_ctx_headers_for_body_hooks,
+        http_flavor,
     );
 
     // Egress baggage strip — see `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`. The
@@ -13173,24 +13174,28 @@ fn strip_query_params(url: &str) -> &str {
 
 /// Resolve the per-request `proxy_headers` map for the H3 dispatch path.
 ///
-/// When `needs_ctx_headers` is `false` (the common case: no context-aware
-/// final request-body hooks active), the headers are *moved* out of
-/// `ctx.headers` via `std::mem::take`, matching the pre-existing zero-alloc
-/// hot path. Downstream H3 code after this point does not read
-/// `ctx.headers`, so leaving the map empty is safe.
+/// When `needs_ctx_headers` is `false` and this is not a WebSocket upgrade (the
+/// common case: no context-aware final request-body hooks or session binding
+/// active), the headers are *moved* out of `ctx.headers` via
+/// `std::mem::take`, matching the pre-existing zero-alloc hot path. Downstream
+/// H3 code after this point does not read `ctx.headers`, so leaving the map
+/// empty is safe.
 ///
 /// When `needs_ctx_headers` is `true` (e.g. WAF or another plugin that
-/// overrides `needs_final_request_body_context`), the map is cloned so the
-/// body hook can still read `ctx.headers` for content-type/content-length
-/// gates and rule conditions.
+/// overrides `needs_final_request_body_context`) or the request is a WebSocket
+/// upgrade, the map is cloned. Body hooks need content-type/content-length
+/// gates; WebSocket session binding needs the original upgrade headers for
+/// WAF rule conditions and header-present exemptions.
 fn own_h3_proxy_headers(
     owned_proxy_headers: Option<HashMap<String, String>>,
     ctx: &mut RequestContext,
     needs_ctx_headers: bool,
+    http_flavor: HttpFlavor,
 ) -> HashMap<String, String> {
+    let preserve_ctx_headers = needs_ctx_headers || http_flavor == HttpFlavor::WebSocket;
     match owned_proxy_headers {
         Some(headers) => headers,
-        None if needs_ctx_headers => ctx.headers.clone(),
+        None if preserve_ctx_headers => ctx.headers.clone(),
         None => std::mem::take(&mut ctx.headers),
     }
 }
@@ -13397,6 +13402,7 @@ mod native_h3_retry_refinement_tests {
 #[cfg(test)]
 mod h3_proxy_header_tests {
     use super::own_h3_proxy_headers;
+    use crate::config::types::HttpFlavor;
     use crate::plugins::RequestContext;
     use std::collections::HashMap;
 
@@ -13413,7 +13419,7 @@ mod h3_proxy_header_tests {
         ctx.headers
             .insert("content-type".to_string(), "application/json".to_string());
 
-        let proxy_headers = own_h3_proxy_headers(None, &mut ctx, true);
+        let proxy_headers = own_h3_proxy_headers(None, &mut ctx, true, HttpFlavor::Plain);
 
         assert_eq!(
             proxy_headers.get("content-type").map(String::as_str),
@@ -13439,7 +13445,7 @@ mod h3_proxy_header_tests {
         ctx.headers
             .insert("content-type".to_string(), "application/json".to_string());
 
-        let proxy_headers = own_h3_proxy_headers(None, &mut ctx, false);
+        let proxy_headers = own_h3_proxy_headers(None, &mut ctx, false, HttpFlavor::Plain);
 
         assert_eq!(
             proxy_headers.get("content-type").map(String::as_str),
@@ -13465,7 +13471,8 @@ mod h3_proxy_header_tests {
             .insert("content-type".to_string(), "application/json".to_string());
         let owned = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
 
-        let proxy_headers = own_h3_proxy_headers(Some(owned), &mut ctx, true);
+        let proxy_headers =
+            own_h3_proxy_headers(Some(owned), &mut ctx, true, HttpFlavor::Plain);
 
         assert_eq!(
             proxy_headers.get("content-type").map(String::as_str),
@@ -13474,6 +13481,34 @@ mod h3_proxy_header_tests {
         assert_eq!(
             ctx.headers.get("content-type").map(String::as_str),
             Some("application/json")
+        );
+    }
+
+    #[test]
+    fn websocket_session_binding_preserves_upgrade_headers_without_body_hooks() {
+        // WebSocket upgrades are GET/CONNECT and normally do not request the
+        // final HTTP body-hook context. Their session policy still binds after
+        // this handoff and must retain header-conditioned WAF rules and
+        // header-present exemptions on the native H3 path.
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "CONNECT".to_string(),
+            "/ws".to_string(),
+        );
+        ctx.headers
+            .insert("x-tenant".to_string(), "acme".to_string());
+
+        let proxy_headers =
+            own_h3_proxy_headers(None, &mut ctx, false, HttpFlavor::WebSocket);
+
+        assert_eq!(
+            proxy_headers.get("x-tenant").map(String::as_str),
+            Some("acme")
+        );
+        assert_eq!(
+            ctx.headers.get("x-tenant").map(String::as_str),
+            Some("acme"),
+            "H3 WebSocket session binding must receive the upgrade headers"
         );
     }
 }

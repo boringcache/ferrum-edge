@@ -452,13 +452,24 @@ fixed-cardinality `waf`-target log events instead of `waf.*` transaction
 metadata: one event for every block (always, since the close is the only other
 signal), plus one per matched rule and one per non-blocking
 oversize/uninspectable/scan-timeout signal when `log_to_stdout` is enabled. No
-message bytes are logged.
+message bytes are logged. Monitor-mode WebSocket findings are non-blocking and
+there is no per-message transaction metadata surface, so enable
+`log_to_stdout` when staging WebSocket policy in `mode: monitor`; otherwise
+those findings intentionally produce no operator-visible signal.
 
 **Operational note.** Configuring WAF body rules on a WebSocket proxy opts that
 proxy's sessions into the parsed frame relay; the raw tunnel-mode fast path
-cannot inspect messages and is not used for them. A WAF with no body rule set,
-or with body inspection disabled in both directions, keeps the previous
-handshake-only behavior and does not force parsed framing.
+cannot inspect messages and is not used for them. This also makes the session
+subject to the parsed relay's `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` ceiling;
+an oversized frame closes with code 1009 even when
+`FERRUM_WEBSOCKET_TUNNEL_MODE=true`. Message scanning performs decoded-variant
+and rule-set work for every complete message up to `max_scan_bytes`, and the
+scan budget is evaluated after that bounded scan completes. For high-rate
+WebSocket workloads, size `max_scan_bytes` to the protocol's real message
+envelope and pair WAF with `ws_rate_limiting` to bound repeated per-message
+work. A WAF with no body rule set, or with body inspection disabled in both
+directions, keeps the previous handshake-only behavior and does not force
+parsed framing.
 
 ## Stream (TCP/UDP) inspection
 

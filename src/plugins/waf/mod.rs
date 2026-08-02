@@ -1246,7 +1246,7 @@ impl Plugin for Waf {
             plugin = "waf",
             proxy = %proxy_id,
             connection_id,
-            direction = ?direction,
+            direction = websocket::direction_label(direction),
             "WAF WebSocket message policy is unbound for this session; closing"
         );
         Some(websocket::unbound_policy_close())
