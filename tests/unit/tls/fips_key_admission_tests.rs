@@ -335,7 +335,8 @@ fn a_default_environment_is_admitted() {
 fn every_independently_configurable_env_verification_bypass_is_refused() {
     // The point here is coverage of the *set*, not of any single flag: a
     // global-only gate is precisely the hole a per-surface switch walks through.
-    let cases: [(&str, fn(&mut EnvConfig)); 5] = [
+    type EnvMutation = fn(&mut EnvConfig);
+    let cases: [(&str, EnvMutation); 5] = [
         ("FERRUM_TLS_NO_VERIFY", |c| c.tls_no_verify = true),
         ("FERRUM_ADMIN_TLS_NO_VERIFY", |c| {
             c.admin_tls_no_verify = true
