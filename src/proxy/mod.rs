@@ -19796,14 +19796,14 @@ async fn run_final_client_visible_response_body_policy(
         // reject decorators, and emit a trailers-only native gRPC error or a
         // gRPC-Web trailer frame instead of a bare JSON HTTP response.
         InitialResponseHeaderPolicySource::Prefiltered(_) => {
-            replace_buffered_response_with_policy_rejection(
+            Box::pin(replace_buffered_response_with_policy_rejection(
                 plugins,
                 ctx,
                 response_status,
                 response_headers,
                 response_body,
                 reject,
-            )
+            ))
             .await;
         }
     }
