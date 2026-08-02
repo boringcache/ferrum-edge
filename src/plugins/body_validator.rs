@@ -2896,6 +2896,16 @@ impl Plugin for BodyValidator {
         self.final_request_body_policy_applies(headers)
     }
 
+    /// The shared backend-visible representation gate stages decoded plaintext
+    /// on the request context before this plugin's final hook runs. Opt in even
+    /// when `body_validator` is the only contextual plugin in the chain; without
+    /// this capability the proxy takes the compatibility hook path with no
+    /// context, so a body-validator-only configuration can never reach either
+    /// the charged decoder or the duplicate-key memo below.
+    fn needs_final_request_body_context(&self) -> bool {
+        self.has_request_validation
+    }
+
     /// Context-aware variant so the duplicate-key screen of the final
     /// backend-visible body is shared with every other governed plugin in this
     /// hook stage (they all receive the same context object).

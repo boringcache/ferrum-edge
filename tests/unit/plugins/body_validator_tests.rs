@@ -127,6 +127,10 @@ fn test_request_vs_response_buffering_flags_are_config_sensitive() {
     let request_plugin = BodyValidator::new(&json!({"validate_xml": true})).unwrap();
     assert!(request_plugin.requires_request_body_buffering());
     assert!(!request_plugin.requires_response_body_buffering());
+    assert!(
+        request_plugin.needs_final_request_body_context(),
+        "a body-validator-only request chain must enter the contextual final-body funnel so the shared representation gate can stage plaintext"
+    );
 
     let response_only = BodyValidator::new(&json!({
         "response_required_fields": ["id"]
@@ -134,6 +138,10 @@ fn test_request_vs_response_buffering_flags_are_config_sensitive() {
     .unwrap();
     assert!(!response_only.requires_request_body_buffering());
     assert!(response_only.requires_response_body_buffering());
+    assert!(
+        !response_only.needs_final_request_body_context(),
+        "response-only validation must not force request-body finalization"
+    );
 }
 
 #[test]
