@@ -7322,7 +7322,7 @@ async fn malformed_and_truncated_stream_frames_apply_the_policy_exactly_once() {
         "text/event-stream",
         &[&garbage, &truncated],
         BodyOutcome::error(
-            ferrum_edge::retry::ErrorClass::Timeout,
+            ferrum_edge::retry::ErrorClass::ReadWriteTimeout,
             garbage.len() as u64,
             false,
         ),
