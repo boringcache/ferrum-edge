@@ -1791,6 +1791,13 @@ pub struct EnvConfig {
     /// aggregate cap to fit one huge response would hand the memory bound back
     /// to whoever picks the response. Default: 268435456 (256 MiB).
     pub response_buffer_max_total_bytes: usize,
+    /// Aggregate ceiling (bytes) on the working set retained while governed
+    /// compressed requests are decoded for final request-body policy
+    /// inspection. This is deliberately separate from the response-buffer
+    /// budget and is floored at the worst-case peak for one stacked request
+    /// decode. A request that cannot reserve capacity fails closed before its
+    /// encoded body can bypass inspection. Default: 268435456 (256 MiB).
+    pub request_decode_max_total_bytes: usize,
     /// Cutoff (bytes) below which response bodies with a known Content-Length
     /// are eagerly buffered into a single allocation instead of streamed
     /// frame-by-frame. For small JSON API responses the single `bytes().await`
@@ -1944,6 +1951,7 @@ pub struct EnvConfig {
     /// Admin API read-only mode (default: false, always true in DP mode)
     pub admin_read_only: bool,
     /// Enable database-backed Admin API mutation audit events. Default: false.
+    /// Does not gate `GET /backup` security-record admission (always on).
     pub admin_audit_enabled: bool,
     /// Optional age-based audit retention in days (`FERRUM_AUDIT_RETENTION_DAYS`).
     /// Unset disables age prune. When set, must be in `1..=36_500`. Distinct from
@@ -2782,6 +2790,8 @@ impl Default for EnvConfig {
                 crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_RESPONSE_FALLBACK_BYTES,
             response_buffer_max_total_bytes:
                 crate::proxy::response_buffer_budget::DEFAULT_RESPONSE_BUFFER_TOTAL_BYTES,
+            request_decode_max_total_bytes:
+                crate::proxy::response_buffer_budget::DEFAULT_REQUEST_DECODE_TOTAL_BYTES,
             response_buffer_cutoff_bytes: 65_536,
             h2_coalesce_target_bytes: 131_072,
             max_url_length_bytes: 8_192,
@@ -3244,6 +3254,7 @@ impl EnvConfig {
             max_response_body_size_bytes: usize = "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES" => 10_485_760usize;
             response_buffer_fallback_max_bytes: usize = "FERRUM_RESPONSE_BUFFER_FALLBACK_MAX_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_RESPONSE_FALLBACK_BYTES;
             response_buffer_max_total_bytes: usize = "FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_RESPONSE_BUFFER_TOTAL_BYTES;
+            request_decode_max_total_bytes: usize = "FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_REQUEST_DECODE_TOTAL_BYTES;
             response_buffer_cutoff_bytes: usize = "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES" => 65_536usize;
             h2_coalesce_target_bytes: usize = "FERRUM_H2_COALESCE_TARGET_BYTES" => 131_072usize, clamp(16_384usize, 1_048_576usize);
             max_url_length_bytes: usize = "FERRUM_MAX_URL_LENGTH_BYTES" => 8_192usize;
@@ -3910,6 +3921,7 @@ impl EnvConfig {
             max_response_body_size_bytes,
             response_buffer_fallback_max_bytes,
             response_buffer_max_total_bytes,
+            request_decode_max_total_bytes,
             response_buffer_cutoff_bytes,
             h2_coalesce_target_bytes,
             max_url_length_bytes,

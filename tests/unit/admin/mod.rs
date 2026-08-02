@@ -1,4 +1,5 @@
 mod admin_audit_tests;
+mod admin_backup_audit_tests;
 mod admin_conn_limit_tests;
 mod admin_db_health_cache_tests;
 mod admin_jwt_auth_tests;

@@ -67,6 +67,7 @@ pub mod body_validator;
 pub mod bot_detection;
 pub mod builtin_parity;
 pub mod chargeback;
+pub(crate) mod charged_decode;
 pub mod compression;
 pub mod correlation_id;
 pub mod cors;
@@ -100,6 +101,7 @@ pub mod proxy_alerts;
 pub mod rate_limiting;
 pub mod request_deduplication;
 pub mod request_mirror;
+pub(crate) mod request_representation;
 pub mod request_size_limiting;
 pub mod request_termination;
 pub mod request_transformer;
@@ -2173,6 +2175,30 @@ pub struct RequestContext {
     /// normalize's rewrite bool as an ordinary body rewrite
     /// (GHSA-pwcm-6rh8-f2gh).
     gateway_capacity_response_selected: bool,
+    /// Whether the gateway selected the fixed request-representation terminal
+    /// (`400`) because a claimed backend-visible request body could not be
+    /// reduced to plaintext (`GHSA-3973-47g5-4mcx`).
+    ///
+    /// Same role as `gateway_capacity_response_selected`, for the other terminal
+    /// the request gate can author: once set, the response-body policy pipeline
+    /// that finalizes the rejection must publish the gateway's error payload as
+    /// written instead of re-deciding it against operator rules meant for
+    /// application responses. Typed and private, because the metadata reason
+    /// beside it is plugin-writable and can authorize nothing.
+    gateway_representation_response_selected: bool,
+    /// One-shot record that a trusted hook authored a complete final
+    /// gateway/protocol terminal while replacing an uncommitted rejection from
+    /// the deliberately-late reject-path `after_proxy` chain.
+    ///
+    /// The synthetic lifecycle re-decides its final client-visible body policy
+    /// after that chain, because the chain can relabel a BACKEND or synthetic
+    /// producer's representation. Only a replacement whose plugin explicitly
+    /// declares `rejection_replacement_is_final_body_policy_terminal` is a
+    /// different thing: it is the gateway's own final answer for a request that
+    /// was already refused. Ordinary fail-closed/custom replacements remain
+    /// subject to re-decision when they change status or representation scope.
+    /// Scoped to that one trusted path and taken exactly once.
+    final_body_policy_terminal_replacement: bool,
     /// One-shot signal that a response-body inspector could not reserve a
     /// retained-response transform window and needs the enclosing
     /// `on_response_body` loop to install the shared capacity terminal.
@@ -2342,6 +2368,35 @@ pub struct RequestContext {
     /// `ai_response_guard_replay_redactions`. Instance scoping prevents one
     /// governor from consuming another instance's transform requirement.
     pub(crate) ai_tool_governor_replay_redactions: HashSet<u64>,
+    /// Per-`graphql`-instance digest of the request envelope that instance
+    /// actually parsed, charged, and admitted in `before_proxy` (priority 2850).
+    ///
+    /// `request_transformer` (3000) applies its body rules afterwards, so a
+    /// rename or replacement can put a deeper, introspecting, aliased, or
+    /// differently named operation into the backend-visible envelope after the
+    /// only structural and rate pass ran (`GHSA-3xrr-4h3f-89pc`). The final
+    /// request-body hook compares the dispatched envelope against this digest and
+    /// re-parses only when it changed, so an untransformed request is never
+    /// charged twice.
+    ///
+    /// Typed rather than `metadata`: a digest of a client query document must not
+    /// enter a transaction log, and no plugin may forge one to skip the recheck.
+    pub(crate) graphql_request_envelope_hashes: HashMap<u64, [u8; 32]>,
+    /// Per-`waf`-instance digest of the response header map that instance
+    /// actually scanned in `after_proxy` (priority 2930).
+    ///
+    /// `response_transformer` (4000), `compression` (4050), and every other later
+    /// header rule mutate the same map afterwards, so the only pass that ever
+    /// enforced response-header policy described a representation the client may
+    /// never receive (`GHSA-62jg-v563-4q23`). The final client-visible phase
+    /// compares the published map against this digest and re-asserts policy only
+    /// when it changed, so an untouched header set is never scanned — or scored —
+    /// twice.
+    ///
+    /// Instance-scoped so one WAF cannot consume another's marker, and typed
+    /// rather than `metadata` because a digest of response headers must not enter
+    /// a transaction log.
+    pub(crate) waf_response_header_digests: HashMap<u64, [u8; 32]>,
     /// Per-request memo of duplicate-object-member screens over governed JSON
     /// bodies (advisory `GHSA-c78j-5w9p-cpq6`). `openapi_validator`,
     /// `body_validator`, and `ai_tool_governor` can all inspect the same
@@ -2351,9 +2406,42 @@ pub struct RequestContext {
     /// Entries are keyed on the body's SHA-256 digest and length — never on an
     /// assertion a client, a backend, or `ctx.metadata` can write — so a
     /// transform that rewrites the body is re-screened rather than inheriting a
-    /// stale verdict. Private for the same reason as the hash ledgers above: a
+    /// stale verdict. Private for the same reason as the digest ledgers above: a
     /// body digest must not reach transaction logs.
     pub(crate) json_scan_memo: crate::util::json_dup_keys::JsonScanMemo,
+    /// Bounded plaintext view of the backend-visible request body, staged by the
+    /// shared request representation gate
+    /// ([`crate::plugins::request_representation`]) immediately before the final
+    /// request-body hooks run, and only when the finalized bytes carry a
+    /// non-identity `Content-Encoding` that a configured policy claims
+    /// (`GHSA-3973-47g5-4mcx`).
+    ///
+    /// `None` is the ordinary case and means "the finalized bytes ARE the
+    /// plaintext" — never "no proof available": the gate rejects every governed
+    /// representation it could not decode, so a claiming hook that reads through
+    /// [`RequestContext::inspectable_final_request_body`] is guaranteed
+    /// plaintext or no request at all.
+    ///
+    /// Typed and outside `metadata` deliberately: this is decoded client body
+    /// content, so it must never reach a transaction log, and no plugin may
+    /// fabricate or clear it.
+    ///
+    /// [`bytes::Bytes`] rather than `Vec<u8>` because the allocation OWNS its
+    /// share of the aggregate request-decode budget
+    /// ([`crate::proxy::response_buffer_budget`], `GHSA-pwcm-6rh8-f2gh`). Three
+    /// properties follow from that and all three are load-bearing:
+    ///
+    /// * the charge is released exactly when the last handle drops, so
+    ///   completion, rejection, deadline, cancellation, and re-finalization are
+    ///   all just drops and no path has to remember to release;
+    /// * `RequestContext` derives `Clone`, and a `Vec` clone would duplicate an
+    ///   attacker-amplified allocation with no second charge behind it. A
+    ///   `Bytes` clone shares the one owner, so the plaintext is charged exactly
+    ///   once however many contexts reference it;
+    /// * a claiming hook can take a cheap owned handle
+    ///   ([`RequestContext::inspectable_final_request_body_owned`]) instead of
+    ///   copying the plaintext out to escape a borrow of `ctx`.
+    governed_request_body_plaintext: Option<bytes::Bytes>,
     /// Per-instance governed-call identity multisets (identity hash -> count),
     /// the one-for-one skip ledgers final re-checks consume. Kept off
     /// `metadata` for the same reason as the response hashes.
@@ -2978,6 +3066,8 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
             gateway_capacity_response_selected: false,
+            gateway_representation_response_selected: false,
+            final_body_policy_terminal_replacement: false,
             buffered_response_capacity_refusal_pending: false,
             response_cache_hit: false,
             origin_http_response_status: None,
@@ -3004,7 +3094,10 @@ impl RequestContext {
             ai_response_guard_replay_redactions: HashSet::new(),
             ai_response_guard_pending_redactions: HashMap::new(),
             ai_tool_governor_replay_redactions: HashSet::new(),
+            graphql_request_envelope_hashes: HashMap::new(),
+            waf_response_header_digests: HashMap::new(),
             json_scan_memo: crate::util::json_dup_keys::JsonScanMemo::default(),
+            governed_request_body_plaintext: None,
             ai_tool_governor_call_hashes: HashMap::new(),
             ai_tool_governor_request_hashes: HashMap::new(),
             ai_tool_governor_redaction_memos: HashMap::new(),
@@ -3219,6 +3312,42 @@ impl RequestContext {
 
     pub(crate) fn gateway_capacity_response_selected(&self) -> bool {
         self.gateway_capacity_response_selected
+    }
+
+    pub(crate) fn mark_gateway_representation_response_selected(&mut self) {
+        self.gateway_representation_response_selected = true;
+    }
+
+    pub(crate) fn gateway_representation_response_selected(&self) -> bool {
+        self.gateway_representation_response_selected
+    }
+
+    /// Record that a reject-path `after_proxy` hook installed a complete final
+    /// gateway/protocol terminal. Set only by the trusted replacement path in
+    /// `run_after_proxy_hooks_on_rejection`.
+    pub(crate) fn mark_final_body_policy_terminal_replacement(&mut self) {
+        self.final_body_policy_terminal_replacement = true;
+    }
+
+    /// Take the one-shot final-terminal replacement record.
+    pub(crate) fn take_final_body_policy_terminal_replacement(&mut self) -> bool {
+        std::mem::take(&mut self.final_body_policy_terminal_replacement)
+    }
+
+    /// Adopt the gateway terminals the final request-body hook stage selected on
+    /// the throwaway clone (`clone_for_final_request_body_hooks`).
+    ///
+    /// The stage's other results travel back through `metadata`, which a plugin
+    /// can write. These two cannot: they authorize the finalizer to publish a
+    /// gateway-authored error payload unchanged, so they are carried as typed
+    /// state and only ever set, never cleared, by the gateway itself.
+    pub(crate) fn adopt_final_request_body_hook_terminals(&mut self, hook_ctx: &RequestContext) {
+        if hook_ctx.gateway_capacity_response_selected() {
+            self.mark_gateway_capacity_response_selected();
+        }
+        if hook_ctx.gateway_representation_response_selected() {
+            self.mark_gateway_representation_response_selected();
+        }
     }
 
     /// Mark that the enclosing `on_response_body` loop must install the shared
@@ -3625,8 +3754,13 @@ impl RequestContext {
         &mut self,
         response_headers: &HashMap<String, String>,
     ) {
-        if !(self.grpc_deadline_at.is_some() || self.gateway_deadline_response_selected) {
-            self.buffered_deadline_response_header_provenance = None;
+        // A final response-header policy also enables this provenance without a
+        // gRPC deadline so its rejection can retain gateway-authored output
+        // without preserving same-named backend fields. Keep an existing state
+        // in that case; callers that need neither contract arrive with `None`.
+        if !(self.grpc_deadline_at.is_some() || self.gateway_deadline_response_selected)
+            && self.buffered_deadline_response_header_provenance.is_none()
+        {
             return;
         }
         match self.buffered_deadline_response_header_provenance.as_mut() {
@@ -3808,6 +3942,75 @@ impl RequestContext {
         }
     }
 
+    /// Stage the bounded plaintext view of the backend-visible request body.
+    ///
+    /// Called only by [`crate::proxy::run_final_request_body_hooks_with_provenance`]
+    /// after the shared request representation gate proved the complete ordered
+    /// `Content-Encoding` chain decodes (`GHSA-3973-47g5-4mcx`).
+    ///
+    /// `plaintext` arrives already carrying its aggregate request-decode charge
+    /// (the gate publishes it through
+    /// [`crate::proxy::response_buffer_budget::charged_bytes`]), so staging it
+    /// here is a move of an owned charge and never a second acquisition.
+    pub(crate) fn stage_governed_request_body_plaintext(&mut self, plaintext: bytes::Bytes) {
+        self.governed_request_body_plaintext = Some(plaintext);
+    }
+
+    /// Drop any staged plaintext view, returning its budget charge.
+    ///
+    /// The gate calls this at the start of every final-request-body hook run so
+    /// a view decoded for one `(headers, body)` pair can never be read against a
+    /// different one — a retry, a deferred pass, or a second finalization. The
+    /// release is the drop itself: whatever the previous run reserved goes back
+    /// to the aggregate budget here, and again wherever the last surviving
+    /// handle to those bytes falls out of scope.
+    pub(crate) fn clear_governed_request_body_plaintext(&mut self) {
+        self.governed_request_body_plaintext = None;
+    }
+
+    /// The representation a final request-body policy must inspect.
+    ///
+    /// Returns the gate's decoded plaintext when the backend-visible bytes carry
+    /// a content coding, and `body` itself otherwise. A claiming plugin MUST read
+    /// through this rather than scanning `body` directly: scanning the encoded
+    /// octets finds no signature and parses no schema, which is exactly the
+    /// silent bypass `GHSA-3973-47g5-4mcx` describes.
+    ///
+    /// This never fails open. The gate rejects the request outright when a
+    /// claimed representation could not be decoded, so reaching a hook at all
+    /// means one of the two arms below is genuinely the plaintext.
+    pub fn inspectable_final_request_body<'a>(&'a self, body: &'a [u8]) -> &'a [u8] {
+        match self.governed_request_body_plaintext.as_deref() {
+            Some(plaintext) => plaintext,
+            None => body,
+        }
+    }
+
+    /// An OWNED handle on the staged plaintext, or `None` when the finalized
+    /// bytes are already the plaintext.
+    ///
+    /// This exists so a claiming hook whose later work needs `&mut ctx` does not
+    /// have to copy the decoded document out to escape the borrow. A `Bytes`
+    /// clone is `O(1)` and shares the one charged allocation, whereas the
+    /// `to_vec()` it replaces produced a second, UNCHARGED copy of an
+    /// attacker-amplified body for every claiming plugin in the chain.
+    pub fn inspectable_final_request_body_owned(&self) -> Option<bytes::Bytes> {
+        self.governed_request_body_plaintext.clone()
+    }
+
+    /// Whether the final request-body representation was decoded from a content
+    /// coding rather than received as plaintext.
+    ///
+    /// `#[allow(dead_code)]`: claiming plugins now take the owned handle above
+    /// (which answers the same question by returning `None`), so the only
+    /// remaining callers are external tests (through `_test_support`), and a
+    /// `pub` item reachable solely from `tests/` is dead in the separately
+    /// compiled binary unit.
+    #[allow(dead_code)]
+    pub fn final_request_body_was_decoded(&self) -> bool {
+        self.governed_request_body_plaintext.is_some()
+    }
+
     /// Route-scoped request-body ceiling as a `usize` for folding with the
     /// global `usize` knobs. Saturates rather than wrapping or panicking on a
     /// 32-bit target, where a ceiling above `usize::MAX` cannot be represented
@@ -3914,6 +4117,8 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
             gateway_capacity_response_selected: self.gateway_capacity_response_selected,
+            gateway_representation_response_selected: self.gateway_representation_response_selected,
+            final_body_policy_terminal_replacement: self.final_body_policy_terminal_replacement,
             // Final request-body hooks cannot produce a response-body capacity
             // refusal. Keep the live response path's one-shot signal on the
             // original context instead of duplicating it into this compatibility
@@ -3969,7 +4174,15 @@ impl RequestContext {
             ai_tool_governor_replay_redactions: self.ai_tool_governor_replay_redactions.clone(),
             // Carried into the final-request-body stage so every plugin in that
             // stage shares one duplicate-key screen of the same body.
+            graphql_request_envelope_hashes: self.graphql_request_envelope_hashes.clone(),
+            waf_response_header_digests: self.waf_response_header_digests.clone(),
             json_scan_memo: self.json_scan_memo.clone(),
+            // Deliberately NOT carried: the shared request representation gate
+            // stages this view from the exact `(headers, body)` pair the final
+            // hooks are about to receive, at the start of every hook run. Copying
+            // an older decode in would risk handing a hook plaintext that does
+            // not describe the bytes it was given.
+            governed_request_body_plaintext: None,
             ai_tool_governor_call_hashes: self.ai_tool_governor_call_hashes.clone(),
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             ai_tool_governor_redaction_memos: self.ai_tool_governor_redaction_memos.clone(),
@@ -8252,6 +8465,21 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` only when this plugin's successful reject-path
+    /// replacement is a complete, fixed/sanitized gateway or protocol terminal
+    /// that must be published without re-applying application-response body
+    /// policies to the terminal payload.
+    ///
+    /// This is narrower than [`Self::may_replace_rejection_response`]. Ordinary
+    /// fail-closed replacements retain the default `false`, so a status or
+    /// representation-scope change still activates the authoritative final body
+    /// policy. Built-in protocol normalizers that return `true` must author the
+    /// entire terminal representation and must not carry backend-controlled
+    /// bytes into it.
+    fn rejection_replacement_is_final_body_policy_terminal(&self) -> bool {
+        false
+    }
+
     /// Returns `true` when a successful reject-path response replacement
     /// should emit a warning.
     ///
@@ -8614,6 +8842,48 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Whether this plugin has a configured final request-body policy that
+    /// claims authority over this request's backend-visible bytes.
+    ///
+    /// Returning `true` is a security claim, not a capability advertisement: it
+    /// asserts that the operator configured this plugin to scan or validate a
+    /// request body like this one, so the gateway must not forward the request
+    /// unless the policy genuinely saw the PLAINTEXT. The shared request
+    /// representation gate ([`crate::plugins::request_representation`]) uses it
+    /// to decide whether a non-identity `Content-Encoding` on the finalized body
+    /// is an ordinary pass-through or a fail-closed rejection
+    /// (`GHSA-3973-47g5-4mcx`).
+    ///
+    /// Return `false` whenever the configured policy would decline this request
+    /// anyway (nothing configured, an exemption matched, a method or media type
+    /// outside the policy's scope). Claiming a request the policy would not have
+    /// inspected converts benign compressed uploads into `400`s; failing to claim
+    /// one it would have inspected reopens the bypass.
+    ///
+    /// "Would inspect" is not enough on its own: the claim must also be able to
+    /// REFUSE. A non-blocking disposition — a `monitor`-mode WAF, a rule set that
+    /// only logs — loses an observation when a body is unscannable, which is not
+    /// a protection-mechanism failure and must not become a `400`. Decide the
+    /// claim from configuration and request state, never by decoding `body`.
+    ///
+    /// `headers` is the finalized backend-visible header map and `body` the
+    /// finalized backend-visible bytes — exactly what
+    /// [`Plugin::on_final_request_body_with_context`] is about to receive. The
+    /// bytes are supplied for structural predicates only; a claim must never be
+    /// decided by decoding them here.
+    ///
+    /// A plugin that can return `true` MUST read its inspection bytes through
+    /// [`RequestContext::inspectable_final_request_body`] rather than using the
+    /// `body` slice directly, or the claim buys nothing.
+    fn enforces_final_request_body_policy(
+        &self,
+        _ctx: &RequestContext,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> bool {
+        false
+    }
+
     /// Returns true when the final request-body hook is a terminal dispatch
     /// boundary and must run before backend-only circuit-breaker, egress,
     /// admission, pool, or TLS work. When backend-path policy is active, the
@@ -8712,6 +8982,12 @@ pub trait Plugin: Send + Sync {
     /// response the policy would not have touched converts benign traffic into
     /// errors; failing to claim one it would have touched reopens the bypass.
     ///
+    /// As on the request side, the disposition is part of the question: a
+    /// policy whose configured outcome is observe-only (`monitor` mode, an
+    /// `ai_response_guard` in `warn`) cannot fail anything closed, so an origin
+    /// coding the gateway cannot decode must stay an ordinary pass-through for
+    /// it rather than becoming a `502`.
+    ///
     /// `response_content_type` is the live `Content-Type`, matching what
     /// [`Plugin::transform_response_body_with_context`] will receive.
     ///
@@ -8783,6 +9059,135 @@ pub trait Plugin: Send + Sync {
         _ctx: &mut RequestContext,
         _response_headers: &mut HashMap<String, String>,
     ) {
+    }
+
+    /// Returns `true` when this plugin's `transform_response_body*` hook applies
+    /// TRANSPORT encoding (a `Content-Encoding` the gateway itself generates)
+    /// rather than a semantic rewrite of the representation.
+    ///
+    /// The buffered transform phase runs in two stages because of it: every
+    /// semantic transform first, then the authoritative final client-visible
+    /// body policy phase ([`Plugin::finalize_client_visible_response_body`]), and
+    /// only then the transport-encoding stage. Without that split, `compression`
+    /// (priority 4050) encodes the body before `waf`, `body_validator`,
+    /// `ai_response_guard`, and `ai_semantic_firewall` can see it — so the WAF
+    /// scans gzip bytes, the validator treats them as non-UTF-8 and skips, and a
+    /// promised redaction cannot parse them (`GHSA-4vqr-427g-5cg7`).
+    ///
+    /// A plugin declaring this must confine its transform to producing the wire
+    /// representation of bytes another phase already decided about: it runs after
+    /// every security decision and rewrite, so nothing downstream re-reads its
+    /// output.
+    fn applies_response_transport_encoding(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin participates in the authoritative final
+    /// client-visible response body phase for this request.
+    ///
+    /// The proxy consults this before invoking
+    /// [`Plugin::finalize_client_visible_response_body`], so a chain with no
+    /// participant pays only a bit test.
+    fn enforces_final_client_visible_response_body(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
+    /// Decide semantic response policy over the EXACT representation the client
+    /// will receive.
+    ///
+    /// Runs after every semantic body transform (`response_transformer` at 4000,
+    /// `ai_response_guard`'s redaction at 4075) and BEFORE the transport-encoding
+    /// stage, on both the backend buffered lifecycle and the synthetic /
+    /// short-circuit lifecycle. It is the phase that makes output policy
+    /// authoritative rather than advisory:
+    ///
+    /// * a later `response_transformer` `add`/`update`/`remove`/`rename` rule can
+    ///   no longer create or erase a protected header or body field after the
+    ///   only enforcing pass ran (`GHSA-62jg-v563-4q23`);
+    /// * the bytes are plaintext, because gateway compression has not run yet and
+    ///   an origin content coding was already decoded (or the response rejected)
+    ///   by the shared representation gate (`GHSA-4vqr-427g-5cg7`).
+    ///
+    /// The phase is REJECTING but NON-REWRITING. Returning a rejection replaces
+    /// the response; returning `Continue` publishes the bytes as they are. A
+    /// plugin that needs to rewrite must do so in its `transform_response_body`
+    /// hook and verify the result here — which is exactly how
+    /// `ai_response_guard` binds its redaction metadata to a rewrite that
+    /// actually happened.
+    ///
+    /// `response_headers` is the client-visible header map as it stands at this
+    /// point. It is NOT the final one on every lifecycle — the synthetic /
+    /// short-circuit lifecycle deliberately runs its `after_proxy` chain
+    /// afterwards — so header policy belongs in
+    /// [`Plugin::finalize_client_visible_response_headers`], which is the phase
+    /// that genuinely closes the header map.
+    ///
+    /// Implementations must be idempotent with respect to charged work: the
+    /// phase runs once per published response, but a plugin that also decided in
+    /// an earlier phase should skip duplicate provider calls and duplicate
+    /// accounting for an unchanged representation (see
+    /// `ai_semantic_firewall`'s instance-scoped body hashes).
+    async fn finalize_client_visible_response_body(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        PluginResult::Continue
+    }
+
+    /// Returns `true` when this plugin enforces policy over the FINAL
+    /// client-visible response header map for this request.
+    ///
+    /// The proxy consults this before invoking
+    /// [`Plugin::finalize_client_visible_response_headers`], so a chain with no
+    /// participant pays only a bit test and never allocates a digest.
+    fn enforces_final_client_visible_response_headers(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
+    /// Decide header policy over the EXACT header map the client will receive.
+    ///
+    /// This is the last rejecting phase in the response lifecycle and it exists
+    /// because no earlier one is genuinely final on every path
+    /// (`GHSA-62jg-v563-4q23`):
+    ///
+    /// * on an ordinary backend response, `waf`'s `after_proxy` header scan runs
+    ///   at priority 2930, while `response_transformer` (4000) and the
+    ///   chain-level route response-header finalizer mutate the same map
+    ///   afterwards. This phase closes the `after_proxy` chain, so a later
+    ///   `add`/`update`/`remove`/`rename` rule can no longer create a prohibited
+    ///   header — or erase a required one — behind the enforcing pass;
+    /// * on a synthetic / short-circuit response the reject-path `after_proxy`
+    ///   chain is deliberately run LAST, after the synthetic body hooks, so that
+    ///   one-shot state (the `oidc_relying_party` rotated session cookie, the
+    ///   `response_transformer` route override) lands exactly once on the real
+    ///   final response. That ordering used to put `response_transformer`'s
+    ///   header rules after every enforcing pass. This phase runs after that
+    ///   chain instead, without re-running it;
+    /// * on buffered responses the outer transform funnel invokes this phase
+    ///   once more after semantic and transport stages, so a late
+    ///   `Content-Encoding`, recomputed `Content-Length`, or transform-owned
+    ///   field cannot appear behind the decision made at the end of
+    ///   `after_proxy`. An instance-scoped digest lets an implementation skip
+    ///   unchanged maps without rescoring them.
+    ///
+    /// The phase is REJECTING and NON-REWRITING: return `Continue` to publish the
+    /// map as it stands, or a rejection to replace the response. A rejection is
+    /// rebuilt by the proxy so gateway-owned decorators and one-shot session
+    /// state survive while the stale representation headers of the discarded
+    /// body do not; the proxy then re-runs this phase once over the rebuild, so
+    /// the rejected header can never be resurrected by it.
+    ///
+    /// Implementations must be idempotent and must never log header values.
+    async fn finalize_client_visible_response_headers(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Continue
     }
 
     /// Called after all `transform_response_body` hooks on buffered responses.

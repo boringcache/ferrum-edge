@@ -186,6 +186,51 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     handling, and response stream inspector/normalizer selection. First matching
     instance claims; `fail_on_missing_model` / `fail_on_no_matching_provider`
     still decide an UNCLAIMED request in normal plugin order.
+5c. `evaluate_final_request_body_posture`: the AUTHORITATIVE backend-visible
+    request representation phase, run once by
+    `run_final_request_body_hooks_with_provenance` immediately before step 6 on
+    every dispatch ladder (`GHSA-3973-47g5-4mcx`). A plugin claims a request with
+    `enforces_final_request_body_policy` (`waf`, `body_validator`, `graphql`)
+    only when its configured policy would BOTH inspect this representation and
+    be able to REFUSE it — a `monitor`-mode WAF, a body rule set that only logs,
+    and an `on_body_too_large: skip` body outside the scan window all lose an
+    observation rather than fail closed, and must not claim;
+    for a claimed request whose finalized `Content-Encoding` names a transforming
+    coding, the ordered `#content-coding` list is parsed and decoded in reverse
+    application order into a staged PLAINTEXT INSPECTION VIEW, and anything
+    unsupported / malformed / Large-Window-Brotli / over-4-layers / over-limit /
+    over-1024:1 is a fixed
+    `400` with a low-cardinality reason that never echoes a token or a body byte.
+    The backend still receives the exact client octets and headers — the decode
+    is never installed. Claiming hooks MUST read through
+    `RequestContext::inspectable_final_request_body` (or the owned
+    `inspectable_final_request_body_owned`, an `O(1)` share of the same charged
+    allocation); reading the raw slice reopens the bypass, and copying the view
+    out with `to_vec()` mints an uncharged duplicate of an attacker-amplified
+    body. This phase is independent of `compression`: an enforcing
+    policy may not silently depend on a separately configured decompressor.
+    Codec strictness and charge ordering come from `plugins::charged_decode`,
+    shared with the response gate — the permissive
+    `utils::content_encoding` decoder (`BrotliState::new`, `large_window = true`)
+    is deliberately unreachable from this security gate. The complete decode
+    working set (output capacity, stacked-pass concurrency window, and the ACTIVE
+    decoder's own heap, reserved before the decoder is CONSTRUCTED) is charged to
+    a process-wide `FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES` budget before
+    allocation; the charge is owned by the staged `Bytes` so every disposal path
+    releases it by drop and a `RequestContext` clone shares it rather than
+    duplicating it. The staged view is ALSO cleared as the hook stage returns, on
+    every exit, so the charge lifetime is the hook stage and not the request —
+    identical on H1/H2 (throwaway context clone) and native H3 (real context). A
+    budget refusal is the GATEWAY-local capacity terminal
+    (`503` / `RESOURCE_EXHAUSTED`), never a `400` and never a backend fault, and
+    still never forwards the encoded body. Both terminals carry TYPED provenance
+    on the context (`mark_gateway_capacity_response_selected` for the `503`,
+    `mark_gateway_representation_response_selected` for the `400`; adopted back
+    from the hook clone by `adopt_final_request_body_hook_terminals`) so the
+    response-side finalizer publishes the fixed error payload as written rather
+    than letting a response schema, WAF response rule, AI guard, or route
+    response-size ceiling restate it. The metadata reason beside them is
+    plugin-writable and authorizes nothing.
 6. `on_final_request_body`: body validator, gRPC-Web validation, WAF body rules, OpenAPI request schema (backend-final fallback), post-transform request-size ceiling, `ai_prompt_compressor` staged marker-sanitization rejection (4055), and `ai_semantic_cache` exact/semantic lookup (4057). `ai_semantic_cache` looks up here — not in `before_proxy` — so its replay partition binds the finalized outbound headers/query/destination and fully transformed request body, and a hit cannot bypass fail-closed final-body policy.
 6b. `dispatch_finalized_request_egress`: irreversible outbound request egress
     (`request_mirror`, `serverless_function`, `ai_federation`) over the immutable
@@ -231,6 +276,84 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
       over-ceiling replacement is refused during construction. Adding a
       `Some`-returning producer hook to a built-in means adding it to that table
       and building through the bounded sink.
+10b. `finalize_client_visible_response_body`: the AUTHORITATIVE final
+    client-visible response phase (`GHSA-62jg-v563-4q23`,
+    `GHSA-4vqr-427g-5cg7`). Phase 10 is SPLIT in two around it: every semantic
+    transform first, then this phase, then the TRANSPORT-ENCODING stage
+    (`applies_response_transport_encoding` — only `compression`). Rejecting and
+    NON-rewriting; a plugin that must rewrite does so in `transform_response_body`
+    and verifies the result here. `waf` (response body scan), `body_validator`
+    (response validation), and `ai_response_guard` (undischarged-redaction check
+    plus a residual re-detection; `warn` still passes through) own it. Response
+    HEADER policy is NOT decided here — the header map is not final at this point
+    on the synthetic lifecycle; see 10c. It also
+    runs when the transform phase is skipped for an unclaimed `206`/`226`, on both
+    the backend buffered lifecycle and the synthetic/short-circuit lifecycle. Do
+    not move gateway compression back ahead of it, and do not move these
+    decisions back into `on_final_response_body` — that hook runs after transport
+    encoding.
+    On the SYNTHETIC lifecycle the phase returns a WITNESS (the HTTP status,
+    exact plaintext bytes, and policy-scope headers it read them under) and is
+    RE-DECIDED at the end of
+    `apply_reject_after_proxy_and_synthetic_body_hooks`, after the
+    deliberately-late reject-path `after_proxy` chain, because that chain is the
+    last thing that can relabel the representation and thereby activate a policy
+    that never saw these bytes. Scope is every `Content-*` field except
+    `Content-Length` and the `Content-Security-Policy` family, plus
+    `grpc-status`/`grpc-message`; HTTP status is compared exactly. Headers are
+    compared AFTER normalizing the gateway's own transport encoding back out — so
+    an unchanged representation is never re-inspected or re-charged, and
+    `compression` alone never triggers a sweep. The legacy
+    `on_final_response_body` participants
+    (`ai_semantic_firewall`) are re-decided in the same sweep. A refusal rebuilds
+    through the same `PRESERVED_GATEWAY_RESPONSE_DECORATORS` path as 10c, then the
+    rebuild is checked STRUCTURALLY (it must carry exactly the gateway-authored
+    `Content-Type: application/json` scope) and collapses to the fixed
+    decorator-free terminal otherwise. Do NOT re-sweep the policies over that
+    rebuild: a gateway-authored error payload is never re-decided against operator
+    rules written for application responses, and doing so turns any configured
+    JSON response schema into a permanent 500. Gateway terminals (capacity,
+    deadline, an earlier rejection, the route body-size refusal, the request
+    representation `400`) are never re-decided either. A late reject-path
+    replacement skips re-decision only when the built-in explicitly declares
+    `rejection_replacement_is_final_body_policy_terminal` (`spec_expose` HEAD,
+    compression's fixed negotiation `406`, `mcp_gateway` JSON-RPC shaping).
+    Mere `may_replace_rejection_response` is not enough: an ordinary
+    fail-closed/custom replacement remains subject to status and representation
+    scope comparison. The final-terminal record is typed, set only on that path,
+    and consumed exactly once. Do not
+    "fix" this by running `after_proxy` twice. `waf`/`body_validator`/`ai_response_guard` additionally claim an
+    ORIGIN-ENCODED response through `enforces_response_body_policy` (narrow: only
+    when their rules apply AND their configured disposition can actually refuse —
+    `monitor` mode and `ai_response_guard`'s `warn` never claim — only on the
+    pristine `ORIGIN_ENCODED_RESPONSE` stamp, never for framed gRPC) so the
+    representation gate decodes it or fails it closed.
+10c. `finalize_client_visible_response_headers`: the AUTHORITATIVE final
+    client-visible response HEADER phase, and the LAST rejecting phase in the
+    response lifecycle (`GHSA-62jg-v563-4q23`). Separate from 10b because the
+    header map does not close where the body does. It runs at exactly two points:
+    the END of the `after_proxy` chain inside `run_after_proxy_hooks` (shared by
+    H1/H2, native gRPC, gRPC-Web, and both H3 paths; streaming as well as
+    buffered — a rejection surfaces as an ordinary `after_proxy` rejection), and
+    the END of `apply_reject_after_proxy_and_synthetic_body_hooks`, AFTER the
+    reject-path `after_proxy` chain that lifecycle deliberately defers to last.
+    That deferral keeps one-shot response state (the `oidc_relying_party` rotated
+    session cookie, the consumed `response_transformer` route override)
+    exactly-once and on the real final response; this phase closes the resulting
+    enforcement window WITHOUT re-running the chain. Do not "fix" it by running
+    `after_proxy` twice. `waf` owns it, gated on an instance-scoped DETERMINISTIC
+    CANONICAL digest of the header map (sorted length-prefixed pairs — never an
+    XOR fold, which cancels case-variant duplicate pairs and would suppress the
+    recheck). A rejection is rebuilt IN PLACE from
+    `PRESERVED_GATEWAY_RESPONSE_DECORATORS` (the `security_headers` set, the CORS
+    contract, correlation/tracing, and the one-shot rotated `Set-Cookie`) plus
+    the rejection's own fields: everything the backend or synthetic producer
+    contributed — including the refused field and the stale representation
+    metadata of the discarded body — is dropped, so the rebuild cannot resurrect
+    it. Policy is re-evaluated exactly ONCE over the rebuild, and a second
+    refusal collapses to a fixed minimal gateway terminal. Gateway transport-encoding fields written
+    after the chain are governed by `sanitize_client_response_headers_for_wire`,
+    not by a further policy pass.
 11. `on_final_response_body`: dedup/cache store, size limiting, response cache predictor
 12. `log`: stdout/statsd/http/tcp/kafka/loki/udp/ws/tx_debug/prometheus/chargeback
 13. `on_ws_frame`: WS size, rate, frame logging, and `waf` complete-message
