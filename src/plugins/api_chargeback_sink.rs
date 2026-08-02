@@ -6902,7 +6902,10 @@ impl SpoolManager {
         Ok(())
     }
 
-    pub fn scan_stats(&self) -> Result<SpoolStats, String> {
+    /// Full owned-spool inventory for external tests that need on-disk truth.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn scan_stats_for_tests(&self) -> Result<SpoolStats, String> {
         Ok(self.inventory_owned_spool_files()?.stats)
     }
 

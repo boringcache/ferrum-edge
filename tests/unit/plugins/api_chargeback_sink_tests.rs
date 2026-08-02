@@ -1182,7 +1182,7 @@ fn spool_write_round_trip_and_oldest_eviction() {
         !first.exists(),
         "oldest spool file should be evicted before second write"
     );
-    let stats = spool.scan_stats().unwrap();
+    let stats = spool.scan_stats_for_tests().unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.bytes, encoded_len);
     assert_eq!(
@@ -1214,7 +1214,7 @@ fn spool_rejects_empty_spool_oversized_batch() {
             || err.contains("cannot fit within spool.max_bytes"),
         "unexpected error: {err}"
     );
-    let stats = spool.scan_stats().unwrap();
+    let stats = spool.scan_stats_for_tests().unwrap();
     assert_eq!(stats.files, 0);
     assert_eq!(stats.bytes, 0);
     assert_eq!(
@@ -1243,7 +1243,7 @@ fn spool_admits_exact_fit_and_rejects_one_byte_over_with_resident_file() {
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
     let path = spool.write_events(std::slice::from_ref(&event)).unwrap();
     assert!(path.exists());
-    let stats = spool.scan_stats().unwrap();
+    let stats = spool.scan_stats_for_tests().unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.bytes, encoded_len);
     assert_eq!(
@@ -1256,7 +1256,7 @@ fn spool_admits_exact_fit_and_rejects_one_byte_over_with_resident_file() {
     let second = spool.write_events(&[sample_event("evt-ex-2")]).unwrap();
     assert!(second.exists());
     assert!(!path.exists());
-    let stats = spool.scan_stats().unwrap();
+    let stats = spool.scan_stats_for_tests().unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.bytes, encoded_len);
 }
@@ -1285,7 +1285,7 @@ fn spool_quota_uses_compressed_encoded_size() {
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
     let path = spool.write_events(std::slice::from_ref(&event)).unwrap();
     assert!(path.exists());
-    let stats = spool.scan_stats().unwrap();
+    let stats = spool.scan_stats_for_tests().unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.bytes, encoded_len);
     assert_eq!(
@@ -1330,7 +1330,7 @@ fn spool_accounts_corrupt_files_toward_quota_and_can_evict_them() {
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
-    let before = spool.scan_stats().unwrap();
+    let before = spool.scan_stats_for_tests().unwrap();
     assert_eq!(before.files, 1);
     assert_eq!(before.bytes, encoded_len);
     assert_eq!(
@@ -1344,7 +1344,7 @@ fn spool_accounts_corrupt_files_toward_quota_and_can_evict_them() {
         !corrupt.exists(),
         "oldest owned corrupt file must be evictable to admit a new write"
     );
-    let stats = spool.scan_stats().unwrap();
+    let stats = spool.scan_stats_for_tests().unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.bytes, encoded_len);
 }
@@ -1370,7 +1370,7 @@ fn spool_reconciles_stale_tmp_files_at_startup() {
         !stale_tmp.exists(),
         "startup must delete crash-left spool temp files"
     );
-    let stats = spool.scan_stats().unwrap();
+    let stats = spool.scan_stats_for_tests().unwrap();
     assert_eq!(stats.files, 0);
     assert_eq!(stats.bytes, 0);
     assert_eq!(
@@ -1408,7 +1408,7 @@ fn spool_counts_tmp_files_toward_quota_before_cleanup() {
     );
 
     fs::write(&stale_tmp, vec![0u8; encoded_len as usize]).unwrap();
-    let stats = spool.scan_stats().unwrap();
+    let stats = spool.scan_stats_for_tests().unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.bytes, encoded_len);
     assert_eq!(
@@ -1422,7 +1422,7 @@ fn spool_counts_tmp_files_toward_quota_before_cleanup() {
         !stale_tmp.exists(),
         "admission eviction must drop owned temp files when they block the ceiling"
     );
-    let after = spool.scan_stats().unwrap();
+    let after = spool.scan_stats_for_tests().unwrap();
     assert_eq!(after.files, 1);
     assert_eq!(after.bytes, encoded_len);
 }
@@ -1448,7 +1448,7 @@ fn quota_eviction_reclaims_multiple_files_in_one_inventory_pass() {
         fs::write(&path, vec![b'x'; file_len as usize]).unwrap();
         planted.push(path);
     }
-    let before = spool.scan_stats().unwrap();
+    let before = spool.scan_stats_for_tests().unwrap();
     assert_eq!(before.files, file_count);
     assert_eq!(before.bytes, file_len.saturating_mul(file_count));
 
@@ -1480,7 +1480,7 @@ fn quota_eviction_reclaims_multiple_files_in_one_inventory_pass() {
             );
         }
     }
-    let after = spool.scan_stats().unwrap();
+    let after = spool.scan_stats_for_tests().unwrap();
     assert_eq!(after.files, 2);
     assert_eq!(after.bytes, file_len.saturating_mul(2));
     assert!(
@@ -1527,7 +1527,7 @@ fn quota_eviction_large_file_count_still_uses_one_planning_pass() {
         file_len.saturating_mul(expected_deleted)
     );
 
-    let after = spool.scan_stats().unwrap();
+    let after = spool.scan_stats_for_tests().unwrap();
     assert_eq!(after.files, retain_after);
     assert_eq!(after.bytes, file_len.saturating_mul(retain_after));
     assert!(
@@ -1644,7 +1644,7 @@ fn quota_eviction_refreshes_inventory_when_a_candidate_disappears() {
             "newest peer replacements must be retained, not over-evicted"
         );
     }
-    let after = spool.scan_stats().unwrap();
+    let after = spool.scan_stats_for_tests().unwrap();
     assert_eq!(after.files, 2);
     assert_eq!(after.bytes, file_len.saturating_mul(2));
     assert_eq!(
@@ -1743,7 +1743,7 @@ fn quota_eviction_fails_closed_when_the_inventory_never_stabilizes() {
             "the peer must replace the planted generation"
         );
     }
-    let after = spool.scan_stats().unwrap();
+    let after = spool.scan_stats_for_tests().unwrap();
     assert_eq!(after.files, file_count);
     assert_eq!(after.bytes, file_len.saturating_mul(file_count));
 }
@@ -1773,7 +1773,7 @@ async fn concurrent_spool_writes_do_not_fail_during_eviction() {
     for handle in handles {
         handle.await.unwrap().unwrap();
     }
-    let stats = spool.scan_stats().unwrap();
+    let stats = spool.scan_stats_for_tests().unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.bytes, encoded_len);
     assert_eq!(
@@ -5741,7 +5741,7 @@ fn snapshot_cardinality_overflow_bounds_entries_and_preserves_protocol_dimension
     let overflow = sample_event("overflow-http");
     assert!(accumulator.stage_overflow_event_for_tests(overflow.clone()));
     spool.write_events(&[overflow]).unwrap();
-    let files = spool.scan_stats().unwrap();
+    let files = spool.scan_stats_for_tests().unwrap();
     assert!(files.files >= 1, "overflow must be durably spooled");
 
     // Stream and websocket dimensions stay distinct when under budget.
