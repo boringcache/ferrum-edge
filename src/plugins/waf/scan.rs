@@ -11,7 +11,24 @@ use super::rules::{
     BytesRuleSet, JsonPathMatcher, JsonPathRule, JsonPathSegment, RuleHit, RuleRef, RuleTarget,
     TextRuleSet, extract_ip_tokens,
 };
+use super::websocket::WsSessionPolicy;
 use crate::plugins::RequestContext;
+
+/// What request-scoped rule predicates (`conditions`, `global_exemptions`) are
+/// evaluated against for one scan.
+///
+/// HTTP scans read the live request context. A WebSocket session has no
+/// per-message request context — it *is* one upgraded request — so its
+/// predicates are resolved once at upgrade admission and replayed from an
+/// immutable snapshot for every message on that connection
+/// (`GHSA-6j3m-vf5h-pgcx`). Both arms drive the identical rule engine, so a
+/// body rule behaves the same on an HTTP body and on a complete WebSocket
+/// message.
+#[derive(Clone, Copy)]
+pub(super) enum ScanSubject<'a> {
+    Http(&'a RequestContext),
+    WebSocketSession(&'a WsSessionPolicy),
+}
 
 #[derive(Debug, Default)]
 pub(super) struct ScanOutcome {
@@ -33,22 +50,36 @@ impl ScanOutcome {
 }
 
 impl Waf {
-    pub(super) fn run_cheap_scan(&self, ctx: &mut RequestContext) -> ScanOutcome {
+    /// Whether `rule_index` applies to this subject: its `conditions` match and
+    /// no `global_exemptions.header_present` entry suppresses it. The WebSocket
+    /// arm replays the verdicts captured at upgrade admission.
+    pub(super) fn rule_applies(&self, subject: ScanSubject<'_>, rule_index: usize) -> bool {
+        match subject {
+            ScanSubject::Http(ctx) => {
+                self.compiled.rules[rule_index].matches_conditions(ctx)
+                    && !self.exemptions.suppresses_rule_for_request(ctx)
+            }
+            ScanSubject::WebSocketSession(policy) => policy.rule_applies(rule_index),
+        }
+    }
+
+    pub(super) fn run_cheap_scan(&self, ctx: &RequestContext) -> ScanOutcome {
         let mut outcome = ScanOutcome::default();
+        let subject = ScanSubject::Http(ctx);
         let raw_query = ctx.raw_query_string();
 
         self.scan_text_set(
             &mut outcome,
             self.compiled.url_path.as_ref(),
             &ctx.path,
-            ctx,
+            subject,
             None,
         );
         self.scan_cidr_rules_matching(
             &mut outcome,
             &ctx.path,
             &self.compiled.text_cidr_rules,
-            ctx,
+            subject,
             |target| matches!(target, RuleTarget::UrlPath),
         );
 
@@ -62,18 +93,18 @@ impl Waf {
                     &mut outcome,
                     self.compiled.full_url.as_ref(),
                     &full_url,
-                    ctx,
+                    subject,
                     None,
                 );
                 self.scan_cidr_rules_matching(
                     &mut outcome,
                     &full_url,
                     &self.compiled.text_cidr_rules,
-                    ctx,
+                    subject,
                     |target| matches!(target, RuleTarget::FullUrl),
                 );
-                self.scan_encoding_specials(&mut outcome, &full_url, ctx);
-                self.scan_hpp_special(&mut outcome, raw_query, ctx);
+                self.scan_encoding_specials(&mut outcome, &full_url, subject);
+                self.scan_hpp_special(&mut outcome, raw_query, subject);
             }
         } else if !ctx.query_params.is_empty() {
             let mut full_url = String::with_capacity(
@@ -91,33 +122,33 @@ impl Waf {
                 &mut outcome,
                 self.compiled.full_url.as_ref(),
                 &full_url,
-                ctx,
+                subject,
                 None,
             );
             self.scan_cidr_rules_matching(
                 &mut outcome,
                 &full_url,
                 &self.compiled.text_cidr_rules,
-                ctx,
+                subject,
                 |target| matches!(target, RuleTarget::FullUrl),
             );
-            self.scan_encoding_specials(&mut outcome, &full_url, ctx);
+            self.scan_encoding_specials(&mut outcome, &full_url, subject);
         } else {
             self.scan_text_set(
                 &mut outcome,
                 self.compiled.full_url.as_ref(),
                 &ctx.path,
-                ctx,
+                subject,
                 None,
             );
             self.scan_cidr_rules_matching(
                 &mut outcome,
                 &ctx.path,
                 &self.compiled.text_cidr_rules,
-                ctx,
+                subject,
                 |target| matches!(target, RuleTarget::FullUrl),
             );
-            self.scan_encoding_specials(&mut outcome, &ctx.path, ctx);
+            self.scan_encoding_specials(&mut outcome, &ctx.path, subject);
         }
 
         // Scan each raw query pair even after query-param materialization so
@@ -133,11 +164,11 @@ impl Waf {
                 let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
                 let key = decode_query_component_for_waf(raw_k);
                 let value = decode_query_component_for_waf(raw_v);
-                self.scan_query_pair(&mut outcome, &key, &value, ctx);
+                self.scan_query_pair(&mut outcome, &key, &value, subject);
             }
         } else {
             for (key, value) in &ctx.query_params {
-                self.scan_query_pair(&mut outcome, key, value, ctx);
+                self.scan_query_pair(&mut outcome, key, value, subject);
             }
         }
 
@@ -146,32 +177,32 @@ impl Waf {
                 &mut outcome,
                 self.compiled.header_names.as_ref(),
                 name,
-                ctx,
+                subject,
                 Some(name.as_str()),
             );
             self.scan_cidr_rules_matching(
                 &mut outcome,
                 name,
                 &self.compiled.text_cidr_rules,
-                ctx,
+                subject,
                 |target| matches!(target, RuleTarget::HeaderNames),
             );
             self.scan_text_set(
                 &mut outcome,
                 self.compiled.header_values.as_ref(),
                 value,
-                ctx,
+                subject,
                 Some(name.as_str()),
             );
             self.scan_cidr_rules_matching(
                 &mut outcome,
                 value,
                 &self.compiled.text_cidr_rules,
-                ctx,
+                subject,
                 |target| header_value_target_matches(target, name),
             );
             if name == "cookie" {
-                self.scan_cookies(&mut outcome, value, ctx);
+                self.scan_cookies(&mut outcome, value, subject);
             }
         }
 
@@ -179,30 +210,41 @@ impl Waf {
             &mut outcome,
             self.compiled.method.as_ref(),
             &ctx.method,
-            ctx,
+            subject,
             None,
         );
         self.scan_cidr_rules_matching(
             &mut outcome,
             &ctx.method,
             &self.compiled.text_cidr_rules,
-            ctx,
+            subject,
             |target| matches!(target, RuleTarget::Method),
         );
-        self.scan_method_special(&mut outcome, &ctx.method, ctx);
-        self.scan_method_override_special(&mut outcome, &ctx.headers, ctx);
+        self.scan_method_special(&mut outcome, &ctx.method, subject);
+        self.scan_method_override_special(&mut outcome, &ctx.headers, &ctx.method, subject);
 
         outcome
     }
 
-    pub(super) fn run_request_body_scan(
+    pub(super) fn run_request_body_scan(&self, ctx: &RequestContext, body: &[u8]) -> ScanOutcome {
+        self.scan_request_body_rules(ScanSubject::Http(ctx), body)
+    }
+
+    /// Request-side body rule engine, shared by the HTTP final-request-body
+    /// hook and by client→backend WebSocket application messages.
+    pub(super) fn scan_request_body_rules(
         &self,
-        ctx: &mut RequestContext,
+        subject: ScanSubject<'_>,
         body: &[u8],
     ) -> ScanOutcome {
         let mut outcome = ScanOutcome::default();
-        self.scan_bytes_set(&mut outcome, self.compiled.body_bytes.as_ref(), body, ctx);
-        self.scan_json_path_rules(&mut outcome, body, ctx);
+        self.scan_bytes_set(
+            &mut outcome,
+            self.compiled.body_bytes.as_ref(),
+            body,
+            subject,
+        );
+        self.scan_json_path_rules(&mut outcome, body, subject);
         let text = String::from_utf8_lossy(body);
         // Re-scan decoded forms so payloads hidden behind JSON `\uXXXX`,
         // HTML entities, or percent-encoding cannot evade the raw-byte set.
@@ -215,39 +257,50 @@ impl Waf {
         // beyond-cap residual in the body, mirroring the URL-side FE-ENCODING
         // check (markers `percent_decode_plus` cannot recover, and stacks the
         // layered decode cannot fully peel, are otherwise silent).
-        self.scan_body_encoding_specials(&mut outcome, text.as_ref(), residual_encoding, ctx);
+        self.scan_body_encoding_specials(&mut outcome, text.as_ref(), residual_encoding, subject);
         for variant in variants {
-            self.scan_json_path_rules(&mut outcome, variant.as_bytes(), ctx);
+            self.scan_json_path_rules(&mut outcome, variant.as_bytes(), subject);
             self.scan_bytes_set(
                 &mut outcome,
                 self.compiled.body_bytes.as_ref(),
                 variant.as_bytes(),
-                ctx,
+                subject,
             );
-            self.scan_luhn_rules(&mut outcome, &variant, &self.compiled.body_luhn_rules, ctx);
-            self.scan_cidr_rules(&mut outcome, &variant, &self.compiled.body_cidr_rules, ctx);
+            self.scan_luhn_rules(
+                &mut outcome,
+                &variant,
+                &self.compiled.body_luhn_rules,
+                subject,
+            );
+            self.scan_cidr_rules(
+                &mut outcome,
+                &variant,
+                &self.compiled.body_cidr_rules,
+                subject,
+            );
         }
         self.scan_luhn_rules(
             &mut outcome,
             text.as_ref(),
             &self.compiled.body_luhn_rules,
-            ctx,
+            subject,
         );
         self.scan_cidr_rules(
             &mut outcome,
             text.as_ref(),
             &self.compiled.body_cidr_rules,
-            ctx,
+            subject,
         );
         outcome
     }
 
     pub(super) fn run_response_header_scan(
         &self,
-        ctx: &mut RequestContext,
+        ctx: &RequestContext,
         headers: &HashMap<String, String>,
     ) -> ScanOutcome {
         let mut outcome = ScanOutcome::default();
+        let subject = ScanSubject::Http(ctx);
         for (name, value) in headers {
             let mut line = String::with_capacity(name.len() + value.len() + 2);
             line.push_str(name);
@@ -257,23 +310,29 @@ impl Waf {
                 &mut outcome,
                 self.compiled.response_headers.as_ref(),
                 &line,
-                ctx,
+                subject,
                 Some(name.as_str()),
             );
             self.scan_cidr_rules_matching(
                 &mut outcome,
                 &line,
                 &self.compiled.text_cidr_rules,
-                ctx,
+                subject,
                 |target| matches!(target, RuleTarget::ResponseHeaders),
             );
         }
         outcome
     }
 
-    pub(super) fn run_response_body_scan(
+    pub(super) fn run_response_body_scan(&self, ctx: &RequestContext, body: &[u8]) -> ScanOutcome {
+        self.scan_response_body_rules(ScanSubject::Http(ctx), body)
+    }
+
+    /// Response-side body rule engine, shared by the HTTP final-response-body
+    /// hook and by backend→client WebSocket application messages.
+    pub(super) fn scan_response_body_rules(
         &self,
-        ctx: &mut RequestContext,
+        subject: ScanSubject<'_>,
         body: &[u8],
     ) -> ScanOutcome {
         let mut outcome = ScanOutcome::default();
@@ -281,43 +340,43 @@ impl Waf {
             &mut outcome,
             self.compiled.response_body_bytes.as_ref(),
             body,
-            ctx,
+            subject,
         );
         let text = String::from_utf8_lossy(body);
         let (variants, residual_encoding) =
             normalize::decoded_variants_with_residual(text.as_ref());
-        self.scan_body_encoding_specials(&mut outcome, text.as_ref(), residual_encoding, ctx);
+        self.scan_body_encoding_specials(&mut outcome, text.as_ref(), residual_encoding, subject);
         for variant in variants {
             self.scan_bytes_set(
                 &mut outcome,
                 self.compiled.response_body_bytes.as_ref(),
                 variant.as_bytes(),
-                ctx,
+                subject,
             );
             self.scan_luhn_rules(
                 &mut outcome,
                 &variant,
                 &self.compiled.response_luhn_rules,
-                ctx,
+                subject,
             );
             self.scan_cidr_rules(
                 &mut outcome,
                 &variant,
                 &self.compiled.response_cidr_rules,
-                ctx,
+                subject,
             );
         }
         self.scan_luhn_rules(
             &mut outcome,
             text.as_ref(),
             &self.compiled.response_luhn_rules,
-            ctx,
+            subject,
         );
         self.scan_cidr_rules(
             &mut outcome,
             text.as_ref(),
             &self.compiled.response_cidr_rules,
-            ctx,
+            subject,
         );
         outcome
     }
@@ -327,14 +386,14 @@ impl Waf {
         outcome: &mut ScanOutcome,
         set: Option<&TextRuleSet>,
         value: &str,
-        ctx: &RequestContext,
+        subject: ScanSubject<'_>,
         header_name: Option<&str>,
     ) {
         let Some(set) = set else {
             return;
         };
         for index in set.set.matches(value) {
-            self.push_if_allowed(outcome, &set.refs[index], value, ctx, header_name);
+            self.push_if_allowed(outcome, &set.refs[index], value, subject, header_name);
         }
     }
 
@@ -343,7 +402,7 @@ impl Waf {
         outcome: &mut ScanOutcome,
         set: Option<&BytesRuleSet>,
         value: &[u8],
-        ctx: &RequestContext,
+        subject: ScanSubject<'_>,
     ) {
         let Some(set) = set else {
             return;
@@ -351,14 +410,19 @@ impl Waf {
         for index in set.set.matches(value) {
             let rule_ref = &set.refs[index];
             if let Ok(text) = std::str::from_utf8(value) {
-                self.push_if_allowed(outcome, rule_ref, text, ctx, None);
+                self.push_if_allowed(outcome, rule_ref, text, subject, None);
             } else {
-                self.push_if_allowed_bytes(outcome, rule_ref, ctx);
+                self.push_if_allowed_bytes(outcome, rule_ref, subject);
             }
         }
     }
 
-    fn scan_json_path_rules(&self, outcome: &mut ScanOutcome, body: &[u8], ctx: &RequestContext) {
+    fn scan_json_path_rules(
+        &self,
+        outcome: &mut ScanOutcome,
+        body: &[u8],
+        subject: ScanSubject<'_>,
+    ) {
         if self.compiled.body_json_paths.is_empty() {
             return;
         }
@@ -373,7 +437,7 @@ impl Waf {
             let Some(text) = json_scan_text(value, &mut scratch) else {
                 continue;
             };
-            if self.json_path_rule_matches(path_rule, text, ctx) {
+            if self.json_path_rule_matches(path_rule, text, subject) {
                 outcome.push(RuleHit {
                     rule_index: path_rule.rule_index,
                     target_name: path_rule.target_name,
@@ -386,7 +450,7 @@ impl Waf {
         &self,
         path_rule: &JsonPathRule,
         value: &str,
-        ctx: &RequestContext,
+        subject: ScanSubject<'_>,
     ) -> bool {
         let rule = &self.compiled.rules[path_rule.rule_index];
         let matched = match &path_rule.matcher {
@@ -397,22 +461,27 @@ impl Waf {
                 .is_some_and(|cidr| extract_ip_tokens(value).any(|ip| cidr.matches(ip))),
         };
         matched
-            && rule.matches_conditions(ctx)
-            && !self.exemptions.suppresses_rule_for_request(ctx)
+            && self.rule_applies(subject, path_rule.rule_index)
             && !self.exemptions.suppresses_value(value)
             && !rule.suppresses_text(value)
     }
 
-    fn scan_cookies(&self, outcome: &mut ScanOutcome, header: &str, ctx: &RequestContext) {
+    fn scan_cookies(&self, outcome: &mut ScanOutcome, header: &str, subject: ScanSubject<'_>) {
         for cookie in header.split(';') {
             let cookie = cookie.trim();
             if !cookie.is_empty() {
-                self.scan_text_set(outcome, self.compiled.cookies.as_ref(), cookie, ctx, None);
+                self.scan_text_set(
+                    outcome,
+                    self.compiled.cookies.as_ref(),
+                    cookie,
+                    subject,
+                    None,
+                );
                 self.scan_cidr_rules_matching(
                     outcome,
                     cookie,
                     &self.compiled.text_cidr_rules,
-                    ctx,
+                    subject,
                     |target| matches!(target, RuleTarget::Cookies),
                 );
             }
@@ -424,28 +493,34 @@ impl Waf {
         outcome: &mut ScanOutcome,
         key: &str,
         value: &str,
-        ctx: &RequestContext,
+        subject: ScanSubject<'_>,
     ) {
-        self.scan_text_set(outcome, self.compiled.query_keys.as_ref(), key, ctx, None);
+        self.scan_text_set(
+            outcome,
+            self.compiled.query_keys.as_ref(),
+            key,
+            subject,
+            None,
+        );
         self.scan_text_set(
             outcome,
             self.compiled.query_values.as_ref(),
             value,
-            ctx,
+            subject,
             None,
         );
         self.scan_cidr_rules_matching(
             outcome,
             key,
             &self.compiled.text_cidr_rules,
-            ctx,
+            subject,
             |target| matches!(target, RuleTarget::QueryKeys),
         );
         self.scan_cidr_rules_matching(
             outcome,
             value,
             &self.compiled.text_cidr_rules,
-            ctx,
+            subject,
             |target| matches!(target, RuleTarget::QueryValues),
         );
     }
@@ -455,15 +530,14 @@ impl Waf {
         outcome: &mut ScanOutcome,
         value: &str,
         rule_indices: &[usize],
-        ctx: &RequestContext,
+        subject: ScanSubject<'_>,
     ) {
         if rule_indices.is_empty() || !contains_luhn_candidate(value) {
             return;
         }
         for &rule_index in rule_indices {
             let rule = &self.compiled.rules[rule_index];
-            if rule.matches_conditions(ctx)
-                && !self.exemptions.suppresses_rule_for_request(ctx)
+            if self.rule_applies(subject, rule_index)
                 && !self.exemptions.suppresses_value(value)
                 && !rule.suppresses_text(value)
             {
@@ -480,9 +554,9 @@ impl Waf {
         outcome: &mut ScanOutcome,
         value: &str,
         rule_indices: &[usize],
-        ctx: &RequestContext,
+        subject: ScanSubject<'_>,
     ) {
-        self.scan_cidr_rules_matching(outcome, value, rule_indices, ctx, |_| true);
+        self.scan_cidr_rules_matching(outcome, value, rule_indices, subject, |_| true);
     }
 
     fn scan_cidr_rules_matching<F>(
@@ -490,7 +564,7 @@ impl Waf {
         outcome: &mut ScanOutcome,
         value: &str,
         rule_indices: &[usize],
-        ctx: &RequestContext,
+        subject: ScanSubject<'_>,
         target_matches: F,
     ) where
         F: Fn(&RuleTarget) -> bool,
@@ -512,8 +586,7 @@ impl Waf {
                 return;
             }
             if ips.iter().any(|ip| cidr.matches(*ip))
-                && rule.matches_conditions(ctx)
-                && !self.exemptions.suppresses_rule_for_request(ctx)
+                && self.rule_applies(subject, rule_index)
                 && !self.exemptions.suppresses_value(value)
                 && !rule.suppresses_text(value)
             {
@@ -525,18 +598,23 @@ impl Waf {
         }
     }
 
-    fn scan_encoding_specials(&self, outcome: &mut ScanOutcome, value: &str, ctx: &RequestContext) {
+    fn scan_encoding_specials(
+        &self,
+        outcome: &mut ScanOutcome,
+        value: &str,
+        subject: ScanSubject<'_>,
+    ) {
         if let Some(rule_index) = self.specials.encoding
             && (decode::has_double_encoded_marker(value)
                 || decode::has_percent_null_byte(value)
                 || decode::has_overlong_utf8_marker(value))
         {
-            self.push_special(outcome, rule_index, value, ctx);
+            self.push_special(outcome, rule_index, value, subject);
         }
         if let Some(rule_index) = self.specials.overlong_utf8
             && decode::has_overlong_utf8_marker(value)
         {
-            self.push_special(outcome, rule_index, value, ctx);
+            self.push_special(outcome, rule_index, value, subject);
         }
     }
 
@@ -560,7 +638,7 @@ impl Waf {
         outcome: &mut ScanOutcome,
         text: &str,
         residual_encoding: bool,
-        ctx: &RequestContext,
+        subject: ScanSubject<'_>,
     ) {
         let percent_markers_present = text.as_bytes().contains(&b'%');
         if let Some(rule_index) = self.specials.encoding {
@@ -569,7 +647,7 @@ impl Waf {
                     && (decode::has_double_encoded_marker(text)
                         || decode::has_percent_null_byte(text)));
             if flagged {
-                self.push_special(outcome, rule_index, text, ctx);
+                self.push_special(outcome, rule_index, text, subject);
             }
         }
         // The marker helpers all look for `%`-prefixed sequences, so skip their
@@ -578,19 +656,29 @@ impl Waf {
             && let Some(rule_index) = self.specials.overlong_utf8
             && decode::has_overlong_utf8_marker(text)
         {
-            self.push_special(outcome, rule_index, text, ctx);
+            self.push_special(outcome, rule_index, text, subject);
         }
     }
 
-    fn scan_hpp_special(&self, outcome: &mut ScanOutcome, raw_query: &str, ctx: &RequestContext) {
+    fn scan_hpp_special(
+        &self,
+        outcome: &mut ScanOutcome,
+        raw_query: &str,
+        subject: ScanSubject<'_>,
+    ) {
         if let Some(rule_index) = self.specials.hpp
             && decode::has_conflicting_duplicate_query_key(raw_query)
         {
-            self.push_special(outcome, rule_index, raw_query, ctx);
+            self.push_special(outcome, rule_index, raw_query, subject);
         }
     }
 
-    fn scan_method_special(&self, outcome: &mut ScanOutcome, method: &str, ctx: &RequestContext) {
+    fn scan_method_special(
+        &self,
+        outcome: &mut ScanOutcome,
+        method: &str,
+        subject: ScanSubject<'_>,
+    ) {
         if let Some(rule_index) = self.specials.method
             && self
                 .config
@@ -598,7 +686,7 @@ impl Waf {
                 .iter()
                 .any(|configured| configured.eq_ignore_ascii_case(method))
         {
-            self.push_special(outcome, rule_index, method, ctx);
+            self.push_special(outcome, rule_index, method, subject);
         }
     }
 
@@ -606,13 +694,14 @@ impl Waf {
         &self,
         outcome: &mut ScanOutcome,
         headers: &HashMap<String, String>,
-        ctx: &RequestContext,
+        method: &str,
+        subject: ScanSubject<'_>,
     ) {
         if let Some(rule_index) = self.specials.method_override
             && let Some(override_method) = headers.get("x-http-method-override")
-            && !override_method.eq_ignore_ascii_case(&ctx.method)
+            && !override_method.eq_ignore_ascii_case(method)
         {
-            self.push_special(outcome, rule_index, override_method, ctx);
+            self.push_special(outcome, rule_index, override_method, subject);
         }
     }
 
@@ -621,11 +710,10 @@ impl Waf {
         outcome: &mut ScanOutcome,
         rule_index: usize,
         value: &str,
-        ctx: &RequestContext,
+        subject: ScanSubject<'_>,
     ) {
         let rule = &self.compiled.rules[rule_index];
-        if rule.matches_conditions(ctx)
-            && !self.exemptions.suppresses_rule_for_request(ctx)
+        if self.rule_applies(subject, rule_index)
             && !self.exemptions.suppresses_value(value)
             && !rule.suppresses_text(value)
         {
@@ -641,13 +729,12 @@ impl Waf {
         outcome: &mut ScanOutcome,
         rule_ref: &RuleRef,
         value: &str,
-        ctx: &RequestContext,
+        subject: ScanSubject<'_>,
         header_name: Option<&str>,
     ) {
         let rule = &self.compiled.rules[rule_ref.rule_index];
         if rule_ref.matches_header(header_name)
-            && rule.matches_conditions(ctx)
-            && !self.exemptions.suppresses_rule_for_request(ctx)
+            && self.rule_applies(subject, rule_ref.rule_index)
             && !self.exemptions.suppresses_value(value)
             && !rule.suppresses_text(value)
         {
@@ -662,10 +749,9 @@ impl Waf {
         &self,
         outcome: &mut ScanOutcome,
         rule_ref: &RuleRef,
-        ctx: &RequestContext,
+        subject: ScanSubject<'_>,
     ) {
-        let rule = &self.compiled.rules[rule_ref.rule_index];
-        if rule.matches_conditions(ctx) && !self.exemptions.suppresses_rule_for_request(ctx) {
+        if self.rule_applies(subject, rule_ref.rule_index) {
             outcome.push(RuleHit {
                 rule_index: rule_ref.rule_index,
                 target_name: rule_ref.target_name,

@@ -1429,7 +1429,7 @@ pub(crate) async fn handle_h3_websocket(
 
     // ── Collect parsed-relay and disconnect plugin lists ────────────
     let (ws_framing_plugins, ws_frame_plugins) =
-        crate::proxy::collect_websocket_relay_plugins(&plugins, requires_websocket_framing);
+        crate::proxy::collect_websocket_relay_plugins(&plugins, requires_websocket_framing, &ctx);
     let ws_disconnect_plugins: Vec<Arc<dyn Plugin>> = plugins
         .iter()
         .filter(|p| p.requires_ws_disconnect_hooks())

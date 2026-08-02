@@ -5,6 +5,7 @@
 //! discovery catalogs in aggregate-router mode, and routes namespaced MCP tool,
 //! resource, and prompt calls to configured upstream MCP servers.
 
+use crate::fips::approved::Sha256;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -13,7 +14,6 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_perc
 use regex::Regex;
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -4872,6 +4872,12 @@ impl Plugin for McpGateway {
     fn may_replace_rejection_response(&self) -> bool {
         // SSE / uninspectable tool-result responses must be replaceable when
         // `validation.validate_tool_results` is enforcing.
+        true
+    }
+
+    fn rejection_replacement_is_final_body_policy_terminal(&self) -> bool {
+        // Enforcement replacements are gateway-authored JSON-RPC error
+        // envelopes and never retain the refused backend tool-result bytes.
         true
     }
 

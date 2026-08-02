@@ -105,7 +105,7 @@ impl AiTokenMetrics {
         };
         if provider != "auto" && parse_ai_provider(&provider).is_none() {
             return Err(format!(
-                "ai_token_metrics: unknown 'provider' value '{}' (expected auto, openai, anthropic, google, cohere, mistral, or bedrock)",
+                "ai_token_metrics: unknown 'provider' value '{}' (expected auto, openai, anthropic, google, cohere, mistral, bedrock, or tgi)",
                 provider
             ));
         }
