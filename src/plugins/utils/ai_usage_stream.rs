@@ -101,10 +101,7 @@ pub(crate) fn encode_aws_event_stream_message(headers: &[u8], payload: &[u8]) ->
 ///
 /// Used by tests (and the message builder) to construct oversized or
 /// length-hostile frames whose declared length is trusted only after CRC.
-pub(crate) fn encode_aws_event_stream_prelude(
-    total_length: u32,
-    headers_length: u32,
-) -> [u8; 12] {
+pub(crate) fn encode_aws_event_stream_prelude(total_length: u32, headers_length: u32) -> [u8; 12] {
     let mut prelude = [0u8; 12];
     prelude[0..4].copy_from_slice(&total_length.to_be_bytes());
     prelude[4..8].copy_from_slice(&headers_length.to_be_bytes());

@@ -6995,9 +6995,7 @@ async fn bedrock_event_stream_is_charged_from_invocation_metrics() {
         "amazon-bedrock-invocationMetrics": {"inputTokenCount": 31, "outputTokenCount": 12}
     }))
     .unwrap();
-    let encoded = {
-        base64::engine::general_purpose::STANDARD.encode(inner)
-    };
+    let encoded = { base64::engine::general_purpose::STANDARD.encode(inner) };
     let payload = serde_json::to_vec(&json!({"bytes": encoded})).unwrap();
     let message = bedrock_event_stream_message(&payload);
 
@@ -7409,13 +7407,8 @@ async fn drive_gateway_stream_variant(
     complete: bool,
 ) -> Vec<u8> {
     let chain: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
-    let inspector = create_response_stream_inspector(
-        &chain,
-        ctx,
-        200,
-        Some(content_type),
-    )
-    .expect("a meterable AI SSE stream must attach an inspector");
+    let inspector = create_response_stream_inspector(&chain, ctx, 200, Some(content_type))
+        .expect("a meterable AI SSE stream must attach an inspector");
 
     let expected: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
     let inspected = match variant {
@@ -7473,13 +7466,8 @@ async fn drive_gateway_stream_variant(
         )
         .await;
     } else {
-        run_response_stream_termination_hooks(
-            &chain,
-            ctx,
-            200,
-            &BodyOutcome::client_disconnect(0),
-        )
-        .await;
+        run_response_stream_termination_hooks(&chain, ctx, 200, &BodyOutcome::client_disconnect(0))
+            .await;
     }
     forwarded
 }
@@ -7571,13 +7559,9 @@ async fn h2_h3_backend_error_applies_unmetered_policy_exactly_once() {
         let reserved = instance_reserved(&plugin, &ctx);
 
         let chain: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
-        let inspector = create_response_stream_inspector(
-            &chain,
-            &mut ctx,
-            200,
-            Some("text/event-stream"),
-        )
-        .expect("inspector");
+        let inspector =
+            create_response_stream_inspector(&chain, &mut ctx, 200, Some("text/event-stream"))
+                .expect("inspector");
 
         let chunk = Bytes::from(sse_frame(json!({"choices": [{"delta": {"content": "x"}}]})));
         let err: ferrum_edge::proxy::body::ProxyBodyError =
@@ -7612,7 +7596,10 @@ async fn h2_h3_backend_error_applies_unmetered_policy_exactly_once() {
                 }
             }
         }
-        assert!(saw_error, "{label}: backend error must surface on the client body");
+        assert!(
+            saw_error,
+            "{label}: backend error must surface on the client body"
+        );
         assert_eq!(forwarded, chunk.as_ref());
 
         run_response_stream_termination_hooks(
