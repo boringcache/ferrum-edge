@@ -4,11 +4,12 @@
 
 **Ferrum Edge is not a validated cryptographic module and is not independently
 FIPS-certified. No configuration or build of this binary makes it so.** What the
-`fips` build profile does is route Ferrum's cryptography through a
-FIPS-validated module and refuse, fail-closed, anything it cannot route.
-Certification of a *deployment* depends on the exact module, the build, the
-operating environment, and operational controls that are the operator's to
-establish — §"The module boundary" enumerates them.
+`fips` build profile does is select the AWS-LC FIPS module implementation,
+route Ferrum's cryptography through it, and refuse, fail-closed, anything it
+cannot route. A claim that a *deployment* is using a validated module still
+depends on matching that artifact to an active CMVP certificate, the certified
+module version and operating environment, and the operational controls that
+are the operator's to establish — §"The module boundary" enumerates them.
 
 This document describes:
 
@@ -45,9 +46,12 @@ re-enable `rustls/ring` without this crate's feature list ever mentioning it.
 
 ### Building the FIPS profile
 
-`aws-lc-fips-sys` compiles the FIPS build of AWS-LC from source under a fixed
-recipe. That recipe is part of what the module's validation covers, so it must
-not be substituted with a prebuilt artifact.
+`aws-lc-fips-sys` compiles the FIPS build of AWS-LC from source. Ferrum's CI
+keeps that upstream build path intact and verifies the selected profile, but a
+successful source build is a functional gate, not CMVP certificate evidence.
+An operator making a validation claim must also show that the pinned crate and
+resulting module match the version, installation procedure, configuration, and
+operating environment in the applicable vendor security policy.
 
 Prerequisites (in addition to Ferrum's usual `protoc`):
 
@@ -75,7 +79,7 @@ the module certificate's tested-platform list (see §"The module boundary").
 | | Status |
 |---|---|
 | Mutually exclusive `crypto-ring` / `fips` build profiles | **Shipped** |
-| Validated AWS-LC-FIPS module linked by the `fips` profile | **Shipped** |
+| AWS-LC FIPS module integration linked by the `fips` profile | **Shipped** |
 | Resolved-feature-graph audit in CI (both profiles) | **Shipped** |
 | Request surface (`--fips-mode`, `FERRUM_FIPS_MODE`, `FERRUM_FIPS_REQUIRED_PROVIDER`) | **Shipped** |
 | Fail-closed bootstrap, including the module's power-on self-test | **Shipped** |
@@ -101,8 +105,10 @@ downgrade — a typo'd `enfroce` must not quietly run non-FIPS.
 
 `FERRUM_FIPS_MODE` is a *runtime request*; the build profile is what decides
 whether it can be satisfied. `enforce` on an ordinary build refuses startup;
-`off` on a FIPS build runs the validated module without applying the admission
-policy, which is a supported (if unusual) configuration for staging a rollout.
+`off` on a FIPS build runs the selected AWS-LC FIPS provider profile without
+applying Ferrum's admission policy, which is a supported (if unusual)
+configuration for staging a rollout. It is not evidence of a compliant
+deployment.
 
 `FERRUM_FIPS_REQUIRED_PROVIDER` pins the integration the operator audited. Only
 `aws-lc-fips` is supported, so today its only effect is to reject a value that
@@ -222,11 +228,15 @@ correctness with which Ferrum calls the module.
 **Outside the module, the operator's responsibility** — and no gateway code can
 discharge these:
 
-- **The exact validated module.** A certificate names a module version built for
-  a specific operating environment. Rebuilding AWS-LC-FIPS from source with a
-  different toolchain produces a module that is *not* the validated one. The
-  operator must record the certificate number, module version, and operating
-  environment for their deployment.
+- **The exact validated module.** A certificate names a module version and the
+  conditions under which it is approved. The current NIST listing for the
+  AWS-LC 3 static module is
+  [CMVP certificate #5314](https://csrc.nist.gov/projects/cryptographic-module-validation-program/certificate/5314),
+  whose caveat requires installation, initialization, and configuration as
+  specified by its security policy. The operator must prove that the pinned
+  `aws-lc-fips-sys` release and built artifact match the applicable certificate
+  and must record the certificate number, module version, build procedure, and
+  operating environment. A green arbitrary source build is not that proof.
 - **Build reproducibility.** The binary an auditor examines must be the binary in
   production.
 - **Operating environment.** The certificate's tested platform list is part of
@@ -254,7 +264,9 @@ Dispositions:
 - **`module-routable`** — the operation resolves its implementation through
   Ferrum's provider seam (`fips::base_crypto_provider`, `fips::backend`,
   `fips::approved`) or through a dependency backend the `crypto-ring` / `fips`
-  feature pair selects. On a FIPS build it reaches the validated module.
+  feature pair selects. On a FIPS build it reaches the selected AWS-LC FIPS
+  module implementation. Applicability of a CMVP certificate remains a
+  deployment-evidence question.
 - **`rejected`** — cannot reach the module; `src/fips/policy.rs` refuses the
   configuration that would perform it, before serving.
 - **`outside-boundary`** — not a security claim Ferrum makes. Either the
@@ -291,9 +303,10 @@ Ferrum does **not** re-implement or re-run the module's self-tests. On-demand
 and conditional self-tests are the module's own behaviour.
 
 **Entropy.** The module supplies the DRBG. Its seeding is part of the module's
-validated behaviour and depends on the operating environment; a container with a
-constrained or virtualized entropy source is an operating-environment concern the
-operator must satisfy, not something the gateway can compensate for.
+approved-mode behaviour and depends on the operating environment; a container
+with a constrained or virtualized entropy source is an operating-environment
+concern the operator must satisfy, not something the gateway can compensate
+for.
 
 **Key management is entirely the operator's.** Ferrum stores no long-term keys of
 its own. Generation, storage, file permissions, rotation, escrow, and destruction
@@ -374,11 +387,12 @@ python3 .github/scripts/check_fips_feature_policy.py \
   --tree /tmp/tree-fips.txt --profile fips
 ```
 
-The gateway's report and the build audit are both necessary and neither is
-sufficient. Deployment compliance additionally requires the exact validated
-module version and certificate, a reproducible build, an operating environment
-on the certificate's tested-platform list, and the operational controls
-enumerated in §"The module boundary" — established and recorded by the operator.
+The gateway's report and the build audit are useful functional evidence, but
+neither establishes that a deployment falls under a CMVP certificate.
+Deployment compliance additionally requires the exact certified module version,
+an applicable active certificate and security policy, a reproducible build, an
+approved operating environment, and the operational controls enumerated in
+§"The module boundary" — established and recorded by the operator.
 
 **Ferrum Edge makes no certification claim of its own, and `certified` will
 remain `false` on every build.**

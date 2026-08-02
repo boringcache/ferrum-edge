@@ -2155,8 +2155,8 @@ pub struct EnvConfig {
     ///
     /// This is the *runtime request*. Whether the build can satisfy it is a
     /// separate question answered by `crate::fips::BUILD_CAPABLE`; an enforce
-    /// request on a build without the validated module fails closed at
-    /// bootstrap rather than downgrading. See `docs/fips.md`.
+    /// request on a build without the AWS-LC FIPS provider profile fails
+    /// closed at bootstrap rather than downgrading. See `docs/fips.md`.
     pub fips_mode: String,
     /// Validated-module integration the operator requires
     /// (default: `aws-lc-fips`, the only integration Ferrum supports).
@@ -5303,7 +5303,8 @@ impl EnvConfig {
         // 2. Reconcile it with the provider bootstrap already installed. The
         //    process-default crypto provider is chosen before `ferrum.conf` can
         //    be read, so a request that reaches Ferrum only through the
-        //    settings file arrives too late to select a validated module;
+        //    settings file arrives too late to select the AWS-LC FIPS provider
+        //    profile;
         //    `verify_resolved_mode` fails closed rather than serving under a
         //    provider chosen from a stale view of the request.
         //

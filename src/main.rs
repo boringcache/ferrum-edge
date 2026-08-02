@@ -177,7 +177,7 @@ fn emit_bootstrap_error(message: &str, fields: &[(&str, String)]) {
 /// Startup sequence:
 /// 1. Parse CLI arguments
 /// 2. Install the rustls crypto provider and resolve FIPS state
-///    (`ring`, or the AWS-LC-FIPS validated module on a `--features fips` build)
+///    (`ring`, or the AWS-LC FIPS provider profile on a `--features fips` build)
 /// 3. Resolve external secrets (Vault, AWS, Azure, GCP, env, file) using a
 ///    temporary runtime that is dropped before env mutation
 /// 4. Initialize structured JSON logging

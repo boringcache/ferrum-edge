@@ -6,9 +6,11 @@
 //! approved algorithm computed by an unvalidated implementation is still
 //! outside the module boundary. Ferrum's security-relevant digests and MACs
 //! previously ran on the RustCrypto `sha2`/`hmac` crates, which the selected
-//! validated module does not cover and which no amount of TLS-provider
-//! switching reaches. Routing them here puts them inside the boundary on a
-//! `fips` build and changes nothing on an ordinary one.
+//! AWS-LC FIPS module implementation does not cover and which no amount of
+//! TLS-provider switching reaches. Routing them here puts them through the
+//! selected module implementation on a `fips` build and changes nothing on an
+//! ordinary one. Certificate applicability remains a deployment-evidence
+//! question described in `docs/fips.md`.
 //!
 //! # Scope
 //!

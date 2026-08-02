@@ -14,9 +14,10 @@
 //! mutually exclusive `crypto-ring` / `fips` cargo-feature pair selects, or
 //! through the process-default rustls provider that
 //! [`crate::fips::install_crypto_provider`] installed. On a build where
-//! [`crate::fips::BUILD_CAPABLE`] is `true` it therefore reaches the validated
-//! module; on an ordinary build it reaches `ring`, and the mode refuses to
-//! enforce.
+//! [`crate::fips::BUILD_CAPABLE`] is `true` it therefore reaches the selected
+//! AWS-LC FIPS module implementation; on an ordinary build it reaches `ring`,
+//! and the mode refuses to enforce. Certificate applicability remains a
+//! deployment-evidence question described in `docs/fips.md`.
 //!
 //! The other dispositions are the honest remainder:
 //! [`Disposition::PendingClassification`] (security-relevant, not yet routed —
@@ -37,8 +38,9 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Disposition {
     /// Resolves through Ferrum's provider seam or a build-time-selected
-    /// dependency backend, and so reaches the validated module on a build that
-    /// links one. See the module docs for why this is "routable", not "backed".
+    /// dependency backend, and so reaches the selected AWS-LC FIPS module
+    /// implementation on a FIPS-profile build. See the module docs for why
+    /// this is "routable", not "backed" or "certified".
     ModuleRoutable,
     /// Security-relevant, and *not* yet routed through the seam. Each of these
     /// must be moved onto the module or explicitly rejected before a FIPS
@@ -205,8 +207,8 @@ pub const INVENTORY: &[CryptoOperation] = &[
         disposition: Disposition::ModuleRoutable,
         rationale: "mongodb is declared with default-features = false; the `fips` feature \
                     selects mongodb/rustls-tls-aws-lc while aws-lc-rs/fips binds the same \
-                    resolved backend to the validated module, and the feature-policy gate \
-                    rejects any resolved mongodb/rustls-tls Ring edge",
+                    resolved backend to the selected AWS-LC FIPS implementation, and the \
+                    feature-policy gate rejects any resolved mongodb/rustls-tls Ring edge",
     },
     // ── JWT / JWK ───────────────────────────────────────────────────────
     CryptoOperation {

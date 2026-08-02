@@ -6,8 +6,8 @@
 //! Ferrum Edge is **not** a validated cryptographic module and is **not**
 //! independently FIPS-certified. No configuration of this binary makes it so.
 //!
-//! This module implements the parts of a FIPS deployment mode that do not
-//! depend on linking a validated module:
+//! This module implements the application-side parts of a FIPS deployment
+//! mode:
 //!
 //! 1. the operator-facing request surface (`--fips-mode`, `FERRUM_FIPS_MODE`,
 //!    `FERRUM_FIPS_REQUIRED_PROVIDER`) and its precedence,
@@ -74,7 +74,7 @@ use rustls::crypto::CryptoProvider;
 #[cfg(all(feature = "crypto-ring", feature = "fips"))]
 compile_error!(
     "the `crypto-ring` and `fips` features are mutually exclusive: enabling both leaves the \
-     non-validated `ring` implementation compiled alongside the validated module, and several \
+     non-FIPS `ring` implementation compiled alongside the AWS-LC FIPS implementation, and several \
      dependencies (sqlx-core, quinn-proto, tonic, ldap3, hyper-rustls) select their ring arm \
      whenever it is present. Build with `--no-default-features --features fips` for the FIPS \
      profile. See docs/fips.md."
@@ -83,7 +83,7 @@ compile_error!(
 #[cfg(not(any(feature = "crypto-ring", feature = "fips")))]
 compile_error!(
     "exactly one cryptographic backend feature must be selected: `crypto-ring` (the default, \
-     ordinary non-FIPS build) or `fips` (the validated AWS-LC-FIPS module). See docs/fips.md."
+     ordinary non-FIPS build) or `fips` (the AWS-LC FIPS module profile). See docs/fips.md."
 );
 
 /// The ring-API-compatible cryptographic backend this build links.
@@ -99,7 +99,9 @@ pub use ring as backend;
 /// The ring-API-compatible cryptographic backend this build links.
 ///
 /// On a `fips` build this is `aws-lc-rs` bound to `aws-lc-fips-sys`, so every
-/// call site that imports from here reaches the validated module.
+/// call site that imports from here reaches the selected AWS-LC FIPS module
+/// implementation. Whether a deployed artifact falls under an active CMVP
+/// certificate is a separate operator-evidence question; see `docs/fips.md`.
 #[cfg(feature = "fips")]
 pub use aws_lc_rs as backend;
 
@@ -115,14 +117,15 @@ pub const SUPPORTED_PROVIDER_ID: &str = "aws-lc-fips";
 /// Provider identifier reported by an ordinary, non-FIPS build.
 pub const RING_PROVIDER_ID: &str = "ring";
 
-/// `true` when this build links the validated module rather than `ring`.
+/// `true` when this build links the AWS-LC FIPS provider profile rather than
+/// `ring`.
 ///
 /// Derived from the selected cargo feature, never hand-set: it is `true`
 /// exactly when `--features fips` compiled `aws-lc-rs/fips` and `rustls/fips`
 /// into this binary. Every enforcement path reads this rather than assuming.
 pub const BUILD_CAPABLE: bool = cfg!(feature = "fips");
 
-/// `true` when this build links the validated module.
+/// `true` when this build links the AWS-LC FIPS provider profile.
 ///
 /// Function form of [`BUILD_CAPABLE`] for callers — notably external tests —
 /// that need the value without embedding a compile-time constant in an
@@ -142,11 +145,11 @@ fn module_self_test() -> Result<(), &'static str> {
     backend::try_fips_mode()
 }
 
-/// No validated module is linked on a `crypto-ring` build, so there is no
+/// No AWS-LC FIPS module is linked on a `crypto-ring` build, so there is no
 /// self-test to have passed. A definite "no", not an optimistic default.
 #[cfg(not(feature = "fips"))]
 fn module_self_test() -> Result<(), &'static str> {
-    Err("no validated cryptographic module is linked in this build")
+    Err("no AWS-LC FIPS cryptographic module is linked in this build")
 }
 
 /// Requested FIPS posture.
@@ -247,7 +250,7 @@ impl FipsState {
         self.mode.is_enforcing()
     }
 
-    /// `true` when this binary links the validated module.
+    /// `true` when this binary links the AWS-LC FIPS provider profile.
     pub fn build_capable(&self) -> bool {
         self.build_capable
     }

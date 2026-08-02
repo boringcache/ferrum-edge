@@ -17,9 +17,9 @@ name: FIPS Build Policy
 #
 # Ferrum Edge is not a validated cryptographic module and is not independently
 # FIPS-certified. A green run here means the FIPS profile builds, links the
-# validated module, passes its power-on self-test, and refuses every
-# non-approved algorithm — not that any deployment is certified. See
-# docs/fips.md.
+# selected AWS-LC FIPS implementation, passes its approved-mode self-test, and
+# refuses every non-approved algorithm. It does not prove that the artifact and
+# operating environment fall under a CMVP certificate. See docs/fips.md.
 
 on:
   push:
@@ -92,9 +92,10 @@ jobs:
           components: clippy
 
       - name: Install aws-lc-fips-sys build prerequisites
-        # The FIPS build of AWS-LC is compiled from source under a fixed build
-        # recipe — that recipe is part of what the module's validation covers,
-        # which is why it cannot be replaced with a prebuilt artifact here.
+        # The FIPS build of AWS-LC is compiled through the upstream crate's
+        # source-build path. This is a functional CI gate; certificate
+        # applicability still depends on the vendor security policy and the
+        # deployment's exact module version and operating environment.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \

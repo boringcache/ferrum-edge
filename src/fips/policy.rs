@@ -38,8 +38,9 @@ pub const MAX_REPORTED_VIOLATIONS: usize = 8;
 /// HMAC-SHA2 (FIPS 198-1), RSASSA-PKCS1-v1_5 and RSASSA-PSS with SHA-2, and
 /// ECDSA over P-256/P-384/P-521 (FIPS 186-5). `none` is always rejected.
 /// `EdDSA` is deliberately absent: Ed25519 is approved by FIPS 186-5, but it is
-/// not part of the algorithm set Ferrum routes through the selected validated
-/// module, so admitting it would be a claim this build cannot back.
+/// not part of the algorithm set Ferrum routes through the selected AWS-LC FIPS
+/// module implementation, so admitting it would be a claim this build cannot
+/// back.
 pub const APPROVED_JWT_ALGORITHMS: &[&str] = &[
     "HS256", "HS384", "HS512", "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256",
     "ES384", "ES512",
@@ -66,8 +67,8 @@ pub fn is_approved_jwt_algorithm(algorithm: &str) -> bool {
 pub const MIN_HMAC_KEY_BYTES: usize = 32;
 
 /// Plugins whose cryptography is provided by a library outside the selected
-/// validated module's boundary, and which are therefore refused while FIPS mode
-/// is enforced.
+/// AWS-LC FIPS module implementation, and which are therefore refused while
+/// FIPS mode is enforced.
 ///
 /// `kafka_logging` binds librdkafka, which performs its TLS through OpenSSL
 /// rather than through the module Ferrum selected. Ferrum cannot attest to that
@@ -282,8 +283,9 @@ pub fn check_gateway_config_enforced(config: &GatewayConfig) -> Result<(), Strin
         non_approved_plugins.sort();
         non_approved_plugins.dedup();
         return Err(format!(
-            "plugin(s) [{}] perform cryptography outside the selected validated module's boundary \
-             and are refused while FIPS mode is enforced. See docs/fips.md for module-backed \
+            "plugin(s) [{}] perform cryptography outside the selected AWS-LC FIPS module \
+             implementation and are refused while FIPS mode is enforced. See docs/fips.md for \
+             module-routed \
              alternatives.",
             bounded_list(&non_approved_plugins)
         ));

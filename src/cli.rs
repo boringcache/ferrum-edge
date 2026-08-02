@@ -55,8 +55,8 @@ pub struct RunArgs {
     ///
     /// Highest-precedence source for the FIPS request; it is materialized into
     /// `FERRUM_FIPS_MODE` before the crypto provider is installed. A request
-    /// that only appears in `ferrum.conf` arrives too late to select a
-    /// validated module and is refused. See docs/fips.md.
+    /// that only appears in `ferrum.conf` arrives too late to select the
+    /// AWS-LC FIPS provider profile and is refused. See docs/fips.md.
     #[arg(long = "fips-mode")]
     pub fips_mode: Option<String>,
 
@@ -83,8 +83,8 @@ pub struct ValidateArgs {
     ///
     /// Highest-precedence source for the FIPS request; it is materialized into
     /// `FERRUM_FIPS_MODE` before the crypto provider is installed. A request
-    /// that only appears in `ferrum.conf` arrives too late to select a
-    /// validated module and is refused. See docs/fips.md.
+    /// that only appears in `ferrum.conf` arrives too late to select the
+    /// AWS-LC FIPS provider profile and is refused. See docs/fips.md.
     #[arg(long = "fips-mode")]
     pub fips_mode: Option<String>,
 
@@ -272,8 +272,8 @@ pub fn apply_run_overrides(args: &RunArgs) {
     // The FIPS request must reach the environment before `main()` installs the
     // crypto provider, which happens immediately after this call. `ferrum.conf`
     // is not readable that early, so CLI and environment are the only sources
-    // that can select a validated module; a settings-file-only request is
-    // caught and refused by `fips::verify_resolved_mode`.
+    // that can select the AWS-LC FIPS provider profile. A settings-file-only
+    // request is caught and refused by `fips::verify_resolved_mode`.
     if let Some(ref fips_mode) = args.fips_mode {
         // SAFETY: single-threaded context, before tokio runtime.
         unsafe { std::env::set_var(crate::fips::FIPS_MODE_ENV, fips_mode) };
@@ -302,8 +302,8 @@ pub fn apply_validate_overrides(args: &ValidateArgs) {
     // The FIPS request must reach the environment before `main()` installs the
     // crypto provider, which happens immediately after this call. `ferrum.conf`
     // is not readable that early, so CLI and environment are the only sources
-    // that can select a validated module; a settings-file-only request is
-    // caught and refused by `fips::verify_resolved_mode`.
+    // that can select the AWS-LC FIPS provider profile. A settings-file-only
+    // request is caught and refused by `fips::verify_resolved_mode`.
     if let Some(ref fips_mode) = args.fips_mode {
         // SAFETY: single-threaded context, before tokio runtime.
         unsafe { std::env::set_var(crate::fips::FIPS_MODE_ENV, fips_mode) };
