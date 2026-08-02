@@ -155,6 +155,23 @@ fn endpoint_slice() -> K8sObject {
 }
 
 fn authorization_policy(namespace: &str) -> K8sObject {
+    authorization_policy_with_not_ports(namespace, &[])
+}
+
+fn authorization_policy_with_not_ports(namespace: &str, not_ports: &[&str]) -> K8sObject {
+    let mut operation = serde_json::Map::new();
+    operation.insert("ports".to_string(), json!(["9080"]));
+    if !not_ports.is_empty() {
+        operation.insert(
+            "notPorts".to_string(),
+            json!(
+                not_ports
+                    .iter()
+                    .map(|pattern| pattern.to_string())
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
     object(
         "security.istio.io/v1",
         "AuthorizationPolicy",
@@ -162,7 +179,7 @@ fn authorization_policy(namespace: &str) -> K8sObject {
         "allow-reviews",
         json!({
             "action": "ALLOW",
-            "rules": [{"to": [{"operation": {"ports": ["9080"]}}]}]
+            "rules": [{"to": [{"operation": operation}]}]
         }),
     )
 }
@@ -367,6 +384,53 @@ fn deleting_the_last_policies_withdraws_the_mesh_overlay() {
         withdrawn.mesh.is_none(),
         "a deleted AuthorizationPolicy / PeerAuthentication / RequestAuthentication must not \
          keep governing traffic"
+    );
+}
+
+#[test]
+fn authorization_policy_wildcard_not_ports_update_and_withdrawal() {
+    // Issue #3237 acceptance: wildcard notPorts must survive apply → update →
+    // delete/withdrawal through the Kubernetes overlay path, not just first
+    // construction.
+    let managed = managed(&["default"]);
+    let initial =
+        authoritative_translation(&[authorization_policy_with_not_ports("default", &["8*"])]);
+    let active = merge_k8s_translation(&GatewayConfig::default(), &initial, &managed);
+    {
+        let initial_request = &mesh_of(&active).mesh_policies[0].rules[0].to[0];
+        assert_eq!(initial_request.ports, vec![9080]);
+        assert!(initial_request.not_ports.is_empty());
+        assert_eq!(
+            initial_request.not_port_patterns,
+            vec!["8*".to_string()],
+            "first apply must project wildcard notPorts into not_port_patterns"
+        );
+    }
+
+    let updated =
+        authoritative_translation(&[authorization_policy_with_not_ports("default", &["*443"])]);
+    let after_update = merge_k8s_translation(&active, &updated, &managed);
+    {
+        let updated_request = &mesh_of(&after_update).mesh_policies[0].rules[0].to[0];
+        assert_eq!(updated_request.ports, vec![9080]);
+        assert!(updated_request.not_ports.is_empty());
+        assert_eq!(
+            updated_request.not_port_patterns,
+            vec!["*443".to_string()],
+            "update must replace the modeled not_port_patterns generation"
+        );
+        assert_ne!(
+            updated_request.not_port_patterns,
+            vec!["8*".to_string()],
+            "update must change wildcard notPorts behavior, not leave the prior generation"
+        );
+    }
+
+    let withdrawn =
+        merge_k8s_translation(&after_update, &authoritative_empty_translation(), &managed);
+    assert!(
+        withdrawn.mesh.is_none(),
+        "deleting the AuthorizationPolicy must withdraw the modeled wildcard notPorts policy"
     );
 }
 
