@@ -22,8 +22,7 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     replay_spool_once_with_batch_size_for_tests, replay_spool_once_with_ceiling_for_tests,
     serialize_json_each_row, serialize_json_each_row_projected, set_spool_write_hook_for_tests,
     spool_artifact_byte_limit_for_tests, spool_claim_lease_secs_for_tests,
-    spool_decompression_limit_for_tests, spool_index_entry_bytes_for_tests,
-    spool_replay_peak_bytes_for_tests, spool_split_worklist_max_entries_for_tests,
+    spool_decompression_limit_for_tests, spool_streaming_limits_for_tests,
     write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
@@ -2764,9 +2763,27 @@ async fn mount_status_sequence(server: &MockServer, statuses: &[u16]) {
         .await;
 }
 
+async fn mount_rejecting_body_marker(server: &MockServer, marker: &'static str, status: u16) {
+    Mock::given(method("POST"))
+        .respond_with(move |request: &Request| {
+            let rejected = request
+                .body
+                .windows(marker.len())
+                .any(|window| window == marker.as_bytes());
+            ResponseTemplate::new(if rejected { status } else { 200 })
+        })
+        .mount(server)
+        .await;
+}
+
 fn dead_letter_meta_path(source_path: &Path) -> std::path::PathBuf {
     let name = source_path.file_name().and_then(|n| n.to_str()).unwrap();
     source_path.with_file_name(format!("{name}.rejected.meta"))
+}
+
+fn dead_letter_payload_path(source_path: &Path) -> std::path::PathBuf {
+    let name = source_path.file_name().and_then(|n| n.to_str()).unwrap();
+    source_path.with_file_name(format!("{name}.rejected.ndjson"))
 }
 
 fn assert_rejected_sidecar(source_path: &Path, expected_status: u16, expected_reason: &str) {
@@ -2781,13 +2798,10 @@ fn assert_rejected_sidecar(source_path: &Path, expected_status: u16, expected_re
         "rejected payload must leave the replay set: {}",
         source_path.display()
     );
-    let rejected_payload = source_path.with_file_name(format!(
-        "{}.rejected",
-        source_path.file_name().and_then(|n| n.to_str()).unwrap()
-    ));
+    let rejected_payload = dead_letter_payload_path(source_path);
     assert!(
-        !rejected_payload.exists(),
-        "dead-letter state must not retain charge-record PII: {}",
+        rejected_payload.exists(),
+        "dead-letter state must retain the original rejected row payload: {}",
         rejected_payload.display()
     );
     let meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
@@ -2801,7 +2815,26 @@ fn assert_rejected_sidecar(source_path: &Path, expected_status: u16, expected_re
                 .as_u64()
                 .is_some_and(|count| count >= 1)
     }));
-    // Safe metadata only — no charge-record fields.
+    assert_eq!(
+        meta["payload_file"],
+        rejected_payload.file_name().unwrap().to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        meta["payload_bytes"].as_u64().unwrap(),
+        fs::metadata(&rejected_payload).unwrap().len()
+    );
+    assert_eq!(meta["payload_sha256"].as_str().unwrap().len(), 64);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&rejected_payload).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "dead-letter billing payload must be owner-only"
+        );
+    }
+    // Metadata stays safe even though its owner-only sibling intentionally
+    // preserves the original rejected billing row.
     let serialized = serde_json::to_string(&meta).unwrap();
     for forbidden in [
         "consumer_id",
@@ -2845,9 +2878,110 @@ async fn replay_dead_letters_permanent_400_and_continues_to_newer_file() {
 }
 
 #[tokio::test]
+async fn replay_bisects_mixed_http_400_and_preserves_only_the_original_bad_row() {
+    let server = MockServer::start().await;
+    mount_rejecting_body_marker(&server, "evt-bad-400", 400).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let events = vec![
+        sample_event("evt-good-a"),
+        sample_event("evt-good-b"),
+        sample_event("evt-bad-400"),
+        sample_event("evt-good-c"),
+    ];
+    let expected_bad = serialize_json_each_row(&[events[2].clone()]).unwrap();
+    let source = spool.write_events(&events).unwrap();
+
+    replay_spool_once_with_batch_size_for_tests(&spool, &server.uri(), 4)
+        .await
+        .expect("permanent batch rejection must isolate the poison row");
+
+    assert_rejected_sidecar(&source, 400, "permanent_http");
+    assert_eq!(
+        fs::read_to_string(dead_letter_payload_path(&source)).unwrap(),
+        expected_bad,
+        "dead-letter payload must preserve exactly the rejected source row"
+    );
+    let meta: Value =
+        serde_json::from_str(&fs::read_to_string(dead_letter_meta_path(&source)).unwrap()).unwrap();
+    assert_eq!(meta["rejected_rows"], 1);
+
+    let requests = wait_for_requests(&server, 5).await;
+    assert_eq!(requests.len(), 5, "four rows with one poison row use a fixed tree");
+    let accepted_attempts: Vec<String> = requests
+        .iter()
+        .map(|request| String::from_utf8(request.body.clone()).unwrap())
+        .filter(|body| !body.contains("evt-bad-400"))
+        .collect();
+    let accepted = accepted_attempts.join("\n");
+    for id in ["evt-good-a", "evt-good-b", "evt-good-c"] {
+        assert!(accepted.contains(id), "good row {id} was not delivered");
+    }
+}
+
+#[tokio::test]
+async fn replay_schema_evolution_400_isolates_the_legacy_row_verbatim() {
+    let server = MockServer::start().await;
+    mount_rejecting_body_marker(&server, "legacy_column", 400).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let source = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FE0"));
+    let legacy = br#"{"event_id":"legacy","legacy_column":"kept"}"#;
+    let current = br#"{"event_id":"current","current_column":"ok"}"#;
+    let mut artifact = Vec::new();
+    artifact.extend_from_slice(legacy);
+    artifact.push(b'\n');
+    artifact.extend_from_slice(current);
+    fs::write(&source, artifact).unwrap();
+
+    replay_spool_once_with_batch_size_for_tests(&spool, &server.uri(), 2)
+        .await
+        .expect("schema-evolution rejection must isolate the legacy row");
+
+    assert_eq!(fs::read(dead_letter_payload_path(&source)).unwrap(), legacy);
+    let requests = wait_for_requests(&server, 3).await;
+    assert_eq!(requests.len(), 3);
+    assert!(requests
+        .iter()
+        .any(|request| request.body.as_slice() == current));
+}
+
+#[tokio::test]
+async fn replay_permanent_isolation_attempts_are_bounded_by_the_batch_tree() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool.write_events(&spool_replay_events(8)).unwrap();
+    replay_spool_once_with_batch_size_for_tests(&spool, &server.uri(), 8)
+        .await
+        .expect("a complete permanent tree must terminate");
+
+    let requests = wait_for_requests(&server, 15).await;
+    let (_, _, _, hard_attempt_limit) = spool_streaming_limits_for_tests();
+    assert_eq!(requests.len(), 15, "eight rejected rows require 2n-1 attempts");
+    assert!(requests.len() <= hard_attempt_limit);
+    assert_eq!(
+        fs::read_to_string(dead_letter_payload_path(&source))
+            .unwrap()
+            .lines()
+            .count(),
+        8
+    );
+}
+
+#[tokio::test]
 async fn replay_keeps_original_when_dead_letter_metadata_cannot_be_written() {
     let server = MockServer::start().await;
-    mount_status_sequence(&server, &[400]).await;
+    mount_status_sequence(&server, &[400, 400]).await;
 
     let temp = tempfile::tempdir().unwrap();
     let spool = test_spool(&temp);
@@ -2875,6 +3009,43 @@ async fn replay_keeps_original_when_dead_letter_metadata_cannot_be_written() {
         !meta_path.exists(),
         "partial metadata must not be published"
     );
+    assert!(
+        dead_letter_payload_path(&source).exists(),
+        "a payload published before metadata failure remains recoverable while the source stays authoritative"
+    );
+
+    fs::remove_dir(&tmp_path).unwrap();
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect("replay must recover after the metadata store becomes writable");
+    assert_rejected_sidecar(&source, 400, "permanent_http");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dead_letter_payload_publish_refuses_symlink_and_restores_the_source_claim() {
+    use std::os::unix::fs::symlink;
+
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[400]).await;
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-symlink-dead-letter")])
+        .unwrap();
+    let outside = temp.path().join("outside-billing-data");
+    fs::write(&outside, b"do-not-touch").unwrap();
+    let payload = dead_letter_payload_path(&source);
+    symlink(&outside, &payload).unwrap();
+
+    let error = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("a planted dead-letter symlink must fail closed");
+
+    assert!(error.contains("symlink"), "unexpected error: {error}");
+    assert!(source.exists(), "the authoritative source must be restored");
+    assert_eq!(fs::read(&outside).unwrap(), b"do-not-touch");
+    assert!(fs::symlink_metadata(&payload).unwrap().file_type().is_symlink());
 }
 
 #[tokio::test]
@@ -2944,7 +3115,7 @@ async fn replay_splits_413_payload_and_preserves_event_ids() {
     ];
     let path = spool.write_events(&events).unwrap();
 
-    replay_spool_once_with_batch_size_for_tests(&spool, &server.uri(), 2)
+    replay_spool_once_with_batch_size_for_tests(&spool, &server.uri(), 4)
         .await
         .unwrap();
 
@@ -6583,10 +6754,9 @@ fn chargeback_insert_body_is_refused_rather_than_serialized_under_a_saturated_ce
 // Spool replay retained-byte ownership — GHSA-83h5-52mw-f33p.
 //
 // Replay must not create an attacker-shaped representation outside the
-// retained-byte ceiling. The decoded artifact, its line index, the replay
-// worklist, and every chunk body are each reserved *before* they exist and held
-// for their real lifetime; 413 splits address line ranges instead of deep-
-// copying rows, so splitting cannot multiply retained row bytes.
+// retained-byte ceiling. A fixed row scratch, decoder window, one bounded
+// batch, its line index, and the isolation worklist are reserved before they
+// exist. Peak retention is independent of artifact size.
 // ---------------------------------------------------------------------------
 
 /// A replay artifact big enough that its decoded bytes dominate every fixed
@@ -6633,6 +6803,138 @@ async fn spool_replay_refuses_before_decoding_when_the_ceiling_cannot_hold_the_a
 }
 
 #[tokio::test]
+async fn spool_replay_quarantines_row_length_and_row_count_violations_before_http() {
+    let (row_limit, row_count_limit, _, _) = spool_streaming_limits_for_tests();
+    let temp = tempfile::tempdir().unwrap();
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 8 * 1024 * 1024), "node-a")
+        .unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    let long_row = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FE1"));
+    fs::write(&long_row, vec![b'x'; row_limit + 1]).unwrap();
+    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
+        .await
+        .expect("an oversized row is quarantined, not retried");
+    assert!(!long_row.exists());
+    assert!(long_row.with_file_name(format!(
+        "{}.corrupt",
+        long_row.file_name().unwrap().to_string_lossy()
+    )).exists());
+
+    let too_many_rows = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FE2"));
+    let mut rows = Vec::with_capacity((row_count_limit + 1) * 3);
+    for _ in 0..=row_count_limit {
+        rows.extend_from_slice(b"{}\n");
+    }
+    fs::write(&too_many_rows, rows).unwrap();
+    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
+        .await
+        .expect("an over-row-count artifact is quarantined before delivery");
+    assert!(!too_many_rows.exists());
+    assert!(too_many_rows.with_file_name(format!(
+        "{}.corrupt",
+        too_many_rows.file_name().unwrap().to_string_lossy()
+    )).exists());
+}
+
+#[tokio::test]
+async fn spool_replay_quarantines_a_compressed_bomb_during_bounded_preflight() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 8 * 1024 * 1024), "node-a")
+        .unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let plain = vec![b' '; 2 * 1024 * 1024];
+    let encoded = encode_spool_bytes_without_ratio_padding_for_tests(&plain).unwrap();
+    assert!(
+        spool_decompression_limit_for_tests(encoded.len() as u64) < plain.len() as u64,
+        "fixture must exceed the encoded-ratio limit"
+    );
+    let source = day.join(format!(
+        "01ARZ3NDEKTSV4RRFFQ69G5FE3.{}.ndjson.zst",
+        default_test_owner_tag()
+    ));
+    fs::write(&source, encoded).unwrap();
+
+    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
+        .await
+        .expect("a compressed bomb is quarantined without an HTTP attempt");
+
+    assert!(!source.exists());
+    assert!(source.with_file_name(format!(
+        "{}.corrupt",
+        source.file_name().unwrap().to_string_lossy()
+    )).exists());
+}
+
+#[tokio::test]
+async fn writer_zstd_artifact_replays_through_the_bounded_streaming_decoder() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+    let temp = tempfile::tempdir().unwrap();
+    let mut settings = spool_settings(temp.path(), 8 * 1024 * 1024);
+    settings.compression = SpoolCompression::Zstd;
+    let spool = SpoolManager::for_tests_with_ceiling(settings, "node-a", ceiling).unwrap();
+    let source = spool.write_events(&spool_replay_events(200)).unwrap();
+
+    replay_spool_once_with_ceiling_for_tests(&spool, &server.uri(), 128, ceiling)
+        .await
+        .expect("writer-produced zstd must stream through bounded replay");
+
+    assert!(!source.exists());
+    assert_eq!(wait_for_requests(&server, 2).await.len(), 2);
+    assert_eq!(ceiling.used(), 0);
+    assert!(ceiling.high_water() <= ceiling.max());
+}
+
+#[tokio::test]
+async fn large_uncompressed_replay_has_artifact_size_independent_peak_retention() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 16 * 1024 * 1024), "node-a")
+        .unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let source = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FE4"));
+    let padding = "x".repeat(1_000);
+    let mut artifact = Vec::new();
+    for index in 0..5_000 {
+        if index != 0 {
+            artifact.push(b'\n');
+        }
+        artifact.extend_from_slice(
+            format!(r#"{{"event_id":"large-{index}","padding":"{padding}"}}"#).as_bytes(),
+        );
+    }
+    assert!(artifact.len() > 4 * 1024 * 1024);
+    fs::write(&source, artifact).unwrap();
+    let ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+
+    replay_spool_once_with_ceiling_for_tests(&spool, &server.uri(), 128, ceiling)
+        .await
+        .expect("large replay must stream under the fixed ceiling");
+
+    assert!(!source.exists());
+    assert_eq!(ceiling.used(), 0);
+    assert!(
+        ceiling.high_water() <= 6 * 1024 * 1024,
+        "streaming peak {} must stay below fixed reader+batch headroom",
+        ceiling.high_water()
+    );
+    assert_eq!(wait_for_requests(&server, 40).await.len(), 40);
+}
+
+#[tokio::test]
 async fn spool_replay_413_split_does_not_multiply_retained_row_bytes() {
     let server = MockServer::start().await;
     // Whole 8-row file -> 413, then each half -> 413 again, then the quarters
@@ -6658,21 +6960,18 @@ async fn spool_replay_413_split_does_not_multiply_retained_row_bytes() {
     );
     assert_eq!(ceiling.rejections(), 0);
 
-    // Peak retention is one decoded artifact + its index + the worklist + the
-    // single largest chunk body. Splitting borrows line ranges, so it never adds
-    // another artifact-sized copy: three levels of halving stay well under two
-    // artifacts plus fixed slack.
-    let artifact_scale = encoded_len * 2 + 4_096;
+    // Peak retention is one fixed row/reader reservation plus one fixed-capacity
+    // streaming batch and its bounded index/worklist, independent of split
+    // depth and artifact size.
     assert!(
         ceiling.high_water() > 0,
         "the injected ceiling must really be on the replay path"
     );
     assert!(
-        ceiling.high_water() <= artifact_scale,
-        "413 splitting must not multiply retained row bytes: high_water={} artifact={} bound={}",
+        ceiling.high_water() <= 6 * 1024 * 1024,
+        "413 splitting must stay inside fixed streaming headroom: high_water={} artifact={}",
         ceiling.high_water(),
-        encoded_len,
-        artifact_scale
+        encoded_len
     );
 
     // Ordering, event identity, and dead-letter semantics are unchanged.
@@ -6711,7 +7010,8 @@ async fn spool_replay_releases_its_reservations_on_success_and_on_retryable_fail
 
     // Permanent path: the file is dead-lettered, and that too releases.
     let server = MockServer::start().await;
-    mount_status_sequence(&server, &[400]).await;
+    // Four rejected rows require the complete seven-node isolation tree.
+    mount_status_sequence(&server, &[400, 400, 400, 400, 400, 400, 400]).await;
     replay_spool_once_with_ceiling_for_tests(&spool, &server.uri(), 4, ceiling)
         .await
         .expect("a permanent rejection is not a replay error");
@@ -6947,49 +7247,20 @@ fn spool_write_is_refused_rather_than_materialized_under_a_saturated_ceiling() {
     );
 }
 
-#[test]
-fn every_writable_artifact_is_structurally_replayable_under_the_same_ceiling() {
-    // The liveness contract: if a ceiling admitted the write, it must also admit
-    // the replay. The write reserves `charge_body_byte_bound`; replay's peak is
-    // `spool_replay_peak_bytes`. Proving the second never exceeds the first, for
-    // every artifact shape this build can produce, is what rules out an artifact
-    // that is deterministically impossible to read back.
-    let roomy = leaked_chargeback_test_ceiling(64 * 1024 * 1024);
-    for count in [1usize, 2, 8, 64, 512, 4_096] {
-        let events = spool_replay_events(count);
-        let (write_bound, _held, _after) =
-            probe_charge_body_materialization_for_tests(roomy, &events)
-                .expect("the write reservation must be representable");
-        let json_len = serialize_json_each_row(&events).unwrap().len() as u64;
-        let replay_peak = spool_replay_peak_bytes_for_tests(json_len, count)
-            .expect("the replay peak must be representable");
-        assert!(
-            replay_peak <= write_bound as u64,
-            "a {count}-row artifact would need {replay_peak} replay bytes but only \
-             {write_bound} were required to write it"
-        );
-    }
-    assert_eq!(roomy.used(), 0);
-}
-
 #[tokio::test]
 async fn spool_replay_of_a_written_artifact_fits_under_the_proven_liveness_bound() {
     let server = MockServer::start().await;
     mount_status_sequence(&server, &[200]).await;
 
     let events = spool_replay_events(256);
-    let json_len = serialize_json_each_row(&events).unwrap().len() as u64;
-    let peak = spool_replay_peak_bytes_for_tests(json_len, events.len()).unwrap();
-
     let write_ceiling = leaked_chargeback_test_ceiling(64 * 1024 * 1024);
     let temp = tempfile::tempdir().unwrap();
     let spool = ceiling_spool(&temp, write_ceiling);
     let path = spool.write_events(&events).expect("artifact is admitted");
 
-    // Replay against exactly the proven bound — no slack. A file this build
-    // spooled must replay under it rather than becoming permanently
-    // unreplayable.
-    let ceiling = leaked_chargeback_test_ceiling(usize::try_from(peak).unwrap());
+    // Replay against fixed streaming headroom rather than an artifact-sized
+    // decoded-buffer formula.
+    let ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
     replay_spool_once_with_ceiling_for_tests(&spool, &server.uri(), 128, ceiling)
         .await
         .expect("a written artifact must be replayable under the same ceiling");
@@ -7001,48 +7272,17 @@ async fn spool_replay_of_a_written_artifact_fits_under_the_proven_liveness_bound
         0,
         "the proven bound must leave no room for a structural refusal"
     );
-    assert!(
-        ceiling.high_water() <= peak as usize,
-        "observed peak {} exceeded the proven bound {peak}",
-        ceiling.high_water()
-    );
-}
-
-#[test]
-fn spool_replay_worklist_reservation_is_independent_of_row_count() {
-    let entries = spool_split_worklist_max_entries_for_tests();
-    let entry_bytes = spool_index_entry_bytes_for_tests();
-    assert!(
-        entries >= usize::BITS as usize,
-        "the bound must cover every halving level"
-    );
-
-    // The worklist charge is fixed, and it is already part of the peak for a
-    // single-row artifact.
-    let worklist = (entries * entry_bytes) as u64;
-    let one_row = spool_replay_peak_bytes_for_tests(1_024, 1).unwrap();
-    assert!(
-        one_row >= worklist,
-        "the peak accounting must include the fixed worklist reservation"
-    );
-
-    // Row-count growth costs only the line index and one row separator each —
-    // never a per-line worklist slot. The old O(lines) worklist reservation is
-    // what this delta would have exposed, and it is what could strand a healthy
-    // high-row-count artifact.
-    let many_rows = spool_replay_peak_bytes_for_tests(1_024, 1_001).unwrap();
-    assert_eq!(
-        many_rows - one_row,
-        1_000 * (entry_bytes as u64 + 1),
-        "each extra row costs exactly one index entry plus its row separator"
-    );
+    assert!(ceiling.high_water() <= 6 * 1024 * 1024);
 }
 
 #[tokio::test]
 async fn spool_replay_dead_letter_accounting_is_aggregated_not_per_row() {
     let server = MockServer::start().await;
-    // Whole file rejected permanently: one aggregate outcome, not one per row.
-    mount_status_sequence(&server, &[400]).await;
+    // Every node in the 64-row isolation tree rejects permanently: one
+    // aggregate outcome is retained after 127 bounded attempts, not one
+    // metadata allocation per row.
+    let statuses = vec![400; 127];
+    mount_status_sequence(&server, &statuses).await;
 
     let ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
     let temp = tempfile::tempdir().unwrap();
@@ -7570,7 +7810,7 @@ fn a_legitimate_high_ratio_batch_is_padded_and_remains_replayable() {
     settings.compression = SpoolCompression::Zstd;
     let spool = SpoolManager::for_tests_with_ceiling(settings, "node-a", ceiling).unwrap();
     let mut event = sample_event("evt-high-ratio");
-    event.request_id = Some("a".repeat(2 * 1024 * 1024));
+    event.request_id = Some("\0".repeat(100 * 1024));
     let decoded_len = serialize_json_each_row(std::slice::from_ref(&event))
         .unwrap()
         .len() as u64;

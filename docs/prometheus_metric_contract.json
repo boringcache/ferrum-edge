@@ -214,6 +214,16 @@
     "emission": "when_plugin_enabled"
   },
   {
+    "name": "chargeback_sink_spool_dead_letter_rows_total",
+    "type": "counter",
+    "help": "Permanently rejected rows durably handed to the private dead-letter payload store.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
     "name": "chargeback_sink_spool_drops_total",
     "type": "counter",
     "help": "Chargeback sink spool files dropped to enforce max_bytes.",
@@ -277,6 +287,16 @@
     "name": "chargeback_sink_spool_prepare_failures_total",
     "type": "counter",
     "help": "Chargeback sink committed spool storage preparation failures.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_spool_replay_attempts_total",
+    "type": "counter",
+    "help": "ClickHouse HTTP attempts made by bounded spool replay, including permanent-failure isolation children.",
     "labels": [],
     "subsystem": "api_chargeback_sink",
     "export_surface": "/metrics",

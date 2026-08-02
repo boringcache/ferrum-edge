@@ -399,6 +399,8 @@ identity:
 ```text
 <spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/spool.meta.json
 <spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/<YYYYMMDD>/<ULID>.<owner_tag>.ndjson.zst
+<spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/<YYYYMMDD>/<ULID>.<owner_tag>.ndjson.zst.rejected.ndjson
+<spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/<YYYYMMDD>/<ULID>.<owner_tag>.ndjson.zst.rejected.meta
 ```
 
 ### Spool ownership identity
@@ -516,8 +518,10 @@ Claim disposition:
 - **Delivered** — the claim is removed.
 - **Retryable** — the claim is released back to its durable replayable name and
   the tick stops so ordering is preserved.
-- **Permanent / 413 single row** — the claim is replaced by safe dead-letter
-  metadata named after the durable data file.
+- **Permanent / 413 single row** — good siblings are delivered through bounded
+  bisection; each minimal rejected row is durably copied byte-for-byte to the
+  private dead-letter payload file and described by safe metadata before the
+  source claim is removed.
 - **Unreadable** — the claim is quarantined as `<data-name>.corrupt`.
 
 In-flight claims count toward `spool.max_bytes` but are **never** eviction
@@ -553,8 +557,16 @@ split, or skip a file:
 | --- | --- | --- |
 | Delivered | HTTP 200 / 204 with a complete empty acknowledgement body and no exception header/markers | Remove the spool file after the accepted insert |
 | Retryable | network / timeout / TLS transport errors, incomplete acknowledgement drains, ambiguous non-empty 2xx bodies, HTTP 401, 403, 408, 429, 5xx, and other non-4xx failures | Keep the file, stop the current replay tick (newer files wait so order is preserved across transient outages) |
-| Payload too large | HTTP 413 | Deterministically split the JSONEachRow body (preferring `batch.size`, otherwise halving) and retry each part without rewriting row bytes, so each event keeps its stable `event_id` idempotency identity. A single row that still returns 413 is dead-lettered |
-| Permanent | other HTTP 4xx (for example 400, 404, 409, 418, 422), or HTTP 200/204 whose body/`X-ClickHouse-Exception-Code` carries a ClickHouse exception | Replace the rejected payload with safe dead-letter metadata and continue with newer spool files so one poison batch cannot head-of-line block the spool |
+| Payload too large | HTTP 413 | Deterministically split the bounded replay batch (preferring `batch.size`, otherwise halving) without rewriting row bytes, so each event keeps its stable `event_id` idempotency identity. A single row that still returns 413 is durably dead-lettered |
+| Permanent | other HTTP 4xx (for example 400, 404, 409, 418, 422), or HTTP 200/204 whose body/`X-ClickHouse-Exception-Code` carries a ClickHouse exception | Deterministically bisect until minimal rejected rows are isolated, deliver good siblings, then durably hand the exact rejected rows to the private payload store and continue with newer spool files |
+
+Replay batches are additionally capped at **128 rows** and **4 MiB**. A complete
+binary isolation tree therefore makes at most **255 HTTP attempts per batch**
+(`2 × rows - 1`), even when every row is independently rejected. Together with
+the 10,000-row artifact limit, this is at most 19,999 attempts for one artifact.
+The attempt count is exported as `chargeback_sink_spool_replay_attempts_total`;
+rows count only after the payload+metadata handoff and source removal complete,
+in `chargeback_sink_spool_dead_letter_rows_total`.
 
 Logs and error strings for these outcomes carry only safe metadata (plugin name,
 HTTP status code, reason class, row count, acknowledgement byte length class,
@@ -565,15 +577,19 @@ fields are never logged.
 
 - Unreadable local spool files are renamed with a `.corrupt` suffix so newer
   files can continue to replay.
-- Every encoded and decoded spool artifact is hard-capped at 256 MiB, matching
-  the sink's maximum accepted retained-byte budget. The writer refuses a larger
-  artifact, so it cannot publish a record this build will not replay. A `zstd`
-  record written by this build records its decompressed size in the frame
-  header, and that is the (tight) bound replay reserves before reading it; a
-  foreign or hand-planted archive with no such header falls back to at most 200x
-  its encoded size (floor 1 MiB). A planted large raw file or high-ratio archive
-  inside the managed tree is quarantined as `.corrupt` without first being read
-  or expanded without limit inside the billing process.
+- Every encoded and decoded spool artifact is hard-capped at 256 MiB. Replay
+  first performs a complete bounded streaming preflight, then reopens the claim
+  and streams at most one 4 MiB / 128-row batch. It never retains the whole
+  decoded file or an artifact-wide row index. A decoded row is capped at **1
+  MiB** and an artifact at **10,000 rows**; decoded bytes, row bytes, and row
+  count are checked before buffer growth or counter admission. UTF-8 and JSON
+  syntax are validated during preflight, before the first HTTP request. A
+  `zstd` record written by this build carries its decoded size, while a foreign
+  headerless archive falls back to at most 200x encoded bytes (floor 1 MiB).
+  The decoder's accepted window is capped and charged before construction. A
+  large raw file, compressed bomb, malformed row, overlong row, or over-row-count
+  artifact is renamed `.corrupt`; it is never retried in an allocation loop or
+  silently deleted.
 - Building a spool artifact is charged to the process-wide retained-byte
   ceiling. The JSONEachRow serialization and, under `zstd`, its compressed form
   are each reserved **before** they are allocated — the queued charge events
@@ -581,32 +597,37 @@ fields are never logged.
   reservation is held across the blocking write, fsync, and rename. A ceiling
   refusal is reported through the existing spool-write failure accounting and
   publishes nothing.
-- The writer additionally refuses any artifact whose *replay* would not fit
-  under the same configured process ceiling. Replay retains, at its peak, one
-  decoded text buffer, one `(start, end)` line index entry per row, a
-  fixed-capacity 413-split worklist, and one request body for the chunk in
-  flight. Because that peak is always below what writing the same artifact
-  required, a file this build successfully spooled is never structurally
-  unreplayable. Transient ceiling *pressure* is different and stays retryable:
-  the claim is released and the artifact replays in order on a later tick — a
-  busy ceiling never quarantines a healthy file.
+- Streaming scratch, the bounded zstd window, batch storage, the at-most-128
+  entry line index, the fixed isolation worklist, and the fixed dead-letter
+  status/outcome state are each reserved before allocation. Safe dead-letter
+  metadata serialization has its own 128 KiB reservation and hard bound. Peak
+  retained memory is therefore independent of artifact length and compression
+  ratio. Transient ceiling pressure stays retryable: the claim is released and
+  the artifact replays in order on a later tick; a busy ceiling never
+  quarantines a healthy file.
 - `spool.meta.json` is bounded separately at 64 KiB. It is the one managed file
   read *before* ownership is established — on every prepare and every replay
   listing — so it is reachable without first deriving this owner's tag. An
   oversized manifest fails the ownership check closed (`spool.available=false`,
   `chargeback_sink_spool_prepare_failures_total`) and mutates nothing.
-- Permanently rejected rows (and single-row 413 failures) are discarded only
-  after one deterministic sibling `.rejected.meta` JSON document has been
-  durably written for the source file. The document contains the aggregate
+- Permanently rejected rows (and single-row 413 failures) are appended verbatim
+  to one owner-only (`0600` on Unix) sibling `.rejected.ndjson` temp. The temp is
+  fsynced, atomically renamed, and directory-fsynced before the sibling
+  `.rejected.meta` document is published; only then is the authoritative source
+  removed. The metadata contains the payload filename, byte length, SHA-256,
+  aggregate
   `rejected_rows`, safe `outcomes` (`reason`, optional `http_status`, and
   `row_count`), and `quarantined_at_unix`. Rejections are accumulated into a
   fixed-size per-status tally whose footprint is independent of the artifact's
   row count, so a hostile row count cannot grow an uncharged accumulator while
-  the decoded artifact is still retained; per-status row counts stay exact. The
-  document never retains the rejected payload, response bodies, credentials, or
-  charge-record PII. If the metadata
-  write fails, the original file remains replayable; successfully inserted
-  rows may be retried with their unchanged `event_id` idempotency identity.
+  the streaming batch is retained; per-status row counts stay exact. The
+  metadata document never embeds the rejected payload, response bodies,
+  credentials, or charge-record fields. The payload file intentionally contains
+  original billing rows and must remain access-controlled. If any payload,
+  metadata, quota, or source-removal step fails, the original file remains
+  replayable; a successfully published payload remains recoverable and is
+  safely replaced by a later attempt. Successfully inserted rows may be retried
+  with their unchanged `event_id` idempotency identity.
 - Temps left by an interrupted atomic write are reconciled only when this process
   demonstrably owns them (matching `process_tag`) and no live writer holds the
   path, or when they are foreign/unattributable **and** older than the stale-temp
@@ -615,13 +636,14 @@ fields are never logged.
 - In-flight replay claims are recovered to durable replayable names during live
   prepare, subject to the lease rules above.
 
-Dead-letter metadata, corrupt files, temps, and in-flight claims remain under
-the managed namespace and count toward `spool.max_bytes` until eviction drops the
-oldest **evictable** owned file. In-flight claims, temps still under an active
-write, and records carrying another owner's tag are never evictable: eviction
-applies the same ownership and stale-age test reconciliation does, so it can
-reclaim a crash-left temp but never unlink a peer generation's in-progress
-publish.
+Dead-letter payloads/metadata, corrupt files, temps, and in-flight claims remain
+under the managed namespace and count toward `spool.max_bytes`. Dead-letter
+payloads and their metadata are not automatic eviction candidates: operators
+must reconcile/remove that billing evidence as a pair. In-flight claims, temps
+still under an active write, and records carrying another owner's tag are also
+never evictable. Eviction applies the same ownership and stale-age test as
+reconciliation, so it can reclaim a crash-left temp but never unlink a peer
+generation's in-progress publish.
 
 ### Migration and destination changes
 
@@ -669,8 +691,9 @@ sink under its managed namespace (after compression when `compression` is
   dead-letter metadata `*.rejected.meta.tmp` files)
 - in-flight replay claims (`*.inflight`)
 - corrupt quarantine (`*.ndjson.corrupt` / `*.ndjson.zst.corrupt`)
-- metadata-only dead letters (`*.ndjson.rejected.meta` /
-  `*.ndjson.zst.rejected.meta`)
+- dead-letter payloads (`*.ndjson.rejected.ndjson` /
+  `*.ndjson.zst.rejected.ndjson`) and their safe metadata
+  (`*.ndjson.rejected.meta` / `*.ndjson.zst.rejected.meta`)
 
 Pending writes are serialized/compressed and sized **before** quota admission.
 Admission holds the spool write lock with eviction so concurrent writers cannot
@@ -754,8 +777,8 @@ Response contract:
   generations retaining an unspooled terminal delta for bounded retry.
 - `totals` aggregates queue depth/capacity/high-water hits/high-water
   diversions/full-buffer drops, spool files/bytes/
-  drops/prepare failures, and export counters across every current accepted
-  instance.
+  drops/prepare failures/replay attempts/durably dead-lettered rows, and export
+  counters across every current accepted instance.
   `totals.spool.available` is `true` only when every spool-enabled live instance
   is currently writable.
 - `instances` lists the current accepted generation for each sink in ascending
@@ -784,6 +807,8 @@ across the current accepted sink generation for every stable plugin-config ID:
 - `chargeback_sink_spool_drops_total`
 - `chargeback_sink_spool_available` (aggregate is `1` only while every spool-enabled live instance is writable)
 - `chargeback_sink_spool_prepare_failures_total`
+- `chargeback_sink_spool_replay_attempts_total`
+- `chargeback_sink_spool_dead_letter_rows_total`
 - `chargeback_sink_spool_unbound_files` (records not bound to a live destination identity; never replayed or deleted; a lower bound when the rate-limited warning reports `scan_truncated=true`)
 - `chargeback_sink_spool_unbound_namespaces` (same bounded-scan lower-bound semantics)
 - `chargeback_sink_export_latency_seconds`

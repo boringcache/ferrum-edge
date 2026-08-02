@@ -764,6 +764,27 @@ pub struct ReservedPayload {
 }
 
 impl ReservedPayload {
+    /// Take ownership of a vector whose complete allocation was reserved before
+    /// construction.
+    ///
+    /// Streaming producers cannot use [`materialize_reserved_payload`] because
+    /// their input arrives incrementally. They reserve `bound`, allocate a
+    /// vector with capacity at most that bound, and transfer both here. The
+    /// runtime check keeps a future allocator/caller change fail-closed rather
+    /// than attaching an undersized charge to the payload.
+    pub(crate) fn from_preallocated_vec(
+        bytes: Vec<u8>,
+        reservation: ProcessByteReservation,
+    ) -> Result<Self, PayloadMaterializationError> {
+        if bytes.capacity() > reservation.reserved() {
+            return Err(PayloadMaterializationError::BoundExceeded);
+        }
+        Ok(Self {
+            bytes: Bytes::from(bytes),
+            _reservation: reservation,
+        })
+    }
+
     /// Refcounted handle for one delivery attempt. No payload bytes are copied.
     pub fn bytes(&self) -> Bytes {
         self.bytes.clone()

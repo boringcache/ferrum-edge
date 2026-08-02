@@ -25283,6 +25283,14 @@ components:
                 prepare_failures_total:
                   type: integer
                   minimum: 0
+                replay_attempts_total:
+                  type: integer
+                  minimum: 0
+                  description: ClickHouse HTTP attempts made by bounded replay, including permanent-failure isolation children.
+                dead_letter_rows_total:
+                  type: integer
+                  minimum: 0
+                  description: Permanently rejected rows durably handed to the private dead-letter payload store.
                 unbound_files:
                   type: integer
                   minimum: 0
@@ -25435,12 +25443,20 @@ components:
               type: integer
             files:
               type: integer
-              description: Count of owned spool files (active data, temps, in-flight claims, and quarantined).
+              description: Count of owned spool files (active data, temps, in-flight claims, corrupt quarantine, and dead-letter payload/metadata files).
             bytes:
               type: integer
-              description: Total encoded on-disk bytes for owned spool files (active data, temps, in-flight claims, and quarantined).
+              description: Total encoded on-disk bytes for owned spool files (active data, temps, in-flight claims, corrupt quarantine, and dead-letter payload/metadata files).
             drops_total:
               type: integer
+            replay_attempts_total:
+              type: integer
+              minimum: 0
+              description: ClickHouse HTTP attempts made by bounded replay, including permanent-failure isolation children.
+            dead_letter_rows_total:
+              type: integer
+              minimum: 0
+              description: Permanently rejected rows durably handed to the private dead-letter payload store.
             unbound_files:
               type: integer
               description: |
