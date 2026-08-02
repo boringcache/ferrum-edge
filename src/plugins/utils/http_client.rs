@@ -292,6 +292,7 @@ fn build_dns_cached_fallback_client(
     tls_posture: &PluginTlsPosture,
     http2_prior_knowledge: bool,
 ) -> reqwest::Client {
+    crate::fips::ensure_internal_client_crypto_provider();
     // Never auto-follow redirects on a shared outbound client (SSRF posture,
     // matches src/connection_pool.rs and the configured clients above).
     let mut builder = reqwest::Client::builder()
@@ -361,6 +362,7 @@ fn build_configured_plugin_client(
     tls_posture: &PluginTlsPosture,
     http2_prior_knowledge: bool,
 ) -> reqwest::Client {
+    crate::fips::ensure_internal_client_crypto_provider();
     let mut builder = reqwest::Client::builder()
         .no_proxy()
         .pool_max_idle_per_host(pool_config.max_idle_per_host)

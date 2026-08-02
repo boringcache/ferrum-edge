@@ -318,6 +318,25 @@ pub fn base_crypto_provider() -> CryptoProvider {
     rustls::crypto::aws_lc_rs::default_provider()
 }
 
+/// Ensure internal client builders can resolve the compile-time-selected
+/// provider when they are exercised outside the binary startup sequence.
+///
+/// The Ferrum binary still calls [`install_crypto_provider`] first and that
+/// fail-closed bootstrap remains authoritative for operator-requested FIPS
+/// enforcement. Library and integration tests can construct plugin clients
+/// directly, though, and reqwest's provider-neutral feature intentionally has
+/// no fallback of its own. Installing the same compile-time-selected provider
+/// here keeps those constructors provider-neutral without adding `ring` to a
+/// FIPS graph or AWS-LC to the ordinary graph.
+pub(crate) fn ensure_internal_client_crypto_provider() {
+    if CryptoProvider::get_default().is_none() {
+        // `install_default` fails only when another thread installed a
+        // provider first. In that race the process default is already usable,
+        // so there is no error to hide or alternate provider to select.
+        let _ = CryptoProvider::install_default(base_crypto_provider());
+    }
+}
+
 /// Parse a DER private key with the selected provider's key provider.
 ///
 /// Mirrors `rustls::crypto::ring::sign::any_supported_type`, which takes a

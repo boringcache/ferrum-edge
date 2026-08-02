@@ -432,12 +432,15 @@ Rules:
   This is the whole reason the features are exclusive rather than layered.
 - **The declared contract is not the audited one.**
   `.github/scripts/check_fips_feature_policy.py` reads what cargo actually
-  resolved (`cargo tree -e features,no-dev`) for *both* profiles and
+  resolved (`cargo tree -e normal,build --prefix none -f '{p}|{f}'`) for
+  *both* profiles and
   fails on any surviving ring selection in the FIPS graph. It runs in the
   required `FIPS Feature Policy` job of `.github/workflows/fips-build.yml`.
-  `no-dev` is load-bearing: test fixtures pin `ring` and `rustls/ring` as
-  dev-dependencies so the suite compiles under both profiles, and a
-  dev-dependency is never linked into a shipped binary.
+  The `normal,build` edge filter is load-bearing: test fixtures pin `ring` and
+  `rustls/ring` as dev-dependencies so the suite can verify both profiles
+  without those edges entering a shipped binary. Package-row feature output is
+  used because cargo's feature-edge view can retain dev-only root feature
+  unification even when the dev dependency edge itself is hidden.
 - **Both profiles are pinned in the committed `Cargo.lock`.** A lockfile entry
   does not compile or link the FIPS-only package into an ordinary artifact;
   feature selection still controls the build. Both resolved-graph audits and

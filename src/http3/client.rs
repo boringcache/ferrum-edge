@@ -3188,8 +3188,21 @@ impl Http3Client {
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
 
-        // Bind to any available local UDP port
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+        // Bind to any available local UDP port. Quinn's `Endpoint::client`
+        // convenience constructor is gated on its `ring` or non-FIPS
+        // `aws-lc-rs` feature. The validated provider uses the distinct
+        // `aws-lc-rs-fips` feature, so construct the same endpoint explicitly
+        // without compiling a second provider merely to expose the helper.
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        socket.set_nonblocking(true)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| anyhow::anyhow!("HTTP/3 client requires a Tokio runtime"))?;
+        let mut endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            runtime,
+        )?;
         endpoint.set_default_client_config(client_config);
 
         Ok(Self { endpoint })

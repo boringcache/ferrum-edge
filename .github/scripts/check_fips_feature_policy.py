@@ -18,12 +18,15 @@ Usage:
 
     check_fips_feature_policy.py --tree <path-to-cargo-tree-output> --profile fips
     check_fips_feature_policy.py --tree <path> --profile crypto-ring
-        Audit `cargo tree -e features,no-dev` output for that profile.
+        Audit provider selections from `cargo tree -e normal,build
+        --prefix none -f '{p}|{f}'` output for that profile.
 
-The `no-dev` edge filter is load-bearing: test fixtures pin `ring` and `rustls/ring` as
-dev-dependencies so the suite compiles under both profiles, and a dev-dependency
-is never linked into the shipped binary. Auditing with dev-deps included would
-report a ring edge that no deployment can reach.
+The normal/build edge filter is load-bearing: test fixtures pin `ring` and
+`rustls/ring` as dev-dependencies so the suite compiles under both profiles,
+and a dev-dependency is never linked into the shipped binary. Feature-edge
+mode can still report the root package's dev-only feature unification even
+when combined with `no-dev`; formatting the selected features on normal/build
+package nodes audits the production graph instead.
 
 Exit status is 0 when the profile is admissible and 1 otherwise, with every
 violation printed.
@@ -83,6 +86,7 @@ REQUIRE_DEFAULT_FEATURES_OFF = ("quinn", "rcgen", "rustls", "tokio-rustls")
 
 # `cargo tree -e features` prints feature edges as `crate feature "name"`.
 FEATURE_EDGE = re.compile(r'^[^a-zA-Z0-9]*([A-Za-z0-9_.-]+) feature "([A-Za-z0-9_.-]+)"')
+PACKAGE_FEATURE_ROW = re.compile(r'^([A-Za-z0-9_.-]+) v[^|]+\|(.*)$')
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 # Feature selections that must never appear in a resolved `fips` graph. Each
@@ -248,9 +252,22 @@ def check_manifest() -> list[str]:
 def parse_tree(path: Path) -> set[tuple[str, str]]:
     selections: set[tuple[str, str]] = set()
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        match = FEATURE_EDGE.match(ANSI_ESCAPE.sub("", line).strip())
-        if match:
-            selections.add((match.group(1), match.group(2)))
+        clean = ANSI_ESCAPE.sub("", line).strip()
+        package_match = PACKAGE_FEATURE_ROW.match(clean)
+        if package_match:
+            crate = package_match.group(1)
+            for feature in package_match.group(2).split(","):
+                feature = feature.strip()
+                if feature:
+                    selections.add((crate, feature))
+            continue
+
+        # Retain support for old captured feature-edge trees so operators can
+        # still audit an existing diagnostic file. Hosted CI uses package-row
+        # mode above because it excludes dev-only feature unification.
+        feature_match = FEATURE_EDGE.match(clean)
+        if feature_match:
+            selections.add((feature_match.group(1), feature_match.group(2)))
     return selections
 
 
@@ -258,8 +275,8 @@ def check_tree(path: Path, profile: str) -> list[str]:
     selections = parse_tree(path)
     if not selections:
         return [
-            f"no feature edges parsed from {path}; expected the output of "
-            "`cargo tree -e features,no-dev`"
+            f"no provider feature selections parsed from {path}; expected the output of "
+            "`cargo tree -e normal,build --prefix none -f '{p}|{f}'`"
         ]
 
     if profile == "fips":

@@ -59,7 +59,8 @@ jobs:
 
       - name: Resolve the ordinary (crypto-ring) feature graph
         run: |
-          cargo tree --color never -e features,no-dev --locked > /tmp/tree-crypto-ring.txt
+          cargo tree --color never -e normal,build --prefix none \
+            -f '{p}|{f}' --locked > /tmp/tree-crypto-ring.txt
 
       - name: Audit the ordinary feature graph
         run: |
@@ -70,7 +71,8 @@ jobs:
         # Feature resolution alone does not build `aws-lc-fips-sys`, so this
         # needs no C/Go toolchain. The committed lockfile pins this profile too.
         run: |
-          cargo tree --color never -e features,no-dev --locked \
+          cargo tree --color never -e normal,build --prefix none \
+            -f '{p}|{f}' --locked \
             --no-default-features --features fips > /tmp/tree-fips.txt
 
       - name: Audit the FIPS feature graph
@@ -116,3 +118,12 @@ jobs:
         run: |
           cargo test --locked --no-default-features --features fips \
             --test unit_tests tls::fips_policy_tests
+
+      - name: FIPS frontend, backend, and CP/DP TLS handshakes
+        run: |
+          cargo test --locked --no-default-features --features fips \
+            --test integration_tests \
+            integration::cp_grpc_handshake_admission_tests::frontend_and_backend_builders_complete_a_real_tls_handshake
+          cargo test --locked --no-default-features --features fips \
+            --test integration_tests \
+            integration::cp_grpc_handshake_admission_tests::legitimate_data_plane_connects_once_a_permit_is_released

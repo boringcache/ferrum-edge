@@ -676,7 +676,21 @@ pub async fn start_http3_listener_with_signal(
             &client_crls,
             &h3_config,
         )?;
-        quinn::Endpoint::server(server_config, addr)?
+        // Quinn's `Endpoint::server` convenience constructor is gated on its
+        // `ring` or non-FIPS `aws-lc-rs` feature. The FIPS provider uses the
+        // distinct `aws-lc-rs-fips` feature, so construct the same endpoint
+        // explicitly instead of making listener availability depend on a
+        // non-validated provider feature being compiled too.
+        let socket = std::net::UdpSocket::bind(addr)?;
+        socket.set_nonblocking(true)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| anyhow::anyhow!("HTTP/3 listener requires a Tokio runtime"))?;
+        quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime,
+        )?
     };
     let bound_addr = endpoint.local_addr().ok();
     let local_addr = bound_addr.unwrap_or(addr);

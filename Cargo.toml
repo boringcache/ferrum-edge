@@ -473,8 +473,8 @@ rcgen = { version = "0.14", features = ["aws_lc_rs"] }
 # the whole suite compiling under both `--features crypto-ring` and
 # `--no-default-features --features fips`, without letting a fixture's provider
 # choice reach a deployment. The FIPS build/lint gate in
-# `.github/workflows/fips-build.yml` audits the resolved graph with the
-# `features,no-dev` edge filter for exactly this reason.
+# `.github/workflows/fips-build.yml` audits normal/build package feature rows
+# with dev-dependency edges excluded for exactly this reason.
 ring = "0.17"
 rustls = { version = "0.23", features = ["ring"] }
 rstest = "0.26"
