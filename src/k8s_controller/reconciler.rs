@@ -665,11 +665,8 @@ pub fn publish_k8s_reconcile(
         // configurations, so without this gate it could bypass the CP full and
         // incremental admission paths. The publication gate keeps the base
         // stable between this composition and the CAS below.
-        let candidate = merge_k8s_translation(
-            config_arc.load().as_ref(),
-            translation,
-            managed_namespaces,
-        );
+        let candidate =
+            merge_k8s_translation(config_arc.load().as_ref(), translation, managed_namespaces);
         if let Err(error) = crate::fips::policy::check_gateway_config(&candidate) {
             error!("Kubernetes configuration rejected — FIPS policy: {}", error);
             return None;

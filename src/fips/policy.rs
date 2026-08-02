@@ -285,15 +285,12 @@ pub fn check_gateway_config_enforced(config: &GatewayConfig) -> Result<(), Strin
         .consumers
         .iter()
         .filter(|consumer| {
-            consumer
-                .credentials
-                .get("basic_auth")
-                .is_some_and(|value| {
-                    stored_password_hash_representations(value).any(|hash| match hash {
-                        Some(hash) => !is_approved_password_hash(hash),
-                        None => true,
-                    })
+            consumer.credentials.get("basic_auth").is_some_and(|value| {
+                stored_password_hash_representations(value).any(|hash| match hash {
+                    Some(hash) => !is_approved_password_hash(hash),
+                    None => true,
                 })
+            })
         })
         .count();
     if unclassified_hashes > 0 {

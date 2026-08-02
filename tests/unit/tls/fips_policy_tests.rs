@@ -333,7 +333,10 @@ fn env_policy_floors_hmac_key_length() {
     let err = policy::check_env_config_enforced(&env_config)
         .expect_err("short Basic-auth HMAC key is rejected");
     assert!(err.contains("FERRUM_BASIC_AUTH_HMAC_SECRET"));
-    assert!(!err.contains("short"), "the secret must not be echoed: {err}");
+    assert!(
+        !err.contains("short"),
+        "the secret must not be echoed: {err}"
+    );
 }
 
 // ── Gateway configuration policy ────────────────────────────────────────────

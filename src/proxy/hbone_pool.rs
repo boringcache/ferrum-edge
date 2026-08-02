@@ -4,8 +4,8 @@
 //! HBONE listener. Each request opens a CONNECT stream to the application port
 //! and then speaks ordinary HTTP over the resulting byte tunnel.
 
-use bytes::{Buf, Bytes};
 use crate::fips::approved::Sha256;
+use bytes::{Buf, Bytes};
 use dashmap::DashMap;
 use futures_util::FutureExt;
 use h2::client::SendRequest;

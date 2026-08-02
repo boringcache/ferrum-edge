@@ -81,6 +81,7 @@ REQUIRE_DEFAULT_FEATURES_OFF = ("quinn", "rcgen")
 
 # `cargo tree -e features` prints feature edges as `crate feature "name"`.
 FEATURE_EDGE = re.compile(r'^[^a-zA-Z0-9]*([A-Za-z0-9_.-]+) feature "([A-Za-z0-9_.-]+)"')
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 # Feature selections that must never appear in a resolved `fips` graph. Each
 # one puts a non-validated implementation in control of a real traffic path.
@@ -245,7 +246,7 @@ def check_manifest() -> list[str]:
 def parse_tree(path: Path) -> set[tuple[str, str]]:
     selections: set[tuple[str, str]] = set()
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        match = FEATURE_EDGE.match(line.strip())
+        match = FEATURE_EDGE.match(ANSI_ESCAPE.sub("", line).strip())
         if match:
             selections.add((match.group(1), match.group(2)))
     return selections

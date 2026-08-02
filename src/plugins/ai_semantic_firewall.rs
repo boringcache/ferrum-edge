@@ -5,9 +5,9 @@
 //! prompt injection, jailbreaks, prompt/system leakage, data exfiltration
 //! intent, indirect prompt injection, tool abuse, and business-topic policy.
 
+use crate::fips::approved::Sha256;
 use async_trait::async_trait;
 use bytes::Bytes;
-use crate::fips::approved::Sha256;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

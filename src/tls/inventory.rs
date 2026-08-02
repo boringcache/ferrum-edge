@@ -25,8 +25,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 
-use chrono::{DateTime, Utc};
 use crate::fips::approved::Sha256;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use x509_parser::extensions::{GeneralName, ParsedExtension};

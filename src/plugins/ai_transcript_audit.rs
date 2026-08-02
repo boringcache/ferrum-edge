@@ -51,9 +51,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use crate::fips::approved::Sha256;
 use async_trait::async_trait;
 use bytes::Bytes;
-use crate::fips::approved::Sha256;
 use dashmap::DashMap;
 use http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use serde::Serialize;

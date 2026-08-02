@@ -9,8 +9,8 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use chrono::{DateTime, Utc};
 use crate::fips::approved::Sha256;
+use chrono::{DateTime, Utc};
 use semver::Version;
 use serde_json::Value;
 

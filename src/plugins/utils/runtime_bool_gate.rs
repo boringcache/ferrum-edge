@@ -31,8 +31,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 use crate::fips::approved::Sha256;
+use arc_swap::ArcSwap;
 
 use crate::modes::mesh::config::MeshRuntimeOverlay;
 

@@ -17,8 +17,8 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use chrono::{DateTime, Utc};
 use crate::fips::approved::Sha256;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use x509_parser::extensions::{GeneralName, ParsedExtension};

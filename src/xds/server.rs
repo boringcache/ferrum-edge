@@ -1,5 +1,5 @@
-use arc_swap::ArcSwap;
 use crate::fips::approved::Sha256;
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use std::collections::{HashMap, HashSet};

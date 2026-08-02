@@ -483,9 +483,7 @@ impl MeshGrpcServer {
         // failures still retain the established advance-on-consumption
         // behaviour documented there.
         crate::fips::policy::check_gateway_config(&candidate).map_err(|error| {
-            Status::failed_precondition(format!(
-                "FIPS policy rejected the mesh delta: {error}"
-            ))
+            Status::failed_precondition(format!("FIPS policy rejected the mesh delta: {error}"))
         })?;
         // Advance the per-stream base BEFORE building the wire frame: the delta
         // is logically consumed regardless of whether THIS frame serializes.

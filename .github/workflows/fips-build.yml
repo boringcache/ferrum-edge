@@ -59,7 +59,7 @@ jobs:
 
       - name: Resolve the ordinary (crypto-ring) feature graph
         run: |
-          cargo tree -e features,no-dev --locked > /tmp/tree-crypto-ring.txt
+          cargo tree --color never -e features,no-dev --locked > /tmp/tree-crypto-ring.txt
 
       - name: Audit the ordinary feature graph
         run: |
@@ -70,7 +70,7 @@ jobs:
         # Feature resolution alone does not build `aws-lc-fips-sys`, so this
         # needs no C/Go toolchain. The committed lockfile pins this profile too.
         run: |
-          cargo tree -e features,no-dev --locked \
+          cargo tree --color never -e features,no-dev --locked \
             --no-default-features --features fips > /tmp/tree-fips.txt
 
       - name: Audit the FIPS feature graph

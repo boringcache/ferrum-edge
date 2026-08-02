@@ -64,8 +64,8 @@
 //!   compatibility variant requires explicit `:method` and `:path` pseudo-
 //!   headers. Compression is deterministic, so all paths agree.
 
-use async_trait::async_trait;
 use crate::fips::approved::Sha256;
+use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};

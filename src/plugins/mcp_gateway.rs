@@ -5,9 +5,9 @@
 //! discovery catalogs in aggregate-router mode, and routes namespaced MCP tool,
 //! resource, and prompt calls to configured upstream MCP servers.
 
+use crate::fips::approved::Sha256;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use crate::fips::approved::Sha256;
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
