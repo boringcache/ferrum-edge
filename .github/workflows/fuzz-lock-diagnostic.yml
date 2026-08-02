@@ -1,0 +1,31 @@
+name: Fuzz Lock Diagnostic
+
+# Temporary hosted-only diagnostic for PR #3519. The root orchestrator removes
+# this workflow after copying Cargo's exact isolated-lockfile repair.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lock-diff:
+    if: github.event.pull_request.number == 3519
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Print the exact isolated fuzz lockfile repair
+        run: |
+          set -euo pipefail
+          cargo metadata --manifest-path fuzz/Cargo.toml --format-version 1 >/dev/null
+          git diff -- fuzz/Cargo.lock
+          if git diff --quiet -- fuzz/Cargo.lock; then
+            echo "::error::Cargo reported no fuzz lockfile delta"
+          else
+            echo "::error::Intentional diagnostic failure after printing the fuzz lockfile delta"
+          fi
+          exit 1
