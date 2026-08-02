@@ -13,6 +13,7 @@ Ferrum Edge includes comprehensive CI/CD pipelines for automated testing, buildi
 - [Binaries and Downloads](#binaries-and-downloads)
 - [Image Signatures, SBOMs, and Provenance](#image-signatures-sboms-and-provenance)
 - [GitHub Actions Secrets](#github-actions-secrets)
+- [Root Merge Gate Attestation](#root-merge-gate-attestation)
 
 ## Pipeline Overview
 
@@ -55,6 +56,7 @@ adding, removing, or materially changing a workflow.
 | `gateways-protocol-benchmark.yml` | Gateways Protocol Benchmark | Manual | Gateway/protocol benchmark harness. |
 | `connection-saturation-benchmark.yml` | Connection Saturation Benchmark | Manual | Connection saturation benchmark suite. |
 | `scale-benchmark.yml` | Resources Scale Benchmark | Manual | Large resource/config scale benchmark suite. |
+| `root-merge-gate-attestation.yml` | Root Merge Gate Attestation | Manual (`workflow_dispatch` on `main` only) | Supplies the single required human-root approval for one exact independently reviewed PR head after hosted checks and review-thread resolution; see [Root Merge Gate Attestation](#root-merge-gate-attestation). |
 
 ### CI Pipeline Flow
 
@@ -1899,6 +1901,64 @@ gh secret set DOCKERHUB_TOKEN --body "your-token"
 3. Value: your-username
 4. Click "Add secret"
 ```
+
+## Root Merge Gate Attestation
+
+`root-merge-gate-attestation.yml` is a prerequisite for the forthcoming no-bypass
+`main` ruleset. The repository currently has a single human administrator, so the
+ruleset's one-approval requirement is satisfied only after that human has
+independently reviewed one exact PR head and then dispatches this workflow with
+matching inputs.
+
+This workflow is **not** a ruleset bypass. The planned ruleset will have **no
+bypass actors**. The workflow only supplies the required approval for **one
+exact root-reviewed head SHA**. All other protections still apply:
+
+- required hosted CI checks (including coverage and release-critical live checks)
+- every review thread resolved
+- stale approvals dismissed on material pushes
+- last-push approval required
+- merge-queue validation of the combined result before landing
+
+### Security and audit contract
+
+| Boundary | Enforcement |
+|---|---|
+| Trigger surface | `workflow_dispatch` only; no `pull_request`, `pull_request_target`, `merge_group`, `push`, or schedule triggers |
+| Trusted workflow copy | Runs only when `github.ref` is `refs/heads/main` in `ferrum-edge/ferrum-edge`; any other ref or repository fails closed |
+| Human authorization | `github.actor` and `github.triggering_actor` must both be `jeremyjpj0916`; unauthorized dispatches and reruns fail visibly |
+| Permissions | `contents: read` and `pull-requests: write` only |
+| Code execution | No checkout and no execution of PR or repository code; GitHub API calls only |
+| Input validation | `pr_number` must be a positive integer; `expected_head_sha` must be exactly 40 lowercase hex characters; inputs are never interpolated into shell syntax, paths, or API endpoints before validation |
+| PR eligibility | PR must be open, non-draft, target `main`, originate from this repository (not a fork), and its live head SHA must equal `expected_head_sha` |
+| Review threads | All review threads are fetched with GraphQL pagination; any unresolved thread, query error, or malformed/missing field fails closed |
+| Race safety | Approval is submitted with an explicit `commit_id`; the full PR eligibility validation (open, non-draft, base `main`, same repository, exact head SHA) is re-run immediately before submission so a push or state change between validation and approval cannot approve a newer or ineligible head |
+| Actions approval setting | Repository setting `can_approve_pull_request_reviews` (“Allow GitHub Actions to create and approve pull requests”) must remain enabled and is audited before the no-bypass ruleset is activated. GitHub’s documented behavior counts enabled Actions reviews toward required approvals; this repository was independently verified as enabled. The live #3040 merge-queue exercise will prove that an attestation approval satisfies the actual ruleset |
+| Concurrency | `root-merge-gate-attestation-<pr_number>` with `cancel-in-progress: false` so overlapping dispatches do not cancel an in-flight attestation |
+
+### Operator inputs
+
+Dispatch the workflow from the `main` branch copy in the Actions UI (or
+equivalent API) with:
+
+1. **`pr_number`** — the pull request to attest.
+2. **`expected_head_sha`** — the full 40-character lowercase hex SHA of the PR
+   head the root orchestrator independently reviewed. It must match the PR's
+   current head at dispatch time.
+
+If the PR head moves after review, dispatch again with the new SHA only after
+re-reviewing that exact head.
+
+### Audit evidence
+
+Each successful attestation leaves two linked records:
+
+1. **Workflow run** — the Actions run URL shows the authorized actor, inputs,
+   and pass/fail outcome.
+2. **Pull request review** — a single `APPROVE` review whose body states that
+   it is the root merge-gate attestation, repeats the bound head SHA, names the
+   authorizing actor, and links the workflow run. The review is bound to
+   `commit_id` and does not quote or incorporate PR-authored text.
 
 ## Customizing CI/CD
 
