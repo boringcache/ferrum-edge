@@ -7126,6 +7126,7 @@ async fn tgi_partial_total_usage_never_releases_unreported_prompt_reservation() 
                 "token_limit": 1_000_000,
                 "window_seconds": 60,
                 "limit_by": "ip",
+                "expose_headers": true,
                 "count_mode": "total_tokens",
                 "provider": "tgi"
             }),
