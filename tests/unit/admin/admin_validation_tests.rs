@@ -117,9 +117,7 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("immediately_succeeds_generation"));
     assert!(crud_source.contains("InterveningWriteRecovery::KeepCurrent"));
     assert!(crud_source.contains("persist_delete_to_settlement("));
-    assert!(crud_source.contains(
-        "audit::spawn_with_request_slot(persist_delete_to_settlement("
-    ));
+    assert!(crud_source.contains("audit::spawn_with_request_slot(persist_delete_to_settlement("));
     assert!(crud_source.contains("lease was lost before persistence started"));
     assert!(crud_source.contains("mark_mtls_dns_admission_unavailable(anyhow::anyhow!("));
     assert!(crud_source.contains("late_create_compensation_safe("));
