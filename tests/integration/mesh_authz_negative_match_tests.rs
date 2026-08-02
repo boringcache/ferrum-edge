@@ -409,3 +409,140 @@ async fn source_ip_blocks_use_direct_peer_not_forwarded_client_ip() {
         "forwarded remote.ip must not satisfy source.ip ipBlocks"
     );
 }
+
+fn policy_allow_except_8_prefix_ports() -> MeshPolicy {
+    MeshPolicy {
+        name: "allow-except-8-prefix".to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector::default(),
+        },
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
+                namespace_pattern: None,
+                trust_domain: Some(TrustDomain::new("cluster.local").expect("trust domain")),
+                trust_domain_pattern: None,
+            }],
+            to: vec![RequestMatch {
+                methods: vec!["GET".to_string()],
+                not_port_patterns: vec!["8*".to_string()],
+                ..RequestMatch::default()
+            }],
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Allow,
+        }],
+    }
+}
+
+fn http_ctx_with_port(method: &str, path: &str, port: Option<u16>) -> RequestContext {
+    let mut ctx = request_context(method, path);
+    ctx.frontend_listen_port = port;
+    ctx
+}
+
+#[tokio::test]
+async fn allow_with_not_port_patterns_admits_non_matching_listener_port() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_allow_except_8_prefix_ports()]
+    }))
+    .expect("plugin config");
+    let mut ctx = http_ctx_with_port("GET", "/api", Some(9090));
+
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "GET on 9090 should be allowed (outside notPorts 8*), got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn allow_with_not_port_patterns_denies_matching_listener_port() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_allow_except_8_prefix_ports()]
+    }))
+    .expect("plugin config");
+    let mut ctx = http_ctx_with_port("GET", "/api", Some(8080));
+
+    let result = plugin.authorize(&mut ctx).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => {
+            panic!("GET on 8080 should be rejected by notPorts 8* → implicit deny, got {other:?}")
+        }
+    }
+}
+
+#[tokio::test]
+async fn allow_with_not_port_patterns_fails_closed_when_listener_port_absent() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_allow_except_8_prefix_ports()]
+    }))
+    .expect("plugin config");
+    let mut ctx = http_ctx_with_port("GET", "/api", None);
+
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "absent destination/listener port must fail closed for notPorts patterns, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn allow_with_ports_and_not_port_patterns_stays_conjunctive() {
+    let policy = MeshPolicy {
+        name: "allow-9xxx-except-90-prefix".to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector::default(),
+        },
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
+                namespace_pattern: None,
+                trust_domain: Some(TrustDomain::new("cluster.local").expect("trust domain")),
+                trust_domain_pattern: None,
+            }],
+            to: vec![RequestMatch {
+                ports: vec![9180, 9090],
+                not_port_patterns: vec!["90*".to_string()],
+                ..RequestMatch::default()
+            }],
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Allow,
+        }],
+    };
+    let plugin = MeshAuthz::new(&json!({ "mesh_policies": [policy] })).expect("plugin config");
+
+    let mut allowed = http_ctx_with_port("GET", "/api", Some(9180));
+    assert!(
+        matches!(plugin.authorize(&mut allowed).await, PluginResult::Continue),
+        "9180 is in ports and outside notPorts 90*"
+    );
+
+    let mut blocked_negative = http_ctx_with_port("GET", "/api", Some(9090));
+    assert!(
+        matches!(
+            plugin.authorize(&mut blocked_negative).await,
+            PluginResult::Reject { .. }
+        ),
+        "9090 matches both ports and notPorts 90* → conjunctive fail"
+    );
+
+    let mut blocked_positive = http_ctx_with_port("GET", "/api", Some(8080));
+    assert!(
+        matches!(
+            plugin.authorize(&mut blocked_positive).await,
+            PluginResult::Reject { .. }
+        ),
+        "8080 is outside positive ports → implicit deny"
+    );
+}
