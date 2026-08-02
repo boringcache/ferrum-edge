@@ -313,6 +313,7 @@ fn build_dns_cached_fallback_client(
     http2_prior_knowledge: bool,
 ) -> reqwest::Client {
     let crypto_provider = crate::fips::ensure_internal_client_crypto_provider();
+    let provider_mismatch = crypto_provider.is_err();
     // Never auto-follow redirects on a shared outbound client (SSRF posture,
     // matches src/connection_pool.rs and the configured clients above).
     let mut builder = reqwest::Client::builder()
@@ -347,6 +348,9 @@ fn build_dns_cached_fallback_client(
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none()),
         );
+        if provider_mismatch {
+            builder = PluginTlsPosture::apply_inert_crypto_posture(builder);
+        }
         if http2_prior_knowledge {
             builder = builder.http2_prior_knowledge();
         }
@@ -361,6 +365,9 @@ fn build_dns_cached_fallback_client(
                 let mut builder = reqwest::Client::builder()
                     .no_proxy()
                     .redirect(reqwest::redirect::Policy::none());
+                if provider_mismatch {
+                    builder = PluginTlsPosture::apply_inert_crypto_posture(builder);
+                }
                 if http2_prior_knowledge {
                     builder = builder.http2_prior_knowledge();
                 }

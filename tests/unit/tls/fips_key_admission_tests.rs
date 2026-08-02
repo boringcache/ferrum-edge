@@ -100,6 +100,36 @@ fn approved_ec_certificates_are_admitted() {
 }
 
 #[test]
+fn certificate_ec_admission_uses_the_named_curve_not_rounded_point_bits() {
+    let mut p521_point = vec![0u8; 1 + 2 * 66];
+    p521_point[0] = 0x04;
+    p521_point[1] = 1;
+    keys::check_ec_curve_oid_and_point_enforced(
+        "1.3.132.0.35",
+        &p521_point,
+        "frontend TLS certificate",
+    )
+    .expect("a correctly sized P-521 point is admitted by its named curve");
+
+    let mut same_size_unapproved = vec![0u8; 1 + 2 * 32];
+    same_size_unapproved[0] = 0x04;
+    same_size_unapproved[1] = 1;
+    keys::check_ec_curve_oid_and_point_enforced(
+        "1.3.132.0.10",
+        &same_size_unapproved,
+        "frontend TLS certificate",
+    )
+    .expect_err("secp256k1 must not be mistaken for P-256 by point length");
+
+    keys::check_ec_curve_oid_and_point_enforced(
+        "1.2.840.10045.3.1.7",
+        &p521_point,
+        "frontend TLS certificate",
+    )
+    .expect_err("a point whose encoding does not match the named curve must fail closed");
+}
+
+#[test]
 fn ed25519_certificates_are_refused_with_an_actionable_diagnostic() {
     // Ed25519 is approved by FIPS 186-5 as an *algorithm*, but it is not in the
     // set Ferrum routes through the selected module — the same reasoning that
@@ -194,11 +224,13 @@ fn certificate_diagnostics_never_carry_a_path_or_key_material() {
 }
 
 #[test]
-fn an_unparseable_certificate_is_left_to_its_own_loader() {
-    // Re-reporting a malformed record here would produce two diagnostics for
-    // one fault and let a parse quirk masquerade as a key-strength rejection.
-    keys::check_certificate_public_key_enforced(b"not a certificate", "frontend TLS certificate")
-        .expect("a structural fault belongs to the PEM/DER loader, not to this gate");
+fn an_unparseable_certificate_fails_key_form_admission() {
+    let error = keys::check_certificate_public_key_enforced(
+        b"not a certificate",
+        "frontend TLS certificate",
+    )
+    .expect_err("unparseable DER has no classifiable public-key form");
+    assert!(error.contains("could not be parsed"), "{error}");
 }
 
 // ── JWK key strength ────────────────────────────────────────────────────────
@@ -213,6 +245,10 @@ fn jwk_rsa_modulus_floor_is_enforced_and_padding_is_not_credited() {
     let strong = vec![0xFFu8; 256]; // 2048 bits
     keys::check_jwk_rsa_modulus_enforced(&strong).expect("RSA-2048 JWK is admitted");
 
+    let rounded_up_weak = vec![0x01u8; 256]; // 2041 significant bits
+    keys::check_jwk_rsa_modulus_enforced(&rounded_up_weak)
+        .expect_err("a short top byte must not be rounded up to 2048 bits");
+
     // An issuer that pads `n` contrary to RFC 7518 §6.3.1.1 must not be
     // credited with the padding.
     let mut padded_weak = vec![0x00u8; 16];
@@ -222,13 +258,32 @@ fn jwk_rsa_modulus_floor_is_enforced_and_padding_is_not_credited() {
 }
 
 #[test]
+fn jwk_rsa_public_exponent_form_is_enforced() {
+    let modulus = vec![0xFFu8; 256];
+    keys::check_jwk_rsa_public_key_enforced(&modulus, &[0x01, 0x00, 0x01])
+        .expect("RSA exponent 65537 is admitted");
+    keys::check_jwk_rsa_public_key_enforced(&modulus, &[0x03])
+        .expect_err("legacy exponent 3 is outside the admitted FIPS form");
+    keys::check_jwk_rsa_public_key_enforced(&modulus, &[0x01, 0x00, 0x02])
+        .expect_err("an even RSA public exponent must be refused");
+}
+
+#[test]
 fn jwk_ec_curves_outside_the_approved_set_are_refused() {
-    for curve in ["P-256", "P-384", "p-256", " P-384 "] {
+    for curve in ["P-256", "P-384"] {
         keys::check_jwk_ec_curve_enforced(curve).unwrap_or_else(|error| {
             panic!("{curve} is approved and must be admitted: {error}");
         });
     }
-    for curve in ["P-521", "secp256k1", "Ed25519", "X25519", ""] {
+    for curve in [
+        "P-521",
+        "secp256k1",
+        "Ed25519",
+        "X25519",
+        "p-256",
+        " P-384 ",
+        "",
+    ] {
         assert!(
             keys::check_jwk_ec_curve_enforced(curve).is_err(),
             "{curve} must be refused"
@@ -246,6 +301,17 @@ fn p521_jwks_are_refused_because_es512_is_refused() {
         !policy::APPROVED_JWT_ALGORITHMS.contains(&"ES512"),
         "the curve gate and the algorithm gate must agree"
     );
+}
+
+#[test]
+fn jwk_ec_curve_and_coordinate_form_are_both_required() {
+    let p256 = vec![1u8; 32];
+    keys::check_jwk_ec_public_key_enforced(Some("P-256"), &p256, &p256)
+        .expect("complete P-256 public components are admitted");
+    keys::check_jwk_ec_public_key_enforced(None, &p256, &p256)
+        .expect_err("a missing curve must not silently default under FIPS enforcement");
+    keys::check_jwk_ec_public_key_enforced(Some("P-256"), &p256[..31], &p256)
+        .expect_err("truncated coordinates must fail at key admission");
 }
 
 // ── Environment-level peer verification ─────────────────────────────────────
@@ -266,7 +332,7 @@ fn a_default_environment_is_admitted() {
 fn every_independently_configurable_env_verification_bypass_is_refused() {
     // The point here is coverage of the *set*, not of any single flag: a
     // global-only gate is precisely the hole a per-surface switch walks through.
-    let cases: [(&str, fn(&mut EnvConfig)); 4] = [
+    let cases: [(&str, fn(&mut EnvConfig)); 5] = [
         ("FERRUM_TLS_NO_VERIFY", |c| c.tls_no_verify = true),
         ("FERRUM_ADMIN_TLS_NO_VERIFY", |c| {
             c.admin_tls_no_verify = true
@@ -276,6 +342,9 @@ fn every_independently_configurable_env_verification_bypass_is_refused() {
         }),
         ("FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT", |c| {
             c.mesh_egress_stream_allow_plaintext = true
+        }),
+        ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", |c| {
+            c.cp_dp_grpc_allow_plaintext = true
         }),
     ];
 
@@ -288,6 +357,16 @@ fn every_independently_configurable_env_verification_bypass_is_refused() {
             "the diagnostic must name the setting to change: {error}"
         );
     }
+}
+
+#[test]
+fn injector_plaintext_escape_hatch_is_in_the_process_peer_bypass_inventory() {
+    assert!(
+        policy::PROCESS_PEER_BYPASS_ENV
+            .iter()
+            .any(|(name, _)| *name == "FERRUM_INJECTOR_ALLOW_PLAINTEXT"),
+        "the injector webhook's dev-only plaintext transport must be refused in FIPS mode"
+    );
 }
 
 #[test]
@@ -463,6 +542,15 @@ fn every_plugin_owned_verification_opt_out_is_refused() {
         (
             "ai_transcript_audit",
             json!({ "sink": { "allow_insecure_loopback": true } }),
+        ),
+        ("ldap_auth", json!({ "allow_plaintext": true })),
+        (
+            "ai_federation",
+            json!({ "providers": [{ "allow_plaintext": true }] }),
+        ),
+        (
+            "ai_stream_router",
+            json!({ "providers": [{ "allow_plaintext": true }] }),
         ),
     ];
 

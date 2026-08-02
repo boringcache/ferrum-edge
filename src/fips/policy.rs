@@ -122,12 +122,12 @@ const NON_APPROVED_ALGORITHM_SELECTIONS: &[(&str, &[&str], &[&str])] = &[(
 /// has not classified, so FIPS mode refuses it rather than assuming.
 pub const APPROVED_PASSWORD_HASH_PREFIX: &str = "hmac_sha256:";
 
-/// Mesh identity escape hatches that admit an unverified workload peer.
+/// Process-environment escape hatches that admit an unverified peer.
 ///
-/// Each is an environment-only dev switch consumed directly by
-/// `src/identity/`, so FIPS mode reads it from the same place its consumer
-/// does. The second element completes the sentence "`<NAME>` …".
-pub const MESH_IDENTITY_BYPASS_ENV: &[(&str, &str)] = &[
+/// Each is consumed directly from the process environment rather than through
+/// `EnvConfig`, so FIPS mode reads it from the same place its consumer does.
+/// The second element completes the sentence "`<NAME>` …".
+pub const PROCESS_PEER_BYPASS_ENV: &[(&str, &str)] = &[
     (
         "FERRUM_MESH_ALLOW_NO_CA",
         "starts the mesh with no workload trust anchor, so no peer identity is verified at all",
@@ -140,6 +140,11 @@ pub const MESH_IDENTITY_BYPASS_ENV: &[(&str, &str)] = &[
         "FERRUM_MESH_CA_BOOTSTRAP_DEV",
         "bootstraps a self-signed development mesh CA rather than an operator-established trust \
          anchor",
+    ),
+    (
+        "FERRUM_INJECTOR_ALLOW_PLAINTEXT",
+        "serves the Kubernetes admission webhook over plaintext HTTP instead of authenticated \
+         TLS",
     ),
 ];
 
@@ -301,6 +306,29 @@ const UNAUTHENTICATED_PEER_PLUGIN_KEYS: &[UnauthenticatedPeerKey] = &[
         gated_by: None,
         absent_is_bypass: false,
     },
+    // These dev-only switches permit credential- or request-bearing plugin
+    // egress over plaintext to a non-loopback peer.
+    UnauthenticatedPeerKey {
+        plugin: "ldap_auth",
+        path: "allow_plaintext",
+        disabling_value: true,
+        gated_by: None,
+        absent_is_bypass: false,
+    },
+    UnauthenticatedPeerKey {
+        plugin: "ai_federation",
+        path: "providers[].allow_plaintext",
+        disabling_value: true,
+        gated_by: None,
+        absent_is_bypass: false,
+    },
+    UnauthenticatedPeerKey {
+        plugin: "ai_stream_router",
+        path: "providers[].allow_plaintext",
+        disabling_value: true,
+        gated_by: None,
+        absent_is_bypass: false,
+    },
 ];
 
 /// Render a bounded list of offending entries.
@@ -412,6 +440,12 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
             env_config.mesh_egress_stream_allow_plaintext,
             "SVID mTLS termination on mesh TCP/UDP egress, admitting unauthenticated peers",
         ),
+        (
+            "FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT",
+            env_config.cp_dp_grpc_allow_plaintext,
+            "TLS on non-loopback CP/DP configuration transport, exposing the authentication JWT \
+             and distributed gateway configuration to active interception",
+        ),
     ] {
         if engaged {
             return Err(format!(
@@ -446,13 +480,12 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
         ));
     }
 
-    // Mesh identity escape hatches. These are read from the process environment
-    // rather than from `EnvConfig` because that is where their own consumers
-    // read them (`src/identity/`), and a FIPS gate that consulted a different
-    // source than the enforcement point would be checking a value that is not
-    // the one in effect. They are boolean-ish dev switches, so only the variable
-    // name is reported.
-    for (name, detail) in MESH_IDENTITY_BYPASS_ENV {
+    // Direct process-environment escape hatches. These are read here rather
+    // than through `EnvConfig` because that is where their own consumers read
+    // them, and a FIPS gate that consulted a different source would be checking
+    // a value that is not the one in effect. They are boolean-ish dev switches,
+    // so only the variable name is reported.
+    for (name, detail) in PROCESS_PEER_BYPASS_ENV {
         if env_flag_engaged(name) {
             return Err(format!(
                 "{name} {detail}, and is refused while FIPS mode is enforced."

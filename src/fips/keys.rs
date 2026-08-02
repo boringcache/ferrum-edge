@@ -109,14 +109,22 @@ pub fn check_certificate_public_key_enforced(
 ) -> Result<(), String> {
     let label = bounded_label(surface_label);
 
-    // A certificate that does not parse is not this check's business: the
-    // caller's own PEM/DER admission already reports it with the record index
-    // and source it knows about. Re-reporting it here would produce two
-    // diagnostics for one fault and would let a parse quirk masquerade as a
-    // key-strength rejection.
-    let Ok((_, certificate)) = X509Certificate::from_der(der) else {
-        return Ok(());
-    };
+    // PEM framing alone does not prove that the decoded record is valid X.509
+    // DER. Fail here before serving: an unparseable record has no classifiable
+    // key form, and several trust-bundle consumers would otherwise silently
+    // skip it rather than produce an actionable admission error.
+    let (remaining, certificate) = X509Certificate::from_der(der).map_err(|_| {
+        format!(
+            "{label}: the certificate DER could not be parsed and its public-key form cannot be \
+             classified, so it is refused while FIPS mode is enforced."
+        )
+    })?;
+    if !remaining.is_empty() {
+        return Err(format!(
+            "{label}: the certificate DER contains trailing data and its public-key form cannot \
+             be classified unambiguously, so it is refused while FIPS mode is enforced."
+        ));
+    }
 
     let spki = certificate.public_key();
     let Ok(parsed) = spki.parsed() else {
@@ -128,29 +136,28 @@ pub fn check_certificate_public_key_enforced(
     };
 
     match parsed {
-        PublicKey::RSA(rsa) => check_rsa_modulus_bits(rsa.key_size(), &label),
+        PublicKey::RSA(rsa) => {
+            check_rsa_modulus_bits(unsigned_be_bit_length(rsa.modulus), &label)?;
+            check_rsa_public_exponent_enforced(rsa.exponent, &label)
+        }
         PublicKey::EC(point) => {
-            let bits = point.key_size();
-            if APPROVED_EC_FIELD_BITS.contains(&bits) {
-                Ok(())
-            } else if bits == 0 {
-                // `ECPoint::key_size()` returns 0 for a point whose leading
-                // octet is neither the uncompressed (0x04) nor a compressed
-                // (0x02/0x03) form — including the RFC 5480 "hybrid" forms and
-                // anything malformed. Refuse the form explicitly rather than
-                // guessing a curve from a length.
-                Err(format!(
-                    "{label}: the certificate carries an elliptic-curve public key in a point \
-                     encoding Ferrum does not admit while FIPS mode is enforced. Use an \
-                     uncompressed or compressed SEC1 point on P-256, P-384, or P-521."
-                ))
-            } else {
-                Err(format!(
-                    "{label}: the certificate's elliptic-curve public key is over a {bits}-bit \
-                     field, which is not an approved curve while FIPS mode is enforced. Approved \
-                     curves: P-256, P-384, P-521."
-                ))
-            }
+            let curve_oid = spki
+                .algorithm
+                .parameters
+                .as_ref()
+                .and_then(|parameters| parameters.as_oid().ok())
+                .ok_or_else(|| {
+                    format!(
+                        "{label}: the certificate's elliptic-curve parameters do not name a \
+                         curve, so the key is refused while FIPS mode is enforced. Approved \
+                         curves: P-256, P-384, P-521."
+                    )
+                })?;
+            check_ec_curve_oid_and_point_enforced(
+                &curve_oid.to_string(),
+                point.data(),
+                &label,
+            )
         }
         // Everything else is a definite "no", not an unclassified maybe. DSA is
         // withdrawn for signature generation by FIPS 186-5; the GOST curves are
@@ -172,6 +179,63 @@ pub fn check_certificate_public_key_enforced(
              ECDSA over P-256/P-384/P-521."
         )),
     }
+}
+
+/// Exact bit length of an unsigned big-endian integer.
+///
+/// Certificate RSA moduli may carry DER sign padding and JWK issuers sometimes
+/// add non-canonical leading zeroes. Neither may be credited as key strength.
+fn unsigned_be_bit_length(bytes: &[u8]) -> usize {
+    let significant = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .map(|start| &bytes[start..])
+        .unwrap_or(&[]);
+    let Some(first) = significant.first() else {
+        return 0;
+    };
+    (significant.len() - 1)
+        .saturating_mul(8)
+        .saturating_add(8usize.saturating_sub(first.leading_zeros() as usize))
+}
+
+/// Admit an EC named-curve OID and its SEC1 point encoding.
+///
+/// Curve identity comes from the RFC 5480 AlgorithmIdentifier parameters, not
+/// from point length: secp256k1 and P-256 have identically sized points, while
+/// P-521 coordinates occupy 66 octets and therefore look like 528 bits when
+/// rounded to bytes. `curve_oid` is a public registry identifier and is never
+/// reproduced in diagnostics.
+#[doc(hidden)]
+pub fn check_ec_curve_oid_and_point_enforced(
+    curve_oid: &str,
+    point: &[u8],
+    surface_label: &str,
+) -> Result<(), String> {
+    let label = bounded_label(surface_label);
+    let (curve_name, coordinate_bytes) = match curve_oid {
+        "1.2.840.10045.3.1.7" => ("P-256", 32usize),
+        "1.3.132.0.34" => ("P-384", 48usize),
+        "1.3.132.0.35" => ("P-521", 66usize),
+        _ => {
+            return Err(format!(
+                "{label}: the certificate names an elliptic curve outside the approved set and \
+                 is refused while FIPS mode is enforced. Approved curves: P-256, P-384, P-521."
+            ));
+        }
+    };
+    let valid_length = match point.first().copied() {
+        Some(0x04) => point.len() == 1 + 2 * coordinate_bytes,
+        Some(0x02 | 0x03) => point.len() == 1 + coordinate_bytes,
+        _ => false,
+    };
+    if !valid_length {
+        return Err(format!(
+            "{label}: the certificate carries a malformed {curve_name} public-point encoding and \
+             is refused while FIPS mode is enforced."
+        ));
+    }
+    Ok(())
 }
 
 /// Shared RSA strength rule for certificates and JWKs.
@@ -219,16 +283,45 @@ pub fn check_jwk_rsa_modulus(modulus: &[u8]) -> Result<(), String> {
 
 /// The enforced half of [`check_jwk_rsa_modulus`].
 pub fn check_jwk_rsa_modulus_enforced(modulus: &[u8]) -> Result<(), String> {
-    // RFC 7518 §6.3.1.1 requires `n` to be the unsigned big-endian octets with
-    // no leading zero padding, but an issuer that pads anyway must not be
-    // credited with the extra byte, and one that pads *short* must not be
-    // rejected for a byte it legitimately omitted.
-    let significant = modulus
+    check_rsa_modulus_bits(unsigned_be_bit_length(modulus), "JWKS RSA signing key")
+}
+
+/// Admit all security-relevant RSA JWK public components.
+pub fn check_jwk_rsa_public_key(modulus: &[u8], exponent: &[u8]) -> Result<(), String> {
+    if !super::is_enforcing() {
+        return Ok(());
+    }
+    check_jwk_rsa_public_key_enforced(modulus, exponent)
+}
+
+/// The enforced half of [`check_jwk_rsa_public_key`].
+pub fn check_jwk_rsa_public_key_enforced(
+    modulus: &[u8],
+    exponent: &[u8],
+) -> Result<(), String> {
+    check_jwk_rsa_modulus_enforced(modulus)?;
+    check_rsa_public_exponent_enforced(exponent, "JWKS RSA signing key")
+}
+
+fn check_rsa_public_exponent_enforced(exponent: &[u8], surface_label: &str) -> Result<(), String> {
+    let significant = exponent
         .iter()
         .position(|byte| *byte != 0)
-        .map(|start| &modulus[start..])
+        .map(|start| &exponent[start..])
         .unwrap_or(&[]);
-    check_rsa_modulus_bits(significant.len() * 8, "JWKS RSA signing key")
+    let greater_than_65536 = significant.len() > 3
+        || (significant.len() == 3 && significant > [0x01, 0x00, 0x00].as_slice());
+    if significant.is_empty()
+        || significant.len() > 32
+        || !greater_than_65536
+        || !significant.last().is_some_and(|byte| byte & 1 == 1)
+    {
+        return Err(format!(
+            "{surface_label} has an RSA public exponent outside the admitted FIPS 186-5 form \
+             (odd, greater than 65536, and at most 256 bits)."
+        ));
+    }
+    Ok(())
 }
 
 /// Approved JWK elliptic curves, as spelled in the RFC 7518 `crv` member.
@@ -249,10 +342,11 @@ pub fn check_jwk_ec_curve(curve: &str) -> Result<(), String> {
 
 /// The enforced half of [`check_jwk_ec_curve`].
 pub fn check_jwk_ec_curve_enforced(curve: &str) -> Result<(), String> {
-    if APPROVED_JWK_EC_CURVES
-        .iter()
-        .any(|approved| approved.eq_ignore_ascii_case(curve.trim()))
-    {
+    // RFC 7518 registry values are case-sensitive. Requiring the exact token
+    // keeps this admission decision identical to the downstream algorithm
+    // dispatch in `JwksKeyStore`; a normalized alias must not pass policy and
+    // then select a different/default algorithm later.
+    if APPROVED_JWK_EC_CURVES.contains(&curve) {
         return Ok(());
     }
     // `crv` is a fixed RFC 7518 registry vocabulary, so naming the observed
@@ -263,4 +357,43 @@ pub fn check_jwk_ec_curve_enforced(curve: &str) -> Result<(), String> {
          enforced. Approved: {}.",
         APPROVED_JWK_EC_CURVES.join(", ")
     ))
+}
+
+/// Admit the complete public portion of an EC JWK.
+pub fn check_jwk_ec_public_key(
+    curve: Option<&str>,
+    x: &[u8],
+    y: &[u8],
+) -> Result<(), String> {
+    if !super::is_enforcing() {
+        return Ok(());
+    }
+    check_jwk_ec_public_key_enforced(curve, x, y)
+}
+
+/// The enforced half of [`check_jwk_ec_public_key`].
+pub fn check_jwk_ec_public_key_enforced(
+    curve: Option<&str>,
+    x: &[u8],
+    y: &[u8],
+) -> Result<(), String> {
+    let curve = curve.ok_or_else(|| {
+        "JWKS EC signing key omits `crv`, so its approved curve cannot be established while FIPS \
+         mode is enforced."
+            .to_string()
+    })?;
+    check_jwk_ec_curve_enforced(curve)?;
+    let expected = match curve {
+        "P-256" => 32,
+        "P-384" => 48,
+        _ => return Err("JWKS EC signing key names an unsupported curve.".to_string()),
+    };
+    if x.len() != expected || y.len() != expected {
+        return Err(format!(
+            "JWKS EC signing key has malformed public coordinates for {}; each coordinate must \
+             be exactly {expected} bytes while FIPS mode is enforced.",
+            curve
+        ));
+    }
+    Ok(())
 }

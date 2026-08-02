@@ -186,16 +186,22 @@ approved algorithm used with an under-strength key — an RSA-1024 leaf is
 SP 800-131A Rev. 2 disallows the 1024-bit *key*. Ferrum therefore enforces key
 policy itself, at admission:
 
-- **Certificates** — RSA modulus of 2048–8192 bits, or ECDSA over
-  P-256 / P-384 / P-521. DSA (withdrawn by FIPS 186-5), the GOST curves, and
+- **Certificates** — RSA modulus of 2048–8192 bits with an odd public exponent
+  greater than 65536 and at most 256 bits, or ECDSA over the exact named curves
+  P-256 / P-384 / P-521 with a matching SEC1 point form. Curve identity is read
+  from the certificate AlgorithmIdentifier OID, never inferred from byte length
+  (secp256k1 points are the same size as P-256, while P-521 coordinates occupy
+  66 bytes). DSA (withdrawn by FIPS 186-5), the GOST curves, and
   Ed25519 / Ed448 / X25519 are refused. Enforced at
   `tls::parse_pem_certificate_bundle`, which is the single PEM loading boundary
   for frontend, admin, backend, mesh, DTLS, CP/DP, health-check, SPIFFE, client
   CA, PKCS#11 leaf, and ACME-issued material. **Every record in a bundle is
   checked, including intermediates and trust anchors** — an approved leaf
   chained to an RSA-1024 issuer is still an RSA-1024 signature verification.
-- **JWKS signing keys** — RSA modulus of at least 2048 bits, and EC keys on
-  P-256 or P-384. `P-521` is refused here because its only JWS use is `ES512`,
+- **JWKS signing keys** — RSA modulus of at least 2048 bits with the same public
+  exponent form, and EC keys that explicitly name P-256 or P-384 and carry
+  exact-width public coordinates. A missing `crv` never defaults under FIPS
+  enforcement. `P-521` is refused here because its only JWS use is `ES512`,
   which is refused above; admitting the curve while refusing every algorithm
   that could use it would only move the failure later. Padding on `n` contrary
   to RFC 7518 §6.3.1.1 is not credited toward the floor.
@@ -221,6 +227,8 @@ walks through, so all of the following are refused:
 | Global outbound | `FERRUM_TLS_NO_VERIFY=true` |
 | Admin API client | `FERRUM_ADMIN_TLS_NO_VERIFY=true` |
 | Admin listener transport | `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true` |
+| CP/DP configuration transport | `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` |
+| Injector admission webhook | `FERRUM_INJECTOR_ALLOW_PLAINTEXT=true` |
 | Mesh stream egress | `FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT=true` |
 | Mesh identity | `FERRUM_MESH_ALLOW_NO_CA`, `FERRUM_MESH_ALLOW_STATIC_ID`, `FERRUM_MESH_CA_BOOTSTRAP_DEV` |
 | Config database | `FERRUM_DB_TLS_MODE=require` (MongoDB `allow_invalid_certificates`), and the `tlsInsecure` / `tlsAllowInvalidCertificates` / `tlsAllowInvalidHostnames` / `tlsDisableOCSPEndpointCheck` URI options in `FERRUM_DB_URL` |
@@ -231,6 +239,9 @@ walks through, so all of the following are refused:
 | `api_chargeback_sink` | `clickhouse.tls.insecure_skip_verify: true`, `clickhouse.tls.verify_hostname: false` |
 | `mesh_route_dispatch` | `rules[].destination.backend_tls.verify_server_cert: false` |
 | `ai_transcript_audit` | `sink.allow_insecure_loopback: true` |
+| `ldap_auth` | `allow_plaintext: true` |
+| `ai_federation` | `providers[].allow_plaintext: true` |
+| `ai_stream_router` | `providers[].allow_plaintext: true` |
 
 Two entries are deliberately absent, each with a test that keeps the reasoning
 honest rather than leaving it as a comment:

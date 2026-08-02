@@ -118,6 +118,14 @@ pub const INVENTORY: &[CryptoOperation] = &[
         disposition: Disposition::ModuleRoutable,
         rationale: "ServerConfig::builder_with_provider(fips::base_crypto_provider())",
     },
+    CryptoOperation {
+        operation: "Kubernetes injector admission-webhook HTTPS listener",
+        location: "src/modes/injector.rs::build_tls_acceptor",
+        implementation: "rustls, tokio-rustls",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "the injector builds through TlsPolicy and the shared TLS loader, while \
+                    fips::policy refuses its dev-only plaintext escape hatch",
+    },
     // ── HTTP/3 and QUIC ─────────────────────────────────────────────────
     CryptoOperation {
         operation: "HTTP/3 server QUIC handshake, packet protection, initial keys",
