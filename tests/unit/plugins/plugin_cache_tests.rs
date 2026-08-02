@@ -8694,7 +8694,8 @@ async fn test_priority_override_delegates_final_client_visible_response_headers(
     );
 
     let mut clean_ctx = trailer_policy_ctx("GET", "/api/orders");
-    let clean_headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let clean_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     assert!(
         matches!(
             waf_plugin
@@ -8706,10 +8707,8 @@ async fn test_priority_override_delegates_final_client_visible_response_headers(
     );
 
     let mut enforcing_ctx = trailer_policy_ctx("GET", "/api/orders");
-    let hostile_headers = HashMap::from([(
-        "x-debug-info".to_string(),
-        "leak-secret-token".to_string(),
-    )]);
+    let hostile_headers =
+        HashMap::from([("x-debug-info".to_string(), "leak-secret-token".to_string())]);
     let result = waf_plugin
         .finalize_client_visible_response_headers(&mut enforcing_ctx, 200, &hostile_headers)
         .await;

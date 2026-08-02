@@ -1290,7 +1290,8 @@ impl Plugin for PriorityOverridePlugin {
             .await
     }
     fn enforces_final_client_visible_response_headers(&self, ctx: &RequestContext) -> bool {
-        self.inner.enforces_final_client_visible_response_headers(ctx)
+        self.inner
+            .enforces_final_client_visible_response_headers(ctx)
     }
     async fn finalize_client_visible_response_headers(
         &self,
