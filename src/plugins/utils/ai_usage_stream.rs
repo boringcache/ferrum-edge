@@ -26,12 +26,14 @@
 //! | Anthropic | `message_start.message.usage.input_tokens`, `message_delta.usage.output_tokens` |
 //! | Cohere v2 | `message-end` event's `delta.usage.tokens.*` |
 //! | Google Gemini / Vertex | `usageMetadata` on a `GenerateContentResponse` SSE event |
-//! | AWS Bedrock | `application/vnd.amazon.eventstream` framing; `amazon-bedrock-invocationMetrics` in the base64 `bytes` chunk payload, or a `ConverseStream` `metadata` event's `usage` |
+//! | AWS Bedrock | `application/vnd.amazon.eventstream` framing with verified prelude and message CRC32; `amazon-bedrock-invocationMetrics` in the base64 `bytes` chunk payload, or a `ConverseStream` `metadata` event's `usage` |
 //! | Hugging Face TGI | terminal `details.generated_tokens` (`/generate_stream`) |
 //!
 //! Anything else is left unobserved, which the caller must treat as "no
 //! authoritative usage" and resolve through its configured unmetered policy —
-//! never as a charge of zero.
+//! never as a charge of zero. Bedrock frames whose prelude or message CRC
+//! fails verification are never admitted as usage (already-observed counters
+//! from earlier valid frames are retained).
 
 use base64::Engine;
 use serde_json::Value;
@@ -66,6 +68,46 @@ const EVENT_STREAM_MIN_MESSAGE_LEN: usize = EVENT_STREAM_PRELUDE_LEN + EVENT_STR
 /// least four long — every caller slices an already-validated prelude).
 fn be_u32(bytes: &[u8]) -> u32 {
     u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+/// AWS event-stream CRC32 (ITU-T V.42 / IEEE / ZIP polynomial).
+fn event_stream_crc32(bytes: &[u8]) -> u32 {
+    crc32fast::hash(bytes)
+}
+
+/// Build one standards-correct `application/vnd.amazon.eventstream` message
+/// with valid prelude and message CRC32 checksums.
+///
+/// Prelude CRC covers the first eight bytes (`total_length` + `headers_length`).
+/// Message CRC covers every byte except the final four-byte checksum field.
+pub fn encode_aws_event_stream_message(headers: &[u8], payload: &[u8]) -> Vec<u8> {
+    let total = EVENT_STREAM_PRELUDE_LEN
+        .saturating_add(headers.len())
+        .saturating_add(payload.len())
+        .saturating_add(EVENT_STREAM_MESSAGE_CRC_LEN);
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&encode_aws_event_stream_prelude(
+        total as u32,
+        headers.len() as u32,
+    ));
+    out.extend_from_slice(headers);
+    out.extend_from_slice(payload);
+    let message_crc = event_stream_crc32(&out);
+    out.extend_from_slice(&message_crc.to_be_bytes());
+    out
+}
+
+/// Twelve-byte AWS event-stream prelude with a valid prelude CRC32.
+///
+/// Used by tests (and the message builder) to construct oversized or
+/// length-hostile frames whose declared length is trusted only after CRC.
+pub fn encode_aws_event_stream_prelude(total_length: u32, headers_length: u32) -> [u8; 12] {
+    let mut prelude = [0u8; 12];
+    prelude[0..4].copy_from_slice(&total_length.to_be_bytes());
+    prelude[4..8].copy_from_slice(&headers_length.to_be_bytes());
+    let prelude_crc = event_stream_crc32(&prelude[0..8]);
+    prelude[8..12].copy_from_slice(&prelude_crc.to_be_bytes());
+    prelude
 }
 
 /// True for the AWS event-stream media type (parameters tolerated).
@@ -371,6 +413,9 @@ impl UsageStreamExtractor {
         }
         let mut rest = chunk;
         while !rest.is_empty() {
+            if self.desynced {
+                return;
+            }
             if self.skip_remaining > 0 {
                 let take = usize::try_from(self.skip_remaining)
                     .unwrap_or(usize::MAX)
@@ -412,22 +457,33 @@ impl UsageStreamExtractor {
     /// Validate the buffered prelude and decide how the message is consumed.
     ///
     /// Returns `false` when the caller must stop consuming this chunk (framing
-    /// proved invalid). An oversized-but-well-formed message is skipped by
-    /// length rather than buffered.
+    /// proved invalid). The prelude CRC is verified **before** any length is
+    /// trusted — including before the oversized-message skip path — so a
+    /// corrupted length field cannot steer retention. An oversized-but-CRC-valid
+    /// message is skipped by its trusted length rather than buffered; its
+    /// contents are never admitted.
     fn begin_event_stream_message(&mut self) -> bool {
+        let declared_prelude_crc = be_u32(&self.carry[8..12]);
+        let actual_prelude_crc = event_stream_crc32(&self.carry[0..8]);
+        if declared_prelude_crc != actual_prelude_crc {
+            // Corrupt prelude: lengths are untrusted. Stop cleanly without
+            // guessing a resynchronization point in a length-prefixed format.
+            self.desync_event_stream();
+            return false;
+        }
+
         let total = be_u32(&self.carry[0..4]) as usize;
         let headers = be_u32(&self.carry[4..8]) as usize;
         if total < EVENT_STREAM_MIN_MESSAGE_LEN || headers > total - EVENT_STREAM_MIN_MESSAGE_LEN {
-            // Not AWS event-stream framing (or irrecoverably corrupt). There is
-            // no resynchronization point in a length-prefixed binary format, so
-            // stop rather than guess; the response becomes unmetered and the
+            // Structurally impossible even with a matching prelude CRC. Stop
+            // rather than guess; the response becomes unmetered and the
             // caller's configured policy decides.
-            self.desynced = true;
-            self.carry = Vec::new();
-            self.pending_message_len = 0;
+            self.desync_event_stream();
             return false;
         }
         if total > MAX_EVENT_STREAM_MESSAGE_BYTES {
+            // Length is trusted only because the prelude CRC matched. Skip the
+            // rest of the message without buffering it or admitting contents.
             self.skip_remaining = (total - EVENT_STREAM_PRELUDE_LEN) as u64;
             self.carry = Vec::new();
             self.pending_message_len = 0;
@@ -437,7 +493,28 @@ impl UsageStreamExtractor {
         true
     }
 
+    fn desync_event_stream(&mut self) {
+        self.desynced = true;
+        self.carry = Vec::new();
+        self.pending_message_len = 0;
+        self.skip_remaining = 0;
+    }
+
     fn apply_event_stream_message(&mut self, message: &[u8]) {
+        if message.len() < EVENT_STREAM_MIN_MESSAGE_LEN {
+            self.desync_event_stream();
+            return;
+        }
+        let (body, crc_bytes) = message.split_at(message.len() - EVENT_STREAM_MESSAGE_CRC_LEN);
+        let declared_message_crc = be_u32(crc_bytes);
+        let actual_message_crc = event_stream_crc32(body);
+        if declared_message_crc != actual_message_crc {
+            // Final CRC mismatch: do not parse headers/payload or record usage
+            // from this frame. Keep any already-observed counters and stop.
+            self.desync_event_stream();
+            return;
+        }
+
         let headers = be_u32(&message[4..8]) as usize;
         let payload_start = EVENT_STREAM_PRELUDE_LEN.saturating_add(headers);
         let payload_end = message.len().saturating_sub(EVENT_STREAM_MESSAGE_CRC_LEN);

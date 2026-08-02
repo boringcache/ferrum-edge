@@ -2,12 +2,14 @@
 //!
 //! Covers GHSA-q2r2-6r7h-f69x (bounded retention instead of full-response
 //! buffering) and GHSA-rxj9-f483-g53f (authoritative terminal usage for the
-//! provider-native Gemini, Bedrock, and TGI streaming formats).
+//! provider-native Gemini, Bedrock, and TGI streaming formats), including
+//! AWS event-stream CRC integrity before usage is trusted.
 
 use base64::Engine;
 use ferrum_edge::plugins::utils::ai_providers::AiProvider;
 use ferrum_edge::plugins::utils::ai_usage_stream::{
     MAX_EVENT_STREAM_MESSAGE_BYTES, MAX_SSE_EVENT_BYTES, UsageStreamExtractor, UsageStreamFormat,
+    encode_aws_event_stream_message, encode_aws_event_stream_prelude,
     is_aws_event_stream_content_type,
 };
 use serde_json::json;
@@ -24,18 +26,9 @@ fn sse(events: &[&str]) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// One `application/vnd.amazon.eventstream` message. CRCs are not verified by
-/// the parser (it only needs the framing), so zeroes are fine here.
+/// One standards-correct `application/vnd.amazon.eventstream` message.
 fn event_stream_message(headers: &[u8], payload: &[u8]) -> Vec<u8> {
-    let total = 12 + headers.len() + payload.len() + 4;
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&(total as u32).to_be_bytes());
-    out.extend_from_slice(&(headers.len() as u32).to_be_bytes());
-    out.extend_from_slice(&[0, 0, 0, 0]);
-    out.extend_from_slice(headers);
-    out.extend_from_slice(payload);
-    out.extend_from_slice(&[0, 0, 0, 0]);
-    out
+    encode_aws_event_stream_message(headers, payload)
 }
 
 /// `InvokeModelWithResponseStream` wraps the model-native chunk as base64.
@@ -53,6 +46,10 @@ fn extract(format: UsageStreamFormat, chunks: &[&[u8]], count_mode: &str) -> Opt
     }
     extractor.finish();
     extractor.usage().total_for_mode(count_mode)
+}
+
+fn mutate_byte(message: &mut [u8], index: usize) {
+    message[index] ^= 0xff;
 }
 
 // ─── SSE: existing providers stay identical ─────────────────────────────
@@ -316,14 +313,25 @@ fn truncated_event_stream_message_reports_no_usage() {
 }
 
 #[test]
+fn truncated_event_stream_crc_reports_no_usage() {
+    // Drop only the final CRC bytes after a complete body — still incomplete.
+    let stream = bedrock_invoke_chunk(json!({
+        "amazon-bedrock-invocationMetrics": {"inputTokenCount": 8, "outputTokenCount": 4}
+    }));
+    let truncated = &stream[..stream.len() - 4];
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::AwsEventStream, None);
+    extractor.push(truncated);
+    extractor.finish();
+    assert!(!extractor.usage().observed());
+}
+
+#[test]
 fn malformed_event_stream_framing_stops_parsing_without_panicking() {
     // A declared total length below the structural minimum is not event-stream
     // framing at all. There is no resync point in a length-prefixed format, so
     // the parser must stop cleanly and report nothing.
     let mut stream = Vec::new();
-    stream.extend_from_slice(&3u32.to_be_bytes());
-    stream.extend_from_slice(&0u32.to_be_bytes());
-    stream.extend_from_slice(&[0, 0, 0, 0]);
+    stream.extend_from_slice(&encode_aws_event_stream_prelude(3, 0));
     stream.extend_from_slice(b"garbage garbage garbage");
     let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::AwsEventStream, None);
     extractor.push(&stream);
@@ -333,12 +341,102 @@ fn malformed_event_stream_framing_stops_parsing_without_panicking() {
 }
 
 #[test]
+fn corrupt_prelude_crc_rejects_declared_length_before_skip_or_parse() {
+    let oversized_total = (MAX_EVENT_STREAM_MESSAGE_BYTES + 4096) as u32;
+    let mut prelude = encode_aws_event_stream_prelude(oversized_total, 0);
+    mutate_byte(&mut prelude, 9);
+    let mut stream = Vec::new();
+    stream.extend_from_slice(&prelude);
+    // Hostile remainder that would be skipped if the corrupt length were trusted.
+    stream.extend_from_slice(&vec![0x41; 64]);
+    stream.extend_from_slice(&bedrock_invoke_chunk(json!({
+        "amazon-bedrock-invocationMetrics": {"inputTokenCount": 2, "outputTokenCount": 3}
+    })));
+
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::AwsEventStream, None);
+    extractor.push(&stream);
+    extractor.finish();
+    assert!(
+        !extractor.usage().observed(),
+        "a corrupt prelude CRC must never trust length or admit later frames"
+    );
+    assert_eq!(extractor.retained_bytes(), 0);
+}
+
+#[test]
+fn corrupt_message_crc_stops_without_admitting_usage() {
+    let mut stream = bedrock_invoke_chunk(json!({
+        "amazon-bedrock-invocationMetrics": {"inputTokenCount": 8, "outputTokenCount": 4}
+    }));
+    let last = stream.len() - 1;
+    mutate_byte(&mut stream, last);
+
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::AwsEventStream, None);
+    extractor.push(&stream);
+    extractor.finish();
+    assert!(
+        !extractor.usage().observed(),
+        "a corrupt final message CRC must never admit payload usage"
+    );
+}
+
+#[test]
+fn corrupt_frame_after_valid_usage_preserves_observed_counters() {
+    let valid = bedrock_invoke_chunk(json!({
+        "amazon-bedrock-invocationMetrics": {"inputTokenCount": 10, "outputTokenCount": 5}
+    }));
+    let mut corrupt = bedrock_invoke_chunk(json!({
+        "amazon-bedrock-invocationMetrics": {"inputTokenCount": 99, "outputTokenCount": 99}
+    }));
+    let last = corrupt.len() - 1;
+    mutate_byte(&mut corrupt, last);
+
+    let mut stream = valid;
+    stream.extend_from_slice(&corrupt);
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::AwsEventStream, None);
+    extractor.push(&stream);
+    extractor.finish();
+    assert_eq!(
+        extractor.usage().total_for_mode("total_tokens"),
+        Some(15),
+        "already-observed usage must survive a later corrupt frame"
+    );
+}
+
+#[test]
+fn malformed_lengths_with_valid_prelude_crc_stop_cleanly() {
+    // Prelude CRC matches, but headers_length exceeds the structural maximum.
+    let mut stream = Vec::new();
+    stream.extend_from_slice(&encode_aws_event_stream_prelude(16, 8));
+    stream.extend_from_slice(&[0u8; 8]);
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::AwsEventStream, None);
+    extractor.push(&stream);
+    extractor.finish();
+    assert!(!extractor.usage().observed());
+    assert_eq!(extractor.retained_bytes(), 0);
+}
+
+#[test]
+fn malformed_lengths_with_invalid_prelude_crc_never_skip_by_length() {
+    let mut prelude = encode_aws_event_stream_prelude(16, 8);
+    mutate_byte(&mut prelude, 10);
+    let mut stream = Vec::new();
+    stream.extend_from_slice(&prelude);
+    stream.extend_from_slice(&[0u8; 64]);
+    stream.extend_from_slice(&bedrock_invoke_chunk(json!({
+        "amazon-bedrock-invocationMetrics": {"inputTokenCount": 1, "outputTokenCount": 1}
+    })));
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::AwsEventStream, None);
+    extractor.push(&stream);
+    extractor.finish();
+    assert!(!extractor.usage().observed());
+}
+
+#[test]
 fn oversized_event_stream_message_is_skipped_by_length_not_buffered() {
     let oversized_total = (MAX_EVENT_STREAM_MESSAGE_BYTES + 4096) as u32;
     let mut stream = Vec::new();
-    stream.extend_from_slice(&oversized_total.to_be_bytes());
-    stream.extend_from_slice(&0u32.to_be_bytes());
-    stream.extend_from_slice(&[0, 0, 0, 0]);
+    stream.extend_from_slice(&encode_aws_event_stream_prelude(oversized_total, 0));
     stream.extend_from_slice(&vec![0x41; MAX_EVENT_STREAM_MESSAGE_BYTES + 4096 - 12]);
     // A well-formed usage message follows the oversized one.
     stream.extend_from_slice(&bedrock_invoke_chunk(json!({

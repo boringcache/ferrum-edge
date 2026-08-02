@@ -2234,6 +2234,7 @@ dependencies = [
  "clap",
  "crossbeam-queue",
  "crossbeam-utils",
+ "crc32fast",
  "cryptoki",
  "dashmap",
  "dimpl",

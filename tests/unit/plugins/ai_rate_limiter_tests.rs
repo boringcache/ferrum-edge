@@ -6893,6 +6893,10 @@ fn streaming_limiter(on_unmetered_response: &str) -> Arc<AiRateLimiter> {
 /// every H1/H2, native H3, and cross-protocol dispatcher funnels through:
 /// `create_response_stream_inspector` → per-chunk `on_chunk` → `on_end` →
 /// `on_response_stream_terminated`. Returns the bytes forwarded downstream.
+///
+/// Protocol-specific body seams (H1 byte-chunk channel, H2/H3
+/// `run_proxy_body_response_inspection`) are covered separately by the
+/// `h1_h2_h3_gateway_streams_*` tests below.
 async fn drive_stream(
     plugin: &Arc<AiRateLimiter>,
     ctx: &mut RequestContext,
@@ -6934,16 +6938,9 @@ fn sse_frame(value: serde_json::Value) -> Vec<u8> {
     format!("data: {value}\n\n").into_bytes()
 }
 
-/// One `application/vnd.amazon.eventstream` message (CRCs are not verified).
+/// One standards-correct `application/vnd.amazon.eventstream` message.
 fn bedrock_event_stream_message(payload: &[u8]) -> Vec<u8> {
-    let total = 12 + payload.len() + 4;
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&(total as u32).to_be_bytes());
-    out.extend_from_slice(&0u32.to_be_bytes());
-    out.extend_from_slice(&[0, 0, 0, 0]);
-    out.extend_from_slice(payload);
-    out.extend_from_slice(&[0, 0, 0, 0]);
-    out
+    ferrum_edge::plugins::utils::ai_usage_stream::encode_aws_event_stream_message(b"", payload)
 }
 
 #[tokio::test]
@@ -7344,4 +7341,279 @@ async fn malformed_and_truncated_stream_frames_apply_the_policy_exactly_once() {
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(0))
         .await;
     assert_eq!(observed_usage(&plugin).await, reserved);
+}
+
+// ─── H1 / H2 / H3 gateway streaming seams (GHSA-rxj9) ───────────────────
+//
+// Production attaches the limiter inspector through the shared factory, then
+// drives it via protocol-specific body seams:
+//   * H1/reqwest → byte chunks into `inspected_streaming_body`
+//   * direct H2 / native H3 → `run_proxy_body_response_inspection`
+// These tests reuse those harnesses (`inspected_byte_chunks_body_for_test` /
+// `inspected_proxy_body_for_test`) rather than standing up a server, and prove
+// the attached `ai_rate_limiter` inspector is actually driven and terminally
+// reconciled — not merely that source wiring mentions the inspector.
+
+use bytes::Bytes;
+use ferrum_edge::proxy::deferred_log::run_response_stream_termination_hooks;
+use futures_util::stream;
+use http_body::Frame;
+use http_body_util::{BodyExt, StreamBody};
+
+#[derive(Clone, Copy, Debug)]
+enum GatewayStreamBodyVariant {
+    /// H1/reqwest-style decoded byte chunks → shared inspected channel body.
+    H1,
+    /// Direct-H2 ProxyBody DATA frames → `run_proxy_body_response_inspection`.
+    H2,
+    /// Native-H3-shaped ProxyBody DATA + trailers → same inspection driver.
+    H3,
+}
+
+fn gemini_usage_sse_chunks() -> Vec<Bytes> {
+    let first = Bytes::from(sse_frame(json!({
+        "candidates": [{"content": {"parts": [{"text": "he"}]}}]
+    })));
+    let last = Bytes::from(sse_frame(json!({
+        "candidates": [{"content": {"parts": [{"text": "llo"}]}}],
+        "usageMetadata": {
+            "promptTokenCount": 30,
+            "candidatesTokenCount": 20,
+            "totalTokenCount": 50
+        }
+    })));
+    vec![first, last]
+}
+
+async fn drain_proxy_body_data(mut body: ferrum_edge::proxy::ProxyBody) -> Vec<u8> {
+    let mut forwarded = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.expect("inspected body must not error on clean completion");
+        if let Ok(data) = frame.into_data() {
+            forwarded.extend_from_slice(&data);
+        }
+    }
+    forwarded
+}
+
+async fn drive_gateway_stream_variant(
+    variant: GatewayStreamBodyVariant,
+    plugin: &Arc<AiRateLimiter>,
+    ctx: &mut RequestContext,
+    chunks: Vec<Bytes>,
+    complete: bool,
+) -> Vec<u8> {
+    let chain: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let inspector = create_response_stream_inspector(
+        &chain,
+        ctx,
+        200,
+        Some("text/event-stream"),
+    )
+    .expect("a meterable AI SSE stream must attach an inspector");
+
+    let expected: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+    let inspected = match variant {
+        GatewayStreamBodyVariant::H1 => {
+            ferrum_edge::_test_support::inspected_byte_chunks_body_for_test(chunks, inspector)
+        }
+        GatewayStreamBodyVariant::H2 => {
+            let frames = chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, ferrum_edge::proxy::body::ProxyBodyError>(Frame::data(chunk)));
+            let source = stream::iter(frames);
+            let backend = ferrum_edge::_test_support::proxy_body_streaming_for_test(Box::pin(
+                StreamBody::new(source),
+            ));
+            ferrum_edge::_test_support::inspected_proxy_body_for_test(backend, inspector)
+        }
+        GatewayStreamBodyVariant::H3 => {
+            // Native H3 also uses `run_proxy_body_response_inspection`; include a
+            // trailer frame so the seam exercises DATA + trailer ordering.
+            let mut frames: Vec<Result<Frame<Bytes>, ferrum_edge::proxy::body::ProxyBodyError>> =
+                chunks
+                    .into_iter()
+                    .map(|chunk| Ok(Frame::data(chunk)))
+                    .collect();
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert("x-test-trailer", "h3".parse().unwrap());
+            frames.push(Ok(Frame::trailers(trailers)));
+            let source = stream::iter(frames);
+            let backend = ferrum_edge::_test_support::proxy_body_streaming_for_test(Box::pin(
+                StreamBody::new(source),
+            ));
+            ferrum_edge::_test_support::inspected_proxy_body_for_test(backend, inspector)
+        }
+    };
+
+    let forwarded = if complete {
+        drain_proxy_body_data(inspected).await
+    } else {
+        // Client disconnect: drop the client-visible body before EOF so the
+        // inspection task cancels and the terminal hook still reconciles.
+        drop(inspected);
+        Vec::new()
+    };
+
+    if complete {
+        assert_eq!(
+            forwarded, expected,
+            "{variant:?}: every byte must be forwarded unchanged"
+        );
+        run_response_stream_termination_hooks(
+            &chain,
+            ctx,
+            200,
+            &BodyOutcome::success(expected.len() as u64),
+        )
+        .await;
+    } else {
+        run_response_stream_termination_hooks(
+            &chain,
+            ctx,
+            200,
+            &BodyOutcome::client_disconnect(0),
+        )
+        .await;
+    }
+    forwarded
+}
+
+#[tokio::test]
+async fn h1_h2_h3_gateway_streams_drive_ai_rate_limiter_and_reconcile() {
+    for variant in [
+        GatewayStreamBodyVariant::H1,
+        GatewayStreamBodyVariant::H2,
+        GatewayStreamBodyVariant::H3,
+    ] {
+        let plugin = streaming_limiter("charge_estimate");
+        let mut ctx = ai_request_ctx(400, &format!("gateway stream {variant:?}"));
+        let mut headers = HashMap::new();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert!(instance_reserved(&plugin, &ctx) > 0);
+
+        drive_gateway_stream_variant(
+            variant,
+            &plugin,
+            &mut ctx,
+            gemini_usage_sse_chunks(),
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            observed_usage(&plugin).await,
+            50,
+            "{variant:?}: terminal usageMetadata must reconcile the reservation"
+        );
+        assert!(
+            instance_released(&plugin, &ctx),
+            "{variant:?}: terminal handoff must consume the release path"
+        );
+    }
+}
+
+#[tokio::test]
+async fn h1_h2_h3_client_disconnect_still_terminally_reconciles() {
+    for variant in [
+        GatewayStreamBodyVariant::H1,
+        GatewayStreamBodyVariant::H2,
+        GatewayStreamBodyVariant::H3,
+    ] {
+        let plugin = streaming_limiter("charge_estimate");
+        let mut ctx = ai_request_ctx(400, &format!("disconnect {variant:?}"));
+        let mut headers = HashMap::new();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        let reserved = instance_reserved(&plugin, &ctx);
+        assert!(reserved > 0);
+
+        // Partial stream with no terminal usage yet — disconnect mid-flight.
+        let partial = vec![Bytes::from(sse_frame(
+            json!({"candidates": [{"content": {"parts": [{"text": "he"}]}}]}),
+        ))];
+        drive_gateway_stream_variant(variant, &plugin, &mut ctx, partial, false).await;
+
+        assert_eq!(
+            observed_usage(&plugin).await,
+            reserved,
+            "{variant:?}: client disconnect without usage applies charge_estimate"
+        );
+        assert!(
+            instance_released(&plugin, &ctx),
+            "{variant:?}: disconnect must still run the terminal release path once"
+        );
+    }
+}
+
+#[tokio::test]
+async fn h2_h3_backend_error_applies_unmetered_policy_exactly_once() {
+    // H2/H3 inspection driver surfaces a backend body error through the shared
+    // channel; prove the limiter still reconciles via the terminal hook.
+    for label in ["H2", "H3"] {
+        let plugin = streaming_limiter("charge_estimate");
+        let mut ctx = ai_request_ctx(400, &format!("backend error stream {label}"));
+        let mut headers = HashMap::new();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        let reserved = instance_reserved(&plugin, &ctx);
+
+        let chain: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+        let inspector = create_response_stream_inspector(
+            &chain,
+            &mut ctx,
+            200,
+            Some("text/event-stream"),
+        )
+        .expect("inspector");
+
+        let chunk = Bytes::from(sse_frame(json!({"choices": [{"delta": {"content": "x"}}]})));
+        let err: ferrum_edge::proxy::body::ProxyBodyError =
+            Box::<dyn std::error::Error + Send + Sync>::from("backend read failed");
+        let mut frames: Vec<Result<Frame<Bytes>, ferrum_edge::proxy::body::ProxyBodyError>> =
+            vec![Ok(Frame::data(chunk.clone()))];
+        if label == "H3" {
+            // Still DATA-then-error; the H3 label documents the same frame driver
+            // native H3 uses (trailers would not arrive after a body error).
+            let _ = label;
+        }
+        frames.push(Err(err));
+        let source = stream::iter(frames);
+        let backend = ferrum_edge::_test_support::proxy_body_streaming_for_test(Box::pin(
+            StreamBody::new(source),
+        ));
+        let mut inspected =
+            ferrum_edge::_test_support::inspected_proxy_body_for_test(backend, inspector);
+
+        let mut forwarded = Vec::new();
+        let mut saw_error = false;
+        while let Some(frame) = inspected.frame().await {
+            match frame {
+                Ok(frame) => {
+                    if let Ok(data) = frame.into_data() {
+                        forwarded.extend_from_slice(&data);
+                    }
+                }
+                Err(_) => {
+                    saw_error = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_error, "{label}: backend error must surface on the client body");
+        assert_eq!(forwarded, chunk.as_ref());
+
+        run_response_stream_termination_hooks(
+            &chain,
+            &mut ctx,
+            200,
+            &BodyOutcome::error(
+                ferrum_edge::retry::ErrorClass::ReadWriteTimeout,
+                chunk.len() as u64,
+                false,
+            ),
+        )
+        .await;
+
+        assert_eq!(observed_usage(&plugin).await, reserved);
+        assert!(instance_released(&plugin, &ctx));
+    }
 }

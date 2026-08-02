@@ -5910,6 +5910,71 @@ pub mod _test_support {
         crate::proxy::body::inspected_streaming_body(rx)
     }
 
+    /// H1/reqwest-style inspection seam: feed decoded body byte chunks through
+    /// a [`ResponseStreamInspector`] into the shared [`inspected_streaming_body`]
+    /// channel that production `run_response_inspection` uses.
+    ///
+    /// Pair with [`inspected_proxy_body_for_test`] (direct-H2 / native-H3
+    /// `run_proxy_body_response_inspection`) so external tests can prove an
+    /// attached inspector is driven on every HTTP body variant without standing
+    /// up a separate server framework.
+    pub fn inspected_byte_chunks_body_for_test(
+        chunks: Vec<bytes::Bytes>,
+        mut inspector: Box<dyn crate::plugins::ResponseStreamInspector>,
+    ) -> crate::proxy::ProxyBody {
+        use crate::plugins::ResponseStreamAction;
+        use http_body::Frame;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            for chunk in chunks {
+                if tx.is_closed() {
+                    return;
+                }
+                let action = tokio::select! {
+                    biased;
+                    _ = tx.closed() => return,
+                    action = inspector.on_chunk(&chunk) => action,
+                };
+                match action {
+                    ResponseStreamAction::Forward(out) => {
+                        if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
+                            return;
+                        }
+                    }
+                    ResponseStreamAction::Terminate(final_bytes) => {
+                        if let Some(fb) = final_bytes
+                            && !fb.is_empty()
+                        {
+                            let _ = tx.send(Ok(Frame::data(fb))).await;
+                        }
+                        return;
+                    }
+                }
+            }
+            let action = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                action = inspector.on_end() => action,
+            };
+            match action {
+                ResponseStreamAction::Forward(out) => {
+                    if !out.is_empty() {
+                        let _ = tx.send(Ok(Frame::data(out))).await;
+                    }
+                }
+                ResponseStreamAction::Terminate(final_bytes) => {
+                    if let Some(fb) = final_bytes
+                        && !fb.is_empty()
+                    {
+                        let _ = tx.send(Ok(Frame::data(fb))).await;
+                    }
+                }
+            }
+        });
+        crate::proxy::body::inspected_streaming_body(rx)
+    }
+
     pub fn mesh_tcp_egress_connection_accounting_for_test(
         cache: &crate::load_balancer::LoadBalancerCache,
         namespace: &str,
