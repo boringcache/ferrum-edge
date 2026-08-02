@@ -280,37 +280,14 @@ fn env_policy_rejects_disabled_backend_certificate_verification() {
 }
 
 #[test]
-fn env_policy_rejects_every_mongodb_config_store_shape() {
-    use ferrum_edge::config::env_config::DbTlsMode;
-
-    // Mongo URI options (and mongodb+srv defaults) can enable the driver's
-    // non-validated TLS stack independently of FERRUM_DB_TLS_MODE. Reject the
-    // backend for every explicit mode, including `disable`, and when unset.
-    for mode in [
-        None,
-        Some(DbTlsMode::Disable),
-        Some(DbTlsMode::Allow),
-        Some(DbTlsMode::Prefer),
-        Some(DbTlsMode::Require),
-        Some(DbTlsMode::VerifyCa),
-        Some(DbTlsMode::VerifyFull),
-    ] {
-        let env_config = EnvConfig {
-            db_type: Some("mongodb".to_string()),
-            db_url: Some("mongodb://db.example/ferrum?tls=true".to_string()),
-            db_tls_mode: mode,
-            ..EnvConfig::default()
-        };
-        let err = policy::check_env_config_enforced(&env_config)
-            .expect_err("every MongoDB config store shape is rejected");
-        assert!(err.contains("mongodb"), "{err}");
-        assert!(err.contains("FERRUM_DB_TLS_MODE"), "{err}");
-        assert!(err.contains("docs/fips.md"), "{err}");
-        assert!(
-            !err.contains("db.example"),
-            "the connection URI must not be echoed: {err}"
-        );
-    }
+fn env_policy_accepts_provider_routed_mongodb_config_store() {
+    let env_config = EnvConfig {
+        db_type: Some("mongodb".to_string()),
+        db_url: Some("mongodb://db.example/ferrum?tls=true".to_string()),
+        ..EnvConfig::default()
+    };
+    policy::check_env_config_enforced(&env_config)
+        .expect("MongoDB TLS follows the selected build-profile provider");
 }
 
 #[test]

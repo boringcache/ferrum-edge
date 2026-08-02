@@ -187,29 +187,6 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
         );
     }
 
-    // ── Config-database TLS ─────────────────────────────────────────────
-    // The SQL config store rides sqlx, whose rustls provider is selectable at
-    // build time. The MongoDB driver instead pins `rustls/ring` in its own
-    // manifest and can enable TLS from the connection URI independently of
-    // FERRUM_DB_TLS_MODE (including implicitly for mongodb+srv). Ferrum cannot
-    // exhaustively prove that every effective Mongo transport is plaintext, so
-    // refuse the Mongo config store outright rather than admit a URI-controlled
-    // non-validated TLS path. See docs/fips.md for supported config stores.
-    if env_config
-        .db_type
-        .as_deref()
-        .is_some_and(|db_type| db_type.eq_ignore_ascii_case("mongodb"))
-    {
-        return Err(
-            "FERRUM_DB_TYPE=mongodb is refused while FIPS mode is enforced: the MongoDB driver \
-             builds its TLS stack on its own bundled non-validated provider and connection-URI \
-             options can enable that TLS path independently of FERRUM_DB_TLS_MODE. Ferrum cannot \
-             route or exhaustively exclude that transport. Use a SQL config store \
-             (postgres/mysql/sqlite), file mode, or CP/DP distribution. See docs/fips.md."
-                .to_string(),
-        );
-    }
-
     // ── Admin and CP/DP JWT MAC keys ────────────────────────────────────
     for (name, secret) in [
         (

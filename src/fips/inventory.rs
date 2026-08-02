@@ -201,11 +201,12 @@ pub const INVENTORY: &[CryptoOperation] = &[
     CryptoOperation {
         operation: "MongoDB config database",
         location: "src/config/mongo_store.rs",
-        implementation: "mongodb driver (pins rustls/ring in its own manifest)",
-        disposition: Disposition::Rejected,
-        rationale: "fips::policy refuses FERRUM_DB_TYPE=mongodb outright because URI options \
-                    can enable the driver's non-validated TLS stack independently of \
-                    FERRUM_DB_TLS_MODE",
+        implementation: "mongodb driver, rustls",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "mongodb is declared with default-features = false; the `fips` feature \
+                    selects mongodb/rustls-tls-aws-lc while aws-lc-rs/fips binds the same \
+                    resolved backend to the validated module, and the feature-policy gate \
+                    rejects any resolved mongodb/rustls-tls Ring edge",
     },
     // ── JWT / JWK ───────────────────────────────────────────────────────
     CryptoOperation {

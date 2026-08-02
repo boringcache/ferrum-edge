@@ -309,7 +309,6 @@ than being allowed to run outside the boundary:
 | Capability | Why | Alternative |
 |---|---|---|
 | `kafka_logging` | librdkafka performs TLS through OpenSSL, which Ferrum cannot route onto the module | `tcp_logging`, `ws_logging`, `http_logging` (all rustls-based) |
-| MongoDB config store | the driver pins its own non-validated rustls provider and URI options can independently enable its TLS path | a SQL config store, file mode, or CP/DP distribution |
 | `soap_ws_security` `rsa-sha1` / `sha1` | SHA-1 is disallowed for signatures (SP 800-131A Rev. 2) | `rsa-sha256` / `sha256` |
 | `EdDSA` JWTs | approved by FIPS 186-5, but not in the algorithm set Ferrum routes through the selected module | ES256/384/512, RS/PS256/384/512, HS256/384/512 |
 | ChaCha20-Poly1305, X25519 | not an approved AEAD / not an approved SP 800-56A scheme | AES-GCM suites, secp256r1 / secp384r1 |

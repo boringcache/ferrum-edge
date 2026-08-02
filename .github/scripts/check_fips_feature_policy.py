@@ -128,6 +128,8 @@ FORBIDDEN_RESOLVED_FIPS = {
 # Feature selections that must be present in a resolved `fips` graph.
 REQUIRED_RESOLVED_FIPS = {
     ("aws-lc-rs", "fips"),
+    ("kube", "aws-lc-rs"),
+    ("mongodb", "rustls-tls-aws-lc"),
     ("reqwest", "__rustls-aws-lc-rs"),
     ("rustls", "fips"),
 }
@@ -135,6 +137,8 @@ REQUIRED_RESOLVED_FIPS = {
 # The ordinary profile's contract, so a change that quietly moves the default
 # build onto a different backend is caught too.
 REQUIRED_RESOLVED_RING = {
+    ("kube", "ring"),
+    ("mongodb", "rustls-tls"),
     ("reqwest", "__rustls-ring"),
     ("rustls", "ring"),
 }
