@@ -2471,23 +2471,21 @@ async fn handle_tcp_connection_inner(
     // Evidence holds `Option<&dyn SourceLabelLookup>`, which is not Sync, so
     // keeping it live across an await would make the spawned connection
     // future !Send. Build and drop evidence only in synchronous match scopes.
-    let shared_port_sni: Option<Option<String>> = if let Some(candidate_ids) = sni_proxy_ids {
-        let use_sni = epoch
+    let shared_port_uses_sni = sni_proxy_ids.is_some_and(|candidate_ids| {
+        epoch
             .proxy_by_namespaced_id(listener_namespace, proxy_id)
             .is_some_and(|p| p.passthrough)
             || candidate_ids.iter().any(|id| {
                 epoch
                     .proxy_by_namespaced_id(&id.namespace, &id.id)
                     .is_some_and(|p| p.passthrough)
-            });
-        if use_sni {
-            let sni =
-                super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
-            stream_ctx.sni_hostname = sni.clone();
-            Some(Some(sni))
-        } else {
-            Some(None)
-        }
+            })
+    });
+    let shared_port_sni = if shared_port_uses_sni {
+        let sni =
+            super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
+        stream_ctx.sni_hostname = sni.clone();
+        sni
     } else {
         None
     };
@@ -2502,51 +2500,36 @@ async fn handle_tcp_connection_inner(
                 .map(|labels| labels as &dyn super::stream_match::SourceLabelLookup),
             trusted_gateway_ref: stream_ctx.trusted_gateway_ref.as_deref(),
         };
-        match (sni_proxy_ids, shared_port_sni) {
-            (Some(candidate_ids), Some(Some(sni))) => {
-                let matched = super::stream_match::resolve_shared_stream_proxy_in_epoch(
-                    sni.as_deref(),
-                    candidate_ids,
-                    &evidence,
-                    epoch,
-                    true,
-                )
-                .ok_or_else(|| {
+        if let Some(candidate_ids) = sni_proxy_ids {
+            let matched = super::stream_match::resolve_shared_stream_proxy_in_epoch(
+                shared_port_sni.as_deref(),
+                candidate_ids,
+                &evidence,
+                epoch,
+                shared_port_uses_sni,
+            )
+            .ok_or_else(|| {
+                if shared_port_uses_sni {
                     anyhow::anyhow!(
                         "No matching passthrough proxy for SNI {:?} on port {}",
-                        sni,
+                        shared_port_sni,
                         stream_ctx.listen_port
                     )
-                })?;
-                stream_ctx.proxy_namespace = matched.namespace.clone();
-                stream_ctx.proxy_id = matched.id.clone();
-                stream_ctx.proxy_name = epoch
-                    .proxy_by_namespaced_id(&matched.namespace, &matched.id)
-                    .and_then(|p| p.name.clone());
-                Some(matched)
-            }
-            (Some(candidate_ids), Some(None)) => {
-                let matched = super::stream_match::resolve_shared_stream_proxy_in_epoch(
-                    None,
-                    candidate_ids,
-                    &evidence,
-                    epoch,
-                    false,
-                )
-                .ok_or_else(|| {
+                } else {
                     anyhow::anyhow!(
                         "No matching L4 stream_match proxy on port {}",
                         stream_ctx.listen_port
                     )
-                })?;
-                stream_ctx.proxy_namespace = matched.namespace.clone();
-                stream_ctx.proxy_id = matched.id.clone();
-                stream_ctx.proxy_name = epoch
-                    .proxy_by_namespaced_id(&matched.namespace, &matched.id)
-                    .and_then(|p| p.name.clone());
-                Some(matched)
-            }
-            _ => None,
+                }
+            })?;
+            stream_ctx.proxy_namespace = matched.namespace.clone();
+            stream_ctx.proxy_id = matched.id.clone();
+            stream_ctx.proxy_name = epoch
+                .proxy_by_namespaced_id(&matched.namespace, &matched.id)
+                .and_then(|p| p.name.clone());
+            Some(matched)
+        } else {
+            None
         }
     };
     let (proxy_namespace, proxy_id) = match &resolved_identity {
