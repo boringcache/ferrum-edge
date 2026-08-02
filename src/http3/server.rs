@@ -13471,8 +13471,7 @@ mod h3_proxy_header_tests {
             .insert("content-type".to_string(), "application/json".to_string());
         let owned = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
 
-        let proxy_headers =
-            own_h3_proxy_headers(Some(owned), &mut ctx, true, HttpFlavor::Plain);
+        let proxy_headers = own_h3_proxy_headers(Some(owned), &mut ctx, true, HttpFlavor::Plain);
 
         assert_eq!(
             proxy_headers.get("content-type").map(String::as_str),
@@ -13498,8 +13497,7 @@ mod h3_proxy_header_tests {
         ctx.headers
             .insert("x-tenant".to_string(), "acme".to_string());
 
-        let proxy_headers =
-            own_h3_proxy_headers(None, &mut ctx, false, HttpFlavor::WebSocket);
+        let proxy_headers = own_h3_proxy_headers(None, &mut ctx, false, HttpFlavor::WebSocket);
 
         assert_eq!(
             proxy_headers.get("x-tenant").map(String::as_str),
