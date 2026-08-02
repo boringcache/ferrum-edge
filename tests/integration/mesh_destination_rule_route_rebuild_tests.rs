@@ -13,12 +13,13 @@ use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use ferrum_edge::config::types::{
-    DnsSdConfig, GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, Proxy, SdProvider,
-    ServiceDiscoveryConfig, Upstream, UpstreamLocalityLbSetting, UpstreamPortOverride,
+    Consumer, DnsSdConfig, GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, Proxy,
+    SdProvider, ServiceDiscoveryConfig, Upstream, UpstreamLocalityLbSetting, UpstreamPortOverride,
     UpstreamTarget,
 };
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::load_balancer::{HashOnStrategy, LoadBalancerCache};
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshConnectionPoolHttp, MeshDestinationRule, MeshTrafficPolicy,
     MeshTrafficPolicyTls, MtlsMode,
@@ -108,6 +109,31 @@ fn unrelated_http_proxy() -> Proxy {
         "backend_scheme": "http"
     }))
     .expect("unrelated proxy fixture")
+}
+
+fn unrelated_consumer(id: &str, username: &str) -> Consumer {
+    let now = Utc::now();
+    Consumer {
+        id: id.to_string(),
+        username: username.to_string(),
+        namespace: "default".to_string(),
+        custom_id: None,
+        credentials: HashMap::new(),
+        acl_groups: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn lb_effective_algorithm(state: &ProxyState, port: Option<u16>) -> LoadBalancerAlgorithm {
+    let snapshot = state.load_balancer_cache.load();
+    LoadBalancerCache::effective_algorithm_from(&snapshot, "default", "reviews-u", port, None)
+        .expect("reviews upstream balancer")
+}
+
+fn lb_hash_on_for_port(state: &ProxyState, port: u16) -> HashOnStrategy {
+    let snapshot = state.load_balancer_cache.load();
+    LoadBalancerCache::get_hash_on_strategy_for_port_from(&snapshot, "default", "reviews-u", port)
 }
 
 fn sd_upstream() -> Upstream {
@@ -752,5 +778,191 @@ async fn update_config_clears_empty_delta_per_port_projection_on_withdrawal() {
     assert!(
         route_port_override(&state, 8080).is_none(),
         "DR per-port withdrawal must clear stale route-held dispatch overrides"
+    );
+}
+
+#[tokio::test]
+async fn update_config_rebuilds_lb_for_projected_dr_change_with_unrelated_consumer_delta() {
+    // Mixed publish: projected-only DestinationRule LB policy change (frozen
+    // upstream timestamps → no upstream ConfigDelta membership) PLUS an
+    // unrelated consumer addition that forces the non-empty incremental path.
+    // Route rebuild alone is insufficient — LoadBalancerCache must observe the
+    // new algorithm/hash/locality without inventing a Proxy/Upstream edit.
+    let (mut old_config, mut new_config) = projected_only_configs(
+        |upstream| {
+            upstream.port_overrides.insert(
+                8080,
+                UpstreamPortOverride {
+                    algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+                    hash_on: Some("ip".to_string()),
+                    locality_lb_setting: Some(UpstreamLocalityLbSetting {
+                        enabled: true,
+                        ..Default::default()
+                    }),
+                    connect_timeout_ms: Some(1_000),
+                    ..Default::default()
+                },
+            );
+        },
+        |upstream| {
+            upstream.port_overrides.insert(
+                8080,
+                UpstreamPortOverride {
+                    algorithm: Some(LoadBalancerAlgorithm::ConsistentHashing),
+                    hash_on: Some("header:x-request-id".to_string()),
+                    locality_lb_setting: Some(UpstreamLocalityLbSetting {
+                        enabled: false,
+                        ..Default::default()
+                    }),
+                    connect_timeout_ms: Some(2_500),
+                    ..Default::default()
+                },
+            );
+        },
+    );
+
+    new_config
+        .consumers
+        .push(unrelated_consumer("c-unrelated", "unrelated-user"));
+    new_config.normalize_fields();
+
+    let delta = ferrum_edge::config_delta::ConfigDelta::compute(&old_config, &new_config);
+    assert!(
+        !delta.is_empty(),
+        "unrelated consumer addition must force the non-empty incremental staging path"
+    );
+    assert_eq!(delta.added_consumers.len(), 1);
+    assert!(
+        delta.modified_proxies.is_empty(),
+        "projected DR change must not invent a Proxy resource modification"
+    );
+    assert!(
+        delta.modified_upstreams.is_empty()
+            && delta.added_upstreams.is_empty()
+            && delta.removed_upstream_ids.is_empty(),
+        "fixture must keep upstream ConfigDelta membership empty so LB cannot \
+         rely on build_delta_inner seeing an affected upstream"
+    );
+
+    old_config.normalize_fields();
+    let (state, _handles) = new_proxy_state(old_config);
+    assert_eq!(
+        lb_effective_algorithm(&state, Some(8080)),
+        LoadBalancerAlgorithm::RoundRobin
+    );
+    assert_eq!(lb_hash_on_for_port(&state, 8080), HashOnStrategy::Ip);
+    let before_port = route_port_override(&state, 8080).expect("old per-port override");
+    assert_eq!(before_port.algorithm, Some(LoadBalancerAlgorithm::RoundRobin));
+    assert_eq!(
+        before_port
+            .locality_lb_setting
+            .as_ref()
+            .map(|setting| setting.enabled),
+        Some(true)
+    );
+    assert!(
+        state
+            .consumer_index
+            .find_by_username("unrelated-user")
+            .is_none()
+    );
+
+    assert_eq!(state.update_config(new_config), ConfigApplyOutcome::Applied);
+
+    assert_eq!(
+        lb_effective_algorithm(&state, Some(8080)),
+        LoadBalancerAlgorithm::ConsistentHashing,
+        "mixed-delta projected DR change must full-rebuild LB so the published \
+         epoch observes the new algorithm"
+    );
+    assert_eq!(
+        lb_hash_on_for_port(&state, 8080),
+        HashOnStrategy::Header("x-request-id".to_string()),
+        "published LB must observe the new per-port hash_on policy"
+    );
+    let after_port = route_port_override(&state, 8080).expect("new per-port override");
+    assert_eq!(
+        after_port.algorithm,
+        Some(LoadBalancerAlgorithm::ConsistentHashing)
+    );
+    assert_eq!(after_port.connect_timeout_ms, Some(2_500));
+    assert_eq!(
+        after_port
+            .locality_lb_setting
+            .as_ref()
+            .map(|setting| setting.enabled),
+        Some(false),
+        "route-held locality projection must refresh atomically with the LB"
+    );
+    assert!(
+        state
+            .consumer_index
+            .find_by_username("unrelated-user")
+            .is_some(),
+        "unrelated consumer delta must still publish into the consumer index"
+    );
+}
+
+#[tokio::test]
+async fn update_config_withdraws_projected_lb_policy_with_unrelated_consumer_delta() {
+    // Withdrawal twin: clearing DR-derived per-port LB policy while an
+    // unrelated consumer lands must restore the upstream default algorithm on
+    // the published LB (not leave the old override live under a non-empty delta).
+    let (mut old_config, mut new_config) = projected_only_configs(
+        |upstream| {
+            upstream.port_overrides.insert(
+                8080,
+                UpstreamPortOverride {
+                    algorithm: Some(LoadBalancerAlgorithm::ConsistentHashing),
+                    hash_on: Some("header:x-user".to_string()),
+                    locality_lb_setting: Some(UpstreamLocalityLbSetting {
+                        enabled: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            );
+        },
+        |_upstream| {},
+    );
+
+    new_config
+        .consumers
+        .push(unrelated_consumer("c-withdraw", "withdraw-user"));
+    new_config.normalize_fields();
+
+    let delta = ferrum_edge::config_delta::ConfigDelta::compute(&old_config, &new_config);
+    assert!(!delta.is_empty());
+    assert!(delta.modified_proxies.is_empty());
+    assert!(
+        delta.modified_upstreams.is_empty()
+            && delta.added_upstreams.is_empty()
+            && delta.removed_upstream_ids.is_empty()
+    );
+
+    old_config.normalize_fields();
+    let (state, _handles) = new_proxy_state(old_config);
+    assert_eq!(
+        lb_effective_algorithm(&state, Some(8080)),
+        LoadBalancerAlgorithm::ConsistentHashing
+    );
+    assert!(route_port_override(&state, 8080).is_some());
+
+    assert_eq!(state.update_config(new_config), ConfigApplyOutcome::Applied);
+    assert_eq!(
+        lb_effective_algorithm(&state, Some(8080)),
+        LoadBalancerAlgorithm::RoundRobin,
+        "projected LB policy withdrawal under a mixed delta must restore the \
+         upstream default algorithm on the published LB"
+    );
+    assert!(
+        route_port_override(&state, 8080).is_none(),
+        "route-held per-port override must clear on withdrawal"
+    );
+    assert!(
+        state
+            .consumer_index
+            .find_by_username("withdraw-user")
+            .is_some()
     );
 }

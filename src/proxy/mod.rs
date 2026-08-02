@@ -9105,7 +9105,20 @@ impl ProxyState {
         let route_changed = Self::delta_routes_changed(delta, &current.config, new_config)
             || Self::mesh_route_table_inputs_changed(&current.config, new_config);
         let consumer_changed = Self::delta_consumers_changed(delta);
-        let lb_changed = Self::delta_load_balancers_changed(delta);
+        // DestinationRule-derived projections (`dispatch_port_overrides`,
+        // `dispatch_port_override_fallback`, stream-relay dispatch maps, and the
+        // upstream `port_overrides` / locality / algorithm / hash policy they
+        // mirror) can change without an upstream `updated_at` bump. When a
+        // projected-only change shares a publish with an unrelated non-empty
+        // ConfigDelta (consumer/plugin/...), `delta_load_balancers_changed` is
+        // false and a delta LB rebuild would see an empty upstream delta — so
+        // rebuild the full LB from the new config, matching the empty-delta
+        // projected path (#3243). Ordinary upstream membership deltas keep the
+        // incremental rebuild; unchanged LB surfaces reuse the live snapshot.
+        let projected_routes_changed =
+            Self::projected_route_proxy_content_changed(&current.config, new_config);
+        let upstream_lb_changed = Self::delta_load_balancers_changed(delta);
+        let lb_changed = upstream_lb_changed || projected_routes_changed;
 
         let plugin_inner = self.plugin_cache.build_delta_inner(
             &current.plugin_cache,
@@ -9120,7 +9133,9 @@ impl ProxyState {
         } else {
             Arc::clone(&current.consumer_index)
         };
-        let load_balancer = if lb_changed {
+        let load_balancer = if projected_routes_changed {
+            LoadBalancerCache::build_inner(new_config)
+        } else if upstream_lb_changed {
             LoadBalancerCache::build_delta_inner(
                 &current.load_balancer,
                 new_config,
