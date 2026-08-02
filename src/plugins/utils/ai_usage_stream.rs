@@ -107,9 +107,14 @@ impl UsageAccumulator {
         self.observed
     }
 
-    /// Resolve the configured `count_mode` counter, or `None` when this stream
-    /// never reported the selected counter.
-    pub fn total_for_mode(&self, count_mode: &str) -> Option<u64> {
+    /// These counters in the shared [`AiTokenUsage`] shape.
+    ///
+    /// Both resolution rules below delegate through this so the streaming and
+    /// buffered halves cannot drift: `total_for_mode` and `is_complete_for_mode`
+    /// together decide whether an observation may release the reserved estimate,
+    /// and a second copy of either rule here would be a fail-open waiting to
+    /// happen.
+    fn as_usage(&self) -> AiTokenUsage {
         AiTokenUsage {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
@@ -117,21 +122,19 @@ impl UsageAccumulator {
             model: None,
             provider: None,
         }
-        .total_for_mode(count_mode)
+    }
+
+    /// Resolve the configured `count_mode` counter, or `None` when this stream
+    /// never reported the selected counter.
+    pub fn total_for_mode(&self, count_mode: &str) -> Option<u64> {
+        self.as_usage().total_for_mode(count_mode)
     }
 
     /// Whether the selected counter is complete rather than a partial lower
     /// bound. A lone prompt/completion counter is authoritative for that
     /// component's mode, but not for `total_tokens`.
     pub fn is_complete_for_mode(&self, count_mode: &str) -> bool {
-        match count_mode {
-            "prompt_tokens" => self.prompt_tokens.is_some(),
-            "completion_tokens" => self.completion_tokens.is_some(),
-            _ => {
-                self.total_tokens.is_some()
-                    || (self.prompt_tokens.is_some() && self.completion_tokens.is_some())
-            }
-        }
+        self.as_usage().is_complete_for_mode(count_mode)
     }
 
     fn record(&mut self, usage: &AiTokenUsage) {
@@ -438,7 +441,13 @@ impl UsageStreamExtractor {
                 return;
             }
 
-            let take = (self.pending_message_len - self.carry.len()).min(rest.len());
+            // `carry.len() <= pending_message_len` holds on every path that
+            // reaches here, but the bound is what keeps this parser's retention
+            // at one message. Saturate rather than trust a non-local invariant
+            // with attacker-controlled framing: an underflow would wrap to a
+            // huge `take` and grow the carry past the cap.
+            let remaining = self.pending_message_len.saturating_sub(self.carry.len());
+            let take = remaining.min(rest.len());
             self.carry.extend_from_slice(&rest[..take]);
             rest = &rest[take..];
             if self.carry.len() < self.pending_message_len {

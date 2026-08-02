@@ -6066,7 +6066,7 @@ Because the `x-ai-ratelimit-*` header **names** are a fixed public contract, two
 > | Genuine non-2xx backend response | Status-only `after_proxy` releases; later body / stream terminal passes no-op on the per-instance release marker |
 > | Genuine pre-provider / failed-dispatch gateway rejection | Reject-replay `after_proxy` releases via `should_release_gateway_rejection` |
 > | Later `after_proxy` / body-policy rejection of a provider-consumed 2xx | Reservation **stays charged** (tokens were already consumed) |
-> | `on_unmetered_response: "reject"` on a committed stream | Cannot substitute a 502; degrades to fail-closed keep-charged accounting and marks the release path consumed so a later reject-replay cannot free it |
+> | A usage-less committed stream whose policy would have answered `502` (`reject`, or `charge_estimate` for a compressed candidate with no safe estimate) | Cannot substitute a 502; degrades to fail-closed keep-charged accounting, logs that the rejection could not be delivered, and marks the release path consumed so a later reject-replay cannot free it |
 > | Federation synthetic provider response | Sole charger is reject-path `after_proxy`, once per instance, against `ai_federation_status` |
 > | Non-federation synthetic short-circuit (cache / dedup / mock / …) | Neither charged nor released (`ferrum:synthetic_short_circuit`) |
 >

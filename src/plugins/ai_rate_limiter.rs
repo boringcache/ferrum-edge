@@ -1260,16 +1260,36 @@ impl AiRateLimiter {
         )
     }
 
+    /// Whether the buffered `on_unmetered_response` path would answer a
+    /// usage-less 2xx with the 502 a committed stream can no longer deliver.
+    ///
+    /// `reject` always would. `charge_estimate` also does for a compressed AI
+    /// candidate that never produced a safe pre-request estimate — that branch
+    /// of [`Self::reconcile_usage`] returns [`Self::reject_unmetered`] too. Both
+    /// therefore degrade to the same fail-closed accounting half on a stream and
+    /// must say so, rather than logging a rejection that never reached the
+    /// client. `warn` releases and is unaffected.
+    fn unmetered_policy_would_reject(&self, ctx: &RequestContext) -> bool {
+        match self.on_unmetered_response {
+            OnUnmeteredResponse::Reject => true,
+            OnUnmeteredResponse::ChargeEstimate => {
+                self.reserved_tokens(ctx) == 0 && self.request_was_compressed_ai_candidate(ctx)
+            }
+            OnUnmeteredResponse::Warn => false,
+        }
+    }
+
     /// Reconcile a STREAMED response's terminal usage.
     ///
     /// Headers were committed before the first byte, so this path can neither
-    /// reject nor rewrite the response. `on_unmetered_response: "reject"`
-    /// therefore degrades to its fail-closed accounting half — the pre-request
-    /// reservation stays charged, exactly like `charge_estimate` — instead of
-    /// substituting a 502 that the client already cannot receive. `warn` still
-    /// releases, `charge_estimate` still keeps. Release idempotency is the same
-    /// per-instance marker the buffered path uses, so a stream that also ran a
-    /// gateway-rejection `after_proxy` pass releases exactly once.
+    /// reject nor rewrite the response. Every `on_unmetered_response` posture
+    /// that would have answered with a 502 therefore degrades to its fail-closed
+    /// accounting half — the pre-request reservation stays charged, exactly like
+    /// `charge_estimate` — instead of substituting a status the client already
+    /// cannot receive. `warn` still releases, `charge_estimate` still keeps.
+    /// Release idempotency is the same per-instance marker the buffered path
+    /// uses, so a stream that also ran a gateway-rejection `after_proxy` pass
+    /// releases exactly once.
     async fn reconcile_streamed_usage(
         &self,
         ctx: &mut RequestContext,
@@ -1279,23 +1299,25 @@ impl AiRateLimiter {
     ) {
         if actual_tokens.is_none()
             && (200..300).contains(&response_status)
-            && self.on_unmetered_response == OnUnmeteredResponse::Reject
             && self.request_was_ai_call(ctx)
+            && self.unmetered_policy_would_reject(ctx)
             && !ctx.metadata.contains_key(&self.keys.reservation_released)
         {
             // Record the action so a later gateway-rejection pass does not
-            // release a reservation this policy deliberately keeps, and emit the
-            // same bounded warning the buffered reject path emits.
+            // release a reservation this policy deliberately keeps. Same value
+            // the buffered path records for the same configured action, so the
+            // two halves stay comparable in the transaction log.
             ctx.metadata.insert(
                 self.keys.unmetered_action.clone(),
-                OnUnmeteredResponse::Reject.as_str().to_string(),
+                self.on_unmetered_response.as_str().to_string(),
             );
             warn!(
                 limiter_instance = self.instance_id,
                 provider = %self.provider,
                 count_mode = %self.count_mode,
+                on_unmetered_response = self.on_unmetered_response.as_str(),
                 detail = %unmetered_detail,
-                "ai_rate_limiter: streamed successful response had no token usage; keeping reservation charged (on_unmetered_response=reject cannot replace a committed streaming response)"
+                "ai_rate_limiter: streamed successful response had no token usage; keeping the reservation charged (a committed streaming response cannot be replaced with a 502)"
             );
             // Mark the release path consumed so nothing later releases it.
             ctx.metadata
