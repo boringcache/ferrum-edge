@@ -1043,7 +1043,10 @@ fn destination_rule(
         if declared.is_empty() {
             vec!["*".to_string()]
         } else {
-            declared.iter().map(|entry| entry.trim().to_string()).collect()
+            declared
+                .iter()
+                .map(|entry| entry.trim().to_string())
+                .collect()
         }
     };
 
@@ -2753,7 +2756,10 @@ fn virtual_service_routes(
             if declared.is_empty() {
                 vec!["*".to_string()]
             } else {
-                declared.iter().map(|entry| entry.trim().to_string()).collect()
+                declared
+                    .iter()
+                    .map(|entry| entry.trim().to_string())
+                    .collect()
             }
         };
         for host in &hosts {

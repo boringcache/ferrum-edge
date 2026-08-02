@@ -56,9 +56,8 @@ use crate::modes::mesh::config::{
     MeshInboundTcpRoute, MeshJwtRule, MeshLoadBalancer, MeshLocalityLbSetting,
     MeshOutlierDetection, MeshPolicy, MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig,
     MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyAction, PolicyScope, Resolution,
-    ServiceEntry, ServiceEntryLocation, ServiceTargetPort,
-    destination_rule_exported_to_namespace, destination_rule_lookup_tier, resolve_target_port,
-    service_entry_exported_to_namespace,
+    ServiceEntry, ServiceEntryLocation, ServiceTargetPort, destination_rule_exported_to_namespace,
+    destination_rule_lookup_tier, resolve_target_port, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
@@ -6900,20 +6899,18 @@ fn apply_destination_rules(
     mesh_slice: &MeshSlice,
 ) -> Result<(), anyhow::Error> {
     let client_namespace = mesh_slice.namespace.as_str();
-    let mut sorted_destination_rules: Vec<&MeshDestinationRule> =
-        mesh_slice
-            .destination_rules
-            .iter()
-            // Re-apply the visibility boundary on the DP before ANY lookup or
-            // selection. Ferrum CP already narrows native/xDS slices, but this
-            // protects file/native/carrier consumers from a cross-wired or
-            // independently implemented producer that sends a rule the
-            // subscriber is not allowed to see.
-            .filter(|dr| destination_rule_exported_to_namespace(dr, client_namespace))
-            .collect();
-    sorted_destination_rules.sort_by(|a, b| {
-        (&a.namespace, &a.name, &a.host).cmp(&(&b.namespace, &b.name, &b.host))
-    });
+    let mut sorted_destination_rules: Vec<&MeshDestinationRule> = mesh_slice
+        .destination_rules
+        .iter()
+        // Re-apply the visibility boundary on the DP before ANY lookup or
+        // selection. Ferrum CP already narrows native/xDS slices, but this
+        // protects file/native/carrier consumers from a cross-wired or
+        // independently implemented producer that sends a rule the
+        // subscriber is not allowed to see.
+        .filter(|dr| destination_rule_exported_to_namespace(dr, client_namespace))
+        .collect();
+    sorted_destination_rules
+        .sort_by(|a, b| (&a.namespace, &a.name, &a.host).cmp(&(&b.namespace, &b.name, &b.host)));
 
     // Owning Service port per materialized per-port outbound upstream
     // (forward-derived from the slice, like `mesh_outbound_service_groups`).
@@ -20287,8 +20284,14 @@ mod tests {
         apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
             .expect("hidden DestinationRule is ignored");
 
-        assert_eq!(config.proxies[0].backend_connect_timeout_ms, original_timeout);
-        assert_eq!(config.upstreams[0].algorithm, LoadBalancerAlgorithm::RoundRobin);
+        assert_eq!(
+            config.proxies[0].backend_connect_timeout_ms,
+            original_timeout
+        );
+        assert_eq!(
+            config.upstreams[0].algorithm,
+            LoadBalancerAlgorithm::RoundRobin
+        );
     }
 
     #[test]

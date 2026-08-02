@@ -654,8 +654,14 @@ fn dr_export_to_visibility() {
         "host": "echo.default.svc.cluster.local",
         "exportTo": ["alpha", "gamma"],
     }));
-    assert!(destination_rule_exported_to_namespace(&allowlisted, "alpha"));
-    assert!(!destination_rule_exported_to_namespace(&allowlisted, "delta"));
+    assert!(destination_rule_exported_to_namespace(
+        &allowlisted,
+        "alpha"
+    ));
+    assert!(!destination_rule_exported_to_namespace(
+        &allowlisted,
+        "delta"
+    ));
 }
 
 /// An unsupported or self-conflicting `exportTo` fails the resource closed
@@ -708,7 +714,10 @@ fn dr_lookup_hierarchy_client_then_service_then_root() {
 
     // Client tier wins when present.
     assert_eq!(
-        admitted_names(base_rules(vec![dr_named("alpha", "client-override", host)]), "alpha"),
+        admitted_names(
+            base_rules(vec![dr_named("alpha", "client-override", host)]),
+            "alpha"
+        ),
         vec!["client-override".to_string()]
     );
     // Falls back to the service namespace.
@@ -757,12 +766,8 @@ fn dr_lookup_hierarchy_client_then_service_then_root() {
     // itself; and contested ownership disables the service tier rather than
     // picking a claimant.
     assert!(
-        admitted_names_with_entries(
-            entries,
-            vec![dr_named("evil", "hijack", external)],
-            "alpha",
-        )
-        .is_empty()
+        admitted_names_with_entries(entries, vec![dr_named("evil", "hijack", external)], "alpha",)
+            .is_empty()
     );
     assert!(
         admitted_names_with_entries(

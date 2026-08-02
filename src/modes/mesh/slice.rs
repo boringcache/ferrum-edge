@@ -8004,7 +8004,10 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_narrowing_keeps_external_dot_svc_destination_rule_literal() {
+    fn sidecar_narrowing_does_not_treat_dot_svc_host_as_external_literal() {
+        // `api.foo.svc` structurally names the in-cluster Service `foo/api`.
+        // A ServiceEntry in `alpha` cannot claim that host and make `alpha`
+        // its owner; the Sidecar's `./...` scope therefore does not admit it.
         let mesh = MeshConfig {
             sidecars: vec![make_sidecar(
                 "default-sc",
@@ -8032,8 +8035,7 @@ mod tests {
         };
         let config = config_with_mesh(mesh);
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
-        assert_eq!(slice.destination_rules.len(), 1);
-        assert_eq!(slice.destination_rules[0].name, "external-dr");
+        assert!(slice.destination_rules.is_empty());
     }
 
     #[test]
@@ -8100,11 +8102,10 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_narrowing_admits_destination_rule_from_target_service_namespace() {
-        // A DR declared in the target service's namespace (`beta`) must
-        // still be admitted alongside one declared in the client
-        // namespace (`alpha`); a DR declared in an unrelated namespace
-        // (`gamma`) targeting the same host must be filtered out.
+    fn sidecar_narrowing_keeps_only_the_winning_client_namespace_tier() {
+        // The client namespace (`alpha`) is the first matching lookup tier,
+        // so the target-service (`beta`) and unrelated (`gamma`) rules are
+        // both excluded from the resolved slice for this destination.
         let mesh = MeshConfig {
             sidecars: vec![make_sidecar(
                 "default-sc",
@@ -8151,9 +8152,10 @@ mod tests {
             .iter()
             .map(|dr| dr.name.as_str())
             .collect();
-        assert_eq!(names.len(), 2);
+        assert_eq!(names.len(), 1);
         assert!(names.contains("from-client-ns"));
-        assert!(names.contains("from-target-ns"));
+        assert!(!names.contains("from-target-ns"));
+        assert!(!names.contains("from-unrelated-ns"));
     }
 
     #[test]

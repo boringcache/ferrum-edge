@@ -65,10 +65,8 @@ fn service_in(namespace: &str, name: &str) -> MeshService {
             target_port: None,
         }],
         workloads: vec![WorkloadRef {
-            spiffe_id: SpiffeId::new(&format!(
-                "spiffe://{TRUST_DOMAIN}/ns/{namespace}/sa/{name}"
-            ))
-            .expect("valid spiffe id"),
+            spiffe_id: SpiffeId::new(&format!("spiffe://{TRUST_DOMAIN}/ns/{namespace}/sa/{name}"))
+                .expect("valid spiffe id"),
         }],
         protocol_overrides: HashMap::new(),
     }
@@ -76,10 +74,8 @@ fn service_in(namespace: &str, name: &str) -> MeshService {
 
 fn workload_in(namespace: &str, name: &str) -> Workload {
     Workload {
-        spiffe_id: SpiffeId::new(&format!(
-            "spiffe://{TRUST_DOMAIN}/ns/{namespace}/sa/{name}"
-        ))
-        .expect("valid spiffe id"),
+        spiffe_id: SpiffeId::new(&format!("spiffe://{TRUST_DOMAIN}/ns/{namespace}/sa/{name}"))
+            .expect("valid spiffe id"),
         selector: Default::default(),
         service_name: name.to_string(),
         addresses: Vec::new(),
@@ -194,7 +190,10 @@ fn dr_object(namespace: &str, name: &str, spec: Value) -> K8sObject {
 fn translate_dr(spec: Value) -> Result<MeshDestinationRule, String> {
     let result = translate_k8s_objects(&[dr_object("beta", "reviews-dr", spec)], k8s_options())
         .map_err(|e| e.to_string())?;
-    let mesh = result.config.mesh.ok_or_else(|| "no mesh config".to_string())?;
+    let mesh = result
+        .config
+        .mesh
+        .ok_or_else(|| "no mesh config".to_string())?;
     mesh.destination_rules
         .into_iter()
         .next()
@@ -258,8 +257,14 @@ fn k8s_wildcard_and_explicit_allowlist_export_to_are_preserved() {
         allowlisted.export_to,
         vec!["alpha".to_string(), "gamma".to_string()]
     );
-    assert!(destination_rule_exported_to_namespace(&allowlisted, "alpha"));
-    assert!(destination_rule_exported_to_namespace(&allowlisted, "gamma"));
+    assert!(destination_rule_exported_to_namespace(
+        &allowlisted,
+        "alpha"
+    ));
+    assert!(destination_rule_exported_to_namespace(
+        &allowlisted,
+        "gamma"
+    ));
     assert!(
         !destination_rule_exported_to_namespace(&allowlisted, "delta"),
         "a namespace absent from the allowlist must not see the rule"
@@ -344,7 +349,13 @@ fn k8s_export_to_rejection_does_not_echo_the_hostile_value() {
 
 #[test]
 fn native_empty_export_to_is_namespace_local_not_public() {
-    let dr = rule("beta", "reviews-dr", "reviews.beta.svc.cluster.local", 1, &[]);
+    let dr = rule(
+        "beta",
+        "reviews-dr",
+        "reviews.beta.svc.cluster.local",
+        1,
+        &[],
+    );
     assert!(
         destination_rule_exported_to_namespace(&dr, "beta"),
         "an omitted native/file export_to keeps the rule visible in its own \
@@ -371,7 +382,13 @@ fn native_validation_rejects_unsupported_export_to_values() {
         let mesh = MeshConfig {
             destination_rules: vec![MeshDestinationRule {
                 export_to,
-                ..rule("beta", "reviews-dr", "reviews.beta.svc.cluster.local", 1, &[])
+                ..rule(
+                    "beta",
+                    "reviews-dr",
+                    "reviews.beta.svc.cluster.local",
+                    1,
+                    &[],
+                )
             }],
             ..MeshConfig::default()
         };
@@ -394,7 +411,13 @@ fn native_validation_accepts_supported_export_to_values() {
         let mesh = MeshConfig {
             destination_rules: vec![MeshDestinationRule {
                 export_to: export_to.clone(),
-                ..rule("beta", "reviews-dr", "reviews.beta.svc.cluster.local", 1, &[])
+                ..rule(
+                    "beta",
+                    "reviews-dr",
+                    "reviews.beta.svc.cluster.local",
+                    1,
+                    &[],
+                )
             }],
             ..MeshConfig::default()
         };
@@ -739,10 +762,7 @@ fn same_tier_duplicate_names_use_host_spelling_as_a_stable_final_tiebreak() {
     ] {
         let mesh = MeshConfig {
             services: vec![service_in("beta", "reviews")],
-            workloads: vec![
-                workload_in("beta", "reviews"),
-                workload_in("alpha", "web"),
-            ],
+            workloads: vec![workload_in("beta", "reviews"), workload_in("alpha", "web")],
             destination_rules,
             sidecars: vec![permissive_sidecar("alpha")],
             ..MeshConfig::default()
@@ -900,7 +920,13 @@ fn carrier_json_round_trip_preserves_export_to() {
     ] {
         let dr = MeshDestinationRule {
             export_to: export_to.clone(),
-            ..rule("beta", "reviews-dr", "reviews.beta.svc.cluster.local", 1, &[])
+            ..rule(
+                "beta",
+                "reviews-dr",
+                "reviews.beta.svc.cluster.local",
+                1,
+                &[],
+            )
         };
         let encoded = serde_json::to_vec(&dr).expect("encode");
         let decoded: MeshDestinationRule = serde_json::from_slice(&encoded).expect("decode");
@@ -1204,7 +1230,11 @@ fn external_host_mesh(entries: Vec<ServiceEntry>, rules: Vec<MeshDestinationRule
 #[test]
 fn a_service_entrys_declaring_namespace_is_the_service_tier_for_its_external_host() {
     let mesh = external_host_mesh(
-        vec![external_service_entry("beta", "external-api", EXTERNAL_HOST)],
+        vec![external_service_entry(
+            "beta",
+            "external-api",
+            EXTERNAL_HOST,
+        )],
         vec![rule("beta", "owner-policy", EXTERNAL_HOST, 2222, &["*"])],
     );
     assert_eq!(
@@ -1220,7 +1250,11 @@ fn a_service_entrys_declaring_namespace_is_the_service_tier_for_its_external_hos
 #[test]
 fn an_unrelated_namespace_rule_for_a_service_entry_host_is_refused() {
     let mesh = external_host_mesh(
-        vec![external_service_entry("beta", "external-api", EXTERNAL_HOST)],
+        vec![external_service_entry(
+            "beta",
+            "external-api",
+            EXTERNAL_HOST,
+        )],
         vec![rule("evil", "hijack", EXTERNAL_HOST, 6666, &["*"])],
     );
     assert!(
@@ -1238,7 +1272,11 @@ fn an_unrelated_namespace_rule_for_a_service_entry_host_is_refused() {
 /// lexical order overwrite the fallback — `evil` sorts after `istio-system`).
 #[test]
 fn an_unrelated_namespace_rule_cannot_alter_the_materialized_external_upstream() {
-    let entries = vec![external_service_entry("beta", "external-api", EXTERNAL_HOST)];
+    let entries = vec![external_service_entry(
+        "beta",
+        "external-api",
+        EXTERNAL_HOST,
+    )];
 
     let (alone, baseline) = materialized_external_connect_timeout(
         external_host_mesh(
@@ -1276,7 +1314,11 @@ fn an_unrelated_namespace_rule_cannot_alter_the_materialized_external_upstream()
 /// host, peeled one tier at a time.
 #[test]
 fn client_then_service_entry_owner_then_root_resolve_in_order_for_an_external_host() {
-    let entries = vec![external_service_entry("beta", "external-api", EXTERNAL_HOST)];
+    let entries = vec![external_service_entry(
+        "beta",
+        "external-api",
+        EXTERNAL_HOST,
+    )];
     let client = rule("alpha", "client-override", EXTERNAL_HOST, 1111, &["*"]);
     let owner = rule("beta", "owner-policy", EXTERNAL_HOST, 2222, &["*"]);
     let root = rule("istio-system", "mesh-default", EXTERNAL_HOST, 3333, &["*"]);
@@ -1336,7 +1378,13 @@ fn ambiguous_service_entry_ownership_does_not_widen_policy_admission() {
     for claimant in ["beta", "gamma"] {
         let mesh = external_host_mesh(
             entries.clone(),
-            vec![rule(claimant, "claimant-policy", EXTERNAL_HOST, 2222, &["*"])],
+            vec![rule(
+                claimant,
+                "claimant-policy",
+                EXTERNAL_HOST,
+                2222,
+                &["*"],
+            )],
         );
         assert!(
             admitted_rule_names(&mesh, "alpha").is_empty(),
@@ -1371,7 +1419,13 @@ fn ambiguous_service_entry_ownership_does_not_widen_policy_admission() {
 
     let root_only = external_host_mesh(
         entries,
-        vec![rule("istio-system", "mesh-default", EXTERNAL_HOST, 3333, &["*"])],
+        vec![rule(
+            "istio-system",
+            "mesh-default",
+            EXTERNAL_HOST,
+            3333,
+            &["*"],
+        )],
     );
     assert_eq!(
         admitted_rule_names(&root_only, "alpha"),
@@ -1428,7 +1482,10 @@ fn an_invisible_service_entry_grants_no_service_tier() {
 #[test]
 fn a_two_label_host_never_makes_an_unrelated_namespace_the_service_tier() {
     for (label, services) in [
-        ("service present in the inventory", vec![service_in("beta", "reviews")]),
+        (
+            "service present in the inventory",
+            vec![service_in("beta", "reviews")],
+        ),
         ("service absent from the inventory", Vec::new()),
     ] {
         let mesh = MeshConfig {

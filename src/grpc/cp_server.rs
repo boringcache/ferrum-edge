@@ -3469,8 +3469,18 @@ mod tests {
                 .iter()
                 .all(|service| service.namespace == "beta")
         );
-        assert!(slice.services.iter().any(|service| service.name == "checkout"));
-        assert!(slice.services.iter().any(|service| service.name == "catalog"));
+        assert!(
+            slice
+                .services
+                .iter()
+                .any(|service| service.name == "checkout")
+        );
+        assert!(
+            slice
+                .services
+                .iter()
+                .any(|service| service.name == "catalog")
+        );
         let admitted_rule_names: HashSet<_> = slice
             .destination_rules
             .iter()

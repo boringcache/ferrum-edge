@@ -31,12 +31,14 @@ capabilities:
     live_suite: mesh-e2e-sidecar
     # Issue #2465. Visibility is enforced BEFORE DestinationRule lookup and
     # before a per-node slice is serialized, so a namespace-local rule never
-    # reaches a subscriber outside its declared visibility. The live backing is
-    # fail-CLOSED: the cross-namespace target-service rule that provably bounds
-    # the dial at 2000ms is changed from public to namespace-local (`.`), and
-    # the observed connect time must fall back to the built-in 5000ms default.
+    # reaches a subscriber outside its declared visibility.
     live_assertions:
       - sidecar.destination_rule.export_to_namespace_visibility
+    live_deferred: >-
+      Trusted Cross policy forbids PR-authored mesh-e2e-sidecar executable and
+      configuration changes; semantic enforcement remains in
+      tests/conformance/istio_destination_rule.rs and
+      tests/integration/mesh_destination_rule_visibility_tests.rs (#2465).
     platform_profile: kind-spire-sidecar
     docs_anchor: docs/mesh.md#destinationrule
     owner: mesh
@@ -55,13 +57,14 @@ capabilities:
     live_suite: mesh-e2e-sidecar
     # Issue #2469. Client namespace, then target service namespace, then the
     # configured istio_root_namespace; the first tier with a visible rule wins
-    # outright. The live backing deliberately INVERTS lexical and semantic
-    # order: the root namespace (`istio-system`) sorts after the client
-    # namespace (`ferrum`), so the retired alphabetical last-writer behaviour
-    # would pick the root rule's 8000ms timeout instead of the client rule's
-    # 2000ms.
+    # outright, independent of lexical namespace ordering.
     live_assertions:
       - sidecar.destination_rule.lookup_tier_client_wins
+    live_deferred: >-
+      Trusted Cross policy forbids PR-authored mesh-e2e-sidecar executable and
+      configuration changes; semantic enforcement remains in
+      tests/conformance/istio_destination_rule.rs and
+      tests/integration/mesh_destination_rule_visibility_tests.rs (#2469).
     platform_profile: kind-spire-sidecar
     docs_anchor: docs/mesh.md#destinationrule
     owner: mesh

@@ -537,8 +537,6 @@ spec:
               value: sidecar
             - name: FERRUM_MESH_CONFIG_PROTOCOL
               value: file
-            - name: FERRUM_MESH_SIDECAR_ENFORCED
-              value: "true"
             - name: FERRUM_MESH_FILE_CONFIG_PATH
               value: /etc/ferrum/mesh/mesh.yaml
             - name: FERRUM_MESH_PRODUCTION_MODE

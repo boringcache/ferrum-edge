@@ -31,10 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `*` combined with an explicit namespace are rejected fail-closed
   (Kubernetes: `FerrumAccepted=False`/`Invalid`; native/file/xDS: the config is
   refused and the previously accepted slice stays live), with diagnostics that
-  name the field and index and never echo the operator-supplied value. The
-  behaviour is live-verified by two new blocking `mesh-e2e-sidecar` assertions,
-  `sidecar.destination_rule.export_to_namespace_visibility` and
-  `sidecar.destination_rule.lookup_tier_client_wins`.
+  name the field and index and never echo the operator-supplied value. Focused
+  Rust integration and Istio conformance tests verify visibility, lookup tiers,
+  hostile-input rejection/redaction, and native/xDS carrier parity.
 
   The target-service tier is granted only on evidence of ownership: an
   in-cluster Service confirmed by the service inventory or pinned by a
