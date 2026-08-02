@@ -274,6 +274,30 @@ fn upstream_locality_lb_setting_round_trips_through_serde() {
     assert_eq!(setting.failover[0].to, "us-east");
 }
 
+
+#[test]
+fn parse_failover_priority_entry_rejects_adversarial_shapes() {
+    use ferrum_edge::config::types::parse_failover_priority_entry;
+
+    assert!(parse_failover_priority_entry("").is_none());
+    assert!(parse_failover_priority_entry("   ").is_none());
+    assert!(parse_failover_priority_entry(" leading").is_none());
+    assert!(parse_failover_priority_entry("trailing ").is_none());
+    assert!(parse_failover_priority_entry("=novalue").is_none());
+    assert_eq!(
+        parse_failover_priority_entry("version"),
+        Some(("version", None))
+    );
+    assert_eq!(
+        parse_failover_priority_entry("version=a=b"),
+        Some(("version", Some("a=b")))
+    );
+    assert_eq!(
+        parse_failover_priority_entry("topology.kubernetes.io/region"),
+        Some(("topology.kubernetes.io/region", None))
+    );
+}
+
 #[test]
 fn upstream_locality_lb_setting_failover_priority_round_trips_through_serde() {
     use ferrum_edge::config::types::UpstreamLocalityLbSetting;

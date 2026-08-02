@@ -1898,8 +1898,9 @@ pub struct MeshTrafficPolicy {
     /// Optional `DestinationRule.trafficPolicy.localityLbSetting`. When
     /// present, the mesh apply layer projects this onto the resolved
     /// `Upstream.locality_lb_setting`; the load balancer then honours
-    /// `distribute` weights and `failover` region overrides on top of the
-    /// existing priority-tier (exact/zone/region) preference. Old DPs
+    /// mutually exclusive `distribute` weights, `failover` region overrides,
+    /// or ordered `failover_priority` label tiers on top of (or instead of)
+    /// the existing priority-tier (exact/zone/region) preference. Old DPs
     /// reading new slices see this as a no-op via the serde default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality_lb_setting: Option<MeshLocalityLbSetting>,
@@ -3912,6 +3913,64 @@ fn validate_mesh_traffic_policy(
     }
     if let Some(tls) = policy.tls.as_ref() {
         validate_mesh_traffic_policy_tls(format!("{context}.tls"), tls, errors);
+    }
+    if let Some(locality) = policy.locality_lb_setting.as_ref() {
+        validate_mesh_locality_lb_setting(format!("{context}.locality_lb_setting"), locality, errors);
+    }
+}
+
+fn validate_mesh_locality_lb_setting(
+    context: String,
+    locality: &MeshLocalityLbSetting,
+    errors: &mut Vec<String>,
+) {
+    let has_distribute = !locality.distribute.is_empty();
+    let has_failover = !locality.failover.is_empty();
+    let has_failover_priority = !locality.failover_priority.is_empty();
+    let mode_count = has_distribute as u8 + has_failover as u8 + has_failover_priority as u8;
+    if mode_count > 1 {
+        errors.push(format!(
+            "{context}: must set only one of distribute, failover, or failover_priority"
+        ));
+    }
+
+    for (idx, entry) in locality.distribute.iter().enumerate() {
+        if entry.from.trim().is_empty() {
+            errors.push(format!("{context}.distribute[{idx}].from: must not be empty"));
+        }
+        if entry.to.is_empty() {
+            errors.push(format!("{context}.distribute[{idx}].to: must not be empty"));
+        }
+    }
+
+    for (idx, entry) in locality.failover.iter().enumerate() {
+        if entry.from.trim().is_empty() {
+            errors.push(format!("{context}.failover[{idx}].from: must not be empty"));
+        }
+        if entry.to.trim().is_empty() {
+            errors.push(format!("{context}.failover[{idx}].to: must not be empty"));
+        }
+        if !entry.from.is_empty() && entry.from == entry.to {
+            errors.push(format!(
+                "{context}.failover[{idx}]: cannot fail over a region to itself"
+            ));
+        }
+    }
+
+    for (idx, raw) in locality.failover_priority.iter().enumerate() {
+        let Some((key, _override)) = crate::config::types::parse_failover_priority_entry(raw)
+        else {
+            errors.push(format!(
+                "{context}.failover_priority[{idx}]: must be a non-empty label key or key=value \
+                 entry without leading/trailing whitespace"
+            ));
+            continue;
+        };
+        if key.chars().any(|c| c.is_whitespace()) {
+            errors.push(format!(
+                "{context}.failover_priority[{idx}]: key must not contain whitespace"
+            ));
+        }
     }
 }
 

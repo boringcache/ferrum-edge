@@ -1766,7 +1766,7 @@ fn translate_locality_lb_setting(
                     object,
                     format!(
                         "trafficPolicy.loadBalancer.localityLbSetting.failoverPriority[{idx}] \
-                         '{raw}' is not a valid label key or key=value entry"
+                         is not a valid label key or key=value entry"
                     ),
                 ));
             };
@@ -1778,7 +1778,7 @@ fn translate_locality_lb_setting(
                 tracing::warn!(
                     resource = %object.metadata.name,
                     namespace = %object.metadata.namespace,
-                    entry = %raw,
+                    key = %key,
                     index = idx,
                     "DestinationRule localityLbSetting.failoverPriority contains a duplicate \
                      entry; each occurrence is still evaluated as an independent ordered match step"
@@ -1790,7 +1790,7 @@ fn translate_locality_lb_setting(
                     object,
                     format!(
                         "trafficPolicy.loadBalancer.localityLbSetting.failoverPriority[{idx}] \
-                         key '{key}' must not contain whitespace"
+                         key must not contain whitespace"
                     ),
                 ));
             }

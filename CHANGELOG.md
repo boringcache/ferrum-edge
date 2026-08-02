@@ -10,19 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Istio DestinationRule `trafficPolicy.loadBalancer.localityLbSetting.failoverPriority`
-  is implemented end to end (#3238). The K8s/native translator accepts ordered
-  label keys (`key`) and key/value overrides (`key=value`), rejects empty or
-  malformed entries and mutually exclusive combinations with `distribute` /
-  `failover` (fail closed — never silently degrades to another locality mode),
-  and projects the list onto mesh upstreams. The load balancer precomputes
-  deterministic priority tiers from source workload labels (plus derived
-  topology metadata) against endpoint labels/locality, prefers the best healthy
-  rank, and recomputes on endpoint/locality/label reload. Missing labels compare
-  as empty strings; duplicates are accepted as independent ordered steps with a
-  warning. FerrumAccepted status reports field-specific rejection diagnostics
-  and a deferred advisory when `failoverPriority` is set without
-  `outlierDetection`. Docs, support matrix, OpenAPI, and focused create/update/
-  delete/data-path tests cover the behavior.
+  is implemented end to end (#3238). The K8s translator and native/file/xDS mesh
+  validators accept ordered label keys (`key`) and key/value overrides
+  (`key=value`), reject empty or malformed entries and mutually exclusive
+  combinations with `distribute` / `failover` (fail closed — never silently
+  degrades to another locality mode), and project the list onto mesh upstreams.
+  Outbound/service-discovery targets stamp workload labels plus derived topology
+  metadata so endpoint matching does not silently broaden. The load balancer
+  precomputes deterministic priority tiers from source workload labels against
+  endpoint labels/locality (including `mesh.network`/`mesh.cluster` fallbacks),
+  prefers the best healthy rank, and recomputes on endpoint/locality/label
+  reload. Missing labels compare as empty strings; duplicates are accepted as
+  independent ordered steps with a key-only warning. FerrumAccepted status
+  reports field-specific rejection diagnostics and a deferred advisory when
+  `failoverPriority` is set without `outlierDetection`. Docs, OpenAPI, and
+  focused create/update/delete/data-path tests cover the behavior.
 
 - Audited admin mutations are durable **before they run** (issue #2421).
   The admin write gate fsyncs a pre-mutation audit intent — a stable event id

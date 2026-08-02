@@ -1615,7 +1615,7 @@ fn mesh_source_workload_labels(
     let locality = source_workload
         .and_then(|workload| workload.locality.as_deref())
         .or_else(|| mesh_source_workload_locality(mesh_slice));
-    merge_derived_topology_labels(
+    crate::config::types::merge_derived_topology_labels(
         &mut labels,
         locality,
         source_workload.and_then(|workload| workload.network.as_deref()),
@@ -1631,7 +1631,7 @@ fn mesh_source_workload_labels(
         // cluster metadata wins over a stale operator-authored topology key
         // that disagrees with the structured fields (matches Istio's preference
         // for locality metadata on the well-known keys).
-        merge_derived_topology_labels(
+        crate::config::types::merge_derived_topology_labels(
             &mut labels,
             workload.locality.as_deref(),
             workload.network.as_deref(),
@@ -1676,43 +1676,6 @@ fn mesh_source_workload(mesh_slice: &MeshSlice) -> Option<&crate::modes::mesh::c
     matched
 }
 
-fn merge_derived_topology_labels(
-    labels: &mut std::collections::HashMap<String, String>,
-    locality: Option<&str>,
-    network: Option<&str>,
-    cluster: Option<&str>,
-) {
-    if let Some(locality) = locality.and_then(crate::config::types::LocalityPreference::parse) {
-        labels.insert(
-            crate::config::types::FAILOVER_PRIORITY_LABEL_REGION.to_string(),
-            locality.region,
-        );
-        if let Some(zone) = locality.zone {
-            labels.insert(
-                crate::config::types::FAILOVER_PRIORITY_LABEL_ZONE.to_string(),
-                zone,
-            );
-        }
-        if let Some(sub_zone) = locality.sub_zone {
-            labels.insert(
-                crate::config::types::FAILOVER_PRIORITY_LABEL_SUBZONE.to_string(),
-                sub_zone,
-            );
-        }
-    }
-    if let Some(network) = network.filter(|value| !value.is_empty()) {
-        labels.insert(
-            crate::config::types::FAILOVER_PRIORITY_LABEL_NETWORK.to_string(),
-            network.to_string(),
-        );
-    }
-    if let Some(cluster) = cluster.filter(|value| !value.is_empty()) {
-        labels.insert(
-            crate::config::types::FAILOVER_PRIORITY_LABEL_CLUSTER.to_string(),
-            cluster.to_string(),
-        );
-    }
-}
 
 fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
     // The source workload is ALWAYS the LOCAL sidecar — never a remote-cluster
@@ -2893,7 +2856,7 @@ fn build_east_west_service_targets(
             // masquerade as remote and be excluded by strict locality LB.
             let mut tags = workload.selector.labels.clone();
             crate::modes::mesh::multicluster::strip_reserved_mesh_tags(&mut tags);
-            merge_derived_topology_labels(
+            crate::config::types::merge_derived_topology_labels(
                 &mut tags,
                 workload.locality.as_deref(),
                 workload.network.as_deref(),
@@ -8625,6 +8588,12 @@ fn build_egress_upstream_targets(
                 // mesh provenance/transport marker the data plane owns.
                 let mut tags = ep.labels.clone();
                 crate::modes::mesh::multicluster::strip_reserved_mesh_tags(&mut tags);
+                crate::config::types::merge_derived_topology_labels(
+                    &mut tags,
+                    None,
+                    ep.network.as_deref(),
+                    None,
+                );
                 Some(UpstreamTarget {
                     host: ep.address.clone(),
                     port: target_port,

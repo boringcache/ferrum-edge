@@ -2152,6 +2152,15 @@ fn compute_failover_priority_ranks(
 ) -> Vec<u8> {
     let n = failover_priority.len();
     let lowest = n.min(u8::MAX as usize) as u8;
+    // Invalid residual entries must not silently match empty endpoint labels.
+    // Admission rejects malformed entries; if any slip through, demote every
+    // endpoint to the lowest tier instead of broadening selection.
+    if failover_priority
+        .iter()
+        .any(|entry| parse_failover_priority_entry(entry).is_none())
+    {
+        return targets.iter().map(|_| lowest).collect();
+    }
     let includes_network = failover_priority
         .first()
         .is_some_and(|entry| parse_failover_priority_entry(entry).is_some_and(|(key, _)| key == FAILOVER_PRIORITY_LABEL_NETWORK));
@@ -2161,11 +2170,7 @@ fn compute_failover_priority_ranks(
     let mut expected: Vec<(&str, String)> = Vec::with_capacity(n);
     for entry in failover_priority {
         let Some((key, override_value)) = parse_failover_priority_entry(entry) else {
-            // Translator rejects invalid entries; treat any residual as a
-            // never-matching sentinel so we fail closed rather than silently
-            // degrading to another locality mode.
-            expected.push(("", String::new()));
-            continue;
+            return targets.iter().map(|_| lowest).collect();
         };
         let value = match override_value {
             Some(value) => value.to_string(),
@@ -2212,11 +2217,20 @@ fn endpoint_failover_priority_label<'a>(target: &'a UpstreamTarget, key: &str) -
         FAILOVER_PRIORITY_LABEL_SUBZONE => {
             locality_segment(target.locality.as_deref(), 2).unwrap_or("")
         }
-        // Network / cluster / hostname are only available as explicit tags
-        // (stamped at materialization from workload.network/cluster when known).
-        FAILOVER_PRIORITY_LABEL_NETWORK
-        | FAILOVER_PRIORITY_LABEL_CLUSTER
-        | FAILOVER_PRIORITY_LABEL_HOSTNAME => "",
+        // Prefer the Istio well-known keys when stamped; fall back to the
+        // mesh-internal network/cluster tags used by outbound materialization
+        // so failoverPriority still resolves before topology keys land.
+        FAILOVER_PRIORITY_LABEL_NETWORK => target
+            .tags
+            .get("mesh.network")
+            .map(String::as_str)
+            .unwrap_or(""),
+        FAILOVER_PRIORITY_LABEL_CLUSTER => target
+            .tags
+            .get("mesh.cluster")
+            .map(String::as_str)
+            .unwrap_or(""),
+        FAILOVER_PRIORITY_LABEL_HOSTNAME => "",
         _ => "",
     }
 }

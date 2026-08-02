@@ -2511,3 +2511,166 @@ fn failover_priority_enabled_false_suppresses_label_tiers() {
         "enabled=false must suppress failoverPriority tiers — saw {seen:?}"
     );
 }
+
+#[test]
+fn failover_priority_order_of_keys_is_significant() {
+    // Swapping the configured key order must change which endpoint wins.
+    let source_labels = HashMap::from([
+        ("topology.kubernetes.io/region".to_string(), "us-west".to_string()),
+        ("topology.kubernetes.io/zone".to_string(), "us-west-1".to_string()),
+    ]);
+    let targets = vec![
+        labeled_target(
+            "region-only.local",
+            Some("us-west/us-west-2/a"),
+            &[
+                ("topology.kubernetes.io/region", "us-west"),
+                ("topology.kubernetes.io/zone", "us-west-2"),
+            ],
+        ),
+        labeled_target(
+            "zone-only.local",
+            Some("eu-central/us-west-1/a"),
+            &[
+                ("topology.kubernetes.io/region", "eu-central"),
+                ("topology.kubernetes.io/zone", "us-west-1"),
+            ],
+        ),
+    ];
+
+    let region_first = upstream_with_failover_priority(
+        source_labels.clone(),
+        targets.clone(),
+        vec![
+            "topology.kubernetes.io/region".to_string(),
+            "topology.kubernetes.io/zone".to_string(),
+        ],
+    );
+    let zone_first = upstream_with_failover_priority(
+        source_labels,
+        targets,
+        vec![
+            "topology.kubernetes.io/zone".to_string(),
+            "topology.kubernetes.io/region".to_string(),
+        ],
+    );
+
+    let region_sel = LoadBalancerCache::select_target_from(
+        &LoadBalancerCache::new(&config(region_first)).load(),
+        "ferrum",
+        "u1",
+        "order-region",
+        no_health(),
+    )
+    .expect("selected");
+    let zone_sel = LoadBalancerCache::select_target_from(
+        &LoadBalancerCache::new(&config(zone_first)).load(),
+        "ferrum",
+        "u1",
+        "order-zone",
+        no_health(),
+    )
+    .expect("selected");
+    assert_eq!(region_sel.target.host, "region-only.local");
+    assert_eq!(zone_sel.target.host, "zone-only.local");
+}
+
+#[test]
+fn failover_priority_reads_mesh_network_cluster_fallback_tags() {
+    // When topology.istio.io/network is absent, the LB still resolves
+    // failoverPriority against the mesh.network / mesh.cluster tags stamped
+    // by outbound materialization.
+    let source_labels = HashMap::from([(
+        "topology.istio.io/network".to_string(),
+        "net-a".to_string(),
+    )]);
+    let mut same = labeled_target("same.local", None, &[]);
+    same.tags.insert("mesh.network".to_string(), "net-a".to_string());
+    let mut other = labeled_target("other.local", None, &[]);
+    other.tags.insert("mesh.network".to_string(), "net-b".to_string());
+    let up = upstream_with_failover_priority(
+        source_labels,
+        vec![same, other],
+        vec!["topology.istio.io/network".to_string()],
+    );
+    let selection = LoadBalancerCache::select_target_from(
+        &LoadBalancerCache::new(&config(up)).load(),
+        "ferrum",
+        "u1",
+        "mesh-net",
+        no_health(),
+    )
+    .expect("selected");
+    assert_eq!(selection.target.host, "same.local");
+}
+
+#[test]
+fn failover_priority_network_first_demotes_without_dropping_later_matches() {
+    // Istio: when the first key is topology.istio.io/network and it mismatches,
+    // demote by N but keep matching later labels.
+    let source_labels = HashMap::from([
+        ("topology.istio.io/network".to_string(), "net-a".to_string()),
+        ("version".to_string(), "v1".to_string()),
+    ]);
+    let up = upstream_with_failover_priority(
+        source_labels,
+        vec![
+            labeled_target(
+                "cross-net-v1.local",
+                None,
+                &[
+                    ("topology.istio.io/network", "net-b"),
+                    ("version", "v1"),
+                ],
+            ),
+            labeled_target(
+                "cross-net-v2.local",
+                None,
+                &[
+                    ("topology.istio.io/network", "net-b"),
+                    ("version", "v2"),
+                ],
+            ),
+        ],
+        vec![
+            "topology.istio.io/network".to_string(),
+            "version".to_string(),
+        ],
+    );
+    let snapshot = LoadBalancerCache::new(&config(up)).load();
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("net-demo-{i}"),
+            no_health(),
+        )
+        .expect("selected");
+        assert_eq!(
+            selection.target.host, "cross-net-v1.local",
+            "network mismatch demotion must still prefer later label matches"
+        );
+    }
+}
+
+#[test]
+fn failover_priority_key_equals_value_keeps_embedded_equals() {
+    let up = upstream_with_failover_priority(
+        HashMap::new(),
+        vec![
+            labeled_target("match.local", None, &[("version", "a=b")]),
+            labeled_target("other.local", None, &[("version", "a")]),
+        ],
+        vec!["version=a=b".to_string()],
+    );
+    let selection = LoadBalancerCache::select_target_from(
+        &LoadBalancerCache::new(&config(up)).load(),
+        "ferrum",
+        "u1",
+        "eq-embed",
+        no_health(),
+    )
+    .expect("selected");
+    assert_eq!(selection.target.host, "match.local");
+}

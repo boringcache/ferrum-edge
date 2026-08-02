@@ -1088,6 +1088,41 @@ pub fn parse_failover_priority_entry(raw: &str) -> Option<(&str, Option<&str>)> 
     }
 }
 
+/// Overlay Istio well-known topology labels derived from structured
+/// locality / network / cluster metadata onto a label map used by
+/// `failoverPriority` matching.
+///
+/// Existing keys are overwritten so structured locality metadata wins over a
+/// stale operator-authored topology label that disagrees with the fields.
+pub fn merge_derived_topology_labels(
+    labels: &mut HashMap<String, String>,
+    locality: Option<&str>,
+    network: Option<&str>,
+    cluster: Option<&str>,
+) {
+    if let Some(locality) = locality.and_then(LocalityPreference::parse) {
+        labels.insert(FAILOVER_PRIORITY_LABEL_REGION.to_string(), locality.region);
+        if let Some(zone) = locality.zone {
+            labels.insert(FAILOVER_PRIORITY_LABEL_ZONE.to_string(), zone);
+        }
+        if let Some(sub_zone) = locality.sub_zone {
+            labels.insert(FAILOVER_PRIORITY_LABEL_SUBZONE.to_string(), sub_zone);
+        }
+    }
+    if let Some(network) = network.filter(|value| !value.is_empty()) {
+        labels.insert(
+            FAILOVER_PRIORITY_LABEL_NETWORK.to_string(),
+            network.to_string(),
+        );
+    }
+    if let Some(cluster) = cluster.filter(|value| !value.is_empty()) {
+        labels.insert(
+            FAILOVER_PRIORITY_LABEL_CLUSTER.to_string(),
+            cluster.to_string(),
+        );
+    }
+}
+
 /// One `localityLbSetting.distribute[]` entry. `from` is an Istio-style
 /// `region/zone/subzone` locality string; `to` maps target localities
 /// (same syntax) to integer weights. Istio treats the values as
@@ -1477,7 +1512,6 @@ pub struct Upstream {
     /// balancing. Projected from the selected workload at slice-apply time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_locality: Option<String>,
-    source_labels: Default::default(),
     /// Source-workload labels used by
     /// `localityLbSetting.failoverPriority` key-only matching. Projected
     /// from the selected mesh workload (plus derived topology labels from

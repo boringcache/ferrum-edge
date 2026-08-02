@@ -232,7 +232,6 @@ fn k8s_translator_rejects_combined_locality_lb_modes() {
 }
 
 #[test]
-#[test]
 fn k8s_translator_parses_failover_priority_entries() {
     let (_, setting) = translate_dr_locality(serde_json::json!({
         "host": "reviews.default.svc.cluster.local",
@@ -338,6 +337,98 @@ fn k8s_translator_rejects_combined_failover_priority_and_distribute() {
         msg.contains("must set only one of distribute, failover, or failoverPriority"),
         "expected mutually-exclusive locality mode rejection, got: {msg}"
     );
+}
+
+
+#[test]
+fn k8s_translator_rejects_combined_failover_priority_and_failover() {
+    let object = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+        "host": "reviews.default.svc.cluster.local",
+        "trafficPolicy": {
+            "loadBalancer": {
+                "localityLbSetting": {
+                    "failover": [{"from": "us-west", "to": "us-east"}],
+                    "failoverPriority": ["topology.kubernetes.io/region"]
+                }
+            }
+        }
+    })
+    );
+    let err = translate_k8s_objects(&[object], k8s_options())
+        .expect_err("combined failover + failoverPriority must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("must set only one of distribute, failover, or failoverPriority"),
+        "expected mutually-exclusive locality mode rejection, got: {msg}"
+    );
+}
+
+#[test]
+fn k8s_translator_rejects_non_string_failover_priority_entry() {
+    let object = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+        "host": "reviews.default.svc.cluster.local",
+        "trafficPolicy": {
+            "loadBalancer": {
+                "localityLbSetting": {
+                    "failoverPriority": [1]
+                }
+            }
+        }
+    })
+    );
+    let err = translate_k8s_objects(&[object], k8s_options())
+        .expect_err("non-string failoverPriority entry must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("failoverPriority[0]") && msg.contains("must be a string"),
+        "expected non-string failoverPriority rejection, got: {msg}"
+    );
+}
+
+#[test]
+fn k8s_translator_rejects_whitespace_failover_priority_entry() {
+    let object = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+        "host": "reviews.default.svc.cluster.local",
+        "trafficPolicy": {
+            "loadBalancer": {
+                "localityLbSetting": {
+                    "failoverPriority": [" version"]
+                }
+            }
+        }
+    })
+    );
+    let err = translate_k8s_objects(&[object], k8s_options())
+        .expect_err("leading whitespace failoverPriority entry must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("failoverPriority[0]") && msg.contains("not a valid label key"),
+        "expected whitespace failoverPriority rejection, got: {msg}"
+    );
+}
+
+#[test]
+fn k8s_translator_accepts_key_equals_value_with_embedded_equals() {
+    let (_, setting) = translate_dr_locality(serde_json::json!({
+        "host": "reviews.default.svc.cluster.local",
+        "trafficPolicy": {
+            "loadBalancer": {
+                "localityLbSetting": {
+                    "failoverPriority": ["version=a=b"]
+                }
+            }
+        }
+    }));
+    assert_eq!(setting.failover_priority, vec!["version=a=b".to_string()]);
 }
 
 #[test]

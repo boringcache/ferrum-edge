@@ -863,6 +863,20 @@ fn mesh_target_tags_core(
     if let Some(cluster) = &workload.cluster {
         tags.insert("mesh.cluster".to_string(), cluster.clone());
     }
+    // Stamp workload labels (minus reserved mesh.* keys) and derived topology
+    // labels so DestinationRule failoverPriority can match endpoints on the
+    // primary outbound / service-discovery path without silently broadening.
+    let mut failover_labels = workload.selector.labels.clone();
+    crate::modes::mesh::multicluster::strip_reserved_mesh_tags(&mut failover_labels);
+    crate::config::types::merge_derived_topology_labels(
+        &mut failover_labels,
+        workload.locality.as_deref(),
+        workload.network.as_deref(),
+        workload.cluster.as_deref(),
+    );
+    for (key, value) in failover_labels {
+        tags.entry(key).or_insert(value);
+    }
     tags
 }
 
@@ -1418,5 +1432,44 @@ mod tests {
         let targets = discoverer.discover().await.expect("discover succeeds");
 
         assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn mesh_target_tags_core_stamps_failover_priority_labels() {
+        let mut wl = workload(
+            "spiffe://cluster.local/ns/default/sa/reviews",
+            "reviews",
+            vec!["10.0.0.1"],
+            vec![8080],
+        );
+        wl.selector.labels.insert("version".into(), "v1".into());
+        wl.selector.labels.insert("mesh.remote".into(), "true".into());
+        wl.locality = Some("us-west/us-west-1/a".into());
+        wl.network = Some("net-a".into());
+        wl.cluster = Some("cluster-a".into());
+        let svc = service("reviews", vec!["spiffe://cluster.local/ns/default/sa/reviews"], vec![8080]);
+        let tags = mesh_hbone_target_tags(&svc, &wl, AppProtocol::Http, Some("http"));
+        assert_eq!(tags.get("version").map(String::as_str), Some("v1"));
+        assert!(
+            !tags.contains_key("mesh.remote"),
+            "reserved mesh.remote workload label must not forge provenance; got {tags:?}"
+        );
+        assert_eq!(
+            tags.get("topology.kubernetes.io/region").map(String::as_str),
+            Some("us-west")
+        );
+        assert_eq!(
+            tags.get("topology.kubernetes.io/zone").map(String::as_str),
+            Some("us-west-1")
+        );
+        assert_eq!(
+            tags.get("topology.istio.io/network").map(String::as_str),
+            Some("net-a")
+        );
+        assert_eq!(
+            tags.get("topology.istio.io/cluster").map(String::as_str),
+            Some("cluster-a")
+        );
+        assert_eq!(tags.get("mesh.network").map(String::as_str), Some("net-a"));
     }
 }

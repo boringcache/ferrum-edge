@@ -7,7 +7,7 @@ use ferrum_edge::modes::mesh::config::{
     MAX_MESH_REMOTE_CLUSTERS, MeshConfig, MeshDestinationRule, MeshEndpoint, MeshJwtRule,
     MeshOutlierDetection, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshRule,
     MeshService, MeshSidecar, MeshSidecarEgress, MeshSidecarIngress, MeshSubset,
-    MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy,
+    MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig, MeshLocalityDistribute, MeshLocalityLbSetting, MeshTrafficPolicy,
     MeshTrafficPolicyTls, MtlsMode, MultiClusterConfig, NodeWaypointEndpoint, ParsedCidr,
     PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, RequestMatch,
     Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet,
@@ -2760,4 +2760,98 @@ mod virtual_service_cors {
             &p, "team-b"
         ));
     }
+}
+
+#[test]
+fn mesh_config_validate_rejects_combined_failover_priority_modes() {
+    let mesh = MeshConfig {
+        destination_rules: vec![MeshDestinationRule {
+            name: "dr".into(),
+            namespace: "default".into(),
+            host: "reviews.default.svc.cluster.local".into(),
+            traffic_policy: Some(MeshTrafficPolicy {
+                locality_lb_setting: Some(MeshLocalityLbSetting {
+                    enabled: true,
+                    distribute: vec![MeshLocalityDistribute {
+                        from: "us-west".into(),
+                        to: std::collections::BTreeMap::from([("us-east".into(), 100)]),
+                    }],
+                    failover: Vec::new(),
+                    failover_priority: vec!["topology.kubernetes.io/region".into()],
+                }),
+                ..MeshTrafficPolicy::default()
+            }),
+            port_level_settings: HashMap::new(),
+            subsets: Vec::new(),
+        }],
+        ..MeshConfig::default()
+    };
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|e| e.contains("must set only one of distribute, failover, or failover_priority")),
+        "expected native mutual-exclusivity rejection, got: {errors:?}"
+    );
+}
+
+#[test]
+fn mesh_config_validate_rejects_malformed_failover_priority_entries() {
+    let mesh = MeshConfig {
+        destination_rules: vec![MeshDestinationRule {
+            name: "dr".into(),
+            namespace: "default".into(),
+            host: "reviews.default.svc.cluster.local".into(),
+            traffic_policy: Some(MeshTrafficPolicy {
+                locality_lb_setting: Some(MeshLocalityLbSetting {
+                    enabled: true,
+                    distribute: Vec::new(),
+                    failover: Vec::new(),
+                    failover_priority: vec!["=novalue".into(), " leading".into()],
+                }),
+                ..MeshTrafficPolicy::default()
+            }),
+            port_level_settings: HashMap::new(),
+            subsets: Vec::new(),
+        }],
+        ..MeshConfig::default()
+    };
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|e| e.contains("failover_priority[0]")),
+        "expected malformed failover_priority[0] rejection, got: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("failover_priority[1]")),
+        "expected malformed failover_priority[1] rejection, got: {errors:?}"
+    );
+}
+
+#[test]
+fn mesh_config_validate_accepts_failover_priority_only() {
+    let mesh = MeshConfig {
+        destination_rules: vec![MeshDestinationRule {
+            name: "dr".into(),
+            namespace: "default".into(),
+            host: "reviews.default.svc.cluster.local".into(),
+            traffic_policy: Some(MeshTrafficPolicy {
+                locality_lb_setting: Some(MeshLocalityLbSetting {
+                    enabled: true,
+                    distribute: Vec::new(),
+                    failover: Vec::new(),
+                    failover_priority: vec![
+                        "topology.kubernetes.io/region".into(),
+                        "version=v1".into(),
+                    ],
+                }),
+                ..MeshTrafficPolicy::default()
+            }),
+            port_level_settings: HashMap::new(),
+            subsets: Vec::new(),
+        }],
+        ..MeshConfig::default()
+    };
+    assert!(
+        mesh.validate().is_empty(),
+        "failover_priority-only locality LB must validate, got: {:?}",
+        mesh.validate()
+    );
 }
