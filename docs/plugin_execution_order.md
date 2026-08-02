@@ -584,7 +584,7 @@ Body-aware plugins such as `graphql`, request-side `body_validator`, `openapi_va
 
 "Matching" is the plugin's own configured representation, not the request method. `body_validator` in particular selects on `content_types` / `application/grpc` alone: a body-bearing `DELETE`, `PUT`, `PATCH`, `OPTIONS`, `GET`, or non-standard method carrying a governed media type is buffered and validated exactly like a `POST` (advisory `GHSA-2vmr-ww8r-mww3`). Once a configured rule applies, an empty, absent, or non-UTF-8 representation is a rejection rather than a skip; the only exemptions are the ones the protocol defines (empty terminal gRPC *error* replies with a single valid non-zero `grpc-status`, and `1xx` / `204` / `205` / `304` / `HEAD` response semantics). Early `before_proxy` prefers a rewritten UTF-8 metadata view when present, falls back to raw bytes / transport-proven emptiness, and fails closed otherwise; the final request-body hook still validates the exact backend-visible bytes. The gateway still never materializes a body the transport proved absent — H1/H2 validate that proven-empty representation directly, and H3 reaches the same decision from its always-drained empty buffer.
 
-`waf` request metadata inspection (path, query, headers, cookies, and method) runs in the `authorize` phase at priority 2930, after authentication and earlier authorization plugins such as `access_control`, `mesh_authz`, `opa`, and consumer-aware `rate_limiting`. Authenticated proxies that reject during auth/authz therefore avoid WAF scan cost, while public/no-auth proxies still run WAF before backend dispatch. WAF request-body inspection remains on the final backend-visible request body.
+`waf` request metadata inspection (path, query, headers, cookies, and method) runs in the `authorize` phase at priority 2930, after authentication and earlier authorization plugins such as `access_control`, `mesh_authz`, `opa`, and consumer-aware `rate_limiting`. Authenticated proxies that reject during auth/authz therefore avoid WAF scan cost, while public/no-auth proxies still run WAF before backend dispatch. WAF request-body inspection remains on the final backend-visible request body. On an upgraded WebSocket session the same body rule sets continue to apply to complete application messages in both directions — see [WebSocket Message Inspection](#websocket-message-inspection-waf).
 
 **Phase 1 — `on_stream_connect`**: Runs after the client connection is accepted (TCP) or the first datagram from a new client creates a session (UDP). For TCP+TLS and UDP+DTLS listeners it runs after the frontend TLS/DTLS handshake and before the backend connection/session is opened, so plugins can inspect the client certificate without spending upstream capacity first. Frontend TLS/DTLS handshake failures do not fire stream plugins; plugin rejects close the frontend connection/session immediately and do not dial the backend. Plugins can also insert metadata (e.g., trace IDs) into `ctx.metadata`, which is carried through to `on_stream_disconnect`. Built-in correlation IDs remain in private lifecycle state and are authoritatively projected into terminal metadata after plugin-writable merges. Built-in admission plugins can instead attach opaque connection permits; TCP runners release all permits in reverse order immediately when a later plugin rejects, and normal connection teardown releases any remaining permits exactly once.
 
@@ -735,6 +735,77 @@ under a short bound. Parser-level size rejections
 (`ws_message_size_limiting` via `websocket_size_limits`) never enter the
 post-reassembly hook chain and use the same dual-peer Close path with code 1009.
 
+### Session-Bound Message Policy (`bind_ws_session`)
+
+`on_ws_frame` deliberately carries no request context, because a WebSocket
+session *is* one upgraded request. A plugin whose per-message decision depends
+on request-scoped state resolves it **once**, at upgrade admission, through
+`Plugin::bind_ws_session`: the relay's per-session plugin collection calls it
+with the finalized upgrade `RequestContext` and substitutes the returned
+instance positionally in both the parser-policy and frame-hook lists. Configured
+priority order is unchanged, binding happens exactly once per plugin per
+session, and each configured instance still sees every message exactly once.
+Implementations must return an immutable snapshot and must not retain request
+headers, bodies, or credentials.
+
+`waf` owns this phase. Its snapshot holds the `global_exemptions` verdict for
+the upgrade, one `conditions` verdict per compiled rule, and whether each
+direction can actually block — all bounded by the configured rule count, none of
+it attacker-controlled at message time.
+
+### WebSocket Message Inspection (`waf`)
+
+`waf` inspects complete **Text and Binary application messages** in both
+directions (advisory `GHSA-6j3m-vf5h-pgcx`; before it, WAF participated only in
+the upgrade handshake). Body targets map to complete messages, not wire frames:
+
+- **client → backend** messages run the **request** body rule set (`body_text`,
+  `body_json_path`, body Luhn/CIDR rules, and the body-scoped encoding
+  specials), gated by `request_inspection` + `request_body_inspection`.
+- **backend → client** messages run the **response** body rule set
+  (`response_body`, response Luhn/CIDR rules, the same encoding specials), gated
+  by `response_inspection` + `response_body_inspection`.
+
+Both Text and Binary are inspected. The HTTP media-type selectors
+(`body_methods`, `body_content_types`, `inspect_multipart`,
+`inspect_binary_body`) do not apply — a WebSocket message carries no
+`Content-Type`, so honoring them would let a client bypass an enforcing rule by
+choosing the Binary opcode. **Control frames (Ping/Pong/Close) are never scanned
+as application payload.**
+
+Fragmentation and compression need no WAF-side state. Tungstenite reassembles
+Text/Binary continuations before the hook, incomplete messages are bounded by
+`FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES` /
+`FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS`, and `permessage-deflate` is
+never negotiated end to end (the client's `Sec-WebSocket-Extensions` offer is
+stripped before the backend handshake and no negotiated extension is echoed
+back), so payloads reaching the hook are complete and uncompressed on H1
+upgrade and on H2/H3 Extended CONNECT alike.
+
+Fail-closed behavior mirrors the HTTP body path. A message larger than
+`max_scan_bytes` is decided by `on_body_too_large`: `fail_closed` (default)
+closes the connection when that direction carries an enforcing body policy and
+otherwise prefix-scans; `scan_truncated` always prefix-scans; `skip` forwards
+uninspected; `block` closes whenever the instance is globally enforcing. An
+uninspectable message representation closes the connection when the direction
+enforces. `on_scan_timeout: block` closes; `allow` / `log_and_allow` forward.
+Every close is a fixed RFC 6455 code 1008 with a compiled-in reason that never
+echoes message bytes.
+
+Anomaly scoring is evaluated **per complete message** rather than accumulated
+across the session: a long-lived connection has no request-scoped accumulator,
+and carrying one would let an unbounded, attacker-driven counter decide
+admission. Multiple configured `waf` instances each bind and scan independently;
+the shared first-terminal-Close rule then applies, so one message can be blocked
+only once. Because a closed session has no transaction-summary surface of its
+own, WebSocket message findings are emitted as fixed-cardinality `waf`-target
+log events (every block; every matched rule when `log_to_stdout` is enabled)
+rather than as `waf.*` transaction metadata.
+
+Note that configuring an enforcing WAF body rule on a WebSocket proxy opts that
+proxy into the parsed relay: raw tunnel mode (`copy_bidirectional`) cannot
+inspect messages and is therefore not used for those sessions.
+
 ### Execution Order
 
 Plugins execute in priority order (lower number runs first):
@@ -877,7 +948,7 @@ Given all built-in plugins enabled, the execution order is:
 | 34 | `ws_rate_limiting` | 2910 | on_ws_frame, on_ws_reassembly_frames |
 | 35 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 36 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body, on_final_request_body |
-| 37 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body, on_stream_connect, on_udp_datagram |
+| 37 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body, on_ws_frame, on_stream_connect, on_udp_datagram |
 | 38 | `fault_injection` | 2940 | before_proxy, on_stream_connect, on_udp_datagram |
 | 39 | `body_validator` | 2950 | before_proxy, on_final_request_body, after_proxy, on_final_response_body |
 | 40 | `openapi_validator` | 2960 | validate_client_request_body_contract, before_proxy, on_final_request_body, after_proxy, on_final_response_body |
@@ -1239,7 +1310,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `udp_rate_limiting` | | | | | ✓ | Per-client-IP datagram and byte rate limiting for UDP proxies |
 | `ai_transcript_audit` | ✓ | | | | | HTTP-only AI transcript capture to a configured sink |
 | `ai_prompt_shield` | ✓ | | | | | HTTP-only PII detection/redaction for bare JSON prompts; native gRPC unsupported (gRPC-Web framed bodies are skipped) |
-| `waf` | ✓ | ✓ | ✓ | ✓ | ✓ | HTTP-family always; TCP/UDP first-bytes and datagram inspection when a `stream` block is configured |
+| `waf` | ✓ | ✓ | ✓ | ✓ | ✓ | HTTP-family always, including complete WebSocket text/binary application messages in both directions; TCP/UDP first-bytes and datagram inspection when a `stream` block is configured |
 | `fault_injection` | ✓ | ✓ | ✓ | ✓ | ✓ | Probabilistic aborts and delays across HTTP-family, TCP stream connect, and UDP/DTLS session + datagram hooks |
 | `body_validator` | ✓ | ✓ | | | | Validates request and response bodies |
 | `openapi_validator` | ✓ | | | | | Validates bodies against generated OpenAPI operation schemas |
