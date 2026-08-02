@@ -1,10 +1,10 @@
 //! Unit tests for backup security-audit helpers and redaction canaries.
 
 use ferrum_edge::admin::audit::{
-    self, AUDIT_REQUEST_ID_MAX_LEN, AuditActor, AuditAdmitSink, AuditEvent, AuditRequestContext,
-    BACKUP_RESOURCES_INVALID_SENTINEL, append_local_fallback_event, backup_failure_diff,
-    backup_resources_audit_value, backup_success_diff, extract_or_generate_request_id,
-    list_local_fallback_events,
+    self, AUDIT_LOCAL_FALLBACK_MAX_BYTES, AUDIT_REQUEST_ID_MAX_LEN, AuditActor, AuditAdmitSink,
+    AuditEvent, AuditRequestContext, BACKUP_RESOURCES_INVALID_SENTINEL, append_local_fallback_event,
+    backup_failure_diff, backup_resources_audit_value, backup_success_diff,
+    extract_or_generate_request_id, list_local_fallback_events,
 };
 use ferrum_edge::admin::jwt_auth::AdminRole;
 use hyper::HeaderMap;
@@ -329,6 +329,135 @@ fn local_fallback_rejects_non_regular_data_target() {
     assert!(err.to_string().contains("regular file"));
 }
 
+#[cfg(unix)]
+fn write_owner_only_fallback_bytes(path: &std::path::Path, bytes: &[u8]) {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .expect("create owner-only fallback fixture");
+    file.write_all(bytes).expect("write fixture");
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .expect("chmod fixture");
+}
+
+#[test]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
+fn local_fallback_rejects_oversized_data_file() {
+    let dir = TempDir::new().expect("tempdir");
+    let data = dir.path().join("admin-audit-fallback.json");
+    // One byte past the documented ceiling; contents are hostile junk that
+    // must never appear in the sanitized fail-closed error.
+    let mut oversized = vec![b'x'; AUDIT_LOCAL_FALLBACK_MAX_BYTES.saturating_add(1)];
+    oversized[..16].copy_from_slice(b"SECRET-CANARY!!!");
+    #[cfg(unix)]
+    write_owner_only_fallback_bytes(&data, &oversized);
+    #[cfg(not(unix))]
+    std::fs::write(&data, &oversized).unwrap();
+
+    let err = list_local_fallback_events(dir.path()).expect_err("oversized");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeds maximum size"),
+        "unexpected error: {msg}"
+    );
+    assert!(
+        !msg.contains("SECRET-CANARY"),
+        "oversized reject must not echo file contents: {msg}"
+    );
+
+    let append_err = append_local_fallback_event(dir.path(), &sample_backup_event())
+        .expect_err("append must also fail closed on oversized store");
+    assert!(
+        append_err.to_string().contains("exceeds maximum size"),
+        "unexpected append error: {append_err}"
+    );
+}
+
+#[test]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
+fn local_fallback_rejects_corrupt_data_file() {
+    let dir = TempDir::new().expect("tempdir");
+    let data = dir.path().join("admin-audit-fallback.json");
+    let corrupt = b"{\"not\": \"an-audit-array\", \"secret\": \"SECRET-CANARY!!!\"}";
+    #[cfg(unix)]
+    write_owner_only_fallback_bytes(&data, corrupt);
+    #[cfg(not(unix))]
+    std::fs::write(&data, corrupt).unwrap();
+
+    let err = list_local_fallback_events(dir.path()).expect_err("corrupt");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("corrupt"),
+        "unexpected error: {msg}"
+    );
+    assert!(
+        !msg.contains("SECRET-CANARY"),
+        "corrupt reject must not echo file contents: {msg}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
+fn local_fallback_rejects_hardlinked_data_file() {
+    let dir = TempDir::new().expect("tempdir");
+    let outside = dir.path().join("outside-data.json");
+    write_owner_only_fallback_bytes(&outside, b"[]");
+    let data = dir.path().join("admin-audit-fallback.json");
+    std::fs::hard_link(&outside, &data).expect("hard link data");
+
+    let err = list_local_fallback_events(dir.path()).expect_err("hardlinked data");
+    assert!(
+        err.to_string().contains("single-link"),
+        "unexpected error: {err}"
+    );
+    let append_err = append_local_fallback_event(dir.path(), &sample_backup_event())
+        .expect_err("append must reject hardlinked data");
+    assert!(
+        append_err.to_string().contains("single-link"),
+        "unexpected append error: {append_err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
+fn local_fallback_rejects_hardlinked_lock_file_before_chmod() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let outside = dir.path().join("unrelated-inode");
+    std::fs::write(&outside, b"keep-me").unwrap();
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644))
+        .expect("seed world-readable unrelated inode");
+    let lock_path = dir.path().join("admin-audit-fallback.lock");
+    std::fs::hard_link(&outside, &lock_path).expect("hard link lock");
+
+    let err = append_local_fallback_event(dir.path(), &sample_backup_event())
+        .expect_err("hardlinked lock");
+    assert!(
+        err.to_string().contains("single-link"),
+        "unexpected error: {err}"
+    );
+
+    let outside_mode = std::fs::metadata(&outside)
+        .expect("outside meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        outside_mode, 0o644,
+        "hard-linked lock reject must not chmod the unrelated inode"
+    );
+    let outside_bytes = std::fs::read(&outside).expect("read outside");
+    assert_eq!(outside_bytes, b"keep-me");
+}
+
 fn sample_backup_event() -> AuditEvent {
     AuditEvent::new(
         &admin_actor(),
@@ -508,6 +637,39 @@ fn local_fallback_windows_replace_uses_movefileex_replace_existing() {
     assert!(
         !windows_body.contains("fs::rename("),
         "Windows replace must not call std::fs::rename"
+    );
+}
+
+#[test]
+fn local_fallback_read_path_uses_nofollow_handle_and_byte_ceiling() {
+    const AUDIT_SOURCE: &str = include_str!("../../../src/admin/audit.rs");
+    assert!(
+        AUDIT_SOURCE.contains("AUDIT_LOCAL_FALLBACK_MAX_BYTES"),
+        "fallback read must document a hard byte ceiling"
+    );
+    assert!(
+        AUDIT_SOURCE.contains("open_fallback_data_file_nofollow"),
+        "fallback read must open through a no-follow helper"
+    );
+    assert!(
+        AUDIT_SOURCE.contains("validate_opened_fallback_data_metadata"),
+        "fallback read must validate opened-handle metadata"
+    );
+    let read_fn = AUDIT_SOURCE
+        .split("fn read_local_fallback_events_unlocked")
+        .nth(1)
+        .unwrap_or("");
+    let read_body = read_fn
+        .split("fn open_fallback_data_file_nofollow")
+        .next()
+        .unwrap_or("");
+    assert!(
+        !read_body.contains("fs::read("),
+        "fallback read must not use unbounded path-based fs::read"
+    );
+    assert!(
+        read_body.contains("AUDIT_LOCAL_FALLBACK_MAX_BYTES"),
+        "fallback read body must enforce the byte ceiling"
     );
 }
 

@@ -24,7 +24,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, TryLockError, Weak};
@@ -40,6 +40,13 @@ const AUDIT_SINK_STALE_CHECK_INTERVAL_SECONDS: u64 = 60;
 pub const AUDIT_REQUEST_ID_MAX_LEN: usize = 128;
 /// Bound on local fallback events retained on disk (newest kept).
 pub const AUDIT_LOCAL_FALLBACK_CAPACITY: usize = 4_096;
+/// Hard ceiling on local fallback file bytes admitted into memory.
+///
+/// Event count is separately capped by [`AUDIT_LOCAL_FALLBACK_CAPACITY`]. This
+/// bound rejects a hostile or corrupt on-disk file before allocation/parse so
+/// the admit/list path cannot grow unboundedly. Sized as 4 KiB average
+/// headroom per retained event (16 MiB at the current capacity).
+pub const AUDIT_LOCAL_FALLBACK_MAX_BYTES: usize = AUDIT_LOCAL_FALLBACK_CAPACITY * 4 * 1024;
 const AUDIT_LOCAL_FALLBACK_FILE_NAME: &str = "admin-audit-fallback.json";
 const AUDIT_LOCAL_FALLBACK_LOCK_FILE_NAME: &str = "admin-audit-fallback.lock";
 const AUDIT_LOCAL_FALLBACK_DEFAULT_DIR: &str = "./ferrum-admin-audit";
@@ -790,9 +797,11 @@ struct FallbackFileLock {
 /// Append one event to the bounded local fallback store.
 ///
 /// Enforces a non-symlink directory/data/lock target, owner-only Unix
-/// permissions, collision-resistant temp publication with same-directory
-/// atomic replace (Unix `rename(2)`; Windows
-/// `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)`), directory sync, and
+/// permissions, single-link regular files on Unix (hard links rejected before
+/// chmod/flock/read), a [`AUDIT_LOCAL_FALLBACK_MAX_BYTES`] on-disk byte
+/// ceiling read through a no-follow open of the exact file, collision-resistant
+/// temp publication with same-directory atomic replace (Unix `rename(2)`;
+/// Windows `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)`), directory sync, and
 /// cross-process exclusion where the platform supports it. In-process and
 /// cross-process locks are acquired without waiting (`try_lock` /
 /// `LOCK_EX|LOCK_NB` on Unix; immediate share denial on Windows): contention
@@ -929,11 +938,13 @@ fn acquire_fallback_file_lock(lock_path: &Path) -> Result<FallbackFileLock, anyh
         .mode(0o600)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(lock_path)
-        .map_err(|error| anyhow!("failed to open audit local fallback lock: {error}"))?;
+        .map_err(|error| map_fallback_open_error(error, "audit local fallback lock file"))?;
     let lock_metadata = file.metadata()?;
-    if !lock_metadata.file_type().is_file() {
+    // Reject hard-linked targets before chmod/flock can affect an unrelated
+    // inode that merely shares this pathname via an extra link.
+    if !lock_metadata.file_type().is_file() || lock_metadata.nlink() != 1 {
         return Err(anyhow!(
-            "audit local fallback lock file must be a regular file"
+            "audit local fallback lock file must be a single-link regular file"
         ));
     }
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
@@ -956,6 +967,7 @@ fn acquire_fallback_file_lock(lock_path: &Path) -> Result<FallbackFileLock, anyh
     let path_metadata = fs::symlink_metadata(lock_path)?;
     if path_metadata.file_type().is_symlink()
         || !path_metadata.file_type().is_file()
+        || path_metadata.nlink() != 1
         || path_metadata.dev() != lock_metadata.dev()
         || path_metadata.ino() != lock_metadata.ino()
     {
@@ -1000,27 +1012,148 @@ fn acquire_fallback_file_lock(_lock_path: &Path) -> Result<FallbackFileLock, any
 }
 
 fn read_local_fallback_events_unlocked(path: &Path) -> Result<Vec<AuditEvent>, anyhow::Error> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(anyhow!(
-                    "audit local fallback data file must not be a symlink"
-                ));
-            }
-            if !meta.file_type().is_file() {
-                return Err(anyhow!(
-                    "audit local fallback data file must be a regular file"
-                ));
-            }
-        }
+    let mut file = match open_fallback_data_file_nofollow(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            return Err(map_fallback_open_error(
+                error,
+                "audit local fallback data file",
+            ));
+        }
+    };
+    let meta = file.metadata().map_err(|error| {
+        anyhow!("failed to stat audit local fallback data file handle: {error}")
+    })?;
+    validate_opened_fallback_data_metadata(&meta, "audit local fallback data file")?;
+    confirm_fallback_path_matches_opened(path, &meta, "audit local fallback data file")?;
+
+    let len = meta.len();
+    if len > AUDIT_LOCAL_FALLBACK_MAX_BYTES as u64 {
+        return Err(anyhow!(
+            "audit local fallback data file exceeds maximum size"
+        ));
     }
-    let raw = fs::read(path)?;
+    let size = usize::try_from(len).map_err(|_| {
+        anyhow!("audit local fallback data file exceeds maximum size")
+    })?;
+    // Reserve exactly the fstat'd size before reading so a hostile multi-GiB
+    // file cannot force amortized growth; the take(+1) bound is defense in
+    // depth if the inode grows after the size check.
+    let mut raw = Vec::new();
+    raw.try_reserve_exact(size).map_err(|_| {
+        anyhow!("audit local fallback data file exceeds available memory")
+    })?;
+    let mut limited = (&mut file).take((AUDIT_LOCAL_FALLBACK_MAX_BYTES as u64).saturating_add(1));
+    limited
+        .read_to_end(&mut raw)
+        .map_err(|error| anyhow!("failed to read audit local fallback data file: {error}"))?;
+    if raw.len() > AUDIT_LOCAL_FALLBACK_MAX_BYTES {
+        return Err(anyhow!(
+            "audit local fallback data file exceeds maximum size"
+        ));
+    }
+    // Re-validate handle + path identity after the read so a replace during
+    // the bounded copy cannot silently admit a different object.
+    let meta_after = file.metadata().map_err(|error| {
+        anyhow!("failed to re-stat audit local fallback data file handle: {error}")
+    })?;
+    validate_opened_fallback_data_metadata(&meta_after, "audit local fallback data file")?;
+    confirm_fallback_path_matches_opened(path, &meta_after, "audit local fallback data file")?;
+
     if raw.iter().all(u8::is_ascii_whitespace) {
         return Ok(Vec::new());
     }
+    // Never include raw bytes in the error: hostile content may contain
+    // secrets or multi-megabyte junk.
     serde_json::from_slice(&raw).map_err(|_| anyhow!("corrupt audit local fallback store"))
+}
+
+/// Open the fallback data file without following a final-path symlink.
+fn open_fallback_data_file_nofollow(path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        OpenOptions::new().read(true).open(path)
+    }
+}
+
+fn map_fallback_open_error(error: std::io::Error, label: &'static str) -> anyhow::Error {
+    #[cfg(unix)]
+    {
+        // O_NOFOLLOW reports ELOOP when the final path component is a symlink.
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return anyhow!("{label} must not be a symlink");
+        }
+    }
+    anyhow!("failed to open {label}: {error}")
+}
+
+/// Validate file-descriptor metadata for a fallback data file.
+///
+/// Decisions use the opened handle (not path metadata alone): regular file,
+/// owner-only mode bits, and (Unix) a single hard link.
+fn validate_opened_fallback_data_metadata(
+    meta: &fs::Metadata,
+    label: &'static str,
+) -> Result<(), anyhow::Error> {
+    if !meta.file_type().is_file() {
+        return Err(anyhow!("{label} must be a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if meta.nlink() != 1 {
+            return Err(anyhow!("{label} must be a single-link regular file"));
+        }
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(anyhow!("{label} must have owner-only permissions"));
+        }
+    }
+    Ok(())
+}
+
+/// Ensure the path still names the same opened object (and is not a symlink).
+fn confirm_fallback_path_matches_opened(
+    path: &Path,
+    opened: &fs::Metadata,
+    label: &'static str,
+) -> Result<(), anyhow::Error> {
+    let path_meta = fs::symlink_metadata(path)?;
+    if path_meta.file_type().is_symlink() {
+        return Err(anyhow!("{label} must not be a symlink"));
+    }
+    if !path_meta.file_type().is_file() {
+        return Err(anyhow!("{label} must be a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_meta.nlink() != 1
+            || path_meta.dev() != opened.dev()
+            || path_meta.ino() != opened.ino()
+        {
+            return Err(anyhow!("{label} changed identity during read"));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Portable platforms lack stable device/inode identity; size is a
+        // weak check that still fails closed when the path entry diverges
+        // grossly from the opened handle mid-read.
+        if path_meta.len() != opened.len() {
+            return Err(anyhow!("{label} changed identity during read"));
+        }
+    }
+    Ok(())
 }
 
 fn write_local_fallback_events_unlocked(
@@ -1029,6 +1162,11 @@ fn write_local_fallback_events_unlocked(
     events: &[AuditEvent],
 ) -> Result<(), anyhow::Error> {
     let body = serde_json::to_vec_pretty(events)?;
+    if body.len() > AUDIT_LOCAL_FALLBACK_MAX_BYTES {
+        return Err(anyhow!(
+            "audit local fallback payload exceeds maximum size"
+        ));
+    }
     let tmp_name = format!("{}.{}.tmp", AUDIT_LOCAL_FALLBACK_FILE_NAME, Uuid::new_v4());
     let tmp = dir.join(tmp_name);
     let write_result = write_temp_fallback_file(&tmp, &body);

@@ -22,7 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same-directory atomic replace (Unix `rename(2)`; Windows
   `MoveFileExW(MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)`) so
   repeated appends succeed when the destination already exists, without
-  unlinking the live file first. Local fallback lock acquisition is
+  unlinking the live file first. Local fallback reads open the data file
+  without following symlinks, validate the opened handle (regular file,
+  owner-only mode, Unix single-link), and refuse inputs above
+  `AUDIT_LOCAL_FALLBACK_MAX_BYTES` (16 MiB) before parse. Hard-linked lock
+  targets are rejected before chmod/flock. Local fallback lock acquisition is
   non-blocking (in-process `try_lock`, Unix `flock(LOCK_EX|LOCK_NB)`,
   Windows immediate share denial) so contention fails closed instead of
   hanging a blocking-pool thread. Backup `resources=` filters are
