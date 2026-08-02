@@ -8041,6 +8041,9 @@ async fn large_spool_status_and_prometheus_use_cached_gauges_without_inventory()
     );
 
     let walks_baseline = active_spool_inventory_walks_for_tests();
+    // Structural proxy-progress proof: scrapes over a large spool must not
+    // inventory/stat the tree. Zero walk growth means the prior blocking FS
+    // work is absent from the admin/metrics path (no flaky wall-clock bound).
     let status = render_status_json();
     let prom = render_prometheus();
     let status2 = render_status_json();
@@ -8048,7 +8051,7 @@ async fn large_spool_status_and_prometheus_use_cached_gauges_without_inventory()
     assert_eq!(
         active_spool_inventory_walks_for_tests(),
         walks_baseline,
-        "status/Prometheus rendering must not inventory the spool; this deterministic walk count proves the prior blocking filesystem work is absent from the scrape path"
+        "status/Prometheus rendering must not inventory the spool; this deterministic walk count proves scrapes do not block proxy progress with large-spool filesystem walks"
     );
     assert!(
         status.contains(&format!("\"files\":{PLANTED}")),
