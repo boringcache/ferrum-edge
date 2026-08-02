@@ -18,12 +18,22 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::cni::spec::CniValidAttachment;
+use crate::cni::spec::{
+    CniValidAttachment, MAX_CNI_ATTACHMENT_FIELD_BYTES, ingest_valid_attachments,
+    is_safe_cni_container_id, is_safe_cni_ifname, is_safe_cni_netns_path,
+    is_safe_cni_network_name,
+};
 
 /// Hard cap on a single RPC message. ADD/DEL/CHECK stay tiny; GC may carry a
-/// bounded valid-attachment set (see [`crate::cni::spec::MAX_CNI_GC_ATTACHMENTS`]),
-/// so the frame cap is sized for that worst case while remaining finite.
-pub const MAX_RPC_BYTES: usize = 256 * 1024;
+/// bounded valid-attachment set. One MiB is deliberately above the CNI stdin
+/// cap so a valid normalized request does not become oversized merely because
+/// the RPC envelope adds fields, while still bounding node-agent allocation.
+pub const MAX_RPC_BYTES: usize = 1024 * 1024;
+
+/// Explicit bounds for the pass-through CNI argument map. The map is not used
+/// for GC, but it crosses the same untrusted local RPC boundary.
+pub const MAX_RPC_ARGS: usize = 64;
+pub const MAX_RPC_ARG_FIELD_BYTES: usize = 1024;
 
 /// Length-prefix size in bytes (big-endian `u32` of the JSON body length).
 pub const LENGTH_PREFIX_BYTES: usize = 4;
@@ -71,8 +81,12 @@ impl RpcOutcome {
 
 /// One CNI invocation, normalized for the node-agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CniRpcRequest {
     pub verb: RpcVerb,
+    /// CNI network configuration name. GC is authoritative only within this
+    /// scope; omitting it would let one network sweep another network's claim.
+    pub network_name: String,
     /// Empty on GC (no attachment parameters).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pod_namespace: String,
@@ -104,6 +118,102 @@ pub struct CniRpcRequest {
     /// Already bounded/validated by the CNI binary before the RPC is sent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub valid_attachments: Vec<CniValidAttachment>,
+}
+
+impl CniRpcRequest {
+    /// Revalidate the complete request at the node-agent boundary. The short-
+    /// lived CNI binary performs the same checks for operator feedback, but the
+    /// UDS peer is not trusted to have used that binary.
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_safe_cni_network_name(&self.network_name) {
+            return Err("invalid CNI network name".to_string());
+        }
+
+        if self.verb == RpcVerb::Gc {
+            if !self.pod_namespace.is_empty()
+                || !self.pod_name.is_empty()
+                || self.pod_uid.is_some()
+                || !self.container_id.is_empty()
+                || self.ifname.is_some()
+                || self.netns_path.is_some()
+                || !self.args.is_empty()
+            {
+                return Err("GC request contains attachment-specific fields".to_string());
+            }
+            ingest_valid_attachments(self.valid_attachments.clone())
+                .map(|_| ())
+                .map_err(|err| err.to_string())?;
+            return Ok(());
+        }
+
+        if !self.valid_attachments.is_empty() {
+            return Err("non-GC request contains a GC attachment set".to_string());
+        }
+        if !is_safe_k8s_namespace(&self.pod_namespace) {
+            return Err("invalid Kubernetes pod namespace".to_string());
+        }
+        if !is_safe_k8s_name(&self.pod_name) {
+            return Err("invalid Kubernetes pod name".to_string());
+        }
+        if !is_safe_cni_container_id(&self.container_id)
+            || self.container_id.len() > MAX_CNI_ATTACHMENT_FIELD_BYTES
+        {
+            return Err("invalid CNI container ID".to_string());
+        }
+        if !self.ifname.as_deref().is_some_and(is_safe_cni_ifname) {
+            return Err("invalid CNI interface name".to_string());
+        }
+        if matches!(self.verb, RpcVerb::Add | RpcVerb::Check) && self.netns_path.is_none() {
+            return Err("ADD/CHECK request is missing CNI network namespace".to_string());
+        }
+        if self
+            .netns_path
+            .as_deref()
+            .is_some_and(|path| !is_safe_cni_netns_path(path))
+        {
+            return Err("invalid CNI network namespace path".to_string());
+        }
+        if self.pod_uid.as_deref().is_some_and(|uid| {
+            uid.len() > MAX_CNI_ATTACHMENT_FIELD_BYTES || !is_safe_cni_container_id(uid)
+        }) {
+            return Err("invalid Kubernetes pod UID".to_string());
+        }
+        if self.args.len() > MAX_RPC_ARGS
+            || self.args.iter().any(|(key, value)| {
+                key.is_empty()
+                    || key.len() > MAX_RPC_ARG_FIELD_BYTES
+                    || value.len() > MAX_RPC_ARG_FIELD_BYTES
+                    || key.chars().any(char::is_control)
+                    || value.chars().any(char::is_control)
+            })
+        {
+            return Err("invalid or oversized CNI argument map".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn is_safe_k8s_namespace(value: &str) -> bool {
+    value.len() <= 63 && is_safe_dns_label(value)
+}
+
+fn is_safe_k8s_name(value: &str) -> bool {
+    if value.is_empty() || value.len() > 253 {
+        return false;
+    }
+    value.split('.').all(is_safe_dns_label)
+}
+
+fn is_safe_dns_label(value: &str) -> bool {
+    if value.is_empty() || value.len() > 63 {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
 /// Node-agent response shape. We never echo back pod payload — `Ok` or
@@ -172,6 +282,7 @@ mod tests {
     fn rpc_request_optional_fields_skip_serializing_when_none() {
         let req = CniRpcRequest {
             verb: RpcVerb::Add,
+            network_name: "ferrum-mesh".to_string(),
             pod_namespace: "demo".to_string(),
             pod_name: "alpha".to_string(),
             pod_uid: None,
@@ -193,6 +304,7 @@ mod tests {
     fn rpc_gc_request_carries_valid_attachments() {
         let req = CniRpcRequest {
             verb: RpcVerb::Gc,
+            network_name: "ferrum-mesh".to_string(),
             pod_namespace: String::new(),
             pod_name: String::new(),
             pod_uid: None,
@@ -235,6 +347,7 @@ mod tests {
     fn encode_frame_includes_length_prefix() {
         let req = CniRpcRequest {
             verb: RpcVerb::Del,
+            network_name: "ferrum-mesh".to_string(),
             pod_namespace: "demo".to_string(),
             pod_name: "alpha".to_string(),
             pod_uid: None,
@@ -261,6 +374,7 @@ mod tests {
         let huge_value = "x".repeat(MAX_RPC_BYTES + 1);
         let req = CniRpcRequest {
             verb: RpcVerb::Add,
+            network_name: "ferrum-mesh".to_string(),
             pod_namespace: huge_value,
             pod_name: "alpha".to_string(),
             pod_uid: None,

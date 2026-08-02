@@ -9,7 +9,7 @@
 //! hard-linked, symlinked, or path-like input. Hostile bytes are never echoed
 //! into errors or logs.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -17,12 +17,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use super::spec::{
     MAX_CNI_ATTACHMENT_FIELD_BYTES, MAX_CNI_GC_ATTACHMENTS, is_safe_cni_container_id,
-    is_safe_cni_ifname,
+    is_safe_cni_ifname, is_safe_cni_network_name,
 };
+use crate::fips::approved::Sha256;
 use crate::tls::private_file::replace_private_file;
 
 /// On-disk schema version. Unknown versions fail closed. This branch replaces
@@ -60,6 +60,7 @@ pub const MAX_CNI_OWNERSHIP_INBOUND_PORTS: usize = 64;
 /// drive Ferrum-owned teardown after a process restart when live `pod_states`
 /// is empty.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DurableCniCleanupSnapshot {
     pub attached: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,7 +79,9 @@ pub struct DurableCniCleanupSnapshot {
 
 /// One Ferrum-owned CNI attachment identity plus its cleanup snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DurableCniOwnershipRecord {
+    pub network_name: String,
     pub container_id: String,
     pub ifname: String,
     pub pod_uid: String,
@@ -86,6 +89,7 @@ pub struct DurableCniOwnershipRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DurableCniOwnershipDocument {
     version: u32,
     attachments: Vec<DurableCniOwnershipRecord>,
@@ -134,14 +138,15 @@ impl std::error::Error for CniOwnershipStoreError {}
 
 /// Stable store filename identity derived from the exact configured socket path.
 ///
-/// Digests the trimmed socket path so hostile path bytes never appear in the
-/// filename, while still distinguishing two sockets that share a parent.
+/// Rejects surrounding whitespace and digests the exact socket path so hostile
+/// path bytes never appear in the filename while distinct socket identities do
+/// not collapse.
 pub fn ownership_store_id_for_socket(socket_path: &str) -> Option<String> {
     let trimmed = socket_path.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed != socket_path {
         return None;
     }
-    let digest = Sha256::digest(trimmed.as_bytes());
+    let digest = Sha256::digest(socket_path.as_bytes());
     Some(hex::encode(&digest[..(CNI_OWNERSHIP_STORE_ID_HEX_LEN / 2)]))
 }
 
@@ -150,15 +155,18 @@ pub fn ownership_store_id_for_socket(socket_path: &str) -> Option<String> {
 /// Returns `None` when the socket path has no usable parent directory.
 pub fn ownership_store_path_for_socket(socket_path: &str) -> Option<PathBuf> {
     let trimmed = socket_path.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed != socket_path {
         return None;
     }
-    let path = Path::new(trimmed);
+    let path = Path::new(socket_path);
+    if !path.is_absolute() {
+        return None;
+    }
     let parent = path.parent()?;
     if parent.as_os_str().is_empty() {
         return None;
     }
-    let id = ownership_store_id_for_socket(trimmed)?;
+    let id = ownership_store_id_for_socket(socket_path)?;
     Some(parent.join(format!(
         "{CNI_OWNERSHIP_STORE_FILENAME_PREFIX}{id}{CNI_OWNERSHIP_STORE_FILENAME_SUFFIX}"
     )))
@@ -201,7 +209,8 @@ fn validate_cleanup(cleanup: &DurableCniCleanupSnapshot) -> Result<(), CniOwners
 }
 
 fn validate_record(record: &DurableCniOwnershipRecord) -> Result<(), CniOwnershipStoreError> {
-    if !is_safe_cni_container_id(&record.container_id)
+    if !is_safe_cni_network_name(&record.network_name)
+        || !is_safe_cni_container_id(&record.container_id)
         || record.container_id.len() > MAX_CNI_ATTACHMENT_FIELD_BYTES
     {
         return Err(CniOwnershipStoreError::InvalidRecord);
@@ -221,6 +230,16 @@ fn refuse_symlink(path: &Path) -> Result<(), CniOwnershipStoreError> {
         Ok(meta) if meta.file_type().is_symlink() => Err(CniOwnershipStoreError::Symlink),
         Ok(_) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(CniOwnershipStoreError::Io),
+    }
+}
+
+fn require_real_directory(path: &Path) -> Result<(), CniOwnershipStoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(CniOwnershipStoreError::Symlink),
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(CniOwnershipStoreError::NotRegular),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Err(CniOwnershipStoreError::Path),
         Err(_) => Err(CniOwnershipStoreError::Io),
     }
 }
@@ -305,6 +324,9 @@ pub fn parse_durable_cni_ownership_bytes(
     if bytes.len() > MAX_CNI_OWNERSHIP_STORE_BYTES {
         return Err(CniOwnershipStoreError::Oversized);
     }
+    if crate::util::json_dup_keys::slice_ambiguity(bytes).is_some() {
+        return Err(CniOwnershipStoreError::TruncatedOrInvalid);
+    }
     let doc: DurableCniOwnershipDocument = match serde_json::from_slice(bytes) {
         Ok(doc) => doc,
         Err(_) => return Err(CniOwnershipStoreError::TruncatedOrInvalid),
@@ -316,11 +338,22 @@ pub fn parse_durable_cni_ownership_bytes(
         return Err(CniOwnershipStoreError::TooManyAttachments);
     }
     let mut seen = HashSet::with_capacity(doc.attachments.len());
+    let mut cleanup_by_pod = HashMap::new();
     let mut out = Vec::with_capacity(doc.attachments.len());
     for record in doc.attachments {
         validate_record(&record)?;
-        let key = (record.container_id.clone(), record.ifname.clone());
+        let key = (
+            record.network_name.clone(),
+            record.container_id.clone(),
+            record.ifname.clone(),
+        );
         if !seen.insert(key) {
+            return Err(CniOwnershipStoreError::InvalidRecord);
+        }
+        if cleanup_by_pod
+            .insert(record.pod_uid.clone(), record.cleanup.clone())
+            .is_some_and(|cleanup| cleanup != record.cleanup)
+        {
             return Err(CniOwnershipStoreError::InvalidRecord);
         }
         out.push(record);
@@ -335,12 +368,23 @@ fn encode_durable_cni_ownership(
         return Err(CniOwnershipStoreError::TooManyAttachments);
     }
     let mut seen = HashSet::with_capacity(records.len());
+    let mut cleanup_by_pod = HashMap::new();
     for record in records {
         validate_record(record)?;
-        let key = (record.container_id.as_str(), record.ifname.as_str());
+        let key = (
+            record.network_name.as_str(),
+            record.container_id.as_str(),
+            record.ifname.as_str(),
+        );
         if !seen.insert(key) {
             // Encoder must refuse duplicate attachment identity so a reused
             // `(container_id, ifname)` cannot persist a self-rejecting file.
+            return Err(CniOwnershipStoreError::InvalidRecord);
+        }
+        if cleanup_by_pod
+            .insert(record.pod_uid.as_str(), &record.cleanup)
+            .is_some_and(|cleanup| cleanup != &record.cleanup)
+        {
             return Err(CniOwnershipStoreError::InvalidRecord);
         }
     }
@@ -364,18 +408,23 @@ pub fn store_durable_cni_ownership(
     if parent.as_os_str().is_empty() {
         return Err(CniOwnershipStoreError::Path);
     }
-    refuse_symlink(path)?;
-    // Refuse a symlinked parent so writes cannot be redirected off the
-    // configured Ferrum CNI runtime directory.
-    refuse_symlink(parent)?;
-    if let Err(err) = fs::create_dir_all(parent)
-        && err.kind() != io::ErrorKind::AlreadyExists
-    {
-        return Err(CniOwnershipStoreError::Io);
+    // Refuse a symlinked or non-directory parent so writes cannot be redirected
+    // off the configured Ferrum CNI runtime directory.
+    match fs::symlink_metadata(parent) {
+        Ok(_) => require_real_directory(parent)?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(parent).map_err(|_| CniOwnershipStoreError::Io)?;
+        }
+        Err(_) => return Err(CniOwnershipStoreError::Io),
     }
-    // Re-check after create: a raced symlink must not become authoritative.
-    refuse_symlink(parent)?;
+    // Re-check after create: a raced symlink or non-directory must not become
+    // authoritative.
+    require_real_directory(parent)?;
     refuse_symlink(path)?;
+    // Validate an existing destination by descriptor before the shared private
+    // file publisher snapshots or replaces it. This rejects hard links and
+    // non-regular files on writes as well as reads.
+    drop(open_durable_ownership_file(path)?);
     let bytes = encode_durable_cni_ownership(records)?;
     replace_private_file(path, &bytes).map_err(|_| CniOwnershipStoreError::Io)
 }
@@ -385,8 +434,6 @@ pub fn store_durable_cni_ownership(
 #[derive(Debug, Default)]
 struct CniOwnershipRuntime {
     path: Option<PathBuf>,
-    /// `true` once a load attempt completed for the configured path.
-    loaded: bool,
     /// `true` when the configured durable state was rejected; GC must fail
     /// closed without sweeping.
     rejected: bool,
@@ -394,7 +441,6 @@ struct CniOwnershipRuntime {
 
 static CNI_OWNERSHIP_RUNTIME: Mutex<CniOwnershipRuntime> = Mutex::new(CniOwnershipRuntime {
     path: None,
-    loaded: false,
     rejected: false,
 });
 
@@ -411,7 +457,6 @@ fn lock_runtime() -> std::sync::MutexGuard<'static, CniOwnershipRuntime> {
 pub fn configure_cni_ownership_store(path: Option<PathBuf>) {
     let mut runtime = lock_runtime();
     runtime.path = path;
-    runtime.loaded = false;
     runtime.rejected = false;
 }
 
@@ -436,18 +481,15 @@ pub fn load_configured_cni_ownership(
 ) -> Result<Option<Vec<DurableCniOwnershipRecord>>, CniOwnershipStoreError> {
     let mut runtime = lock_runtime();
     let Some(path) = runtime.path.clone() else {
-        runtime.loaded = true;
         runtime.rejected = false;
         return Ok(None);
     };
     match load_durable_cni_ownership(&path) {
         Ok(records) => {
-            runtime.loaded = true;
             runtime.rejected = false;
             Ok(Some(records))
         }
         Err(err) => {
-            runtime.loaded = true;
             runtime.rejected = true;
             Err(err)
         }

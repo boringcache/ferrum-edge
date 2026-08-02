@@ -129,6 +129,7 @@ mod tests {
 
         let req = CniRpcRequest {
             verb: RpcVerb::Add,
+            network_name: "ferrum-mesh".to_string(),
             pod_namespace: "demo".to_string(),
             pod_name: "alpha".to_string(),
             pod_uid: Some("uid-1".to_string()),
@@ -150,6 +151,7 @@ mod tests {
         let socket_path = dir.path().join("does-not-exist.sock");
         let req = CniRpcRequest {
             verb: RpcVerb::Add,
+            network_name: "ferrum-mesh".to_string(),
             pod_namespace: "demo".to_string(),
             pod_name: "alpha".to_string(),
             pod_uid: None,

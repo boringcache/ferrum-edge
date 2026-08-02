@@ -1661,14 +1661,14 @@ pub struct EnvConfig {
     pub node_agent_hbone_redirect_port: u16,
     /// Opt in to the node-agent CNI plugin lifecycle hook. When `true`, the
     /// node-agent listens on `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` for ADD /
-    /// DEL / CHECK calls forwarded by the `ferrum-cni` binary that the
+    /// DEL / CHECK / GC calls forwarded by the `ferrum-cni` binary that the
     /// Helm install drops into `/opt/cni/bin/`. Default `false` so existing
     /// operators with a working install do not change behavior on upgrade;
     /// the kube-rs pod watcher remains the source of truth for enrollment
     /// regardless of this flag — CNI is an optimization, not a hard
     /// dependency.
     pub node_agent_cni_enabled: bool,
-    /// Path the node-agent listens on for the CNI plugin RPC. Default
+    /// Absolute path the node-agent listens on for the CNI plugin RPC. Default
     /// `/var/run/ferrum/node-agent-cni.sock` — a sibling of the existing
     /// `DEFAULT_NODE_AGENT_SOCKET_PATH` so the two surfaces don't collide.
     /// Only consulted when `node_agent_cni_enabled` is `true`.
@@ -5313,6 +5313,20 @@ impl EnvConfig {
             }
             if self.node_agent_cni_enabled && self.node_agent_cni_socket_path.trim().is_empty() {
                 return Err("FERRUM_NODE_AGENT_CNI_SOCKET_PATH must not be empty when \
+                     FERRUM_NODE_AGENT_CNI_ENABLED is true"
+                    .into());
+            }
+            if self.node_agent_cni_enabled
+                && self.node_agent_cni_socket_path != self.node_agent_cni_socket_path.trim()
+            {
+                return Err("FERRUM_NODE_AGENT_CNI_SOCKET_PATH must not contain surrounding \
+                     whitespace"
+                    .into());
+            }
+            if self.node_agent_cni_enabled
+                && !std::path::Path::new(self.node_agent_cni_socket_path.trim()).is_absolute()
+            {
+                return Err("FERRUM_NODE_AGENT_CNI_SOCKET_PATH must be absolute when \
                      FERRUM_NODE_AGENT_CNI_ENABLED is true"
                     .into());
             }

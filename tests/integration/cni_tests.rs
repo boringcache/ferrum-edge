@@ -41,6 +41,7 @@ use ferrum_edge::modes::node_agent_cni_server::{cni_work_channel, spawn_cni_list
 fn build_request(verb: RpcVerb) -> CniRpcRequest {
     CniRpcRequest {
         verb,
+        network_name: "ferrum-mesh-chain".to_string(),
         pod_namespace: "demo".to_string(),
         pod_name: "alpha".to_string(),
         pod_uid: Some("uid-1".to_string()),
@@ -200,8 +201,8 @@ async fn cni_del_round_trip_is_idempotent() {
 }
 
 /// Error path: stub main loop replies with an `Error` variant — the
-/// blocking client decodes it and surfaces it to the binary, which the
-/// binary maps to CNI exit code 12.
+/// blocking client decodes it and surfaces it to the binary as a retryable
+/// CNI error (code 11).
 #[tokio::test]
 async fn cni_round_trip_surfaces_main_loop_error() {
     let dir = tempdir().expect("tempdir");
@@ -392,6 +393,7 @@ async fn cni_gc_round_trip_forwards_valid_attachments() {
     let resp = tokio::task::spawn_blocking(move || {
         let req = CniRpcRequest {
             verb: RpcVerb::Gc,
+            network_name: "ferrum-mesh-chain".to_string(),
             pod_namespace: String::new(),
             pod_name: String::new(),
             pod_uid: None,
@@ -473,7 +475,7 @@ async fn ferrum_cni_binary_gc_rejects_pre_1_1_version() {
             "cniVersion": "1.0.0",
             "name": "ferrum-mesh-chain",
             "type": "ferrum-cni",
-            "cni.dev/valid-attachments": []
+            "cni.dev/attachments": []
         })
         .to_string();
         let mut child = Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
@@ -504,6 +506,93 @@ async fn ferrum_cni_binary_gc_rejects_pre_1_1_version() {
     let payload: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("CNI error JSON should parse");
     assert_eq!(payload["code"], 1);
+}
+
+/// The CNI 1.1 reserved field is exactly `cni.dev/attachments`. A misspelled
+/// reserved key must not collapse to an authoritative empty set.
+#[tokio::test]
+async fn ferrum_cni_binary_gc_rejects_missing_or_misspelled_attachment_set() {
+    let output = tokio::task::spawn_blocking(|| {
+        let stdin_config = serde_json::json!({
+            "cniVersion": "1.1.0",
+            "name": "ferrum-mesh-chain",
+            "type": "ferrum-cni",
+            "cni.dev/valid-attachments": []
+        })
+        .to_string();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
+            .env("CNI_COMMAND", "GC")
+            .env("CNI_PATH", "/opt/cni/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ferrum-cni");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin pipe")
+            .write_all(stdin_config.as_bytes())
+            .expect("write stdin");
+        child.wait_with_output().expect("wait ferrum-cni")
+    })
+    .await
+    .expect("blocking task joined");
+
+    assert!(!output.status.success());
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("CNI error JSON should parse");
+    assert_eq!(payload["code"], 7);
+    assert!(
+        payload["msg"]
+            .as_str()
+            .is_some_and(|message| message.contains("reserved cni.dev/")),
+        "unexpected payload: {payload}"
+    );
+}
+
+#[test]
+fn cni_rpc_boundary_rejects_cross_verb_paths_and_identifiers() {
+    use ferrum_edge::cni::spec::CniValidAttachment;
+
+    let valid_gc = CniRpcRequest {
+        verb: RpcVerb::Gc,
+        network_name: "ferrum-mesh-chain".to_string(),
+        pod_namespace: String::new(),
+        pod_name: String::new(),
+        pod_uid: None,
+        container_id: String::new(),
+        ifname: None,
+        netns_path: None,
+        args: std::collections::HashMap::new(),
+        valid_attachments: vec![CniValidAttachment {
+            container_id: "ctr-live".to_string(),
+            ifname: "eth0".to_string(),
+        }],
+    };
+    assert!(valid_gc.validate().is_ok());
+
+    let mut cross_verb = valid_gc.clone();
+    cross_verb.pod_name = "another-pod".to_string();
+    assert!(cross_verb.validate().is_err());
+
+    let mut unsafe_id = valid_gc.clone();
+    unsafe_id.valid_attachments[0].container_id = "../escape".to_string();
+    assert!(unsafe_id.validate().is_err());
+
+    let mut unsafe_network = valid_gc;
+    unsafe_network.network_name = "../../other-network".to_string();
+    assert!(unsafe_network.validate().is_err());
+
+    let mut unsafe_path = build_request(RpcVerb::Add);
+    unsafe_path.netns_path = Some("/var/run/netns/../host".to_string());
+    assert!(unsafe_path.validate().is_err());
+
+    let mut oversized_args = build_request(RpcVerb::Add);
+    oversized_args.args = (0..65)
+        .map(|index| (format!("ARG_{index}"), "value".to_string()))
+        .collect();
+    assert!(oversized_args.validate().is_err());
 }
 
 /// Binary-level GC against a live node-agent socket succeeds with empty stdout.
@@ -542,7 +631,7 @@ async fn ferrum_cni_binary_gc_exits_zero_on_ok() {
             "name": "ferrum-mesh-chain",
             "type": "ferrum-cni",
             "ferrum": { "socketPath": socket_path_str },
-            "cni.dev/valid-attachments": [
+            "cni.dev/attachments": [
                 {"containerID": "ctr-live", "ifname": "eth0"}
             ]
         })

@@ -69,12 +69,14 @@ fn durable_ownership_round_trip_persists_cleanup_snapshot() {
     let path = dir.path().join("cni-owned-attachments.test.v2");
     let records = vec![
         DurableCniOwnershipRecord {
+            network_name: "ferrum-mesh".into(),
             container_id: "ctr-a".into(),
             ifname: "eth0".into(),
             pod_uid: "pod-uid-1".into(),
             cleanup: sample_cleanup(),
         },
         DurableCniOwnershipRecord {
+            network_name: "ferrum-mesh".into(),
             container_id: "ctr-b".into(),
             ifname: "eth1".into(),
             pod_uid: "pod-uid-2".into(),
@@ -113,12 +115,14 @@ fn durable_ownership_round_trip_persists_cleanup_snapshot() {
 fn encoder_rejects_duplicate_attachment_identity() {
     let dup = vec![
         DurableCniOwnershipRecord {
+            network_name: "ferrum-mesh".into(),
             container_id: "ctr-a".into(),
             ifname: "eth0".into(),
             pod_uid: "pod-uid-1".into(),
             cleanup: sample_cleanup(),
         },
         DurableCniOwnershipRecord {
+            network_name: "ferrum-mesh".into(),
             container_id: "ctr-a".into(),
             ifname: "eth0".into(),
             pod_uid: "pod-uid-2".into(),
@@ -139,15 +143,49 @@ fn encoder_rejects_duplicate_attachment_identity() {
 }
 
 #[test]
+fn ownership_identity_is_network_scoped_and_shared_pod_cleanup_must_agree() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("network-scoped.v2");
+    let mut second_network = DurableCniOwnershipRecord {
+        network_name: "network-b".into(),
+        container_id: "ctr-a".into(),
+        ifname: "eth0".into(),
+        pod_uid: "pod-uid-1".into(),
+        cleanup: sample_cleanup(),
+    };
+    let records = vec![
+        DurableCniOwnershipRecord {
+            network_name: "network-a".into(),
+            ..second_network.clone()
+        },
+        second_network.clone(),
+    ];
+    store_durable_cni_ownership(&path, &records)
+        .expect("the same attachment tuple in distinct networks is not a duplicate");
+    assert_eq!(
+        load_durable_cni_ownership(&path)
+            .expect("load network-scoped claims")
+            .len(),
+        2
+    );
+
+    second_network.cleanup.node_probe_ports.push(9090);
+    let inconsistent = vec![records[0].clone(), second_network];
+    let err = store_durable_cni_ownership(&path, &inconsistent)
+        .expect_err("one pod cannot carry conflicting cleanup authority");
+    assert!(err.to_string().contains("invalid"));
+}
+
+#[test]
 fn malformed_oversized_and_hostile_durable_state_fail_closed_without_echo() {
     let oversized_id = "a".repeat(MAX_CNI_ATTACHMENT_FIELD_BYTES + 1);
     let oversized = format!(
-        "{{\"version\":2,\"attachments\":[{{\"container_id\":\"{oversized_id}\",\"ifname\":\"eth0\",\"pod_uid\":\"uid\",\"cleanup\":{{\"attached\":true}}}}]}}"
+        "{{\"version\":2,\"attachments\":[{{\"network_name\":\"ferrum-mesh\",\"container_id\":\"{oversized_id}\",\"ifname\":\"eth0\",\"pod_uid\":\"uid\",\"cleanup\":{{\"attached\":true}}}}]}}"
     );
     let err = parse_durable_cni_ownership_bytes(oversized.as_bytes()).expect_err("reject");
     assert!(!err.to_string().contains(&oversized_id));
 
-    let path_like = br#"{"version":2,"attachments":[{"container_id":"../escape","ifname":"eth0","pod_uid":"uid","cleanup":{"attached":true}}]}"#;
+    let path_like = br#"{"version":2,"attachments":[{"network_name":"ferrum-mesh","container_id":"../escape","ifname":"eth0","pod_uid":"uid","cleanup":{"attached":true}}]}"#;
     let err = parse_durable_cni_ownership_bytes(path_like).expect_err("reject");
     assert!(!err.to_string().contains("../escape"));
 
@@ -188,6 +226,7 @@ fn hard_linked_durable_ownership_store_is_rejected() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("cni-owned-attachments.hl.v2");
     let records = vec![DurableCniOwnershipRecord {
+        network_name: "ferrum-mesh".into(),
         container_id: "ctr-a".into(),
         ifname: "eth0".into(),
         pod_uid: "pod-uid-1".into(),
@@ -196,6 +235,13 @@ fn hard_linked_durable_ownership_store_is_rejected() {
     store_durable_cni_ownership(&path, &records).expect("store");
     let link = dir.path().join("hardlink.v2");
     std::fs::hard_link(&path, &link).expect("hardlink");
+    let write_err =
+        store_durable_cni_ownership(&path, &records).expect_err("hardlink write");
+    assert!(
+        write_err.to_string().contains("hard-linked")
+            || write_err.to_string().contains("non-regular"),
+        "expected hard-link write rejection, got: {write_err}"
+    );
     let err = load_durable_cni_ownership(&path).expect_err("hardlink");
     assert!(
         err.to_string().contains("hard-linked") || err.to_string().contains("non-regular"),

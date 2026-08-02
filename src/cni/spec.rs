@@ -17,12 +17,23 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-/// Hard cap on `cni.dev/valid-attachments` entries accepted for one GC call.
+/// Hard cap on `cni.dev/attachments` entries accepted for one GC call.
 /// Large enough for dense nodes; small enough to keep reconciliation bounded.
 pub const MAX_CNI_GC_ATTACHMENTS: usize = 8192;
 
 /// Per-field byte cap for GC attachment `containerID` / `ifname` values.
 pub const MAX_CNI_ATTACHMENT_FIELD_BYTES: usize = 256;
+
+/// Maximum byte length accepted for a CNI network name.
+pub const MAX_CNI_NETWORK_NAME_BYTES: usize = 256;
+
+/// Maximum byte length accepted for a network-namespace path.
+pub const MAX_CNI_NETNS_PATH_BYTES: usize = 4096;
+
+/// Explicit CNI_ARGS resource limits before values cross the local RPC.
+pub const MAX_CNI_ARGS_BYTES: usize = 16 * 1024;
+pub const MAX_CNI_ARGS_ENTRIES: usize = 64;
+pub const MAX_CNI_ARG_FIELD_BYTES: usize = 1024;
 
 /// Hard cap on CNI stdin JSON size. Prevents hostile kubelet/runtime input
 /// from forcing unbounded allocation into the short-lived plugin process.
@@ -165,11 +176,24 @@ impl CniInvocation {
             CniCommand::Add | CniCommand::Del | CniCommand::Check => {
                 let container_id = env::var("CNI_CONTAINERID")
                     .map_err(|_| CniError::missing_env("CNI_CONTAINERID"))?;
-                if container_id.trim().is_empty() {
+                if !is_safe_cni_container_id(&container_id)
+                    || container_id.len() > MAX_CNI_ATTACHMENT_FIELD_BYTES
+                {
                     return Err(CniError::missing_env("CNI_CONTAINERID"));
                 }
                 let netns = env::var("CNI_NETNS").ok().filter(|v| !v.trim().is_empty());
-                let ifname = env::var("CNI_IFNAME").ok().filter(|v| !v.trim().is_empty());
+                if matches!(command, CniCommand::Add | CniCommand::Check) && netns.is_none() {
+                    return Err(CniError::missing_env("CNI_NETNS"));
+                }
+                if netns.as_deref().is_some_and(|path| !is_safe_cni_netns_path(path)) {
+                    return Err(CniError::missing_env("CNI_NETNS"));
+                }
+                let ifname = env::var("CNI_IFNAME")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty());
+                if !ifname.as_deref().is_some_and(is_safe_cni_ifname) {
+                    return Err(CniError::missing_env("CNI_IFNAME"));
+                }
                 let args = env::var("CNI_ARGS").ok().filter(|v| !v.trim().is_empty());
                 let path = env::var("CNI_PATH").ok().filter(|v| !v.trim().is_empty());
                 Ok(Self {
@@ -203,6 +227,49 @@ pub fn parse_cni_args(raw: &str) -> HashMap<String, String> {
             Some((key, v.trim().to_string()))
         })
         .collect()
+}
+
+/// Strict, bounded CNI_ARGS ingestion for the executable boundary.
+///
+/// Duplicate keys are rejected after case normalization so pod identity cannot
+/// depend on first-wins versus last-wins interpretation.
+pub fn ingest_cni_args(raw: &str) -> Result<HashMap<String, String>, CniError> {
+    if raw.len() > MAX_CNI_ARGS_BYTES {
+        return Err(CniError::BadConfig(format!(
+            "CNI_ARGS exceeds {MAX_CNI_ARGS_BYTES} byte cap"
+        )));
+    }
+    let mut args = HashMap::new();
+    for token in raw.split(';') {
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_uppercase();
+        let value = value.trim();
+        if key.is_empty() {
+            continue;
+        }
+        if key.len() > MAX_CNI_ARG_FIELD_BYTES
+            || value.len() > MAX_CNI_ARG_FIELD_BYTES
+            || key.chars().any(char::is_control)
+            || value.chars().any(char::is_control)
+        {
+            return Err(CniError::BadConfig(
+                "CNI_ARGS contains an invalid or oversized field".to_string(),
+            ));
+        }
+        if args.len() >= MAX_CNI_ARGS_ENTRIES {
+            return Err(CniError::BadConfig(format!(
+                "CNI_ARGS exceeds {MAX_CNI_ARGS_ENTRIES} entry cap"
+            )));
+        }
+        if args.insert(key, value.to_string()).is_some() {
+            return Err(CniError::BadConfig(
+                "CNI_ARGS contains a duplicate key".to_string(),
+            ));
+        }
+    }
+    Ok(args)
 }
 
 /// Extracted Kubernetes pod identity from CNI_ARGS.
@@ -269,13 +336,17 @@ pub struct CniNetConfig {
     /// Defaults to `Default` when missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ferrum: Option<FerrumCniOptions>,
-    /// Still-valid attachments supplied on GC (CNI 1.1 `cni.dev/valid-attachments`).
+    /// Still-valid attachments supplied on GC (CNI 1.1 `cni.dev/attachments`).
+    ///
+    /// `None` is distinct from an explicitly empty list: the specification
+    /// requires the runtime-generated key on GC, and treating omission as an
+    /// empty authoritative set would widen cleanup on malformed requests.
     #[serde(
-        rename = "cni.dev/valid-attachments",
+        rename = "cni.dev/attachments",
         default,
-        skip_serializing_if = "Vec::is_empty"
+        skip_serializing_if = "Option::is_none"
     )]
-    pub valid_attachments: Vec<CniValidAttachment>,
+    pub valid_attachments: Option<Vec<CniValidAttachment>>,
     /// Pass-through for any conflist fields we don't model explicitly
     /// (chained plugins may add fields kubelet round-trips). Preserving
     /// them keeps Ferrum invisible to neighbour plugins.
@@ -289,6 +360,7 @@ fn default_cni_version() -> String {
 
 /// One still-valid CNI attachment from a GC request (`containerID`, `ifname`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
 pub struct CniValidAttachment {
     #[serde(rename = "containerID")]
     pub container_id: String,
@@ -317,7 +389,7 @@ impl CniValidAttachment {
 fn validate_attachment_field(field: &str, value: &str) -> Result<(), CniError> {
     if value.is_empty() {
         return Err(CniError::BadConfig(format!(
-            "cni.dev/valid-attachments entry missing {field}"
+            "cni.dev/attachments entry missing {field}"
         )));
     }
     if value.len() > MAX_CNI_ATTACHMENT_FIELD_BYTES {
@@ -357,6 +429,32 @@ pub fn is_safe_cni_ifname(value: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' || c == '@')
 }
 
+/// CNI network names use the same safe grammar as container IDs and are
+/// additionally bounded before they cross the node-agent RPC boundary.
+pub fn is_safe_cni_network_name(value: &str) -> bool {
+    value.len() <= MAX_CNI_NETWORK_NAME_BYTES && is_safe_cni_container_id(value)
+}
+
+/// Validate a network-namespace path without touching the filesystem.
+///
+/// Runtimes may use different absolute roots, so the boundary checks shape,
+/// length, NULs, and parent traversal rather than pinning one host prefix.
+pub fn is_safe_cni_netns_path(value: &str) -> bool {
+    use std::path::{Component, Path};
+
+    if value.is_empty()
+        || value.len() > MAX_CNI_NETNS_PATH_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let path = Path::new(value);
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+}
+
 /// Bound, validate, and dedupe a GC valid-attachment list. Fail closed on
 /// oversized or hostile input rather than partially applying GC.
 pub fn ingest_valid_attachments(
@@ -364,7 +462,7 @@ pub fn ingest_valid_attachments(
 ) -> Result<Vec<CniValidAttachment>, CniError> {
     if attachments.len() > MAX_CNI_GC_ATTACHMENTS {
         return Err(CniError::BadConfig(format!(
-            "cni.dev/valid-attachments has {} entries; cap is {MAX_CNI_GC_ATTACHMENTS}",
+            "cni.dev/attachments has {} entries; cap is {MAX_CNI_GC_ATTACHMENTS}",
             attachments.len()
         )));
     }
@@ -383,7 +481,9 @@ pub fn ingest_valid_attachments(
 /// unbounded allocation from hostile input.
 pub fn read_stdin_bounded(max_bytes: usize) -> Result<String, CniError> {
     use std::io::Read;
-    let mut limited = std::io::stdin().take(u64::try_from(max_bytes.saturating_add(1)).unwrap_or(u64::MAX));
+    let mut limited = std::io::stdin().take(
+        u64::try_from(max_bytes.saturating_add(1)).unwrap_or(u64::MAX),
+    );
     let mut buf = Vec::new();
     limited
         .read_to_end(&mut buf)
@@ -625,7 +725,7 @@ mod tests {
             Some("/tmp/x.sock")
         );
         assert!(cfg.extra.contains_key("extra-key"));
-        assert!(cfg.valid_attachments.is_empty());
+        assert!(cfg.valid_attachments.is_none());
     }
 
     #[test]
@@ -634,14 +734,18 @@ mod tests {
             "cniVersion": "1.1.0",
             "name": "ferrum-mesh",
             "type": "ferrum-cni",
-            "cni.dev/valid-attachments": [
+            "cni.dev/attachments": [
                 {"containerID": "ctr-alive", "ifname": "eth0"},
                 {"containerID": "ctr-alive", "ifname": "eth0"},
                 {"containerID": "ctr-other", "ifname": "eth1"}
             ]
         });
         let cfg: CniNetConfig = serde_json::from_value(raw).expect("net config should parse");
-        let ingested = ingest_valid_attachments(cfg.valid_attachments).expect("ingest");
+        let ingested = ingest_valid_attachments(
+            cfg.valid_attachments
+                .expect("GC attachment field should be present"),
+        )
+        .expect("ingest");
         assert_eq!(ingested.len(), 2, "duplicate attachments should dedupe");
         assert_eq!(ingested[0].container_id, "ctr-alive");
         assert_eq!(ingested[1].container_id, "ctr-other");

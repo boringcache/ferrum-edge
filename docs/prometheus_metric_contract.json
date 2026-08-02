@@ -2052,6 +2052,20 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_node_agent_cni_calls_total",
+    "type": "counter",
+    "help": "Node-agent CNI plugin RPC outcomes by verb.",
+    "labels": [
+      "verb",
+      "outcome",
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_node_agent_cni_socket_lifecycle_total",
     "type": "counter",
     "help": "Node-agent CNI socket lifecycle failures by bounded reason.",
