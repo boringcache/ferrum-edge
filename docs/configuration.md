@@ -787,7 +787,7 @@ See [docs/http3.md](http3.md) for the full HTTP/3 dispatch model, cross-protocol
 | `FERRUM_UDP_MAX_SESSIONS` | No | `10000` | Maximum concurrent UDP sessions per proxy |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | No | `10` | UDP session cleanup interval |
 | `FERRUM_UDP_RECVMMSG_BATCH_SIZE` | No | `64` | Linux `recvmmsg` receive batch size; clamped 1..1024 |
-| `FERRUM_DTLS_CERT_PATH` | No | — | Leaf-first PEM certificate bundle for frontend DTLS termination. The ECDSA P-256/P-384 leaf must match `FERRUM_DTLS_KEY_PATH`; the complete chain is transmitted in configured order |
+| `FERRUM_DTLS_CERT_PATH` | No | — | Leaf-first PEM certificate bundle for frontend DTLS termination. The ECDSA P-256/P-384 leaf must match `FERRUM_DTLS_KEY_PATH`; the complete chain is transmitted in configured order. Refused while `FERRUM_FIPS_MODE=enforce` — see [FIPS mode](fips.md#dtls-why-the-whole-transport-is-refused) |
 | `FERRUM_DTLS_CERT_SOURCE` | No | — | Source override for `FERRUM_DTLS_CERT_PATH`; accepts path, `file://`, inline PEM, or provider URI |
 | `FERRUM_DTLS_KEY_PATH` | No | — | PEM private key for frontend DTLS termination |
 | `FERRUM_DTLS_KEY_SOURCE` | No | — | Source override for `FERRUM_DTLS_KEY_PATH`; accepts path, `file://`, inline PEM, or provider URI |

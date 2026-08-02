@@ -308,6 +308,10 @@ the entry and discloses nothing.
 - `kafka_logging`: librdkafka performs its TLS through OpenSSL, outside the
   selected module. Use `tcp_logging`, `ws_logging`, or `http_logging`, which are
   rustls-based.
+- **Every DTLS surface** — a frontend DTLS listener
+  (`FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH`), a `backend_scheme: dtls`
+  stream proxy, and a `udp_logging` sink with `dtls: true`. See
+  §"DTLS: why the whole transport is refused".
 Every diagnostic is bounded — at most 8 offending entries are named, followed by
 a count — and carries no secret, key material, path, or free-form
 operator-supplied value.
@@ -424,6 +428,7 @@ than being allowed to run outside the boundary:
 | Capability | Why | Alternative |
 |---|---|---|
 | `kafka_logging` | librdkafka performs TLS through OpenSSL, which Ferrum cannot route onto the module | `tcp_logging`, `ws_logging`, `http_logging` (all rustls-based) |
+| **DTLS** (frontend listener, `backend_scheme: dtls`, `udp_logging` `dtls: true`) | the vendored `dimpl` stack draws its handshake and record randomness from the `rand` crate, not the module DRBG | a TLS-terminating listener or a rustls-based sink |
 | `soap_ws_security` `rsa-sha1` / `sha1` | SHA-1 is disallowed for signatures (SP 800-131A Rev. 2) | `rsa-sha256` / `sha256` |
 | `EdDSA` JWTs | approved by FIPS 186-5, but not in the algorithm set Ferrum routes through the selected module | ES256/384, RS/PS256/384/512, HS256/384/512 |
 | `ES512` JWTs | ECDSA over P-521 is approved, but the selected `jsonwebtoken/aws_lc_rs` backend exposes no P-521 JWS path — its `Algorithm` enum has no such variant | ES256 / ES384 |
@@ -431,6 +436,36 @@ than being allowed to run outside the boundary:
 | RSA below 2048 bits; DSA, GOST, Ed25519/Ed448/X25519 certificates | SP 800-131A Rev. 2 / FIPS 186-5 | RSA 2048–8192, ECDSA P-256/P-384/P-521 |
 | Any peer-verification opt-out | an unauthenticated peer defeats the approved key exchange | pin the peer's CA (see the table in §"What FIPS mode enforces") |
 | **External secret providers** (`_VAULT`, `_AWS`, `_AZURE`, `_GCP`) | their SDKs resolve secrets over their own TLS stacks, which are not built from Ferrum's provider seam and are not selected by the `crypto-ring` / `fips` feature pair | the `_FILE` suffix, or a direct environment value, backed by an operator-validated delivery mechanism (mounted secret, init container, KMS-backed volume) |
+
+### DTLS: why the whole transport is refused
+
+DTLS is the one transport Ferrum terminates outside rustls. It runs on the
+vendored `dimpl` stack (`vendor/dimpl-0.6.1-ferrum-patched`), which does select
+`aws-lc-rs` for key agreement, signing, hashing, and record AEAD — so cargo
+feature unification really does put those primitives inside the selected module
+once `aws-lc-rs/fips` is on.
+
+That is not sufficient, and the gap is specifically **randomness**. `dimpl`
+exposes a module-backed `secure_random` (`src/crypto/aws_lc_rs/random.rs`) but
+uses it only for signing and key-exchange keypairs. Its protocol randomness
+comes from `SeededRng` in `src/rng.rs`, which is the `rand` crate's thread RNG:
+
+- the DTLS handshake `Random` (`src/types.rs`, used by both the 1.2 and 1.3
+  engines), which feeds the key schedule;
+- the DTLS 1.2 `HelloVerifyRequest` cookie secret; and
+- the DTLS 1.2 explicit AES-GCM record nonce, whose construction SP 800-38D
+  pins to an approved source.
+
+§"The module boundary" places the DRBG **inside** the module. Admitting DTLS
+under enforcement would therefore be precisely the "uses a FIPS-capable library"
+claim this mode exists to refuse, so `fips::policy` rejects every DTLS surface
+before serving — at the environment gate for a frontend listener and at the
+gateway-document gate for `backend_scheme: dtls` proxies and `udp_logging`
+sinks, so `validate`, startup, reload, and CP/DP publication all agree.
+
+Retiring the refusal means routing `dimpl`'s protocol randomness through its own
+`secure_random` provider hook; that is an upstream change, tracked with the rest
+of the vendored `dimpl` patch lifecycle in `docs/dependency-policy.md`.
 
 ### External secret providers: why this changed to a refusal
 

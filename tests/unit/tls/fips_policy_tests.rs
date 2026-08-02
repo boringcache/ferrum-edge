@@ -280,6 +280,46 @@ fn env_policy_rejects_disabled_backend_certificate_verification() {
 }
 
 #[test]
+fn env_policy_rejects_a_frontend_dtls_listener() {
+    // DTLS is the one transport Ferrum terminates outside rustls. The vendored
+    // `dimpl` stack routes suites and signatures onto the selected module but
+    // draws the handshake `Random`, the HelloVerifyRequest cookie secret, and
+    // the DTLS 1.2 explicit AES-GCM nonce from the `rand` crate rather than the
+    // module DRBG, so the whole surface is refused instead of admitted under an
+    // implicit claim. See docs/fips.md §"DTLS: why the whole transport is
+    // refused".
+    for env_config in [
+        EnvConfig {
+            dtls_cert_path: Some("/etc/ferrum/dtls.pem".to_string()),
+            ..EnvConfig::default()
+        },
+        EnvConfig {
+            dtls_key_path: Some("/etc/ferrum/dtls.key".to_string()),
+            ..EnvConfig::default()
+        },
+    ] {
+        let err = policy::check_env_config_enforced(&env_config).expect_err("refused");
+        assert!(err.contains("FERRUM_DTLS_"), "{err}");
+        assert!(err.contains("dimpl"), "{err}");
+        assert!(
+            !err.contains("/etc/ferrum/"),
+            "the configured path must never be echoed: {err}"
+        );
+    }
+}
+
+#[test]
+fn env_policy_ignores_a_blank_dtls_path() {
+    // Blank means unset everywhere else in `EnvConfig`; a whitespace-only value
+    // must not be read as a configured listener.
+    let env_config = EnvConfig {
+        dtls_cert_path: Some("   ".to_string()),
+        ..EnvConfig::default()
+    };
+    policy::check_env_config_enforced(&env_config).expect("blank configures no listener");
+}
+
+#[test]
 fn env_policy_accepts_provider_routed_mongodb_config_store() {
     let env_config = EnvConfig {
         db_type: Some("mongodb".to_string()),

@@ -27,7 +27,7 @@
 use std::fmt::Write as _;
 
 use crate::config::env_config::EnvConfig;
-use crate::config::types::{GatewayConfig, PluginConfig};
+use crate::config::types::{BackendScheme, GatewayConfig, PluginConfig};
 
 /// Maximum number of individual offending entries named in one diagnostic.
 ///
@@ -112,6 +112,32 @@ const NON_APPROVED_ALGORITHM_SELECTIONS: &[(&str, &[&str], &[&str])] = &[(
     ],
     &["rsa-sha1", "sha1"],
 )];
+
+/// Why every DTLS surface is refused while FIPS mode is enforced.
+///
+/// DTLS is the one transport Ferrum terminates outside rustls: it runs on the
+/// vendored `dimpl` stack (`vendor/dimpl-0.6.1-ferrum-patched`). That stack does
+/// resolve key agreement, signing, hashing, and record AEAD through `aws-lc-rs`,
+/// so those primitives reach the selected module — but it draws its *random*
+/// values from the `rand` crate's thread RNG (`src/rng.rs`, `SeededRng`), not
+/// from the module DRBG that `crypto/aws_lc_rs/random.rs` exposes. Three of
+/// those values are inputs to an approved security function:
+///
+/// * the DTLS handshake `Random` (`src/types.rs`, used by both the 1.2 and 1.3
+///   engines), which feeds the key schedule;
+/// * the DTLS 1.2 `HelloVerifyRequest` cookie secret; and
+/// * the DTLS 1.2 explicit AES-GCM record nonce, whose construction SP 800-38D
+///   pins to an approved source.
+///
+/// `docs/fips.md` places the DRBG *inside* the module boundary, so admitting
+/// DTLS under enforcement would be exactly the "uses a FIPS-capable library"
+/// claim this mode exists to refuse. It is therefore rejected before serving,
+/// like `kafka_logging`, rather than allowed under an implicit claim.
+pub const DTLS_REFUSAL_DETAIL: &str = "DTLS runs on the vendored `dimpl` stack, whose handshake \
+                                       and record randomness does not come from the selected \
+                                       module's approved DRBG, so it is refused while FIPS mode \
+                                       is enforced. Use a TLS-terminating listener or sink \
+                                       instead. See docs/fips.md.";
 
 /// Approved stored-password representation.
 ///
@@ -402,6 +428,24 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
         }
     }
 
+    // ── DTLS ────────────────────────────────────────────────────────────
+    // Frontend DTLS termination is the one transport Ferrum terminates outside
+    // rustls: it runs on the vendored `dimpl` DTLS stack. See
+    // [`DTLS_REFUSAL_DETAIL`] for why that stack cannot be routed onto the
+    // selected module even though its suites and signatures already are.
+    for (name, configured) in [
+        ("FERRUM_DTLS_CERT_PATH", &env_config.dtls_cert_path),
+        ("FERRUM_DTLS_KEY_PATH", &env_config.dtls_key_path),
+    ] {
+        // Blank means unset everywhere else in `EnvConfig`; a whitespace-only
+        // value must not be read as a configured listener.
+        if configured.iter().any(|value| !value.trim().is_empty()) {
+            return Err(format!(
+                "{name} configures a frontend DTLS listener. {DTLS_REFUSAL_DETAIL}"
+            ));
+        }
+    }
+
     // ── Peer verification ───────────────────────────────────────────────
     // An unauthenticated peer defeats the point of an approved key exchange:
     // the module can perform a perfect ECDHE, and it is still a key agreement
@@ -634,10 +678,24 @@ pub fn check_gateway_config_enforced(config: &GatewayConfig) -> Result<(), Strin
     let mut jwt_violations: Vec<String> = Vec::new();
     let mut algorithm_violations: Vec<String> = Vec::new();
     let mut peer_verification_violations: Vec<String> = Vec::new();
+    let mut dtls_violations: Vec<String> = Vec::new();
 
-    for plugin in &config.plugin_configs {
+    for (index, plugin) in config.plugin_configs.iter().enumerate() {
         if !plugin.enabled {
             continue;
+        }
+        // `udp_logging` opens its own DTLS client session. The plugin itself is
+        // approved in plaintext UDP form, so only the DTLS selection is
+        // refused — the key is Ferrum's own fixed vocabulary and the position
+        // is enough to find the instance without echoing its operator-chosen
+        // id. See [`DTLS_REFUSAL_DETAIL`].
+        if plugin.plugin_name == "udp_logging"
+            && matches!(
+                lookup_dotted(&plugin.config, "dtls"),
+                Some(serde_json::Value::Bool(true))
+            )
+        {
+            dtls_violations.push(format!("plugin_configs[#{}].udp_logging.dtls", index + 1));
         }
         if NON_APPROVED_PLUGINS.contains(&plugin.plugin_name.as_str()) {
             // The plugin name is a fixed Ferrum vocabulary entry, not operator
@@ -701,6 +759,12 @@ pub fn check_gateway_config_enforced(config: &GatewayConfig) -> Result<(), Strin
                 index + 1
             ));
         }
+        // A `dtls` backend scheme is both the DTLS listener selector and the
+        // DTLS dial selector for a stream proxy, so one rule covers both ends.
+        // See [`DTLS_REFUSAL_DETAIL`].
+        if proxy.backend_scheme == Some(BackendScheme::Dtls) {
+            dtls_violations.push(format!("proxies[#{}].backend_scheme=dtls", index + 1));
+        }
     }
 
     if !peer_verification_violations.is_empty() {
@@ -711,6 +775,18 @@ pub fn check_gateway_config_enforced(config: &GatewayConfig) -> Result<(), Strin
              admit an unauthenticated transport, and are refused while FIPS mode is enforced. An \
              unverified peer defeats the point of an approved key exchange. See docs/fips.md.",
             bounded_list(&peer_verification_violations)
+        ));
+    }
+
+    // Reported after peer verification, deliberately: a DTLS surface that
+    // *also* disables peer verification gets the more specific opt-out
+    // diagnostic first, exactly as it did before DTLS itself became a refusal.
+    if !dtls_violations.is_empty() {
+        dtls_violations.sort();
+        dtls_violations.dedup();
+        return Err(format!(
+            "configuration entr(ies) [{}] terminate or dial DTLS. {DTLS_REFUSAL_DETAIL}",
+            bounded_list(&dtls_violations)
         ));
     }
 

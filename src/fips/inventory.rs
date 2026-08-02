@@ -183,12 +183,21 @@ pub const INVENTORY: &[CryptoOperation] = &[
     },
     // ── DTLS ────────────────────────────────────────────────────────────
     CryptoOperation {
-        operation: "DTLS 1.2/1.3 frontend termination (UDP proxy)",
-        location: "src/dtls/mod.rs",
-        implementation: "dimpl (vendored), aws-lc-rs",
-        disposition: Disposition::ModuleRoutable,
-        rationale: "dimpl already selects the aws-lc-rs backend, so cargo feature unification \
-                    turns that same crate into the FIPS module build once aws-lc-rs/fips is on",
+        operation: "DTLS 1.2/1.3 termination and dialing (UDP stream proxies, udp_logging sink)",
+        location: "src/dtls/mod.rs, vendor/dimpl-0.6.1-ferrum-patched",
+        implementation: "dimpl (vendored): aws-lc-rs for suites/signatures, `rand` for randomness",
+        disposition: Disposition::Rejected,
+        rationale: "dimpl selects the aws-lc-rs backend for key agreement, signing, hashing, and \
+                    record AEAD, so cargo feature unification does route those primitives onto \
+                    the module — but its *random* values come from the `rand` crate's thread RNG \
+                    (src/rng.rs `SeededRng`), not the module DRBG that its own \
+                    crypto/aws_lc_rs/random.rs exposes. The DTLS handshake `Random` (src/types.rs, \
+                    both engines), the DTLS 1.2 HelloVerifyRequest cookie secret, and the DTLS 1.2 \
+                    explicit AES-GCM record nonce are all drawn that way, and docs/fips.md places \
+                    the DRBG inside the module boundary. Rather than claim a coverage this build \
+                    cannot back, fips::policy refuses every DTLS surface — frontend \
+                    FERRUM_DTLS_CERT_PATH/KEY_PATH, `backend_scheme: dtls` stream proxies, and \
+                    `udp_logging` with `dtls: true` — before serving",
     },
     CryptoOperation {
         operation: "DTLS private-key parsing / signing key selection",
@@ -196,7 +205,8 @@ pub const INVENTORY: &[CryptoOperation] = &[
         implementation: "rustls",
         disposition: Disposition::ModuleRoutable,
         rationale: "fips::any_supported_signing_key() selects the active key provider without a \
-                    second owned DER allocation",
+                    second owned DER allocation. Reachable only outside FIPS enforcement, since \
+                    fips::policy refuses the DTLS surfaces that load this material",
     },
     // ── Config store ────────────────────────────────────────────────────
     CryptoOperation {

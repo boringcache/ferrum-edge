@@ -578,6 +578,93 @@ fn every_plugin_owned_verification_opt_out_is_refused() {
     }
 }
 
+// ── DTLS ────────────────────────────────────────────────────────────────────
+
+/// Build a raw stream proxy on a caller-chosen backend scheme.
+fn stream_proxy(id: &str, scheme: &str) -> Proxy {
+    serde_json::from_value(json!({
+        "id": id,
+        "namespace": "ferrum",
+        "name": format!("proxy-{id}"),
+        // Stream proxies route on `listen_port` and must leave `listen_path`
+        // unset.
+        "listen_port": 6000,
+        "backend_scheme": scheme,
+        "backend_host": "backend.internal",
+        "backend_port": 6001,
+    }))
+    .expect("stream proxy fixture")
+}
+
+#[test]
+fn a_dtls_stream_proxy_is_refused() {
+    // `dimpl` routes DTLS suites and signatures onto the selected module but
+    // draws the handshake `Random`, the DTLS 1.2 HelloVerifyRequest cookie
+    // secret, and the DTLS 1.2 explicit AES-GCM record nonce from the `rand`
+    // crate rather than the module DRBG. docs/fips.md puts the DRBG inside the
+    // boundary, so the transport is refused rather than admitted under an
+    // implicit claim.
+    let config = GatewayConfig {
+        proxies: vec![stream_proxy("udp-edge", "dtls")],
+        ..GatewayConfig::default()
+    };
+    let error = policy::check_gateway_config_enforced(&config).expect_err("DTLS is refused");
+    assert!(error.contains("proxies[#1].backend_scheme=dtls"), "{error}");
+    assert!(error.contains("dimpl"), "{error}");
+    assert!(
+        !error.contains("udp-edge"),
+        "an id is operator free text and must not be echoed: {error}"
+    );
+}
+
+#[test]
+fn a_plaintext_udp_stream_proxy_is_admitted() {
+    // The refusal is about the DTLS stack, not about UDP: a plaintext UDP
+    // stream proxy performs no cryptography and stays supported.
+    let config = GatewayConfig {
+        proxies: vec![stream_proxy("udp-edge", "udp")],
+        ..GatewayConfig::default()
+    };
+    policy::check_gateway_config_enforced(&config).expect("plaintext UDP has no crypto");
+}
+
+#[test]
+fn a_dtls_udp_logging_sink_is_refused_but_a_plaintext_one_is_not() {
+    let dtls_sink = config_with_plugins(vec![plugin(
+        "udp_logging",
+        json!({ "host": "collector.internal", "port": 9000, "dtls": true }),
+    )]);
+    let error = policy::check_gateway_config_enforced(&dtls_sink).expect_err("DTLS is refused");
+    assert!(error.contains("udp_logging.dtls"), "{error}");
+    assert!(error.contains("dimpl"), "{error}");
+
+    let plaintext_sink = config_with_plugins(vec![plugin(
+        "udp_logging",
+        json!({ "host": "collector.internal", "port": 9000 }),
+    )]);
+    policy::check_gateway_config_enforced(&plaintext_sink)
+        .expect("a plaintext UDP log sink performs no cryptography");
+}
+
+#[test]
+fn the_dtls_inventory_row_and_the_dtls_refusal_agree() {
+    use ferrum_edge::fips::inventory;
+
+    // The inventory is documentation; the policy is enforcement. A row that
+    // claimed DTLS was module-routable while the policy refused it — or the
+    // reverse — is exactly the drift this table exists to prevent.
+    let rejected_dtls = inventory::rejected().any(|entry| entry.location.contains("dimpl"));
+    let policy_refuses_dtls = policy::check_gateway_config_enforced(&GatewayConfig {
+        proxies: vec![stream_proxy("dtls-edge", "dtls")],
+        ..GatewayConfig::default()
+    })
+    .is_err();
+    assert_eq!(
+        rejected_dtls, policy_refuses_dtls,
+        "inventory and fips::policy disagree about DTLS"
+    );
+}
+
 #[test]
 fn an_approved_plugin_configuration_is_admitted() {
     // The verification keys are refused; the plugins that own them are not.
