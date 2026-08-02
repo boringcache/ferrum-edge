@@ -1145,6 +1145,34 @@ pub mod _test_support {
             .map_err(|error| error.to_string())
     }
 
+    /// Drive the cancellation-safe pre-mutation audit prepare with two blocking
+    /// barriers around the durable write. External tests abort the enclosing
+    /// request scope between them, then prove the detached prepare finalizes the
+    /// newly durable intent instead of stranding it in a live generation.
+    pub async fn prepare_audit_intent_with_barriers_for_test(
+        pipeline: std::sync::Arc<crate::admin::audit::AuditPipeline>,
+        slot: std::sync::Arc<crate::admin::audit::AuditRequestSlot>,
+        event: crate::admin::audit::AuditEvent,
+        started: std::sync::Arc<std::sync::Barrier>,
+        release: std::sync::Arc<std::sync::Barrier>,
+    ) -> Result<String, crate::admin::audit::AuditUnavailableReason> {
+        let action = event.action.clone();
+        let resource_id = event.resource_id.clone();
+        let prepare_pipeline = std::sync::Arc::clone(&pipeline);
+        crate::admin::audit::prepare_request_intent_cancellation_safe(
+            pipeline,
+            slot,
+            action,
+            resource_id,
+            move || {
+                started.wait();
+                release.wait();
+                prepare_pipeline.prepare_intent(event)
+            },
+        )
+        .await
+    }
+
     /// Acquire the durable namespace config admission lease (same primitive as
     /// admin mutations and api_specs-emitting backups) for external tests.
     pub async fn lock_namespace_config_admission_db_for_test(

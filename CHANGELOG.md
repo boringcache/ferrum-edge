@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Audited admin mutations are durable **before they run** (issue #2421).
   The admin write gate fsyncs a pre-mutation audit intent — a stable event id
-  plus the redacted actor / method / sanitized path / namespace / socket source
-  address / bounded request id — into `FERRUM_ADMIN_AUDIT_SPOOL_DIR` before the
+  plus the authenticated actor, method, sanitized path / namespace, canonical
+  socket source address, and bounded request id — into
+  `FERRUM_ADMIN_AUDIT_SPOOL_DIR` before the
   configuration mutation is invoked, and durably finalizes that same id with
   `success` or `failure` once the mutation returns. A crash between commit and
   finalize replays as an explicit `outcome: unknown_outcome` event, never a
@@ -27,7 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mutation. Mutation settlement tasks explicitly carry the request audit slot
   across `tokio::spawn`, and cancellation ownership transfers before spawn so a
   disconnected client cannot race the detailed outcome against a generic
-  fallback record. Delivery is at-least-once on the stable id and every backend
+  fallback record. The blocking prepare/fsync is itself detached and settles a
+  cancellation that arrived mid-write as `unknown_outcome`, so the newly
+  durable intent cannot remain dormant in a live process generation. Delivery
+  is at-least-once on the stable id and every backend
   insert is insert-only and idempotent (PostgreSQL/SQLite `ON CONFLICT (id) DO
   NOTHING`, MySQL `ON DUPLICATE KEY UPDATE id = id`, MongoDB `insert_one` with
   duplicate-key treated as success), so a duplicate delivery converges to the

@@ -5,8 +5,9 @@
 //! An audited admin mutation is durable **before it happens**, not after:
 //!
 //! 1. The admin write gate durably prepares an *audit intent* — a stable event
-//!    id plus the redacted request context (actor subject, method, sanitized
-//!    path, namespace, socket source address, bounded request id) — fsyncing
+//!    id plus the minimal audit request context (authenticated actor subject,
+//!    method, sanitized path/namespace, canonical socket source address,
+//!    bounded request id) — fsyncing
 //!    both the record and its directory before the mutation is invoked.
 //! 2. Once the mutation returns, the same stable id is durably finalized with
 //!    the real outcome (`success` or `failure`) and diff, and only then is the
@@ -400,9 +401,10 @@ pub struct AuditEvent {
     /// generated). Empty for legacy mutation events.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub request_id: String,
-    /// Fixed-cardinality outcome (`success`, `denied`, `validation_failed`,
-    /// `unavailable`). Empty for legacy mutation events that only recorded
-    /// successful commits. Set only through [`AuditEvent::with_outcome`].
+    /// Fixed-cardinality outcome (`success`, `failure`, `denied`,
+    /// `validation_failed`, `unavailable`, or `unknown_outcome`). Empty for
+    /// legacy mutation events that only recorded successful commits. Set only
+    /// through [`AuditEvent::with_outcome`].
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub outcome: String,
     pub diff: Value,
@@ -1601,6 +1603,11 @@ pub struct AuditRequestSlot {
     /// parent request must then leave the prepared intent alone if it is
     /// cancelled while that task continues.
     cancellation_transferred: AtomicBool,
+    /// The request scope disappeared before a settlement task took ownership.
+    /// A detached prepare task checks this after its blocking fsync completes,
+    /// closing the race where cancellation observed an empty slot immediately
+    /// before that task installed the now-durable intent.
+    scope_cancelled_without_settlement_owner: AtomicBool,
 }
 
 impl AuditRequestSlot {
@@ -1678,6 +1685,9 @@ impl Drop for AuditScopeCompletion {
         {
             return;
         }
+        self.slot
+            .scope_cancelled_without_settlement_owner
+            .store(true, Ordering::Release);
         let slot = Arc::clone(&self.slot);
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             // The prepared record remains durable and will be claimed as an
@@ -1781,6 +1791,66 @@ pub fn note_request_actor(actor: &AuditActor, ctx: &AuditRequestContext) {
     });
 }
 
+/// Run a blocking intent prepare in a detached settlement task.
+///
+/// Dropping a Tokio join handle does not cancel its `spawn_blocking` work. The
+/// task therefore installs the prepared id into the request slot itself, rather
+/// than asking the possibly-cancelled caller to do so after the await. If the
+/// request scope disappeared while the fsync was in flight, the same task
+/// immediately finalizes the intent as `unknown_outcome`; it cannot remain
+/// stranded under a still-live process generation until restart.
+pub(crate) async fn prepare_request_intent_cancellation_safe<F>(
+    pipeline: Arc<AuditPipeline>,
+    slot: Arc<AuditRequestSlot>,
+    action: String,
+    resource_id: String,
+    prepare: F,
+) -> Result<String, AuditUnavailableReason>
+where
+    F: FnOnce() -> Result<String, AuditUnavailableReason> + Send + 'static,
+{
+    let prepare_slot = Arc::clone(&slot);
+    let finalizer_pipeline = Arc::clone(&pipeline);
+    let prepare_task = tokio::spawn(async move {
+        let outcome = tokio::task::spawn_blocking(prepare)
+            .await
+            .unwrap_or(Err(AuditUnavailableReason::PrepareFailed));
+        let id = match outcome {
+            Ok(id) => id,
+            Err(reason) => return Err(reason),
+        };
+        if prepare_slot
+            .with(|inner| {
+                inner.prepared = Some(PreparedIntent {
+                    id: id.clone(),
+                    action,
+                    resource_id,
+                });
+            })
+            .is_none()
+        {
+            return Err(AuditUnavailableReason::PrepareFailed);
+        }
+        if prepare_slot
+            .scope_cancelled_without_settlement_owner
+            .load(Ordering::Acquire)
+        {
+            finalize_unconsumed_intent_with_pipeline(
+                finalizer_pipeline,
+                &prepare_slot,
+                AuditOutcome::UnknownOutcome,
+                "request_task_cancelled_while_audit_intent_prepare_was_in_flight",
+                None,
+            )
+            .await;
+        }
+        Ok(id)
+    });
+    prepare_task
+        .await
+        .unwrap_or(Err(AuditUnavailableReason::PrepareFailed))
+}
+
 /// Durably prepare the pre-mutation audit intent for the current request.
 ///
 /// Called by the admin write gate **before** the mutation is invoked. Returns
@@ -1814,22 +1884,19 @@ pub async fn prepare_request_intent(enabled: bool) -> Option<&'static str> {
     let resource_id = event.resource_id.clone();
     let pipeline_for_task = Arc::clone(&pipeline);
     // The durable write is blocking filesystem work. This is the admin mutation
-    // path, never a proxy hot path, so moving it onto the blocking pool keeps
-    // the reactor free while the request waits for durability.
-    let outcome = tokio::task::spawn_blocking(move || pipeline_for_task.prepare_intent(event))
-        .await
-        .unwrap_or(Err(AuditUnavailableReason::PrepareFailed));
+    // path, never a proxy hot path. The detached settlement wrapper keeps the
+    // fsync and slot installation cancellation-safe while the request waits for
+    // durability.
+    let outcome = prepare_request_intent_cancellation_safe(
+        Arc::clone(&pipeline),
+        Arc::clone(&slot),
+        action,
+        resource_id,
+        move || pipeline_for_task.prepare_intent(event),
+    )
+    .await;
     match outcome {
-        Ok(id) => {
-            slot.with(|inner| {
-                inner.prepared = Some(PreparedIntent {
-                    id,
-                    action,
-                    resource_id,
-                })
-            });
-            None
-        }
+        Ok(_) => None,
         Err(reason) => {
             if pipeline.config.policy == AuditUnavailablePolicy::FailClosed {
                 return Some(reason.as_str());
@@ -1965,7 +2032,16 @@ async fn finalize_unconsumed_intent_with_evidence(
     evidence: &'static str,
     status: Option<u16>,
 ) {
-    let pipeline = pipeline();
+    finalize_unconsumed_intent_with_pipeline(pipeline(), slot, outcome, evidence, status).await;
+}
+
+async fn finalize_unconsumed_intent_with_pipeline(
+    pipeline: Arc<AuditPipeline>,
+    slot: &Arc<AuditRequestSlot>,
+    outcome: AuditOutcome,
+    evidence: &'static str,
+    status: Option<u16>,
+) {
     if !pipeline.config.enabled {
         return;
     }

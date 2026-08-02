@@ -583,8 +583,9 @@ but do not consult the configuration audit pipeline's `fail_closed` state.
 ### Durable evidence before the mutation (issue #2421)
 
 1. **Prepare.** The admin write gate durably creates an *audit intent* — a
-   stable event id plus the redacted request context (actor subject, method,
-   sanitized path, namespace, socket source address, bounded request id) —
+   stable event id plus the minimal audit request context (authenticated actor
+   subject, method, sanitized path and namespace, canonical socket source
+   address, bounded request id) —
    fsyncing both the record and its directory **before** the configuration
    mutation is invoked.
 2. **Finalize.** Once the mutation returns, the same stable id is durably
@@ -629,8 +630,12 @@ no durable audit evidence.
   so a disconnected client cannot make the parent finalize an intent while the
   settlement task is still committing it. If no task owns settlement when a
   request is cancelled, the prepared record is finalized as
-  `unknown_outcome`; if the runtime is already stopping, it remains durable for
-  next-process adoption instead of being deleted.
+  `unknown_outcome`. The blocking prepare/fsync itself is owned by a detached
+  settlement task: if cancellation arrives while that write is still in flight,
+  the task installs the newly durable id into the request slot and immediately
+  finalizes it as `unknown_outcome`, rather than leaving it dormant under a live
+  process generation until restart. If the runtime is already stopping, it
+  remains durable for next-process adoption instead of being deleted.
 - **Delivery semantics: at-least-once with a stable id.** All four backends
   insert **insert-only and idempotently** on that id (PostgreSQL/SQLite
   `ON CONFLICT (id) DO NOTHING`, MySQL `ON DUPLICATE KEY UPDATE id = id` — a

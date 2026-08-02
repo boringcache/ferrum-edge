@@ -4,8 +4,9 @@
 //!
 //! An audited admin mutation is durable **before** it is performed:
 //!
-//! 1. `prepare` writes a *prepared* record — the redacted request context
-//!    (actor, method, sanitized path, namespace, source address, request id)
+//! 1. `prepare` writes a *prepared* record — the minimal audit request context
+//!    (authenticated actor, method, sanitized path and namespace, canonical
+//!    source address, bounded request id)
 //!    under a stable event id — and fsyncs both the file and its directory.
 //!    Only then may the mutation run.
 //! 2. `finalize` rewrites that same stable id as a *finalized* record carrying

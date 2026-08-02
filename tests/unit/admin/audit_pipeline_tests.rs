@@ -8,23 +8,26 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
+use ferrum_edge::_test_support::prepare_audit_intent_with_barriers_for_test;
 use ferrum_edge::admin::audit::{
-    AuditDurabilityMode, AuditEvent, AuditEventDelivery, AuditOutcome, AuditPipeline,
-    AuditPipelineConfig, AuditUnavailablePolicy, AuditUnavailableReason, AuditWorker,
-    audit_destination_identity, credential_update_diff, sanitize_audit_namespace,
-    sanitize_audit_path, update_diff,
+    AuditActor, AuditDurabilityMode, AuditEvent, AuditEventDelivery, AuditOutcome, AuditPipeline,
+    AuditPipelineConfig, AuditRequestContext, AuditUnavailablePolicy, AuditUnavailableReason,
+    AuditWorker, audit_destination_identity, credential_update_diff, new_request_slot,
+    note_request_actor, sanitize_audit_namespace, sanitize_audit_path, scope_request, update_diff,
 };
+use ferrum_edge::admin::jwt_auth::AdminRole;
 use ferrum_edge::admin::audit_spool::{
     AUDIT_DIFF_OMITTED_MARKER, AUDIT_SPOOL_RECORD_VERSION, AuditSpool, SpoolErrorKind,
     SpooledAuditRecord, is_valid_record_id, record_id_from_file_name,
 };
+use ferrum_edge::grpc::auth::AllowedNamespaces;
 use serde_json::json;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -266,6 +269,74 @@ fn spawned_mutation_persistence_explicitly_propagates_the_request_audit_slot() {
             .count(),
         3,
         "API-spec create, replace, and delete carry the prepared intent"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_while_prepare_is_in_flight_finalizes_unknown_outcome() {
+    let dir = TempDir::new().expect("temp dir");
+    let pipeline = pipeline(config(Some(&dir)));
+    let slot = new_request_slot("POST", "/proxies", "ferrum");
+    let started = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+
+    let request = tokio::spawn({
+        let pipeline = Arc::clone(&pipeline);
+        let slot = Arc::clone(&slot);
+        let started = Arc::clone(&started);
+        let release = Arc::clone(&release);
+        async move {
+            let scoped_slot = Arc::clone(&slot);
+            scope_request(scoped_slot, async move {
+                note_request_actor(
+                    &AuditActor {
+                        sub: "audit-user".to_string(),
+                        role: AdminRole::Admin,
+                        allowed_namespaces: AllowedNamespaces::empty(),
+                    },
+                    &AuditRequestContext {
+                        source_address: "203.0.113.7".to_string(),
+                        request_id: "cancelled-prepare".to_string(),
+                    },
+                );
+                prepare_audit_intent_with_barriers_for_test(
+                    pipeline, slot, event(), started, release,
+                )
+                .await
+            })
+            .await
+        }
+    });
+
+    let started_wait = Arc::clone(&started);
+    tokio::task::spawn_blocking(move || started_wait.wait())
+        .await
+        .expect("prepare reached the blocking barrier");
+    request.abort();
+    assert!(request.await.is_err(), "the request scope was cancelled");
+    let release_wait = Arc::clone(&release);
+    tokio::task::spawn_blocking(move || release_wait.wait())
+        .await
+        .expect("prepare barrier released");
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let status = pipeline.status();
+            status.metrics.unknown_outcome_total == 1
+                && status.metrics.spool_prepared_records == 0
+                && status.metrics.spool_pending_records == 1
+        })
+        .await,
+        "the detached prepare finalized the cancelled request without waiting for restart"
+    );
+    let spool = pipeline.spool().expect("durable spool");
+    let ids = spool.list_pending_ids(2);
+    assert_eq!(ids.len(), 1, "one cancellation record remains pending");
+    let record = spool.read_pending(&ids[0]).expect("pending record is readable");
+    assert_eq!(record.event.outcome, AuditOutcome::UnknownOutcome.as_str());
+    assert_eq!(
+        record.event.diff["outcome_evidence"],
+        "request_task_cancelled_while_audit_intent_prepare_was_in_flight"
     );
 }
 
