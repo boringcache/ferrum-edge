@@ -28,8 +28,8 @@ use ferrum_edge::_test_support::{
     transform_buffered_response_body_with_deadline_full_for_test,
 };
 use ferrum_edge::plugins::{
-    Plugin, RequestContext, body_validator::BodyValidator, compression::CompressionPlugin,
-    response_transformer::ResponseTransformer, waf::Waf,
+    Plugin, RequestContext, ResponseBodyProduction, body_validator::BodyValidator,
+    compression::CompressionPlugin, response_transformer::ResponseTransformer, waf::Waf,
 };
 use serde_json::json;
 
@@ -79,6 +79,10 @@ impl Plugin for FinalPolicyCapacityRefusal {
         "final_policy_capacity_refusal"
     }
 
+    fn response_body_production(&self) -> ResponseBodyProduction {
+        ResponseBodyProduction::Never
+    }
+
     fn requires_response_body_buffering(&self) -> bool {
         true
     }
@@ -107,6 +111,10 @@ impl Plugin for FinalPolicyCapacityRefusal {
 impl Plugin for RejectingFinalBodyPolicy {
     fn name(&self) -> &str {
         "rejecting_final_body_policy"
+    }
+
+    fn response_body_production(&self) -> ResponseBodyProduction {
+        ResponseBodyProduction::Never
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -142,6 +150,10 @@ impl Plugin for SelfRefusingFinalHeaderPolicy {
         "self_refusing_final_header_policy"
     }
 
+    fn response_body_production(&self) -> ResponseBodyProduction {
+        ResponseBodyProduction::Never
+    }
+
     fn enforces_final_client_visible_response_headers(&self, _ctx: &RequestContext) -> bool {
         true
     }
@@ -167,6 +179,10 @@ impl Plugin for SelfRefusingFinalHeaderPolicy {
 impl Plugin for OneShotGatewayDecorator {
     fn name(&self) -> &str {
         "one_shot_gateway_decorator"
+    }
+
+    fn response_body_production(&self) -> ResponseBodyProduction {
+        ResponseBodyProduction::Never
     }
 
     async fn after_proxy(
@@ -216,6 +232,10 @@ impl Plugin for ScopedCountingFinalBodyPolicy {
         "scoped_counting_final_body_policy"
     }
 
+    fn response_body_production(&self) -> ResponseBodyProduction {
+        ResponseBodyProduction::Never
+    }
+
     fn requires_response_body_buffering(&self) -> bool {
         true
     }
@@ -261,6 +281,10 @@ impl Plugin for RepresentationBearingRejectFinalBodyPolicy {
         "representation_bearing_reject_final_body_policy"
     }
 
+    fn response_body_production(&self) -> ResponseBodyProduction {
+        ResponseBodyProduction::Never
+    }
+
     fn requires_response_body_buffering(&self) -> bool {
         true
     }
@@ -300,6 +324,10 @@ impl Plugin for OneShotRotatedSessionCookie {
         "one_shot_rotated_session_cookie"
     }
 
+    fn response_body_production(&self) -> ResponseBodyProduction {
+        ResponseBodyProduction::Never
+    }
+
     fn applies_after_proxy_on_reject(&self) -> bool {
         true
     }
@@ -324,6 +352,10 @@ impl Plugin for LateHeaderBearingReject {
         "late_header_bearing_reject"
     }
 
+    fn response_body_production(&self) -> ResponseBodyProduction {
+        ResponseBodyProduction::Never
+    }
+
     fn priority(&self) -> u16 {
         3500
     }
@@ -346,6 +378,10 @@ impl Plugin for LateHeaderBearingReject {
 impl Plugin for LateIdenticalBodyStatusReject {
     fn name(&self) -> &str {
         "late_identical_body_status_reject"
+    }
+
+    fn response_body_production(&self) -> ResponseBodyProduction {
+        ResponseBodyProduction::Never
     }
 
     fn applies_after_proxy_on_reject(&self) -> bool {
@@ -374,6 +410,10 @@ impl Plugin for LateIdenticalBodyStatusReject {
 impl Plugin for StatusScopedFinalBodyPolicy {
     fn name(&self) -> &str {
         "status_scoped_final_body_policy"
+    }
+
+    fn response_body_production(&self) -> ResponseBodyProduction {
+        ResponseBodyProduction::Never
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -465,6 +505,7 @@ fn waf_blocking_response_body() -> Arc<dyn Plugin> {
         Waf::new(&json!({
             "mode": "enforce",
             "include_default_rules": false,
+            "scan_budget_ms": 0,
             "response_inspection": true,
             "response_body_inspection": true,
             "custom_rules": [{
@@ -488,6 +529,7 @@ fn waf_blocking_protected_header(rule_id: &str) -> Arc<dyn Plugin> {
         Waf::new(&json!({
             "mode": "enforce",
             "include_default_rules": false,
+            "scan_budget_ms": 0,
             "response_inspection": true,
             "custom_rules": [{
                 "id": rule_id,
@@ -510,6 +552,7 @@ fn waf_blocking_unrelated_header(rule_id: &str) -> Arc<dyn Plugin> {
         Waf::new(&json!({
             "mode": "enforce",
             "include_default_rules": false,
+            "scan_budget_ms": 0,
             "response_inspection": true,
             "custom_rules": [{
                 "id": rule_id,
@@ -532,6 +575,7 @@ fn waf_blocking_content_encoding_header() -> Arc<dyn Plugin> {
         Waf::new(&json!({
             "mode": "enforce",
             "include_default_rules": false,
+            "scan_budget_ms": 0,
             "response_inspection": true,
             "custom_rules": [{
                 "id": "CUSTOM-LATE-CONTENT-ENCODING",
