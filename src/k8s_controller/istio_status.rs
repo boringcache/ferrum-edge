@@ -1155,20 +1155,46 @@ fn workload_entry_status(
         .get("service")
         .and_then(Value::as_str)
         .unwrap_or(object.metadata.name.as_str());
-    let service_key = workload_entry_service_key_from_host(
-        service_host,
-        &object.metadata.namespace,
-        cluster_domain,
-    );
-    let service_name = service_key
-        .as_ref()
-        .map(|key| key.name.as_str())
-        .unwrap_or(service_host);
-    let service_namespace = service_key
-        .as_ref()
-        .map(|key| key.namespace.as_str())
-        .unwrap_or(object.metadata.namespace.as_str());
-    let cross_namespace = service_namespace != object.metadata.namespace.as_str();
+    // Prefer the translator-stamped attachment when present so status mirrors
+    // the authoritative association carried into the mesh slice (not merely the
+    // raw host string). Fall back to deterministic host parsing for diagnostics
+    // when the WorkloadEntry was rejected or not materialised.
+    let stamped = result.ok().and_then(|translation| {
+        translation.config.mesh.as_ref().and_then(|mesh| {
+            mesh.workloads.iter().find(|workload| {
+                workload.namespace == object.metadata.namespace
+                    && (address.is_empty()
+                        || workload
+                            .addresses
+                            .iter()
+                            .any(|candidate| candidate == &address))
+            })
+        })
+    });
+    let (service_name, service_namespace, cross_namespace) = if let Some(workload) = stamped {
+        let service_namespace = workload.attached_service_namespace();
+        (
+            workload.service_name.as_str(),
+            service_namespace,
+            service_namespace != object.metadata.namespace.as_str(),
+        )
+    } else {
+        let service_key = workload_entry_service_key_from_host(
+            service_host,
+            &object.metadata.namespace,
+            cluster_domain,
+        );
+        let service_name = service_key
+            .as_ref()
+            .map(|key| key.name.as_str())
+            .unwrap_or(service_host);
+        let service_namespace = service_key
+            .as_ref()
+            .map(|key| key.namespace.as_str())
+            .unwrap_or(object.metadata.namespace.as_str());
+        let cross_namespace = service_namespace != object.metadata.namespace.as_str();
+        (service_name, service_namespace, cross_namespace)
+    };
 
     match result {
         Ok(_translation) => {

@@ -3292,6 +3292,35 @@ fn validate_mesh_config_internal(
             &wl.service_name,
             &mut errors,
         );
+        if let Some(service_namespace) = wl.service_namespace.as_deref() {
+            if service_namespace.trim().is_empty() {
+                errors.push(format!(
+                    "Workload '{}'.service_namespace: must not be empty when set",
+                    wl.spiffe_id
+                ));
+            } else if service_namespace != wl.namespace {
+                // Cross-namespace attachment is only valid when an authoritative
+                // MeshService in the target namespace names this workload. A bare
+                // service_namespace stamp without membership is fail-closed so
+                // native/xDS/file authors cannot spoof attachment via the field
+                // alone (K8s stamping already requires ReferenceGrant + Service).
+                let authorized = services.iter().any(|svc| {
+                    svc.namespace == service_namespace
+                        && svc.name == wl.service_name
+                        && svc
+                            .workloads
+                            .iter()
+                            .any(|reference| reference.spiffe_id == wl.spiffe_id)
+                });
+                if !authorized {
+                    errors.push(format!(
+                        "Workload '{}'.service_namespace: cross-namespace attachment to \
+                         '{}/{}' requires that MeshService to list this workload's SPIFFE id",
+                        wl.spiffe_id, service_namespace, wl.service_name
+                    ));
+                }
+            }
+        }
         for (i, address) in wl.addresses.iter().enumerate() {
             if address.trim().is_empty() {
                 errors.push(format!(

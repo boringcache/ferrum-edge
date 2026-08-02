@@ -10,8 +10,14 @@ use std::collections::HashMap;
 
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    translate_k8s_objects_collecting_skips,
 };
-use ferrum_edge::identity::spiffe::TrustDomain;
+use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
+use ferrum_edge::modes::mesh::config::{
+    AppProtocol, MeshService, ServicePort, Workload, WorkloadRef, WorkloadSelector,
+    validate_mesh_config,
+};
+use ferrum_edge::xds::carrier::MeshSliceCarrier;
 use serde_json::{Value, json};
 
 fn options() -> K8sTranslationOptions {
@@ -167,6 +173,28 @@ fn cross_namespace_workload_entry_attaches_only_to_granted_service() {
 }
 
 #[test]
+fn cross_namespace_host_casing_normalizes_deterministically() {
+    let result = translate_k8s_objects(
+        &[
+            service("reviews", "prod"),
+            reference_grant("vms", "prod", "reviews"),
+            workload_entry("vms", "Reviews.PROD.svc.Cluster.Local.", "10.9.0.8"),
+        ],
+        options(),
+    )
+    .expect("cased FQDN must normalize to the authorized Service key");
+
+    let mesh = result.config.mesh.expect("mesh");
+    let workload = mesh
+        .workloads
+        .iter()
+        .find(|workload| workload.addresses.iter().any(|a| a == "10.9.0.8"))
+        .expect("workload");
+    assert_eq!(workload.service_name, "reviews");
+    assert_eq!(workload.service_namespace.as_deref(), Some("prod"));
+}
+
+#[test]
 fn cross_namespace_workload_entry_without_grant_is_rejected() {
     let err = translate_k8s_objects(
         &[
@@ -238,5 +266,297 @@ fn cross_namespace_workload_entry_delete_withdraws_service_attachment() {
             .expect("service")
             .workloads
             .is_empty()
+    );
+}
+
+#[test]
+fn reference_grant_withdrawal_removes_cross_namespace_association() {
+    let authorized = [
+        service("reviews", "prod"),
+        reference_grant("vms", "prod", "reviews"),
+        workload_entry("vms", "reviews.prod.svc.cluster.local", "10.9.0.5"),
+    ];
+    let created = translate_k8s_objects(&authorized, options()).expect("authorized create");
+    assert!(
+        created
+            .config
+            .mesh
+            .as_ref()
+            .expect("mesh")
+            .workloads
+            .iter()
+            .any(|workload| workload.service_namespace.as_deref() == Some("prod"))
+    );
+
+    let (withdrawn, skipped) = translate_k8s_objects_collecting_skips(
+        &[
+            service("reviews", "prod"),
+            workload_entry("vms", "reviews.prod.svc.cluster.local", "10.9.0.5"),
+        ],
+        options(),
+    )
+    .expect("grant withdrawal must skip the WorkloadEntry fail-closed");
+    assert!(
+        !skipped.is_empty(),
+        "withdrawn grant must record a skip error"
+    );
+    assert!(
+        skipped
+            .values()
+            .any(|error| error.to_string().contains("ReferenceGrant")),
+        "{skipped:?}"
+    );
+    let mesh = withdrawn.config.mesh.expect("mesh");
+    assert!(
+        mesh.workloads
+            .iter()
+            .all(|workload| !workload.addresses.iter().any(|a| a == "10.9.0.5")),
+        "grant withdrawal must remove the WorkloadEntry from the mesh"
+    );
+    assert!(
+        mesh.services
+            .iter()
+            .find(|service| service.namespace == "prod" && service.name == "reviews")
+            .expect("service")
+            .workloads
+            .is_empty(),
+        "grant withdrawal must clear Service workload refs"
+    );
+}
+
+#[test]
+fn target_service_withdrawal_removes_cross_namespace_association() {
+    let (withdrawn, skipped) = translate_k8s_objects_collecting_skips(
+        &[
+            reference_grant("vms", "prod", "reviews"),
+            workload_entry("vms", "reviews.prod.svc.cluster.local", "10.9.0.5"),
+        ],
+        options(),
+    )
+    .expect("missing target Service must skip fail-closed");
+    assert!(
+        skipped.values().any(|error| {
+            error
+                .to_string()
+                .contains("not present in the translated inventory")
+        }),
+        "{skipped:?}"
+    );
+    let mesh = withdrawn.config.mesh.expect("mesh");
+    assert!(
+        mesh.workloads
+            .iter()
+            .all(|workload| !workload.addresses.iter().any(|a| a == "10.9.0.5"))
+    );
+    assert!(
+        mesh.services
+            .iter()
+            .filter(|service| service.name == "reviews")
+            .all(|service| service.workloads.is_empty())
+    );
+}
+
+#[test]
+fn watcher_ordering_workload_entry_before_grant_then_succeeds() {
+    // Simulate a WorkloadEntry arriving before its grant/Service (watcher
+    // ordering): first reconcile skips fail-closed; a later reconcile with the
+    // full inventory attaches.
+    let early = [
+        workload_entry("vms", "reviews.prod.svc.cluster.local", "10.9.0.5"),
+        service("reviews", "prod"),
+    ];
+    let (early_translation, skipped) =
+        translate_k8s_objects_collecting_skips(&early, options()).expect("early reconcile");
+    assert!(
+        skipped
+            .values()
+            .any(|error| error.to_string().contains("ReferenceGrant")),
+        "early WorkloadEntry without grant must be skipped: {skipped:?}"
+    );
+    assert!(
+        early_translation
+            .config
+            .mesh
+            .as_ref()
+            .expect("mesh")
+            .workloads
+            .iter()
+            .all(|workload| !workload.addresses.iter().any(|a| a == "10.9.0.5"))
+    );
+
+    let later = translate_k8s_objects(
+        &[
+            service("reviews", "prod"),
+            reference_grant("vms", "prod", "reviews"),
+            workload_entry("vms", "reviews.prod.svc.cluster.local", "10.9.0.5"),
+        ],
+        options(),
+    )
+    .expect("later reconcile with grant+service must attach");
+    let mesh = later.config.mesh.expect("mesh");
+    let workload = mesh
+        .workloads
+        .iter()
+        .find(|workload| workload.addresses.iter().any(|a| a == "10.9.0.5"))
+        .expect("workload");
+    assert_eq!(workload.service_namespace.as_deref(), Some("prod"));
+}
+
+#[test]
+fn ambiguous_two_label_host_does_not_spoof_cross_namespace_attachment() {
+    let result = translate_k8s_objects(
+        &[
+            service("reviews", "prod"),
+            reference_grant("vms", "prod", "reviews"),
+            workload_entry("vms", "reviews.prod", "10.9.0.7"),
+        ],
+        options(),
+    )
+    .expect("ambiguous two-label DNS must stay literal");
+
+    let mesh = result.config.mesh.expect("mesh");
+    let workload = mesh
+        .workloads
+        .iter()
+        .find(|workload| workload.addresses.iter().any(|a| a == "10.9.0.7"))
+        .expect("workload");
+    assert_eq!(workload.service_name, "reviews.prod");
+    assert_eq!(workload.service_namespace, None);
+    assert!(
+        mesh.services
+            .iter()
+            .find(|service| service.namespace == "prod" && service.name == "reviews")
+            .expect("service")
+            .workloads
+            .is_empty(),
+        "two-label DNS must not attach via confused-deputy namespace spoofing"
+    );
+}
+
+#[test]
+fn workloads_carrier_round_trips_service_namespace() {
+    let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
+    let workload = Workload {
+        spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/vms/sa/reviews-vm").expect("spiffe"),
+        selector: WorkloadSelector::default(),
+        service_name: "reviews".to_string(),
+        service_namespace: Some("prod".to_string()),
+        addresses: vec!["10.9.0.5".to_string()],
+        ports: Vec::new(),
+        trust_domain,
+        namespace: "vms".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some("reviews-vm".to_string()),
+        pod_uid: None,
+        node_waypoint: None,
+        remote_provenance: false,
+    };
+    let carrier = MeshSliceCarrier::Workloads(vec![workload]);
+    let encoded = carrier.encode_value().expect("encode");
+    let decoded = MeshSliceCarrier::decode(carrier.type_url(), &encoded)
+        .expect("decode")
+        .expect("recognized");
+    match decoded {
+        MeshSliceCarrier::Workloads(workloads) => {
+            assert_eq!(workloads.len(), 1);
+            assert_eq!(workloads[0].service_namespace.as_deref(), Some("prod"));
+            assert_eq!(workloads[0].attached_service_namespace(), "prod");
+            assert_eq!(workloads[0].namespace, "vms");
+        }
+        other => panic!("unexpected carrier: {other:?}"),
+    }
+}
+
+#[test]
+fn mesh_validation_rejects_spoofed_cross_namespace_service_namespace() {
+    let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
+    let spiffe = SpiffeId::new("spiffe://cluster.local/ns/vms/sa/reviews-vm").expect("spiffe");
+    let workload = Workload {
+        spiffe_id: spiffe,
+        selector: WorkloadSelector::default(),
+        service_name: "reviews".to_string(),
+        service_namespace: Some("prod".to_string()),
+        addresses: vec!["10.9.0.5".to_string()],
+        ports: Vec::new(),
+        trust_domain,
+        namespace: "vms".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some("reviews-vm".to_string()),
+        pod_uid: None,
+        node_waypoint: None,
+        remote_provenance: false,
+    };
+    let service = MeshService {
+        name: "reviews".to_string(),
+        namespace: "prod".to_string(),
+        ports: vec![ServicePort {
+            port: 9080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        // No authoritative membership — stamp alone must fail closed.
+        workloads: Vec::new(),
+        protocol_overrides: HashMap::new(),
+        cluster_ips: Vec::new(),
+    };
+
+    let errors = validate_mesh_config(&[workload], &[service], &[], &[], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("service_namespace") && error.contains("requires")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn mesh_validation_accepts_authorized_cross_namespace_service_namespace() {
+    let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
+    let spiffe = SpiffeId::new("spiffe://cluster.local/ns/vms/sa/reviews-vm").expect("spiffe");
+    let workload = Workload {
+        spiffe_id: spiffe.clone(),
+        selector: WorkloadSelector::default(),
+        service_name: "reviews".to_string(),
+        service_namespace: Some("prod".to_string()),
+        addresses: vec!["10.9.0.5".to_string()],
+        ports: Vec::new(),
+        trust_domain,
+        namespace: "vms".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some("reviews-vm".to_string()),
+        pod_uid: None,
+        node_waypoint: None,
+        remote_provenance: false,
+    };
+    let service = MeshService {
+        name: "reviews".to_string(),
+        namespace: "prod".to_string(),
+        ports: vec![ServicePort {
+            port: 9080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        workloads: vec![WorkloadRef { spiffe_id: spiffe }],
+        protocol_overrides: HashMap::new(),
+        cluster_ips: Vec::new(),
+    };
+
+    let errors = validate_mesh_config(&[workload], &[service], &[], &[], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .all(|error| !error.contains("service_namespace")),
+        "{errors:?}"
     );
 }

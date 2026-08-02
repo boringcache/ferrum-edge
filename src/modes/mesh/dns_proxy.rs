@@ -203,12 +203,19 @@ impl DnsResolutionTable {
         let mut exact: HashMap<String, DnsRecordSet> = HashMap::new();
         let mut wildcard_suffixes: HashMap<String, Vec<WildcardRecordSet>> = HashMap::new();
 
-        // Index workload addresses by SPIFFE ID and namespace, keeping the
-        // workload's service identity alongside its IPs. Multiple Kubernetes
-        // services commonly share a service-account SPIFFE ID; when a matching
-        // service identity exists we prefer it so auto-discovered refs do not
-        // bleed endpoints across services. The fallback below preserves older
-        // explicit MeshService refs whose workload.service_name differs.
+        // Index workload addresses by SPIFFE ID and *attached Service*
+        // namespace, keeping the workload's service identity alongside its IPs.
+        // Cross-namespace WorkloadEntry attachments stamp
+        // `Workload.service_namespace` to the target Service namespace while
+        // SPIFFE/`Workload.namespace` stay on the WorkloadEntry namespace — DNS
+        // lookups key by MeshService.namespace, so indexing must use
+        // `attached_service_namespace()` or authorized cross-namespace
+        // endpoints would silently disappear from service FQDNs.
+        // Multiple Kubernetes services commonly share a service-account SPIFFE
+        // ID; when a matching service identity exists we prefer it so
+        // auto-discovered refs do not bleed endpoints across services. The
+        // fallback below preserves older explicit MeshService refs whose
+        // workload.service_name differs.
         type WorkloadDnsKey<'a> = (&'a str, &'a str);
         type WorkloadDnsEntry<'a> = (&'a str, Vec<IpAddr>);
         let mut workload_ips: HashMap<WorkloadDnsKey<'_>, Vec<WorkloadDnsEntry<'_>>> =
@@ -221,7 +228,7 @@ impl DnsResolutionTable {
                 .collect();
             if !ips.is_empty() {
                 let entries = workload_ips
-                    .entry((wl.spiffe_id.as_str(), wl.namespace.as_str()))
+                    .entry((wl.spiffe_id.as_str(), wl.attached_service_namespace()))
                     .or_default();
                 if let Some((_, existing_ips)) = entries
                     .iter_mut()
@@ -3679,5 +3686,30 @@ mod tests {
 
         let short_b = table.resolve("api.ns-b").expect("short name B");
         assert!(short_b.contains(&"10.2.0.1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn resolution_table_cross_namespace_workload_entry_uses_attached_service_namespace() {
+        // WorkloadEntry identity stays in `vms`, but authorized attachment stamps
+        // service_namespace=`prod`. DNS must resolve the Service FQDN against the
+        // attached Service namespace — not the WorkloadEntry namespace.
+        let spiffe = "spiffe://cluster.local/ns/vms/sa/reviews-vm";
+        let mut workload = test_workload_for_service(spiffe, "reviews", "vms", vec!["10.9.0.5"]);
+        workload.service_namespace = Some("prod".to_string());
+        let slice = MeshSlice {
+            workloads: vec![workload],
+            services: vec![test_mesh_service("reviews", "prod", vec![spiffe])],
+            ..MeshSlice::default()
+        };
+
+        let table = DnsResolutionTable::from_mesh_slice(&slice);
+        let ips = table
+            .resolve("reviews.prod.svc.cluster.local")
+            .expect("authorized cross-namespace attachment must resolve");
+        assert!(ips.contains(&"10.9.0.5".parse::<IpAddr>().unwrap()));
+        assert!(
+            table.resolve("reviews.vms.svc.cluster.local").is_none(),
+            "must not publish endpoints under the WorkloadEntry namespace"
+        );
     }
 }
