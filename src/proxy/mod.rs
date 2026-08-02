@@ -11450,7 +11450,7 @@ async fn handle_websocket_request_authenticated(
     // lists come from the same request-cache snapshot, so neither path reloads
     // the cache or risks mixing generations.
     let (ws_framing_plugins, ws_frame_plugins) =
-        collect_websocket_relay_plugins(&plugins, requires_websocket_framing);
+        collect_websocket_relay_plugins(&plugins, requires_websocket_framing, &ctx);
     // Collect disconnect-hook plugins separately. These fire exactly once at
     // session end instead of per-frame, so keeping them in their own list
     // avoids the per-frame filter cost paid by the frame-hook path.
@@ -13165,9 +13165,19 @@ pub(crate) struct EffectiveWsSizeLimits {
     plugin_message: Option<WsSizeLimitRule>,
 }
 
+/// Collect the per-session parser-policy and frame-hook plugin lists for one
+/// accepted upgrade.
+///
+/// Plugins that opt into [`Plugin::bind_ws_session`] are substituted, in place,
+/// by the session-bound instance they return, so a policy plugin resolves its
+/// request-scoped state once at admission instead of per frame
+/// (`GHSA-6j3m-vf5h-pgcx`). Binding happens exactly once per plugin per
+/// session: the frame-hook list is derived from the already-bound framing list,
+/// never from the shared chain, so no message is processed twice.
 pub(crate) fn collect_websocket_relay_plugins(
     plugins: &[Arc<dyn Plugin>],
     requires_websocket_framing: bool,
+    upgrade_ctx: &RequestContext,
 ) -> WebSocketRelayPluginLists {
     if !requires_websocket_framing {
         return (Vec::new(), Vec::new());
@@ -13175,7 +13185,11 @@ pub(crate) fn collect_websocket_relay_plugins(
     let framing_plugins: Vec<_> = plugins
         .iter()
         .filter(|plugin| plugin.requires_websocket_framing())
-        .cloned()
+        .map(|plugin| {
+            Arc::clone(plugin)
+                .bind_ws_session(upgrade_ctx)
+                .unwrap_or_else(|| Arc::clone(plugin))
+        })
         .collect();
     let frame_plugins = framing_plugins
         .iter()

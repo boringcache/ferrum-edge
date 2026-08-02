@@ -1359,6 +1359,12 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_websocket_framing(&self) -> bool {
         self.inner.requires_websocket_framing()
     }
+    /// Priority override affects chain ORDER, which the relay has already
+    /// applied by the time sessions bind, so the inner plugin's session-bound
+    /// substitute is returned directly.
+    fn bind_ws_session(self: Arc<Self>, ctx: &RequestContext) -> Option<Arc<dyn Plugin>> {
+        Arc::clone(&self.inner).bind_ws_session(ctx)
+    }
     async fn on_ws_frame(
         &self,
         proxy_id: &str,
