@@ -184,6 +184,10 @@ reload, which rebuilds through the same constructor.
   the RFC 6455 `Sec-WebSocket-Accept` handshake value (a cache-poisoning guard
   over a fixed public GUID — it carries no key and protects nothing), and
   content-addressing digests listed in the inventory as `outside-boundary`.
+- The Kubernetes and MongoDB clients have their provider-selecting default
+  features disabled. Their rustls transports follow the same mutually exclusive
+  `crypto-ring` / `fips` feature pair as Ferrum's frontend, backend, and control
+  plane TLS, so neither client can re-enable Ring transitively in a FIPS build.
 
 **Rejected configurations**
 
@@ -194,12 +198,6 @@ reload, which rebuilds through the same constructor.
 - `kafka_logging`: librdkafka performs its TLS through OpenSSL, outside the
   selected module. Use `tcp_logging`, `ws_logging`, or `http_logging`, which are
   rustls-based.
-- `FERRUM_DB_TYPE=mongodb`: the MongoDB driver pins its own non-validated rustls
-  provider, and URI options (including `mongodb+srv` defaults) can enable that
-  TLS path independently of `FERRUM_DB_TLS_MODE`. Ferrum cannot route or
-  exhaustively exclude that transport. Use a SQL config store, file mode, or
-  CP/DP distribution.
-
 Every diagnostic is bounded — at most 8 offending entries are named, followed by
 a count — and carries no secret, key material, path, or free-form
 operator-supplied value.

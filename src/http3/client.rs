@@ -3197,12 +3197,8 @@ impl Http3Client {
         socket.set_nonblocking(true)?;
         let runtime = quinn::default_runtime()
             .ok_or_else(|| anyhow::anyhow!("HTTP/3 client requires a Tokio runtime"))?;
-        let mut endpoint = quinn::Endpoint::new(
-            quinn::EndpointConfig::default(),
-            None,
-            socket,
-            runtime,
-        )?;
+        let mut endpoint =
+            quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
         endpoint.set_default_client_config(client_config);
 
         Ok(Self { endpoint })

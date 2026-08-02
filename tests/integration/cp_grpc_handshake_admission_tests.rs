@@ -40,7 +40,7 @@ use tokio_rustls::TlsConnector;
 use ferrum_edge::modes::control_plane::{cp_grpc_plain_incoming, cp_grpc_tls_incoming};
 use ferrum_edge::tls::backend::BackendTlsConfigBuilder;
 use ferrum_edge::tls::source::{CertSource, MaterialKind};
-use ferrum_edge::tls::{load_tls_config_with_client_auth_from_sources, TlsPolicy};
+use ferrum_edge::tls::{TlsPolicy, load_tls_config_with_client_auth_from_sources};
 use ferrum_edge::util::conn_limit::ConnLimiter;
 
 use crate::scaffolding::certs::TestCa;
@@ -220,8 +220,7 @@ fn drive_in_memory_handshake(
     let server_name = ServerName::try_from("localhost").expect("static server name");
     let mut client = ClientConnection::new(Arc::new(client_config), server_name)
         .expect("construct backend TLS client");
-    let mut server =
-        ServerConnection::new(server_config).expect("construct frontend TLS server");
+    let mut server = ServerConnection::new(server_config).expect("construct frontend TLS server");
 
     for _ in 0..32 {
         let mut to_server = Vec::new();

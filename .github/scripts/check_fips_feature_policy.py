@@ -59,6 +59,8 @@ REQUIRED_FEATURE_PAIRS = (
     ("jsonwebtoken/rust_crypto", "jsonwebtoken/aws_lc_rs"),
     ("hyper-rustls?/ring", "hyper-rustls?/fips"),
     ("instant-acme?/ring", "instant-acme?/fips"),
+    ("kube/ring", "kube/aws-lc-rs"),
+    ("mongodb/rustls-tls", "mongodb/rustls-tls-aws-lc"),
 )
 
 # The `fips` feature must additionally bind the validated module itself.
@@ -75,6 +77,8 @@ FORBIDDEN_INLINE_DECLARATIONS = {
     "ldap3": ("tls-rustls-ring", "tls-rustls-aws-lc-rs"),
     "hyper-rustls": ("ring", "aws-lc-rs", "fips"),
     "instant-acme": ("ring", "aws-lc-rs", "fips"),
+    "kube": ("ring", "aws-lc-rs"),
+    "mongodb": ("rustls-tls", "rustls-tls-aws-lc"),
     "x509-parser": ("verify", "verify-aws"),
     "jsonwebtoken": ("rust_crypto", "aws_lc_rs"),
     "reqwest": ("rustls",),
@@ -82,7 +86,14 @@ FORBIDDEN_INLINE_DECLARATIONS = {
 
 # Dependencies that must be declared with `default-features = false`, because
 # their default feature set selects a crypto backend.
-REQUIRE_DEFAULT_FEATURES_OFF = ("quinn", "rcgen", "rustls", "tokio-rustls")
+REQUIRE_DEFAULT_FEATURES_OFF = (
+    "kube",
+    "mongodb",
+    "quinn",
+    "rcgen",
+    "rustls",
+    "tokio-rustls",
+)
 
 # `cargo tree -e features` prints feature edges as `crate feature "name"`.
 FEATURE_EDGE = re.compile(r'^[^a-zA-Z0-9]*([A-Za-z0-9_.-]+) feature "([A-Za-z0-9_.-]+)"')
@@ -102,6 +113,9 @@ FORBIDDEN_RESOLVED_FIPS = {
     ("ldap3", "tls-rustls-ring"),
     ("tonic", "tls-ring"),
     ("hyper-rustls", "ring"),
+    ("kube", "ring"),
+    ("kube-client", "ring"),
+    ("mongodb", "rustls-tls"),
     ("rcgen", "ring"),
     ("jsonwebtoken", "rust_crypto"),
     ("x509-parser", "verify"),
