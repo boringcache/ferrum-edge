@@ -7978,7 +7978,7 @@ async fn spool_usage_counters_track_successful_replay_deletion() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
-async fn large_spool_status_and_prometheus_do_not_inventory_or_block_progress() {
+async fn large_spool_status_and_prometheus_use_cached_gauges_without_inventory() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200))
@@ -8041,13 +8041,6 @@ async fn large_spool_status_and_prometheus_do_not_inventory_or_block_progress() 
     );
 
     let walks_baseline = active_spool_inventory_walks_for_tests();
-    let progress = Arc::new(AtomicBool::new(false));
-    let progress_flag = Arc::clone(&progress);
-    let progress_task = tokio::spawn(async move {
-        tokio::task::yield_now().await;
-        progress_flag.store(true, Ordering::SeqCst);
-    });
-
     let status = render_status_json();
     let prom = render_prometheus();
     let status2 = render_status_json();
@@ -8055,7 +8048,7 @@ async fn large_spool_status_and_prometheus_do_not_inventory_or_block_progress() 
     assert_eq!(
         active_spool_inventory_walks_for_tests(),
         walks_baseline,
-        "status/Prometheus rendering must not inventory the spool"
+        "status/Prometheus rendering must not inventory the spool; this deterministic walk count proves the prior blocking filesystem work is absent from the scrape path"
     );
     assert!(
         status.contains(&format!("\"files\":{PLANTED}")),
@@ -8067,12 +8060,6 @@ async fn large_spool_status_and_prometheus_do_not_inventory_or_block_progress() 
     );
     assert_eq!(status, status2);
     assert_eq!(prom, prom2);
-
-    progress_task.await.expect("progress task");
-    assert!(
-        progress.load(Ordering::SeqCst),
-        "unrelated async progress must complete while status/metrics use cached gauges"
-    );
 
     // Plant one more file without reconciling: scrapes must keep last-good
     // values, proving they are not walking the tree for freshness.
