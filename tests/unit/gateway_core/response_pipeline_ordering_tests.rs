@@ -21,8 +21,8 @@ use std::sync::Arc;
 use ferrum_edge::_test_support::{
     finalize_synthetic_response_for_test, gateway_capacity_response_selected_for_test,
     mark_buffered_response_capacity_refusal_pending_for_test,
-    run_after_proxy_hooks_reject_for_test,
-    set_original_response_content_encoding_for_test, stamp_original_response_metadata_for_test,
+    run_after_proxy_hooks_reject_for_test, set_original_response_content_encoding_for_test,
+    stamp_original_response_metadata_for_test,
     take_buffered_response_capacity_refusal_pending_for_test,
     transform_buffered_response_body_with_deadline_full_for_test,
 };
@@ -93,10 +93,7 @@ impl Plugin for LateHeaderBearingReject {
         ferrum_edge::plugins::PluginResult::Reject {
             status_code: 502,
             body: r#"{"error":"upstream rejected"}"#.to_string(),
-            headers: HashMap::from([(
-                "x-pending-secret".to_string(),
-                "value".to_string(),
-            )]),
+            headers: HashMap::from([("x-pending-secret".to_string(), "value".to_string())]),
         }
     }
 }
@@ -269,8 +266,8 @@ fn response_transformer_renaming_header() -> Arc<dyn Plugin> {
 }
 
 fn compression_plugin() -> Arc<dyn Plugin> {
-    let plugin = CompressionPlugin::new(&json!({"min_content_length": 10}))
-        .expect("compression config");
+    let plugin =
+        CompressionPlugin::new(&json!({"min_content_length": 10})).expect("compression config");
     Arc::new(plugin)
 }
 
@@ -318,14 +315,8 @@ async fn final_body_policy_capacity_refusal_cannot_escape_without_transport_stag
     let mut headers = json_headers();
     let mut body = bytes::Bytes::from_static(br#"{"secret":"must-not-publish"}"#);
 
-    finalize_synthetic_response_for_test(
-        &plugins,
-        &mut ctx,
-        &mut status,
-        &mut headers,
-        &mut body,
-    )
-    .await;
+    finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)
+        .await;
 
     assert_eq!(status, 503);
     assert!(gateway_capacity_response_selected_for_test(&ctx));
@@ -424,7 +415,10 @@ async fn late_header_rename_cannot_bypass_waf_on_synthetic_response() {
     let mut headers = json_headers();
     headers.insert("x-pending-secret".to_string(), "value".to_string());
     // One-shot gateway session state staged onto the synthetic response.
-    headers.insert("set-cookie".to_string(), "sid=rotated; HttpOnly".to_string());
+    headers.insert(
+        "set-cookie".to_string(),
+        "sid=rotated; HttpOnly".to_string(),
+    );
     let mut body = bytes::Bytes::from_static(br#"{"ok":true}"#);
 
     finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)

@@ -17689,10 +17689,8 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // observers, and the HEAD/204/205/304 wire preparation, so a rejection here
     // is normalized by exactly the same boundaries as every other rejection that
     // flows through this finalizer.
-    enforce_final_client_visible_response_header_policy(
-        plugins, ctx, status, headers, body, false,
-    )
-    .await;
+    enforce_final_client_visible_response_header_policy(plugins, ctx, status, headers, body, false)
+        .await;
 
     // A failed WebSocket handshake is still an ordinary HTTP response, but its
     // transport-owned fields must come only from a successful H1 Upgrade or
@@ -17826,8 +17824,7 @@ pub(crate) async fn run_after_proxy_hooks(
     if plugins.iter().any(|plugin| {
         plugin.may_enforce_response_body_policy(ctx)
             || plugin.enforces_final_client_visible_response_headers(ctx)
-    })
-    {
+    }) {
         ctx.begin_buffered_replacement_response_header_provenance(response_headers);
     } else {
         ctx.begin_buffered_deadline_response_header_provenance(response_headers);
@@ -20115,9 +20112,7 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
             response_status,
             response_headers,
             response_body,
-            InitialResponseHeaderPolicySource::Prefiltered(
-                initial_response_header_policy_plugins,
-            ),
+            InitialResponseHeaderPolicySource::Prefiltered(initial_response_header_policy_plugins),
         )
         .await
         {
