@@ -17533,7 +17533,7 @@ async fn reenforce_final_synthetic_client_visible_response_body_policy(
     let mut candidate_headers = response_headers.clone();
     let candidate_body = if body_unchanged {
         for (name, value) in &witness.plaintext_transport_headers {
-            restore_response_header(&mut candidate_headers, *name, value.as_deref());
+            restore_response_header(&mut candidate_headers, name, value.as_deref());
         }
         witness.plaintext_body.clone()
     } else {
