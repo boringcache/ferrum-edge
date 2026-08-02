@@ -852,7 +852,10 @@ async fn update_config_rebuilds_lb_for_projected_dr_change_with_unrelated_consum
     );
     assert_eq!(lb_hash_on_for_port(&state, 8080), HashOnStrategy::Ip);
     let before_port = route_port_override(&state, 8080).expect("old per-port override");
-    assert_eq!(before_port.algorithm, Some(LoadBalancerAlgorithm::RoundRobin));
+    assert_eq!(
+        before_port.algorithm,
+        Some(LoadBalancerAlgorithm::RoundRobin)
+    );
     assert_eq!(
         before_port
             .locality_lb_setting
