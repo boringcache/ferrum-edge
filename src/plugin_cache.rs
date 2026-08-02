@@ -1289,6 +1289,19 @@ impl Plugin for PriorityOverridePlugin {
             .finalize_client_visible_response_body(ctx, response_status, response_headers, body)
             .await
     }
+    fn enforces_final_client_visible_response_headers(&self, ctx: &RequestContext) -> bool {
+        self.inner.enforces_final_client_visible_response_headers(ctx)
+    }
+    async fn finalize_client_visible_response_headers(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> PluginResult {
+        self.inner
+            .finalize_client_visible_response_headers(ctx, response_status, response_headers)
+            .await
+    }
     fn enforces_response_body_policy(
         &self,
         ctx: &RequestContext,
