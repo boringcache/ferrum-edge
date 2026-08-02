@@ -547,11 +547,11 @@ impl AuditSpool {
     /// Move a pending record into operator-visible retention.
     ///
     /// Discarding the *newest* arrival preserves the oldest evidence, which is
-    /// what an operator reconciling a gap needs first. A record that is no
-    /// longer pending is reported as [`RetainOutcome::AlreadySettled`] rather
-    /// than as a discard: at-least-once delivery means the same stable id can
-    /// be settled by one attempt while another is still burning its retry
-    /// budget, and that is not evidence loss.
+    /// what an operator reconciling a gap needs first. An id that is no longer
+    /// pending is distinguished as already retained when its failed record
+    /// exists, or already settled when neither record exists. At-least-once
+    /// delivery means either can race another attempt for the same stable id;
+    /// neither is a new retention or new evidence loss.
     pub fn retain_unrecoverable(&self, id: &str) -> Result<RetainOutcome, SpoolError> {
         let pending = record_path(&self.pending_dir(), id)?;
         let failed = record_path(&self.failed_dir(), id)?;
