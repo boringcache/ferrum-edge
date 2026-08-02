@@ -610,15 +610,12 @@ fn configured_provider_still_sees_the_native_terminal_signal() {
 
 #[test]
 fn configured_provider_cannot_suppress_an_unambiguous_root_usage_signal() {
-    let mut extractor =
-        UsageStreamExtractor::new(UsageStreamFormat::Sse, Some(AiProvider::Google));
-    extractor.push(&sse(&[
-        &json!({
-            "object": "chat.completion.chunk",
-            "usage": {"prompt_tokens": 5, "completion_tokens": 8, "total_tokens": 13}
-        })
-        .to_string(),
-    ]));
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, Some(AiProvider::Google));
+    extractor.push(&sse(&[&json!({
+        "object": "chat.completion.chunk",
+        "usage": {"prompt_tokens": 5, "completion_tokens": 8, "total_tokens": 13}
+    })
+    .to_string()]));
     extractor.finish();
     assert_eq!(extractor.usage().total_for_mode("total_tokens"), Some(13));
 }
