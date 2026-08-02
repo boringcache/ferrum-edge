@@ -18800,6 +18800,16 @@ components:
         requests and optional responses. Fixed-shape objects reject unknown keys;
         intentionally open maps are rule_modes / rule_overrides (rule-id keys),
         conditions.headers, and global_exemptions.header_present.
+        On an upgraded WebSocket session the same body rule sets govern complete
+        application messages: client-to-backend messages use the request body
+        rules (request_inspection + request_body_inspection), backend-to-client
+        messages use the response body rules (response_inspection +
+        response_body_inspection). Text and Binary messages are both inspected —
+        the HTTP media-type selectors (body_methods, body_content_types,
+        inspect_multipart, inspect_binary_body) do not apply because a WebSocket
+        message carries no Content-Type — control frames are never scanned, and
+        max_scan_bytes / on_body_too_large / on_scan_timeout fail closed by
+        closing the connection with RFC 6455 code 1008.
       properties:
         mode:
           type: string
@@ -24305,10 +24315,12 @@ components:
                 Durable mode rejects `wait_for_async_insert` values that disable
                 persistence waits (`0`, `false`, `no`, `off`) unless
                 `allow_lossy_async_insert` is true. Recommended durable settings
-                use `async_insert=1` with `wait_for_async_insert=1`. When
-                `async_insert` is enabled and the wait setting is omitted, the
-                sink pins `wait_for_async_insert=1` rather than inheriting the
-                ClickHouse user/profile default.
+                use `async_insert=1` with `wait_for_async_insert=1`. Whenever
+                the wait setting is omitted, the sink pins
+                `wait_for_async_insert=1` on every durable request rather than
+                inheriting a ClickHouse user/profile default, including one
+                that enables `async_insert` while disabling the persistence
+                wait.
 
                 Credential-bearing parameter names are rejected: the exact names
                 `user`, `password`, `access_token`, and `session_id`, plus any

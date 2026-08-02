@@ -72,6 +72,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Durable `api_chargeback_sink` ClickHouse requests now pin
+  `wait_for_async_insert=1` whenever the setting is omitted, even when Ferrum
+  also omits `async_insert`. This prevents a ClickHouse user/profile default
+  from turning an acknowledged export into fire-and-forget buffering before
+  Ferrum advances or deletes durable spool state (#3040). The explicit
+  `allow_lossy_async_insert` opt-in remains available for operators that accept
+  that loss mode.
+
 - H1/H2 WebSocket backend dials now use the effective proxy of the target they
   are actually dialing (#2416). The WebSocket branch previously received only
   the retry-capped base proxy: retry rotation moved the URL, the admission
@@ -114,6 +122,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Required CI owners now declare `merge_group` triggers and event-aware
+  base/head selection so a future `main` merge queue can run the six required
+  checks (`Tests`, `Merge Coverage`, `Gateway API Conformance`,
+  `Mesh E2E Sidecar Live`, `Trusted Cross Build Policy`,
+  `Multicluster Federation Live`) on the synthesized queue SHA without
+  deadlocking. Repository ruleset/branch-protection enablement remains a
+  separate root-owned step (#2458).
 - Gateway API and Istio status planning now build immutable per-reconcile
   indexes and reuse one primary translation/materialization (plus skip errors)
   instead of retranslating a filtered snapshot once per status object, and

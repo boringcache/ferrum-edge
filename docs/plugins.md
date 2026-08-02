@@ -1883,8 +1883,10 @@ at least one nonempty pricing dimension (`pricing_tiers`, `bandwidth_pricing`,
 or `stream_connection_pricing` with `PricingConfig::has_any_pricing`
 semantics). Durable delivery requires a complete empty ClickHouse
 acknowledgement (HTTP 200/204 alone is insufficient); `wait_for_async_insert=0`
-needs explicit `clickhouse.allow_lossy_async_insert=true`, and enabling
-`async_insert` without a wait setting pins `wait_for_async_insert=1`. It
+needs explicit `clickhouse.allow_lossy_async_insert=true`, and omitted
+`wait_for_async_insert` pins `wait_for_async_insert=1` on every durable
+request so ClickHouse user/profile defaults cannot enable fire-and-forget async
+inserts. It
 supports per-event mode for transaction-level provenance, snapshot mode for
 lower ingest volume (requires `spool.enabled=true`), an on-disk spool for
 ClickHouse outages, `GET /charges/sink/status` (multi-instance accepted-generation
@@ -4172,6 +4174,22 @@ inspection and cannot be proven safe. Native gRPC's reserved terminal fields
 (`grpc-status`, `grpc-message`, `grpc-status-details-bin`) always survive.
 Global monitor mode and monitor-action-only response header rules preserve
 trailers. Anomaly scoring counts as enforcing when it can block.
+
+WebSocket support is not handshake-only. On an upgraded session (HTTP/1.1
+upgrade and HTTP/2 / HTTP/3 Extended CONNECT alike) the same body rule sets
+apply to complete application messages: client→backend messages run the request
+body rules, backend→client messages run the response body rules. Text and
+Binary are both inspected — the HTTP media-type selectors (`body_methods`,
+`body_content_types`, `inspect_multipart`, `inspect_binary_body`) do not apply
+because a WebSocket message carries no `Content-Type`. Control frames
+(Ping/Pong/Close) are never scanned as application payload, messages arrive
+reassembled and uncompressed (`permessage-deflate` is never negotiated end to
+end), and `max_scan_bytes` / `on_body_too_large` / `on_scan_timeout` fail closed
+by closing the connection with RFC 6455 code 1008 and a fixed reason that never
+echoes message bytes. Anomaly scoring is evaluated per complete message rather
+than accumulated across a session, and message findings are emitted as `waf`
+log events rather than `waf.*` transaction metadata. See
+[waf.md](waf.md#websocket-message-inspection).
 
 That drop is decided **per request**, not per configuration. A request matched
 by `global_exemptions` (path, method, IP, or consumer) never reaches a WAF

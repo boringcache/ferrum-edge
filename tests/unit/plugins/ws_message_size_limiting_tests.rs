@@ -60,8 +60,17 @@ fn test_supported_protocols_and_frame_parser_opt_in() {
 fn test_parser_only_plugin_is_excluded_from_message_hook_list() {
     let plugin: Arc<dyn Plugin> =
         Arc::new(WsMessageSizeLimiting::new(&json!({"max_frame_bytes": 1024})).unwrap());
+    let upgrade_ctx = ferrum_edge::plugins::RequestContext::new(
+        "203.0.113.10".to_string(),
+        "GET".to_string(),
+        "/ws".to_string(),
+    );
     let (framing_plugins, frame_plugins) =
-        ferrum_edge::_test_support::websocket_relay_plugin_names_for_test(&[plugin], true);
+        ferrum_edge::_test_support::websocket_relay_plugin_names_for_test(
+            &[plugin],
+            true,
+            &upgrade_ctx,
+        );
     assert_eq!(
         framing_plugins,
         vec!["ws_message_size_limiting".to_string()]
