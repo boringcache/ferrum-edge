@@ -192,6 +192,84 @@ async fn unreserved_stream_is_rejected_before_headers_are_committed() {
     assert_reject(result, Some(502));
 }
 
+#[tokio::test]
+async fn compressed_unreserved_stream_default_charge_estimate_rejects_at_after_proxy() {
+    // Second security arm: default `on_unmetered_response: charge_estimate` still
+    // rejects a usage-less 2xx when the compressed Case B candidate never
+    // produced a safe pre-request estimate. The markers come from `before_proxy`
+    // on a realistic POST JSON + Content-Encoding fixture, not from test setup.
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 1000, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "compressed streaming prompt");
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        0,
+        "compressed request is not pre-reserved"
+    );
+    assert!(
+        has_scoped_meta(&ctx, "ai_ratelimit_request"),
+        "compressed POST JSON must be marked through before_proxy"
+    );
+    assert!(
+        has_scoped_meta(&ctx, "ai_ratelimit_compressed_ai_request"),
+        "Case B compressed candidate must carry the compressed marker"
+    );
+
+    let mut response_headers = sse_headers();
+    let result = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_reject(result, Some(502));
+}
+
+#[tokio::test]
+async fn non_ai_unreserved_stream_continues_at_after_proxy() {
+    // Blast-radius boundary: the pre-commit guard keys off `request_was_ai_call`,
+    // so an ordinary non-AI request with a streaming/non-JSON 2xx must continue
+    // at `after_proxy` even under the strictest `on_unmetered_response: reject`.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "on_unmetered_response": "reject"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        !has_scoped_meta(&ctx, "ai_ratelimit_request"),
+        "a non-AI request must not be marked"
+    );
+    assert_eq!(reserved_tokens(&ctx), 0);
+
+    let mut response_headers = sse_headers();
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+    );
+
+    let mut plain_stream_headers = HashMap::new();
+    plain_stream_headers.insert("content-type".to_string(), "text/plain".to_string());
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut plain_stream_headers)
+            .await,
+    );
+}
+
 // ─── Basic flow ─────────────────────────────────────────────────────────
 
 #[tokio::test]
