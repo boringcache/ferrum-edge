@@ -2,6 +2,7 @@
 
 pub mod api_specs;
 pub mod audit;
+pub mod audit_spool;
 mod backup;
 pub mod conn_limit;
 pub(crate) mod crud;
@@ -467,6 +468,9 @@ impl AdminState {
     pub async fn admit_write(
         &self,
     ) -> Result<crate::config::db_backend::DbWriteTopologyPermit, Response<Full<Bytes>>> {
+        if self.admin_audit_enabled {
+            audit::note_fail_closed_rejection();
+        }
         if let Some(response) = self.evaluate_non_topology_write_gate() {
             return Err(response);
         }
@@ -503,6 +507,9 @@ impl AdminState {
     // an extra allocation/dereference layer on an already exceptional path.
     #[allow(clippy::result_large_err)]
     pub fn admit_non_config_db_write(&self) -> Result<(), Response<Full<Bytes>>> {
+        if self.admin_audit_enabled {
+            audit::note_fail_closed_rejection();
+        }
         if let Some(response) = self.evaluate_non_topology_write_gate() {
             Err(response)
         } else {
@@ -515,6 +522,22 @@ impl AdminState {
             return Some(json_response(
                 StatusCode::FORBIDDEN,
                 &json!({"error": "Admin API is in read-only mode"}),
+            ));
+        }
+        // Audit fail-closed policy (issue #2421). Refusing a mutation that
+        // cannot be durably audited is strictly better than performing it and
+        // reporting the audit failure afterwards, so the gate runs *before* the
+        // write rather than converting a committed mutation into a 503. The
+        // reason is a closed static label — never a path or an OS error.
+        if self.admin_audit_enabled
+            && let Some(reason) = audit::fail_closed_block_reason()
+        {
+            return Some(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": "Admin mutations are refused because the audit pipeline cannot durably record events (FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed)",
+                    "audit_unavailable_reason": reason
+                }),
             ));
         }
         if let Some(ref flag) = self.db_available
@@ -1514,11 +1537,17 @@ fn tls_route_required_role(method: &Method, segments: &[&str]) -> Option<AdminRo
     }
 }
 
+/// Report a failed durable audit handoff without disclosing the underlying
+/// detail (which can carry a spool path or an OS error string).
+///
+/// Under `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed` this line is the
+/// last mutation admitted before the write gate closes; under `fail_open` the
+/// response proceeds and the gap is reconciled from `/health` and `/metrics`.
 pub(crate) fn log_audit_enqueue_failure(_error: &anyhow::Error) {
     warn!(
         surface = "audit_enqueue",
         detail_withheld = true,
-        "Admin mutation persisted but audit event was not enqueued"
+        "Admin mutation persisted but the audit event had no durable handoff"
     );
 }
 
@@ -1827,6 +1856,15 @@ pub async fn handle_admin_request(
             }
         }
 
+        // Admin audit delivery pipeline (issue #2421). An unavailable pipeline
+        // degrades `status` so a stuck audit backlog is not invisible behind an
+        // otherwise green probe. This check is a lock-free atomic read: the
+        // detailed projection below is what pays the bounded backlog rescan, so
+        // an unauthenticated probe cannot drive filesystem work.
+        if state.admin_audit_enabled && !audit::pipeline_available() {
+            health_status["status"] = json!("degraded");
+        }
+
         // Report cached config availability for resilience visibility
         if let Some(config) = state.cached_gateway_config() {
             health_status["cached_config"] = json!({
@@ -1943,6 +1981,13 @@ pub async fn handle_admin_request(
         // timestamps while operators using the established observability auth
         // paths can diagnose stdout/stderr independently.
         if detailed {
+            // Counts, bounded backlog, retained/unrecoverable state, and a
+            // closed-set reason label only — never an actor subject, token,
+            // diff, resource id, or spool path (issue #2421).
+            if state.admin_audit_enabled {
+                health_status["audit_pipeline"] =
+                    serde_json::to_value(audit::pipeline_status()).unwrap_or_default();
+            }
             health_status["logging"] =
                 serde_json::to_value(crate::logging::snapshot()).unwrap_or_default();
             health_status["kafka_logging"] =
@@ -3042,7 +3087,7 @@ pub async fn handle_admin_request(
                 &namespace,
                 json!({"path": path}),
             );
-            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
                 log_audit_enqueue_failure(&error);
             }
         }
@@ -5180,7 +5225,7 @@ async fn finish_failed_restore(
             json!({"rollback": rollback_status}),
         ),
     );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
         log_audit_enqueue_failure(&error);
     }
 
@@ -5274,7 +5319,7 @@ async fn finish_failed_restore_after_intervening_clear(
             json!({"rollback": rollback_status}),
         ),
     );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db, event) {
+    if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
         log_audit_enqueue_failure(&error);
     }
 
@@ -5323,7 +5368,7 @@ async fn finish_atomic_delete_failure(
             json!({"rollback": "not_needed"}),
         ),
     );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
         log_audit_enqueue_failure(&error);
     }
 
@@ -5357,7 +5402,7 @@ async fn finish_unknown_atomic_delete_failure(
             json!({"rollback": "unknown_outcome"}),
         ),
     );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db, event) {
+    if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
         log_audit_enqueue_failure(&error);
     }
 
@@ -5498,7 +5543,7 @@ async fn handle_update_credentials(
                     crud::consumer_audit_body(&consumer),
                 ),
             );
-            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
                 log_audit_enqueue_failure(&error);
             }
         }
@@ -5582,7 +5627,7 @@ async fn handle_delete_credentials(
                     crud::consumer_audit_body(&consumer),
                 ),
             );
-            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
                 log_audit_enqueue_failure(&error);
             }
         }
@@ -5720,7 +5765,7 @@ async fn handle_append_credential(
                     crud::consumer_audit_body(&consumer),
                 ),
             );
-            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
                 log_audit_enqueue_failure(&error);
             }
         }
@@ -5845,7 +5890,7 @@ async fn handle_delete_credential_by_index(
                     crud::consumer_audit_body(&consumer),
                 ),
             );
-            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
                 log_audit_enqueue_failure(&error);
             }
         }
@@ -6660,7 +6705,7 @@ async fn handle_batch_create(
             namespace,
             audit::create_diff(response["created"].clone()),
         );
-        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
             log_audit_enqueue_failure(&error);
         }
     }
@@ -7951,7 +7996,7 @@ async fn handle_restore(
             response["restored"].clone(),
         ),
     );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
         log_audit_enqueue_failure(&error);
     }
 

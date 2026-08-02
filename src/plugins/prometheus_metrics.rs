@@ -2048,6 +2048,129 @@ impl MetricsRegistry {
             render_process_counter(&mut output, name, value, &ns_label);
         }
 
+        // Admin audit delivery pipeline (issue #2421). Process-wide counters
+        // and bounded-backlog gauges so an operator can reconcile committed
+        // mutations against durable audit rows. Values only — no actor subject,
+        // token, diff, resource id, or spool path ever reaches the exposition,
+        // and the single `reason` label comes from a closed `&'static str` set.
+        let audit_pipeline = crate::admin::audit::pipeline_metrics_snapshot();
+        for (name, help, value) in [
+            (
+                "ferrum_admin_audit_events_accepted_total",
+                "Admin audit events accepted from a committed admin mutation.",
+                audit_pipeline.accepted_total,
+            ),
+            (
+                "ferrum_admin_audit_events_spooled_total",
+                "Admin audit events made durable in the spool before the mutation response.",
+                audit_pipeline.spooled_total,
+            ),
+            (
+                "ferrum_admin_audit_events_enqueued_total",
+                "Admin audit events admitted to the bounded in-memory delivery queue.",
+                audit_pipeline.enqueued_total,
+            ),
+            (
+                "ferrum_admin_audit_events_delivered_total",
+                "Admin audit events accepted by the configured database backend.",
+                audit_pipeline.delivered_total,
+            ),
+            (
+                "ferrum_admin_audit_events_replayed_total",
+                "Durable admin audit records re-read from the spool for delivery (restart, queue overflow, or an expired shutdown drain).",
+                audit_pipeline.replayed_total,
+            ),
+            (
+                "ferrum_admin_audit_delivery_retries_total",
+                "Bounded-backoff retries scheduled after a transient admin audit delivery failure.",
+                audit_pipeline.retries_total,
+            ),
+            (
+                "ferrum_admin_audit_delivery_failures_total",
+                "Admin audit delivery attempts that returned an error from the database backend.",
+                audit_pipeline.delivery_failures_total,
+            ),
+            (
+                "ferrum_admin_audit_events_retained_total",
+                "Admin audit events that exhausted the delivery-attempt budget and were retained for operator remediation.",
+                audit_pipeline.retained_total,
+            ),
+            (
+                "ferrum_admin_audit_corrupt_records_total",
+                "Durable admin audit records quarantined as corrupt (bad version, unparseable, oversized, or id mismatch).",
+                audit_pipeline.corrupt_records_total,
+            ),
+            (
+                "ferrum_admin_audit_truncated_diffs_total",
+                "Admin audit events whose diff was replaced by a redacted marker because it exceeded the durable record ceiling.",
+                audit_pipeline.truncated_diffs_total,
+            ),
+            (
+                "ferrum_admin_audit_fail_closed_rejections_total",
+                "Admin mutations refused up front because the audit pipeline is unavailable under the fail_closed policy.",
+                audit_pipeline.fail_closed_rejections_total,
+            ),
+        ] {
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} counter\n"));
+            render_process_counter(&mut output, name, value, &ns_label);
+        }
+        output.push_str(
+            "# HELP ferrum_admin_audit_events_dropped_total Admin audit events lost without a durable record, by reason.\n",
+        );
+        output.push_str("# TYPE ferrum_admin_audit_events_dropped_total counter\n");
+        // Emit every reason bucket even at zero so dashboards can pin them.
+        for (reason, value) in [
+            (
+                "durable_handoff_failed",
+                audit_pipeline.dropped_durable_handoff_failed_total,
+            ),
+            (
+                "no_durable_spool",
+                audit_pipeline.dropped_no_durable_spool_total,
+            ),
+            (
+                "retained_capacity",
+                audit_pipeline.dropped_retained_capacity_total,
+            ),
+        ] {
+            output.push_str(&format!(
+                "ferrum_admin_audit_events_dropped_total{{reason=\"{reason}\"{ns_label}}} {value}\n"
+            ));
+        }
+        let audit_status = crate::admin::audit::pipeline_status();
+        for (name, help, value) in [
+            (
+                "ferrum_admin_audit_queue_depth",
+                "Admin audit events currently waiting in the bounded in-memory delivery queue.",
+                audit_pipeline.queue_depth as i64,
+            ),
+            (
+                "ferrum_admin_audit_queue_capacity",
+                "Configured depth of the bounded in-memory admin audit delivery queue.",
+                audit_status.queue_capacity as i64,
+            ),
+            (
+                "ferrum_admin_audit_spool_pending_records",
+                "Durable admin audit records awaiting delivery (bounded scan; a saturated scan reports a floor).",
+                audit_pipeline.spool_pending_records as i64,
+            ),
+            (
+                "ferrum_admin_audit_retained_records",
+                "Durable admin audit records retained as unrecoverable for operator remediation.",
+                audit_pipeline.spool_retained_records as i64,
+            ),
+            (
+                "ferrum_admin_audit_available",
+                "Whether the admin audit pipeline can durably record committed mutations (1) or not (0).",
+                i64::from(audit_status.available),
+            ),
+        ] {
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} gauge\n"));
+            render_process_gauge(&mut output, name, value, &ns_label);
+        }
+
         output.push_str(
             "# HELP ferrum_ai_federation_circuits_open Current ai_federation provider circuits in open or half-open recovery state.\n",
         );

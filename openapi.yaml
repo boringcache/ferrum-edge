@@ -6116,6 +6116,25 @@ components:
         error:
           type: [string, "null"]
           description: Human-readable error message
+        audit_unavailable_reason:
+          type: string
+          description: |
+            Present only on the `503` returned by the admin write gate when
+            `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed` and the audit
+            pipeline cannot durably record events (issue #2421). The mutation
+            was **not** performed. Closed set of static labels — never a
+            filesystem path, an OS error string, or actor metadata.
+          enum:
+            - spool_unavailable
+            - spool_saturated
+            - spool_io_error
+            - invalid_record
+            - corrupt_record
+            - queue_saturated
+            - worker_unavailable
+            - delivery_exhausted
+            - retained_capacity
+            - no_durable_spool
 
     AcmeCertificateRecordListResponse:
       type: object
@@ -10767,7 +10786,7 @@ components:
         remaining detailed fields (`timestamp`, `mode`, `database`,
         `admin_writes_enabled`, `cached_config`, `database_polling`,
         `config_rejected`, `mesh`, `listener_failures`, `logging`,
-        `kafka_logging`, `ai_transcript_audit`) are
+        `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`) are
         present only when the caller is authenticated (admin JWT, metrics bearer
         token, or allowlisted CIDR).
       required: [status, ready]
@@ -10783,8 +10802,9 @@ components:
             for that, not `status`.
             `degraded` — ready but the configured database is currently
             unavailable (still 200; the gateway continues to serve from
-            cached config). Intentional read-only mode does NOT set
-            `degraded`.
+            cached config), or the admin audit pipeline cannot durably record
+            committed mutations (see `audit_pipeline`). Intentional read-only
+            mode does NOT set `degraded`.
             `starting` — startup not yet complete (returned with 503 and
             `ready: false`).
             `unavailable` — the gateway became ready but a supervised serving
@@ -10931,6 +10951,8 @@ components:
           $ref: "#/components/schemas/MeshHealthResponse"
         listener_failures:
           $ref: "#/components/schemas/ServingListenerFailureSnapshot"
+        audit_pipeline:
+          $ref: "#/components/schemas/AuditPipelineStatus"
         logging:
           $ref: "#/components/schemas/LoggingSinkSnapshot"
         ai_transcript_audit:
@@ -11150,6 +11172,118 @@ components:
               kind:
                 type: string
                 enum: [serve_failed]
+
+    AuditPipelineStatus:
+      type: object
+      description: |
+        Admin audit delivery pipeline state (issue #2421). Present only when
+        `FERRUM_ADMIN_AUDIT_ENABLED=true`, and only in the authenticated
+        detailed `/health` + `/status` tier.
+
+        Counts and closed-set reason labels only. Never contains an actor
+        subject, a bearer token, a request body, an audit diff, a resource id,
+        an OS error string, or a spool filesystem path.
+
+        When `available` is `false`, `status` is forced to `degraded`, and under
+        `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed` audited admin
+        mutations are refused with `503`.
+      required:
+        [enabled, durability, policy, available, last_unavailable_reason]
+      properties:
+        enabled:
+          type: boolean
+        durability:
+          type: string
+          enum: [spool, memory, disabled]
+          description: |
+            `spool` — events are fsynced before the mutation response.
+            `memory` — no usable durable spool; a crash can lose committed
+            mutations' audit events. `disabled` — auditing is off.
+        policy:
+          type: string
+          enum: [fail_open, fail_closed]
+        available:
+          type: boolean
+          description: Whether committed mutations can currently be durably audited.
+        last_unavailable_reason:
+          type: string
+          enum:
+            - none
+            - spool_unavailable
+            - spool_saturated
+            - spool_io_error
+            - invalid_record
+            - corrupt_record
+            - queue_saturated
+            - worker_unavailable
+            - delivery_exhausted
+            - retained_capacity
+            - no_durable_spool
+        queue_capacity:
+          type: integer
+          format: uint64
+        spool_max_records:
+          type: integer
+          format: uint64
+        retained_max_records:
+          type: integer
+          format: uint64
+        max_delivery_attempts:
+          type: integer
+          format: uint32
+        accepted_total:
+          type: integer
+          format: uint64
+        spooled_total:
+          type: integer
+          format: uint64
+        enqueued_total:
+          type: integer
+          format: uint64
+        delivered_total:
+          type: integer
+          format: uint64
+        retries_total:
+          type: integer
+          format: uint64
+        delivery_failures_total:
+          type: integer
+          format: uint64
+        retained_total:
+          type: integer
+          format: uint64
+          description: Events that exhausted the delivery budget and are retained for operator remediation.
+        replayed_total:
+          type: integer
+          format: uint64
+        corrupt_records_total:
+          type: integer
+          format: uint64
+        truncated_diffs_total:
+          type: integer
+          format: uint64
+          description: Events whose diff exceeded the durable record ceiling and was replaced by a redacted marker.
+        dropped_durable_handoff_failed_total:
+          type: integer
+          format: uint64
+        dropped_no_durable_spool_total:
+          type: integer
+          format: uint64
+        dropped_retained_capacity_total:
+          type: integer
+          format: uint64
+        fail_closed_rejections_total:
+          type: integer
+          format: uint64
+        queue_depth:
+          type: integer
+          format: uint64
+        spool_pending_records:
+          type: integer
+          format: uint64
+        spool_retained_records:
+          type: integer
+          format: uint64
 
     # ── Overload ──────────────────────────────────────────────────
     OverloadNoProxyState:

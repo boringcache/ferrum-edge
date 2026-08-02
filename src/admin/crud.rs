@@ -959,7 +959,7 @@ async fn persist_undecodable_delete_repair<R: AdminResource>(
                 "undecodable_row_repair": true,
             })),
         );
-        if let Err(error) = audit::record(state.admin_audit_enabled, success_db, event) {
+        if let Err(error) = audit::record(state.admin_audit_enabled, success_db, event).await {
             super::log_audit_enqueue_failure(&error);
         }
     }
@@ -1085,7 +1085,7 @@ async fn persist_delete_to_settlement<R: AdminResource>(
             &namespace,
             audit::delete_diff(R::audit_body(&recovery.previous)),
         );
-        if let Err(error) = audit::record(state.admin_audit_enabled, success_db, event) {
+        if let Err(error) = audit::record(state.admin_audit_enabled, success_db, event).await {
             super::log_audit_enqueue_failure(&error);
         }
     }
@@ -1125,7 +1125,7 @@ async fn finish_write_success<R: AdminResource>(
         namespace,
         diff,
     );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db, event) {
+    if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
         super::log_audit_enqueue_failure(&error);
     }
 }

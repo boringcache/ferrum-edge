@@ -57,6 +57,26 @@ Scrape rendering stays allocation-light: the inventory is a documentation/CI con
 
 **Suggested alert:** `sum(rate(ferrum_mesh_tcp_egress_connections_total{result="failure"}[5m]))` above baseline. Investigate orig-dst capture, outbound registry admits, and HBONE/mTLS dial failures for stream-family ports.
 
+### Admin audit delivery
+
+| Family | Type | Labels | Guidance |
+|--------|------|--------|----------|
+| `ferrum_admin_audit_available` | gauge | `namespace` | `0` means committed admin mutations currently have no durable audit handoff. Under `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed` further audited mutations are refused with `503`. |
+| `ferrum_admin_audit_spool_pending_records` | gauge | `namespace` | Durable backlog awaiting insertion into `audit_events`. A steadily rising value means the configured database is rejecting or slow-walking audit inserts. |
+| `ferrum_admin_audit_retained_records` | gauge | `namespace` | Records that exhausted `FERRUM_ADMIN_AUDIT_MAX_DELIVERY_ATTEMPTS`. These are held under `<spool>/failed/` for manual reconciliation and are never replayed automatically. |
+| `ferrum_admin_audit_events_dropped_total` | counter | `reason`, `namespace` | Any non-zero value is an audit gap. `durable_handoff_failed` = the spool write failed; `no_durable_spool` = the deployment runs memory-only; `retained_capacity` = retained storage is full. |
+
+**Suggested alerts:** `min_over_time(ferrum_admin_audit_available[5m]) == 0`;
+`increase(ferrum_admin_audit_events_dropped_total[15m]) > 0`;
+`ferrum_admin_audit_retained_records > 0`.
+
+**Reconciliation:** delivery is at-least-once on a stable event id, and every
+backend insert is idempotent on that id, so a replayed record converges to one
+`audit_events` row. To reconcile a gap, compare
+`ferrum_admin_audit_events_accepted_total` against
+`ferrum_admin_audit_events_delivered_total` and inspect
+`<FERRUM_ADMIN_AUDIT_SPOOL_DIR>/failed/`.
+
 ## Complete family inventory
 
 Sorted by family name. Optional namespace labels are listed when the emitter supports them.
@@ -94,6 +114,23 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `chargeback_sink_spool_unbound_files` | gauge | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Retained spool records not bound to a live destination identity. Never replayed or deleted; an observed lower bound when the bounded aggregate scan is truncated. |
 | `chargeback_sink_spool_unbound_namespaces` | gauge | — | `api_chargeback_sink` | `documented_only` | `when_plugin_enabled` | Managed spool namespaces still holding records for a destination identity no live instance owns; an observed lower bound when the bounded aggregate scan is truncated. |
 | `ferrum_admin_active_connections` | gauge | `namespace` | `admin` | `documented_only` | `conditional` | Admin/management-plane connections currently in flight. |
+| `ferrum_admin_audit_available` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Whether the admin audit pipeline can durably record committed mutations (1) or not (0). |
+| `ferrum_admin_audit_corrupt_records_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Durable admin audit records quarantined as corrupt (bad version, unparseable, oversized, or id mismatch). |
+| `ferrum_admin_audit_delivery_failures_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit delivery attempts that returned an error from the database backend. |
+| `ferrum_admin_audit_delivery_retries_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Bounded-backoff retries scheduled after a transient admin audit delivery failure. |
+| `ferrum_admin_audit_events_accepted_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events accepted from a committed admin mutation. |
+| `ferrum_admin_audit_events_delivered_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events accepted by the configured database backend. |
+| `ferrum_admin_audit_events_dropped_total` | counter | `reason`, `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events lost without a durable record, by reason. |
+| `ferrum_admin_audit_events_enqueued_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events admitted to the bounded in-memory delivery queue. |
+| `ferrum_admin_audit_events_replayed_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Durable admin audit records re-read from the spool for delivery (restart, queue overflow, or an expired shutdown drain). |
+| `ferrum_admin_audit_events_retained_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events that exhausted the delivery-attempt budget and were retained for operator remediation. |
+| `ferrum_admin_audit_events_spooled_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events made durable in the spool before the mutation response. |
+| `ferrum_admin_audit_fail_closed_rejections_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin mutations refused up front because the audit pipeline is unavailable under the fail_closed policy. |
+| `ferrum_admin_audit_queue_capacity` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Configured depth of the bounded in-memory admin audit delivery queue. |
+| `ferrum_admin_audit_queue_depth` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events currently waiting in the bounded in-memory delivery queue. |
+| `ferrum_admin_audit_retained_records` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Durable admin audit records retained as unrecoverable for operator remediation. |
+| `ferrum_admin_audit_spool_pending_records` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Durable admin audit records awaiting delivery (bounded scan; a saturated scan reports a floor). |
+| `ferrum_admin_audit_truncated_diffs_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events whose diff was replaced by a redacted marker because it exceeded the durable record ceiling. |
 | `ferrum_admin_max_connections` | gauge | `namespace` | `admin` | `documented_only` | `conditional` | Configured admin connection cap (0 = unlimited). |
 | `ferrum_admin_max_connections_per_ip` | gauge | `namespace` | `admin` | `documented_only` | `conditional` | Configured per-source-IP admin connection cap (0 = unlimited). |
 | `ferrum_admin_rejected_connections_total` | counter | `reason`, `namespace` | `admin` | `documented_only` | `conditional` | Admin connections rejected by the connection limiter, by reason. |

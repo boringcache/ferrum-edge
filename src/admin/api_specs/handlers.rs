@@ -3032,7 +3032,7 @@ pub async fn handle_post_api_spec(
                     "spec_version": audit_spec.spec_version,
                 })),
             );
-            if let Err(error) = audit::record(audit_enabled, audit_db, event) {
+            if let Err(error) = audit::record(audit_enabled, audit_db, event).await {
                 log_audit_enqueue_failure(&error);
             }
         }
@@ -3293,7 +3293,7 @@ pub async fn handle_put_api_spec(
                     }),
                 ),
             );
-            if let Err(error) = audit::record(audit_enabled, audit_db, event) {
+            if let Err(error) = audit::record(audit_enabled, audit_db, event).await {
                 log_audit_enqueue_failure(&error);
             }
         }
@@ -3781,7 +3781,7 @@ pub async fn handle_delete_api_spec(
                     "spec_version": audit_spec.spec_version,
                 })),
             );
-            if let Err(error) = audit::record(audit_enabled, audit_db, event) {
+            if let Err(error) = audit::record(audit_enabled, audit_db, event).await {
                 log_audit_enqueue_failure(&error);
             }
         }

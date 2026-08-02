@@ -2714,6 +2714,14 @@ pub async fn run(
     // `Drop for HealthChecker` abort that fires at process exit.
     background_handles.extend(proxy_state.health_checker.take_active_check_handles());
     join_background_handles(background_handles, Duration::from_secs(5)).await;
+    // Drain accepted audit events while the database Arc is still alive (issue
+    // #2421). Bounded by the graceful-shutdown drain budget: anything still
+    // undelivered when the deadline expires stays in the durable spool and is
+    // replayed by the next process, so the deadline costs latency, not events.
+    crate::admin::audit::shutdown(Duration::from_secs(
+        env_config.shutdown_drain_seconds.clamp(5, 60),
+    ))
+    .await;
     crate::observability_delivery::shutdown(Duration::from_millis(
         env_config.log_shutdown_drain_timeout_ms,
     ))

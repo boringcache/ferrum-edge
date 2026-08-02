@@ -879,6 +879,14 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         env_config.pool_shard_amount,
         env_config.log_delivery_max_tasks,
     );
+    // Install the durable admin-audit pipeline before mode dispatch (issue
+    // #2421). Preparing the spool here means a `fail_closed` deployment with an
+    // unwritable spool refuses to start rather than discovering the problem on
+    // its first committed mutation.
+    if let Err(error) = admin::audit::initialize(env_config.admin_audit_pipeline.clone()) {
+        error!("Failed to initialize the admin audit pipeline: {}", error);
+        return 1;
+    }
     // Process-wide retained-byte ceiling for observability sink instances.
     // Installed before mode dispatch so the first plugin activation already
     // reserves against the operator-configured total.

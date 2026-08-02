@@ -12422,8 +12422,17 @@ mod inner {
             event: &crate::admin::audit::AuditEvent,
         ) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
+            // Idempotent on `_id` (issue #2421). Durable-spool replay after a
+            // crash, a partial failure, or a shutdown deadline re-delivers the
+            // same event id; a plain `insert_one` would raise duplicate-key
+            // (11000) and burn the bounded retry budget on an event that is
+            // already recorded. This is a single-document upsert, so it needs
+            // no multi-document transaction and therefore no replica set —
+            // audit delivery stays correct on standalone MongoDB.
+            let doc = audit_event_to_doc(event)?;
             self.audit_events()
-                .insert_one(audit_event_to_doc(event)?)
+                .replace_one(doc! { "_id": event.id.as_str() }, doc)
+                .upsert(true)
                 .await?;
             self.check_slow_query("insert_audit_event", start);
             if self.audit_retention.is_enabled()

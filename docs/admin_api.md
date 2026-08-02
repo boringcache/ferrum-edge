@@ -572,7 +572,51 @@ See [admin_backup_restore.md](admin_backup_restore.md) for details.
 
 ## Audit Log
 
-When `FERRUM_ADMIN_AUDIT_ENABLED=true`, successful admin mutations enqueue a database-backed audit event before the mutation response is returned. The response waits only for bounded queue enqueue, not durable database persistence. Audit persistence is best-effort after the mutation commits: if enqueue or persistence fails, Ferrum logs the failure and still returns the mutation result so operators do not retry an already-applied write. `POST /batch` is all-or-nothing (issue #2401), so it emits exactly one audit event when its graph commits and none at all when it does not. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, and a JSON `diff` object with redacted consumer credentials and sensitive plugin configuration. Basic credential mutations remain visible by type and action, but every Basic value, entry field, shape, and count is replaced by one stable `[REDACTED]` marker before persistence. Loki plugin diffs preserve only the endpoint scheme/host/port and redact its path, query, authorization, and all custom-header values. Redis-backed plugin diffs replace `redis_integrity_key` (and any other `*_integrity_key` signing secret) with `[REDACTED]` and strip `redis_url` userinfo/query/fragment while keeping its scheme/host/port/database.
+When `FERRUM_ADMIN_AUDIT_ENABLED=true`, successful admin mutations hand a database-backed audit event to a durable spool before the mutation response is returned. `POST /batch` is all-or-nothing (issue #2401), so it emits exactly one audit event when its graph commits and none at all when it does not. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, and a JSON `diff` object with redacted consumer credentials and sensitive plugin configuration. Basic credential mutations remain visible by type and action, but every Basic value, entry field, shape, and count is replaced by one stable `[REDACTED]` marker before persistence. Loki plugin diffs preserve only the endpoint scheme/host/port and redact its path, query, authorization, and all custom-header values. Redis-backed plugin diffs replace `redis_integrity_key` (and any other `*_integrity_key` signing secret) with `[REDACTED]` and strip `redis_url` userinfo/query/fragment while keeping its scheme/host/port/database. Every redaction above is applied before the durable spool write, so a spooled or retained record carries exactly the same redacted representation as the `audit_events` row.
+
+### Durable delivery (issue #2421)
+
+The response is acknowledged only after the event is fsynced into
+`FERRUM_ADMIN_AUDIT_SPOOL_DIR/pending/`, so a crash after the response still
+leaves a replayable record. Insertion into `audit_events` happens
+asynchronously with bounded exponential backoff (250 ms → 30 s, capped by
+`FERRUM_ADMIN_AUDIT_MAX_DELIVERY_ATTEMPTS`), and the spool file is deleted only
+after the backend accepts the event.
+
+- **Delivery semantics: at-least-once with a stable id.** The event `id` is
+  minted once, before the durable write, and reused by every retry and every
+  post-restart replay. All four backends insert idempotently on that id
+  (PostgreSQL/SQLite `ON CONFLICT (id) DO NOTHING`, MySQL `INSERT IGNORE`,
+  MongoDB single-document `_id` upsert), so a replayed event converges to
+  exactly one durable row. The MongoDB path is a single-document write, so it
+  needs no multi-document transaction and works on standalone deployments.
+- **Residual crash window.** The event body is only knowable after the mutation
+  commits, so the durable write necessarily follows the commit. A crash
+  strictly between the config-database commit and the spool write loses that one
+  event. No response has been acknowledged in that window. Eliminating it
+  entirely requires a per-backend transactional outbox writing the event inside
+  the mutation's own transaction.
+- **Unrecoverable events are retained, not dropped.** After the attempt budget
+  is exhausted, the record moves to `<spool>/failed/` for operator remediation.
+  Corrupt records (bad version, unparseable, oversized, or an id that disagrees
+  with the filename) are quarantined there too and are never replayed.
+- **Shutdown.** Serving modes drain accepted audit work before the database
+  handle is released, bounded by `FERRUM_SHUTDOWN_DRAIN_SECONDS` (clamped to
+  5–60 s). Anything still undelivered stays in `pending/` and is replayed by the
+  next process, so an expired deadline costs latency, not events.
+- **Unavailability policy.** With `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_open`
+  (default) a failed durable handoff is logged, counted, and surfaced; the
+  mutation result is still returned so operators do not retry an already-applied
+  write. With `fail_closed`, the admin write gate refuses subsequent audited
+  mutations with `503` and an `audit_unavailable_reason` **before** performing
+  them, so a change that cannot be audited is never made.
+- **Observability.** Authenticated `/health` and `/status` carry an
+  `audit_pipeline` object (backlog, retries, failures, retained/unrecoverable
+  state, drops, and a closed-set reason label), and an unavailable pipeline
+  forces `status: degraded`. The same counters are exported as
+  `ferrum_admin_audit_*` Prometheus families. These surfaces expose counts and
+  static labels only — never an actor subject, token, request body, audit diff,
+  or spool path.
 
 `GET /audit` requires an `admin` role token and supports `actor`, `action`, `resource_type`, `resource_id`, `start`, `end`, `limit`, and `offset` query parameters. `limit` follows the shared bounds (default 100, maximum 1000), and malformed or out-of-range values are rejected with `400`. The audit store indexes offsets as a 32-bit value, so `offset` is capped at `2^32 - 1` here rather than the `2^63 - 1` other list endpoints allow — a larger offset returns `400`. The audit response keeps its own `{ "items", "limit", "offset", "next_offset", "total" }` envelope. `next_offset` is always strictly greater than `offset`; it is `null` when no further page exists or the next cursor would exceed the 32-bit ceiling.
 
