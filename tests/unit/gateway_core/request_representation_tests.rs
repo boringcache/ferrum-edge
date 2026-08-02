@@ -835,14 +835,9 @@ async fn run_final_request_stage(
     request_headers: &HashMap<String, String>,
     body: &[u8],
 ) -> PluginResult {
-    run_request_body_stage_with_context_for_test(
-        plugins,
-        ctx,
-        request_headers,
-        body,
-    )
-    .await
-    .1
+    run_request_body_stage_with_context_for_test(plugins, ctx, request_headers, body)
+        .await
+        .1
 }
 
 /// The fail-closed baseline this pair is measured against.
@@ -860,7 +855,13 @@ async fn an_enforcing_waf_still_refuses_an_undecodable_request_representation() 
     .await;
 
     assert!(
-        matches!(&result, PluginResult::Reject { status_code: 400, .. }),
+        matches!(
+            &result,
+            PluginResult::Reject {
+                status_code: 400,
+                ..
+            }
+        ),
         "an enforcing body policy must not forward a representation it could \
          not read, got {result:?}"
     );
@@ -925,7 +926,13 @@ async fn a_skip_on_large_waf_does_not_claim_a_body_it_would_not_scan() {
     )
     .await;
     assert!(
-        matches!(&claimed, PluginResult::Reject { status_code: 400, .. }),
+        matches!(
+            &claimed,
+            PluginResult::Reject {
+                status_code: 400,
+                ..
+            }
+        ),
         "a body within the scan window is still claimed, got {claimed:?}"
     );
 }
@@ -1029,7 +1036,10 @@ async fn finalize_rejection(
 /// chain nor the finalizer's route response-size policy may restate it.
 #[tokio::test]
 async fn the_request_representation_terminal_survives_the_response_policy_finalizer() {
-    let plugins = vec![enforcing_waf(), body_validator_requiring_approved_response()];
+    let plugins = vec![
+        enforcing_waf(),
+        body_validator_requiring_approved_response(),
+    ];
     let mut ctx = ctx_with_json_post();
 
     let rejection = run_final_request_stage(
@@ -1061,7 +1071,10 @@ async fn the_request_representation_terminal_survives_the_response_policy_finali
 /// `503` and likewise never a policy verdict about an application response.
 #[tokio::test]
 async fn the_request_decode_capacity_terminal_survives_the_response_policy_finalizer() {
-    let plugins = vec![enforcing_waf(), body_validator_requiring_approved_response()];
+    let plugins = vec![
+        enforcing_waf(),
+        body_validator_requiring_approved_response(),
+    ];
     let mut ctx = ctx_with_json_post();
     let document = large_json_document();
     let wire = gzip(&document);

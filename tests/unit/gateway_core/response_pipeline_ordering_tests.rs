@@ -1745,7 +1745,10 @@ async fn an_enforcing_waf_refuses_an_undecodable_origin_encoded_response() {
     let (replaced, status, _, body) =
         publish_origin_encoded_response(&[waf_blocking_response_body()]).await;
 
-    assert!(replaced, "a claimed representation must not be served opaque");
+    assert!(
+        replaced,
+        "a claimed representation must not be served opaque"
+    );
     assert_ne!(status, 200);
     assert_ne!(
         body,
@@ -1808,7 +1811,10 @@ async fn a_warn_only_ai_response_guard_does_not_refuse_an_undecodable_response()
     );
 
     let (replaced, status, _, body) = publish_origin_encoded_response(&[warner]).await;
-    assert!(!replaced, "a warn-only guard is pass-through by construction");
+    assert!(
+        !replaced,
+        "a warn-only guard is pass-through by construction"
+    );
     assert_eq!(status, 200);
     assert_eq!(body, b"opaque-octets".to_vec());
 
