@@ -20059,8 +20059,8 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     // already replaced the backend response with its terminal. Presentation and
     // protocol transforms may still shape that terminal, but no later policy may
     // inspect the gateway error body and overwrite the decision that selected it.
-    let final_policy_eligible = origin
-        == crate::plugins::response_representation::RepresentationOrigin::Backend;
+    let final_policy_eligible =
+        origin == crate::plugins::response_representation::RepresentationOrigin::Backend;
     // Provenance is established before the gate, exactly as it is before the
     // deadline replacement path: a representation rejection is a gateway-authored
     // terminal response, so it must keep the gateway's own decorators (CORS,

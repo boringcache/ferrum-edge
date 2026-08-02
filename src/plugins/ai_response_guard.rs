@@ -3695,13 +3695,8 @@ impl Plugin for AiResponseGuard {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        self.finalize_client_visible_response_body(
-            ctx,
-            response_status,
-            response_headers,
-            body,
-        )
-        .await
+        self.finalize_client_visible_response_body(ctx, response_status, response_headers, body)
+            .await
     }
 
     fn on_response_body_transformed(
