@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ferrum_edge::_test_support::{
     finalize_synthetic_response_for_test, gateway_capacity_response_selected_for_test,
@@ -169,6 +170,143 @@ impl Plugin for OneShotGatewayDecorator {
 
     fn owns_deadline_response_header(&self, _ctx: &RequestContext, name: &str) -> bool {
         name.eq_ignore_ascii_case("x-request-id")
+    }
+}
+
+/// Counts how many times the authoritative final BODY phase asked it about a
+/// response, and refuses only JSON. Used to prove both halves of the synthetic
+/// re-decision contract: a late relabel into its scope must reach it, and a late
+/// change outside its scope must not cost a second sweep.
+struct ScopedCountingFinalBodyPolicy {
+    calls: Arc<AtomicUsize>,
+    seen_content_types: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+/// Refuses JSON with a rejection that carries its OWN representation field, so
+/// the rebuilt rejection no longer has the shape the decision was made under.
+struct RepresentationBearingRejectFinalBodyPolicy;
+
+/// Reject-path `after_proxy` decorator carrying state it can emit only once —
+/// the shape of the `oidc_relying_party` rotated session cookie. It consumes the
+/// staged metadata, so a second chain run would silently drop the cookie.
+struct OneShotRotatedSessionCookie {
+    runs: Arc<AtomicUsize>,
+}
+
+/// Metadata key `OneShotRotatedSessionCookie` stages its cookie under.
+const ROTATED_COOKIE_METADATA_KEY: &str = "test.rotated_session_cookie";
+
+/// The rotated cookie value that must reach the client exactly once.
+const ROTATED_COOKIE_VALUE: &str = "sid=rotated; HttpOnly";
+
+#[async_trait::async_trait]
+impl Plugin for ScopedCountingFinalBodyPolicy {
+    fn name(&self) -> &str {
+        "scoped_counting_final_body_policy"
+    }
+
+    fn requires_response_body_buffering(&self) -> bool {
+        true
+    }
+
+    fn enforces_final_client_visible_response_body(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
+    fn may_enforce_response_body_policy(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
+    async fn finalize_client_visible_response_body(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> ferrum_edge::plugins::PluginResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let content_type = response_headers
+            .get("content-type")
+            .cloned()
+            .unwrap_or_default();
+        self.seen_content_types
+            .lock()
+            .expect("content-type log")
+            .push(content_type.clone());
+        if !content_type.starts_with("application/json") {
+            return ferrum_edge::plugins::PluginResult::Continue;
+        }
+        ferrum_edge::plugins::PluginResult::Reject {
+            status_code: 502,
+            body: r#"{"error":"json representation refused"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Plugin for RepresentationBearingRejectFinalBodyPolicy {
+    fn name(&self) -> &str {
+        "representation_bearing_reject_final_body_policy"
+    }
+
+    fn requires_response_body_buffering(&self) -> bool {
+        true
+    }
+
+    fn enforces_final_client_visible_response_body(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
+    fn may_enforce_response_body_policy(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
+    async fn finalize_client_visible_response_body(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> ferrum_edge::plugins::PluginResult {
+        let is_json = response_headers
+            .get("content-type")
+            .is_some_and(|value| value.starts_with("application/json"));
+        if !is_json {
+            return ferrum_edge::plugins::PluginResult::Continue;
+        }
+        ferrum_edge::plugins::PluginResult::Reject {
+            status_code: 502,
+            body: r#"{"error":"json representation refused"}"#.to_string(),
+            headers: HashMap::from([(
+                "content-disposition".to_string(),
+                "attachment".to_string(),
+            )]),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Plugin for OneShotRotatedSessionCookie {
+    fn name(&self) -> &str {
+        "one_shot_rotated_session_cookie"
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> ferrum_edge::plugins::PluginResult {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        if let Some(cookie) = ctx.metadata.remove(ROTATED_COOKIE_METADATA_KEY) {
+            response_headers.insert("set-cookie".to_string(), cookie);
+        }
+        ferrum_edge::plugins::PluginResult::Continue
     }
 }
 
@@ -382,6 +520,34 @@ fn response_transformer_renaming_header() -> Arc<dyn Plugin> {
             ]
         }))
         .expect("response_transformer header rename config"),
+    )
+}
+
+/// A later `response_transformer` that RELABELS the representation — the exact
+/// synthetic-lifecycle advisory shape, since its header rules run in the
+/// reject-path `after_proxy` chain the finalizer defers to last.
+fn response_transformer_relabeling_content_type() -> Arc<dyn Plugin> {
+    Arc::new(
+        ResponseTransformer::new(&json!({
+            "rules": [
+                {"operation": "update", "target": "header",
+                 "key": "content-type", "value": "application/json"}
+            ]
+        }))
+        .expect("response_transformer content-type relabel config"),
+    )
+}
+
+/// A later `response_transformer` that adds a header no body policy scope reads.
+fn response_transformer_adding_unrelated_header() -> Arc<dyn Plugin> {
+    Arc::new(
+        ResponseTransformer::new(&json!({
+            "rules": [
+                {"operation": "add", "target": "header",
+                 "key": "x-gateway-note", "value": "decorated"}
+            ]
+        }))
+        .expect("response_transformer unrelated header config"),
     )
 }
 
@@ -1004,6 +1170,313 @@ async fn sibling_waf_instances_do_not_suppress_each_other() {
         assert_eq!(reject.0, 403);
         assert!(!header_names_contain(&reject.2, PROTECTED_HEADER));
     }
+}
+
+// ───── 6. late header relabels cannot bypass BODY policy on the synthetic path ─────
+//
+// Every test below drives `finalize_synthetic_response_for_test`, i.e. the real
+// shared H1/H2/H3 synthetic finalizer
+// (`apply_reject_after_proxy_and_synthetic_body_hooks`), so the reject-path
+// `after_proxy` chain really does run after the body-hook phase.
+
+/// The synthetic-lifecycle body half of the advisory. A `response_transformer`
+/// header rule relabels a `text/plain` body as `application/json` inside the
+/// deliberately-late reject-path chain — after `body_validator`'s only pass,
+/// which correctly declined the unmatched media type. The published response is
+/// now governed by the JSON rule, so the rule has to decide it.
+#[tokio::test]
+async fn late_content_type_relabel_cannot_bypass_body_validator_on_synthetic_response() {
+    let plugins = vec![
+        body_validator_requiring_approved(),
+        response_transformer_relabeling_content_type(),
+    ];
+    let mut ctx = ctx_for("GET", "/cache-hit");
+    let mut status = 200u16;
+    let mut headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+    // No `approved` field: refused the moment the JSON rule applies.
+    let mut body = bytes::Bytes::from_static(br#"{"was_approved":true}"#);
+
+    finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)
+        .await;
+
+    assert_eq!(
+        status,
+        502,
+        "the relabelled representation must be validated: {headers:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&body).contains("was_approved"),
+        "the refused representation must not reach the client"
+    );
+}
+
+/// The control for the same pair: a body that SATISFIES the rule the relabel
+/// activates is still published. Closing the window must not turn every late
+/// relabel into a rejection.
+#[tokio::test]
+async fn late_content_type_relabel_admits_a_conforming_body() {
+    let plugins = vec![
+        body_validator_requiring_approved(),
+        response_transformer_relabeling_content_type(),
+    ];
+    let mut ctx = ctx_for("GET", "/cache-hit");
+    let mut status = 200u16;
+    let mut headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+    let mut body = bytes::Bytes::from_static(br#"{"approved":true}"#);
+
+    finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)
+        .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(&body[..], br#"{"approved":true}"#);
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/json"),
+        "the relabel itself still applies"
+    );
+}
+
+/// One-shot reject-path `after_proxy` state — the `oidc_relying_party` rotated
+/// session cookie shape — must survive the response the re-decision replaces,
+/// and its hook must still have run exactly once. That is the contract the late
+/// chain exists to protect; closing the body window may not weaken it.
+#[tokio::test]
+async fn post_policy_body_rejection_preserves_one_shot_session_state() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        body_validator_requiring_approved(),
+        Arc::new(OneShotRotatedSessionCookie {
+            runs: Arc::clone(&runs),
+        }),
+        response_transformer_relabeling_content_type(),
+    ];
+    let mut ctx = ctx_for("GET", "/cache-hit");
+    ctx.metadata.insert(
+        ROTATED_COOKIE_METADATA_KEY.to_string(),
+        ROTATED_COOKIE_VALUE.to_string(),
+    );
+    let mut status = 200u16;
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "text/plain".to_string()),
+        // A synthetic-producer field with no gateway provenance.
+        ("x-synthetic-secret".to_string(), "value".to_string()),
+        // Stale representation metadata for the discarded body.
+        ("etag".to_string(), "\"synthetic\"".to_string()),
+    ]);
+    let mut body = bytes::Bytes::from_static(br#"{"was_approved":true}"#);
+
+    finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)
+        .await;
+
+    assert_eq!(status, 502, "the relabelled representation must be refused");
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the reject-path after_proxy chain must still run exactly once"
+    );
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some(ROTATED_COOKIE_VALUE),
+        "one-shot session state must survive the post-policy rejection: {headers:?}"
+    );
+    assert!(
+        !header_names_contain(&headers, "x-synthetic-secret"),
+        "a synthetic-producer field must not cross onto the rejection: {headers:?}"
+    );
+    assert!(
+        !header_names_contain(&headers, "etag"),
+        "stale representation metadata must not describe the rejection: {headers:?}"
+    );
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/json"),
+        "the rejection authors its own representation"
+    );
+}
+
+/// The generic contract, stated without any built-in: a policy is asked again
+/// only when the late chain moved something its scope depends on.
+#[tokio::test]
+async fn body_policy_is_re_decided_only_when_the_late_chain_changes_policy_scope() {
+    for (label, late_transform, expected_calls, expected_status) in [
+        (
+            "unrelated header",
+            response_transformer_adding_unrelated_header(),
+            1usize,
+            200u16,
+        ),
+        (
+            "content-type relabel",
+            response_transformer_relabeling_content_type(),
+            2usize,
+            502u16,
+        ),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(ScopedCountingFinalBodyPolicy {
+                calls: Arc::clone(&calls),
+                seen_content_types: Arc::clone(&seen),
+            }),
+            late_transform,
+        ];
+        let mut ctx = ctx_for("GET", "/cache-hit");
+        let mut status = 200u16;
+        let mut headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+        let mut body = bytes::Bytes::from_static(b"plain synthetic payload");
+
+        finalize_synthetic_response_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await;
+
+        let seen = seen.lock().expect("content-type log").clone();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            expected_calls,
+            "{label}: unexpected number of policy decisions (saw {seen:?})"
+        );
+        assert_eq!(status, expected_status, "{label}: unexpected final status");
+        assert_eq!(
+            seen.first().map(String::as_str),
+            Some("text/plain"),
+            "{label}: the first decision reads the pre-chain representation"
+        );
+    }
+}
+
+/// Gateway transport encoding is not a policy-scope change. `compression` adds
+/// `Content-Encoding` and rewrites `Content-Length` after the policy phase by
+/// design, and the re-decision normalizes that back out — so an unchanged
+/// document is never inspected, called out to, or charged a second time.
+#[tokio::test]
+async fn gateway_transport_encoding_does_not_trigger_a_second_body_decision() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(ScopedCountingFinalBodyPolicy {
+            calls: Arc::clone(&calls),
+            seen_content_types: Arc::clone(&seen),
+        }),
+        compression_plugin(),
+    ];
+    let mut ctx = ctx_for("GET", "/cache-hit");
+    ctx.headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    let mut request_headers = HashMap::new();
+    for plugin in &plugins {
+        let _ = plugin.before_proxy(&mut ctx, &mut request_headers).await;
+    }
+    let payload = b"plain synthetic payload padded padded padded padded".to_vec();
+    let mut status = 200u16;
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "text/plain".to_string()),
+        ("content-length".to_string(), payload.len().to_string()),
+    ]);
+    let mut body = bytes::Bytes::from(payload.clone());
+
+    finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)
+        .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "an unchanged document must be decided exactly once (saw {:?})",
+        seen.lock().expect("content-type log")
+    );
+    if headers.get("content-encoding").map(String::as_str) == Some("gzip") {
+        assert_eq!(
+            gunzip(&body),
+            payload,
+            "the wire body must still decode to the inspected plaintext"
+        );
+    } else {
+        assert_eq!(&body[..], &payload[..]);
+    }
+}
+
+/// A rejection whose own headers re-open a representation scope the decision was
+/// not made under must fail closed onto the fixed, decorator-free gateway
+/// terminal rather than being published on the strength of that decision.
+///
+/// The gateway terminal is deliberately NOT re-swept through the policies — a
+/// gateway-authored error payload is never re-decided against itself — so the
+/// rebuild is checked structurally instead.
+#[tokio::test]
+async fn post_policy_rejection_reopening_a_representation_scope_collapses_to_fixed_terminal() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(RepresentationBearingRejectFinalBodyPolicy),
+        response_transformer_relabeling_content_type(),
+    ];
+    let mut ctx = ctx_for("GET", "/cache-hit");
+    let mut status = 200u16;
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "text/plain".to_string()),
+        ("set-cookie".to_string(), ROTATED_COOKIE_VALUE.to_string()),
+    ]);
+    let mut body = bytes::Bytes::from_static(b"plain synthetic payload");
+
+    finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)
+        .await;
+
+    assert_eq!(status, 500, "the rebuilt shape must fail closed");
+    assert!(
+        String::from_utf8_lossy(&body).contains("response policy could not be applied"),
+        "unexpected terminal body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        !header_names_contain(&headers, "content-disposition"),
+        "the plugin-supplied representation field must not survive: {headers:?}"
+    );
+    assert!(
+        !header_names_contain(&headers, "set-cookie"),
+        "the fixed terminal keeps no decorators at all: {headers:?}"
+    );
+}
+
+/// The ordinary half of the same path: a rejection whose rebuild carries only
+/// the gateway's own representation is published as-is, and its decorators
+/// survive. Failing closed must be reserved for the anomalous shape above.
+#[tokio::test]
+async fn post_policy_body_rejection_is_published_when_the_rebuild_is_gateway_shaped() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(ScopedCountingFinalBodyPolicy {
+            calls: Arc::clone(&calls),
+            seen_content_types: Arc::clone(&seen),
+        }),
+        response_transformer_relabeling_content_type(),
+    ];
+    let mut ctx = ctx_for("GET", "/cache-hit");
+    let mut status = 200u16;
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "text/plain".to_string()),
+        ("set-cookie".to_string(), ROTATED_COOKIE_VALUE.to_string()),
+    ]);
+    let mut body = bytes::Bytes::from_static(b"plain synthetic payload");
+
+    finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)
+        .await;
+
+    assert_eq!(status, 502);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one pre-chain decision and exactly one re-decision, never a third"
+    );
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some(ROTATED_COOKIE_VALUE),
+        "gateway decorators survive an ordinary rebuild: {headers:?}"
+    );
 }
 
 /// A sibling that scanned an identical map must not stop the other from

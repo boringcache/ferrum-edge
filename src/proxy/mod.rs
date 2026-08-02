@@ -17119,7 +17119,7 @@ pub(crate) fn should_apply_synthetic_response_body_hooks(
 /// synthetic/short-circuit body, independently of the response body-hook gate.
 ///
 /// Replaces `status`/`headers`/`body` in place with a 502 when the body exceeds
-/// the ceiling.
+/// the ceiling, returning whether it did.
 ///
 /// Why this is not simply folded into
 /// [`should_apply_synthetic_response_body_hooks`]: opening that gate would
@@ -17137,17 +17137,17 @@ fn enforce_synthetic_response_body_limit(
     status: &mut u16,
     headers: &mut HashMap<String, String>,
     body: &mut Bytes,
-) {
+) -> bool {
     use crate::plugins::utils::synthetic_response::synthetic_response_omits_body;
 
     // The shared retained-response terminal is already the authoritative
     // gateway outcome. A smaller route body-size ceiling must not recategorize
     // that fixed, redaction-safe error as a backend representation failure.
     if ctx.gateway_capacity_response_selected() {
-        return;
+        return false;
     }
     if body.is_empty() || synthetic_response_omits_body(&ctx.method, *status) {
-        return;
+        return false;
     }
     // The context folds the process-wide ceiling with the precomputed route
     // ceiling. This synthetic path already owns the complete body, but it must
@@ -17157,10 +17157,10 @@ fn enforce_synthetic_response_body_limit(
     // bypass the global ceiling.
     let limit = ctx.effective_max_response_body_size_bytes();
     if limit == 0 {
-        return;
+        return false;
     }
     if body.len() <= limit {
-        return;
+        return false;
     }
     // Attribute the refusal to the enforcing plugin without re-running hooks.
     let plugin_name = plugins
@@ -17189,6 +17189,7 @@ fn enforce_synthetic_response_body_limit(
             headers: HashMap::new(),
         },
     );
+    true
 }
 
 /// Whether this synthetic response IS the validated `serverless_function`
@@ -17253,6 +17254,377 @@ pub(crate) fn response_body_plugins_process_body(
     })
 }
 
+/// Whether this response header field can change whether — or how — a final
+/// client-visible body policy applies to the representation it describes.
+///
+/// Deliberately shape-based rather than a plugin-by-plugin enumeration: every
+/// `Content-*` field describes the representation itself (media type, coding,
+/// language, disposition, range), and the native-gRPC status pair decides the
+/// "empty terminal error reply" exemption `body_validator` honors. Over-matching
+/// here only costs one extra re-decision, so the prefix is the fail-safe
+/// direction; the exclusions below are the fields that are provably NOT
+/// representation descriptors:
+/// - `Content-Length` is derived from bytes this witness already pins, so it can
+///   never open or close a policy scope on its own, and
+/// - the `Content-Security-Policy` family is a client directive and a
+///   gateway-owned decorator, not a description of these bytes.
+fn is_final_response_body_policy_scope_header(name: &str) -> bool {
+    const NOT_REPRESENTATION: [&str; 3] = [
+        "content-length",
+        "content-security-policy",
+        "content-security-policy-report-only",
+    ];
+    if NOT_REPRESENTATION
+        .iter()
+        .any(|excluded| name.eq_ignore_ascii_case(excluded))
+    {
+        return false;
+    }
+    let bytes = name.as_bytes();
+    (bytes.len() > 8 && bytes[..8].eq_ignore_ascii_case(b"content-"))
+        || name.eq_ignore_ascii_case("grpc-status")
+        || name.eq_ignore_ascii_case("grpc-message")
+}
+
+/// The complete policy scope a gateway-authored rejection rebuild is expected to
+/// have: it forces `Content-Type: application/json`, drops every backend- and
+/// synthetic-contributed representation field, and preserves only
+/// non-representation gateway decorators.
+fn gateway_authored_rejection_body_policy_scope() -> Vec<(String, String)> {
+    let mut authored = HashMap::new();
+    authored.insert("content-type".to_string(), "application/json".to_string());
+    final_response_body_policy_scope(&authored)
+}
+
+/// The policy-scope projection of a response header map: the subset of fields
+/// [`is_final_response_body_policy_scope_header`] admits, canonicalized so two
+/// maps that differ only in ordering or header-name case compare equal.
+fn final_response_body_policy_scope(headers: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut scope: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(name, _)| is_final_response_body_policy_scope_header(name))
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+        .collect();
+    scope.sort_unstable();
+    scope
+}
+
+/// Representation fields the gateway's own transport-encoding stage owns. They
+/// describe wire bytes rather than the plaintext document, so a re-decision over
+/// the retained plaintext must read the values that stood when the plaintext was
+/// current, not the encoded ones.
+const TRANSPORT_ENCODING_OWNED_RESPONSE_HEADERS: [&str; 2] = ["content-encoding", "content-length"];
+
+/// What the authoritative final client-visible BODY policy decided over, on the
+/// synthetic / short-circuit lifecycle, so the caller can tell whether the
+/// deliberately-late reject-path `after_proxy` chain invalidated that decision.
+///
+/// The synthetic lifecycle runs its body policy BEFORE that chain (the chain
+/// must run exactly once and last, over the final response, or one-shot state
+/// like the `oidc_relying_party` rotated session cookie and the consumed
+/// `response_transformer` route override would be lost). A late header rule can
+/// therefore relabel the representation — `text/plain` becoming
+/// `application/json` — and activate a policy that never saw these bytes under
+/// the header map the client actually receives (`GHSA-62jg-v563-4q23`).
+pub(crate) struct FinalSyntheticBodyPolicyWitness {
+    /// Policy-scope headers as the decision saw them, over the plaintext body.
+    scope: Vec<(String, String)>,
+    /// The exact plaintext representation the policy decided over.
+    plaintext_body: Bytes,
+    /// Transport-owned representation fields as they stood over that plaintext.
+    plaintext_transport_headers: Vec<(&'static str, Option<String>)>,
+    /// The body as it left the body-hook phase, after transport encoding. Used
+    /// to detect that something after the witness rewrote the bytes themselves.
+    published_body: Bytes,
+    /// Whether the legacy `on_final_response_body` loop ran for this response,
+    /// and so must also be re-decided when the scope changes.
+    legacy_final_hooks_ran: bool,
+}
+
+impl FinalSyntheticBodyPolicyWitness {
+    fn capture(headers: &HashMap<String, String>, body: &Bytes) -> Self {
+        Self {
+            scope: final_response_body_policy_scope(headers),
+            plaintext_body: body.clone(),
+            plaintext_transport_headers: TRANSPORT_ENCODING_OWNED_RESPONSE_HEADERS
+                .iter()
+                .map(|name| {
+                    let value = headers
+                        .iter()
+                        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                        .map(|(_, value)| value.clone());
+                    (*name, value)
+                })
+                .collect(),
+            published_body: body.clone(),
+            legacy_final_hooks_ran: false,
+        }
+    }
+}
+
+/// Replace `name` in `headers` with `value`, removing it when `value` is `None`.
+/// Case-insensitive so a differently-cased duplicate cannot survive alongside.
+fn restore_response_header(headers: &mut HashMap<String, String>, name: &str, value: Option<&str>) {
+    headers.retain(|key, _| !key.eq_ignore_ascii_case(name));
+    if let Some(value) = value {
+        headers.insert(name.to_string(), value.to_string());
+    }
+}
+
+/// Outcome of one non-rewriting sweep of the final client-visible body policies
+/// over a candidate representation.
+enum FinalSyntheticBodyPolicyDecision {
+    /// Every participating policy accepted this representation.
+    Continue,
+    /// A policy reported the one-shot bounded-scratch capacity refusal. The
+    /// pending flag has already been consumed; the caller installs the shared
+    /// terminal.
+    CapacityRefusal,
+    /// A policy refused this representation.
+    Reject(RejectedResponseParts),
+}
+
+/// Ask every final client-visible body policy — the authoritative phase, then
+/// the legacy `on_final_response_body` participants that phase does not cover —
+/// to decide over a candidate representation, WITHOUT mutating the response.
+///
+/// The candidate is passed by reference precisely because this sweep is a
+/// re-decision: the response it may replace is rebuilt by the caller through the
+/// shared gateway-decorator-preserving path, not by a hook here.
+async fn evaluate_final_synthetic_client_visible_response_body_policy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: u16,
+    response_headers: &HashMap<String, String>,
+    response_body: &[u8],
+    include_legacy_final_hooks: bool,
+) -> FinalSyntheticBodyPolicyDecision {
+    for plugin in plugins.iter() {
+        if !plugin.enforces_final_client_visible_response_body(ctx) {
+            continue;
+        }
+        let deadline = ctx.grpc_deadline_at();
+        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
+            deadline,
+            plugin.finalize_client_visible_response_body(
+                ctx,
+                response_status,
+                response_headers,
+                response_body,
+            ),
+        )
+        .await
+        .into_plugin_result(ctx);
+        match result {
+            PluginResult::Continue => {
+                // Consume the one-shot signal here, exactly as the first-pass
+                // loop does, so it can never linger to publication.
+                if ctx.take_buffered_response_capacity_refusal_pending() {
+                    return FinalSyntheticBodyPolicyDecision::CapacityRefusal;
+                }
+            }
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let reject = plugin_result_into_reject_parts(reject).unwrap_or_else(|| {
+                    warn!(
+                        plugin = plugin.name(),
+                        "Final client-visible response policy re-decision could not be \
+                         converted; failing closed"
+                    );
+                    final_response_policy_conversion_failure_parts()
+                });
+                debug!(
+                    plugin = plugin.name(),
+                    status_code = reject.status_code,
+                    "Plugin rejected the re-decided final client-visible response body"
+                );
+                return FinalSyntheticBodyPolicyDecision::Reject(reject);
+            }
+        }
+    }
+    if !include_legacy_final_hooks {
+        return FinalSyntheticBodyPolicyDecision::Continue;
+    }
+    for plugin in plugins.iter() {
+        // Participants in the authoritative phase already decided above.
+        if plugin.enforces_final_client_visible_response_body(ctx) {
+            continue;
+        }
+        let deadline = ctx.grpc_deadline_at();
+        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
+            deadline,
+            plugin.on_final_response_body(ctx, response_status, response_headers, response_body),
+        )
+        .await
+        .into_plugin_result(ctx);
+        match result {
+            PluginResult::Continue => {
+                if ctx.take_buffered_response_capacity_refusal_pending() {
+                    return FinalSyntheticBodyPolicyDecision::CapacityRefusal;
+                }
+            }
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let reject = plugin_result_into_reject_parts(reject)
+                    .unwrap_or_else(final_response_policy_conversion_failure_parts);
+                debug!(
+                    plugin = plugin.name(),
+                    status_code = reject.status_code,
+                    "Plugin rejected the re-decided finalized synthetic response body"
+                );
+                return FinalSyntheticBodyPolicyDecision::Reject(reject);
+            }
+        }
+    }
+    FinalSyntheticBodyPolicyDecision::Continue
+}
+
+/// Close the synthetic lifecycle's body-policy window: re-decide the final
+/// client-visible BODY policy once the reject-path `after_proxy` chain has made
+/// its last mutation, but ONLY when that chain actually changed something the
+/// policy scope depends on.
+///
+/// The chain runs last on this lifecycle by design, so a late
+/// `response_transformer` header `rename` — or a route header rule — can relabel
+/// the representation after every enforcing pass has decided. Relabelling
+/// `text/plain` to `application/json` activates JSON policies (`body_validator`
+/// response rules, a WAF response-body content-type gate, `ai_response_guard`)
+/// over bytes those policies were never asked about under the final header map.
+///
+/// Scoping rules, so nothing is charged or called twice for a representation
+/// that did not change:
+/// - the plaintext bytes are pinned by the witness, and
+/// - the comparison is made after normalizing away the gateway's own transport
+///   encoding, so `compression` adding `Content-Encoding: gzip` is not a scope
+///   change and never triggers a second sweep.
+///
+/// A refusal here cannot re-run the `after_proxy` chain that authored the
+/// current header map, so it rebuilds through the same path the final HEADER
+/// policy uses: only [`PRESERVED_GATEWAY_RESPONSE_DECORATORS`] survive — no
+/// stale representation metadata, and no backend/synthetic-producer field
+/// carried across merely because its name looks gateway-owned. The rebuild is
+/// then checked STRUCTURALLY (it must carry exactly the representation the
+/// gateway authored) rather than re-swept through the policies, because a
+/// gateway-authored terminal is never re-decided against its own error payload.
+///
+/// Returns `true` when the response was replaced.
+async fn reenforce_final_synthetic_client_visible_response_body_policy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    witness: FinalSyntheticBodyPolicyWitness,
+) -> bool {
+    // These gateway terminals are already the authoritative, redaction-safe
+    // answer. Re-deciding policy against a gateway error payload is exactly what
+    // the first-pass loops refuse to do.
+    if ctx.gateway_capacity_response_selected() || ctx.gateway_deadline_response_selected() {
+        return false;
+    }
+
+    let body_unchanged = *response_body == witness.published_body;
+    // The representation a re-decision is entitled to read: the FINAL semantic
+    // header map, with the gateway's transport framing restored to the plaintext
+    // the policy phase owns.
+    let mut candidate_headers = response_headers.clone();
+    let candidate_body = if body_unchanged {
+        for (name, value) in &witness.plaintext_transport_headers {
+            restore_response_header(&mut candidate_headers, *name, value.as_deref());
+        }
+        witness.plaintext_body.clone()
+    } else {
+        // Something after the witness rewrote the bytes themselves. The truth of
+        // what would be published is the current pair; judge that instead.
+        response_body.clone()
+    };
+    if body_unchanged && final_response_body_policy_scope(&candidate_headers) == witness.scope {
+        return false;
+    }
+
+    // Re-establish the phase marker for the duration of the sweep so storing
+    // plugins keep seeing these bytes as a synthetic short-circuit, and restore
+    // it afterwards so it never leaks into later logging/metrics hooks.
+    let previous_synthetic_marker = ctx.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let decision = evaluate_final_synthetic_client_visible_response_body_policy(
+        plugins,
+        ctx,
+        *response_status,
+        &candidate_headers,
+        &candidate_body,
+        witness.legacy_final_hooks_ran,
+    )
+    .await;
+
+    let replaced = match decision {
+        FinalSyntheticBodyPolicyDecision::Continue => false,
+        FinalSyntheticBodyPolicyDecision::CapacityRefusal => {
+            replace_buffered_response_with_capacity_refusal_with_policy_source(
+                ctx,
+                response_status,
+                response_headers,
+                response_body,
+                InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
+            );
+            true
+        }
+        FinalSyntheticBodyPolicyDecision::Reject(reject) => {
+            install_final_header_policy_rejection(
+                ctx,
+                response_status,
+                response_headers,
+                response_body,
+                reject,
+                true,
+                false,
+            );
+            // Fail closed on the rebuild, WITHOUT re-deciding policy against the
+            // gateway's own error payload — that is the rule every first-pass
+            // loop here follows, and violating it would turn any configured JSON
+            // response schema into a permanent 500 (the rejection body is itself
+            // JSON that no operator rule was written for).
+            //
+            // The rebuild is instead checked structurally: it must carry exactly
+            // the representation the gateway authored. Preserved decorators are
+            // non-representation by construction and the discarded body's
+            // metadata is dropped, so any other scope field means a plugin-
+            // supplied rejection header re-opened a policy scope that the
+            // decision above was not made under. That shape must not be
+            // published on the strength of that decision, so it collapses to the
+            // fixed, decorator-free terminal.
+            if final_response_body_policy_scope(response_headers)
+                != gateway_authored_rejection_body_policy_scope()
+            {
+                warn!(
+                    "Final client-visible response body policy rejection rebuilt an unexpected \
+                     representation; collapsing to the fixed gateway terminal"
+                );
+                install_final_header_policy_rejection(
+                    ctx,
+                    response_status,
+                    response_headers,
+                    response_body,
+                    final_response_policy_conversion_failure_parts(),
+                    false,
+                    false,
+                );
+            }
+            true
+        }
+    };
+
+    if let Some(previous_synthetic_marker) = previous_synthetic_marker {
+        ctx.metadata.insert(
+            SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+            previous_synthetic_marker,
+        );
+    } else {
+        ctx.metadata.remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
+    }
+    replaced
+}
+
 /// Run the governed synthetic short-circuit response-body hook pipeline
 /// (`on_response_body`, `transform_response_body_with_context`,
 /// `on_final_response_body`) over a plugin-generated body, replacing the
@@ -17268,13 +17640,21 @@ pub(crate) fn response_body_plugins_process_body(
 /// session cookie, `response_transformer` route overrides) lands on the final
 /// response exactly once instead of being consumed by an earlier pass and lost
 /// when this path replaces the response.
+///
+/// Returns the [`FinalSyntheticBodyPolicyWitness`] describing what the
+/// authoritative final client-visible body policy actually decided over, so the
+/// caller can re-decide once the deliberately-late chain has closed the header
+/// map (see
+/// [`reenforce_final_synthetic_client_visible_response_body_policy`]). `None`
+/// means there is nothing to re-decide: a gateway-authored terminal already owns
+/// the response, or no policy pass produced a client-visible representation.
 pub(crate) async fn apply_synthetic_response_body_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Bytes,
-) {
+) -> Option<FinalSyntheticBodyPolicyWitness> {
     // Mark the context for the duration of this body-hook phase so that storing
     // plugins (e.g. `request_deduplication`) can tell this body is a synthetic
     // plugin short-circuit and skip caching/replaying it. Saved/restored so a
@@ -17291,6 +17671,10 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     // correct client wire shape. A retained-response capacity terminal is
     // already protocol-correct and skips those later mutating phases.
     let mut terminal_body_response_selected = false;
+    // What the authoritative final body policy decided over, if it reached a
+    // client-visible representation. Dropped again whenever a gateway-authored
+    // terminal takes over, because a terminal is not re-decided.
+    let mut policy_witness: Option<FinalSyntheticBodyPolicyWitness> = None;
     let mut response_body_reject = None;
     for plugin in plugins.iter() {
         let deadline = ctx.grpc_deadline_at();
@@ -17466,7 +17850,8 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
             if stage == ResponseTransformStage::Semantic
                 && !terminal_body_response_selected
                 && mandatory_replay_transform_failed.is_none()
-                && run_final_client_visible_response_body_policy(
+            {
+                if run_final_client_visible_response_body_policy(
                     plugins,
                     ctx,
                     response_status,
@@ -17475,9 +17860,18 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
                     InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
                 )
                 .await
-            {
-                terminal_body_response_selected = true;
-                break 'stages;
+                {
+                    terminal_body_response_selected = true;
+                    break 'stages;
+                }
+                // The exact plaintext representation policy just accepted, and
+                // the header scope it accepted it under. Captured BEFORE
+                // transport encoding, so a later re-decision reads the document
+                // rather than gzip octets.
+                policy_witness = Some(FinalSyntheticBodyPolicyWitness::capture(
+                    response_headers,
+                    response_body,
+                ));
             }
         }
         if let Some(plugin_name) = mandatory_replay_transform_failed {
@@ -17496,8 +17890,13 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
             );
             terminal_body_response_selected = true;
         }
-    } else if !terminal_body_response_selected
-        && run_final_client_visible_response_body_policy(
+    } else if !terminal_body_response_selected {
+        // The transform phase was skipped (an unclaimed range/delta
+        // representation, or a gate rejection that did not select a terminal),
+        // but the final client-visible policy phase is non-rewriting and must
+        // still decide. Skipping it would drop `waf` / `body_validator` /
+        // `ai_response_guard` enforcement on exactly those responses.
+        if run_final_client_visible_response_body_policy(
             plugins,
             ctx,
             response_status,
@@ -17506,16 +17905,21 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
             InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
         )
         .await
-    {
-        // The transform phase was skipped (an unclaimed range/delta
-        // representation, or a gate rejection that did not select a terminal),
-        // but the final client-visible policy phase is non-rewriting and must
-        // still decide. Skipping it would drop `waf` / `body_validator` /
-        // `ai_response_guard` enforcement on exactly those responses.
-        terminal_body_response_selected = true;
+        {
+            terminal_body_response_selected = true;
+        } else {
+            policy_witness = Some(FinalSyntheticBodyPolicyWitness::capture(
+                response_headers,
+                response_body,
+            ));
+        }
     }
 
+    let mut legacy_final_body_reject_selected = false;
     if !terminal_body_response_selected {
+        if let Some(witness) = policy_witness.as_mut() {
+            witness.legacy_final_hooks_ran = true;
+        }
         let mut response_body_reject = None;
         for plugin in plugins.iter() {
             // Participants already decided in the authoritative pre-encoding
@@ -17560,6 +17964,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
                 response_headers,
                 reject,
             );
+            legacy_final_body_reject_selected = true;
         }
     }
 
@@ -17573,6 +17978,19 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     } else {
         ctx.metadata.remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
     }
+
+    // A gateway-authored terminal — a capacity refusal, a body rejection, a
+    // failed mandatory replay redaction — is already the answer, and must never
+    // be re-decided against its own error payload.
+    if terminal_body_response_selected || legacy_final_body_reject_selected {
+        return None;
+    }
+    let mut policy_witness = policy_witness?;
+    // Pin the bytes as published, so the caller can tell a header-only late
+    // mutation (re-decide over the retained plaintext) from a rewrite of the
+    // bytes themselves (re-decide over what is actually there).
+    policy_witness.published_body = response_body.clone();
+    Some(policy_witness)
 }
 
 /// Run the rejection-response plugin pipeline over a plugin short-circuit:
@@ -17608,6 +18026,17 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
 /// The reject-path `after_proxy` hooks are header-only and do not depend on the
 /// body-hook output (`compression::after_proxy` deliberately no-ops on the
 /// rejection path), so deferring them past the body hooks is safe.
+///
+/// Because that chain is last, it is also the last thing that can change the
+/// client-visible header map — and the representation fields in that map are
+/// what decide whether a body policy applies at all. So both authoritative final
+/// client-visible phases run AFTER it, without re-running it:
+/// [`reenforce_final_synthetic_client_visible_response_body_policy`] re-decides
+/// the BODY policy over the retained plaintext when (and only when) the chain
+/// changed the policy scope, then
+/// [`enforce_final_client_visible_response_header_policy`] closes the HEADER map
+/// (`GHSA-62jg-v563-4q23`). Neither consumes one-shot state, so the exactly-once
+/// contract above is unaffected.
 pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -17623,37 +18052,34 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         .map(|method_override| std::mem::replace(&mut ctx.method, method_override));
     let applied_synthetic_body_hooks = !plugins.is_empty()
         && should_apply_synthetic_response_body_hooks(*status, is_grpc_request, body, plugins, ctx);
+    // ORDERING, AND WHY BOTH CONTRACTS NOW HOLD:
+    //
+    // On the synthetic short-circuit path the response-BODY hooks
+    // (`on_response_body` / `transform_response_body_with_context` /
+    // `on_final_response_body`) run HERE, BEFORE the `after_proxy` reject hooks
+    // below; on the NORMAL backend path the order is reversed. That inversion is
+    // deliberate and cannot be removed: the body hooks may REPLACE the response
+    // when a guardrail rejects the synthetic body, so the `after_proxy` reject
+    // hooks have to run exactly once and LAST, over whatever the client actually
+    // receives, or one-shot state emitted from consumed metadata — the
+    // `oidc_relying_party` rotated session cookie, the `response_transformer`
+    // route override — is consumed against a response the rejection discards
+    // (commit 36de1bf0 and the function-level doc below).
+    //
+    // The inversion used to leave a real security residual: a late
+    // `response_transformer` or route header rule could change `Content-Type` (or
+    // another representation field) only AFTER `waf` / `body_validator` /
+    // `ai_response_guard` and the legacy final hooks had decided, relabelling a
+    // `text/plain` body as `application/json` and activating a policy that never
+    // saw those bytes under the published header map. That is now closed
+    // generically without moving the chain: the body-hook phase returns a witness
+    // of what policy decided over, and
+    // `reenforce_final_synthetic_client_visible_response_body_policy` re-decides
+    // below when — and only when — the chain actually changed the policy scope.
+    let mut synthetic_body_policy_witness = None;
     if applied_synthetic_body_hooks {
-        // KNOWN ORDERING DIVERGENCE (accepted, documented trade-off):
-        //
-        // On the synthetic short-circuit path the response-BODY hooks
-        // (`on_response_body` / `transform_response_body_with_context` /
-        // `on_final_response_body`) run HERE, BEFORE the `after_proxy` reject
-        // hooks below. On the NORMAL backend path the order is reversed —
-        // `after_proxy` runs before the body transforms. So a body transform that
-        // depends on a header/metadata mutation made by an `after_proxy` hook
-        // (e.g. `response_transformer`'s `after_proxy` rewriting `Content-Type`
-        // to `application/json` before its JSON body rules, or `compression`
-        // choosing an encoding) can see a different input on a synthetic 2xx than
-        // it would on an equivalent backend 2xx.
-        //
-        // This is INTENTIONAL and must NOT be "fixed" by moving `after_proxy`
-        // ahead of the body hooks: doing so would re-break the one-shot
-        // `after_proxy` response-state contract that the caller relies on. The
-        // body hooks may REPLACE the response when a guardrail rejects the
-        // synthetic body (`apply_synthetic_response_body_hooks` rebuilds
-        // headers via `rebuild_plugin_rejection_response_headers`). The
-        // `after_proxy` reject hooks therefore have to run exactly once and LAST,
-        // over the FINAL response, so one-shot state emitted from consumed
-        // metadata — the `oidc_relying_party` rotated session cookie, the
-        // `response_transformer` route override — lands on whatever the client
-        // actually receives instead of being consumed against a synthetic
-        // response that a later body rejection discards (see commit 36de1bf0
-        // and the function-level doc on
-        // `apply_reject_after_proxy_and_synthetic_body_hooks`).
-        // The two requirements directly conflict; we keep the one-shot guarantee
-        // and accept the minor body-transform divergence on the synthetic path.
-        apply_synthetic_response_body_hooks(plugins, ctx, status, headers, body).await;
+        synthetic_body_policy_witness =
+            apply_synthetic_response_body_hooks(plugins, ctx, status, headers, body).await;
     }
     // Route response-size policy over an ALREADY-BUFFERED synthetic body, run
     // independently of the body-hook gate above (`GHSA-xrfj-852f-645j`).
@@ -17669,7 +18095,11 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     //
     // Still inside the method-override window: bodyless semantics are decided
     // from the same effective method the hooks saw.
-    enforce_synthetic_response_body_limit(plugins, ctx, status, headers, body);
+    if enforce_synthetic_response_body_limit(plugins, ctx, status, headers, body) {
+        // The size terminal is now the authoritative gateway answer; there is no
+        // accepted representation left to re-decide.
+        synthetic_body_policy_witness = None;
+    }
     if let Some(original_method) = original_method {
         ctx.method = original_method;
     }
@@ -17677,19 +18107,32 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // (the synthetic response or the body-rejection response produced above), so
     // one-shot response state (rotated session cookie, route overrides) is
     // emitted onto whatever the client actually receives. Runs LAST by design —
-    // see the divergence note above.
+    // see the ordering note above.
     apply_replaceable_after_proxy_hooks_to_rejection(plugins, ctx, status, body, headers).await;
+
+    // Authoritative final client-visible BODY policy, re-decided over the exact
+    // header map the chain above just closed (`GHSA-62jg-v563-4q23`). No-ops
+    // unless that chain changed a field the policy scope depends on, so an
+    // unchanged representation is never inspected, called out to, or charged
+    // twice. Runs BEFORE the header phase so a body refusal is normalized by the
+    // same boundaries as every other rejection in this finalizer.
+    if let Some(witness) = synthetic_body_policy_witness {
+        reenforce_final_synthetic_client_visible_response_body_policy(
+            plugins, ctx, status, headers, body, witness,
+        )
+        .await;
+    }
 
     // Authoritative final client-visible HEADER policy, AFTER the deliberately
     // late reject-path `after_proxy` chain above (`GHSA-62jg-v563-4q23`).
     //
-    // The synthetic body hooks already ran the final client-visible BODY phase,
-    // but that phase saw a header map the chain above could still rewrite: a
-    // `response_transformer` header `rename` — or a route header rule — can carry
-    // a backend- or synthetic-controlled value into a protected field after every
-    // enforcing pass. This phase closes that window without re-running the chain,
-    // so one-shot state (the rotated session cookie, the consumed route override)
-    // stays exactly-once and stays on the response the client receives.
+    // A `response_transformer` header `rename` — or a route header rule — can
+    // carry a backend- or synthetic-controlled value into a protected field after
+    // every enforcing pass. This phase closes that window without re-running the
+    // chain, so one-shot state (the rotated session cookie, the consumed route
+    // override) stays exactly-once and stays on the response the client receives.
+    // The BODY half of the same window was already closed just above, so both
+    // final phases now judge the identical closed header map.
     //
     // Deliberately BEFORE the WebSocket transport strip, the committed-response
     // observers, and the HEAD/204/205/304 wire preparation, so a rejection here

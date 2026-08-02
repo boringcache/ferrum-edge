@@ -549,6 +549,47 @@ Why the split matters:
 The phase also runs when the transform phase is skipped (an unclaimed `206`/`226`
 representation), because it is non-rewriting and must still decide.
 
+#### Re-decision on the synthetic / short-circuit lifecycle
+
+On that lifecycle the reject-path `after_proxy` chain runs LAST — it has to, so
+one-shot response state (the `oidc_relying_party` rotated session cookie, the
+consumed `response_transformer` route override) is emitted exactly once onto the
+response the client actually receives. That chain is therefore also the last
+thing that can change the header map, and the representation fields in that map
+are what decide whether a body policy applies at all. A late header `rename` or
+route header rule relabelling a `text/plain` body as `application/json` would
+otherwise activate JSON policies over bytes they were never asked about under the
+published header map.
+
+So the body-hook phase returns a **witness** of what it decided over — the exact
+plaintext bytes, plus the policy-scope headers it read them under — and the
+finalizer re-decides once the chain has closed the map, before the header phase
+below. The scope is every `Content-*` field except `Content-Length` (derived from
+bytes the witness already pins) and the `Content-Security-Policy` family (a client
+directive and a gateway decorator, not a description of these bytes), plus
+`grpc-status` / `grpc-message` (which decide `body_validator`'s
+empty-terminal-error exemption). The comparison is made after
+normalizing the gateway's own transport encoding back out, so `compression`
+adding `Content-Encoding: gzip` is not a scope change: an unchanged
+representation is never re-inspected, re-called-out-to, or re-charged. Both the
+authoritative phase and the legacy `on_final_response_body` participants
+(`ai_semantic_firewall`) are re-decided together.
+
+A refusal here cannot re-run the chain that authored the current header map, so
+it rebuilds through the same path the header phase uses — only
+`PRESERVED_GATEWAY_RESPONSE_DECORATORS` survive, no stale representation metadata
+and no backend/synthetic-producer field carried across on a trusted-looking name.
+The rebuild is then checked **structurally** rather than re-swept through the
+policies: it must carry exactly the representation the gateway authored
+(`Content-Type: application/json` and nothing else in scope), and anything else —
+a plugin-supplied rejection header re-opening a representation scope — collapses
+to the fixed, decorator-free gateway terminal. Re-sweeping instead would judge a
+gateway-authored error payload against operator rules written for application
+responses, which is exactly what every other phase here refuses to do (and would
+turn any configured JSON response schema into a permanent `500`). Gateway-authored
+terminals (capacity, deadline, an earlier rejection, a route body-size refusal)
+are likewise never re-decided: they are already the answer.
+
 ### Authoritative final client-visible response HEADER phase
 
 Response HEADER policy is a separate phase

@@ -261,7 +261,28 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     the backend buffered lifecycle and the synthetic/short-circuit lifecycle. Do
     not move gateway compression back ahead of it, and do not move these
     decisions back into `on_final_response_body` — that hook runs after transport
-    encoding. `waf`/`body_validator`/`ai_response_guard` additionally claim an
+    encoding.
+    On the SYNTHETIC lifecycle the phase returns a WITNESS (the exact plaintext
+    bytes plus the policy-scope headers it read them under) and is RE-DECIDED at
+    the end of `apply_reject_after_proxy_and_synthetic_body_hooks`, after the
+    deliberately-late reject-path `after_proxy` chain, because that chain is the
+    last thing that can relabel the representation and thereby activate a policy
+    that never saw these bytes. Scope is every `Content-*` field except
+    `Content-Length` and the `Content-Security-Policy` family, plus
+    `grpc-status`/`grpc-message`, compared AFTER normalizing
+    the gateway's own transport encoding back out — so an unchanged representation
+    is never re-inspected or re-charged, and `compression` alone never triggers a
+    sweep. The legacy `on_final_response_body` participants
+    (`ai_semantic_firewall`) are re-decided in the same sweep. A refusal rebuilds
+    through the same `PRESERVED_GATEWAY_RESPONSE_DECORATORS` path as 10c, then the
+    rebuild is checked STRUCTURALLY (it must carry exactly the gateway-authored
+    `Content-Type: application/json` scope) and collapses to the fixed
+    decorator-free terminal otherwise. Do NOT re-sweep the policies over that
+    rebuild: a gateway-authored error payload is never re-decided against operator
+    rules written for application responses, and doing so turns any configured
+    JSON response schema into a permanent 500. Gateway terminals (capacity,
+    deadline, an earlier rejection, the route body-size refusal) are never
+    re-decided either. Do not "fix" this by running `after_proxy` twice. `waf`/`body_validator`/`ai_response_guard` additionally claim an
     ORIGIN-ENCODED response through `enforces_response_body_policy` (narrow: only
     when their rules apply, only on the pristine `ORIGIN_ENCODED_RESPONSE`
     stamp, never for framed gRPC) so the representation gate decodes it or fails

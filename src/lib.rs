@@ -4764,14 +4764,18 @@ pub mod _test_support {
         response_headers: &mut HashMap<String, String>,
         response_body: &mut bytes::Bytes,
     ) {
-        crate::proxy::apply_synthetic_response_body_hooks(
+        // The returned policy witness only matters to the shared finalizer,
+        // which re-decides body policy after its deliberately-late reject-path
+        // `after_proxy` chain; drive `finalize_synthetic_response_for_test` to
+        // exercise that.
+        let _ = crate::proxy::apply_synthetic_response_body_hooks(
             plugins,
             ctx,
             response_status,
             response_headers,
             response_body,
         )
-        .await
+        .await;
     }
 
     /// Drive the complete shared H1/H2/H3 synthetic-response finalizer,
