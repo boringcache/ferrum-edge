@@ -117,6 +117,8 @@ pub fn tls_store_instance_id_from_env() -> Option<String> {
 /// PostgreSQL and MySQL. Callers must never log or echo it — the value may
 /// embed credentials. `Debug` redacts the URL for the same reason.
 #[derive(Clone, PartialEq, Eq)]
+// Public custom-plugin API; the binary test target may compile without opt-in plugins.
+#[allow(dead_code)]
 pub struct EffectiveSqlBackend {
     pub db_type: String,
     pub effective_url: String,
@@ -881,6 +883,8 @@ fn resolve_tls_source_override(
 /// Resolve the same source-over-path contract through the process-wide
 /// conf-aware resolver for consumers that do not hold the `ConfFile` used by
 /// `EnvConfig::from_env_with_conf`.
+// Used by the public SQL-backend resolver when an opt-in plugin is compiled.
+#[allow(dead_code)]
 fn resolve_cached_tls_source_override(source_key: &str, path_key: &str) -> Option<String> {
     let path_value = crate::config::conf_file::resolve_ferrum_var(path_key);
     match crate::config::conf_file::resolve_ferrum_var(source_key) {
@@ -4627,6 +4631,8 @@ impl EnvConfig {
     ///
     /// MongoDB is rejected because callers need a SQL pool. Errors never include
     /// the raw database URL or credentials.
+    // Public custom-plugin API; not every binary artifact opts a SQL consumer in.
+    #[allow(dead_code)]
     pub fn resolve_effective_sql_backend() -> Result<EffectiveSqlBackend, String> {
         use env_config_macro::EnvValue;
 
@@ -4662,6 +4668,8 @@ impl EnvConfig {
     /// Prefer [`Self::resolve_effective_sql_backend`] when loading from the
     /// process environment / `ferrum.conf`. This method is useful for tests that
     /// construct a partial [`EnvConfig`] without opening a network connection.
+    // Public custom-plugin API and external-test helper.
+    #[allow(dead_code)]
     pub fn effective_sql_backend(&self) -> Result<EffectiveSqlBackend, String> {
         let db_type = self
             .db_type

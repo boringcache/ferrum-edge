@@ -4,6 +4,7 @@
 //! listener rejects conflicting `Host` and `:authority` values before routing.
 
 use crate::common::TestGateway;
+use crate::scaffolding::clients::bind_quinn_client_endpoint;
 
 use quinn::{ClientConfig, Endpoint};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -138,7 +139,8 @@ fn insecure_h3_endpoint() -> Result<Endpoint, Box<dyn std::error::Error + Send +
         .map_err(|e| format!("QuicClientConfig build failed: {e}"))?;
     let client_config = ClientConfig::new(Arc::new(quic_config));
 
-    let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let mut endpoint =
+        bind_quinn_client_endpoint(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
 }
