@@ -1498,10 +1498,7 @@ async fn compressed_decode_fallback_without_text_view_defers_to_on_final() {
             .await,
     );
     assert!(has_scoped_meta(&ctx, "ai_ratelimit_request"));
-    assert!(has_scoped_meta(
-        &ctx,
-        "ai_ratelimit_compressed_ai_request"
-    ));
+    assert!(has_scoped_meta(&ctx, "ai_ratelimit_compressed_ai_request"));
     assert!(!has_scoped_meta(
         &ctx,
         "ai_ratelimit_deferred_compressed_classify"
