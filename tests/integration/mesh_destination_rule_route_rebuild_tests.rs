@@ -464,7 +464,10 @@ async fn update_config_dr_noop_and_repeated_reload_are_stable() {
 
     // Repeated reload with a real DR pool change then a second identical apply.
     let changed = prepared_with_dr(Some(destination_rule(Some(9_000), None)));
-    assert_eq!(state.update_config(changed.clone()), ConfigApplyOutcome::Applied);
+    assert_eq!(
+        state.update_config(changed.clone()),
+        ConfigApplyOutcome::Applied
+    );
     assert_eq!(route_fallback_idle_ms(&state), Some(9_000));
 
     let repeat = state.update_config(changed);
@@ -659,10 +662,7 @@ async fn update_config_republishes_routes_for_empty_delta_retry_fallback_change(
 
     let (state, _handles) = new_proxy_state(old_config);
     assert_eq!(route_fallback_max_retries(&state), Some(2));
-    assert_eq!(
-        state.update_config(new_config),
-        ConfigApplyOutcome::Applied
-    );
+    assert_eq!(state.update_config(new_config), ConfigApplyOutcome::Applied);
     assert_eq!(
         route_fallback_max_retries(&state),
         Some(0),
