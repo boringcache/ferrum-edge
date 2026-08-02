@@ -1047,6 +1047,10 @@ impl Plugin for PriorityOverridePlugin {
     fn may_replace_rejection_response(&self) -> bool {
         self.inner.may_replace_rejection_response()
     }
+    fn rejection_replacement_is_final_body_policy_terminal(&self) -> bool {
+        self.inner
+            .rejection_replacement_is_final_body_policy_terminal()
+    }
     fn warn_on_rejection_response_replacement(&self) -> bool {
         self.inner.warn_on_rejection_response_replacement()
     }

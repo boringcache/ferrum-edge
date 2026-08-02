@@ -417,7 +417,7 @@ mod tests {
     use rustls::ServerConfig;
 
     fn install_default_crypto_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = crate::fips::base_crypto_provider().install_default();
     }
 
     fn dummy_server_config() -> Arc<ServerConfig> {
@@ -441,7 +441,7 @@ mod tests {
 
         Arc::new(
             rustls::ServerConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
+                crate::fips::base_crypto_provider(),
             ))
             .with_safe_default_protocol_versions()
             .expect("default protocol versions")
@@ -455,7 +455,7 @@ mod tests {
         install_default_crypto_provider();
         TlsPolicy {
             protocol_versions: vec![&rustls::version::TLS13],
-            crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
+            crypto_provider: Arc::new(crate::fips::base_crypto_provider()),
             prefer_server_cipher_order: false,
             session_cache_size: 64,
             early_data_max_size: 0,

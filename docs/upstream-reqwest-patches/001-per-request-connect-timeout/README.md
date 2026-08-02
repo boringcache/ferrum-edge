@@ -59,7 +59,8 @@ those two context lines. The applied patch in the vendor directory uses
 the v0.13.2 context. The original PR diff is preserved verbatim in
 `reqwest-3017.patch` for audit purposes.
 
-No other deviations.
+The provider-selection deviation is documented independently under
+`../002-selectable-rustls-provider/`; it is not part of upstream PR #3017.
 
 ## Files copied into `vendor/reqwest-0.13.3-ferrum-patched/`
 

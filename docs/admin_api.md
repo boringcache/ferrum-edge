@@ -566,13 +566,136 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://localhost:9000/restore?confirm=true"
 ```
 
-The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Before replacement, restore acquires a persistent namespace guard and snapshots the current namespace with a non-validating raw load from the primary, so an already-invalid-but-present config still snapshots and keeps rollback available while it is repaired. If that snapshot cannot be taken at all — a genuine database/connectivity failure — restore **aborts with `503` before deleting anything** and leaves the prior config intact (retry once the database is reachable). Database inserts are chunked into 1,000-record transactions for large-scale imports. Conditional mTLS DNS-identity uniqueness is checked under the same namespace-scoped datastore admission guard used by ordinary Consumer, plugin, proxy-association, upstream, and API-spec writes, so a concurrent admin process cannot race a batch/restore policy activation with a case-variant credential. Restore retains one persistent guard owner from before its snapshot through the clear and every import or compensating-replay batch. All non-owning namespace resource writers and replays fail closed for that full interval, so no concurrent resource can be lost merely because it was absent from the restore payload. The compensating replay intentionally does not apply newly introduced mTLS DNS admission to the old snapshot: otherwise a pre-existing ambiguity would be deleted successfully and then become impossible to restore. Normal batch/restore admission never receives this rollback-only bypass. The endpoint returns `500 Internal Server Error` with a `rollback` field (`completed` / `incomplete` / `not_needed` / `unknown_outcome`). `not_needed` means the clear definitively aborted atomically (SQL / replica-set MongoDB), so nothing was deleted and the prior config was retained without any re-import. An unknown MongoDB commit remains `unknown_outcome` with the guard retained even when immediate verification still sees the prior counts, because the clear can become visible later. API specs are admin-plane-only metadata outside the backup/restore payload: a successful restore deletes them, and a config rollback cannot recreate them. Re-submit original documents via `POST /api-specs`; use `GET /api-specs` to list specs currently stored in the namespace. Failed restores report the authoritative affected count in `api_specs_not_restored`.
+The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Successful exports and authenticated denied/failed attempts are always audited with request context before (or instead of) releasing unredacted bytes — independent of `FERRUM_ADMIN_AUDIT_ENABLED`, which gates ordinary mutation audit events only — see [Audit Log](#audit-log) and [admin_backup_restore.md](admin_backup_restore.md). Before replacement, restore acquires a persistent namespace guard and snapshots the current namespace with a non-validating raw load from the primary, so an already-invalid-but-present config still snapshots and keeps rollback available while it is repaired. If that snapshot cannot be taken at all — a genuine database/connectivity failure — restore **aborts with `503` before deleting anything** and leaves the prior config intact (retry once the database is reachable). Database inserts are chunked into 1,000-record transactions for large-scale imports. Conditional mTLS DNS-identity uniqueness is checked under the same namespace-scoped datastore admission guard used by ordinary Consumer, plugin, proxy-association, upstream, and API-spec writes, so a concurrent admin process cannot race a batch/restore policy activation with a case-variant credential. Restore retains one persistent guard owner from before its snapshot through the clear and every import or compensating-replay batch. All non-owning namespace resource writers and replays fail closed for that full interval, so no concurrent resource can be lost merely because it was absent from the restore payload. The compensating replay intentionally does not apply newly introduced mTLS DNS admission to the old snapshot: otherwise a pre-existing ambiguity would be deleted successfully and then become impossible to restore. Normal batch/restore admission never receives this rollback-only bypass. The endpoint returns `500 Internal Server Error` with a `rollback` field (`completed` / `incomplete` / `not_needed` / `unknown_outcome`). `not_needed` means the clear definitively aborted atomically (SQL / replica-set MongoDB), so nothing was deleted and the prior config was retained without any re-import. An unknown MongoDB commit remains `unknown_outcome` with the guard retained even when immediate verification still sees the prior counts, because the clear can become visible later. API specs are admin-plane-only metadata outside the backup/restore payload: a successful restore deletes them, and a config rollback cannot recreate them. Re-submit original documents via `POST /api-specs`; use `GET /api-specs` to list specs currently stored in the namespace. Failed restores report the authoritative affected count in `api_specs_not_restored`.
 
 See [admin_backup_restore.md](admin_backup_restore.md) for details.
 
 ## Audit Log
 
-When `FERRUM_ADMIN_AUDIT_ENABLED=true`, successful admin mutations enqueue a database-backed audit event before the mutation response is returned. The response waits only for bounded queue enqueue, not durable database persistence. Audit persistence is best-effort after the mutation commits: if enqueue or persistence fails, Ferrum logs the failure and still returns the mutation result so operators do not retry an already-applied write. `POST /batch` is all-or-nothing (issue #2401), so it emits exactly one audit event when its graph commits and none at all when it does not. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, and a JSON `diff` object with redacted consumer credentials and sensitive plugin configuration. Basic credential mutations remain visible by type and action, but every Basic value, entry field, shape, and count is replaced by one stable `[REDACTED]` marker before persistence. Loki plugin diffs preserve only the endpoint scheme/host/port and redact its path, query, authorization, and all custom-header values. Redis-backed plugin diffs replace `redis_integrity_key` (and any other `*_integrity_key` signing secret) with `[REDACTED]` and strip `redis_url` userinfo/query/fragment while keeping its scheme/host/port/database.
+When `FERRUM_ADMIN_AUDIT_ENABLED=true`, an audited admin mutation is made durable **before it runs**, not after it commits. `POST /batch` is all-or-nothing (issue #2401), so it emits exactly one audit event when its graph commits and none at all when it does not. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, outcome, and a JSON `diff` object with redacted consumer credentials and sensitive plugin configuration. Basic credential mutations remain visible by type and action, but every Basic value, entry field, shape, and count is replaced by one stable `[REDACTED]` marker before persistence. Loki plugin diffs preserve only the endpoint scheme/host/port and redact its path, query, authorization, and all custom-header values. Redis-backed plugin diffs replace `redis_integrity_key` (and any other `*_integrity_key` signing secret) with `[REDACTED]` and strip `redis_url` userinfo/query/fragment while keeping its scheme/host/port/database. Every redaction above is applied before the durable spool write, so a spooled or retained record carries exactly the same redacted representation as the `audit_events` row.
+
+This pipeline covers every Admin action that emits an ordinary mutation audit
+event: configuration-database mutations (CRUD, credentials, API specs, batch,
+and restore), managed TLS/ACME file-store mutations, and explicit TLS rotation.
+The TLS/ACME stores remain independent of config-database topology, but their
+audit handoff still happens before the action. A `fail_closed` audit outage
+therefore refuses the audited TLS/ACME action without applying sticky database
+failover policy to that independent store or operational reload.
+
+### Durable evidence before the mutation (issue #2421)
+
+1. **Prepare.** The admin write gate durably creates an *audit intent* — a
+   stable event id plus the minimal audit request context (authenticated actor
+   subject, method, sanitized path and namespace, canonical socket source
+   address, bounded request id) —
+   fsyncing both the record and its directory **before** the configuration
+   mutation is invoked.
+2. **Finalize.** Once the mutation returns, the same stable id is durably
+   finalized with its real outcome (`success` or `failure`) and diff, and only
+   then is the prepared record unlinked. The outcome is never written before
+   the mutation result is known.
+3. **Deliver.** Insertion into `audit_events` happens asynchronously with
+   bounded exponential backoff (250 ms → 30 s, capped by
+   `FERRUM_ADMIN_AUDIT_MAX_DELIVERY_ATTEMPTS`), and the durable record is
+   deleted only after the backend accepts the event.
+
+There is therefore no window in which a configuration mutation is committed with
+no durable audit evidence.
+
+- **Unknowable outcomes are recorded as such.** A crash between commit and
+  finalize leaves the prepared record on disk. A later process generation
+  replays it as an explicit `outcome: unknown_outcome` event with
+  `diff.outcome_evidence = prior_process_generation_did_not_finalize`. Such a
+  record is never deleted silently and never promoted to a known success or
+  failure — the mutation may or may not have taken effect, and reconciling that
+  is an operator decision.
+- **Ownership across processes.** Records live under
+  `<spool>/instances/<generation>/`, whose `owner.lock` this process holds with
+  an exclusive, non-blocking OS lock for its entire lifetime. A process adopts
+  only instance directories whose lock it can take — exactly the generations
+  that are no longer running — so it can never classify its own in-flight
+  prepared record, and several gateway processes may share one configured spool
+  root safely.
+- **Destination binding.** Every record carries a non-secret audit-destination
+  identity (database type, namespace, and a SHA-256 digest of the *redacted*
+  connection URL). A record whose destination does not match the adopting
+  process is quarantined into `<spool>/failed/` rather than delivered, so
+  repointing a gateway cannot replay one deployment's audit evidence into
+  another's database or namespace. The connection secret itself is never stored
+  or logged.
+- **Startup replay.** Discovery, adoption, and replay begin when the mode's
+  database backend starts, not when a later mutation happens to arrive, so a
+  process that receives no new mutations still drains the backlog it inherited.
+- **Request cancellation.** Mutation persistence tasks explicitly inherit the
+  request audit slot because Tokio task-local state is not inherited by
+  `tokio::spawn`. Cancellation ownership transfers before the task is spawned,
+  so a disconnected client cannot make the parent finalize an intent while the
+  settlement task is still committing it. If no task owns settlement when a
+  request is cancelled, the prepared record is finalized as
+  `unknown_outcome`. The blocking prepare/fsync itself is owned by a detached
+  settlement task: if cancellation arrives while that write is still in flight,
+  the task installs the newly durable id into the request slot and immediately
+  finalizes it as `unknown_outcome`, rather than leaving it dormant under a live
+  process generation until restart. If the runtime is already stopping, it
+  remains durable for next-process adoption instead of being deleted.
+- **Delivery semantics: at-least-once with a stable id.** All four backends
+  insert **insert-only and idempotently** on that id (PostgreSQL/SQLite
+  `ON CONFLICT (id) DO NOTHING`, MySQL `ON DUPLICATE KEY UPDATE id = id` — a
+  no-op assignment that mutates no column, not `INSERT IGNORE`, which would also
+  downgrade unrelated errors; MongoDB `insert_one` with a duplicate key treated
+  as success). A duplicate delivery of the same id is success, never
+  replacement: an `audit_events` row is immutable. The MongoDB path is a
+  single-document write, so it needs no multi-document transaction and works on
+  standalone deployments.
+- **Unrecoverable evidence is retained, not dropped.** After the attempt budget
+  is exhausted, the record moves to `<spool>/failed/` for operator remediation.
+  Corrupt records (bad version, unparseable, oversized, non-finalized, or an id
+  that disagrees with the filename) and foreign-destination records are
+  quarantined there too and are never replayed.
+- **Hostile-filesystem hardening.** Spool directories are created owner-only
+  (`0700` on Unix) and validated as non-symlink real directories; record files
+  are created `O_EXCL`/`O_NOFOLLOW` at `0600`, read back through a no-follow
+  open validated as a single-link regular file, and published with an atomic
+  same-directory rename. Record filenames derive from the event UUID and are
+  charset-validated before any path join, so no actor- or operator-controlled
+  string reaches the filesystem. A **directory fsync failure is a durability
+  failure**, not a warning: the record is not reported as durable.
+- **Shutdown.** Serving modes drain accepted audit work before the database
+  handle is released, bounded by `FERRUM_SHUTDOWN_DRAIN_SECONDS` (clamped to
+  5–60 s). Every retry wait and replay loop is cancellation-aware, so the drain
+  signal interrupts a 30 s backoff instead of outliving the budget. If the
+  deadline still expires, the worker is explicitly aborted **and joined** — it
+  is never detached. With a configured spool, anything undelivered stays
+  durable for the next process, so an expired deadline costs latency, not
+  events. In explicitly configured memory-only `fail_open` mode, undelivered
+  entries cannot survive process exit; they are counted as dropped and latch
+  `audit_pipeline.evidence_lost` plus degraded health instead of being silently
+  abandoned or falsely reported as durable.
+- **Unavailability policy.** With
+  `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed`, a failed pre-mutation
+  handoff refuses that mutation with `503` and a closed-set
+  `audit_unavailable_reason` **before** it is performed, so a change that cannot
+  be audited is never made. With `fail_open` (default) the mutation proceeds,
+  but only after an explicit fixed-cardinality warning and
+  `ferrum_admin_audit_fail_open_unaudited_mutations_total`, and the pipeline
+  stops claiming durable audit coverage.
+- **Observability.** Authenticated `/health` and `/status` carry an
+  `audit_pipeline` object (backlog, retries, failures, retained/unrecoverable
+  state, drops, sticky degradation, and closed-set reason labels), and an
+  unavailable or degraded pipeline forces `status: degraded`. Every field is
+  read from a process atomic or cached background state, so the reads are O(1):
+  no admin request path performs a filesystem walk or a database query for audit
+  observability. Evidence of corrupt, unrecoverable, or capacity-discarded
+  records is **sticky** — a later successful delivery does not clear it; only
+  resolving `<spool>/failed/` does, and a record actually discarded for capacity
+  latches `evidence_lost` permanently. The same counters are exported as
+  `ferrum_admin_audit_*` Prometheus families. These surfaces expose counts and
+  static labels only — never an actor subject, token, request body, audit diff,
+  connection string, or spool path.
+
+Audit events may also carry `source_address` (canonical admin socket peer — never a client-spoofable forwarding header), a bounded `request_id` (from a validated `X-Request-Id` / `X-Correlation-Id`, otherwise generated), and a fixed-cardinality `outcome`. Mutation events that predate request-context capture omit those fields (empty / skipped in JSON).
+
+`GET /backup` security auditing is unconditional and does not consult `FERRUM_ADMIN_AUDIT_ENABLED`: before any unredacted configuration bytes leave the process, Ferrum admits a security record via a synchronous `audit_events` insert when a database backend is available, otherwise via the bounded local fallback under `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` (so a cached-config export during a primary outage is still recorded without depending on that same unavailable database). If neither sink admits the event, the export returns `503` and does not attach a backup body. Fallback-stored records are not served by `GET /audit` and are not replayed into `audit_events` once the primary recovers; the file keeps the newest 4096 events and logs a content-free `audit_local_fallback_evicted` warning whenever an append evicts an older record. Authenticated denied/failed backup attempts (role or namespace denial, validation failure — including an invalid `X-Ferrum-Namespace` recorded under the default audit namespace with fixed `namespace_status: invalid`, unavailable) are audited best-effort with fixed failure categories only — never raw backend, parser, authorization, or serialization error strings, and never credentials, tokens, cookies, JWTs, or backup payload fragments. The `resources` query is a closed allow-list (`proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`); unknown tokens and structurally malformed forms (key-only `resources`, duplicate/ambiguous occurrences) are rejected with `400` and a static client message that does not echo the rejected value, and audit records store only allow-listed names or the fixed `invalid` sentinel.
 
 `GET /audit` requires an `admin` role token and supports `actor`, `action`, `resource_type`, `resource_id`, `start`, `end`, `limit`, and `offset` query parameters. `limit` follows the shared bounds (default 100, maximum 1000), and malformed or out-of-range values are rejected with `400`. The audit store indexes offsets as a 32-bit value, so `offset` is capped at `2^32 - 1` here rather than the `2^63 - 1` other list endpoints allow — a larger offset returns `400`. The audit response keeps its own `{ "items", "limit", "offset", "next_offset", "total" }` envelope. `next_offset` is always strictly greater than `offset`; it is `null` when no further page exists or the next cursor would exceed the 32-bit ceiling.
 

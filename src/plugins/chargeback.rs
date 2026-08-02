@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use sha2::{Digest as _, Sha256};
+use crate::fips::approved::Sha256;
 
 use super::TransactionSummary;
 

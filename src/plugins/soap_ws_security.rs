@@ -279,11 +279,11 @@
 //! `shared` (atomic Redis `SET NX EX` across replicas). `OneTimeUse` needs no
 //! special case because every accepted assertion is claimed exactly once.
 
+use crate::fips::backend::digest;
+use crate::fips::backend::signature as ring_sig;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Datelike, Utc};
-use ring::digest;
-use ring::signature as ring_sig;
 use roxmltree::{Document, Node, NodeId, ParsingOptions};
 use serde_json::Value;
 use std::borrow::Cow;
@@ -7652,7 +7652,7 @@ mod tests {
     // ── RSA public-key DER shape validator ──────────────────────────────────
     //
     // These tests pin the structural framing guard applied before the bare
-    // RSAPublicKey reaches `ring::signature::UnparsedPublicKey::new`.
+    // RSAPublicKey reaches `crate::fips::backend::signature::UnparsedPublicKey::new`.
 
     #[test]
     fn rsa_pk_shape_accepts_short_form_sequence_with_matching_length() {
