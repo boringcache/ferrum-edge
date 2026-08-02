@@ -24,6 +24,7 @@
 // warnings there; the `acme`-feature build keeps full dead-code linting.
 #![cfg_attr(not(feature = "acme"), allow(dead_code))]
 
+use crate::fips::approved::Sha256;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
@@ -36,7 +37,6 @@ use base64::Engine;
 use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 #[cfg(feature = "acme")]
 use uuid::Uuid;

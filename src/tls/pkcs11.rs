@@ -15,6 +15,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow, bail};
+use crate::fips::backend::rand::{SecureRandom, SystemRandom};
+use crate::fips::backend::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use cryptoki::error::{Error as CryptokiError, RvError};
 use cryptoki::mechanism::rsa::{PkcsMgfType, PkcsPssParams};
@@ -25,8 +27,6 @@ use cryptoki::object::{
 use cryptoki::session::{Session, UserType};
 use cryptoki::slot::Slot;
 use cryptoki::types::{AuthPin, Ulong};
-use ring::rand::{SecureRandom, SystemRandom};
-use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 use rustls::pki_types::{CertificateDer, SubjectPublicKeyInfoDer, alg_id};
 use rustls::sign::{CertifiedKey, Signer, SigningKey, public_key_to_spki};
 use rustls::{Error as RustlsError, InconsistentKeys, SignatureAlgorithm, SignatureScheme};

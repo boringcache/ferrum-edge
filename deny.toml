@@ -76,6 +76,17 @@ ignore = [
 # The repo intentionally carries duplicate major versions during build-out
 # (rustls 0.21+0.23, hyper 0.14+1.x, hickory 0.25+0.26, tungstenite 0.28+0.29).
 # Surface them as warnings for visibility without blocking PRs.
+#
+# FIPS profile (issue #3510): `--no-default-features --features fips` adds
+# `aws-lc-fips-sys` (the FIPS build of AWS-LC) alongside the ordinary
+# `aws-lc-sys`. Both sys crates may be compiled — `dimpl` and rustls's own
+# aws_lc_rs arm request `aws-lc-sys` unconditionally — but `aws-lc-rs` binds
+# `aws-lc-fips-sys` whenever its `fips` feature is on, so only the validated
+# module is reachable through the API. That is the upstream-supported shape;
+# `.github/scripts/check_fips_feature_policy.py` is what asserts it rather than
+# assuming it. Both crates come from crates.io, so the `[sources]` gate below
+# covers them unchanged, and the FIPS profile is not part of the committed
+# `Cargo.lock` (see docs/dependency-policy.md → "FIPS build profile").
 multiple-versions = "warn"
 # Block `*` registry version requirements (an unpinned-dependency supply-chain
 # risk). The only wildcard in the tree is the in-repo workspace path dep

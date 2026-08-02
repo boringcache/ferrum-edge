@@ -1,0 +1,127 @@
+name: FIPS Build Policy
+
+# FIPS deployment-mode gate for issue #3510.
+#
+# Two jobs, deliberately split by cost and by what they can prove:
+#
+# 1. `feature-policy` is the REQUIRED gate. It is cheap, hermetic, and
+#    deterministic: it reads `Cargo.toml` and the *resolved* feature graph for
+#    both profiles and fails when a ring feature could still be in control of a
+#    nominal FIPS build. It also runs the ordinary-profile check, so a change
+#    that quietly moves the default build onto a different backend is caught.
+#
+# 2. `fips-build` compiles and tests the FIPS profile against the real
+#    `aws-lc-fips-sys` module. That needs CMake, Go, and Perl, and it resolves
+#    dependencies the default profile's `Cargo.lock` does not pin (the FIPS
+#    module is not in the committed lock, by design — the ordinary build must
+#    not carry it). It therefore runs WITHOUT `--locked`.
+#
+# Ferrum Edge is not a validated cryptographic module and is not independently
+# FIPS-certified. A green run here means the FIPS profile builds, links the
+# validated module, passes its power-on self-test, and refuses every
+# non-approved algorithm — not that any deployment is certified. See
+# docs/fips.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fips-build-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  # These jobs do not install sccache, so clear the checked-in rustc wrapper
+  # from `.cargo/config.toml` rather than exec'ing a missing tool.
+  RUSTC_WRAPPER: ""
+  CARGO_BUILD_RUSTC_WRAPPER: ""
+
+jobs:
+  feature-policy:
+    name: FIPS Feature Policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Static manifest contract
+        run: python3 .github/scripts/check_fips_feature_policy.py --manifest-check
+
+      - name: Resolve the ordinary (crypto-ring) feature graph
+        run: |
+          cargo tree -e features --no-dev-deps > /tmp/tree-crypto-ring.txt
+
+      - name: Audit the ordinary feature graph
+        run: |
+          python3 .github/scripts/check_fips_feature_policy.py \
+            --tree /tmp/tree-crypto-ring.txt --profile crypto-ring
+
+      - name: Resolve the FIPS feature graph
+        # Feature resolution alone does not build `aws-lc-fips-sys`, so this
+        # needs no C/Go toolchain. It DOES need to update the lockfile with the
+        # FIPS-only crates, which is why `--locked` is deliberately absent.
+        run: |
+          cargo tree -e features --no-dev-deps \
+            --no-default-features --features fips > /tmp/tree-fips.txt
+
+      - name: Audit the FIPS feature graph
+        run: |
+          python3 .github/scripts/check_fips_feature_policy.py \
+            --tree /tmp/tree-fips.txt --profile fips
+
+      - name: Confirm the ordinary lockfile is unchanged by the ordinary profile
+        # The FIPS resolution above may have written FIPS-only crates into
+        # Cargo.lock. That is expected and is not committed. What must hold is
+        # that the ORDINARY profile still resolves against the committed lock.
+        run: |
+          git checkout -- Cargo.lock
+          cargo tree -e features --no-dev-deps --locked > /dev/null
+
+  fips-build:
+    name: FIPS Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
+
+      - name: Install aws-lc-fips-sys build prerequisites
+        # The FIPS build of AWS-LC is compiled from source under a fixed build
+        # recipe — that recipe is part of what the module's validation covers,
+        # which is why it cannot be replaced with a prebuilt artifact here.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build golang-go
+
+      - name: Install protoc
+        run: |
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Build the FIPS profile
+        # No `--locked`: the FIPS module's crates are intentionally absent from
+        # the committed lockfile so the ordinary build never carries them.
+        run: cargo build --no-default-features --features fips --bin ferrum-edge
+
+      - name: Lint the FIPS profile
+        run: |
+          cargo clippy --no-default-features --features fips \
+            --lib --tests -p ferrum-edge -- -D warnings
+
+      - name: FIPS policy and approved-primitive tests
+        run: |
+          cargo test --no-default-features --features fips \
+            --test unit_tests tls::fips_policy_tests

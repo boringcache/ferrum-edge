@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 
 #[cfg(target_os = "linux")]
-use sha2::{Digest, Sha256};
+use crate::fips::approved::Sha256;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 

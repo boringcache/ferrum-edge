@@ -498,6 +498,13 @@ pub fn execute_validate() -> Result<(), String> {
         )
         .map_err(|e| format!("Spec validation failed: {}", e))?;
 
+        // FIPS gateway-document admission, evaluated with exactly the policy
+        // that startup, SIGHUP reload, database poll apply, CP publication, and
+        // DP apply use, so `validate` cannot pass a document the gateway would
+        // then refuse. Inert when FIPS mode is off.
+        crate::fips::policy::check_gateway_config(&config)
+            .map_err(|e| format!("FIPS policy validation failed: {e}"))?;
+
         // Validate stream proxy port conflicts
         let reserved_ports = env_config.reserved_gateway_ports();
         if let Err(errors) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {

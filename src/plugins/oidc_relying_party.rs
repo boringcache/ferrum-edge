@@ -1,3 +1,4 @@
+use crate::fips::approved::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
@@ -8,12 +9,11 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use base64::Engine;
+use crate::fips::backend::rand::{SecureRandom, SystemRandom};
 use dashmap::DashMap;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use url::{Host, Url};
 

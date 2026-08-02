@@ -63,6 +63,35 @@ pub const MIN_HMAC_KEY_BYTES: usize = 32;
 /// and therefore module-backed).
 pub const NON_APPROVED_PLUGINS: &[&str] = &["kafka_logging"];
 
+/// Algorithm selections a plugin may expose that name a non-approved primitive.
+///
+/// SHA-1 is not an approved hash for a digital signature or a signature-bearing
+/// digest (SP 800-131A Rev. 2 disallowed it for signature generation and
+/// verification). `soap_ws_security` lets an operator admit `rsa-sha1`
+/// signatures and `sha1` reference digests for XML-DSig interoperability; both
+/// are refused while FIPS mode is enforced rather than silently computed
+/// outside the approved set. The values are Ferrum's own fixed configuration
+/// vocabulary, so echoing them in a diagnostic discloses nothing.
+const NON_APPROVED_ALGORITHM_SELECTIONS: &[(&str, &[&str], &[&str])] = &[(
+    "soap_ws_security",
+    &[
+        "x509_signature.allowed_algorithms",
+        "x509_signature.allowed_digest_algorithms",
+        "saml.allowed_signature_algorithms",
+        "saml.allowed_digest_algorithms",
+    ],
+    &["rsa-sha1", "sha1"],
+)];
+
+/// Approved stored-password representation.
+///
+/// Ferrum stores consumer Basic credentials as `hmac_sha256:<64 hex>` — an
+/// HMAC-SHA-256 under an operator secret, which is an approved keyed MAC and,
+/// since this change, computed by the selected module
+/// ([`crate::fips::approved`]). Any other prefix would be a password KDF Ferrum
+/// has not classified, so FIPS mode refuses it rather than assuming.
+pub const APPROVED_PASSWORD_HASH_PREFIX: &str = "hmac_sha256:";
+
 /// Render a bounded list of offending entries.
 fn bounded_list(entries: &[String]) -> String {
     let mut out = String::new();
@@ -213,6 +242,7 @@ pub fn check_gateway_config(config: &GatewayConfig) -> Result<(), String> {
 pub fn check_gateway_config_enforced(config: &GatewayConfig) -> Result<(), String> {
     let mut non_approved_plugins: Vec<String> = Vec::new();
     let mut jwt_violations: Vec<String> = Vec::new();
+    let mut algorithm_violations: Vec<String> = Vec::new();
 
     for plugin in &config.plugin_configs {
         if !plugin.enabled {
@@ -225,6 +255,31 @@ pub fn check_gateway_config_enforced(config: &GatewayConfig) -> Result<(), Strin
             non_approved_plugins.push(plugin.plugin_name.clone());
         }
         collect_jwt_algorithm_violations(plugin, &mut jwt_violations);
+        collect_non_approved_algorithm_selections(plugin, &mut algorithm_violations);
+    }
+
+    // ── Stored password representation ──────────────────────────────────
+    // Ordinary validation already pins the `hmac_sha256:` form, so this is a
+    // fail-closed backstop rather than the primary gate: it is what refuses a
+    // future stored-credential format that has not been classified against the
+    // approved KDF/MAC set. No credential material is interpolated — only the
+    // consumer count, which the operator already knows.
+    let unclassified_hashes = config
+        .consumers
+        .iter()
+        .filter(|consumer| {
+            consumer.credentials.values().any(|value| {
+                stored_password_hashes(value)
+                    .any(|hash| !hash.starts_with(APPROVED_PASSWORD_HASH_PREFIX))
+            })
+        })
+        .count();
+    if unclassified_hashes > 0 {
+        return Err(format!(
+            "{unclassified_hashes} consumer(s) carry a stored password hash in a representation \
+             Ferrum has not classified against the approved MAC/KDF set. FIPS mode admits only \
+             `{APPROVED_PASSWORD_HASH_PREFIX}<64 lowercase hex>`. See docs/fips.md."
+        ));
     }
 
     if !non_approved_plugins.is_empty() {
@@ -249,7 +304,78 @@ pub fn check_gateway_config_enforced(config: &GatewayConfig) -> Result<(), Strin
         ));
     }
 
+    if !algorithm_violations.is_empty() {
+        algorithm_violations.sort();
+        algorithm_violations.dedup();
+        return Err(format!(
+            "plugin algorithm selection(s) [{}] name a primitive that is not approved for \
+             signature generation or verification and are refused while FIPS mode is enforced. \
+             See docs/fips.md.",
+            bounded_list(&algorithm_violations)
+        ));
+    }
+
     Ok(())
+}
+
+/// Stored password hashes carried by one credential value.
+///
+/// A credential is either a single object or an array of objects (multi-
+/// credential rotation), so both shapes are walked. Only the `password_hash`
+/// member is read, and only its *prefix* is ever compared — the value itself
+/// never leaves this function.
+fn stored_password_hashes(value: &serde_json::Value) -> impl Iterator<Item = &str> {
+    let entries: Vec<&serde_json::Value> = match value {
+        serde_json::Value::Array(entries) => entries.iter().collect(),
+        other => vec![other],
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry| entry.get("password_hash"))
+        .filter_map(|hash| hash.as_str())
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
+/// Collect non-approved algorithm names a plugin's configuration selects.
+///
+/// The keys are dotted paths into the plugin's config object, matching the
+/// spelling the plugin's own validator uses, so the diagnostic names the field
+/// the operator must edit.
+fn collect_non_approved_algorithm_selections(plugin: &PluginConfig, out: &mut Vec<String>) {
+    for (plugin_name, keys, non_approved) in NON_APPROVED_ALGORITHM_SELECTIONS {
+        if plugin.plugin_name != *plugin_name {
+            continue;
+        }
+        for key in *keys {
+            let Some(value) = lookup_dotted(&plugin.config, key) else {
+                continue;
+            };
+            let serde_json::Value::Array(entries) = value else {
+                continue;
+            };
+            for entry in entries {
+                let Some(selected) = entry.as_str() else {
+                    continue;
+                };
+                if non_approved
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(selected.trim()))
+                {
+                    out.push(format!("{plugin_name}.{key}={}", selected.trim()));
+                }
+            }
+        }
+    }
+}
+
+/// Resolve a dotted path through nested JSON objects.
+fn lookup_dotted<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut current = root;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current)
 }
 
 /// Collect non-approved JWT algorithm names from one plugin's configuration.

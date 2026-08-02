@@ -3,41 +3,89 @@
 ## Status of this document
 
 **Ferrum Edge is not a validated cryptographic module and is not independently
-FIPS-certified. No configuration of this binary makes it so.**
+FIPS-certified. No configuration or build of this binary makes it so.** What the
+`fips` build profile does is route Ferrum's cryptography through a
+FIPS-validated module and refuse, fail-closed, anything it cannot route.
+Certification of a *deployment* depends on the exact module, the build, the
+operating environment, and operational controls that are the operator's to
+establish — §"The module boundary" enumerates them.
 
 This document describes:
 
-1. the FIPS deployment mode that ships today — its request surface, its
-   fail-closed behaviour, and the single cryptographic-provider seam it is built
-   on;
-2. the validated-module integration Ferrum has **selected** (`aws-lc-fips`), the
-   exact build contract it requires, and what remains before that integration
-   can ship;
-3. the module boundary — what a validated module would and would not cover — and
-   the operator obligations that no amount of gateway code can discharge.
+1. the two mutually exclusive build profiles and how to build the FIPS one;
+2. the runtime request surface, its precedence, and its fail-closed behaviour;
+3. what the mode admits and what it refuses;
+4. the module boundary, the self-test and key-management assumptions, and the
+   features that are deliberately unsupported inside it;
+5. how an operator verifies what is actually running.
 
-Read §"Current capability" before planning a deployment. The mode is
-**fail-closed**: on a build that cannot provide a validated module,
-`FERRUM_FIPS_MODE=enforce` refuses to start rather than serving with
-non-validated cryptography.
+## Build profiles
+
+The cryptographic backend is a **mutually exclusive** cargo-feature pair.
+Selecting both, or neither, is a `compile_error!`.
+
+| Profile | Build command | Backend | `BUILD_CAPABLE` |
+|---|---|---|---|
+| Ordinary (default) | `cargo build --release` | `ring` + `rustls/ring` | `false` |
+| FIPS | `cargo build --release --no-default-features --features fips` | `aws-lc-fips-sys` via `aws-lc-rs/fips` + `rustls/fips` | `true` |
+
+The ordinary profile is byte-for-byte the build Ferrum has always shipped; the
+existence of the FIPS profile changes nothing about it. `FERRUM_FIPS_MODE=enforce`
+on an ordinary build refuses to start, with a diagnostic that names the missing
+module. It never downgrades to `ring`.
+
+Exclusivity is not stylistic. `sqlx-core`, `quinn-proto`, `tonic`, `ldap3`, and
+`hyper-rustls` each gate their aws-lc arm on the *absence* of their ring arm, so
+additively "also enabling aws-lc" produces a build that reports a FIPS provider
+while several real traffic paths still run `ring`. `src/fips/mod.rs` enforces the
+pair at compile time and
+[`.github/scripts/check_fips_feature_policy.py`](../.github/scripts/check_fips_feature_policy.py)
+re-checks the **resolved** feature graph in CI, because a transitive edge can
+re-enable `rustls/ring` without this crate's feature list ever mentioning it.
+
+### Building the FIPS profile
+
+`aws-lc-fips-sys` compiles the FIPS build of AWS-LC from source under a fixed
+recipe. That recipe is part of what the module's validation covers, so it must
+not be substituted with a prebuilt artifact.
+
+Prerequisites (in addition to Ferrum's usual `protoc`):
+
+- a C/C++ toolchain
+- CMake and a generator (`ninja` or `make`)
+- Go
+- Perl
+
+```bash
+cargo build --release --no-default-features --features fips --bin ferrum-edge
+```
+
+**Lockfile.** The FIPS module's crates are deliberately **not** in the committed
+`Cargo.lock`: adding them would put a second cryptographic supply chain on every
+developer and every ordinary release artifact for no benefit. The FIPS build
+therefore resolves without `--locked`. A FIPS *release* must pin its own
+lockfile and keep it with the deployment record — that lockfile, the toolchain
+version, and the container base image are part of the evidence an auditor needs.
+
+**Container images.** The published Ferrum images are ordinary-profile builds.
+A FIPS deployment builds its own image; the base image and its kernel must be on
+the module certificate's tested-platform list (see §"The module boundary").
 
 ## Current capability
 
 | | Status |
 |---|---|
+| Mutually exclusive `crypto-ring` / `fips` build profiles | **Shipped** |
+| Validated AWS-LC-FIPS module linked by the `fips` profile | **Shipped** |
+| Resolved-feature-graph audit in CI (both profiles) | **Shipped** |
 | Request surface (`--fips-mode`, `FERRUM_FIPS_MODE`, `FERRUM_FIPS_REQUIRED_PROVIDER`) | **Shipped** |
-| Fail-closed bootstrap when the module is absent | **Shipped** |
+| Fail-closed bootstrap, including the module's power-on self-test | **Shipped** |
 | Single crypto-provider seam (`crate::fips`) across all rustls construction | **Shipped** |
-| Admission policy (TLS versions/suites/groups, JWT algorithms, key sizes, non-approved plugins, MongoDB TLS) | **Shipped** |
-| Authenticated status/health metadata | **Shipped** |
-| Source-level crypto inventory | **Shipped** (`src/fips/inventory.rs`) |
-| **AWS-LC-FIPS module linked into the binary** | **Not yet** — see §"Residual work" |
-
-Because the module is not linked, `crate::fips::BUILD_CAPABLE` is `false` and
-`FERRUM_FIPS_MODE=enforce` always fails startup with an explicit diagnostic.
-That is deliberate. A mode that "enforces" without a validated module underneath
-would be a compliance claim the binary cannot back, which is worse than no mode
-at all.
+| Module-backed SHA-2 / HMAC-SHA-2 for security-relevant digests and MACs | **Shipped** (`crate::fips::approved`) |
+| Admission policy at `validate`, startup, SIGHUP reload, DB poll apply, CP publication, DP apply | **Shipped** |
+| Authenticated status/health metadata, with `certified: false` | **Shipped** |
+| Source-level crypto inventory with an empty work register | **Shipped** (`src/fips/inventory.rs`) |
+| Ferrum Edge itself certified as a cryptographic module | **No — and it will not be.** Ferrum is an application that calls a module |
 
 ## Configuration
 
@@ -52,8 +100,13 @@ Precedence follows Ferrum's standard order: **CLI > environment > `ferrum.conf`
 An unrecognized `FERRUM_FIPS_MODE` value is a configuration error, not a silent
 downgrade — a typo'd `enfroce` must not quietly run non-FIPS.
 
+`FERRUM_FIPS_MODE` is a *runtime request*; the build profile is what decides
+whether it can be satisfied. `enforce` on an ordinary build refuses startup;
+`off` on a FIPS build runs the validated module without applying the admission
+policy, which is a supported (if unusual) configuration for staging a rollout.
+
 `FERRUM_FIPS_REQUIRED_PROVIDER` pins the integration the operator audited. Only
-one integration is supported, so today its only effect is to reject a value that
+`aws-lc-fips` is supported, so today its only effect is to reject a value that
 names something else; its purpose is forward-looking, so a future build that
 changed integrations cannot silently satisfy an existing deployment contract.
 
@@ -69,6 +122,15 @@ A request that appears **only** in `ferrum.conf` is not ignored: after `EnvConfi
 resolution, `fips::verify_resolved_mode` detects the mismatch and fails the
 command with an explicit message telling the operator to move the setting. It
 never serves under a provider chosen from a stale view of the request.
+
+**The resolved mode is immutable for the life of the process.** The rustls
+process-default provider can be installed exactly once, so a reload cannot turn
+enforcement on or off; `fips::state()` is established at bootstrap and read
+unchanged thereafter. This is enforced, not merely documented: the late-request
+path above fails the command on *both* build profiles rather than promoting the
+mode after the fact. Changing the mode is a restart. Every *incoming*
+configuration document is still validated against the resolved mode at every
+admission point, so an immutable mode does not mean an unchecked config.
 
 ## What FIPS mode enforces
 
@@ -99,8 +161,33 @@ reload, which rebuilds through the same constructor.
 - `FERRUM_ADMIN_JWT_SECRET` and `FERRUM_CP_DP_GRPC_JWT_SECRET` must be at least
   32 bytes (SP 800-107 HMAC key strength).
 
+**Digests, MACs, and stored passwords**
+
+- Security-relevant SHA-2 and HMAC-SHA-2 — request MAC verification
+  (`hmac_auth`), stored-password MACs (`basic_auth`), LDAP bind-cache keying,
+  DPoP proofs and JWK thumbprints, client-certificate thumbprints, PKCE
+  challenges, OIDC session context, AWS SigV4 signing, ACME key
+  authorizations, keyed PII redaction, replay partitioning, and workload
+  attestation — run through `crate::fips::approved`, which is backed by the
+  selected module. They were migrated off the RustCrypto `sha2`/`hmac` crates
+  for exactly this reason: an approved *algorithm* computed by an unvalidated
+  *implementation* is still outside the boundary.
+- Ferrum's only stored-password representation is `hmac_sha256:<64 hex>`, an
+  approved keyed MAC. A stored hash in any other representation is refused: it
+  would be a KDF Ferrum has not classified. The unreferenced `argon2`
+  dependency was **removed** from the build rather than policy-gated, so no
+  non-approved KDF is linked at all.
+- SHA-1 remains present for two non-security uses that are documented as such:
+  the RFC 6455 `Sec-WebSocket-Accept` handshake value (a cache-poisoning guard
+  over a fixed public GUID — it carries no key and protects nothing), and
+  content-addressing digests listed in the inventory as `outside-boundary`.
+
 **Rejected configurations**
 
+- `soap_ws_security` with `rsa-sha1` signature or `sha1` digest selections:
+  SHA-1 is disallowed for signature generation and verification (SP 800-131A
+  Rev. 2). The `rsa-sha256` / `sha256` selections on the same plugin are
+  module-backed and admitted.
 - `kafka_logging`: librdkafka performs its TLS through OpenSSL, outside the
   selected module. Use `tcp_logging`, `ws_logging`, or `http_logging`, which are
   rustls-based.
@@ -152,71 +239,86 @@ discharge these:
 
 `src/fips/inventory.rs` is the machine-readable inventory: every
 security-relevant cryptographic operation, the source location that performs it,
-the implementing library, and its disposition. It is asserted by
-`tests/unit/tls/fips_inventory_tests.rs`, which fails if an entry is
-unclassified or if the rejected-plugin set drifts from the policy.
+the implementing library, and its disposition. `tests/unit/tls/fips_policy_tests.rs`
+asserts the invariants that keep it honest — every row carries a rationale, the
+rejected-plugin set agrees with the admission policy, every `rejected` row names
+the check that refuses it, and the work register is empty.
 
-Dispositions are `module-backed`, `rejected` (refused by the admission policy),
-and `outside-boundary` (not a claim Ferrum makes — see above).
+Dispositions:
 
-## Residual work before the module can ship
+- **`module-routable`** — the operation resolves its implementation through
+  Ferrum's provider seam (`fips::base_crypto_provider`, `fips::backend`,
+  `fips::approved`) or through a dependency backend the `crypto-ring` / `fips`
+  feature pair selects. On a FIPS build it reaches the validated module.
+- **`rejected`** — cannot reach the module; `src/fips/policy.rs` refuses the
+  configuration that would perform it, before serving.
+- **`outside-boundary`** — not a security claim Ferrum makes. Either the
+  operation is not a security service (a protocol handshake token, a cache key,
+  a change-detection digest, scheduling jitter), or the cryptography is performed
+  by a separately validated component the operator supplies (an HSM behind
+  PKCS#11, a remote KMS).
+- **`pending-classification`** — security-relevant and *not* routed. **This set
+  must be empty**, and a test fails if it is not. The variant exists so a newly
+  discovered surface has an honest place to land while it is being routed or
+  rejected, never as a standing residual-work list.
 
-These are the concrete, known blockers. None is a design question; all are
-mechanical but individually verifiable work.
+A note on the last two, because the distinction is the whole point of the table:
+33 source modules still use RustCrypto `sha2` for cache keys, deduplication keys,
+ETags, configuration-drift digests, xDS nonces, and spec-codec identities. Those
+are recorded as `outside-boundary` with that rationale, not relabelled approved.
+They carry no key, protect no secret, and authenticate nothing — forging one
+causes a cache or rebuild decision, not an authentication or confidentiality
+failure. The digests and MACs that *do* back a security control were migrated to
+`crate::fips::approved` instead.
 
-1. **Dependency-feature contract.** The crypto backend must become a pair of
-   mutually exclusive cargo features (`crypto-ring`, default, and `fips`) rather
-   than a set of unconditional dependency features. Cargo features are additive,
-   and `sqlx-core`, `quinn-proto`, and `tonic` each gate their aws-lc arm on
-   `not(ring)` — so additively "also enabling aws-lc" leaves the non-validated
-   implementation in charge while *looking* switched. The verified mapping is:
+## Self-test and key-management assumptions
 
-   | Dependency | `crypto-ring` | `fips` |
-   |---|---|---|
-   | `rustls` | `ring` | `fips` |
-   | `tonic` | `tls-ring` | `tls-aws-lc` |
-   | `quinn` | `rustls-ring` | `rustls-aws-lc-rs-fips` |
-   | `sqlx` | `tls-rustls-ring` | `tls-rustls-aws-lc-rs` |
-   | `ldap3` | `tls-rustls-ring` | `tls-rustls-aws-lc-rs` |
-   | `jsonwebtoken` | `rust_crypto` | `aws_lc_rs` |
-   | `rcgen` | `ring` | `fips` |
-   | `x509-parser` | `verify` | `verify-aws` |
-   | `hyper-rustls` (acme) | `ring` | `fips` |
-   | `instant-acme` (acme) | `ring` | `fips` |
-   | `ring` / `aws-lc-rs` | `dep:ring` | `dep:aws-lc-rs` + `aws-lc-rs/fips` |
+**Power-on self-tests.** AWS-LC-FIPS runs its integrity check and known-answer
+tests when the module initializes. Ferrum asks the module itself
+(`aws_lc_rs::try_fips_mode()`) during bootstrap, before installing the provider
+and before any TLS material is parsed. A module that does not report approved-mode
+operation is a startup failure, not a warning: Ferrum will not serve or publish
+configuration behind a module that failed its own tests. The result is reported
+as `module_self_test_passed` on the authenticated status surface.
 
-   `reqwest` 0.13's `rustls` feature is already aws-lc-rs backed, and `dimpl`
-   (DTLS) already selects `aws-lc-rs`, so both follow feature unification.
+Ferrum does **not** re-implement or re-run the module's self-tests. On-demand
+and conditional self-tests are the module's own behaviour.
 
-2. **RustCrypto hash/MAC surface.** 47 source files import `sha2`/`hmac`
-   directly. Most are non-security uses (cache keys, dedup keys, fingerprints),
-   but `hmac_auth`, `basic_auth`, `dpop`, `mtls_auth`, `oidc_relying_party`, and
-   `ai_transcript_audit` are security-relevant and must move onto the module or
-   be classified and rejected. This is the largest remaining item and it is not
-   mechanical: RustCrypto's streaming `Digest` API and the module's one-shot API
-   differ.
+**Entropy.** The module supplies the DRBG. Its seeding is part of the module's
+validated behaviour and depends on the operating environment; a container with a
+constrained or virtualized entropy source is an operating-environment concern the
+operator must satisfy, not something the gateway can compensate for.
 
-3. **Inline `#[cfg(test)]` provider construction.** Several source modules build
-   `rustls::crypto::ring` providers inside inline test modules. They must move
-   onto `crate::fips::base_crypto_provider()` before `cargo test --features fips`
-   can compile.
+**Key management is entirely the operator's.** Ferrum stores no long-term keys of
+its own. Generation, storage, file permissions, rotation, escrow, and destruction
+of TLS private keys, JWT secrets, SVID material, and PKCS#11 credentials are
+outside the module and outside Ferrum. The mode enforces *algorithm and key-size
+policy* (for example the 32-byte HMAC key floor); it cannot enforce provenance.
 
-4. **Config-admission wiring.** `fips::policy::check_gateway_config` is
-   implemented and tested but is not yet called from the file-mode SIGHUP reload,
-   database poll apply, CP publication, or DP snapshot/delta apply paths. Until
-   it is, gateway-document policy is enforced at `validate` and startup only.
+## Deliberately unsupported in FIPS mode
 
-5. **Hosted CI.** A `--no-default-features --features fips` build job (AWS-LC-FIPS
-   needs cmake and Go, and is slow) plus the FIPS-profile test subset.
+Each of these is refused before serving, with an actionable diagnostic, rather
+than being allowed to run outside the boundary:
 
-6. **`deny.toml` / dependency policy.** `[graph] all-features = true` means
-   cargo-deny will resolve `aws-lc-fips-sys`; that must be reviewed and the
-   dependency-policy inventory updated.
+| Capability | Why | Alternative |
+|---|---|---|
+| `kafka_logging` | librdkafka performs TLS through OpenSSL, which Ferrum cannot route onto the module | `tcp_logging`, `ws_logging`, `http_logging` (all rustls-based) |
+| MongoDB config store with TLS | the driver pins its own non-validated rustls provider in its manifest | a SQL config store, file mode, or CP/DP distribution |
+| `soap_ws_security` `rsa-sha1` / `sha1` | SHA-1 is disallowed for signatures (SP 800-131A Rev. 2) | `rsa-sha256` / `sha256` |
+| `EdDSA` JWTs | approved by FIPS 186-5, but not in the algorithm set Ferrum routes through the selected module | ES256/384/512, RS/PS256/384/512, HS256/384/512 |
+| ChaCha20-Poly1305, X25519 | not an approved AEAD / not an approved SP 800-56A scheme | AES-GCM suites, secp256r1 / secp384r1 |
+| `FERRUM_TLS_NO_VERIFY=true` | an unauthenticated peer defeats the approved key exchange | pin the backend CA |
+
+External secret providers (Vault, AWS, Azure, GCP) are **outside the boundary
+rather than refused**: their SDK TLS stacks are not routed through Ferrum's
+provider, but secrets resolve once at startup before the gateway serves, and the
+remote KMS/HSM carries its own validation. This is an operator control, recorded
+in the inventory as `outside-boundary`, not a Ferrum claim.
 
 ## Verifying a deployment
 
-Once the module ships, an operator confirms the runtime posture through the
-**authenticated** detail tier of `/health` or `/status`:
+An operator confirms the runtime posture through the **authenticated** detail
+tier of `/health` or `/status`:
 
 ```json
 {
@@ -224,6 +326,7 @@ Once the module ships, an operator confirms the runtime posture through the
     "mode": "enforce",
     "enforcing": true,
     "build_capable": true,
+    "build_profile": "fips",
     "provider": "aws-lc-fips",
     "module_self_test_passed": true,
     "provider_algorithms_approved": true,
@@ -238,7 +341,38 @@ cannot read `enforcing: true` as "certified". This object is never exposed on th
 unauthenticated coarse tier (`/live`, or `/health` without credentials), which
 continues to return only `status` and `ready`.
 
-The gateway's report is necessary but not sufficient evidence. Deployment
-compliance requires the exact validated module, build, operating environment, and
-operational controls enumerated in §"The module boundary", established and
-recorded by the operator.
+`build_profile` is the field to compare against the artifact you intended to
+deploy: it is `fips` only when the binary was compiled
+`--no-default-features --features fips`.
+
+A build that reports `enforcing: true` has already passed, at startup:
+
+1. the build-capability gate (`BUILD_CAPABLE`),
+2. the module's own power-on self-test,
+3. rustls's classification of the installed provider as FIPS-approved, and
+4. the whole admission policy over the resolved environment and the loaded
+   gateway document.
+
+Any one of those failing is a startup refusal, so a serving gateway reporting
+`enforcing: true` is evidence that all four held — not merely that the operator
+asked for them.
+
+To verify the *build* independently of the running process:
+
+```bash
+# The resolved feature graph must carry aws-lc-rs/fips and rustls/fips, and no
+# ring arm. This is the same audit CI runs.
+cargo tree -e features --no-dev-deps --no-default-features --features fips \
+  > /tmp/tree-fips.txt
+python3 .github/scripts/check_fips_feature_policy.py \
+  --tree /tmp/tree-fips.txt --profile fips
+```
+
+The gateway's report and the build audit are both necessary and neither is
+sufficient. Deployment compliance additionally requires the exact validated
+module version and certificate, a reproducible build, an operating environment
+on the certificate's tested-platform list, and the operational controls
+enumerated in §"The module boundary" — established and recorded by the operator.
+
+**Ferrum Edge makes no certification claim of its own, and `certified` will
+remain `false` on every build.**

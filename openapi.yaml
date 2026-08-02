@@ -10905,6 +10905,7 @@ components:
               mode,
               enforcing,
               build_capable,
+              build_profile,
               provider,
               module_self_test_passed,
               provider_algorithms_approved,
@@ -10926,6 +10927,14 @@ components:
                 Whether this binary links the validated cryptographic module.
                 When `false`, a `FERRUM_FIPS_MODE=enforce` request fails closed
                 at startup rather than downgrading to a non-validated provider.
+            build_profile:
+              type: string
+              enum: [crypto-ring, fips]
+              description: |
+                The mutually exclusive cargo feature this binary was built with.
+                `crypto-ring` is the ordinary, non-FIPS build; `fips` links the
+                validated AWS-LC-FIPS module. This is the field an operator
+                compares against the artifact they intended to deploy.
             provider:
               type: string
               enum: [ring, aws-lc-fips]

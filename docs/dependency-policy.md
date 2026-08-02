@@ -406,8 +406,63 @@ Never refresh a checksum by copying a digest from an unpinned adjacent path
 without official release provenance, and never pipe a remote install script to
 a shell as a shortcut.
 
+## FIPS build profile
+
+Ferrum ships two mutually exclusive cryptographic-backend cargo features
+(issue #3510). Exactly one must be selected; both or neither is a
+`compile_error!` in `src/fips/mod.rs`.
+
+| Feature | Backend | Lockfile |
+|---|---|---|
+| `crypto-ring` (default) | `ring` + `rustls/ring` | the committed `Cargo.lock` |
+| `fips` | `aws-lc-fips-sys` via `aws-lc-rs/fips` and `rustls/fips` | resolved at build time |
+
+Rules:
+
+- **The backend is never selected inline on a dependency.** `rustls`, `tonic`,
+  `sqlx`, `ldap3`, `quinn`, `rcgen`, `x509-parser`, `jsonwebtoken`,
+  `hyper-rustls`, and `instant-acme` all take their crypto arm from the feature
+  pair. An inline selection would win on both profiles.
+  `quinn` and `rcgen` additionally carry `default-features = false`, because
+  their default sets select ring.
+- **Additive is not sufficient.** `sqlx-core`, `quinn-proto`, `tonic`, `ldap3`,
+  and `hyper-rustls` each gate their aws-lc arm on the *absence* of their ring
+  arm, so "also enable aws-lc" produces a build that looks switched and is not.
+  This is the whole reason the features are exclusive rather than layered.
+- **The declared contract is not the audited one.**
+  `.github/scripts/check_fips_feature_policy.py` reads what cargo actually
+  resolved (`cargo tree -e features --no-dev-deps`) for *both* profiles and
+  fails on any surviving ring selection in the FIPS graph. It runs in the
+  required `FIPS Feature Policy` job of `.github/workflows/fips-build.yml`.
+  `--no-dev-deps` is load-bearing: test fixtures pin `ring` and `rustls/ring` as
+  dev-dependencies so the suite compiles under both profiles, and a
+  dev-dependency is never linked into a shipped binary.
+- **The FIPS profile is not in the committed `Cargo.lock`.** Adding
+  `aws-lc-fips-sys` to the ordinary lockfile would put a non-validated build's
+  supply chain on every developer and every release artifact for no benefit.
+  The FIPS CI job therefore builds without `--locked` and restores the committed
+  lock before re-verifying that the ordinary profile still resolves against it.
+  A FIPS *release* pins its own lockfile as a deployment artifact — see
+  `docs/fips.md`.
+- **`aws-lc-sys` may still be compiled next to `aws-lc-fips-sys`.** `dimpl` and
+  rustls's `aws_lc_rs` arm request it unconditionally. `aws-lc-rs` binds
+  `aws-lc-fips-sys` whenever its `fips` feature is on, so the validated module
+  is what the API reaches; the policy check asserts the `fips` selection rather
+  than the absence of the non-FIPS sys crate.
+- **A new TLS-consuming dependency must declare its crypto arm in the feature
+  pair** and add its ring/aws-lc selections to `REQUIRED_FEATURE_PAIRS` and
+  `FORBIDDEN_RESOLVED_FIPS` in the policy script. A dependency whose backend is
+  unselectable belongs in `src/fips/inventory.rs` as `rejected` or
+  `outside-boundary`, with a matching admission rule in `src/fips/policy.rs`.
+
+`aws-lc-fips-sys` compiles the FIPS build of AWS-LC from source under a fixed
+recipe (CMake + Go + Perl). That recipe is part of what the module's validation
+covers, so it must not be replaced with a prebuilt artifact.
+
 ## See also
 
+- `docs/fips.md` — the FIPS deployment mode, module boundary, and operator
+  verification procedure.
 - `docs/vendored-patch-lifecycle.json` — machine-readable owner/upstream/retirement
   inventory enforced by `scripts/check_vendored_patch_lifecycle.py`.
 - `deny.toml` — the gate configuration and current exceptions.

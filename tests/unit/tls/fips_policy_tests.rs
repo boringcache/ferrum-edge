@@ -1,15 +1,20 @@
 //! FIPS deployment-mode surface and fail-closed admission policy (issue #3510).
 //!
 //! These target the `_enforced` policy entry points rather than the gated
-//! wrappers. `crate::fips::BUILD_CAPABLE` is `false` in this build, so
-//! enforcement can never be established at runtime and the gated wrappers would
-//! short-circuit to `Ok(())` — testing through them would assert nothing. The
-//! wrappers' own gate is covered by
+//! wrappers. Enforcement is established only by `install_crypto_provider`
+//! during process bootstrap, which an external test binary never runs, so the
+//! gated wrappers short-circuit to `Ok(())` here and testing through them would
+//! assert nothing. The wrappers' own gate is covered by
 //! `fips_policy_is_inert_when_mode_is_off`.
+//!
+//! Assertions that depend on which cryptographic backend this build linked are
+//! `cfg`-gated on the `fips` feature, so the same file is meaningful under both
+//! `--features crypto-ring` (the default) and
+//! `--no-default-features --features fips` (the hosted FIPS lane).
 
 use chrono::Utc;
 use ferrum_edge::config::env_config::EnvConfig;
-use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
+use ferrum_edge::config::types::{Consumer, GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::fips;
 use ferrum_edge::fips::policy;
 use serde_json::json;
@@ -25,6 +30,21 @@ fn plugin(name: &str, config: serde_json::Value) -> PluginConfig {
         enabled: true,
         priority_override: None,
         api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn consumer_with(basic_auth: serde_json::Value) -> Consumer {
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert("basic_auth".to_string(), basic_auth);
+    Consumer {
+        id: "consumer-1".to_string(),
+        username: "alice".to_string(),
+        namespace: "ferrum".to_string(),
+        custom_id: None,
+        credentials,
+        acl_groups: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -90,16 +110,24 @@ fn mode_default_is_off() {
 // ── Fail-closed bootstrap ───────────────────────────────────────────────────
 
 #[test]
+fn build_capability_matches_the_selected_cryptographic_backend() {
+    // `BUILD_CAPABLE` must be derived from the build, never hand-set. Read it
+    // through the function form so the assertion is a runtime comparison rather
+    // than an assertion on a constant.
+    assert_eq!(
+        fips::build_capable(),
+        cfg!(feature = "fips"),
+        "build capability must follow the selected cargo feature"
+    );
+    assert_eq!(fips::build_capable(), fips::BUILD_CAPABLE);
+}
+
+#[cfg(not(feature = "fips"))]
+#[test]
 fn enforce_request_fails_closed_on_a_build_without_the_module() {
     // The load-bearing assertion of this whole feature: an enforce request on a
     // build that cannot provide a validated module must be refused, never
     // downgraded to `ring`.
-    assert!(
-        !fips::BUILD_CAPABLE,
-        "this build is expected to lack the validated-module integration; \
-         if that changed, this test and docs/fips.md must both be updated"
-    );
-
     let err = fips::verify_resolved_mode(fips::FipsMode::Enforce)
         .expect_err("enforce must fail closed without build capability");
     assert!(err.contains("aws-lc-fips"), "names the integration: {err}");
@@ -107,6 +135,51 @@ fn enforce_request_fails_closed_on_a_build_without_the_module() {
 
     // And the mode-off path stays inert.
     assert!(fips::verify_resolved_mode(fips::FipsMode::Off).is_ok());
+}
+
+#[cfg(feature = "fips")]
+#[test]
+fn late_enforce_request_is_refused_on_a_capable_build_too() {
+    // The process-default provider is installed before `ferrum.conf` is
+    // readable, so an enforce request that only appears in the settings file
+    // arrives after provider selection. Even on a capable build that is refused
+    // rather than silently applied, because the resolved mode — and therefore
+    // every policy gate keyed on it — is immutable after bootstrap.
+    let err = fips::verify_resolved_mode(fips::FipsMode::Enforce)
+        .expect_err("a settings-file-only request must not silently enable enforcement");
+    assert!(err.contains("FERRUM_FIPS_MODE"), "names the setting: {err}");
+    assert!(err.contains("docs/fips.md"), "points at the boundary doc");
+    assert!(fips::verify_resolved_mode(fips::FipsMode::Off).is_ok());
+}
+
+#[cfg(feature = "fips")]
+#[test]
+fn a_fips_build_supplies_an_approved_provider_and_passes_the_module_self_test() {
+    // On the FIPS profile the linked module must report approved-mode
+    // operation and rustls must classify the resulting provider as FIPS. If
+    // either is false the build is mislabelled, and `install_crypto_provider`
+    // would refuse to start — assert it here so the FIPS CI lane fails on the
+    // build rather than on a deployment.
+    let provider = fips::base_crypto_provider();
+    assert!(
+        provider.fips(),
+        "the fips profile's rustls provider must be FIPS-approved"
+    );
+    assert!(
+        provider.cipher_suites.iter().all(|suite| suite.fips()),
+        "every compiled cipher suite must be approved"
+    );
+    assert!(
+        provider.kx_groups.iter().all(|group| group.fips()),
+        "every compiled key-exchange group must be approved"
+    );
+    // A constructed policy over that provider must therefore pass the last gate
+    // before any listener or backend client is built.
+    fips::policy::check_tls_policy_enforced(
+        &ferrum_edge::tls::TlsPolicy::from_env_config(&EnvConfig::default())
+            .expect("default TLS policy builds"),
+    )
+    .expect("the fips profile's default TLS policy is approved");
 }
 
 #[test]
@@ -130,13 +203,34 @@ fn status_metadata_is_non_sensitive_and_denies_certification() {
     let value = fips::status_metadata();
     let object = value.as_object().expect("object");
 
-    // `certified` must be present and false on every build. A status scraper
-    // must never be able to read `enforcing` as `certified`.
+    // `certified` must be present and false on EVERY build, including the FIPS
+    // one. Ferrum Edge is not itself a validated cryptographic module and is
+    // not independently certified; a status scraper must never be able to read
+    // `enforcing` — or a FIPS build profile — as `certified`.
     assert_eq!(object.get("certified"), Some(&json!(false)));
+    // Bootstrap never ran in this test binary, so the resolved mode is off.
     assert_eq!(object.get("mode"), Some(&json!("off")));
-    assert_eq!(object.get("build_capable"), Some(&json!(false)));
-    assert_eq!(object.get("provider"), Some(&json!("ring")));
-    assert_eq!(object.get("module_self_test_passed"), Some(&json!(false)));
+    assert_eq!(object.get("enforcing"), Some(&json!(false)));
+
+    // The build-derived half must describe the build that is actually running.
+    let expected_capable = cfg!(feature = "fips");
+    assert_eq!(object.get("build_capable"), Some(&json!(expected_capable)));
+    assert_eq!(
+        object.get("build_profile"),
+        Some(&json!(if expected_capable {
+            "fips"
+        } else {
+            "crypto-ring"
+        }))
+    );
+    assert_eq!(
+        object.get("provider"),
+        Some(&json!(if expected_capable {
+            "aws-lc-fips"
+        } else {
+            "ring"
+        }))
+    );
     assert_eq!(
         object.get("boundary_documentation"),
         Some(&json!("docs/fips.md"))
@@ -162,8 +256,10 @@ fn env_policy_accepts_an_approved_default_configuration() {
 
 #[test]
 fn env_policy_rejects_a_provider_pin_this_build_does_not_provide() {
-    let mut env_config = EnvConfig::default();
-    env_config.fips_required_provider = "some-other-module".to_string();
+    let env_config = EnvConfig {
+        fips_required_provider: "some-other-module".to_string(),
+        ..EnvConfig::default()
+    };
     let err = policy::check_env_config_enforced(&env_config).expect_err("pin is rejected");
     assert!(err.contains("FERRUM_FIPS_REQUIRED_PROVIDER"));
     assert!(err.contains(fips::SUPPORTED_PROVIDER_ID));
@@ -175,8 +271,10 @@ fn env_policy_rejects_a_provider_pin_this_build_does_not_provide() {
 
 #[test]
 fn env_policy_rejects_disabled_backend_certificate_verification() {
-    let mut env_config = EnvConfig::default();
-    env_config.tls_no_verify = true;
+    let env_config = EnvConfig {
+        tls_no_verify: true,
+        ..EnvConfig::default()
+    };
     let err = policy::check_env_config_enforced(&env_config).expect_err("no-verify is rejected");
     assert!(err.contains("FERRUM_TLS_NO_VERIFY"));
 }
@@ -185,9 +283,11 @@ fn env_policy_rejects_disabled_backend_certificate_verification() {
 fn env_policy_rejects_encrypted_mongodb_config_store() {
     // The MongoDB driver pins its own non-validated rustls provider, so its
     // transport can never be routed onto Ferrum's module.
-    let mut env_config = EnvConfig::default();
-    env_config.db_type = Some("mongodb".to_string());
-    env_config.db_tls_mode = Some(ferrum_edge::config::env_config::DbTlsMode::Require);
+    let mut env_config = EnvConfig {
+        db_type: Some("mongodb".to_string()),
+        db_tls_mode: Some(ferrum_edge::config::env_config::DbTlsMode::Require),
+        ..EnvConfig::default()
+    };
     let err = policy::check_env_config_enforced(&env_config).expect_err("mongo TLS is rejected");
     assert!(err.contains("mongodb"), "{err}");
     assert!(err.contains("docs/fips.md"), "{err}");
@@ -199,8 +299,10 @@ fn env_policy_rejects_encrypted_mongodb_config_store() {
 
 #[test]
 fn env_policy_floors_hmac_key_length() {
-    let mut env_config = EnvConfig::default();
-    env_config.admin_jwt_secret = Some("short".to_string());
+    let mut env_config = EnvConfig {
+        admin_jwt_secret: Some("short".to_string()),
+        ..EnvConfig::default()
+    };
     let err = policy::check_env_config_enforced(&env_config).expect_err("short key is rejected");
     assert!(err.contains("FERRUM_ADMIN_JWT_SECRET"));
     assert!(
@@ -293,8 +395,10 @@ fn fips_policy_is_inert_when_mode_is_off() {
     // admit configurations the enforced policy refuses.
     assert!(!fips::is_enforcing());
 
-    let mut env_config = EnvConfig::default();
-    env_config.tls_no_verify = true;
+    let env_config = EnvConfig {
+        tls_no_verify: true,
+        ..EnvConfig::default()
+    };
     policy::check_env_config(&env_config).expect("gated wrapper is inert when mode is off");
 
     let config = config_with(vec![plugin("kafka_logging", json!({}))]);
@@ -353,16 +457,133 @@ fn inventory_rejected_plugins_agree_with_the_admission_policy() {
 }
 
 #[test]
-fn inventory_records_the_outstanding_module_integration_work() {
+fn inventory_work_register_is_empty() {
     use ferrum_edge::fips::inventory;
 
-    // This build does not link the validated module, so the inventory must
-    // still be carrying a non-empty work register. When the integration lands,
-    // this assertion is the thing that forces the register to be revisited
-    // rather than silently left stale.
-    assert!(!fips::BUILD_CAPABLE);
+    // `pending-classification` means "security-relevant and NOT routed through
+    // the module". A non-empty register is Ferrum claiming a FIPS deployment
+    // mode over a crypto surface it has not actually routed, which is the exact
+    // failure this module exists to prevent. Anything genuinely outside the
+    // module boundary belongs in `outside-boundary` or `rejected` with a stated
+    // rationale, not in the register.
+    let pending: Vec<&str> = inventory::pending_classification()
+        .map(|entry| entry.operation)
+        .collect();
     assert!(
-        inventory::pending_classification().count() > 0,
-        "a build without the module must not claim a fully routed crypto surface"
+        pending.is_empty(),
+        "unrouted security-relevant crypto remains: {pending:?}"
+    );
+}
+
+#[test]
+fn inventory_rejected_rows_are_all_actually_refused_by_the_policy() {
+    use ferrum_edge::fips::inventory;
+
+    // Every `rejected` row must name a check that exists. Otherwise the table
+    // is documenting a protection the gateway does not implement.
+    for entry in inventory::rejected() {
+        assert!(
+            entry.rationale.contains("fips::policy"),
+            "rejected row must name the enforcing check: {}",
+            entry.operation
+        );
+    }
+}
+
+// ── Newly classified admission rules ────────────────────────────────────────
+
+#[test]
+fn gateway_policy_rejects_sha1_xml_signature_selections() {
+    // SP 800-131A Rev. 2 disallows SHA-1 for signature generation and
+    // verification. `soap_ws_security` lets an operator admit `rsa-sha1` for
+    // XML-DSig interoperability; FIPS mode refuses the configuration rather
+    // than computing it outside the approved set.
+    let config = config_with(vec![plugin(
+        "soap_ws_security",
+        json!({
+            "x509_signature": { "allowed_algorithms": ["rsa-sha256", "rsa-sha1"] }
+        }),
+    )]);
+    let err = policy::check_gateway_config_enforced(&config).expect_err("rsa-sha1 is rejected");
+    assert!(err.contains("rsa-sha1"), "{err}");
+    assert!(err.contains("x509_signature.allowed_algorithms"), "{err}");
+
+    let approved = config_with(vec![plugin(
+        "soap_ws_security",
+        json!({
+            "x509_signature": {
+                "allowed_algorithms": ["rsa-sha256"],
+                "allowed_digest_algorithms": ["sha256"]
+            }
+        }),
+    )]);
+    policy::check_gateway_config_enforced(&approved).expect("sha256 selections are approved");
+}
+
+#[test]
+fn gateway_policy_rejects_an_unclassified_stored_password_representation() {
+    let consumer = consumer_with(json!({
+        "password_hash": "argon2id$v=19$m=65536,t=3,p=4$abc$def"
+    }));
+    let config = GatewayConfig {
+        consumers: vec![consumer],
+        ..GatewayConfig::default()
+    };
+    let err = policy::check_gateway_config_enforced(&config)
+        .expect_err("an unclassified stored hash is rejected");
+    assert!(err.contains(policy::APPROVED_PASSWORD_HASH_PREFIX), "{err}");
+    assert!(
+        !err.contains("argon2id"),
+        "the stored value must never be echoed: {err}"
+    );
+}
+
+#[test]
+fn gateway_policy_admits_the_approved_stored_password_representation() {
+    // Multi-credential rotation stores an array; both shapes are walked.
+    let consumer = consumer_with(json!([
+        { "password_hash": format!("hmac_sha256:{}", "a".repeat(64)) }
+    ]));
+    let config = GatewayConfig {
+        consumers: vec![consumer],
+        ..GatewayConfig::default()
+    };
+    policy::check_gateway_config_enforced(&config).expect("HMAC-SHA256 hashes are approved");
+}
+
+#[test]
+fn approved_primitives_agree_with_their_published_test_vectors() {
+    use ferrum_edge::fips::approved::{HmacSha256, HmacSha512, Sha256, Sha512};
+
+    // FIPS 180-4 / RFC 6234 "abc" vectors, and the RFC 4231 HMAC test case 1
+    // vector. These pin the module-backed primitives against a published
+    // answer, which is what makes the substitution for RustCrypto verifiable
+    // rather than assumed — and they run identically on both build profiles.
+    assert_eq!(
+        hex::encode(Sha256::digest(b"abc")),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(
+        &hex::encode(Sha512::digest(b"abc"))[..32],
+        "ddaf35a193617abacc417349ae204131"
+    );
+
+    let mut incremental = Sha256::new();
+    incremental.update(b"a");
+    incremental.update(b"bc");
+    assert_eq!(incremental.finalize(), Sha256::digest(b"abc"));
+
+    let mut mac = HmacSha256::new_from_slice(&[0x0b; 20]).expect("any key length is accepted");
+    mac.update(b"Hi There");
+    assert_eq!(
+        hex::encode(mac.finalize().into_bytes()),
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+    );
+
+    let mut mac512 = HmacSha512::new_from_slice(&[0x0b; 20]).expect("any key length is accepted");
+    mac512.update(b"Hi There");
+    assert_eq!(
+        &hex::encode(mac512.finalize().into_bytes())[..32],
+        "87aa7cdea5ef619d4ff0b4241a1d6cb0"
     );
 }

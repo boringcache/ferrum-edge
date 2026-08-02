@@ -54,10 +54,9 @@
 //! Nothing here is ever logged. The returned values are opaque digests; the
 //! inputs are credentials, identities, and addresses.
 
+use crate::fips::approved::Sha256;
 use std::collections::HashMap;
 use std::net::IpAddr;
-
-use sha2::{Digest, Sha256};
 
 use crate::plugins::RequestContext;
 use crate::util::body_limit::{ContentLength, parse_content_length};

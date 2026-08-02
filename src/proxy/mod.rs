@@ -9121,6 +9121,19 @@ impl ProxyState {
         // fully BEFORE swap" guard must live inside the swap function so a
         // future caller (e.g. an admin "import config" handler) cannot
         // publish an invalid config to the hot path.
+        // FIPS gateway-document admission (issue #3510).
+        //
+        // This is the common swap boundary for file-mode SIGHUP reload,
+        // database poll application, and DP snapshot/delta application, so
+        // gating here means a document that could not start the gateway also
+        // cannot be hot-loaded into it. Rejection returns before any cache is
+        // rebuilt or swapped, so the last known-good config stays published.
+        // The check is inert when FIPS mode is off.
+        if let Err(error) = crate::fips::policy::check_gateway_config(&new_config) {
+            error!("Config reload rejected — FIPS policy: {}", error);
+            return ConfigApplyOutcome::rejected_one(format!("FIPS policy: {error}"));
+        }
+
         if let Err(errors) = self.validate_full_config_with_mesh_ids(&new_config, trusted_mesh_ids)
         {
             for msg in &errors {

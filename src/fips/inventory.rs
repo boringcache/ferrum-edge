@@ -8,24 +8,30 @@
 //!
 //! This exists because "uses a FIPS-capable library" is not evidence of
 //! coverage — so note the precise meaning of [`Disposition::ModuleRoutable`]:
-//! the operation resolves its implementation through Ferrum's single provider
-//! seam ([`crate::fips::base_crypto_provider`] / [`crate::fips::backend`]),
-//! through a dependency crypto backend selected at build time, or through the
-//! process-default rustls provider that
-//! [`crate::fips::install_crypto_provider`] installed. It therefore *will*
-//! reach the validated module on a build that links one. It does **not** assert
-//! that it reaches one today: [`crate::fips::BUILD_CAPABLE`] is `false` in this
-//! build, so every routable entry currently resolves to `ring`.
+//! the operation resolves its implementation through Ferrum's provider seam
+//! ([`crate::fips::base_crypto_provider`], [`crate::fips::backend`],
+//! [`crate::fips::approved`]), through a dependency crypto backend the
+//! mutually exclusive `crypto-ring` / `fips` cargo-feature pair selects, or
+//! through the process-default rustls provider that
+//! [`crate::fips::install_crypto_provider`] installed. On a build where
+//! [`crate::fips::BUILD_CAPABLE`] is `true` it therefore reaches the validated
+//! module; on an ordinary build it reaches `ring`, and the mode refuses to
+//! enforce.
 //!
 //! The other dispositions are the honest remainder:
-//! [`Disposition::PendingClassification`] (security-relevant, not yet routed
-//! through the seam — the work register), [`Disposition::Rejected`] (refused by
-//! [`crate::fips::policy`]), and [`Disposition::OutsideBoundary`] (not
-//! cryptography Ferrum is claiming, and documented as such).
+//! [`Disposition::PendingClassification`] (security-relevant, not yet routed —
+//! the variant is retained so a newly discovered surface has somewhere honest
+//! to land, and `pending_classification()` must be **empty** on a build that
+//! claims a complete surface), [`Disposition::Rejected`] (refused by
+//! [`crate::fips::policy`] before serving), and
+//! [`Disposition::OutsideBoundary`] (not cryptography Ferrum is claiming, and
+//! documented as such — either not a security service, or performed by a
+//! separately validated component the operator supplies).
 //!
-//! `tests/unit/tls/fips_inventory_tests.rs` asserts the invariants that keep
-//! this table honest: every entry carries a non-empty rationale, and the set of
-//! rejected plugins agrees with [`crate::fips::policy::NON_APPROVED_PLUGINS`].
+//! `tests/unit/tls/fips_policy_tests.rs` asserts the invariants that keep this
+//! table honest: every entry carries a non-empty rationale, the set of rejected
+//! plugins agrees with [`crate::fips::policy::NON_APPROVED_PLUGINS`], and the
+//! work register is empty.
 
 /// How one cryptographic operation behaves under FIPS mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,10 +122,11 @@ pub const INVENTORY: &[CryptoOperation] = &[
         location: "src/http3/server.rs",
         implementation: "quinn, quinn-proto, rustls",
         disposition: Disposition::ModuleRoutable,
-        rationale: "quinn derives initial keys from the supplied rustls config's own provider, \
-                    which is fips::base_crypto_provider(); the TLS 1.3 suite fallback now also \
-                    resolves against that provider. Selecting quinn's rustls-aws-lc-rs-fips \
-                    backend is docs/fips.md residual item 1",
+        rationale: "quinn is declared with default-features = false so its default `rustls-ring` \
+                    arm is never compiled; the `fips` feature selects quinn/rustls-aws-lc-rs-fips. \
+                    Initial keys come from the supplied rustls config's own provider \
+                    (fips::base_crypto_provider()), and the TLS 1.3 suite fallback resolves \
+                    against that same provider",
     },
     CryptoOperation {
         operation: "HTTP/3 backend (client) QUIC handshake",
@@ -150,17 +157,18 @@ pub const INVENTORY: &[CryptoOperation] = &[
         location: "src/grpc/cp_server.rs, src/grpc/dp_client.rs",
         implementation: "tonic, tokio-rustls",
         disposition: Disposition::ModuleRoutable,
-        rationale: "tonic resolves CryptoProvider::get_default() first, which \
-                    fips::install_crypto_provider() sets. Selecting tonic/tls-aws-lc so no ring \
-                    fallback arm is compiled is docs/fips.md residual item 1",
+        rationale: "the `fips` feature selects tonic/tls-aws-lc and excludes tonic/tls-ring, so no \
+                    ring arm is compiled; tonic also resolves CryptoProvider::get_default() first, \
+                    which fips::install_crypto_provider() sets",
     },
     CryptoOperation {
         operation: "CP/DP gRPC bearer-token HS256 signing and verification",
         location: "src/grpc/auth.rs",
-        implementation: "jsonwebtoken (rust_crypto backend)",
-        disposition: Disposition::PendingClassification,
-        rationale: "requires jsonwebtoken/aws_lc_rs; docs/fips.md residual item 1. Key length is \
-                    already floored by fips::policy::check_env_config",
+        implementation: "jsonwebtoken (aws_lc_rs backend on a fips build)",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "the `fips` cargo feature selects jsonwebtoken/aws_lc_rs and excludes \
+                    jsonwebtoken/rust_crypto, so HS256 runs in the module. Key length is floored \
+                    by fips::policy::check_env_config",
     },
     // ── DTLS ────────────────────────────────────────────────────────────
     CryptoOperation {
@@ -184,9 +192,10 @@ pub const INVENTORY: &[CryptoOperation] = &[
         operation: "SQL config-database TLS (postgres, mysql, sqlite)",
         location: "src/config/db_backend.rs",
         implementation: "sqlx, rustls",
-        disposition: Disposition::PendingClassification,
-        rationale: "sqlx-core prefers ring whenever its ring feature is compiled, so this needs \
-                    the mutually exclusive crypto-ring/fips split; docs/fips.md residual item 1",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "the `fips` feature selects sqlx/tls-rustls-aws-lc-rs and the `crypto-ring` \
+                    feature that would otherwise keep sqlx-core on ring is mutually exclusive \
+                    with it",
     },
     CryptoOperation {
         operation: "MongoDB config-database TLS",
@@ -200,42 +209,44 @@ pub const INVENTORY: &[CryptoOperation] = &[
     CryptoOperation {
         operation: "Admin API JWT verification",
         location: "src/admin/jwt_auth.rs",
-        implementation: "jsonwebtoken (rust_crypto backend)",
-        disposition: Disposition::PendingClassification,
-        rationale: "requires jsonwebtoken/aws_lc_rs; docs/fips.md residual item 1",
+        implementation: "jsonwebtoken (aws_lc_rs backend on a fips build)",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "the `fips` cargo feature selects jsonwebtoken/aws_lc_rs",
     },
     CryptoOperation {
         operation: "Request-path JWT and JWKS verification (plugins)",
         location: "src/plugins/jwt_auth.rs, src/plugins/jwks_auth.rs",
-        implementation: "jsonwebtoken (rust_crypto backend)",
-        disposition: Disposition::PendingClassification,
-        rationale: "algorithms are already screened against \
-                    fips::policy::APPROVED_JWT_ALGORITHMS at config admission; the implementation \
-                    still needs jsonwebtoken/aws_lc_rs (docs/fips.md residual item 1)",
+        implementation: "jsonwebtoken (aws_lc_rs backend on a fips build)",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "algorithms are screened against fips::policy::APPROVED_JWT_ALGORITHMS at \
+                    config admission and the implementation is selected by the `fips` feature",
     },
     // ── Hash / MAC / randomness ─────────────────────────────────────────
     CryptoOperation {
         operation: "HMAC-SHA256/512 request authentication",
         location: "src/plugins/hmac_auth.rs",
-        implementation: "RustCrypto hmac + sha2 (not routed through the seam)",
-        disposition: Disposition::PendingClassification,
-        rationale: "must move onto the module or be rejected; docs/fips.md residual item 2",
+        implementation: "crate::fips::approved (module-backed HMAC-SHA-256/512)",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "migrated off RustCrypto hmac/sha2 onto fips::approved; the request body digest \
+                    (`Digest`/`Content-Digest`) uses the same module-backed SHA-2",
     },
     CryptoOperation {
-        operation: "Password verification (basic auth, LDAP bind caching)",
+        operation: "Password verification (basic auth) and LDAP bind-cache keying",
         location: "src/plugins/basic_auth.rs, src/plugins/ldap_auth.rs",
-        implementation: "argon2, RustCrypto sha2",
-        disposition: Disposition::PendingClassification,
-        rationale: "Argon2 is not an SP 800-132 approved KDF; must be classified and either \
-                    rejected or replaced with PBKDF2 in FIPS mode; docs/fips.md residual item 2",
+        implementation: "crate::fips::approved (module-backed HMAC-SHA-256)",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "Ferrum's only stored-password representation is `hmac_sha256:<hex>`, an \
+                    approved keyed MAC, now computed by the module. The unreferenced `argon2` \
+                    dependency was removed rather than policy-gated, so no non-approved KDF is \
+                    linked; fips::policy additionally refuses any unclassified stored-hash form",
     },
     CryptoOperation {
         operation: "DPoP proof and client-certificate thumbprints",
         location: "src/plugins/utils/dpop.rs, src/plugins/utils/cert_hash.rs, \
                    src/plugins/mtls_auth.rs",
-        implementation: "RustCrypto sha2",
-        disposition: Disposition::PendingClassification,
-        rationale: "security-relevant digests; docs/fips.md residual item 2",
+        implementation: "crate::fips::approved (module-backed SHA-256)",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "migrated off RustCrypto sha2 onto fips::approved",
     },
     CryptoOperation {
         operation: "HMAC-SHA256 frame-log redaction keying",
@@ -267,22 +278,22 @@ pub const INVENTORY: &[CryptoOperation] = &[
         implementation: "x509-parser, rustls-webpki",
         disposition: Disposition::ModuleRoutable,
         rationale: "chain-building signature verification runs in the rustls provider; structural \
-                    DER parsing performs no cryptography. x509-parser's own `verify` feature \
-                    needs the `verify-aws` counterpart (docs/fips.md residual item 1)",
+                    DER parsing performs no cryptography",
     },
     CryptoOperation {
         operation: "Certificate and CSR generation (internal CA, dev bootstrap)",
         location: "src/identity/ca/internal.rs, src/identity/ca/bootstrap.rs",
         implementation: "rcgen",
-        disposition: Disposition::PendingClassification,
-        rationale: "requires rcgen/fips; docs/fips.md residual item 1",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "the `fips` feature selects rcgen/fips and excludes rcgen/ring",
     },
     CryptoOperation {
         operation: "ACME (RFC 8555) account keys, CSR signing, directory TLS",
         location: "src/tls/acme.rs",
-        implementation: "instant-acme, hyper-rustls, rcgen",
-        disposition: Disposition::PendingClassification,
-        rationale: "requires instant-acme/fips and hyper-rustls/fips; docs/fips.md residual item 1",
+        implementation: "instant-acme, hyper-rustls, rcgen, crate::fips::approved",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "the `fips` feature selects instant-acme/fips and hyper-rustls/fips; the \
+                    key-authorization digest is module-backed SHA-256",
     },
     // ── PKCS#11 ─────────────────────────────────────────────────────────
     CryptoOperation {
@@ -315,6 +326,42 @@ pub const INVENTORY: &[CryptoOperation] = &[
     },
     // ── Not a security service ──────────────────────────────────────────
     CryptoOperation {
+        operation: "Non-security SHA-256 digests (cache keys, deduplication \
+                    keys, ETags, config/policy drift digests, xDS nonces, spec \
+                    codec identities, statsd/chargeback row identities)",
+        location: "src/plugins/response_caching.rs, src/plugins/request_deduplication.rs, \
+                   src/plugins/utils/policy_digest.rs, src/xds/, src/admin/spec_codec.rs, \
+                   src/tls/inventory.rs, src/tls/events.rs (33 modules)",
+        implementation: "RustCrypto sha2",
+        disposition: Disposition::OutsideBoundary,
+        rationale: "these digests carry no key, protect no secret, and authenticate nothing: they \
+                    are content-addressing and change-detection identities over data that was \
+                    already admitted and, where applicable, already cryptographically verified. \
+                    Forging one causes a cache or rebuild decision, not an authentication or \
+                    confidentiality failure, so relabelling them approved would be the exact \
+                    'uses a FIPS-capable library' claim this table exists to refuse. The \
+                    security-relevant digests and MACs were migrated to crate::fips::approved \
+                    instead",
+    },
+    CryptoOperation {
+        operation: "X.509 / PKCS#10 signature verification helper (proof-of-possession)",
+        location: "src/identity/ca/",
+        implementation: "x509-parser",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "the `fips` feature selects x509-parser/verify-aws (aws-lc-rs) and excludes \
+                    x509-parser/verify (ring); both gate the same public API",
+    },
+    CryptoOperation {
+        operation: "SOAP WS-Security XML-DSig with rsa-sha1 / sha1 selections",
+        location: "src/plugins/soap_ws_security.rs",
+        implementation: "crate::fips::backend signature + digest",
+        disposition: Disposition::Rejected,
+        rationale: "SHA-1 is disallowed for signature generation and verification (SP 800-131A \
+                    Rev. 2); fips::policy::NON_APPROVED_ALGORITHM_SELECTIONS refuses the \
+                    configuration at admission. The rsa-sha256 / sha256 selections on the same \
+                    plugin are module-routed through crate::fips::backend",
+    },
+    CryptoOperation {
         operation: "WebSocket Sec-WebSocket-Accept SHA-1 digest",
         location: "vendor/tungstenite (RFC 6455 handshake)",
         implementation: "sha1",
@@ -333,8 +380,11 @@ pub fn rejected() -> impl Iterator<Item = &'static CryptoOperation> {
 
 /// Rows that are security-relevant but not yet routed through the seam.
 ///
-/// This is the work register for `docs/fips.md` §"Residual work"; it is
-/// deliberately queryable so a test can assert the list has not silently grown.
+/// This must be **empty**. It is queryable precisely so a test can assert that:
+/// a non-empty register means Ferrum is claiming a crypto surface it has not
+/// actually routed, which is the failure mode this whole module exists to
+/// prevent. The variant is retained so a newly discovered surface has an honest
+/// place to land while it is being routed or rejected.
 pub fn pending_classification() -> impl Iterator<Item = &'static CryptoOperation> {
     INVENTORY
         .iter()

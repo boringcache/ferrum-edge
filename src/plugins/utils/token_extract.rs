@@ -1,5 +1,5 @@
+use crate::fips::approved::Sha256;
 use crate::plugins::RequestContext;
-use sha2::{Digest, Sha256};
 
 use super::auth_attempt::AuthenticationAttempt;
 use super::auth_flow::ExtractedCredential;

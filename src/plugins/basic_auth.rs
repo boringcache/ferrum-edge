@@ -10,9 +10,8 @@
 
 use async_trait::async_trait;
 use base64::Engine;
-use hmac::{Hmac, KeyInit, Mac};
+use crate::fips::approved::HmacSha256;
 use serde_json::Value;
-use sha2::Sha256;
 use tracing::{debug, warn};
 
 use crate::consumer_index::ConsumerIndex;
@@ -21,8 +20,6 @@ use super::utils::auth_flow::{
     self, AuthMechanism, ExtractedCredential, VerifyOutcome, constant_time_eq,
 };
 use super::{RequestContext, strip_auth_scheme};
-
-type HmacSha256 = Hmac<Sha256>;
 
 // A canonical stored Basic hash alone consumes this many serialized bytes,
 // before its JSON field/object/array overhead. Capping dummy work by the total

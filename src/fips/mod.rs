@@ -19,31 +19,45 @@
 //!    [`kx_group`] — through which every Ferrum-owned cryptographic
 //!    construction now resolves its implementation.
 //!
-//! **The validated-module integration itself is not in this build.**
-//! [`BUILD_CAPABLE`] is `false`, so `FERRUM_FIPS_MODE=enforce` always fails
-//! closed with [`BootstrapError::BuildNotCapable`]. That is the correct
-//! behaviour for a binary that cannot back the claim, and it is deliberately
-//! not silently degraded into "run anyway with `ring`".
+//! # Build profiles
 //!
-//! `docs/fips.md` records the selected integration (`aws-lc-fips`, the FIPS
-//! build of AWS-LC consumed through `aws-lc-rs` and `rustls`), the exact
-//! dependency-feature contract it requires, the module boundary, the operating
-//! environment assumptions, and the residual work — including the RustCrypto
-//! `sha2`/`hmac` surface that must move onto the module before any deployment
-//! claim is possible. [`inventory`] is the machine-readable half of that
+//! The backend is selected by a **mutually exclusive** cargo-feature pair
+//! declared in `Cargo.toml`:
+//!
+//! | Feature | Backend | [`BUILD_CAPABLE`] |
+//! |---|---|---|
+//! | `crypto-ring` (default) | `ring` / `rustls/ring` | `false` |
+//! | `fips` | `aws-lc-fips-sys` via `aws-lc-rs/fips` and `rustls/fips` | `true` |
+//!
+//! Selecting both or neither is a compile error, because "additively enable
+//! aws-lc" is precisely the mistake that produces a build which *looks*
+//! switched while `sqlx-core`, `quinn-proto`, `tonic`, `ldap3`, and
+//! `hyper-rustls` still route through their ring arm. Every one of those crates
+//! gates its aws-lc arm on the absence of its ring arm.
+//!
+//! On a `crypto-ring` build, `FERRUM_FIPS_MODE=enforce` fails closed with
+//! [`BootstrapError::BuildNotCapable`] rather than degrading into "run anyway
+//! with `ring`". On a `fips` build, enforcement additionally requires the
+//! module's power-on self-test (`aws_lc_rs::try_fips_mode`) and rustls's own
+//! classification of the installed provider; either failing is also fail-closed.
+//!
+//! `docs/fips.md` records the module boundary, the operating-environment
+//! assumptions, the operator verification procedure, and what is deliberately
+//! outside the boundary. [`inventory`] is the machine-readable half of that
 //! record.
 //!
-//! # Why the seam exists before the module does
+//! # Why the seam exists
 //!
 //! Before this module, thirteen files each named `rustls::crypto::ring`
 //! directly and three more built cipher-suite tables from
-//! provider-qualified constants. Any provider swap therefore had to be
+//! provider-qualified constants. A provider swap therefore had to be
 //! reproduced at ~55 call sites, and a single missed site would have been a
 //! silent non-validated fallback on a real traffic path — exactly the failure
 //! mode a FIPS mode exists to prevent. Collapsing them onto one function is
-//! what makes the later swap a reviewable change rather than a sprawl, and it
-//! is independently useful: provider selection is now auditable in one place.
+//! what makes the swap reviewable rather than a sprawl, and it is independently
+//! useful: provider selection is auditable in one place.
 
+pub mod approved;
 pub mod inventory;
 pub mod policy;
 
@@ -51,16 +65,43 @@ use std::sync::OnceLock;
 
 use rustls::crypto::CryptoProvider;
 
+// ── Mutual exclusion ────────────────────────────────────────────────────────
+//
+// These are the compile-time half of the contract. The resolved *feature graph*
+// is checked separately by `.github/scripts/check_fips_feature_policy.py`,
+// because a transitive edge can enable `rustls/ring` without this crate's own
+// feature list mentioning it.
+#[cfg(all(feature = "crypto-ring", feature = "fips"))]
+compile_error!(
+    "the `crypto-ring` and `fips` features are mutually exclusive: enabling both leaves the \
+     non-validated `ring` implementation compiled alongside the validated module, and several \
+     dependencies (sqlx-core, quinn-proto, tonic, ldap3, hyper-rustls) select their ring arm \
+     whenever it is present. Build with `--no-default-features --features fips` for the FIPS \
+     profile. See docs/fips.md."
+);
+
+#[cfg(not(any(feature = "crypto-ring", feature = "fips")))]
+compile_error!(
+    "exactly one cryptographic backend feature must be selected: `crypto-ring` (the default, \
+     ordinary non-FIPS build) or `fips` (the validated AWS-LC-FIPS module). See docs/fips.md."
+);
+
 /// The ring-API-compatible cryptographic backend this build links.
 ///
-/// Ferrum's non-rustls cryptography (randomness, HMAC, digests, signature
-/// verification) imports from here rather than naming a crate directly, so the
-/// implementation is one alias rather than a dozen import sites. `aws-lc-rs` is
-/// API-compatible with `ring` across these surfaces, which is what makes the
-/// alias sufficient for the eventual module swap.
-///
-/// Today this is `ring`. See the module docs for why the swap is staged.
+/// Ferrum's non-rustls cryptography (randomness, HMAC, digests, AEAD, HKDF,
+/// signature verification) imports from here rather than naming a crate
+/// directly, so the implementation is one alias rather than a dozen import
+/// sites. `aws-lc-rs` is API-compatible with `ring` across these surfaces,
+/// which is what makes the alias sufficient.
+#[cfg(all(feature = "crypto-ring", not(feature = "fips")))]
 pub use ring as backend;
+
+/// The ring-API-compatible cryptographic backend this build links.
+///
+/// On a `fips` build this is `aws-lc-rs` bound to `aws-lc-fips-sys`, so every
+/// call site that imports from here reaches the validated module.
+#[cfg(feature = "fips")]
+pub use aws_lc_rs as backend;
 
 /// Identifier of the validated-module integration Ferrum has selected.
 ///
@@ -76,11 +117,37 @@ pub const RING_PROVIDER_ID: &str = "ring";
 
 /// `true` when this build links the validated module rather than `ring`.
 ///
-/// Currently always `false`: the module integration is staged behind the
-/// dependency-feature contract in `docs/fips.md`. Every enforcement path reads
-/// this rather than assuming, so flipping it is the whole of the runtime change
-/// when the integration lands.
-pub const BUILD_CAPABLE: bool = false;
+/// Derived from the selected cargo feature, never hand-set: it is `true`
+/// exactly when `--features fips` compiled `aws-lc-rs/fips` and `rustls/fips`
+/// into this binary. Every enforcement path reads this rather than assuming.
+pub const BUILD_CAPABLE: bool = cfg!(feature = "fips");
+
+/// `true` when this build links the validated module.
+///
+/// Function form of [`BUILD_CAPABLE`] for callers — notably external tests —
+/// that need the value without embedding a compile-time constant in an
+/// assertion.
+pub fn build_capable() -> bool {
+    BUILD_CAPABLE
+}
+
+/// Run the linked module's power-on self-test / approved-mode check.
+///
+/// On a FIPS build this asks AWS-LC itself whether it is operating in its
+/// approved mode; a module whose integrity check or known-answer tests failed
+/// reports `Err` here, and Ferrum then refuses to serve. It is deliberately the
+/// module's own answer rather than a Ferrum-side inference.
+#[cfg(feature = "fips")]
+fn module_self_test() -> Result<(), &'static str> {
+    backend::try_fips_mode()
+}
+
+/// No validated module is linked on a `crypto-ring` build, so there is no
+/// self-test to have passed. A definite "no", not an optimistic default.
+#[cfg(not(feature = "fips"))]
+fn module_self_test() -> Result<(), &'static str> {
+    Err("no validated cryptographic module is linked in this build")
+}
 
 /// Requested FIPS posture.
 ///
@@ -235,8 +302,20 @@ pub fn is_enforcing() -> bool {
 /// mesh, DTLS signing, SPIFFE, plugin sinks, and the `health` subcommand —
 /// builds from this one function, so provider selection is a single auditable
 /// switch rather than fifty-odd call sites that each have to remember.
+#[cfg(all(feature = "crypto-ring", not(feature = "fips")))]
 pub fn base_crypto_provider() -> CryptoProvider {
     rustls::crypto::ring::default_provider()
+}
+
+/// Base rustls crypto provider for this build.
+///
+/// On a `fips` build, `rustls/fips` restricts this provider's suites, groups,
+/// and signature algorithms to the approved set at compile time, so
+/// `CryptoProvider::fips()` is `true` and no non-approved algorithm is
+/// reachable through it.
+#[cfg(feature = "fips")]
+pub fn base_crypto_provider() -> CryptoProvider {
+    rustls::crypto::aws_lc_rs::default_provider()
 }
 
 /// Parse a DER private key with the selected provider's key provider.
@@ -245,15 +324,35 @@ pub fn base_crypto_provider() -> CryptoProvider {
 /// borrow and therefore does not create a second owned DER allocation the
 /// caller cannot zeroize — load-bearing for `src/dtls/mod.rs`, which owns its
 /// key DER through a zeroizing wrapper.
+#[cfg(all(feature = "crypto-ring", not(feature = "fips")))]
 pub fn any_supported_signing_key(
     der: &rustls::pki_types::PrivateKeyDer<'_>,
 ) -> Result<std::sync::Arc<dyn rustls::sign::SigningKey>, rustls::Error> {
     rustls::crypto::ring::sign::any_supported_type(der)
 }
 
+/// Parse a DER private key with the selected provider's key provider.
+/// See the `crypto-ring` arm for why this takes a borrow.
+#[cfg(feature = "fips")]
+pub fn any_supported_signing_key(
+    der: &rustls::pki_types::PrivateKeyDer<'_>,
+) -> Result<std::sync::Arc<dyn rustls::sign::SigningKey>, rustls::Error> {
+    rustls::crypto::aws_lc_rs::sign::any_supported_type(der)
+}
+
 /// TLS 1.2 session-ticket encrypter/decrypter from the selected provider.
+#[cfg(all(feature = "crypto-ring", not(feature = "fips")))]
 pub fn ticketer() -> Result<std::sync::Arc<dyn rustls::server::ProducesTickets>, rustls::Error> {
     rustls::crypto::ring::Ticketer::new()
+}
+
+/// TLS 1.2 session-ticket encrypter/decrypter from the selected provider.
+///
+/// On a FIPS build the ticket key is generated by the module's approved DRBG
+/// and the ticket AEAD is an approved AES-GCM construction.
+#[cfg(feature = "fips")]
+pub fn ticketer() -> Result<std::sync::Arc<dyn rustls::server::ProducesTickets>, rustls::Error> {
+    rustls::crypto::aws_lc_rs::Ticketer::new()
 }
 
 /// Look up a cipher suite by registry identifier in the active provider.
@@ -346,6 +445,16 @@ pub fn install_crypto_provider() -> Result<FipsState, BootstrapError> {
         return Err(BootstrapError::BuildNotCapable);
     }
 
+    // The module's own answer, asked before anything is installed. On a
+    // non-FIPS build this is always `Err`, which is only consulted when an
+    // enforce request has already passed the `BUILD_CAPABLE` gate above.
+    let self_test = module_self_test();
+    if mode.is_enforcing()
+        && let Err(reason) = self_test
+    {
+        return Err(BootstrapError::SelfTestFailed(reason));
+    }
+
     let provider = base_crypto_provider();
     let provider_is_fips = provider.fips();
 
@@ -359,9 +468,7 @@ pub fn install_crypto_provider() -> Result<FipsState, BootstrapError> {
     let resolved = FipsState {
         mode,
         build_capable: BUILD_CAPABLE,
-        // No module is linked, so there is no self-test to have passed. This is
-        // a definite "no", not an optimistic default.
-        module_self_test_passed: BUILD_CAPABLE && provider_is_fips,
+        module_self_test_passed: BUILD_CAPABLE && self_test.is_ok(),
         provider_is_fips,
     };
     // `install_default` above already guarantees single execution per process;
@@ -408,6 +515,7 @@ pub fn status_metadata() -> serde_json::Value {
         "mode": state.mode().as_str(),
         "enforcing": state.is_enforcing(),
         "build_capable": state.build_capable(),
+        "build_profile": if BUILD_CAPABLE { "fips" } else { "crypto-ring" },
         "provider": state.provider_id(),
         "module_self_test_passed": state.module_self_test_passed(),
         "provider_algorithms_approved": state.provider_is_fips(),

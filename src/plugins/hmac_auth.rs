@@ -44,9 +44,8 @@
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use hmac::{Hmac, KeyInit, Mac};
+use crate::fips::approved::{HmacSha256, HmacSha512, Sha256, Sha512};
 use serde_json::Value;
-use sha2::{Digest, Sha256, Sha512};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
@@ -57,9 +56,6 @@ use super::utils::auth_flow::{
 use super::{RequestContext, strip_auth_scheme};
 use crate::config::types::Consumer;
 use crate::consumer_index::ConsumerIndex;
-
-type HmacSha256 = Hmac<Sha256>;
-type HmacSha512 = Hmac<Sha512>;
 
 const HMAC_REQUEST_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 const HMAC_SIGNING_VERSION: &str = "ferrum-hmac-v1";
@@ -931,7 +927,6 @@ mod tests {
 
     use super::HmacAuth;
     use base64::Engine as _;
-    use sha2::{Digest, Sha256, Sha512};
 
     fn sha256_digest_header(body: &[u8]) -> String {
         let mut hasher = Sha256::new();
