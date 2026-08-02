@@ -396,6 +396,13 @@ impl JwksKeyStore {
             .decode(e)
             .map_err(|e| format!("invalid base64url in 'e': {}", e))?;
 
+        // Approved RSA strength, when FIPS mode is enforced. A JWKS is fetched
+        // from an operator-configured issuer, so a weak signing key admitted
+        // here would make that issuer's compromise Ferrum's authentication
+        // failure. Only the public modulus is inspected, and the diagnostic
+        // reports its bit length and nothing else.
+        crate::fips::keys::check_jwk_rsa_modulus(&n_bytes)?;
+
         let algorithm = match jwk.alg.as_deref() {
             Some("RS384") => Algorithm::RS384,
             Some("RS512") => Algorithm::RS512,
@@ -414,6 +421,12 @@ impl JwksKeyStore {
     fn parse_ec_jwk(jwk: &JwkKey) -> Result<CachedJwk, String> {
         let x = jwk.x.as_deref().ok_or("missing EC coordinate 'x'")?;
         let y = jwk.y.as_deref().ok_or("missing EC coordinate 'y'")?;
+
+        // An absent `crv` is treated as P-256 below, which is approved, so the
+        // FIPS curve gate only has to speak for an explicitly named one.
+        if let Some(curve) = jwk.crv.as_deref() {
+            crate::fips::keys::check_jwk_ec_curve(curve)?;
+        }
 
         let algorithm = match jwk.crv.as_deref() {
             Some("P-384") => Algorithm::ES384,

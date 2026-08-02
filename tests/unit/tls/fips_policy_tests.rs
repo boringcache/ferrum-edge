@@ -338,7 +338,16 @@ fn gateway_policy_ignores_a_disabled_non_approved_plugin() {
 
 #[test]
 fn gateway_policy_rejects_non_approved_jwt_algorithms() {
-    for alg in ["none", "EdDSA", "HS999"] {
+    // `ES512` is in this list deliberately. ECDSA over P-521 is an approved
+    // FIPS 186-5 scheme, but the `jsonwebtoken/aws_lc_rs` backend this profile
+    // selects exposes no supportable P-521 JWS path — `jsonwebtoken`'s
+    // `Algorithm` enum has no `ES512` variant at all, so every downstream
+    // admission surface (including the CP/DP trust-bundle parser in
+    // `src/grpc/cp_trust.rs`) would fail to construct a key for it. Admitting an
+    // algorithm Ferrum cannot route is the failure mode this allow-list exists
+    // to prevent, so it must be refused at admission with an actionable
+    // diagnostic instead of at first use.
+    for alg in ["none", "EdDSA", "HS999", "ES512"] {
         let config = config_with(vec![plugin("jwt_auth", json!({ "algorithm": alg }))]);
         let err = match policy::check_gateway_config_enforced(&config) {
             Err(err) => err,
@@ -353,7 +362,7 @@ fn shared_jwt_algorithm_policy_covers_external_admission_surfaces() {
     for algorithm in ["HS256", "RS384", "PS512", "ES256"] {
         assert!(policy::is_approved_jwt_algorithm(algorithm), "{algorithm}");
     }
-    for algorithm in ["none", "EdDSA", "HS999", ""] {
+    for algorithm in ["none", "EdDSA", "HS999", "ES512", ""] {
         assert!(!policy::is_approved_jwt_algorithm(algorithm), "{algorithm}");
     }
 
@@ -362,6 +371,36 @@ fn shared_jwt_algorithm_policy_covers_external_admission_surfaces() {
         cp_trust.contains("crate::fips::is_enforcing()")
             && cp_trust.contains("crate::fips::policy::is_approved_jwt_algorithm("),
         "the environment-selected CP/DP trust bundle must enforce the shared algorithm policy"
+    );
+}
+
+#[test]
+fn approved_jwt_algorithms_are_all_routable_by_the_selected_backend() {
+    // The whole point of the allow-list is that everything on it can actually
+    // be routed. An entry the backend cannot construct would be admitted at
+    // config time and fail at first use — which is exactly how `ES512` got in.
+    //
+    // `src/grpc/cp_trust.rs` is the surface that maps every admitted algorithm
+    // onto a concrete `DecodingKey`, so its EC arm is the authoritative
+    // statement of which ECDSA curves this build can serve. The selected
+    // `jsonwebtoken` release has no `ES512` variant at all.
+    assert_eq!(
+        policy::APPROVED_JWT_ALGORITHMS,
+        &[
+            "HS256", "HS384", "HS512", "RS256", "RS384", "RS512", "PS256", "PS384", "PS512",
+            "ES256", "ES384",
+        ],
+        "the approved JWS set changed; every entry must be constructible by the selected backend"
+    );
+
+    let cp_trust = include_str!("../../../src/grpc/cp_trust.rs");
+    assert!(
+        cp_trust.contains("Algorithm::ES256 | Algorithm::ES384 => DecodingKey::from_ec_pem"),
+        "cp_trust's EC arm is the routable-curve statement this allow-list must agree with"
+    );
+    assert!(
+        !cp_trust.contains("Algorithm::ES512"),
+        "the selected jsonwebtoken backend exposes no ES512 variant; it must not be admitted"
     );
 }
 

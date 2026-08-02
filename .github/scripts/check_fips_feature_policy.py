@@ -47,7 +47,6 @@ MANIFEST = REPO_ROOT / "Cargo.toml"
 # whose aws-lc arm is gated on the absence of its ring arm, so "additively
 # enable aws-lc" is not sufficient for it.
 REQUIRED_FEATURE_PAIRS = (
-    ("dep:ring", "dep:aws-lc-rs"),
     ("rustls/ring", "rustls/fips"),
     ("tokio-rustls/ring", "tokio-rustls/fips"),
     ("tonic/tls-ring", "tonic/tls-aws-lc"),
@@ -65,7 +64,50 @@ REQUIRED_FEATURE_PAIRS = (
 )
 
 # The `fips` feature must additionally bind the validated module itself.
+#
+# `aws-lc-rs/fips` is the *only* entry needed for that: on an optional
+# dependency, a `dep/feature` edge already activates the dependency, so a
+# companion `dep:aws-lc-rs` would be a duplicate activation of the same optional
+# dep. `crypto-ring` still needs an explicit `dep:ring`, because `ring` is
+# activated by nothing else in that list.
 REQUIRED_FIPS_ONLY = ("aws-lc-rs/fips",)
+REQUIRED_RING_ONLY = ("dep:ring",)
+
+# Neither profile may name the other's backend crate at all, in any spelling.
+# The pair table above catches a known counterpart edge; this catches a *new*
+# edge onto the wrong crate that nobody thought to pair.
+BACKEND_CRATE_PREFIXES = {
+    "crypto-ring": ("aws-lc-rs", "aws_lc_rs", "aws-lc-fips-sys", "aws-lc-sys"),
+    "fips": ("ring",),
+}
+
+# Optional feature combinations the PR claims are supported on the FIPS
+# profile. Each is audited as a resolved feature graph in CI, so a claim that an
+# optional feature is FIPS-clean is checked rather than asserted in prose.
+#
+# `label` is the CI step name; `features` is the exact `--features` argument.
+# Every entry is built with `--no-default-features`.
+#
+# `secrets-*` / `cloud-secrets` are deliberately absent. Their SDKs carry their
+# own TLS stacks that Ferrum's provider seam does not reach, so rather than
+# claim a coverage this build cannot back, an enforcing FIPS process REFUSES an
+# external secret provider before it is used (`fips::policy::check_env_config`,
+# `docs/fips.md` §"Deliberately unsupported in FIPS mode"). They are still
+# audited below, under CLAIMED_FIPS_PROFILES_UNSUPPORTED_AT_RUNTIME, so the
+# combination is proven to *build* and the refusal is proven to be the only
+# thing standing between it and use.
+CLAIMED_FIPS_PROFILES = (
+    ("fips", "fips"),
+    ("fips + acme", "fips,acme"),
+    ("fips + pkcs11", "fips,pkcs11"),
+    ("fips + ebpf", "fips,ebpf"),
+    ("fips + acme + pkcs11 + ebpf", "fips,acme,pkcs11,ebpf"),
+)
+
+# Combinations that must build cleanly and must be refused at runtime.
+CLAIMED_FIPS_PROFILES_UNSUPPORTED_AT_RUNTIME = (
+    ("fips + cloud-secrets", "fips,cloud-secrets"),
+)
 
 # Dependencies that must never be declared with an inline crypto-backend
 # feature: the backend belongs to the mutually exclusive feature pair, and an
@@ -123,6 +165,11 @@ FORBIDDEN_RESOLVED_FIPS = {
     ("reqwest", "__rustls-ring"),
     ("rustls-webpki", "ring"),
     ("webpki", "ring"),
+    # Only reachable with `--features acme`, which is one of the claimed
+    # profiles below, so this row is what makes that claim mean something.
+    # (`hyper-rustls/aws-lc-rs` is deliberately NOT forbidden here:
+    # `hyper-rustls/fips` enables it, so it is the *expected* selection.)
+    ("instant-acme", "ring"),
 }
 
 # Feature selections that must be present in a resolved `fips` graph.
@@ -215,6 +262,45 @@ def check_manifest() -> list[str]:
     for edge in REQUIRED_FIPS_ONLY:
         if edge not in fips_features:
             failures.append(f"`fips` must select {edge!r} to bind the validated module")
+    for edge in REQUIRED_RING_ONLY:
+        if edge not in ring_features:
+            failures.append(f"`crypto-ring` must select {edge!r} to bind the ordinary backend")
+
+    # A duplicate entry in either list is a manifest-integrity fault in its own
+    # right: the two lists are read position-for-position as counterparts, and a
+    # repeated entry silently breaks that correspondence for every reviewer
+    # after it. It is also how a redundant optional-dependency activation
+    # (`dep:x` beside `x/feature`) gets in.
+    for profile, entries in (("crypto-ring", ring_features), ("fips", fips_features)):
+        seen: set[str] = set()
+        for entry in entries:
+            if entry in seen:
+                failures.append(
+                    f"`{profile}` lists {entry!r} more than once; each dependency's crypto arm "
+                    "must appear exactly once"
+                )
+            seen.add(entry)
+        # `dep:x` beside `x/...` for the same optional dep is the same fault in
+        # a different spelling: the `dep/feature` edge already activates it.
+        activated_by_feature = {
+            entry.split("/", 1)[0].rstrip("?") for entry in entries if "/" in entry
+        }
+        for entry in entries:
+            if entry.startswith("dep:") and entry[4:] in activated_by_feature:
+                failures.append(
+                    f"`{profile}` selects {entry!r} redundantly: a `{entry[4:]}/<feature>` edge "
+                    "in the same list already activates that optional dependency"
+                )
+
+    for profile, entries in (("crypto-ring", ring_features), ("fips", fips_features)):
+        for prefix in BACKEND_CRATE_PREFIXES[profile]:
+            for entry in entries:
+                crate = entry.removeprefix("dep:").split("/", 1)[0].rstrip("?")
+                if crate == prefix:
+                    failures.append(
+                        f"`{profile}` names the opposing backend crate {crate!r} via {entry!r}; "
+                        "the profiles are mutually exclusive"
+                    )
 
     for dep, forbidden in FORBIDDEN_INLINE_DECLARATIONS.items():
         line = dependency_line(manifest, dep)
@@ -329,16 +415,79 @@ def check_tree(path: Path, profile: str) -> list[str]:
     return failures
 
 
+def claimed_profiles() -> tuple[tuple[str, str, bool], ...]:
+    """Every claimed FIPS feature combination, with its runtime-support flag."""
+
+    return tuple(
+        (label, features, True) for label, features in CLAIMED_FIPS_PROFILES
+    ) + tuple(
+        (label, features, False)
+        for label, features in CLAIMED_FIPS_PROFILES_UNSUPPORTED_AT_RUNTIME
+    )
+
+
+def check_claimed_profiles_declared() -> list[str]:
+    """Every optional cargo feature must be accounted for by a claimed profile.
+
+    This is what stops the inventory from silently going stale: adding a new
+    optional feature to `Cargo.toml` without deciding whether it is supported
+    under FIPS fails here, rather than shipping as an implicit claim.
+    """
+
+    manifest = read_manifest()
+    table = re.search(r"^\[features\]\s*$\n(.*?)(?=^\[)", manifest, re.M | re.S)
+    if table is None:
+        return ["Cargo.toml has no `[features]` table"]
+
+    declared = set(re.findall(r"^([A-Za-z0-9_-]+) = \[", table.group(1), re.M))
+    # `default` is the profile selector; `crypto-ring`/`fips` are the backends
+    # themselves; `fuzzing` compiles no cryptography and is never shipped;
+    # `cloud-secrets` is the umbrella over the individual `secrets-*` features.
+    exempt = {"default", "crypto-ring", "fips", "fuzzing"}
+    covered = {
+        feature
+        for _, features, _ in claimed_profiles()
+        for feature in features.split(",")
+    }
+    # An umbrella feature covers what it expands to.
+    for umbrella in list(covered):
+        expansion = feature_list(manifest, umbrella)
+        covered.update(entry for entry in expansion if entry in declared)
+
+    missing = sorted(declared - exempt - covered)
+    if missing:
+        return [
+            "optional cargo feature(s) "
+            f"{missing} are not named by any entry in CLAIMED_FIPS_PROFILES or "
+            "CLAIMED_FIPS_PROFILES_UNSUPPORTED_AT_RUNTIME. Every optional feature must be "
+            "explicitly claimed as FIPS-supported (and audited) or explicitly recorded as "
+            "refused at runtime — an unlisted feature is an implicit claim this build cannot back."
+        ]
+    return []
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest-check", action="store_true")
     parser.add_argument("--tree", type=Path)
     parser.add_argument("--profile", choices=("fips", "crypto-ring"))
+    parser.add_argument(
+        "--list-claimed-profiles",
+        action="store_true",
+        help="Print one `<label>\\t<features>` row per claimed FIPS profile, so CI enumerates "
+        "the same table this script audits instead of duplicating it in YAML.",
+    )
     args = parser.parse_args()
+
+    if args.list_claimed_profiles:
+        for label, features, _ in claimed_profiles():
+            print(f"{label}\t{features}")
+        return 0
 
     failures: list[str] = []
     if args.manifest_check or args.tree is None:
         failures.extend(check_manifest())
+        failures.extend(check_claimed_profiles_declared())
     if args.tree is not None:
         if args.profile is None:
             parser.error("--tree requires --profile")

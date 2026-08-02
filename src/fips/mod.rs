@@ -59,9 +59,10 @@
 
 pub mod approved;
 pub mod inventory;
+pub mod keys;
 pub mod policy;
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use rustls::crypto::CryptoProvider;
 
@@ -321,6 +322,29 @@ pub fn base_crypto_provider() -> CryptoProvider {
     rustls::crypto::aws_lc_rs::default_provider()
 }
 
+/// The process-default crypto provider is not the one an enforcing FIPS
+/// process requires.
+///
+/// Carries no detail beyond the fact itself: there is exactly one way to be
+/// wrong here, and naming the interloping provider would be guesswork —
+/// `CryptoProvider` exposes no identity, only its algorithm classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderMismatch;
+
+impl std::fmt::Display for ProviderMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the installed process-default rustls crypto provider is not classified as \
+             FIPS-approved, so an internal client built against it would run its TLS outside the \
+             selected `{SUPPORTED_PROVIDER_ID}` module. Refusing to use it while \
+             {FIPS_MODE_ENV}=enforce is in effect."
+        )
+    }
+}
+
+impl std::error::Error for ProviderMismatch {}
+
 /// Ensure internal client builders can resolve the compile-time-selected
 /// provider when they are exercised outside the binary startup sequence.
 ///
@@ -331,13 +355,61 @@ pub fn base_crypto_provider() -> CryptoProvider {
 /// no fallback of its own. Installing the same compile-time-selected provider
 /// here keeps those constructors provider-neutral without adding `ring` to a
 /// FIPS graph or AWS-LC to the ordinary graph.
-pub(crate) fn ensure_internal_client_crypto_provider() {
-    if CryptoProvider::get_default().is_none() {
-        // `install_default` fails only when another thread installed a
-        // provider first. In that race the process default is already usable,
-        // so there is no error to hide or alternate provider to select.
-        let _ = CryptoProvider::install_default(base_crypto_provider());
+///
+/// # Fail-closed behaviour
+///
+/// "A provider is already installed" is **not** the same as "a usable provider
+/// is already installed". An embedding application, or a racing constructor on
+/// a build that links both arms, can pin `ring` before Ferrum looks; treating
+/// any installed provider as acceptable would then hand an enforcing FIPS
+/// process a client whose TLS runs outside the selected module — silently, and
+/// on a real traffic path.
+///
+/// So when [`is_enforcing`] holds, this verifies the installed provider's own
+/// algorithm classification (`CryptoProvider::fips()`) and returns
+/// [`ProviderMismatch`] rather than proceeding. It does not panic: the callers
+/// are infallible client constructors on library paths, and they translate the
+/// error into a client that cannot complete a request (see
+/// `src/plugins/utils/http_client.rs`).
+///
+/// Outside enforcement the behaviour is exactly as before, so ordinary library
+/// and test construction is unaffected.
+///
+/// # Why the binary cannot normally reach the error
+///
+/// [`install_crypto_provider`] runs before any client is constructed and is
+/// itself fail-closed: it refuses an enforce request on a non-capable build,
+/// on a failed module self-test, on a provider rustls does not classify as
+/// approved, and — through `install_default`'s own error — when a provider was
+/// already installed by someone else. `STATE` is set only on that success path,
+/// so `is_enforcing()` implies the FIPS provider was the one installed. This
+/// check is the backstop that keeps that implication true if the invariant is
+/// ever weakened, rather than a condition the shipped binary is expected to
+/// meet at runtime.
+pub(crate) fn ensure_internal_client_crypto_provider() -> Result<(), ProviderMismatch> {
+    if let Some(installed) = CryptoProvider::get_default() {
+        return verify_installed_provider(installed);
     }
+
+    // `install_default` fails only when another thread installed a provider
+    // between the check above and this call. That race is precisely the case
+    // that must not be waved through, so re-read the winner and classify it
+    // rather than assuming the process default is usable.
+    if CryptoProvider::install_default(base_crypto_provider()).is_err()
+        && let Some(installed) = CryptoProvider::get_default()
+    {
+        return verify_installed_provider(installed);
+    }
+
+    Ok(())
+}
+
+/// Classify an installed provider against the enforced posture.
+fn verify_installed_provider(installed: &Arc<CryptoProvider>) -> Result<(), ProviderMismatch> {
+    if is_enforcing() && !installed.fips() {
+        return Err(ProviderMismatch);
+    }
+    Ok(())
 }
 
 /// Parse a DER private key with the selected provider's key provider.

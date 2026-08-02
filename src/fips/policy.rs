@@ -11,6 +11,8 @@
 //! | CP publication / DP apply | [`check_gateway_config`] |
 //! | CP/DP namespace trust-bundle load | [`is_approved_jwt_algorithm`] |
 //! | rustls policy construction | [`check_tls_policy`] |
+//! | external secret resolution | [`check_external_secret_sources`] |
+//! | PEM certificate / JWKS key load | [`super::keys`] |
 //!
 //! Every diagnostic is bounded: it names the setting, states the rule, and — for
 //! collection-valued settings — reports at most [`MAX_REPORTED_VIOLATIONS`]
@@ -36,14 +38,27 @@ pub const MAX_REPORTED_VIOLATIONS: usize = 8;
 /// JWT/JWS algorithms Ferrum admits while FIPS mode is enforced.
 ///
 /// HMAC-SHA2 (FIPS 198-1), RSASSA-PKCS1-v1_5 and RSASSA-PSS with SHA-2, and
-/// ECDSA over P-256/P-384/P-521 (FIPS 186-5). `none` is always rejected.
+/// ECDSA over P-256/P-384 (FIPS 186-5). `none` is always rejected.
+///
 /// `EdDSA` is deliberately absent: Ed25519 is approved by FIPS 186-5, but it is
 /// not part of the algorithm set Ferrum routes through the selected AWS-LC FIPS
 /// module implementation, so admitting it would be a claim this build cannot
 /// back.
+///
+/// `ES512` is deliberately absent for the same reason, and it is worth being
+/// precise about why, because ECDSA over P-521 *is* an approved FIPS 186-5
+/// scheme. The exclusion is about the *implementation contract*, not the
+/// algorithm: the `jsonwebtoken` backend this profile selects
+/// (`jsonwebtoken/aws_lc_rs`) does not expose a supportable P-521 signing and
+/// verification path for JWS, so an `ES512` selection admitted here would
+/// either fail at first use or fall through to an implementation outside the
+/// selected module. Admitting an algorithm Ferrum cannot actually route is the
+/// exact failure mode this allow-list exists to prevent, so it is refused at
+/// admission with an actionable diagnostic instead. See `docs/fips.md`
+/// §"Deliberately unsupported in FIPS mode".
 pub const APPROVED_JWT_ALGORITHMS: &[&str] = &[
     "HS256", "HS384", "HS512", "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256",
-    "ES384", "ES512",
+    "ES384",
 ];
 
 /// Whether a configured JWS algorithm is in Ferrum's FIPS-approved set.
@@ -106,6 +121,187 @@ const NON_APPROVED_ALGORITHM_SELECTIONS: &[(&str, &[&str], &[&str])] = &[(
 /// ([`crate::fips::approved`]). Any other prefix would be a password KDF Ferrum
 /// has not classified, so FIPS mode refuses it rather than assuming.
 pub const APPROVED_PASSWORD_HASH_PREFIX: &str = "hmac_sha256:";
+
+/// Mesh identity escape hatches that admit an unverified workload peer.
+///
+/// Each is an environment-only dev switch consumed directly by
+/// `src/identity/`, so FIPS mode reads it from the same place its consumer
+/// does. The second element completes the sentence "`<NAME>` …".
+pub const MESH_IDENTITY_BYPASS_ENV: &[(&str, &str)] = &[
+    (
+        "FERRUM_MESH_ALLOW_NO_CA",
+        "starts the mesh with no workload trust anchor, so no peer identity is verified at all",
+    ),
+    (
+        "FERRUM_MESH_ALLOW_STATIC_ID",
+        "admits an unattested static workload identity in place of a real attestation",
+    ),
+    (
+        "FERRUM_MESH_CA_BOOTSTRAP_DEV",
+        "bootstraps a self-signed development mesh CA rather than an operator-established trust \
+         anchor",
+    ),
+];
+
+/// MongoDB URI options that disable config-database TLS peer verification.
+///
+/// A fixed MongoDB vocabulary, matched case-insensitively because the driver
+/// treats URI option names case-insensitively.
+const MONGODB_URI_VERIFICATION_BYPASS_PARAMS: &[&str] = &[
+    "tlsinsecure",
+    "tlsallowinvalidcertificates",
+    "tlsallowinvalidhostnames",
+    "tlsdisableocspendpointcheck",
+    "sslinsecure",
+];
+
+/// `true` when an environment-only boolean switch is engaged.
+///
+/// Deliberately permissive about spelling in the *rejecting* direction: any
+/// value the mesh's own consumers would read as "on" must reject here. An
+/// unset, empty, or explicitly-off value is not engaged.
+fn env_flag_engaged(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no" | "disabled" | "disable"
+        ),
+        // A non-Unicode value is reported as absent by `var`. Ferrum's startup
+        // env sweep rejects undecodable `FERRUM_*` values before the gateway
+        // runs, so this cannot silently drop an engaged switch.
+        Err(_) => false,
+    }
+}
+
+/// The first MongoDB URI verification-bypass option present in `FERRUM_DB_URL`.
+///
+/// Returns the matched *parameter name* only. The URL is never returned,
+/// logged, or interpolated: it carries the database credentials.
+fn mongodb_url_verification_bypass(env_config: &EnvConfig) -> Option<&'static str> {
+    if env_config.db_type.as_deref() != Some("mongodb") {
+        return None;
+    }
+    let url = env_config.db_url.as_deref()?;
+    // The query component only. A password or host that happened to contain
+    // `tlsinsecure` must not be read as an option, and must not be inspected
+    // any more closely than this.
+    let query = url.split_once('?').map(|(_, query)| query)?;
+    query.split(['&', ';']).find_map(|pair| {
+        let key = pair.split('=').next().unwrap_or_default().trim();
+        // The driver treats `false` as not engaged. A bare flag with no value
+        // is engaged, matching MongoDB's own permissive parsing.
+        let engaged = match pair.split_once('=') {
+            Some((_, value)) => !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false"
+            ),
+            None => true,
+        };
+        if !engaged {
+            return None;
+        }
+        MONGODB_URI_VERIFICATION_BYPASS_PARAMS
+            .iter()
+            .copied()
+            .find(|parameter| parameter.eq_ignore_ascii_case(key))
+    })
+}
+
+/// A plugin configuration key that admits an unauthenticated TLS/DTLS peer.
+///
+/// `path` is a dotted path into the plugin's `config` object. A `[]` segment
+/// walks every element of an array, so one entry covers a per-rule or
+/// per-provider override without needing a bespoke traversal.
+struct UnauthenticatedPeerKey {
+    /// Plugin this key belongs to.
+    plugin: &'static str,
+    /// Dotted path into the plugin's config object.
+    path: &'static str,
+    /// The boolean value that *disables* verification.
+    disabling_value: bool,
+    /// When `Some`, the key only takes effect if this sibling path is `true`,
+    /// and its absence then means "disabled" (an insecure default).
+    gated_by: Option<&'static str>,
+    /// Whether an *absent* key is itself a bypass, because the plugin defaults
+    /// it insecurely once `gated_by` is engaged.
+    absent_is_bypass: bool,
+}
+
+/// Every plugin-owned, independently configurable verification opt-out.
+///
+/// The gateway-wide `FERRUM_TLS_NO_VERIFY` is already refused at the
+/// environment gate, and most plugins can only *inherit* it. These are the
+/// plugins that own a switch of their own, so a FIPS deployment that fixed the
+/// global flag could still be admitting unauthenticated peers on one sink.
+///
+/// `kafka_logging`'s `ssl_no_verify` is deliberately absent: the whole plugin
+/// is refused by [`NON_APPROVED_PLUGINS`], so a second rule for one of its keys
+/// would be unreachable. `tests/unit/tls/fips_policy_tests.rs` pins that
+/// relationship so removing the plugin-level rejection cannot silently orphan
+/// the key.
+const UNAUTHENTICATED_PEER_PLUGIN_KEYS: &[UnauthenticatedPeerKey] = &[
+    // Builds its own reqwest client and, when set, *also* drops the gateway CA
+    // bundle rather than merely skipping verification.
+    UnauthenticatedPeerKey {
+        plugin: "spec_expose",
+        path: "tls_no_verify",
+        disabling_value: true,
+        gated_by: None,
+        absent_is_bypass: false,
+    },
+    // The one insecure-by-default surface in the inventory: when `gateway_tls`
+    // is on, an *absent* `gateway_tls_no_verify` resolves to `true`. An
+    // absence therefore has to reject here, or the default silently wins.
+    UnauthenticatedPeerKey {
+        plugin: "load_testing",
+        path: "gateway_tls_no_verify",
+        disabling_value: true,
+        gated_by: Some("gateway_tls"),
+        absent_is_bypass: true,
+    },
+    // DTLS server-certificate verifier is skipped entirely.
+    UnauthenticatedPeerKey {
+        plugin: "udp_logging",
+        path: "dtls_no_verify",
+        disabling_value: true,
+        gated_by: None,
+        absent_is_bypass: false,
+    },
+    // ClickHouse sink: certificate and hostname verification are separate
+    // switches, so both are listed.
+    UnauthenticatedPeerKey {
+        plugin: "api_chargeback_sink",
+        path: "clickhouse.tls.insecure_skip_verify",
+        disabling_value: true,
+        gated_by: None,
+        absent_is_bypass: false,
+    },
+    UnauthenticatedPeerKey {
+        plugin: "api_chargeback_sink",
+        path: "clickhouse.tls.verify_hostname",
+        disabling_value: false,
+        gated_by: None,
+        absent_is_bypass: false,
+    },
+    // Per-route backend TLS override; overrides the proxy's resolved backend
+    // TLS, so the `GatewayConfig` upstream/proxy check below does not see it.
+    UnauthenticatedPeerKey {
+        plugin: "mesh_route_dispatch",
+        path: "rules[].destination.backend_tls.verify_server_cert",
+        disabling_value: false,
+        gated_by: None,
+        absent_is_bypass: false,
+    },
+    // Not a certificate bypass, but it admits a plaintext `http://` audit sink,
+    // which is an unauthenticated transport for security-relevant records.
+    UnauthenticatedPeerKey {
+        plugin: "ai_transcript_audit",
+        path: "sink.allow_insecure_loopback",
+        disabling_value: true,
+        gated_by: None,
+        absent_is_bypass: false,
+    },
+];
 
 /// Render a bounded list of offending entries.
 fn bounded_list(entries: &[String]) -> String {
@@ -179,13 +375,89 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
     }
 
     // ── Peer verification ───────────────────────────────────────────────
-    // An unauthenticated peer defeats the point of an approved key exchange.
-    if env_config.tls_no_verify {
+    // An unauthenticated peer defeats the point of an approved key exchange:
+    // the module can perform a perfect ECDHE, and it is still a key agreement
+    // with whoever answered. Every *independently configurable* opt-out is
+    // covered, not just the global one, because a per-surface switch is exactly
+    // the hole a global-only gate leaves open.
+    //
+    // `FERRUM_DP_GRPC_TLS_NO_VERIFY` is deliberately absent from this list. It
+    // is already refused unconditionally, on every build and in every mode, by
+    // `EnvConfig::validate_cp_dp_grpc_transport_security`, so a FIPS rule for it
+    // would be unreachable.
+    // `dp_grpc_no_verify_is_covered_by_the_ordinary_validator_not_by_fips` in
+    // `tests/unit/tls/fips_key_admission_tests.rs` pins that reasoning: it
+    // asserts the ordinary rejection is still unconditional, so a future
+    // relaxation there fails a FIPS test rather than silently opening a bypass.
+    for (name, engaged, detail) in [
+        (
+            "FERRUM_TLS_NO_VERIFY",
+            env_config.tls_no_verify,
+            "outbound backend, service-discovery, and plugin HTTP/TLS server certificate \
+             verification",
+        ),
+        (
+            "FERRUM_ADMIN_TLS_NO_VERIFY",
+            env_config.admin_tls_no_verify,
+            "admin API client TLS server certificate verification",
+        ),
+        (
+            "FERRUM_ALLOW_INSECURE_ADMIN_HTTP",
+            env_config.allow_insecure_admin_http,
+            "TLS on a non-loopback admin API listener, leaving it a plaintext, unauthenticated \
+             transport",
+        ),
+        (
+            "FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT",
+            env_config.mesh_egress_stream_allow_plaintext,
+            "SVID mTLS termination on mesh TCP/UDP egress, admitting unauthenticated peers",
+        ),
+    ] {
+        if engaged {
+            return Err(format!(
+                "{name} disables {detail}, and is refused while FIPS mode is enforced."
+            ));
+        }
+    }
+
+    // The configuration database is a peer like any other, and MongoDB's
+    // `require` mode is the one whose *name* reads as more secure while it is
+    // the mode that turns CA and hostname verification off
+    // (`DbTlsMode::allows_invalid_certificates`).
+    if env_config.mongodb_tls_allows_invalid_certs() {
         return Err(
-            "FERRUM_TLS_NO_VERIFY=true disables backend server certificate verification and is \
-             refused while FIPS mode is enforced."
+            "FERRUM_DB_TLS_MODE=require maps to the MongoDB driver's \
+             `allow_invalid_certificates`, which encrypts the config-database connection but \
+             disables CA and hostname verification. It is refused while FIPS mode is enforced; \
+             use `verify-ca` or `verify-full`."
                 .to_string(),
         );
+    }
+
+    // A MongoDB connection string can carry the same opt-out as a URI option,
+    // bypassing `FERRUM_DB_TLS_MODE` entirely. Only the matched parameter name
+    // — a fixed MongoDB URI vocabulary — is reported; the URL itself carries
+    // credentials and is never interpolated.
+    if let Some(parameter) = mongodb_url_verification_bypass(env_config) {
+        return Err(format!(
+            "FERRUM_DB_URL sets the MongoDB URI option `{parameter}`, which disables \
+             config-database TLS peer verification. It is refused while FIPS mode is enforced. \
+             The offending URL is withheld from this diagnostic."
+        ));
+    }
+
+    // Mesh identity escape hatches. These are read from the process environment
+    // rather than from `EnvConfig` because that is where their own consumers
+    // read them (`src/identity/`), and a FIPS gate that consulted a different
+    // source than the enforcement point would be checking a value that is not
+    // the one in effect. They are boolean-ish dev switches, so only the variable
+    // name is reported.
+    for (name, detail) in MESH_IDENTITY_BYPASS_ENV {
+        if env_flag_engaged(name) {
+            return Err(format!(
+                "{name} {detail}, and is refused while FIPS mode is enforced."
+            ));
+        }
     }
 
     // ── Admin and CP/DP JWT MAC keys ────────────────────────────────────
@@ -219,6 +491,100 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// External secret-provider suffixes whose SDK carries its own TLS stack.
+///
+/// `_FILE` is deliberately absent: it is a local filesystem read that performs
+/// no cryptography and reaches no network peer, so it stays supported.
+pub const REMOTE_SECRET_PROVIDER_SUFFIXES: &[&str] = &["_VAULT", "_AWS", "_AZURE", "_GCP"];
+
+/// Refuse remote external secret providers while FIPS mode is enforced.
+///
+/// # Why this is a refusal rather than a claim
+///
+/// Vault, AWS, Azure, and GCP each resolve secrets over their own SDK's TLS
+/// stack. Those stacks are not built from [`super::base_crypto_provider`] and
+/// are not selected by the `crypto-ring` / `fips` feature pair, so Ferrum
+/// cannot route them onto the selected module and cannot attest to what they
+/// use. The previous position — "outside the boundary, but allowed, because
+/// secrets resolve once at startup" — was an *implicit* claim that a
+/// pre-serving TLS session to a credential store does not matter. It does: that
+/// session carries the gateway's private keys and JWT secrets, and it is the
+/// one connection whose compromise hands over everything else.
+///
+/// So an enforcing FIPS process refuses it, before the provider is contacted,
+/// with a diagnostic that names the alternative. `_FILE` (and an ordinary
+/// direct environment value) remain supported, which is the shape a FIPS
+/// deployment already needs: the secret is delivered by an operator-controlled
+/// mechanism — a mounted secret, an init container, a KMS-backed volume — whose
+/// own transport the operator has validated.
+///
+/// # Where this runs
+///
+/// Called from `main::resolve_startup_secrets`, which runs *after*
+/// [`super::install_crypto_provider`] has established the FIPS state and
+/// *before* any provider client is constructed. That ordering is what makes it
+/// a refusal rather than a post-hoc complaint.
+pub fn check_external_secret_sources() -> Result<(), String> {
+    if !super::is_enforcing() {
+        return Ok(());
+    }
+    check_external_secret_sources_enforced(configured_remote_secret_providers())
+}
+
+/// The enforced half of [`check_external_secret_sources`], over an already
+/// collected suffix set so it is directly testable without mutating the
+/// process environment.
+pub fn check_external_secret_sources_enforced(
+    configured: Vec<&'static str>,
+) -> Result<(), String> {
+    if configured.is_empty() {
+        return Ok(());
+    }
+    // Only the suffixes are named — a fixed Ferrum vocabulary. The base keys
+    // are withheld: they are the names of the settings an operator chose to
+    // source remotely, which is deployment intelligence, and a diagnostic does
+    // not need them to be actionable.
+    let suffixes: Vec<String> = configured.into_iter().map(str::to_string).collect();
+    Err(format!(
+        "external secret provider suffix(es) [{}] are configured. Those SDKs resolve secrets over \
+         their own TLS stacks, which Ferrum cannot route through the selected \
+         `{}` module, so they are refused while FIPS mode is enforced. Supply the affected \
+         settings directly, or through the local `_FILE` suffix backed by an \
+         operator-validated delivery mechanism. See docs/fips.md.",
+        bounded_list(&suffixes),
+        super::SUPPORTED_PROVIDER_ID
+    ))
+}
+
+/// Remote-provider suffixes present on at least one `FERRUM_*` variable.
+///
+/// Iterates `vars_os` rather than `vars`, which panics on a non-Unicode name or
+/// value, and screens the prefix on raw bytes so unrelated variables are never
+/// decoded — the same discipline `src/secrets/` uses for the identical sweep.
+fn configured_remote_secret_providers() -> Vec<&'static str> {
+    let mut found: Vec<&'static str> = Vec::new();
+    for (name, value) in std::env::vars_os() {
+        if !name.as_encoded_bytes().starts_with(b"FERRUM_") {
+            continue;
+        }
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // "Set" means non-empty, matching `secrets::external_source_configured`
+        // so the two cannot disagree about whether a source exists.
+        if value.is_empty() {
+            continue;
+        }
+        for suffix in REMOTE_SECRET_PROVIDER_SUFFIXES {
+            if name.ends_with(suffix) && !found.contains(suffix) {
+                found.push(suffix);
+            }
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
 /// Validate a gateway configuration document against FIPS policy.
 ///
 /// This is the shared admission gate for `validate`, startup, file-mode SIGHUP
@@ -238,6 +604,7 @@ pub fn check_gateway_config_enforced(config: &GatewayConfig) -> Result<(), Strin
     let mut non_approved_plugins: Vec<String> = Vec::new();
     let mut jwt_violations: Vec<String> = Vec::new();
     let mut algorithm_violations: Vec<String> = Vec::new();
+    let mut peer_verification_violations: Vec<String> = Vec::new();
 
     for plugin in &config.plugin_configs {
         if !plugin.enabled {
@@ -251,6 +618,71 @@ pub fn check_gateway_config_enforced(config: &GatewayConfig) -> Result<(), Strin
         }
         collect_jwt_algorithm_violations(plugin, &mut jwt_violations);
         collect_non_approved_algorithm_selections(plugin, &mut algorithm_violations);
+        collect_unauthenticated_peer_keys(plugin, &mut peer_verification_violations);
+    }
+
+    // ── Per-upstream and per-proxy backend peer verification ────────────
+    //
+    // These are refused whenever they are `false`, including on a plaintext
+    // backend where the field has no runtime effect. That is a deliberate
+    // choice, not an oversight, and it is pinned by
+    // `a_declared_upstream_verification_opt_out_is_refused_even_when_dormant`
+    // in `tests/unit/tls/fips_key_admission_tests.rs`:
+    //
+    //  * An `Upstream` carries no scheme of its own — TLS-ness is a property of
+    //    each target and of every proxy that references the upstream, so
+    //    "inert" is not a stable property of the document being admitted. A
+    //    later target edit turns a dormant `false` into a live bypass with no
+    //    change to this field, and that edit would arrive through a hot reload
+    //    or CP publication that this same gate is supposed to be the backstop
+    //    for.
+    //  * The remedy is free and unambiguous: set it to `true`, which is both
+    //    the schema default and a no-op on a plaintext backend.
+    //
+    // The mesh `DestinationRule.trafficPolicy.tls.insecureSkipVerify` override
+    // needs no rule of its own: it is projected onto
+    // `Upstream.backend_tls_verify_server_cert` before admission, so it is
+    // caught here at exactly the point it takes effect.
+    //
+    // Entries are named by their one-based *position* in the document, never by
+    // their `id`. An id is operator-supplied free text; a position is
+    // sufficient to find the entry and discloses nothing.
+    for (index, upstream) in config.upstreams.iter().enumerate() {
+        if !upstream.backend_tls_verify_server_cert {
+            peer_verification_violations.push(format!(
+                "upstreams[#{}].backend_tls_verify_server_cert=false",
+                index + 1
+            ));
+        }
+    }
+    for (index, proxy) in config.proxies.iter().enumerate() {
+        // The *declared* field, deliberately, not `resolved_tls`.
+        // `BackendTlsConfig` derives `Default`, so `resolved_tls` reads `false`
+        // on any document this gate sees before `normalize_fields()` has run —
+        // and this gate runs at `validate`, at startup, and at every reload and
+        // publication boundary, not only after normalization. Screening the
+        // resolved projection would therefore reject every not-yet-normalized
+        // proxy. The declared fields are what an operator writes and what
+        // normalization projects *from*, and a proxy that references an
+        // upstream inherits that upstream's value, which the loop above already
+        // covers.
+        if !proxy.backend_tls_verify_server_cert {
+            peer_verification_violations.push(format!(
+                "proxies[#{}].backend_tls_verify_server_cert=false",
+                index + 1
+            ));
+        }
+    }
+
+    if !peer_verification_violations.is_empty() {
+        peer_verification_violations.sort();
+        peer_verification_violations.dedup();
+        return Err(format!(
+            "configuration entr(ies) [{}] disable TLS/DTLS peer certificate verification, or \
+             admit an unauthenticated transport, and are refused while FIPS mode is enforced. An \
+             unverified peer defeats the point of an approved key exchange. See docs/fips.md.",
+            bounded_list(&peer_verification_violations)
+        ));
     }
 
     // ── Stored password representation ──────────────────────────────────
@@ -390,6 +822,92 @@ fn lookup_dotted<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serd
         current = current.get(segment)?;
     }
     Some(current)
+}
+
+/// Resolve a dotted path that may contain `[]` array-walk segments.
+///
+/// Returns every value the path reaches. A `name[]` segment descends into
+/// `name` and continues from each element, so
+/// `rules[].destination.backend_tls.verify_server_cert` yields one value per
+/// configured rule that sets it. Bounded by the configuration document itself;
+/// this runs at admission, never on the request path.
+fn lookup_path_all<'a>(root: &'a serde_json::Value, path: &str) -> Vec<&'a serde_json::Value> {
+    let mut current = vec![root];
+    for segment in path.split('.') {
+        if current.is_empty() {
+            return current;
+        }
+        let (name, walk_array) = match segment.strip_suffix("[]") {
+            Some(name) => (name, true),
+            None => (segment, false),
+        };
+        let mut next = Vec::new();
+        for value in current {
+            let Some(child) = value.get(name) else {
+                continue;
+            };
+            if walk_array {
+                match child {
+                    serde_json::Value::Array(entries) => next.extend(entries.iter()),
+                    // A non-array where an array was expected is a schema fault
+                    // the plugin's own validator reports; it is not a
+                    // verification bypass, so it is skipped rather than
+                    // double-reported here.
+                    _ => continue,
+                }
+            } else {
+                next.push(child);
+            }
+        }
+        current = next;
+    }
+    current
+}
+
+/// Collect verification opt-outs a plugin's configuration engages.
+///
+/// The reported entry is `plugin.path`, both of which are fixed Ferrum
+/// configuration vocabulary — never an operator-supplied value.
+fn collect_unauthenticated_peer_keys(plugin: &PluginConfig, out: &mut Vec<String>) {
+    for key in UNAUTHENTICATED_PEER_PLUGIN_KEYS {
+        if plugin.plugin_name != key.plugin {
+            continue;
+        }
+
+        // A key whose enabling sibling is off cannot bypass anything, so it is
+        // not reported. This is the one place an "inert" setting is tolerated,
+        // because here the gate is a value in the *same document* being
+        // admitted rather than an inference about a different one.
+        if let Some(gate) = key.gated_by
+            && !matches!(
+                lookup_dotted(&plugin.config, gate),
+                Some(serde_json::Value::Bool(true))
+            )
+        {
+            continue;
+        }
+
+        let values = lookup_path_all(&plugin.config, key.path);
+        if values.is_empty() {
+            if key.absent_is_bypass {
+                out.push(format!("{}.{} (unset, defaults open)", key.plugin, key.path));
+            }
+            continue;
+        }
+        for value in values {
+            match value {
+                serde_json::Value::Bool(observed) if *observed == key.disabling_value => {
+                    out.push(format!("{}.{}", key.plugin, key.path));
+                }
+                // An explicit JSON `null` is "absent" to every one of these
+                // plugins, so it takes the insecure default where there is one.
+                serde_json::Value::Null if key.absent_is_bypass => {
+                    out.push(format!("{}.{} (null, defaults open)", key.plugin, key.path));
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Collect non-approved JWT algorithm names from one plugin's configuration.

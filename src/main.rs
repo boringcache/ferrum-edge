@@ -525,6 +525,14 @@ where
 /// caller report which base variables and providers were loaded after tracing
 /// is initialized (never source references or values).
 fn resolve_startup_secrets() -> Result<secrets::ResolvedEnvSecrets, String> {
+    // Refuse remote external secret providers before any provider client is
+    // constructed. `fips::install_crypto_provider()` has already run, so the
+    // enforced posture is known here; the SDK TLS stacks are not routed through
+    // the selected module, so an enforcing process must not open that session
+    // rather than quietly treating it as outside the boundary. See
+    // `fips::policy::check_external_secret_sources`.
+    fips::policy::check_external_secret_sources()?;
+
     let resolved = {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

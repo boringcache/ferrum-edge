@@ -80,7 +80,10 @@ the module certificate's tested-platform list (see §"The module boundary").
 |---|---|
 | Mutually exclusive `crypto-ring` / `fips` build profiles | **Shipped** |
 | AWS-LC FIPS module integration linked by the `fips` profile | **Shipped** |
-| Resolved-feature-graph audit in CI (both profiles) | **Shipped** |
+| Resolved-feature-graph audit in CI (both profiles, and every claimed optional combination) | **Shipped** |
+| Hosted compile lane for every claimed optional FIPS combination | **Shipped** |
+| Approved key-strength/form admission for certificates and JWKS keys | **Shipped** (`src/fips/keys.rs`) |
+| Fail-closed gate on every independently configurable peer-verification opt-out | **Shipped** |
 | Request surface (`--fips-mode`, `FERRUM_FIPS_MODE`, `FERRUM_FIPS_REQUIRED_PROVIDER`) | **Shipped** |
 | Fail-closed bootstrap, including the module's power-on self-test | **Shipped** |
 | Single crypto-provider seam (`crate::fips`) across all rustls construction | **Shipped** |
@@ -154,19 +157,106 @@ reload, which rebuilds through the same constructor.
   (ECDH over Curve25519 is not an approved SP 800-56A scheme). An explicitly
   configured non-approved suite or group is rejected with a bounded diagnostic
   naming it — never silently dropped from the list.
-- `FERRUM_TLS_NO_VERIFY=true` is refused: an unauthenticated peer defeats the
-  point of an approved key exchange.
+- Peer certificate verification cannot be disabled on any surface; see
+  §"Peer verification" below for the complete list.
 
 **Keys and algorithms**
 
 - JWT/JWS algorithms restricted to HS256/384/512, RS256/384/512, PS256/384/512,
-  ES256/384/512 across gateway plugins and CP/DP namespace trust bundles.
+  ES256/384 across gateway plugins and CP/DP namespace trust bundles.
   `none` is always rejected. `EdDSA` is rejected — Ed25519 is
   approved by FIPS 186-5 but is not part of the algorithm set Ferrum routes
   through the selected module, so admitting it would be an unbacked claim.
+  `ES512` is rejected for a related but distinct reason: ECDSA over P-521 *is*
+  an approved FIPS 186-5 scheme, but the `jsonwebtoken/aws_lc_rs` backend this
+  profile selects exposes no P-521 JWS path at all, so admitting it would be an
+  allow-list entry that fails at first use rather than at admission.
 - `FERRUM_ADMIN_JWT_SECRET`, `FERRUM_CP_DP_GRPC_JWT_SECRET`, and
   `FERRUM_BASIC_AUTH_HMAC_SECRET` must be at least 32 bytes (SP 800-107 HMAC
   key strength).
+
+**Key strengths and forms (Ferrum-enforced, not provider-enforced)**
+
+This is a distinct gate, and the distinction matters for an audit. The rustls
+FIPS provider refuses a non-approved *algorithm*: it will not negotiate a suite,
+group, or signature scheme outside the approved set, and `check_tls_policy`
+re-asserts that over the constructed policy. It does **not** uniformly refuse an
+approved algorithm used with an under-strength key — an RSA-1024 leaf is
+`rsaEncryption` with `rsa_pkcs1_sha256`, both nominally approved, while
+SP 800-131A Rev. 2 disallows the 1024-bit *key*. Ferrum therefore enforces key
+policy itself, at admission:
+
+- **Certificates** — RSA modulus of 2048–8192 bits, or ECDSA over
+  P-256 / P-384 / P-521. DSA (withdrawn by FIPS 186-5), the GOST curves, and
+  Ed25519 / Ed448 / X25519 are refused. Enforced at
+  `tls::parse_pem_certificate_bundle`, which is the single PEM loading boundary
+  for frontend, admin, backend, mesh, DTLS, CP/DP, health-check, SPIFFE, client
+  CA, PKCS#11 leaf, and ACME-issued material. **Every record in a bundle is
+  checked, including intermediates and trust anchors** — an approved leaf
+  chained to an RSA-1024 issuer is still an RSA-1024 signature verification.
+- **JWKS signing keys** — RSA modulus of at least 2048 bits, and EC keys on
+  P-256 or P-384. `P-521` is refused here because its only JWS use is `ES512`,
+  which is refused above; admitting the curve while refusing every algorithm
+  that could use it would only move the failure later. Padding on `n` contrary
+  to RFC 7518 §6.3.1.1 is not credited toward the floor.
+- The upper RSA bound is not a security floor but a denial-of-service bound: an
+  oversized modulus costs every handshake that touches it, and no approved
+  profile needs one.
+
+Only **public** key material is inspected — a certificate's
+`SubjectPublicKeyInfo`, or a JWK's public components. Private keys continue to
+flow through the existing secure loading boundary (`parse_pem_private_key`) and
+are never parsed, copied, or logged by this gate. Diagnostics name the surface,
+the algorithm family, and the observed bit length, and nothing else.
+
+**Peer verification — every independently configurable opt-out**
+
+An unverified peer defeats the point of an approved key exchange: the module can
+perform a perfect ECDHE and it is still a key agreement with whoever answered.
+A gate on the *global* switch alone is exactly the hole a per-surface switch
+walks through, so all of the following are refused:
+
+| Surface | Setting |
+|---|---|
+| Global outbound | `FERRUM_TLS_NO_VERIFY=true` |
+| Admin API client | `FERRUM_ADMIN_TLS_NO_VERIFY=true` |
+| Admin listener transport | `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true` |
+| Mesh stream egress | `FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT=true` |
+| Mesh identity | `FERRUM_MESH_ALLOW_NO_CA`, `FERRUM_MESH_ALLOW_STATIC_ID`, `FERRUM_MESH_CA_BOOTSTRAP_DEV` |
+| Config database | `FERRUM_DB_TLS_MODE=require` (MongoDB `allow_invalid_certificates`), and the `tlsInsecure` / `tlsAllowInvalidCertificates` / `tlsAllowInvalidHostnames` / `tlsDisableOCSPEndpointCheck` URI options in `FERRUM_DB_URL` |
+| Backend, per upstream/proxy | `backend_tls_verify_server_cert: false` (this also covers the mesh `DestinationRule.trafficPolicy.tls.insecureSkipVerify` override, which is projected onto it before admission) |
+| `spec_expose` | `tls_no_verify: true` |
+| `load_testing` | `gateway_tls_no_verify` — refused when `gateway_tls` is on and it is not explicitly `false`, because it **defaults open** |
+| `udp_logging` | `dtls_no_verify: true` |
+| `api_chargeback_sink` | `clickhouse.tls.insecure_skip_verify: true`, `clickhouse.tls.verify_hostname: false` |
+| `mesh_route_dispatch` | `rules[].destination.backend_tls.verify_server_cert: false` |
+| `ai_transcript_audit` | `sink.allow_insecure_loopback: true` |
+
+Two entries are deliberately absent, each with a test that keeps the reasoning
+honest rather than leaving it as a comment:
+
+- `FERRUM_DP_GRPC_TLS_NO_VERIFY` is already refused **unconditionally**, on every
+  build and in every mode, by the ordinary validator. A FIPS rule for it would
+  be unreachable, so instead a test asserts that unconditional rejection still
+  holds — relaxing it fails a FIPS test rather than silently opening a bypass.
+- `kafka_logging`'s `ssl_no_verify` is covered by the refusal of the whole
+  plugin (below). A test pins that relationship so removing the plugin-level
+  rejection cannot orphan the key.
+
+`backend_tls_verify_server_cert: false` is refused **even where it is currently
+inert** — for example on a plaintext backend. That is a deliberate decision, not
+an oversight, and it is tested as such: an `Upstream` carries no scheme of its
+own, so "inert" is a property of its targets and of every proxy referencing it,
+none of which is stable across the hot reload or CP publication this gate exists
+to backstop. The remedy is free and unambiguous — `true` is the schema default
+and a no-op on a plaintext backend. A plugin key whose *enabling sibling* is off
+in the same document (`load_testing` without `gateway_tls`) is not reported,
+because there the gate is a value in the document being admitted rather than an
+inference about a different one.
+
+Diagnostics name entries by their one-based **position** (`upstreams[#3]`),
+never by `id`: an id is operator free text, while a position is enough to find
+the entry and discloses nothing.
 
 **Digests, MACs, and stored passwords**
 
@@ -246,9 +336,10 @@ discharge these:
   private keys, JWT secrets, and PKCS#11 token credentials.
 - **PKCS#11 tokens.** Signing happens inside the operator's HSM, which must carry
   its own validation. Ferrum's mode says nothing about it.
-- **External secret providers** (Vault, AWS, Azure, GCP). Their SDK TLS stacks are
-  not routed through Ferrum's provider. Secrets resolve once at startup, before
-  the gateway serves; the remote KMS/HSM carries its own validation.
+- **Secret delivery.** The cloud secret providers are refused in enforce mode
+  (see §"Deliberately unsupported"), so delivering `_FILE`-backed or direct
+  environment secrets over a transport the operator has validated is the
+  operator's control, not Ferrum's.
 
 ## Source-level crypto inventory
 
@@ -323,15 +414,48 @@ than being allowed to run outside the boundary:
 |---|---|---|
 | `kafka_logging` | librdkafka performs TLS through OpenSSL, which Ferrum cannot route onto the module | `tcp_logging`, `ws_logging`, `http_logging` (all rustls-based) |
 | `soap_ws_security` `rsa-sha1` / `sha1` | SHA-1 is disallowed for signatures (SP 800-131A Rev. 2) | `rsa-sha256` / `sha256` |
-| `EdDSA` JWTs | approved by FIPS 186-5, but not in the algorithm set Ferrum routes through the selected module | ES256/384/512, RS/PS256/384/512, HS256/384/512 |
+| `EdDSA` JWTs | approved by FIPS 186-5, but not in the algorithm set Ferrum routes through the selected module | ES256/384, RS/PS256/384/512, HS256/384/512 |
+| `ES512` JWTs | ECDSA over P-521 is approved, but the selected `jsonwebtoken/aws_lc_rs` backend exposes no P-521 JWS path — its `Algorithm` enum has no such variant | ES256 / ES384 |
 | ChaCha20-Poly1305, X25519 | not an approved AEAD / not an approved SP 800-56A scheme | AES-GCM suites, secp256r1 / secp384r1 |
-| `FERRUM_TLS_NO_VERIFY=true` | an unauthenticated peer defeats the approved key exchange | pin the backend CA |
+| RSA below 2048 bits; DSA, GOST, Ed25519/Ed448/X25519 certificates | SP 800-131A Rev. 2 / FIPS 186-5 | RSA 2048–8192, ECDSA P-256/P-384/P-521 |
+| Any peer-verification opt-out | an unauthenticated peer defeats the approved key exchange | pin the peer's CA (see the table in §"What FIPS mode enforces") |
+| **External secret providers** (`_VAULT`, `_AWS`, `_AZURE`, `_GCP`) | their SDKs resolve secrets over their own TLS stacks, which are not built from Ferrum's provider seam and are not selected by the `crypto-ring` / `fips` feature pair | the `_FILE` suffix, or a direct environment value, backed by an operator-validated delivery mechanism (mounted secret, init container, KMS-backed volume) |
 
-External secret providers (Vault, AWS, Azure, GCP) are **outside the boundary
-rather than refused**: their SDK TLS stacks are not routed through Ferrum's
-provider, but secrets resolve once at startup before the gateway serves, and the
-remote KMS/HSM carries its own validation. This is an operator control, recorded
-in the inventory as `outside-boundary`, not a Ferrum claim.
+### External secret providers: why this changed to a refusal
+
+An earlier revision of this document recorded the cloud secret backends as
+`outside-boundary` — allowed, on the reasoning that secrets resolve once at
+startup before the gateway serves. That was an *implicit* claim that a
+pre-serving TLS session to a credential store does not matter. It does: that
+session carries the gateway's private keys and JWT secrets, and it is the one
+connection whose compromise hands over everything else. Ferrum cannot route
+those SDK stacks onto the selected module and cannot attest to what they use, so
+an enforcing process now refuses them at
+`fips::policy::check_external_secret_sources`, called from
+`main::resolve_startup_secrets` **before any provider client is constructed**.
+
+The `cloud-secrets` build still compiles under `--features fips` and is audited
+in CI for exactly that reason: the refusal is what stands between the
+combination and use, rather than a compile error nobody would recognise as
+policy. `_FILE` remains supported — it is a local filesystem read that performs
+no cryptography and reaches no network peer.
+
+### Optional build profiles
+
+Every optional cargo feature is explicitly claimed or explicitly refused; an
+unlisted feature would be an implicit support claim, so
+`check_claimed_profiles_declared()` fails the build when one appears without a
+decision. The claimed set is enumerated by the checker itself
+(`--list-claimed-profiles`), and CI resolves and audits the feature graph for
+each, then compiles each against the real module:
+
+| Combination | Status under FIPS |
+|---|---|
+| `fips` | Supported |
+| `fips,acme` | Supported — `instant-acme/fips` + `hyper-rustls/fips`; the resolved-graph audit rejects any surviving `instant-acme/ring` |
+| `fips,pkcs11` | Supported — signing happens inside the operator's token, which carries its own validation (`outside-boundary`); Ferrum's local randomness and RSA verification on this path use the selected module, and the PKCS#11 leaf certificate goes through the same key-strength admission |
+| `fips,ebpf` | Supported — the eBPF capture path performs no cryptography |
+| `fips,cloud-secrets` | **Builds, refused at runtime** (above) |
 
 ## Verifying a deployment
 
@@ -379,12 +503,16 @@ To verify the *build* independently of the running process:
 
 ```bash
 # The resolved feature graph must carry aws-lc-rs/fips and rustls/fips, and no
-# ring arm. This is the same audit CI runs.
-cargo tree -e normal,build --prefix none -f '{p}|{f}' --locked \
-  --no-default-features --features fips \
-  > /tmp/tree-fips.txt
-python3 .github/scripts/check_fips_feature_policy.py \
-  --tree /tmp/tree-fips.txt --profile fips
+# ring arm. This is the same audit CI runs, over the same enumerated set of
+# claimed feature combinations — the checker owns that list, so a build cannot
+# be audited under one set and documented under another.
+python3 .github/scripts/check_fips_feature_policy.py --list-claimed-profiles \
+| while IFS=$'\t' read -r label features; do
+    cargo tree -e normal,build --prefix none -f '{p}|{f}' --locked \
+      --no-default-features --features "$features" > /tmp/tree.txt
+    python3 .github/scripts/check_fips_feature_policy.py \
+      --tree /tmp/tree.txt --profile fips || echo "FAILED: $label"
+  done
 ```
 
 The gateway's report and the build audit are useful functional evidence, but

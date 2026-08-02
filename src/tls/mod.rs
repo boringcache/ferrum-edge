@@ -154,6 +154,32 @@ pub(crate) fn parse_pem_certificate_bundle(
         ));
     }
 
+    // Approved key strengths and forms, when FIPS mode is enforced.
+    //
+    // This is the single PEM certificate-loading boundary for frontend, admin,
+    // backend, mesh, DTLS, CP/DP, health-check, SPIFFE, and client-CA material,
+    // which is exactly why the check belongs here rather than at a dozen
+    // construction sites. It is a load/reload path, never the request path.
+    //
+    // Every record in the bundle is checked, including intermediates and trust
+    // anchors: an approved leaf chained to an RSA-1024 issuer is still an
+    // RSA-1024 signature verification. The record index is reported so a
+    // multi-record bundle names the offending entry, and the diagnostic itself
+    // carries no path, subject, or key bytes — `display_source` is deliberately
+    // not interpolated into it.
+    for (index, certificate) in certificates.iter().enumerate() {
+        if let Err(reason) =
+            crate::fips::keys::check_certificate_public_key(certificate.as_ref(), label)
+        {
+            return Err(anyhow::anyhow!(
+                "certificate record #{} of {}: {}",
+                index + 1,
+                label,
+                reason
+            ));
+        }
+    }
+
     Ok(certificates)
 }
 

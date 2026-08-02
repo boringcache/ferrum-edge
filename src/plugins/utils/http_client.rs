@@ -238,6 +238,26 @@ impl PluginTlsPosture {
         Self::FailClosedCaBundle { source_id, reason }
     }
 
+    /// Reduce a builder to a posture that can complete no request.
+    ///
+    /// Reached only when [`crate::fips::ensure_internal_client_crypto_provider`]
+    /// reports that the installed process-default rustls provider is not the
+    /// FIPS-approved one an enforcing process requires. There is no safe client
+    /// to hand back at that point and no error channel to return through —
+    /// these constructors are infallible by design — so the client is made
+    /// inert instead: an empty trust store means no server certificate can be
+    /// verified, and `https_only` means no plaintext fallback is attempted
+    /// either. Every outbound call then fails closed with a transport error,
+    /// which is the same shape callers already handle for an unreachable sink.
+    ///
+    /// Applied *after* the configured posture so a custom CA bundle cannot
+    /// widen it back open.
+    fn apply_inert_crypto_posture(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        builder
+            .https_only(true)
+            .tls_certs_only(Vec::<reqwest::Certificate>::new())
+    }
+
     fn apply(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
         match self {
             Self::PlatformRoots => builder,
@@ -292,7 +312,7 @@ fn build_dns_cached_fallback_client(
     tls_posture: &PluginTlsPosture,
     http2_prior_knowledge: bool,
 ) -> reqwest::Client {
-    crate::fips::ensure_internal_client_crypto_provider();
+    let crypto_provider = crate::fips::ensure_internal_client_crypto_provider();
     // Never auto-follow redirects on a shared outbound client (SSRF posture,
     // matches src/connection_pool.rs and the configured clients above).
     let mut builder = reqwest::Client::builder()
@@ -303,6 +323,15 @@ fn build_dns_cached_fallback_client(
         builder = builder.dns_resolver(Arc::new(resolver));
     }
     builder = tls_posture.apply(builder);
+    if let Err(error) = crypto_provider {
+        tracing::error!(
+            %error,
+            "Refusing to build a usable plugin HTTP client: the process-default crypto provider \
+             is not the FIPS-approved one this enforcing process requires. The client is left \
+             unable to establish any connection."
+        );
+        builder = PluginTlsPosture::apply_inert_crypto_posture(builder);
+    }
     if http2_prior_knowledge {
         builder = builder.http2_prior_knowledge();
     }
@@ -362,7 +391,7 @@ fn build_configured_plugin_client(
     tls_posture: &PluginTlsPosture,
     http2_prior_knowledge: bool,
 ) -> reqwest::Client {
-    crate::fips::ensure_internal_client_crypto_provider();
+    let crypto_provider = crate::fips::ensure_internal_client_crypto_provider();
     let mut builder = reqwest::Client::builder()
         .no_proxy()
         .pool_max_idle_per_host(pool_config.max_idle_per_host)
@@ -393,6 +422,15 @@ fn build_configured_plugin_client(
     //   - invalid custom CA    -> empty trust store (fail closed)
     //   - no CA configured     -> reqwest 0.13 defaults
     builder = tls_posture.apply(builder);
+    if let Err(error) = crypto_provider {
+        tracing::error!(
+            %error,
+            "Refusing to build a usable plugin HTTP client: the process-default crypto provider \
+             is not the FIPS-approved one this enforcing process requires. The client is left \
+             unable to establish any connection."
+        );
+        builder = PluginTlsPosture::apply_inert_crypto_posture(builder);
+    }
 
     if pool_config.enable_http_keep_alive {
         builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));

@@ -300,6 +300,34 @@ pub const INVENTORY: &[CryptoOperation] = &[
         rationale: "scheduling jitter is not a security service; routed through the backend alias \
                     anyway so no second RNG is linked",
     },
+    // ── Key and certificate admission ───────────────────────────────────
+    CryptoOperation {
+        operation: "Approved key strength/form admission for configured certificates \
+                    (frontend, admin, backend, mesh, DTLS, CP/DP, SPIFFE, client CA, \
+                    PKCS#11 leaf, ACME-issued)",
+        location: "src/fips/keys.rs via src/tls/mod.rs::parse_pem_certificate_bundle",
+        implementation: "x509-parser (structural SubjectPublicKeyInfo read; no cryptography)",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "the rustls FIPS provider rejects a non-approved algorithm but not uniformly \
+                    an approved algorithm under an under-strength key, so Ferrum enforces RSA >= \
+                    2048 bits and P-256/P-384/P-521 at the single PEM certificate-loading \
+                    boundary, over every record in a bundle including intermediates and trust \
+                    anchors. A freshly issued ACME certificate reaches the same boundary through \
+                    acme::validate_completed_certificate_pair -> \
+                    tls::check_cert_expiry_from_pem_bytes. Only public SubjectPublicKeyInfo is \
+                    read; private keys stay inside parse_pem_private_key and are never parsed or \
+                    logged here",
+    },
+    CryptoOperation {
+        operation: "Approved key strength/form admission for operator-configured JWKS \
+                    signing keys",
+        location: "src/fips/keys.rs via src/plugins/utils/jwks_store.rs",
+        implementation: "crate::fips::keys (structural public-component check)",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "an RSA JWK below 2048 bits and an EC JWK outside P-256/P-384 are refused at \
+                    JWKS admission, so a configured issuer cannot introduce a weak signing key \
+                    that jsonwebtoken would otherwise accept",
+    },
     // ── Certificates ────────────────────────────────────────────────────
     CryptoOperation {
         operation: "X.509 parsing, expiry, SAN and trust-chain checks",
@@ -339,11 +367,14 @@ pub const INVENTORY: &[CryptoOperation] = &[
         operation: "External secret provider transport (Vault, AWS, Azure, GCP)",
         location: "src/secrets/",
         implementation: "provider SDKs over their own TLS stacks",
-        disposition: Disposition::OutsideBoundary,
-        rationale: "the SDK TLS stacks are not routed through Ferrum's provider; secrets resolve \
-                    once at startup, before the gateway serves, and the remote KMS/HSM carries \
-                    its own validation. Documented in docs/fips.md as an operator control, not a \
-                    Ferrum claim",
+        disposition: Disposition::Rejected,
+        rationale: "fips::policy::check_external_secret_sources refuses the `_VAULT`/`_AWS`/ \
+                    `_AZURE`/`_GCP` suffixes from main::resolve_startup_secrets, before any \
+                    provider client is constructed. The SDK TLS stacks are not built from the \
+                    provider seam and are not selected by the crypto-ring/fips feature pair, so \
+                    Ferrum can neither route nor attest to them — and this is the one session \
+                    that carries every other key. The local `_FILE` suffix and direct environment \
+                    values remain supported",
     },
     // ── Non-approved sinks ──────────────────────────────────────────────
     CryptoOperation {

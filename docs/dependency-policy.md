@@ -461,6 +461,19 @@ Rules:
   `FORBIDDEN_RESOLVED_FIPS` in the policy script. A dependency whose backend is
   unselectable belongs in `src/fips/inventory.rs` as `rejected` or
   `outside-boundary`, with a matching admission rule in `src/fips/policy.rs`.
+- **A new optional cargo feature must be explicitly claimed or explicitly
+  refused.** `CLAIMED_FIPS_PROFILES` (supported and audited) and
+  `CLAIMED_FIPS_PROFILES_UNSUPPORTED_AT_RUNTIME` (builds, refused before use)
+  in the policy script are the inventory; `check_claimed_profiles_declared()`
+  fails when a declared optional feature appears in neither. An unlisted feature
+  would be an implicit FIPS support claim, which is exactly what this gate
+  refuses. CI enumerates the same table through `--list-claimed-profiles`, so
+  the audited set and the compiled set cannot drift apart.
+- **Each feature list must name a dependency's crypto arm exactly once.** A
+  duplicate entry, or a `dep:x` beside an `x/<feature>` edge for the same
+  optional dependency (the `dep/feature` edge already activates it), breaks the
+  position-for-position correspondence the two lists are read under. The
+  manifest check rejects both spellings.
 
 `aws-lc-fips-sys` compiles the FIPS build of AWS-LC from source under a fixed
 recipe (CMake + Go + Perl). That recipe is part of what the module's validation

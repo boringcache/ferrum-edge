@@ -67,18 +67,36 @@ jobs:
           python3 .github/scripts/check_fips_feature_policy.py \
             --tree /tmp/tree-crypto-ring.txt --profile crypto-ring
 
-      - name: Resolve the FIPS feature graph
+      - name: Audit every claimed FIPS feature combination
         # Feature resolution alone does not build `aws-lc-fips-sys`, so this
         # needs no C/Go toolchain. The committed lockfile pins this profile too.
+        #
+        # The combinations are enumerated by the checker itself
+        # (`--list-claimed-profiles`) rather than duplicated in YAML, so a new
+        # optional feature cannot be claimed as FIPS-clean in one place and go
+        # unaudited in the other. `check_claimed_profiles_declared()` in the
+        # static manifest step above additionally fails when an optional cargo
+        # feature is named by no claimed profile at all — an unlisted feature is
+        # an implicit support claim, which is exactly what this gate refuses.
         run: |
-          cargo tree --color never -e normal,build --prefix none \
-            -f '{p}|{f}' --locked \
-            --no-default-features --features fips > /tmp/tree-fips.txt
-
-      - name: Audit the FIPS feature graph
-        run: |
-          python3 .github/scripts/check_fips_feature_policy.py \
-            --tree /tmp/tree-fips.txt --profile fips
+          set -euo pipefail
+          status=0
+          while IFS=$'\t' read -r label features; do
+            [ -n "$features" ] || continue
+            echo "::group::FIPS feature graph — ${label}"
+            slug="$(printf '%s' "$features" | tr ',' '-')"
+            cargo tree --color never -e normal,build --prefix none \
+              -f '{p}|{f}' --locked \
+              --no-default-features --features "$features" \
+              > "/tmp/tree-${slug}.txt"
+            if ! python3 .github/scripts/check_fips_feature_policy.py \
+                --tree "/tmp/tree-${slug}.txt" --profile fips; then
+              echo "::error::FIPS feature-graph audit failed for ${label} (--features ${features})"
+              status=1
+            fi
+            echo "::endgroup::"
+          done < <(python3 .github/scripts/check_fips_feature_policy.py --list-claimed-profiles)
+          exit "$status"
 
   fips-build:
     name: FIPS Build & Test
@@ -110,6 +128,30 @@ jobs:
       - name: Build the FIPS profile
         run: cargo build --locked --no-default-features --features fips --bin ferrum-edge
 
+      - name: Compile every crypto-relevant optional FIPS combination
+        # `aws-lc-fips-sys` is already compiled by the step above and lives in
+        # the same target directory, so these reuse it and cost roughly one
+        # incremental check each. That is what keeps enumerating the claimed
+        # profiles affordable rather than a matrix of full builds.
+        #
+        # `cargo check` is deliberate: the question here is whether the
+        # combination's cryptography compiles against the selected module, not
+        # whether it links a second binary. Linking is proven once, above.
+        #
+        # `cloud-secrets` is included even though it is REFUSED at runtime: the
+        # combination must still build, so the refusal is what stands between it
+        # and use rather than a compile error nobody would recognise as policy.
+        # `fips_external_secret_tests` proves the refusal itself.
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r label features; do
+            [ -n "$features" ] || continue
+            echo "::group::cargo check — ${label}"
+            cargo check --locked --no-default-features --features "$features" \
+              --lib --bins
+            echo "::endgroup::"
+          done < <(python3 .github/scripts/check_fips_feature_policy.py --list-claimed-profiles)
+
       - name: Lint the FIPS profile
         run: |
           cargo clippy --locked --no-default-features --features fips \
@@ -119,6 +161,11 @@ jobs:
         run: |
           cargo test --locked --no-default-features --features fips \
             --test unit_tests tls::fips_policy_tests
+
+      - name: FIPS key-admission and peer-verification tests
+        run: |
+          cargo test --locked --no-default-features --features fips \
+            --test unit_tests tls::fips_key_admission_tests
 
       - name: FIPS frontend, backend, and CP/DP TLS handshakes
         run: |

@@ -1642,10 +1642,7 @@ impl Plugin for GraphqlPlugin {
 /// hash because a collision would let a transformed operation reuse the admitted
 /// one's decision.
 fn graphql_envelope_digest(envelope: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(envelope);
-    hasher.finalize().into()
+    crate::fips::approved::Sha256::digest(envelope)
 }
 
 impl GraphqlPlugin {

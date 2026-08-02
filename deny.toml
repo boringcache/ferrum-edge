@@ -85,8 +85,11 @@ ignore = [
 # module is reachable through the API. That is the upstream-supported shape;
 # `.github/scripts/check_fips_feature_policy.py` is what asserts it rather than
 # assuming it. Both crates come from crates.io, so the `[sources]` gate below
-# covers them unchanged, and the FIPS profile is not part of the committed
-# `Cargo.lock` (see docs/dependency-policy.md → "FIPS build profile").
+# covers them unchanged. The committed `Cargo.lock` pins BOTH profiles,
+# including `aws-lc-fips-sys`, so every FIPS resolve and build runs `--locked`
+# (see docs/dependency-policy.md → "FIPS build profile"). A lockfile entry does
+# not compile or link that package into an ordinary artifact; feature selection
+# still controls the build.
 multiple-versions = "warn"
 # Block `*` registry version requirements (an unpinned-dependency supply-chain
 # risk). The only wildcard in the tree is the in-repo workspace path dep

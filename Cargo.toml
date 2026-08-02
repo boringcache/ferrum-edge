@@ -375,8 +375,13 @@ crypto-ring = [
 # module Ferrum's cryptography is routed through; validation, the operating
 # environment, and the deployment controls are the operator's, and are
 # documented in docs/fips.md.
+# NOTE: there is deliberately no `dep:aws-lc-rs` entry. `aws-lc-rs/fips` on an
+# optional dependency already enables that dependency, so listing both was a
+# duplicate activation of the same optional dep — harmless to cargo, but it made
+# the list read as if the dep and its FIPS arm were independently selectable,
+# which is exactly the confusion this profile cannot afford. `crypto-ring` still
+# needs its explicit `dep:ring` because `ring` has no feature to enable through.
 fips = [
-    "dep:aws-lc-rs",
     "aws-lc-rs/fips",
     "rustls/fips",
     "tokio-rustls/fips",

@@ -1054,13 +1054,12 @@ impl Waf {
 /// Used only to answer "did anything change since this instance last scanned?" —
 /// it is never logged, exported, or compared against attacker-supplied input.
 fn response_header_map_digest(headers: &HashMap<String, String>) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
     let mut canonical: Vec<(String, &str)> = headers
         .iter()
         .map(|(name, value)| (name.to_ascii_lowercase(), value.as_str()))
         .collect();
     canonical.sort_unstable();
-    let mut hasher = Sha256::new();
+    let mut hasher = crate::fips::approved::Sha256::new();
     hasher.update((canonical.len() as u64).to_le_bytes());
     for (name, value) in &canonical {
         hasher.update((name.len() as u64).to_le_bytes());
@@ -1068,7 +1067,7 @@ fn response_header_map_digest(headers: &HashMap<String, String>) -> [u8; 32] {
         hasher.update((value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
     }
-    hasher.finalize().into()
+    hasher.finalize()
 }
 
 #[async_trait]
