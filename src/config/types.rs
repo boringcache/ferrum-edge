@@ -4973,16 +4973,12 @@ impl GatewayConfig {
             }
 
             let all_passthrough = proxies_on_port.iter().all(|p| p.passthrough);
-            let stream_match_group = proxies_on_port.iter().all(|p| {
-                matches!(
-                    p.dispatch_kind,
-                    DispatchKind::TcpRaw | DispatchKind::TcpTls
-                )
-            }) && proxies_on_port.iter().any(|p| {
-                p.stream_match
-                    .as_ref()
-                    .is_some_and(|m| !m.is_empty())
-            });
+            let stream_match_group = proxies_on_port
+                .iter()
+                .all(|p| matches!(p.dispatch_kind, DispatchKind::TcpRaw | DispatchKind::TcpTls))
+                && proxies_on_port
+                    .iter()
+                    .any(|p| p.stream_match.as_ref().is_some_and(|m| !m.is_empty()));
 
             if !all_passthrough && !stream_match_group {
                 let non_pt: Vec<&str> = proxies_on_port

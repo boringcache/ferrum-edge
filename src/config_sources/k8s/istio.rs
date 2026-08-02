@@ -2444,9 +2444,7 @@ fn parse_l4_match_arm(
         if labels.is_empty() {
             return Err(invalid_resource(
                 object,
-                format!(
-                    "VirtualService {kind}[] match.sourceLabels must not be empty when set"
-                ),
+                format!("VirtualService {kind}[] match.sourceLabels must not be empty when set"),
             ));
         }
         for (key, value) in labels {
@@ -2461,9 +2459,7 @@ fn parse_l4_match_arm(
             let Some(value) = value.as_str() else {
                 return Err(invalid_resource(
                     object,
-                    format!(
-                        "VirtualService {kind}[] match.sourceLabels['{key}'] must be a string"
-                    ),
+                    format!("VirtualService {kind}[] match.sourceLabels['{key}'] must be a string"),
                 ));
             };
             if !valid_kubernetes_label_value(value) {
@@ -2482,17 +2478,13 @@ fn parse_l4_match_arm(
         let Some(ns) = ns_val.as_str() else {
             return Err(invalid_resource(
                 object,
-                format!(
-                    "VirtualService {kind}[] match.sourceNamespace must be a string"
-                ),
+                format!("VirtualService {kind}[] match.sourceNamespace must be a string"),
             ));
         };
         if ns.is_empty() || ns.chars().all(char::is_whitespace) {
             return Err(invalid_resource(
                 object,
-                format!(
-                    "VirtualService {kind}[] match.sourceNamespace must not be empty"
-                ),
+                format!("VirtualService {kind}[] match.sourceNamespace must not be empty"),
             ));
         }
         crate::config::types::validate_namespace(ns).map_err(|e| {
@@ -2526,9 +2518,7 @@ fn parse_l4_match_arm(
         if arr.is_empty() {
             return Err(invalid_resource(
                 object,
-                format!(
-                    "VirtualService {kind}[] match.gateways must not be empty when set"
-                ),
+                format!("VirtualService {kind}[] match.gateways must not be empty when set"),
             ));
         }
         let mut out = Vec::with_capacity(arr.len());
@@ -2536,13 +2526,11 @@ fn parse_l4_match_arm(
             let Some(raw) = entry.as_str() else {
                 return Err(invalid_resource(
                     object,
-                    format!(
-                        "VirtualService {kind}[] match.gateways[{i}] must be a string"
-                    ),
+                    format!("VirtualService {kind}[] match.gateways[{i}] must be a string"),
                 ));
             };
-            let canonical = canonicalize_gateway_name(raw, &object.metadata.namespace)
-                .map_err(|e| {
+            let canonical =
+                canonicalize_gateway_name(raw, &object.metadata.namespace).map_err(|e| {
                     invalid_resource(
                         object,
                         format!("VirtualService {kind}[] match.gateways[{i}]: {e}"),
@@ -2554,12 +2542,9 @@ fn parse_l4_match_arm(
     } else if !vs_gateways.is_empty() {
         let mut out = Vec::with_capacity(vs_gateways.len());
         for (i, raw) in vs_gateways.iter().enumerate() {
-            let canonical = canonicalize_gateway_name(raw, &object.metadata.namespace)
-                .map_err(|e| {
-                    invalid_resource(
-                        object,
-                        format!("VirtualService spec.gateways[{i}]: {e}"),
-                    )
+            let canonical =
+                canonicalize_gateway_name(raw, &object.metadata.namespace).map_err(|e| {
+                    invalid_resource(object, format!("VirtualService spec.gateways[{i}]: {e}"))
                 })?;
             out.push(canonical);
         }
@@ -2620,9 +2605,8 @@ fn attach_l4_stream_match(
     arm: Option<crate::proxy::stream_match::StreamMatchArm>,
 ) {
     if let Some(arm) = arm {
-        proxy.stream_match = Some(crate::proxy::stream_match::StreamMatchCriteria {
-            arms: vec![arm],
-        });
+        proxy.stream_match =
+            Some(crate::proxy::stream_match::StreamMatchCriteria { arms: vec![arm] });
     }
 }
 
@@ -10271,7 +10255,10 @@ extensionProviders:
             .find(|p| p.listen_port == Some(3306))
             .expect("tcp proxy");
         let arm = &proxy.stream_match.as_ref().unwrap().arms[0];
-        assert_eq!(arm.source_labels.get("app").map(String::as_str), Some("billing"));
+        assert_eq!(
+            arm.source_labels.get("app").map(String::as_str),
+            Some("billing")
+        );
         assert_eq!(arm.source_namespace.as_deref(), Some("prod"));
         assert_eq!(arm.source_subnets, vec!["10.1.0.0/16".to_string()]);
         assert_eq!(arm.destination_subnets, vec!["10.2.0.0/16".to_string()]);
@@ -10294,10 +10281,7 @@ extensionProviders:
             options(),
         )
         .expect_err("bad CIDR must fail closed");
-        assert!(
-            format!("{err}").contains("sourceSubnets"),
-            "got {err}"
-        );
+        assert!(format!("{err}").contains("sourceSubnets"), "got {err}");
     }
 
     #[test]

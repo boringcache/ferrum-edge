@@ -2747,14 +2747,14 @@ fn mesh_tier3_l4_virtual_service_source_labels_materialize_stream_match() {
         .expect("sourceLabels must project onto stream_match");
     assert_eq!(criteria.arms.len(), 1);
     assert_eq!(
-        criteria.arms[0].source_labels.get("app").map(String::as_str),
+        criteria.arms[0]
+            .source_labels
+            .get("app")
+            .map(String::as_str),
         Some("billing")
     );
     assert!(
-        criteria.arms[0]
-            .gateways
-            .iter()
-            .any(|g| g == "mesh"),
+        criteria.arms[0].gateways.iter().any(|g| g == "mesh"),
         "omitted gateways default to mesh"
     );
 }

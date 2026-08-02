@@ -220,10 +220,7 @@ pub fn resolve_shared_stream_proxy_in_epoch(
             let Some(proxy) = epoch.proxy_by_namespaced_id(&id.namespace, &id.id) else {
                 continue;
             };
-            let configured = proxy
-                .stream_match
-                .as_ref()
-                .is_some_and(|c| !c.is_empty());
+            let configured = proxy.stream_match.as_ref().is_some_and(|c| !c.is_empty());
             if configured {
                 match proxy.compiled_stream_match.as_ref() {
                     Some(matcher) if matcher.matches(evidence) => {}
@@ -316,7 +313,11 @@ impl CompiledStreamMatchArm {
             let Some(binding) = evidence.trusted_gateway_ref else {
                 return false;
             };
-            if !self.gateways.iter().any(|g| gateway_names_equal(g, binding)) {
+            if !self
+                .gateways
+                .iter()
+                .any(|g| gateway_names_equal(g, binding))
+            {
                 return false;
             }
         }
@@ -327,7 +328,10 @@ impl CompiledStreamMatchArm {
 /// Trustworthy connection / workload evidence for L4 match evaluation.
 ///
 /// All fields are optional; predicates that need a missing field deny.
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// Manual [`Debug`]: `&dyn SourceLabelLookup` is not `Debug`, and deriving
+/// would force an object-safe `Debug` supertrait on every label map.
+#[derive(Clone, Copy, Default)]
 pub struct StreamMatchEvidence<'a> {
     /// Socket-peer / direct client IP (`source.ip`). Never from client headers.
     pub source_ip: Option<IpAddr>,
@@ -340,6 +344,21 @@ pub struct StreamMatchEvidence<'a> {
     /// Listener-configured gateway binding (`mesh` or `namespace/name`).
     /// Never inferred from untrusted wire data.
     pub trusted_gateway_ref: Option<&'a str>,
+}
+
+impl std::fmt::Debug for StreamMatchEvidence<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamMatchEvidence")
+            .field("source_ip", &self.source_ip)
+            .field("destination_ip", &self.destination_ip)
+            .field("source_namespace", &self.source_namespace)
+            .field(
+                "source_labels",
+                &self.source_labels.map(|_| "<SourceLabelLookup>"),
+            )
+            .field("trusted_gateway_ref", &self.trusted_gateway_ref)
+            .finish()
+    }
 }
 
 /// Label lookup used by `sourceLabels` matching without forcing a concrete map
@@ -636,7 +655,10 @@ mod tests {
             canonicalize_gateway_name("istio-system/ingress", "default").unwrap(),
             "istio-system/ingress"
         );
-        assert_eq!(canonicalize_gateway_name("mesh", "default").unwrap(), "mesh");
+        assert_eq!(
+            canonicalize_gateway_name("mesh", "default").unwrap(),
+            "mesh"
+        );
     }
 
     #[test]

@@ -465,7 +465,10 @@ fn vs_l4_stream_match_predicates() {
         .as_ref()
         .expect("stream_match projected")
         .arms[0];
-    assert_eq!(arm.source_labels.get("app").map(String::as_str), Some("billing"));
+    assert_eq!(
+        arm.source_labels.get("app").map(String::as_str),
+        Some("billing")
+    );
     assert_eq!(arm.source_namespace.as_deref(), Some("prod"));
     assert_eq!(arm.source_subnets, vec!["10.0.0.0/8".to_string()]);
     assert_eq!(arm.destination_subnets, vec!["192.168.0.0/16".to_string()]);
@@ -482,10 +485,7 @@ fn vs_l4_stream_match_predicates() {
         options(),
     )
     .expect_err("malformed sourceSubnets must fail closed");
-    assert!(
-        format!("{err}").contains("sourceSubnets"),
-        "got {err}"
-    );
+    assert!(format!("{err}").contains("sourceSubnets"), "got {err}");
 }
 
 /// VS predicate: `uri.exact`. The translator collapses this onto a single
