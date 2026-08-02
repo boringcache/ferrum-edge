@@ -75,41 +75,6 @@ fn event_stream_crc32(bytes: &[u8]) -> u32 {
     crc32fast::hash(bytes)
 }
 
-/// Build one standards-correct `application/vnd.amazon.eventstream` message
-/// with valid prelude and message CRC32 checksums.
-///
-/// Prelude CRC covers the first eight bytes (`total_length` + `headers_length`).
-/// Message CRC covers every byte except the final four-byte checksum field.
-pub(crate) fn encode_aws_event_stream_message(headers: &[u8], payload: &[u8]) -> Vec<u8> {
-    let total = EVENT_STREAM_PRELUDE_LEN
-        .saturating_add(headers.len())
-        .saturating_add(payload.len())
-        .saturating_add(EVENT_STREAM_MESSAGE_CRC_LEN);
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&encode_aws_event_stream_prelude(
-        total as u32,
-        headers.len() as u32,
-    ));
-    out.extend_from_slice(headers);
-    out.extend_from_slice(payload);
-    let message_crc = event_stream_crc32(&out);
-    out.extend_from_slice(&message_crc.to_be_bytes());
-    out
-}
-
-/// Twelve-byte AWS event-stream prelude with a valid prelude CRC32.
-///
-/// Used by tests (and the message builder) to construct oversized or
-/// length-hostile frames whose declared length is trusted only after CRC.
-pub(crate) fn encode_aws_event_stream_prelude(total_length: u32, headers_length: u32) -> [u8; 12] {
-    let mut prelude = [0u8; 12];
-    prelude[0..4].copy_from_slice(&total_length.to_be_bytes());
-    prelude[4..8].copy_from_slice(&headers_length.to_be_bytes());
-    let prelude_crc = event_stream_crc32(&prelude[0..8]);
-    prelude[8..12].copy_from_slice(&prelude_crc.to_be_bytes());
-    prelude
-}
-
 /// True for the AWS event-stream media type (parameters tolerated).
 pub fn is_aws_event_stream_content_type(content_type: &str) -> bool {
     content_type

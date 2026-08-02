@@ -1073,7 +1073,7 @@ fn ai_request_ctx(max_tokens: u64, prompt: &str) -> RequestContext {
 }
 
 fn reserved_tokens(ctx: &RequestContext) -> u64 {
-    scoped_meta(&ctx, "ai_ratelimit_reserved_tokens")
+    scoped_meta(ctx, "ai_ratelimit_reserved_tokens")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0)
 }
@@ -6143,9 +6143,10 @@ async fn expose_headers_lifecycle_positive_delta_charges_extra() {
 
 #[tokio::test]
 async fn expose_headers_non_2xx_release_refreshes_remaining() {
-    // Non-2xx releases the reservation in on_response_body after after_proxy
-    // already copied admission headers. Final usage/remaining must show the
-    // released bucket (zero charged for this request).
+    // Non-2xx releases the reservation in after_proxy (status-only; must not
+    // depend on collecting a body this plugin no longer pins). Final
+    // usage/remaining must show the released bucket (zero charged). A later
+    // on_response_body pass is an idempotent no-op that keeps those headers.
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 1000,
@@ -6162,7 +6163,6 @@ async fn expose_headers_non_2xx_release_refreshes_remaining() {
     assert_continue(plugin.before_proxy(&mut ctx, &mut request_headers).await);
     let reserved = reserved_tokens(&ctx);
     assert!(reserved > 0);
-    let reserved_str = reserved.to_string();
 
     let mut response_headers = HashMap::new();
     assert_continue(
@@ -6174,8 +6174,17 @@ async fn expose_headers_non_2xx_release_refreshes_remaining() {
         response_headers
             .get("x-ai-ratelimit-usage")
             .map(String::as_str),
-        Some(reserved_str.as_str())
+        Some("0"),
+        "after_proxy non-2xx release must refresh usage to the post-release bucket"
     );
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-remaining")
+            .map(String::as_str),
+        Some("1000"),
+        "after_proxy non-2xx release must refresh remaining to the full budget"
+    );
+    assert_eq!(observed_usage(&plugin).await, 0);
 
     assert_continue(
         plugin
@@ -6192,7 +6201,7 @@ async fn expose_headers_non_2xx_release_refreshes_remaining() {
             .get("x-ai-ratelimit-usage")
             .map(String::as_str),
         Some("0"),
-        "non-2xx release must refresh usage to the post-release bucket"
+        "idempotent body pass must keep the post-release usage header"
     );
     assert_eq!(
         response_headers

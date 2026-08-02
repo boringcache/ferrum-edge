@@ -1445,6 +1445,7 @@ dependencies = [
  "clap",
  "crossbeam-queue",
  "crossbeam-utils",
+ "crc32fast",
  "dashmap",
  "dimpl",
  "ferrum-ebpf-common",

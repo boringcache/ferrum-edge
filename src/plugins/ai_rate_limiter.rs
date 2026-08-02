@@ -999,13 +999,12 @@ impl AiRateLimiter {
         // response), or the federation `after_proxy` branch (itself guarded by the
         // per-instance federation-recorded flag). A response is either buffered or
         // streamed, never both, and federation traffic is excluded from the other
-        // two by their own guards. It must NOT
-        // consult or set the release-dedup marker below: `adjust_usage` advances
-        // the sliding window's running-sum/eviction bookkeeping (via
-        // `current_usage`), so suppressing it would silently drop a legitimate
-        // usage record and corrupt the window accounting. The release dedup is
-        // exclusively about the duplicate *release* of a reservation
-        // (`actual_tokens == None`), not about charging real usage.
+        // two by their own guards. It must NOT *consult* the release-dedup marker
+        // below before charging: `adjust_usage` advances the sliding window's
+        // running-sum/eviction bookkeeping (via `current_usage`), so suppressing a
+        // legitimate usage record would corrupt the window accounting. After a
+        // successful charge, though, the marker IS set so a later release path
+        // (`actual_tokens == None`) cannot double-adjust the same reservation.
         if let Some(actual_tokens) = actual_tokens {
             ctx.metadata
                 .insert(self.keys.actual_tokens.clone(), actual_tokens.to_string());
@@ -1035,7 +1034,8 @@ impl AiRateLimiter {
                 //
                 // No warning here: the failover backend already emits one
                 // bounded operational warning per outage, and this path runs
-                // once per request.
+                // once per request. Leave the release marker unset so a later
+                // retryable path can still attempt reconciliation.
                 if outcome.enforcement_unavailable {
                     if (200..300).contains(&response_status) {
                         return self.reject_enforcement_unavailable();
@@ -1048,6 +1048,11 @@ impl AiRateLimiter {
                 // not the pre-request admission estimate (#2261).
                 self.store_metadata(ctx, &outcome);
             }
+            // Authoritative charge consumed this reservation's lifecycle: mark
+            // it reconciled so a subsequent release (gateway rejection, non-2xx
+            // body hook, streamed unmetered policy) is a clean no-op.
+            ctx.metadata
+                .insert(self.keys.reservation_released.clone(), "true".to_string());
             return PluginResult::Continue;
         }
 
@@ -2791,8 +2796,9 @@ impl Plugin for AiRateLimiter {
             let result = self
                 .reconcile_usage(ctx, response_status, None, "non_2xx_response")
                 .await;
-            // `after_proxy` already copied admission-time usage/remaining; refresh
-            // the client-visible map now that the reservation was released.
+            // `after_proxy` already released (or will no-op on the marker) and
+            // refreshed expose headers; re-apply so a body-hook-only caller still
+            // sees the post-release bucket.
             if matches!(result, PluginResult::Continue) {
                 self.apply_exposed_headers(ctx, response_headers);
             }

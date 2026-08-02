@@ -5977,8 +5977,26 @@ pub mod _test_support {
 
     /// Build one standards-correct AWS event-stream message for external
     /// gateway tests without exposing a production message-construction API.
+    ///
+    /// Encoding lives here (not in the production parser module) so the binary
+    /// target does not carry test-only constructors as dead code.
     pub fn encode_aws_event_stream_message_for_test(headers: &[u8], payload: &[u8]) -> Vec<u8> {
-        crate::plugins::utils::ai_usage_stream::encode_aws_event_stream_message(headers, payload)
+        const PRELUDE_LEN: usize = 12;
+        const MESSAGE_CRC_LEN: usize = 4;
+        let total = PRELUDE_LEN
+            .saturating_add(headers.len())
+            .saturating_add(payload.len())
+            .saturating_add(MESSAGE_CRC_LEN);
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(&encode_aws_event_stream_prelude_for_test(
+            total as u32,
+            headers.len() as u32,
+        ));
+        out.extend_from_slice(headers);
+        out.extend_from_slice(payload);
+        let message_crc = crc32fast::hash(&out);
+        out.extend_from_slice(&message_crc.to_be_bytes());
+        out
     }
 
     /// Build the CRC-valid twelve-byte AWS event-stream prelude used by hostile
@@ -5987,10 +6005,12 @@ pub mod _test_support {
         total_length: u32,
         headers_length: u32,
     ) -> [u8; 12] {
-        crate::plugins::utils::ai_usage_stream::encode_aws_event_stream_prelude(
-            total_length,
-            headers_length,
-        )
+        let mut prelude = [0u8; 12];
+        prelude[0..4].copy_from_slice(&total_length.to_be_bytes());
+        prelude[4..8].copy_from_slice(&headers_length.to_be_bytes());
+        let prelude_crc = crc32fast::hash(&prelude[0..8]);
+        prelude[8..12].copy_from_slice(&prelude_crc.to_be_bytes());
+        prelude
     }
 
     pub fn mesh_tcp_egress_connection_accounting_for_test(

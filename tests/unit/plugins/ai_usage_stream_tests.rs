@@ -350,7 +350,7 @@ fn corrupt_prelude_crc_rejects_declared_length_before_skip_or_parse() {
     let mut stream = Vec::new();
     stream.extend_from_slice(&prelude);
     // Hostile remainder that would be skipped if the corrupt length were trusted.
-    stream.extend_from_slice(&vec![0x41; 64]);
+    stream.extend_from_slice(&[0x41; 64]);
     stream.extend_from_slice(&bedrock_invoke_chunk(json!({
         "amazon-bedrock-invocationMetrics": {"inputTokenCount": 2, "outputTokenCount": 3}
     })));
