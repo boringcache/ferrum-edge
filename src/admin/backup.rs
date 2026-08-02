@@ -14,22 +14,81 @@ use crate::config::types::{
 /// remain restorable via the explicit deletion-confirmation preflight.
 pub(crate) const API_SPECS_BACKUP_SECTION_VERSION: &str = "1";
 
-pub(crate) fn parse_backup_resources(query: Option<&str>) -> Option<HashSet<&str>> {
-    let query = query?;
+/// Stable client text when `resources=` contains an unsupported token.
+/// Never echoes the rejected token.
+pub(crate) const BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR: &str =
+    "Unsupported backup resource filter";
+
+/// Structurally malformed `resources` query parameter (key-only, duplicate, or
+/// otherwise ambiguous). Distinct from an absent parameter and from a present
+/// filter that merely contains unknown allow-list tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BackupResourcesQueryMalformed;
+
+/// Parse the optional `resources` query parameter.
+///
+/// - Parameter absent → `Ok(None)` (unfiltered export)
+/// - Single well-formed `resources=<csv>` → `Ok(Some(set))` (may still fail
+///   allow-list / dependency validation later)
+/// - Key-only (`?resources`), duplicate/ambiguous occurrences, or other
+///   structural malformation → `Err` (fail closed; never widen to unfiltered)
+pub(crate) fn parse_backup_resources(
+    query: Option<&str>,
+) -> Result<Option<HashSet<&str>>, BackupResourcesQueryMalformed> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+
+    let mut found_value: Option<&str> = None;
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');
-        if let (Some(key), Some(val)) = (parts.next(), parts.next())
-            && key == "resources"
-        {
-            return Some(
-                val.split(',')
-                    .map(str::trim)
-                    .filter(|resource| !resource.is_empty())
-                    .collect(),
-            );
+        let Some(key) = parts.next() else {
+            continue;
+        };
+        if key != "resources" {
+            continue;
         }
+        let Some(val) = parts.next() else {
+            // Key-only `resources` (no `=`) is structurally malformed.
+            return Err(BackupResourcesQueryMalformed);
+        };
+        if found_value.is_some() {
+            // Duplicate/ambiguous `resources` occurrences fail closed.
+            return Err(BackupResourcesQueryMalformed);
+        }
+        found_value = Some(val);
     }
-    None
+
+    match found_value {
+        None => Ok(None),
+        Some(val) => Ok(Some(
+            val.split(',')
+                .map(str::trim)
+                .filter(|resource| !resource.is_empty())
+                .collect(),
+        )),
+    }
+}
+
+/// Fail closed when any `resources=` token is outside the closed allow-list.
+///
+/// Client text is static and never echoes the rejected token. Unknown tokens
+/// must also never reach audit persistence (see
+/// [`crate::admin::audit::backup_resources_audit_value`]).
+pub(crate) fn validate_backup_resources_allowlist(
+    filter: Option<&HashSet<&str>>,
+) -> Result<(), &'static str> {
+    let Some(filter) = filter else {
+        return Ok(());
+    };
+    if filter
+        .iter()
+        .copied()
+        .any(|name| !crate::admin::audit::is_canonical_backup_resource(name))
+    {
+        return Err(BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR);
+    }
+    Ok(())
 }
 
 /// Stable error when a filtered backup requests `api_specs` without the
@@ -788,15 +847,16 @@ mod tests {
 
     #[test]
     fn parse_backup_resources_absent_query_is_unfiltered() {
-        assert!(parse_backup_resources(None).is_none());
-        assert!(parse_backup_resources(Some("page=1")).is_none());
+        assert_eq!(parse_backup_resources(None), Ok(None));
+        assert_eq!(parse_backup_resources(Some("page=1")), Ok(None));
     }
 
     #[test]
     fn parse_backup_resources_trims_and_ignores_empty_tokens() {
         let resources =
             parse_backup_resources(Some("download=true&resources=proxies, upstreams,,"))
-                .expect("resources filter should parse");
+                .expect("resources filter should parse")
+                .expect("resources filter should be present");
 
         assert!(resources.contains("proxies"));
         assert!(resources.contains("upstreams"));
@@ -804,30 +864,93 @@ mod tests {
     }
 
     #[test]
+    fn parse_backup_resources_key_only_is_malformed() {
+        assert_eq!(
+            parse_backup_resources(Some("resources")),
+            Err(BackupResourcesQueryMalformed)
+        );
+        assert_eq!(
+            parse_backup_resources(Some("download=true&resources")),
+            Err(BackupResourcesQueryMalformed)
+        );
+        assert_eq!(
+            parse_backup_resources(Some("resources&page=1")),
+            Err(BackupResourcesQueryMalformed)
+        );
+    }
+
+    #[test]
+    fn parse_backup_resources_duplicate_occurrences_are_malformed() {
+        assert_eq!(
+            parse_backup_resources(Some("resources=proxies&resources=consumers")),
+            Err(BackupResourcesQueryMalformed)
+        );
+        assert_eq!(
+            parse_backup_resources(Some("resources=proxies&resources=proxies")),
+            Err(BackupResourcesQueryMalformed)
+        );
+        assert_eq!(
+            parse_backup_resources(Some("resources=proxies&resources")),
+            Err(BackupResourcesQueryMalformed)
+        );
+    }
+
+    #[test]
+    fn parse_backup_resources_empty_value_is_present_empty_filter() {
+        let empty = parse_backup_resources(Some("resources="))
+            .expect("empty value is structurally valid")
+            .expect("parameter present");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn validate_backup_resources_allowlist_rejects_unknown_without_echoing() {
+        assert!(validate_backup_resources_allowlist(None).is_ok());
+        let known = parse_backup_resources(Some("resources=proxies,consumers"))
+            .expect("parse known")
+            .expect("present");
+        assert!(validate_backup_resources_allowlist(Some(&known)).is_ok());
+
+        let unknown =
+            parse_backup_resources(Some("resources=proxies,canary-secret-token-never-echoed"))
+                .expect("parse unknown")
+                .expect("present");
+        assert_eq!(
+            validate_backup_resources_allowlist(Some(&unknown)),
+            Err(BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR)
+        );
+        assert!(!BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR.contains("canary"));
+    }
+
+    #[test]
     fn validate_backup_api_specs_resource_filter_accepts_no_filter_and_non_spec_filters() {
         assert!(validate_backup_api_specs_resource_filter(None).is_ok());
 
-        let proxies_only =
-            parse_backup_resources(Some("resources=proxies")).expect("parse proxies");
+        let proxies_only = parse_backup_resources(Some("resources=proxies"))
+            .expect("parse proxies")
+            .expect("present");
         assert!(validate_backup_api_specs_resource_filter(Some(&proxies_only)).is_ok());
 
         let without_specs =
             parse_backup_resources(Some("resources=proxies,consumers,plugin_configs,upstreams"))
-                .expect("parse without api_specs");
+                .expect("parse without api_specs")
+                .expect("present");
         assert!(validate_backup_api_specs_resource_filter(Some(&without_specs)).is_ok());
     }
 
     #[test]
     fn validate_backup_api_specs_resource_filter_requires_owning_resource_classes() {
-        let api_specs_only =
-            parse_backup_resources(Some("resources=api_specs")).expect("parse api_specs");
+        let api_specs_only = parse_backup_resources(Some("resources=api_specs"))
+            .expect("parse api_specs")
+            .expect("present");
         assert_eq!(
             validate_backup_api_specs_resource_filter(Some(&api_specs_only)),
             Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR)
         );
 
         let missing_plugins = parse_backup_resources(Some("resources=api_specs,proxies,upstreams"))
-            .expect("parse missing plugin_configs");
+            .expect("parse missing plugin_configs")
+            .expect("present");
         assert_eq!(
             validate_backup_api_specs_resource_filter(Some(&missing_plugins)),
             Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR)
@@ -835,7 +958,8 @@ mod tests {
 
         let missing_upstreams =
             parse_backup_resources(Some("resources=api_specs,proxies,plugin_configs"))
-                .expect("parse missing upstreams");
+                .expect("parse missing upstreams")
+                .expect("present");
         assert_eq!(
             validate_backup_api_specs_resource_filter(Some(&missing_upstreams)),
             Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR)
@@ -843,7 +967,8 @@ mod tests {
 
         let missing_proxies =
             parse_backup_resources(Some("resources=api_specs,upstreams,plugin_configs"))
-                .expect("parse missing proxies");
+                .expect("parse missing proxies")
+                .expect("present");
         assert_eq!(
             validate_backup_api_specs_resource_filter(Some(&missing_proxies)),
             Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR)
@@ -855,13 +980,15 @@ mod tests {
         let complete = parse_backup_resources(Some(
             "resources= plugin_configs ,api_specs, proxies , upstreams ",
         ))
-        .expect("parse complete filter with whitespace");
+        .expect("parse complete filter with whitespace")
+        .expect("present");
         assert!(validate_backup_api_specs_resource_filter(Some(&complete)).is_ok());
 
         let with_consumers = parse_backup_resources(Some(
             "resources=api_specs,proxies,upstreams,plugin_configs,consumers",
         ))
-        .expect("parse with optional consumers");
+        .expect("parse with optional consumers")
+        .expect("present");
         assert!(validate_backup_api_specs_resource_filter(Some(&with_consumers)).is_ok());
     }
 
