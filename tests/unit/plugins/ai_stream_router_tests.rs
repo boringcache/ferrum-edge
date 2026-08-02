@@ -558,6 +558,28 @@ async fn test_non_post_continues() {
 }
 
 #[tokio::test]
+async fn test_claim_keeps_final_body_context_after_content_type_transform() {
+    let plugin = build(openai_and_anthropic_config());
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(ferrum_edge::_test_support::request_has_ai_stream_router_claim_for_test(&ctx));
+
+    // A later request_transformer can relabel the effective outbound body
+    // before the dispatcher recomputes final body requirements. The private
+    // claim must keep contextual final revalidation selected; the router's
+    // boundary policy will restore application/json before body transforms.
+    ctx.headers
+        .insert("content-type".to_string(), "text/plain".to_string());
+    assert!(plugin.should_buffer_request_body(&ctx));
+}
+
+#[tokio::test]
 async fn test_streaming_missing_model_rejects_by_default() {
     let plugin = build(openai_and_anthropic_config());
     let body = json!({"stream": true, "messages": [{"role": "user", "content": "hi"}]});
