@@ -289,10 +289,7 @@ impl Plugin for RepresentationBearingRejectFinalBodyPolicy {
         ferrum_edge::plugins::PluginResult::Reject {
             status_code: 502,
             body: r#"{"error":"json representation refused"}"#.to_string(),
-            headers: HashMap::from([(
-                "content-disposition".to_string(),
-                "attachment".to_string(),
-            )]),
+            headers: HashMap::from([("content-disposition".to_string(), "attachment".to_string())]),
         }
     }
 }
@@ -1276,8 +1273,7 @@ async fn late_content_type_relabel_cannot_bypass_body_validator_on_synthetic_res
         .await;
 
     assert_eq!(
-        status,
-        502,
+        status, 502,
         "the relabelled representation must be validated: {headers:?}"
     );
     assert!(
