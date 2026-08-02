@@ -14,7 +14,8 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use ferrum_edge::config::types::{
     DnsSdConfig, GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, Proxy, SdProvider,
-    ServiceDiscoveryConfig, Upstream, UpstreamPortOverride, UpstreamTarget,
+    ServiceDiscoveryConfig, Upstream, UpstreamLocalityLbSetting, UpstreamPortOverride,
+    UpstreamTarget,
 };
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -94,6 +95,19 @@ fn http_proxy() -> Proxy {
         "upstream_id": "reviews-u"
     }))
     .expect("proxy fixture")
+}
+
+fn unrelated_http_proxy() -> Proxy {
+    serde_json::from_value(serde_json::json!({
+        "id": "ratings-p",
+        "namespace": "default",
+        "hosts": ["ratings.example.com"],
+        "listen_path": "/ratings",
+        "backend_host": "ratings.default.svc.cluster.local",
+        "backend_port": 8080,
+        "backend_scheme": "http"
+    }))
+    .expect("unrelated proxy fixture")
 }
 
 fn sd_upstream() -> Upstream {
@@ -219,6 +233,32 @@ fn route_tls_sni(state: &ProxyState) -> Option<String> {
         .clone()
 }
 
+fn route_port_override(
+    state: &ProxyState,
+    port: u16,
+) -> Option<ferrum_edge::config::types::ResolvedPortOverride> {
+    state
+        .router_cache
+        .find_proxy(Some("reviews.example.com"), "/http")
+        .expect("route present")
+        .proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&port))
+        .cloned()
+}
+
+fn route_fallback_max_retries(state: &ProxyState) -> Option<u32> {
+    state
+        .router_cache
+        .find_proxy(Some("reviews.example.com"), "/http")
+        .expect("route present")
+        .proxy
+        .dispatch_port_override_fallback
+        .as_ref()
+        .and_then(|override_config| override_config.max_retries)
+}
+
 fn new_proxy_state(config: GatewayConfig) -> (ProxyState, Vec<tokio::task::JoinHandle<()>>) {
     let dns_cache = DnsCache::new(DnsConfig::default());
     ProxyState::new(config, dns_cache, mesh_env(), None, None).expect("ProxyState")
@@ -230,6 +270,14 @@ fn new_proxy_state(config: GatewayConfig) -> (ProxyState, Vec<tokio::task::JoinH
 fn projected_only_configs(
     mutate_old: impl FnOnce(&mut Upstream),
     mutate_new: impl FnOnce(&mut Upstream),
+) -> (GatewayConfig, GatewayConfig) {
+    projected_only_configs_with_extra_proxies(mutate_old, mutate_new, Vec::new())
+}
+
+fn projected_only_configs_with_extra_proxies(
+    mutate_old: impl FnOnce(&mut Upstream),
+    mutate_new: impl FnOnce(&mut Upstream),
+    extra_proxies: Vec<Proxy>,
 ) -> (GatewayConfig, GatewayConfig) {
     let stamp = Utc::now();
     let mut old_upstream = sd_upstream();
@@ -246,13 +294,25 @@ fn projected_only_configs(
     proxy.created_at = stamp;
     proxy.updated_at = stamp;
 
+    let mut extras_old = extra_proxies;
+    for proxy in &mut extras_old {
+        proxy.created_at = stamp;
+        proxy.updated_at = stamp;
+    }
+    let extras_new = extras_old.clone();
+
+    let mut old_proxies = vec![proxy.clone()];
+    old_proxies.extend(extras_old);
+    let mut new_proxies = vec![proxy];
+    new_proxies.extend(extras_new);
+
     let mut old_config = GatewayConfig {
-        proxies: vec![proxy.clone()],
+        proxies: old_proxies,
         upstreams: vec![old_upstream],
         ..GatewayConfig::default()
     };
     let mut new_config = GatewayConfig {
-        proxies: vec![proxy],
+        proxies: new_proxies,
         upstreams: vec![new_upstream],
         ..GatewayConfig::default()
     };
@@ -503,4 +563,194 @@ async fn update_config_unrelated_mesh_policy_does_not_require_proxy_edit_for_dr(
         "DR-only change must publish a fresh route-held Arc<Proxy>, not wait for an unrelated proxy event"
     );
     assert_eq!(route_fallback_idle_ms(&state), Some(8_800));
+}
+
+#[tokio::test]
+async fn update_config_republishes_routes_for_empty_delta_per_port_projection_change() {
+    let (old_config, new_config) = projected_only_configs(
+        |upstream| {
+            upstream.port_overrides.insert(
+                8080,
+                UpstreamPortOverride {
+                    connect_timeout_ms: Some(1_000),
+                    max_retries: Some(1),
+                    locality_lb_setting: Some(UpstreamLocalityLbSetting {
+                        enabled: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            );
+        },
+        |upstream| {
+            upstream.port_overrides.insert(
+                8080,
+                UpstreamPortOverride {
+                    connect_timeout_ms: Some(2_500),
+                    max_retries: Some(4),
+                    locality_lb_setting: Some(UpstreamLocalityLbSetting {
+                        enabled: false,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            );
+        },
+    );
+
+    let delta = ferrum_edge::config_delta::ConfigDelta::compute(&old_config, &new_config);
+    assert!(
+        delta.is_empty(),
+        "per-port DR projection fixture must keep ConfigDelta empty"
+    );
+    assert!(
+        delta.modified_proxies.is_empty(),
+        "per-port DR edits must not manufacture a Proxy resource modification"
+    );
+
+    let (state, _handles) = new_proxy_state(old_config);
+    let before = route_port_override(&state, 8080).expect("old per-port override");
+    assert_eq!(before.connect_timeout_ms, Some(1_000));
+    assert_eq!(before.max_retries, Some(1));
+    assert_eq!(
+        before
+            .locality_lb_setting
+            .as_ref()
+            .map(|setting| setting.enabled),
+        Some(true)
+    );
+
+    assert_eq!(state.update_config(new_config), ConfigApplyOutcome::Applied);
+    let after = route_port_override(&state, 8080).expect("new per-port override");
+    assert_eq!(after.connect_timeout_ms, Some(2_500));
+    assert_eq!(after.max_retries, Some(4));
+    assert_eq!(
+        after
+            .locality_lb_setting
+            .as_ref()
+            .map(|setting| setting.enabled),
+        Some(false),
+        "empty-delta per-port timeout/retry/locality projections must refresh the live route"
+    );
+}
+
+#[tokio::test]
+async fn update_config_republishes_routes_for_empty_delta_retry_fallback_change() {
+    let (old_config, new_config) = projected_only_configs(
+        |upstream| {
+            upstream.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+                max_retries: Some(2),
+                http_idle_timeout_ms: Some(1_000),
+                ..Default::default()
+            });
+        },
+        |upstream| {
+            upstream.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+                max_retries: Some(0),
+                http_idle_timeout_ms: Some(1_000),
+                ..Default::default()
+            });
+        },
+    );
+
+    let delta = ferrum_edge::config_delta::ConfigDelta::compute(&old_config, &new_config);
+    assert!(delta.is_empty());
+    assert!(delta.modified_proxies.is_empty());
+
+    let (state, _handles) = new_proxy_state(old_config);
+    assert_eq!(route_fallback_max_retries(&state), Some(2));
+    assert_eq!(
+        state.update_config(new_config),
+        ConfigApplyOutcome::Applied
+    );
+    assert_eq!(
+        route_fallback_max_retries(&state),
+        Some(0),
+        "empty-delta DR retry/pool fallback change must swap the route-held projection"
+    );
+}
+
+#[tokio::test]
+async fn update_config_dr_projection_does_not_mutate_unrelated_route_policy() {
+    let (old_config, new_config) = projected_only_configs_with_extra_proxies(
+        |upstream| {
+            upstream.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+                http_idle_timeout_ms: Some(1_000),
+                ..Default::default()
+            });
+        },
+        |upstream| {
+            upstream.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+                http_idle_timeout_ms: Some(9_000),
+                ..Default::default()
+            });
+        },
+        vec![unrelated_http_proxy()],
+    );
+
+    let delta = ferrum_edge::config_delta::ConfigDelta::compute(&old_config, &new_config);
+    assert!(
+        delta.is_empty(),
+        "unrelated-route fixture must keep ConfigDelta empty"
+    );
+    assert!(
+        delta.modified_proxies.is_empty(),
+        "DR-only signaling must not invent Proxy modifications for any route"
+    );
+
+    let (state, _handles) = new_proxy_state(old_config);
+    let unrelated_before = state
+        .router_cache
+        .find_proxy(Some("ratings.example.com"), "/ratings")
+        .expect("unrelated route")
+        .proxy
+        .clone();
+    assert!(unrelated_before.dispatch_port_override_fallback.is_none());
+    assert_eq!(route_fallback_idle_ms(&state), Some(1_000));
+
+    assert_eq!(state.update_config(new_config), ConfigApplyOutcome::Applied);
+    assert_eq!(route_fallback_idle_ms(&state), Some(9_000));
+
+    let unrelated_after = state
+        .router_cache
+        .find_proxy(Some("ratings.example.com"), "/ratings")
+        .expect("unrelated route")
+        .proxy
+        .clone();
+    assert!(
+        unrelated_after.dispatch_port_override_fallback.is_none(),
+        "DR projection rebuild must not invent policy on an unrelated route"
+    );
+    assert_eq!(unrelated_after.backend_host, unrelated_before.backend_host);
+    assert_eq!(unrelated_after.backend_port, unrelated_before.backend_port);
+    assert_eq!(unrelated_after.listen_path, unrelated_before.listen_path);
+}
+
+#[tokio::test]
+async fn update_config_clears_empty_delta_per_port_projection_on_withdrawal() {
+    let (with_override, without_override) = projected_only_configs(
+        |upstream| {
+            upstream.port_overrides.insert(
+                8080,
+                UpstreamPortOverride {
+                    connect_timeout_ms: Some(3_000),
+                    max_retries: Some(2),
+                    ..Default::default()
+                },
+            );
+        },
+        |_upstream| {},
+    );
+
+    let (state, _handles) = new_proxy_state(with_override);
+    assert!(route_port_override(&state, 8080).is_some());
+
+    assert_eq!(
+        state.update_config(without_override),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        route_port_override(&state, 8080).is_none(),
+        "DR per-port withdrawal must clear stale route-held dispatch overrides"
+    );
 }
