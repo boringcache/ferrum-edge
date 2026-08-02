@@ -21,9 +21,8 @@ use std::sync::Arc;
 use ferrum_edge::_test_support::{
     finalize_synthetic_response_for_test, gateway_capacity_response_selected_for_test,
     mark_buffered_response_capacity_refusal_pending_for_test, mark_native_grpc_request_for_test,
-    retain_grpc_web_client_content_type_for_test,
-    run_after_proxy_hooks_reject_for_test, set_original_response_content_encoding_for_test,
-    stamp_original_response_metadata_for_test,
+    retain_grpc_web_client_content_type_for_test, run_after_proxy_hooks_reject_for_test,
+    set_original_response_content_encoding_for_test, stamp_original_response_metadata_for_test,
     take_buffered_response_capacity_refusal_pending_for_test,
     transform_buffered_response_body_with_deadline_full_for_test,
 };
@@ -164,10 +163,7 @@ impl Plugin for OneShotGatewayDecorator {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> ferrum_edge::plugins::PluginResult {
-        response_headers.insert(
-            "x-request-id".to_string(),
-            "gateway-request-id".to_string(),
-        );
+        response_headers.insert("x-request-id".to_string(), "gateway-request-id".to_string());
         ferrum_edge::plugins::PluginResult::Continue
     }
 
@@ -510,10 +506,7 @@ async fn final_body_policy_rejection_is_native_grpc_terminal() {
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RejectingFinalBodyPolicy)];
     let mut ctx = ctx_for("POST", "/grpc.Service/Method");
     mark_native_grpc_request_for_test(&mut ctx);
-    let mut headers = HashMap::from([(
-        "content-type".to_string(),
-        "application/grpc".to_string(),
-    )]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
     stamp_original_response_metadata_for_test(&mut ctx, 200, &headers);
     let mut status = 200u16;
     let mut body = bytes::Bytes::from_static(b"backend data");
@@ -531,8 +524,14 @@ async fn final_body_policy_rejection_is_native_grpc_terminal() {
 
     assert!(replaced);
     assert_eq!(status, 200);
-    assert!(body.is_empty(), "native gRPC rejection must be trailers-only");
-    assert_eq!(headers.get("content-type").map(String::as_str), Some("application/grpc"));
+    assert!(
+        body.is_empty(),
+        "native gRPC rejection must be trailers-only"
+    );
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
     assert_eq!(headers.get("grpc-status").map(String::as_str), Some("7"));
     assert!(!header_names_contain(&headers, "content-length"));
 }
@@ -545,10 +544,7 @@ async fn final_body_policy_rejection_is_grpc_web_trailer_frame() {
     let mut ctx = ctx_for("POST", "/grpc.Service/Method");
     let client_content_type = "application/grpc-web+proto";
     retain_grpc_web_client_content_type_for_test(&mut ctx, client_content_type);
-    let mut headers = HashMap::from([(
-        "content-type".to_string(),
-        "application/grpc".to_string(),
-    )]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
     stamp_original_response_metadata_for_test(&mut ctx, 200, &headers);
     let mut status = 200u16;
     let mut body = bytes::Bytes::from_static(b"backend data");
@@ -566,7 +562,10 @@ async fn final_body_policy_rejection_is_grpc_web_trailer_frame() {
 
     assert!(replaced);
     assert_eq!(status, 200);
-    assert_eq!(headers.get("content-type").map(String::as_str), Some(client_content_type));
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some(client_content_type)
+    );
     assert!(!header_names_contain(&headers, "grpc-status"));
     assert_eq!(body.first().copied(), Some(0x80));
     assert!(String::from_utf8_lossy(&body).contains("grpc-status: 7"));

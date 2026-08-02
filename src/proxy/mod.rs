@@ -19830,11 +19830,7 @@ fn strip_rejected_buffered_representation_headers(headers: &mut HashMap<String, 
         "trailer",
         "vary",
     ];
-    headers.retain(|name, _| {
-        !STALE
-            .iter()
-            .any(|stale| name.eq_ignore_ascii_case(stale))
-    });
+    headers.retain(|name, _| !STALE.iter().any(|stale| name.eq_ignore_ascii_case(stale)));
 }
 
 /// Install a buffered policy rejection in the client's immutable request
