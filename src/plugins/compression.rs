@@ -1741,6 +1741,13 @@ impl Plugin for CompressionPlugin {
         true
     }
 
+    fn rejection_replacement_is_final_body_policy_terminal(&self) -> bool {
+        // The only replacement this hook can author is the fixed
+        // negotiation-required 406 for a cache HIT whose identity variant the
+        // client explicitly refused. It contains no backend representation.
+        true
+    }
+
     fn warn_on_rejection_response_replacement(&self) -> bool {
         // Replacing a cache HIT identity variant with a standards-required 406
         // is expected negotiation behavior, not an anomalous overwrite.

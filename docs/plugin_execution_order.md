@@ -633,14 +633,15 @@ terminals (capacity, deadline, an earlier rejection, a route body-size refusal,
 the request-representation `400`) are likewise never re-decided: they are already
 the answer.
 
-One more thing on that list is authored by the late chain itself. A hook that
-opted into `may_replace_rejection_response` and actually replaced the rejection's
-body, status, or representation — `spec_expose`'s HEAD body strip,
-`mcp_gateway`'s JSON-RPC error shaping — has written the final answer for a
-request that was already refused, so the re-decision skips it. The record of that
-replacement is typed, set only on that trusted rejection path, and consumed
-exactly once, so an ordinary late mutation of a backend or synthetic-producer
-representation is still re-checked.
+One more thing on that list is authored by the late chain itself. A replacement
+skips re-decision only when the built-in explicitly declares
+`rejection_replacement_is_final_body_policy_terminal`: `spec_expose`'s HEAD body
+strip, compression's fixed negotiation `406`, and `mcp_gateway`'s sanitized
+JSON-RPC error shaping. Mere `may_replace_rejection_response` is not enough: an
+ordinary fail-closed/custom replacement remains subject to status and
+representation-scope comparison. The final-terminal record is typed, set only
+on that trusted rejection path, and consumed exactly once, so an ordinary late
+mutation of a backend or synthetic-producer representation is still re-checked.
 
 ### Authoritative final client-visible response HEADER phase
 

@@ -314,12 +314,14 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     rules written for application responses, and doing so turns any configured
     JSON response schema into a permanent 500. Gateway terminals (capacity,
     deadline, an earlier rejection, the route body-size refusal, the request
-    representation `400`) are never re-decided either, and neither is a body /
-    status / representation replacement authored by an opted-in
-    `may_replace_rejection_response` hook on the late reject path (`spec_expose`
-    HEAD, `mcp_gateway` JSON-RPC shaping) — that record is typed, set only on
-    that path, and consumed exactly once, so an ordinary late mutation of a
-    backend or synthetic-producer representation is still re-checked. Do not
+    representation `400`) are never re-decided either. A late reject-path
+    replacement skips re-decision only when the built-in explicitly declares
+    `rejection_replacement_is_final_body_policy_terminal` (`spec_expose` HEAD,
+    compression's fixed negotiation `406`, `mcp_gateway` JSON-RPC shaping).
+    Mere `may_replace_rejection_response` is not enough: an ordinary
+    fail-closed/custom replacement remains subject to status and representation
+    scope comparison. The final-terminal record is typed, set only on that path,
+    and consumed exactly once. Do not
     "fix" this by running `after_proxy` twice. `waf`/`body_validator`/`ai_response_guard` additionally claim an
     ORIGIN-ENCODED response through `enforces_response_body_policy` (narrow: only
     when their rules apply AND their configured disposition can actually refuse —

@@ -115,6 +115,7 @@ fn test_creation_valid_config() {
     assert!(!plugin.modifies_request_headers());
     assert!(plugin.applies_after_proxy_on_reject());
     assert!(plugin.may_replace_rejection_response());
+    assert!(plugin.rejection_replacement_is_final_body_policy_terminal());
     assert!(!plugin.is_auth_plugin());
 }
 

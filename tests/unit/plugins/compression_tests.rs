@@ -211,6 +211,7 @@ fn test_applies_after_proxy_on_reject() {
     let plugin = make_plugin(json!({}));
     assert!(plugin.applies_after_proxy_on_reject());
     assert!(plugin.may_replace_rejection_response());
+    assert!(plugin.rejection_replacement_is_final_body_policy_terminal());
     assert!(!plugin.warn_on_rejection_response_replacement());
 }
 

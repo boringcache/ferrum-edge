@@ -17053,12 +17053,15 @@ async fn run_after_proxy_hooks_on_rejection(
                             .or_insert_with(|| "Origin".to_string());
                     }
                     ctx.record_deadline_response_header_mutations(response_headers);
-                    // This response is now authored by the rejection path, not
-                    // by the backend or the synthetic producer whose bytes the
-                    // body-policy witness was captured over. The synthetic
-                    // lifecycle's re-decision consumes this exactly once and
-                    // skips re-judging it (`.claude/rules/plugins.md` 10b).
-                    ctx.mark_rejection_response_replaced();
+                    // A narrow set of trusted built-in normalizers author a
+                    // complete gateway/protocol terminal here. Record those
+                    // exactly once so application-response body policy does not
+                    // reinterpret the terminal payload. Ordinary fail-closed or
+                    // custom replacements intentionally remain re-decidable when
+                    // they change status or representation scope.
+                    if plugin.rejection_replacement_is_final_body_policy_terminal() {
+                        ctx.mark_final_body_policy_terminal_replacement();
+                    }
                     if plugin.warn_on_rejection_response_replacement() {
                         warn!(
                             rejecting_plugin = plugin.name(),
@@ -17654,7 +17657,7 @@ async fn reenforce_final_synthetic_client_visible_response_body_policy(
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Bytes,
     witness: FinalSyntheticBodyPolicyWitness,
-    late_rejection_replacement: bool,
+    final_body_policy_terminal_replacement: bool,
 ) -> bool {
     // These gateway terminals are already the authoritative, redaction-safe
     // answer. Re-deciding policy against a gateway error payload is exactly what
@@ -17666,17 +17669,14 @@ async fn reenforce_final_synthetic_client_visible_response_body_policy(
         return false;
     }
 
-    // A hook on the deliberately-late reject-path `after_proxy` chain replaced
-    // the rejection body/status/representation. That replacement IS the gateway's
-    // (or an opted-in plugin's) final answer for an already-rejected request, and
-    // section 10b of `.claude/rules/plugins.md` is explicit that a gateway
-    // terminal and an earlier rejection are never re-decided. Re-judging it here
-    // would let an operator's response schema turn, say, `spec_expose`'s HEAD
-    // body strip into a second rejection. Narrow by construction: the marker is
-    // set only on that trusted replacement path, and taken exactly once, so a
-    // backend/application representation that some other late hook mutated is
-    // still re-checked below.
-    if late_rejection_replacement {
+    // A trusted hook on the deliberately-late reject path installed a complete
+    // final gateway/protocol terminal. Section 10b of
+    // `.claude/rules/plugins.md` keeps such terminal payloads out of application
+    // response policy. This is deliberately narrower than mere replacement:
+    // ordinary fail-closed/custom replacements still reach the scope comparison
+    // below, while the typed one-shot marker covers only explicit built-in
+    // terminal authors and is consumed at this single site.
+    if final_body_policy_terminal_replacement {
         return false;
     }
 
@@ -18278,12 +18278,13 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // Discard any record left by an earlier rejection chain: only a replacement
     // authored by THIS chain, over the response the witness was captured from,
     // may suppress the re-decision below.
-    let _ = ctx.take_rejection_response_replaced();
+    let _ = ctx.take_final_body_policy_terminal_replacement();
     apply_replaceable_after_proxy_hooks_to_rejection(plugins, ctx, status, body, headers).await;
-    // Consume the one-shot record of whether that chain's replacement path
-    // actually authored this response. Taken here — at the single trusted site,
+    // Consume the one-shot record of whether that chain installed a complete
+    // final gateway/protocol terminal. Taken here — at the single trusted site,
     // immediately after the chain — so it can never survive into another phase.
-    let late_rejection_replacement = ctx.take_rejection_response_replaced();
+    let final_body_policy_terminal_replacement =
+        ctx.take_final_body_policy_terminal_replacement();
 
     // Authoritative final client-visible BODY policy, re-decided over the exact
     // header map the chain above just closed (`GHSA-62jg-v563-4q23`). No-ops
@@ -18299,7 +18300,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
             headers,
             body,
             witness,
-            late_rejection_replacement,
+            final_body_policy_terminal_replacement,
         )
         .await;
     }

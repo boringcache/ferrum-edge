@@ -2186,19 +2186,19 @@ pub struct RequestContext {
     /// application responses. Typed and private, because the metadata reason
     /// beside it is plugin-writable and can authorize nothing.
     gateway_representation_response_selected: bool,
-    /// One-shot record that a hook opted into `may_replace_rejection_response`
-    /// actually replaced an uncommitted rejection's body/status/representation
-    /// from the deliberately-late reject-path `after_proxy` chain.
+    /// One-shot record that a trusted hook authored a complete final
+    /// gateway/protocol terminal while replacing an uncommitted rejection from
+    /// the deliberately-late reject-path `after_proxy` chain.
     ///
     /// The synthetic lifecycle re-decides its final client-visible body policy
     /// after that chain, because the chain can relabel a BACKEND or synthetic
-    /// producer's representation. A replacement authored ON the rejection path
-    /// is a different thing: it is the gateway's own final answer for a request
-    /// that was already refused, and `.claude/rules/plugins.md` 10b keeps
-    /// gateway terminals and an earlier rejection out of that re-decision.
-    /// Scoped to that one trusted path and taken exactly once, so an ordinary
-    /// late mutation of an application representation is still re-checked.
-    rejection_response_replaced: bool,
+    /// producer's representation. Only a replacement whose plugin explicitly
+    /// declares `rejection_replacement_is_final_body_policy_terminal` is a
+    /// different thing: it is the gateway's own final answer for a request that
+    /// was already refused. Ordinary fail-closed/custom replacements remain
+    /// subject to re-decision when they change status or representation scope.
+    /// Scoped to that one trusted path and taken exactly once.
+    final_body_policy_terminal_replacement: bool,
     /// One-shot signal that a response-body inspector could not reserve a
     /// retained-response transform window and needs the enclosing
     /// `on_response_body` loop to install the shared capacity terminal.
@@ -3067,7 +3067,7 @@ impl RequestContext {
             gateway_deadline_response_selected: false,
             gateway_capacity_response_selected: false,
             gateway_representation_response_selected: false,
-            rejection_response_replaced: false,
+            final_body_policy_terminal_replacement: false,
             buffered_response_capacity_refusal_pending: false,
             response_cache_hit: false,
             origin_http_response_status: None,
@@ -3322,16 +3322,16 @@ impl RequestContext {
         self.gateway_representation_response_selected
     }
 
-    /// Record that a reject-path `after_proxy` hook replaced this rejection's
-    /// body/status/representation. Set only by the rejection-replacement path in
+    /// Record that a reject-path `after_proxy` hook installed a complete final
+    /// gateway/protocol terminal. Set only by the trusted replacement path in
     /// `run_after_proxy_hooks_on_rejection`.
-    pub(crate) fn mark_rejection_response_replaced(&mut self) {
-        self.rejection_response_replaced = true;
+    pub(crate) fn mark_final_body_policy_terminal_replacement(&mut self) {
+        self.final_body_policy_terminal_replacement = true;
     }
 
-    /// Take the one-shot rejection-replacement record.
-    pub(crate) fn take_rejection_response_replaced(&mut self) -> bool {
-        std::mem::take(&mut self.rejection_response_replaced)
+    /// Take the one-shot final-terminal replacement record.
+    pub(crate) fn take_final_body_policy_terminal_replacement(&mut self) -> bool {
+        std::mem::take(&mut self.final_body_policy_terminal_replacement)
     }
 
     /// Adopt the gateway terminals the final request-body hook stage selected on
@@ -4118,7 +4118,8 @@ impl RequestContext {
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
             gateway_capacity_response_selected: self.gateway_capacity_response_selected,
             gateway_representation_response_selected: self.gateway_representation_response_selected,
-            rejection_response_replaced: self.rejection_response_replaced,
+            final_body_policy_terminal_replacement: self
+                .final_body_policy_terminal_replacement,
             // Final request-body hooks cannot produce a response-body capacity
             // refusal. Keep the live response path's one-shot signal on the
             // original context instead of duplicating it into this compatibility
@@ -8462,6 +8463,21 @@ pub trait Plugin: Send + Sync {
     /// ignore-on-reject behavior. Fail-closed enforcement plugins may opt in at
     /// the shared finalizer, before any response bytes are sent.
     fn may_replace_rejection_response(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` only when this plugin's successful reject-path
+    /// replacement is a complete, fixed/sanitized gateway or protocol terminal
+    /// that must be published without re-applying application-response body
+    /// policies to the terminal payload.
+    ///
+    /// This is narrower than [`Self::may_replace_rejection_response`]. Ordinary
+    /// fail-closed replacements retain the default `false`, so a status or
+    /// representation-scope change still activates the authoritative final body
+    /// policy. Built-in protocol normalizers that return `true` must author the
+    /// entire terminal representation and must not carry backend-controlled
+    /// bytes into it.
+    fn rejection_replacement_is_final_body_policy_terminal(&self) -> bool {
         false
     }
 
