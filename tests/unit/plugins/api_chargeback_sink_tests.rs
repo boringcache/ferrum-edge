@@ -2817,7 +2817,11 @@ fn assert_rejected_sidecar(source_path: &Path, expected_status: u16, expected_re
     }));
     assert_eq!(
         meta["payload_file"],
-        rejected_payload.file_name().unwrap().to_string_lossy().as_ref()
+        rejected_payload
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
     );
     assert_eq!(
         meta["payload_bytes"].as_u64().unwrap(),
@@ -2828,7 +2832,11 @@ fn assert_rejected_sidecar(source_path: &Path, expected_status: u16, expected_re
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
-            fs::metadata(&rejected_payload).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&rejected_payload)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o600,
             "dead-letter billing payload must be owner-only"
         );
@@ -2908,7 +2916,11 @@ async fn replay_bisects_mixed_http_400_and_preserves_only_the_original_bad_row()
     assert_eq!(meta["rejected_rows"], 1);
 
     let requests = wait_for_requests(&server, 5).await;
-    assert_eq!(requests.len(), 5, "four rows with one poison row use a fixed tree");
+    assert_eq!(
+        requests.len(),
+        5,
+        "four rows with one poison row use a fixed tree"
+    );
     let accepted_attempts: Vec<String> = requests
         .iter()
         .map(|request| String::from_utf8(request.body.clone()).unwrap())
@@ -2945,9 +2957,11 @@ async fn replay_schema_evolution_400_isolates_the_legacy_row_verbatim() {
     assert_eq!(fs::read(dead_letter_payload_path(&source)).unwrap(), legacy);
     let requests = wait_for_requests(&server, 3).await;
     assert_eq!(requests.len(), 3);
-    assert!(requests
-        .iter()
-        .any(|request| request.body.as_slice() == current));
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.body.as_slice() == current)
+    );
 }
 
 #[tokio::test]
@@ -2967,7 +2981,11 @@ async fn replay_permanent_isolation_attempts_are_bounded_by_the_batch_tree() {
 
     let requests = wait_for_requests(&server, 15).await;
     let (_, _, _, hard_attempt_limit) = spool_streaming_limits_for_tests();
-    assert_eq!(requests.len(), 15, "eight rejected rows require 2n-1 attempts");
+    assert_eq!(
+        requests.len(),
+        15,
+        "eight rejected rows require 2n-1 attempts"
+    );
     assert!(requests.len() <= hard_attempt_limit);
     assert_eq!(
         fs::read_to_string(dead_letter_payload_path(&source))
@@ -3045,7 +3063,12 @@ async fn dead_letter_payload_publish_refuses_symlink_and_restores_the_source_cla
     assert!(error.contains("symlink"), "unexpected error: {error}");
     assert!(source.exists(), "the authoritative source must be restored");
     assert_eq!(fs::read(&outside).unwrap(), b"do-not-touch");
-    assert!(fs::symlink_metadata(&payload).unwrap().file_type().is_symlink());
+    assert!(
+        fs::symlink_metadata(&payload)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[tokio::test]
@@ -6806,8 +6829,8 @@ async fn spool_replay_refuses_before_decoding_when_the_ceiling_cannot_hold_the_a
 async fn spool_replay_quarantines_row_length_and_row_count_violations_before_http() {
     let (row_limit, row_count_limit, _, _) = spool_streaming_limits_for_tests();
     let temp = tempfile::tempdir().unwrap();
-    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 8 * 1024 * 1024), "node-a")
-        .unwrap();
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), 8 * 1024 * 1024), "node-a").unwrap();
     let day = spool.namespace_root_for_tests().join("20260524");
     fs::create_dir_all(&day).unwrap();
 
@@ -6817,10 +6840,14 @@ async fn spool_replay_quarantines_row_length_and_row_count_violations_before_htt
         .await
         .expect("an oversized row is quarantined, not retried");
     assert!(!long_row.exists());
-    assert!(long_row.with_file_name(format!(
-        "{}.corrupt",
-        long_row.file_name().unwrap().to_string_lossy()
-    )).exists());
+    assert!(
+        long_row
+            .with_file_name(format!(
+                "{}.corrupt",
+                long_row.file_name().unwrap().to_string_lossy()
+            ))
+            .exists()
+    );
 
     let too_many_rows = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FE2"));
     let mut rows = Vec::with_capacity((row_count_limit + 1) * 3);
@@ -6832,17 +6859,21 @@ async fn spool_replay_quarantines_row_length_and_row_count_violations_before_htt
         .await
         .expect("an over-row-count artifact is quarantined before delivery");
     assert!(!too_many_rows.exists());
-    assert!(too_many_rows.with_file_name(format!(
-        "{}.corrupt",
-        too_many_rows.file_name().unwrap().to_string_lossy()
-    )).exists());
+    assert!(
+        too_many_rows
+            .with_file_name(format!(
+                "{}.corrupt",
+                too_many_rows.file_name().unwrap().to_string_lossy()
+            ))
+            .exists()
+    );
 }
 
 #[tokio::test]
 async fn spool_replay_quarantines_a_compressed_bomb_during_bounded_preflight() {
     let temp = tempfile::tempdir().unwrap();
-    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 8 * 1024 * 1024), "node-a")
-        .unwrap();
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), 8 * 1024 * 1024), "node-a").unwrap();
     let day = spool.namespace_root_for_tests().join("20260524");
     fs::create_dir_all(&day).unwrap();
     let plain = vec![b' '; 2 * 1024 * 1024];
@@ -6862,10 +6893,14 @@ async fn spool_replay_quarantines_a_compressed_bomb_during_bounded_preflight() {
         .expect("a compressed bomb is quarantined without an HTTP attempt");
 
     assert!(!source.exists());
-    assert!(source.with_file_name(format!(
-        "{}.corrupt",
-        source.file_name().unwrap().to_string_lossy()
-    )).exists());
+    assert!(
+        source
+            .with_file_name(format!(
+                "{}.corrupt",
+                source.file_name().unwrap().to_string_lossy()
+            ))
+            .exists()
+    );
 }
 
 #[tokio::test]
@@ -6901,8 +6936,8 @@ async fn large_uncompressed_replay_has_artifact_size_independent_peak_retention(
         .await;
 
     let temp = tempfile::tempdir().unwrap();
-    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 16 * 1024 * 1024), "node-a")
-        .unwrap();
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), 16 * 1024 * 1024), "node-a").unwrap();
     let day = spool.namespace_root_for_tests().join("20260524");
     fs::create_dir_all(&day).unwrap();
     let source = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FE4"));

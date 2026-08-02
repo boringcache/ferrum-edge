@@ -233,10 +233,10 @@ fn spool_streaming_replay_minimum_bytes(decoded_bound: u64, compressed: bool) ->
     // a short artifact will fill it. Charge the hard batch-row maximum here so
     // every writer-produced artifact remains replayable with any valid batch
     // configuration, including a one-row artifact and a 128-row replay batch.
-    let index_bytes = (SPOOL_REPLAY_BATCH_MAX_ROWS as u64)
-        .checked_mul(SPOOL_INDEX_ENTRY_BYTES as u64)?;
-    let worklist_bytes = (SPOOL_SPLIT_WORKLIST_MAX_ENTRIES as u64)
-        .checked_mul(SPOOL_INDEX_ENTRY_BYTES as u64)?;
+    let index_bytes =
+        (SPOOL_REPLAY_BATCH_MAX_ROWS as u64).checked_mul(SPOOL_INDEX_ENTRY_BYTES as u64)?;
+    let worklist_bytes =
+        (SPOOL_SPLIT_WORKLIST_MAX_ENTRIES as u64).checked_mul(SPOOL_INDEX_ENTRY_BYTES as u64)?;
     let zstd_window = if compressed {
         decoded_bound
             .max(1 << 10)
@@ -8159,12 +8159,11 @@ impl DeadLetterPayloadWriter {
         self.byte_len = self
             .byte_len
             .checked_add(row.len() as u64)
-            .ok_or_else(|| {
-                format!("{PLUGIN_NAME}: dead-letter payload byte count overflowed")
-            })?;
-        self.rows = self.rows.checked_add(1).ok_or_else(|| {
-            format!("{PLUGIN_NAME}: dead-letter payload row count overflowed")
-        })?;
+            .ok_or_else(|| format!("{PLUGIN_NAME}: dead-letter payload byte count overflowed"))?;
+        self.rows = self
+            .rows
+            .checked_add(1)
+            .ok_or_else(|| format!("{PLUGIN_NAME}: dead-letter payload row count overflowed"))?;
         Ok(())
     }
 
@@ -8281,17 +8280,16 @@ fn write_dead_letter_meta(
     meta: &DeadLetterMeta<'_>,
 ) -> Result<PathBuf, String> {
     let (tmp_path, meta_path) = dead_letter_meta_paths(source_path)?;
-    let bytes = materialize_reserved_payload(
-        spool.ceiling,
-        SPOOL_MAX_DEAD_LETTER_META_BYTES,
-        |writer| serde_json::to_writer(writer, meta).map_err(|error| error.to_string()),
-    )
-    .map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: failed to serialize bounded dead-letter metadata: {}",
-            error.reason()
-        )
-    })?;
+    let bytes =
+        materialize_reserved_payload(spool.ceiling, SPOOL_MAX_DEAD_LETTER_META_BYTES, |writer| {
+            serde_json::to_writer(writer, meta).map_err(|error| error.to_string())
+        })
+        .map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to serialize bounded dead-letter metadata: {}",
+                error.reason()
+            )
+        })?;
     let _guard = spool
         .write_lock
         .lock()
@@ -8391,8 +8389,7 @@ fn is_spool_rejected_payload_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    name.ends_with(".ndjson.rejected.ndjson")
-        || name.ends_with(".ndjson.zst.rejected.ndjson")
+    name.ends_with(".ndjson.rejected.ndjson") || name.ends_with(".ndjson.zst.rejected.ndjson")
 }
 
 fn is_spool_owned_file(path: &Path) -> bool {
@@ -8600,9 +8597,10 @@ impl StreamingReplayBatch {
                 "{PLUGIN_NAME}: spool replay requested an empty batch range"
             ));
         }
-        let byte_start = self.lines.get(start).map(|line| line.0).ok_or_else(|| {
-            format!("{PLUGIN_NAME}: spool replay batch start is out of range")
-        })?;
+        let byte_start =
+            self.lines.get(start).map(|line| line.0).ok_or_else(|| {
+                format!("{PLUGIN_NAME}: spool replay batch start is out of range")
+            })?;
         let byte_end = self
             .lines
             .get(end.saturating_sub(1))
@@ -8618,9 +8616,10 @@ impl StreamingReplayBatch {
     }
 
     fn row(&self, index: usize) -> Result<&[u8], String> {
-        let (start, end) = *self.lines.get(index).ok_or_else(|| {
-            format!("{PLUGIN_NAME}: spool replay row index is out of range")
-        })?;
+        let (start, end) = *self
+            .lines
+            .get(index)
+            .ok_or_else(|| format!("{PLUGIN_NAME}: spool replay row index is out of range"))?;
         self.payload
             .as_slice()
             .get(start..end)
@@ -8747,14 +8746,12 @@ impl StreamingSpoolReader {
                     path.display()
                 ))
             })?;
-            decoder
-                .window_log_max(zstd_window_log)
-                .map_err(|error| {
-                    SpoolDecodeError::Unreadable(format!(
-                        "{PLUGIN_NAME}: spool file '{}' exceeds the bounded zstd window: {error}",
-                        path.display()
-                    ))
-                })?;
+            decoder.window_log_max(zstd_window_log).map_err(|error| {
+                SpoolDecodeError::Unreadable(format!(
+                    "{PLUGIN_NAME}: spool file '{}' exceeds the bounded zstd window: {error}",
+                    path.display()
+                ))
+            })?;
             Box::new(decoder)
         } else {
             Box::new(file)
@@ -8909,14 +8906,14 @@ impl StreamingSpoolReader {
             let newline = available.iter().position(|byte| *byte == b'\n');
             let consumed = newline.map_or(available.len(), |offset| offset.saturating_add(1));
             let content_len = newline.unwrap_or(available.len());
-            let next_decoded = self
-                .decoded_bytes
-                .checked_add(consumed as u64)
-                .ok_or_else(|| {
-                    SpoolDecodeError::Unreadable(format!(
-                        "{PLUGIN_NAME}: spool decoded byte count overflowed"
-                    ))
-                })?;
+            let next_decoded =
+                self.decoded_bytes
+                    .checked_add(consumed as u64)
+                    .ok_or_else(|| {
+                        SpoolDecodeError::Unreadable(format!(
+                            "{PLUGIN_NAME}: spool decoded byte count overflowed"
+                        ))
+                    })?;
             if next_decoded > self.decoded_limit || next_decoded > SPOOL_MAX_ARTIFACT_BYTES {
                 return Err(SpoolDecodeError::Unreadable(format!(
                     "{PLUGIN_NAME}: spool artifact exceeds its hard decoded-byte bound"
@@ -10264,22 +10261,13 @@ async fn replay_spool_once(
                 }
             }
         };
-        match replay_spool_stream(
-            spool,
-            &mut claim,
-            flush_config,
-            &mut reader,
-            batch_size,
-        )
-        .await
-        {
+        match replay_spool_stream(spool, &mut claim, flush_config, &mut reader, batch_size).await {
             Ok(completion) => {
                 if reader.row_count() != line_count {
                     drop(reader);
                     drop(completion);
-                    let error = format!(
-                        "{PLUGIN_NAME}: spool artifact changed row count during replay"
-                    );
+                    let error =
+                        format!("{PLUGIN_NAME}: spool artifact changed row count during replay");
                     spool
                         .metrics
                         .record_failure(FailureReason::Serialize, error.clone());
@@ -10569,14 +10557,11 @@ async fn replay_stream_batch(
         }
         attempts = attempts.saturating_add(1);
         {
-            let _guard = spool
-                .write_lock
-                .lock()
-                .map_err(|_| {
-                    ReplayStreamError::Retryable(format!(
-                        "{PLUGIN_NAME}: spool writer lock is poisoned"
-                    ))
-                })?;
+            let _guard = spool.write_lock.lock().map_err(|_| {
+                ReplayStreamError::Retryable(format!(
+                    "{PLUGIN_NAME}: spool writer lock is poisoned"
+                ))
+            })?;
             spool
                 .renew_claim_locked(claim)
                 .map_err(ReplayStreamError::Retryable)?;
@@ -10638,13 +10623,10 @@ fn append_dead_letter_row(
 ) -> Result<(), ReplayStreamError> {
     if payload.is_none() {
         *payload = Some(
-            DeadLetterPayloadWriter::open(spool, source)
-                .map_err(ReplayStreamError::Retryable)?,
+            DeadLetterPayloadWriter::open(spool, source).map_err(ReplayStreamError::Retryable)?,
         );
     }
-    let row = batch
-        .row(row_index)
-        .map_err(ReplayStreamError::Retryable)?;
+    let row = batch.row(row_index).map_err(ReplayStreamError::Retryable)?;
     payload
         .as_mut()
         .ok_or_else(|| {
@@ -10712,10 +10694,10 @@ fn finalize_replayed_spool_file(
             )
         })?;
     }
-    spool
-        .metrics
-        .spool_dead_letter_rows_total
-        .fetch_add(u64::try_from(rejected_rows).unwrap_or(u64::MAX), Ordering::Relaxed);
+    spool.metrics.spool_dead_letter_rows_total.fetch_add(
+        u64::try_from(rejected_rows).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
     let quota_result = {
         let _guard = spool
             .write_lock
