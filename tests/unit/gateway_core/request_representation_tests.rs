@@ -353,11 +353,14 @@ async fn waf_scans_the_staged_plaintext_not_the_wire_octets() {
     }))
     .expect("waf config");
     let mut ctx = ctx_with_json_post();
-    let encoded = gzip(BLOCKED_JSON.as_bytes());
+    // The decode gate itself is exercised above. At this direct hook seam, use
+    // a valid marker-free document for the wire argument so unrelated binary
+    // encoding protections cannot decide the control case first.
+    let wire_body = br#"{"note":"opaque"}"#;
 
-    // Without the gate's plaintext view, the compressed octets match nothing.
+    // Without the gate's plaintext view, the custom marker is absent.
     let opaque = plugin
-        .on_final_request_body_with_context(&mut ctx, &headers(Some("gzip")), &encoded)
+        .on_final_request_body_with_context(&mut ctx, &headers(Some("gzip")), wire_body)
         .await;
     assert!(matches!(opaque, PluginResult::Continue));
 
@@ -368,7 +371,7 @@ async fn waf_scans_the_staged_plaintext_not_the_wire_octets() {
         BLOCKED_JSON.as_bytes().to_vec(),
     );
     let scanned = plugin
-        .on_final_request_body_with_context(&mut ctx, &headers(Some("gzip")), &encoded)
+        .on_final_request_body_with_context(&mut ctx, &headers(Some("gzip")), wire_body)
         .await;
     assert!(
         matches!(scanned, PluginResult::Reject { .. }),

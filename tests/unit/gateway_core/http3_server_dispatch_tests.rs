@@ -426,12 +426,23 @@ fn buffered_h3_deadline_replacements_keep_grpc_web_wire_flavor() {
     assert!(committed_hooks.contains("replace_buffered_grpc_response_with_deadline("));
 
     let cross_protocol = include_str!("../../../src/http3/cross_protocol.rs");
-    let replacement = cross_protocol
-        .find("fn replace_buffered_grpc_response_with_deadline(")
-        .expect("cross-protocol buffered gRPC replacement must remain present");
-    let replacement = &cross_protocol[replacement..];
-    assert!(replacement.contains("is_grpc_web_content_type(content_type)"));
-    assert!(replacement.contains("replace_buffered_h3_response_with_grpc_deadline("));
+    let transform = cross_protocol
+        .find("crate::proxy::transform_buffered_response_body_with_deadline(")
+        .expect("cross-protocol buffered response transform must remain present");
+    let transform = &cross_protocol[transform..];
+    let committed = transform
+        .find("run_deadline_bounded_response_committed_hooks(")
+        .expect("cross-protocol committed-hook pipeline must remain present");
+    assert!(transform[..committed].contains("grpc_web_response_content_type,"));
+
+    let shared_transform = shared
+        .split("pub(crate) async fn transform_buffered_response_body_with_deadline(")
+        .nth(1)
+        .expect("shared buffered transform deadline pipeline must remain present")
+        .split("pub(crate) async fn")
+        .next()
+        .expect("shared buffered transform deadline pipeline must remain bounded");
+    assert!(shared_transform.contains("replace_buffered_grpc_response_with_deadline("));
 }
 
 // Buffered response-body policy enforcement across encoded, partial, and
