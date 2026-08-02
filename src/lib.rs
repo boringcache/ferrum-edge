@@ -4705,6 +4705,13 @@ pub mod _test_support {
         crate::proxy::stamp_original_response_metadata(ctx, response_status, response_headers);
     }
 
+    /// Stamp the immutable inbound request flavor used by buffered rejection
+    /// normalization. Tests use the production classification seam rather than
+    /// inferring native gRPC from a mutable response Content-Type.
+    pub fn mark_native_grpc_request_for_test(ctx: &mut crate::plugins::RequestContext) {
+        ctx.set_request_http_flavor(crate::config::types::HttpFlavor::Grpc);
+    }
+
     /// Force the representation gate's pristine origin-encoding marker so a
     /// defensive identity-only decoder branch can be exercised independently of
     /// the production snapshotter, which intentionally stamps only non-identity

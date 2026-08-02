@@ -20,7 +20,8 @@ use std::sync::Arc;
 
 use ferrum_edge::_test_support::{
     finalize_synthetic_response_for_test, gateway_capacity_response_selected_for_test,
-    mark_buffered_response_capacity_refusal_pending_for_test,
+    mark_buffered_response_capacity_refusal_pending_for_test, mark_native_grpc_request_for_test,
+    retain_grpc_web_client_content_type_for_test,
     run_after_proxy_hooks_reject_for_test, set_original_response_content_encoding_for_test,
     stamp_original_response_metadata_for_test,
     take_buffered_response_capacity_refusal_pending_for_test,
@@ -44,6 +45,19 @@ const PROTECTED_HEADER: &str = "x-public-secret";
 /// pending signal previously reached publication unconsumed.
 struct FinalPolicyCapacityRefusal;
 
+/// Final-body policy that deterministically rejects, used to assert that the
+/// shared funnel installs protocol-correct terminals rather than bare JSON.
+struct RejectingFinalBodyPolicy;
+
+/// Header policy whose own first rejection recreates the refused field. The
+/// second decision must collapse to the fixed terminal rather than publishing
+/// that plugin-controlled rejection shape.
+struct SelfRefusingFinalHeaderPolicy;
+
+/// Successful-response-only decorator. It cannot be reconstructed by the
+/// rejection hook chain, so survival proves line-aware provenance is retained.
+struct OneShotGatewayDecorator;
+
 /// Later ordinary `after_proxy` rejection whose gateway-owned replacement
 /// exposes a rename source to the still-later response transformer.
 struct LateHeaderBearingReject;
@@ -62,6 +76,10 @@ impl Plugin for FinalPolicyCapacityRefusal {
         true
     }
 
+    fn may_enforce_response_body_policy(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
     async fn finalize_client_visible_response_body(
         &self,
         ctx: &mut RequestContext,
@@ -71,6 +89,90 @@ impl Plugin for FinalPolicyCapacityRefusal {
     ) -> ferrum_edge::plugins::PluginResult {
         mark_buffered_response_capacity_refusal_pending_for_test(ctx);
         ferrum_edge::plugins::PluginResult::Continue
+    }
+}
+
+#[async_trait::async_trait]
+impl Plugin for RejectingFinalBodyPolicy {
+    fn name(&self) -> &str {
+        "rejecting_final_body_policy"
+    }
+
+    fn requires_response_body_buffering(&self) -> bool {
+        true
+    }
+
+    fn enforces_final_client_visible_response_body(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
+    fn may_enforce_response_body_policy(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
+    async fn finalize_client_visible_response_body(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> ferrum_edge::plugins::PluginResult {
+        ferrum_edge::plugins::PluginResult::Reject {
+            status_code: 403,
+            body: r#"{"error":"blocked"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Plugin for SelfRefusingFinalHeaderPolicy {
+    fn name(&self) -> &str {
+        "self_refusing_final_header_policy"
+    }
+
+    fn enforces_final_client_visible_response_headers(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
+    async fn finalize_client_visible_response_headers(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> ferrum_edge::plugins::PluginResult {
+        if !header_names_contain(response_headers, "x-refused") {
+            return ferrum_edge::plugins::PluginResult::Continue;
+        }
+        ferrum_edge::plugins::PluginResult::Reject {
+            status_code: 418,
+            body: "plugin-controlled rejection".to_string(),
+            headers: HashMap::from([("x-refused".to_string(), "again".to_string())]),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Plugin for OneShotGatewayDecorator {
+    fn name(&self) -> &str {
+        "one_shot_gateway_decorator"
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> ferrum_edge::plugins::PluginResult {
+        response_headers.insert(
+            "x-request-id".to_string(),
+            "gateway-request-id".to_string(),
+        );
+        ferrum_edge::plugins::PluginResult::Continue
+    }
+
+    fn owns_deadline_response_header(&self, _ctx: &RequestContext, name: &str) -> bool {
+        name.eq_ignore_ascii_case("x-request-id")
     }
 }
 
@@ -211,6 +313,28 @@ fn waf_blocking_unrelated_header(rule_id: &str) -> Arc<dyn Plugin> {
             }]
         }))
         .expect("waf unrelated response-header config"),
+    )
+}
+
+/// A WAF rule over a header name authored only by the late transport stage.
+fn waf_blocking_content_encoding_header() -> Arc<dyn Plugin> {
+    Arc::new(
+        Waf::new(&json!({
+            "mode": "enforce",
+            "include_default_rules": false,
+            "response_inspection": true,
+            "custom_rules": [{
+                "id": "CUSTOM-LATE-CONTENT-ENCODING",
+                "name": "late content encoding",
+                "category": "custom",
+                "severity": "high",
+                "target": "response_headers",
+                "match_kind": "contains",
+                "pattern": "content-encoding",
+                "action": "enforce"
+            }]
+        }))
+        .expect("waf late content-encoding config"),
     )
 }
 
@@ -377,6 +501,119 @@ async fn late_body_add_cannot_bypass_waf_response_body_rule() {
         !String::from_utf8_lossy(&body).contains(BLOCKED_TOKEN),
         "the blocked token must not survive into the client-visible body"
     );
+}
+
+/// A final body-policy rejection on native gRPC must become a trailers-only
+/// gRPC error. A bare HTTP 403 JSON body is not a valid RPC terminal.
+#[tokio::test]
+async fn final_body_policy_rejection_is_native_grpc_terminal() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RejectingFinalBodyPolicy)];
+    let mut ctx = ctx_for("POST", "/grpc.Service/Method");
+    mark_native_grpc_request_for_test(&mut ctx);
+    let mut headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc".to_string(),
+    )]);
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &headers);
+    let mut status = 200u16;
+    let mut body = bytes::Bytes::from_static(b"backend data");
+
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+
+    assert!(replaced);
+    assert_eq!(status, 200);
+    assert!(body.is_empty(), "native gRPC rejection must be trailers-only");
+    assert_eq!(headers.get("content-type").map(String::as_str), Some("application/grpc"));
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("7"));
+    assert!(!header_names_contain(&headers, "content-length"));
+}
+
+/// The same rejection for a translated gRPC-Web client must put terminal
+/// metadata in a trailer frame, not in the initial HTTP header block.
+#[tokio::test]
+async fn final_body_policy_rejection_is_grpc_web_trailer_frame() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RejectingFinalBodyPolicy)];
+    let mut ctx = ctx_for("POST", "/grpc.Service/Method");
+    let client_content_type = "application/grpc-web+proto";
+    retain_grpc_web_client_content_type_for_test(&mut ctx, client_content_type);
+    let mut headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc".to_string(),
+    )]);
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &headers);
+    let mut status = 200u16;
+    let mut body = bytes::Bytes::from_static(b"backend data");
+
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        Some(client_content_type),
+        false,
+    )
+    .await;
+
+    assert!(replaced);
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("content-type").map(String::as_str), Some(client_content_type));
+    assert!(!header_names_contain(&headers, "grpc-status"));
+    assert_eq!(body.first().copied(), Some(0x80));
+    assert!(String::from_utf8_lossy(&body).contains("grpc-status: 7"));
+}
+
+/// Gateway decorations already authored by the accepted after_proxy chain must
+/// survive a later body-policy rejection, while an untouched backend cookie is
+/// shed even though it has the same trusted-looking name as a gateway cookie.
+#[tokio::test]
+async fn final_body_policy_rejection_preserves_only_gateway_header_provenance() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(RejectingFinalBodyPolicy),
+        Arc::new(OneShotGatewayDecorator),
+    ];
+    let mut ctx = ctx_for("GET", "/orders");
+    let mut headers = json_headers();
+    headers.insert(
+        "set-cookie".to_string(),
+        "backend-session=must-not-cross".to_string(),
+    );
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &headers);
+    assert!(
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut headers)
+            .await
+            .is_none()
+    );
+    let mut status = 200u16;
+    let mut body = bytes::Bytes::from_static(br#"{"ok":true}"#);
+
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+
+    assert!(replaced);
+    assert_eq!(status, 403);
+    assert_eq!(
+        headers.get("x-request-id").map(String::as_str),
+        Some("gateway-request-id")
+    );
+    assert!(!header_names_contain(&headers, "set-cookie"));
 }
 
 /// The control: with no later rewrite, an untouched clean response still passes.
@@ -560,6 +797,68 @@ async fn unrelated_late_header_rules_do_not_reject() {
 
     assert!(reject.is_none(), "a benign header add must not be refused");
     assert!(header_names_contain(&headers, "x-benign"));
+}
+
+/// The transport stage can author headers after the ordinary after_proxy map
+/// closes. Buffered publication therefore needs a final header-policy decision
+/// after compression, not only at the end of after_proxy.
+#[tokio::test]
+async fn transport_encoding_header_cannot_bypass_final_header_policy() {
+    let plugins = vec![waf_blocking_content_encoding_header(), compression_plugin()];
+    let mut ctx = ctx_for("GET", "/orders");
+    ctx.headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    let payload = r#"{"note":"padding padding padding padding padding padding"}"#;
+    let mut headers = json_headers();
+    headers.insert("content-length".to_string(), payload.len().to_string());
+    run_request_and_response_header_hooks(&plugins, &mut ctx, &mut headers).await;
+
+    let (replaced, status, headers, body) = run_buffered_transform(
+        &plugins,
+        &mut ctx,
+        200,
+        headers,
+        payload.as_bytes().to_vec(),
+    )
+    .await;
+
+    assert!(replaced, "the late Content-Encoding header must be refused");
+    assert_eq!(status, 403);
+    assert!(!header_names_contain(&headers, "content-encoding"));
+    assert!(!body.is_empty());
+}
+
+/// A rejection shape that the policy itself still refuses cannot be used as
+/// the second terminal. The fixed body and empty plugin header set are the
+/// bounded fail-closed outcome.
+#[tokio::test]
+async fn repeated_final_header_refusal_collapses_to_fixed_terminal() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(SelfRefusingFinalHeaderPolicy)];
+    let mut ctx = ctx_for("GET", "/orders");
+    let mut status = 200u16;
+    let mut headers = json_headers();
+    headers.insert("x-refused".to_string(), "first".to_string());
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    let mut body = bytes::Bytes::from_static(br#"{"ok":true}"#);
+
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+
+    assert!(replaced);
+    assert_eq!(status, 500);
+    assert!(!header_names_contain(&headers, "x-refused"));
+    assert_eq!(
+        body.as_ref(),
+        br#"{"error":"response policy could not be applied"}"#
+    );
 }
 
 // ───────────────────── 3. transport encoding runs last ─────────────────────

@@ -553,7 +553,7 @@ representation), because it is non-rewriting and must still decide.
 
 Response HEADER policy is a separate phase
 (`finalize_client_visible_response_headers`) because the body phase above is not
-the last thing that can rewrite the header map. It runs at the two points where
+the last thing that can rewrite the header map. It runs at the three points where
 the client-visible header map genuinely closes:
 
 - **At the END of the `after_proxy` chain**, inside `run_after_proxy_hooks`, so
@@ -570,6 +570,11 @@ the client-visible header map genuinely closes:
   a late header `rename` create a prohibited header behind every enforcing pass
   (`GHSA-62jg-v563-4q23`). This phase closes that window WITHOUT re-running the
   chain.
+- **At the OUTER buffered transform boundary**, after semantic rewrites and the
+  transport-encoding stage. Every return from the inner transform funnel — an
+  admitted response, a body-policy rejection, a representation refusal, a
+  capacity terminal, or a deadline terminal — crosses this boundary. This is
+  the actual final map for buffered H1/H2, native gRPC, gRPC-Web, and H3.
 
 `waf` owns this phase. Its re-assertion is gated on an instance-scoped,
 deterministic canonical digest of the header map, so an untouched header set is
@@ -584,14 +589,17 @@ re-run the hooks that authored them. Dropped: everything the backend or the
 synthetic producer contributed, including the refused field itself and the stale
 representation metadata of the discarded body, so the rebuild cannot resurrect
 what was just refused. Policy is then re-evaluated exactly once over the rebuild;
-a second refusal collapses to a fixed minimal gateway terminal.
+a second refusal collapses to a fixed minimal gateway terminal. Buffered body
+and header rejections are normalized through the immutable inbound request
+flavor: native gRPC receives a trailers-only error and gRPC-Web receives a
+terminal trailer frame, never a bare JSON HTTP response. The buffered rebuild
+retains gateway decorators through line-aware provenance, so a same-named
+backend field cannot cross onto the terminal.
 
 Gateway transport-encoding fields written after the `after_proxy` chain
-(`Content-Encoding` and the recomputed `Content-Length` from the transport stage)
-are gateway-owned and are governed by
-`sanitize_client_response_headers_for_wire`, not by a further policy pass — a
-re-scan there would rescore every already-scanned field on every buffered
-response.
+(`Content-Encoding` and the recomputed `Content-Length`) are evaluated at the
+outer buffered boundary. Untouched fields are still skipped by WAF's
+instance-scoped digest, so the extra boundary does not rescore an unchanged map.
 
 `waf`, `body_validator`, and `ai_response_guard` additionally claim an
 **origin-encoded** buffered response through `enforces_response_body_policy`, so

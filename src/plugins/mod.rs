@@ -9030,7 +9030,13 @@ pub trait Plugin: Send + Sync {
     ///   `response_transformer` route override) lands exactly once on the real
     ///   final response. That ordering used to put `response_transformer`'s
     ///   header rules after every enforcing pass. This phase runs after that
-    ///   chain instead, without re-running it.
+    ///   chain instead, without re-running it;
+    /// * on buffered responses the outer transform funnel invokes this phase
+    ///   once more after semantic and transport stages, so a late
+    ///   `Content-Encoding`, recomputed `Content-Length`, or transform-owned
+    ///   field cannot appear behind the decision made at the end of
+    ///   `after_proxy`. An instance-scoped digest lets an implementation skip
+    ///   unchanged maps without rescoring them.
     ///
     /// The phase is REJECTING and NON-REWRITING: return `Continue` to publish the
     /// map as it stands, or a rejection to replace the response. A rejection is
