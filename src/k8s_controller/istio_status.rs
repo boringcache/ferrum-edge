@@ -1200,7 +1200,11 @@ fn workload_entry_status(
         )
     } else {
         let cross_namespace = expected_service_namespace != object.metadata.namespace.as_str();
-        (expected_service_name, expected_service_namespace, cross_namespace)
+        (
+            expected_service_name,
+            expected_service_namespace,
+            cross_namespace,
+        )
     };
 
     match result {
