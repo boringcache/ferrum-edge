@@ -2148,8 +2148,8 @@ pub(crate) async fn handle_delete<R: AdminResource>(
             // Issue #2997: the target row exists but cannot be decoded. Skip
             // namespace-snapshot recovery (that load fails for the same row) and
             // delete by id so admin remains the in-band repair path.
-            let persistence = match audit::spawn_with_request_slot(
-                persist_undecodable_delete_repair::<R>(
+            let persistence =
+                match audit::spawn_with_request_slot(persist_undecodable_delete_repair::<R>(
                     OwnedWriteSettlementContext {
                         db: db_arc.clone(),
                         namespace: namespace.to_string(),
@@ -2159,15 +2159,14 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                         actor: actor.clone(),
                     },
                     id.to_string(),
-                ),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => Err(anyhow::anyhow!(
-                    "namespace undecodable-row delete persistence task failed: {error}"
-                )),
-            };
+                ))
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow::anyhow!(
+                        "namespace undecodable-row delete persistence task failed: {error}"
+                    )),
+                };
             return match persistence {
                 Ok(true) => Ok(super::empty_response(StatusCode::NO_CONTENT)),
                 Ok(false) => Ok(not_found_response::<R>()),
@@ -5007,8 +5006,8 @@ async fn handle_write<R: AdminResource>(
         }
         WriteAction::Update { id } => {
             if undecodable_update_repair {
-                let persistence = match audit::spawn_with_request_slot(
-                    persist_undecodable_update_repair(
+                let persistence =
+                    match audit::spawn_with_request_slot(persist_undecodable_update_repair(
                         OwnedWriteSettlementContext {
                             db: db_arc.clone(),
                             namespace: namespace.to_string(),
@@ -5019,15 +5018,14 @@ async fn handle_write<R: AdminResource>(
                         },
                         id.to_string(),
                         resource.clone(),
-                    ),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error) => Err(anyhow::anyhow!(
-                        "namespace undecodable-row update persistence task failed: {error}"
-                    )),
-                };
+                    ))
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => Err(anyhow::anyhow!(
+                            "namespace undecodable-row update persistence task failed: {error}"
+                        )),
+                    };
                 match persistence {
                     Ok(false) => return Ok(not_found_response::<R>()),
                     Ok(true) => {}
@@ -5040,8 +5038,8 @@ async fn handle_write<R: AdminResource>(
                         &json!({"error": "Update persistence is missing the prior resource"}),
                     ));
                 };
-                let persistence = match audit::spawn_with_request_slot(
-                    persist_update_to_settlement(
+                let persistence =
+                    match audit::spawn_with_request_slot(persist_update_to_settlement(
                         OwnedWriteSettlementContext {
                             db: db_arc.clone(),
                             namespace: namespace.to_string(),
@@ -5053,15 +5051,14 @@ async fn handle_write<R: AdminResource>(
                         id.to_string(),
                         resource.clone(),
                         previous,
-                    ),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error) => Err(anyhow::anyhow!(
-                        "namespace update persistence task failed: {error}"
-                    )),
-                };
+                    ))
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => Err(anyhow::anyhow!(
+                            "namespace update persistence task failed: {error}"
+                        )),
+                    };
                 // The row vanished between the precheck and the write (concurrent
                 // delete). The backend recorded no change — report not-found
                 // rather than a phantom success (issue #2122 DB-M4).

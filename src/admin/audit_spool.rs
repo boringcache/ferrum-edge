@@ -372,7 +372,9 @@ impl AuditSpool {
     /// Verify the tree is actually writable *and syncable* now rather than
     /// discovering it on the first audited mutation.
     fn probe_writable(&self) -> Result<(), SpoolError> {
-        let probe = self.tmp_dir().join(format!("probe-{}{TMP_EXTENSION}", uuid_text()));
+        let probe = self
+            .tmp_dir()
+            .join(format!("probe-{}{TMP_EXTENSION}", uuid_text()));
         let result = (|| -> Result<(), SpoolError> {
             write_new_owner_only_file(&probe, b"ok")?;
             sync_dir(&self.tmp_dir())
@@ -463,7 +465,9 @@ impl AuditSpool {
             // an identity field that is itself hostile-sized.
             return Err(SpoolError::new(SpoolErrorKind::InvalidRecord));
         }
-        let tmp = self.tmp_dir().join(format!("{}{TMP_EXTENSION}", uuid_text()));
+        let tmp = self
+            .tmp_dir()
+            .join(format!("{}{TMP_EXTENSION}", uuid_text()));
         let published = (|| -> Result<(), SpoolError> {
             write_new_owner_only_file(&tmp, &bytes)?;
             // The temp directory entry itself must be durable before the rename
@@ -753,8 +757,7 @@ impl AuditSpool {
                     report.corrupt = report.corrupt.saturating_add(1);
                     match self.quarantine(&path) {
                         Ok(false) => {
-                            report.capacity_discarded =
-                                report.capacity_discarded.saturating_add(1);
+                            report.capacity_discarded = report.capacity_discarded.saturating_add(1);
                         }
                         Ok(true) | Err(_) => {}
                     }

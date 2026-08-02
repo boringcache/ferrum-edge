@@ -1948,8 +1948,7 @@ async fn handle_admin_request_inner(
         // evidence that records were corrupted, retained as unrecoverable, or
         // permanently discarded: a later successful delivery must not clear it,
         // so it stays visible until the evidence itself is resolved.
-        if state.admin_audit_enabled
-            && (!audit::pipeline_available() || audit::pipeline_degraded())
+        if state.admin_audit_enabled && (!audit::pipeline_available() || audit::pipeline_degraded())
         {
             health_status["status"] = json!("degraded");
         }

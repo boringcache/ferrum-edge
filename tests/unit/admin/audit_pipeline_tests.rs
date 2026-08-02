@@ -259,10 +259,7 @@ fn spawned_mutation_persistence_explicitly_propagates_the_request_audit_slot() {
     );
 
     let api_specs = include_str!("../../../src/admin/api_specs/handlers.rs");
-    let compact_api_specs: String = api_specs
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect();
+    let compact_api_specs: String = api_specs.chars().filter(|ch| !ch.is_whitespace()).collect();
     assert_eq!(
         compact_api_specs
             .matches("audit::spawn_with_request_slot(asyncmove")
@@ -286,7 +283,10 @@ fn intent_is_durable_before_the_mutation_and_finalized_after_it() {
     assert_eq!(instances.len(), 1, "one live process generation");
     let instance = &instances[0];
     assert!(
-        instance.join("prepared").join(format!("{id}.json")).exists(),
+        instance
+            .join("prepared")
+            .join(format!("{id}.json"))
+            .exists(),
         "the intent is on disk before the mutation runs"
     );
     assert_eq!(
@@ -302,7 +302,10 @@ fn intent_is_durable_before_the_mutation_and_finalized_after_it() {
         .expect("finalize is durable");
 
     assert!(
-        !instance.join("prepared").join(format!("{id}.json")).exists(),
+        !instance
+            .join("prepared")
+            .join(format!("{id}.json"))
+            .exists(),
         "the prepared record is unlinked only after the finalized one is durable"
     );
     assert!(
@@ -354,7 +357,10 @@ fn a_prepared_record_is_never_deliverable_as_an_outcome() {
         1024 * 1024,
     );
     assert_eq!(
-        spool.finalize(&prepared).expect_err("finalize rejects").kind,
+        spool
+            .finalize(&prepared)
+            .expect_err("finalize rejects")
+            .kind,
         SpoolErrorKind::InvalidRecord
     );
 }
@@ -439,7 +445,9 @@ async fn successful_delivery_reopens_fail_closed_admission_after_saturation() {
     );
     let mut finalized = event_with(&id, json!({"delivered": true}));
     finalized.outcome = AuditOutcome::Success.as_str().to_string();
-    worker.record(finalized).expect("finalized handoff succeeds");
+    worker
+        .record(finalized)
+        .expect("finalized handoff succeeds");
 
     assert!(
         wait_until(Duration::from_secs(5), || delivery
@@ -728,7 +736,10 @@ async fn duplicate_delivery_of_the_same_id_is_success_not_replacement() {
     let first = event_with(&id, json!({"generation": 1}));
     let second = event_with(&id, json!({"generation": 2}));
     delivery.deliver(&first).await.expect("first insert");
-    delivery.deliver(&second).await.expect("duplicate is success");
+    delivery
+        .deliver(&second)
+        .await
+        .expect("duplicate is success");
 
     let stored = delivery.accepted_event(&id).expect("one stored row");
     assert_eq!(
@@ -860,11 +871,7 @@ async fn retained_capacity_loss_degrades_without_deadlocking_fail_closed_admissi
 
     assert!(
         wait_until(Duration::from_secs(10), || {
-            pipeline
-                .status()
-                .metrics
-                .dropped_retained_capacity_total
-                == 1
+            pipeline.status().metrics.dropped_retained_capacity_total == 1
         })
         .await,
         "the bounded retained store reports the discarded newest event"

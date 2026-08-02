@@ -865,9 +865,7 @@ impl AuditPipelineMetrics {
             truncated_diffs_total: self.truncated_diffs.load(Ordering::Relaxed),
             dropped_durable_handoff_failed_total: self.dropped_handoff.load(Ordering::Relaxed),
             dropped_no_durable_spool_total: self.dropped_no_spool.load(Ordering::Relaxed),
-            dropped_retained_capacity_total: self
-                .dropped_retained_capacity
-                .load(Ordering::Relaxed),
+            dropped_retained_capacity_total: self.dropped_retained_capacity.load(Ordering::Relaxed),
             fail_open_unaudited_mutations_total: self.fail_open_unaudited.load(Ordering::Relaxed),
             fail_closed_rejections_total: self.fail_closed_rejections.load(Ordering::Relaxed),
             queue_depth: self.queue_depth.load(Ordering::Relaxed),
@@ -966,7 +964,9 @@ impl AuditPipeline {
         let mut spool = None;
         let mut reason = AuditUnavailableReason::None;
 
-        if config.enabled && let Some(dir) = config.spool_dir.as_ref() {
+        if config.enabled
+            && let Some(dir) = config.spool_dir.as_ref()
+        {
             match AuditSpool::open(
                 dir.clone(),
                 generation.clone(),
@@ -1314,7 +1314,9 @@ impl AuditPipeline {
     fn note_unrecoverable(&self, record: &SpooledAuditRecord) {
         self.mark_degraded(AuditUnavailableReason::DeliveryExhausted);
         let Some(spool) = self.spool.as_ref() else {
-            self.metrics.dropped_no_spool.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .dropped_no_spool
+                .fetch_add(1, Ordering::Relaxed);
             self.evidence_lost.store(true, Ordering::Relaxed);
             error!(
                 audit_event_id = %record.id(),
@@ -1370,7 +1372,9 @@ impl AuditPipeline {
     /// in retained storage, so report a real drop rather than inflating the
     /// retained counter.
     fn note_shutdown_memory_loss(&self, record: &SpooledAuditRecord) {
-        self.metrics.dropped_no_spool.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .dropped_no_spool
+            .fetch_add(1, Ordering::Relaxed);
         self.mark_unavailable(AuditUnavailableReason::NoDurableSpool);
         self.evidence_lost.store(true, Ordering::Relaxed);
         self.mark_degraded(AuditUnavailableReason::NoDurableSpool);
@@ -1391,7 +1395,9 @@ impl AuditPipeline {
         reason: AuditUnavailableReason,
         event_id: &str,
     ) -> Result<(), anyhow::Error> {
-        self.metrics.dropped_no_spool.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .dropped_no_spool
+            .fetch_add(1, Ordering::Relaxed);
         self.mark_unavailable(reason);
         self.evidence_lost.store(true, Ordering::Relaxed);
         self.mark_degraded(AuditUnavailableReason::NoDurableSpool);
@@ -1458,9 +1464,7 @@ impl AuditPipeline {
         if let Some(spool) = self.spool.as_ref() {
             spool.resync_counts();
             let stats = spool.stats();
-            if stats
-                .prepared_records
-                .saturating_add(stats.pending_records)
+            if stats.prepared_records.saturating_add(stats.pending_records)
                 < self.config.spool_max_records
             {
                 self.mark_capacity_available();
@@ -1733,18 +1737,14 @@ where
     if let Some(slot) = slot.as_ref() {
         // Transfer cancellation responsibility before spawning so the parent
         // cannot race task scheduling and finalize the same intent first.
-        slot.cancellation_transferred
-            .store(true, Ordering::Release);
+        slot.cancellation_transferred.store(true, Ordering::Release);
     }
     tokio::spawn(async move {
         match slot {
             Some(slot) => {
-                let output = scope_request_with_cancellation_ownership(
-                    Arc::clone(&slot),
-                    future,
-                    true,
-                )
-                .await;
+                let output =
+                    scope_request_with_cancellation_ownership(Arc::clone(&slot), future, true)
+                        .await;
                 // The parent request can be cancelled while this settlement
                 // task intentionally keeps running. If persistence did not
                 // emit a detailed success event, finalize the intent here as a
@@ -2130,7 +2130,11 @@ impl AuditWorker {
                     .enqueued
                     .fetch_add(1, Ordering::Relaxed);
                 self.pipeline.metrics.queue_depth.store(
-                    (self.pipeline.config.queue_capacity.saturating_sub(tx.capacity())) as u64,
+                    (self
+                        .pipeline
+                        .config
+                        .queue_capacity
+                        .saturating_sub(tx.capacity())) as u64,
                     Ordering::Relaxed,
                 );
                 Ok(())
@@ -2370,7 +2374,8 @@ async fn replay_spool(pipeline: &Arc<AuditPipeline>, delivery: &Arc<dyn AuditEve
     };
     let ids = {
         let spool = Arc::clone(&spool);
-        match tokio::task::spawn_blocking(move || spool.list_pending_ids(AUDIT_REPLAY_BATCH)).await {
+        match tokio::task::spawn_blocking(move || spool.list_pending_ids(AUDIT_REPLAY_BATCH)).await
+        {
             Ok(ids) => ids,
             Err(_) => return,
         }
@@ -2675,8 +2680,8 @@ pub async fn record(
             }
         }
     })
-        .await
-        .unwrap_or_else(|error| Err(anyhow!("admin audit durable handoff task failed: {error}")))
+    .await
+    .unwrap_or_else(|error| Err(anyhow!("admin audit durable handoff task failed: {error}")))
 }
 
 /// Drain every registered audit worker within `timeout`.
