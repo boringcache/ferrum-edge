@@ -12426,7 +12426,7 @@ mod inner {
             // replay after a crash, a partial failure, or a shutdown deadline
             // re-delivers the same event id. An audit row is immutable, so a
             // duplicate must converge to the row that is already durable rather
-            // than replace it: `replace_one(...).upsert(true)` would silently
+            // than replace it: a replace-with-upsert operation would silently
             // overwrite an existing audit record, which is exactly the mutation
             // an audit log must not permit. `insert_one` with duplicate-key
             // (11000) treated as success is the insert-only equivalent, and it
