@@ -193,8 +193,13 @@ impl UsageAccumulator {
             .and_then(Value::as_object)
             .is_some_and(|usage| !usage.is_empty())
         {
-            let provider = configured
-                .or_else(|| detect_sse_provider(json))
+            // Prefer an unambiguous wire-shape discriminator. A configured
+            // provider remains the fallback for genuinely ambiguous `usage`
+            // documents, but must not suppress the authoritative format the
+            // backend actually emitted (especially under the opt-in `warn`
+            // policy, which would otherwise release the reservation).
+            let provider = detect_sse_provider(json)
+                .or(configured)
                 .unwrap_or(AiProvider::OpenAi);
             self.record(&extract_response_usage(json, provider));
         }
