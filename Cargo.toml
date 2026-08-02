@@ -467,7 +467,7 @@ rcgen = { version = "0.14", features = ["aws_lc_rs"] }
 # `--no-default-features --features fips`, without letting a fixture's provider
 # choice reach a deployment. The FIPS build/lint gate in
 # `.github/workflows/fips-build.yml` audits the resolved graph with
-# `--no-dev-deps` for exactly this reason.
+# `--no-dev-dependencies` for exactly this reason.
 ring = "0.17"
 rustls = { version = "0.23", features = ["ring"] }
 rstest = "0.26"

@@ -18,9 +18,9 @@
 //!   arbitrary extra headers.
 //! - **Authentication**: `Authorization` header for Bearer/Basic auth.
 
+use crate::fips::backend::rand::{SecureRandom, SystemRandom};
 use async_trait::async_trait;
 use bytes::Bytes;
-use crate::fips::backend::rand::{SecureRandom, SystemRandom};
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::BTreeMap;

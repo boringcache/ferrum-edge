@@ -8,9 +8,9 @@
 //! unique, random value of at least 32 bytes. The plugin rejects construction
 //! if that requirement is not met — there is no insecure default.
 
+use crate::fips::approved::HmacSha256;
 use async_trait::async_trait;
 use base64::Engine;
-use crate::fips::approved::HmacSha256;
 use serde_json::Value;
 use tracing::{debug, warn};
 

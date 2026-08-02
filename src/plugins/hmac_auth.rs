@@ -42,9 +42,9 @@
 //! Consumer credentials should include:
 //!   { "hmac_auth": { "secret": "<shared-secret>" } }
 
+use crate::fips::approved::{HmacSha256, HmacSha512, Sha256, Sha512};
 use async_trait::async_trait;
 use base64::Engine as _;
-use crate::fips::approved::{HmacSha256, HmacSha512, Sha256, Sha512};
 use serde_json::Value;
 use std::fmt;
 use std::sync::{Arc, OnceLock};

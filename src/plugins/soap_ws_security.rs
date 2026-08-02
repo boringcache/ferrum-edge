@@ -279,11 +279,11 @@
 //! `shared` (atomic Redis `SET NX EX` across replicas). `OneTimeUse` needs no
 //! special case because every accepted assertion is claimed exactly once.
 
+use crate::fips::backend::digest;
+use crate::fips::backend::signature as ring_sig;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Datelike, Utc};
-use crate::fips::backend::digest;
-use crate::fips::backend::signature as ring_sig;
 use roxmltree::{Document, Node, NodeId, ParsingOptions};
 use serde_json::Value;
 use std::borrow::Cow;

@@ -60,7 +60,7 @@ jobs:
 
       - name: Resolve the ordinary (crypto-ring) feature graph
         run: |
-          cargo tree -e features --no-dev-deps > /tmp/tree-crypto-ring.txt
+          cargo tree -e features --no-dev-dependencies > /tmp/tree-crypto-ring.txt
 
       - name: Audit the ordinary feature graph
         run: |
@@ -72,7 +72,7 @@ jobs:
         # needs no C/Go toolchain. It DOES need to update the lockfile with the
         # FIPS-only crates, which is why `--locked` is deliberately absent.
         run: |
-          cargo tree -e features --no-dev-deps \
+          cargo tree -e features --no-dev-dependencies \
             --no-default-features --features fips > /tmp/tree-fips.txt
 
       - name: Audit the FIPS feature graph
@@ -86,7 +86,7 @@ jobs:
         # that the ORDINARY profile still resolves against the committed lock.
         run: |
           git checkout -- Cargo.lock
-          cargo tree -e features --no-dev-deps --locked > /dev/null
+          cargo tree -e features --no-dev-dependencies --locked > /dev/null
 
   fips-build:
     name: FIPS Build & Test
@@ -110,6 +110,8 @@ jobs:
       - name: Install protoc
         run: |
           sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - uses: ./.github/actions/setup-fast-linker
 
       - name: Build the FIPS profile
         # No `--locked`: the FIPS module's crates are intentionally absent from

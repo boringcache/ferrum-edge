@@ -362,7 +362,7 @@ To verify the *build* independently of the running process:
 ```bash
 # The resolved feature graph must carry aws-lc-rs/fips and rustls/fips, and no
 # ring arm. This is the same audit CI runs.
-cargo tree -e features --no-dev-deps --no-default-features --features fips \
+cargo tree -e features --no-dev-dependencies --no-default-features --features fips \
   > /tmp/tree-fips.txt
 python3 .github/scripts/check_fips_feature_policy.py \
   --tree /tmp/tree-fips.txt --profile fips

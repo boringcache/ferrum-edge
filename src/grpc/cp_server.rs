@@ -2010,7 +2010,10 @@ impl ConfigSync for CpGrpcServer {
             &self.scope,
         );
         let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
-            error!("Refusing to publish configuration in get_full_config: {}", e);
+            error!(
+                "Refusing to publish configuration in get_full_config: {}",
+                e
+            );
             Status::internal("Failed to serialize configuration")
         })?;
         let trust_bundles_json = Self::trust_bundles_json(filtered.trust_bundles.as_deref())

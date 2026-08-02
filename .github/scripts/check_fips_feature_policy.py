@@ -18,9 +18,9 @@ Usage:
 
     check_fips_feature_policy.py --tree <path-to-cargo-tree-output> --profile fips
     check_fips_feature_policy.py --tree <path> --profile crypto-ring
-        Audit `cargo tree -e features --no-dev-deps` output for that profile.
+        Audit `cargo tree -e features --no-dev-dependencies` output for that profile.
 
-`--no-dev-deps` is load-bearing: test fixtures pin `ring` and `rustls/ring` as
+`--no-dev-dependencies` is load-bearing: test fixtures pin `ring` and `rustls/ring` as
 dev-dependencies so the suite compiles under both profiles, and a dev-dependency
 is never linked into the shipped binary. Auditing with dev-deps included would
 report a ring edge that no deployment can reach.
@@ -216,7 +216,7 @@ def check_tree(path: Path, profile: str) -> list[str]:
     if not selections:
         return [
             f"no feature edges parsed from {path}; expected the output of "
-            "`cargo tree -e features --no-dev-deps`"
+            "`cargo tree -e features --no-dev-dependencies`"
         ]
 
     if profile == "fips":

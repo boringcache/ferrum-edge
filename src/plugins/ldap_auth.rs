@@ -38,10 +38,10 @@
 //! closes DNS-rebinding windows without replacing the hostname used for TLS
 //! certificate and SNI verification.
 
-use async_trait::async_trait;
-use base64::Engine;
 use crate::fips::approved::HmacSha256;
 use crate::fips::backend::rand::SecureRandom;
+use async_trait::async_trait;
+use base64::Engine;
 use dashmap::DashMap;
 use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, Scope, SearchEntry, SearchOptions, StdStream};
 use rustls::ClientConfig;

@@ -1,5 +1,5 @@
-use base64::Engine;
 use crate::fips::approved::Sha256;
+use base64::Engine;
 
 pub fn sha256_hex_lower(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();

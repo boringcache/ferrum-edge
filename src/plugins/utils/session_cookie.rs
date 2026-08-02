@@ -1,7 +1,7 @@
-use base64::Engine;
 use crate::fips::backend::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use crate::fips::backend::hkdf::{HKDF_SHA256, KeyType, Salt};
 use crate::fips::backend::rand::{SecureRandom, SystemRandom};
+use base64::Engine;
 
 const SALT: &[u8] = b"ferrum-edge oidc-rp session v1";
 const INFO: &[u8] = b"AEAD-AES-256-GCM";

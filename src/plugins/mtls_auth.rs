@@ -9,9 +9,9 @@
 //! per-proxy CA certificates (defense-in-depth on top of the TLS layer's CA
 //! verification).
 
+use crate::fips::approved::Sha256;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use crate::fips::approved::Sha256;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
@@ -426,7 +426,6 @@ impl MtlsAuth {
 
         // Check allowed_ca_fingerprints_sha256 against the chain certs
         if !self.allowed_ca_fingerprints_sha256.is_empty() {
-
             let chain = chain_der.unwrap_or(&[]);
             let matched = self
                 .validated_issuer_chain(peer_cert_der, chain)
