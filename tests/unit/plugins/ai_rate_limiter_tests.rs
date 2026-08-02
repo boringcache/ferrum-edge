@@ -155,6 +155,43 @@ async fn test_plugin_name_and_priority() {
     }
 }
 
+#[tokio::test]
+async fn unreserved_stream_is_rejected_before_headers_are_committed() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "count_mode": "completion_tokens",
+            "on_unmetered_response": "reject"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .unwrap(),
+    );
+    let mut request_headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut request_headers).await);
+    assert_eq!(reserved_tokens(&ctx), 0);
+
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let result = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_reject(result, Some(502));
+}
+
 // ─── Basic flow ─────────────────────────────────────────────────────────
 
 #[tokio::test]
