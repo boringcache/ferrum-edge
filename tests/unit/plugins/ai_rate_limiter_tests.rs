@@ -7148,7 +7148,10 @@ async fn tgi_partial_total_usage_never_releases_unreported_prompt_reservation() 
     let mut headers = HashMap::new();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     let reserved = instance_reserved(&plugin, &ctx);
-    assert!(reserved > 64, "total mode must reserve prompt plus output cap");
+    assert!(
+        reserved > 64,
+        "total mode must reserve prompt plus output cap"
+    );
 
     let last = sse_frame(json!({
         "generated_text": "hello",
