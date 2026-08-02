@@ -63,6 +63,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -279,6 +280,11 @@ pub struct AuditSpool {
     max_pending_records: u64,
     max_retained_records: u64,
     max_record_bytes: u64,
+    /// Serializes the capacity check with publication of a new prepared intent.
+    /// Without this, concurrent admin mutations could all observe the same
+    /// below-ceiling counters and each publish a record, exceeding the configured
+    /// per-generation disk bound before any atomic increment became visible.
+    prepare_admission: Mutex<()>,
     prepared_count: AtomicU64,
     pending_count: AtomicU64,
     retained_count: AtomicU64,
@@ -330,6 +336,7 @@ impl AuditSpool {
             max_pending_records: max_pending_records.max(1),
             max_retained_records: max_retained_records.max(1),
             max_record_bytes: AUDIT_SPOOL_MAX_RECORD_BYTES,
+            prepare_admission: Mutex::new(()),
             prepared_count: AtomicU64::new(0),
             pending_count: AtomicU64::new(0),
             retained_count: AtomicU64::new(0),
@@ -415,6 +422,13 @@ impl AuditSpool {
     /// Durably create the pre-mutation intent. Returns once the record bytes and
     /// the `prepared/` directory entry are both on stable storage.
     pub fn prepare(&self, record: &SpooledAuditRecord) -> Result<(), SpoolError> {
+        // The configured record ceiling is a hard storage bound, not a sampled
+        // gauge. Hold the admission lock through publication and its counter
+        // increment so concurrent requests cannot all pass one stale check.
+        let _admission = self
+            .prepare_admission
+            .lock()
+            .map_err(|_| SpoolError::new(SpoolErrorKind::Unavailable))?;
         if record.finalized {
             return Err(SpoolError::new(SpoolErrorKind::InvalidRecord));
         }

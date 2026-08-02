@@ -500,6 +500,64 @@ fn fail_closed_blocks_mutations_once_the_handoff_fails() {
     );
 }
 
+#[test]
+fn concurrent_prepares_enforce_the_strict_generation_ceiling() {
+    const CONTENDERS: usize = 32;
+
+    let dir = TempDir::new().expect("temp dir");
+    let spool = Arc::new(
+        AuditSpool::open(
+            dir.path().to_path_buf(),
+            Uuid::new_v4().to_string(),
+            TEST_DESTINATION.to_string(),
+            1,
+            8,
+        )
+        .expect("spool opens"),
+    );
+    let start = Arc::new(Barrier::new(CONTENDERS + 1));
+    let mut contenders = Vec::with_capacity(CONTENDERS);
+    for _ in 0..CONTENDERS {
+        let spool = Arc::clone(&spool);
+        let start = Arc::clone(&start);
+        let record = SpooledAuditRecord::with_bounded_diff(
+            event(),
+            TEST_DESTINATION,
+            spool.generation(),
+            /* finalized */ false,
+            1024 * 1024,
+        );
+        contenders.push(std::thread::spawn(move || {
+            start.wait();
+            spool.prepare(&record)
+        }));
+    }
+
+    start.wait();
+    let outcomes: Vec<_> = contenders
+        .into_iter()
+        .map(|contender| contender.join().expect("prepare contender joins"))
+        .collect();
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+        1,
+        "exactly one concurrent intent may consume the only durable slot"
+    );
+    assert!(outcomes.iter().filter(|outcome| outcome.is_err()).all(|outcome| {
+        outcome.as_ref().expect_err("failed prepare").kind == SpoolErrorKind::Saturated
+    }));
+
+    let instance = instance_dirs(dir.path())
+        .into_iter()
+        .find(|path| path.ends_with(spool.generation()))
+        .expect("live instance directory");
+    assert_eq!(
+        count_json(&instance.join("prepared")),
+        1,
+        "the on-disk generation never exceeds its configured ceiling"
+    );
+}
+
 #[tokio::test]
 async fn successful_delivery_reopens_fail_closed_admission_after_saturation() {
     let dir = TempDir::new().expect("temp dir");
