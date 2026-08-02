@@ -20457,8 +20457,8 @@ fn final_response_policy_conversion_failure_parts() -> RejectedResponseParts {
     }
 }
 
-/// Gateway-owned response decorators that survive a SYNTHETIC
-/// final-header-policy rejection.
+/// Gateway-owned response decorators that survive a final-header-policy
+/// rejection.
 ///
 /// This phase runs after the `after_proxy` chain has already completed and
 /// consumed its one-shot state into the header map, so it cannot re-run those
@@ -20468,12 +20468,15 @@ fn final_response_policy_conversion_failure_parts() -> RejectedResponseParts {
 /// contract, request-correlation and tracing fields, and the one-shot rotated
 /// session cookie `oidc_relying_party` stages during the reject-path chain.
 ///
-/// Ordinary backend responses do not use this name list: they rebuild from the
-/// request context's line-aware gateway provenance, so a backend field that
-/// happens to share one of these names is never mistaken for a decorator.
-/// Everything NOT listed on the synthetic path is dropped. A policy that objects
-/// to something inside the set is still caught because the rebuild is
-/// re-evaluated once.
+/// Ordinary backend responses first rebuild from the request context's
+/// line-aware gateway provenance, so a backend field that happens to share one
+/// of these names is never mistaken for a decorator, and then apply this list.
+/// That second narrowing matters for a gateway-authored semantic transform: the
+/// transformed field is trusted provenance, but it is still the representation
+/// the policy just refused and must not be carried onto the rejection. Synthetic
+/// responses have no backend lineage and apply the same list directly.
+/// Everything not listed is dropped. A policy that objects to something inside
+/// the set is still caught because the rebuild is re-evaluated once.
 const PRESERVED_GATEWAY_RESPONSE_DECORATORS: [&str; 17] = [
     "set-cookie",
     "vary",
@@ -20493,6 +20496,12 @@ const PRESERVED_GATEWAY_RESPONSE_DECORATORS: [&str; 17] = [
     "permissions-policy",
     "x-request-id",
 ];
+
+fn is_preserved_gateway_response_decorator(name: &str) -> bool {
+    PRESERVED_GATEWAY_RESPONSE_DECORATORS
+        .iter()
+        .any(|preserved| name.eq_ignore_ascii_case(preserved))
+}
 
 /// Install a final-header-policy rejection over the current response.
 ///
@@ -20515,14 +20524,16 @@ fn install_final_header_policy_rejection(
             // because the backend can also supply Set-Cookie, CSP, CORS, or
             // request-id fields.
             ctx.retain_deadline_response_gateway_headers(response_headers);
+            // Provenance also records ordinary semantic transforms. They are
+            // gateway-authored, but retaining one here would resurrect the very
+            // final representation field policy rejected and force every
+            // otherwise-valid configured rejection into the fixed 500 terminal.
+            // Keep only provenance-proven gateway decorators on the rebuild.
+            response_headers.retain(|name, _| is_preserved_gateway_response_decorator(name));
         } else {
             // Synthetic/reject responses are gateway-owned and carry one-shot
             // state that cannot be reconstructed by re-running the hooks.
-            response_headers.retain(|name, _| {
-                PRESERVED_GATEWAY_RESPONSE_DECORATORS
-                    .iter()
-                    .any(|preserved| name.eq_ignore_ascii_case(preserved))
-            });
+            response_headers.retain(|name, _| is_preserved_gateway_response_decorator(name));
         }
     } else {
         response_headers.clear();
