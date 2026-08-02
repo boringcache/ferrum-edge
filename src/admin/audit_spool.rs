@@ -706,6 +706,17 @@ impl AuditSpool {
     /// finalized records are adopted for delivery; anything bound to a different
     /// destination is quarantined instead of misdelivered.
     pub fn claim_abandoned(&self) -> ClaimReport {
+        // Order startup adoption with new-intent admission. The inherited
+        // obligations themselves are never discarded to satisfy this
+        // generation's admission ceiling, but once they are counted no new
+        // prepare may slip through a stale below-ceiling observation.
+        let _admission = match self.prepare_admission.lock() {
+            Ok(admission) => admission,
+            // Preserve already-durable evidence even if an earlier prepare
+            // panicked while holding the ordering lock. Future prepares still
+            // fail closed on the poisoned lock.
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let mut report = ClaimReport::default();
         let instances = self.root.join(INSTANCES_DIR);
         let Ok(entries) = fs::read_dir(&instances) else {
