@@ -31,10 +31,10 @@ set -euo pipefail
 #                                               bounds the mesh-mTLS dial
 #                                               (two-phase timing, see below)
 #   sidecar.destination_rule.export_to_namespace_visibility
-#                                               a DestinationRule exported ONLY
-#                                               to another namespace cannot
-#                                               change this client's effective
-#                                               policy (issue #2465)
+#                                               a target-service namespace
+#                                               DestinationRule exported only
+#                                               to `.` cannot change a client
+#                                               in another namespace (#2465)
 #   sidecar.destination_rule.lookup_tier_client_wins
 #                                               a client-namespace rule beats a
 #                                               root-namespace default even
@@ -94,6 +94,7 @@ CLUSTER="${FERRUM_MESH_E2E_CLUSTER:-ferrum-sidecar-e2e}"
 CONTEXT="kind-$CLUSTER"
 TRUST_DOMAIN="${FERRUM_MESH_E2E_TRUST_DOMAIN:-mesh-e2e.test}"
 NS="${FERRUM_NAMESPACE:-ferrum}"
+SLOW_SERVICE_NAMESPACE="${FERRUM_MESH_E2E_SLOW_SERVICE_NAMESPACE:-ferrum-other-tenant}"
 SPIRE_NS="${FERRUM_SPIRE_NAMESPACE:-spire-system}"
 IMAGE_REPOSITORY="${FERRUM_IMAGE_REPOSITORY:-ferrum-edge}"
 IMAGE_TAG="${FERRUM_IMAGE_TAG:-mesh-e2e-sidecar}"
@@ -109,7 +110,7 @@ LIVE_PLATFORM_PROFILE="${FERRUM_LIVE_PLATFORM_PROFILE:-kind-spire-sidecar}"
 LIVE_SUITE_NAME="mesh-e2e-sidecar"
 
 SVC_HOST="svc.$NS.svc.cluster.local"
-SLOW_HOST="slowsvc.$NS.svc.cluster.local"
+SLOW_HOST="slowsvc.$SLOW_SERVICE_NAMESPACE.svc.cluster.local"
 WS_HOST="wssvc.$NS.svc.cluster.local"
 CAPP_HOST="capp.$NS.svc.cluster.local"
 JWT_ISSUER="mesh-e2e-issuer"
@@ -134,7 +135,6 @@ PHASE2_WINDOW_HI=4.5
 # 5000ms default; the window deliberately excludes the 2000ms phase-2 window.
 # Phase 4 restores a client-namespace rule at 2000ms alongside an 8000ms
 # root-namespace rule and must land back in the phase-2 window.
-UNEXPORTED_NAMESPACE="ferrum-other-tenant"
 ROOT_NAMESPACE="${FERRUM_MESH_E2E_ROOT_NAMESPACE:-istio-system}"
 DEFAULT_CONNECT_WINDOW_LO=3.6
 DEFAULT_CONNECT_WINDOW_HI=8.0
@@ -464,11 +464,14 @@ apply_workloads() {
   ' "$MANIFESTS" | kubectl --context "$CONTEXT" apply -f -
 }
 
-# Idempotently create the workload namespace: the namespaced mesh ConfigMaps
-# are applied BEFORE apply_workloads creates the Namespace object.
+# Idempotently create the client and cross-namespace target-service namespaces
+# before any namespaced ConfigMap or workload is applied.
 ensure_namespace() {
-  kubectl --context "$CONTEXT" create namespace "$NS" \
-    --dry-run=client -o yaml | kubectl --context "$CONTEXT" apply -f -
+  local namespace
+  for namespace in "$NS" "$SLOW_SERVICE_NAMESPACE"; do
+    kubectl --context "$CONTEXT" create namespace "$namespace" \
+      --dry-run=client -o yaml | kubectl --context "$CONTEXT" apply -f -
+  done
 }
 
 apply_configmap() {
@@ -658,10 +661,10 @@ YAML
 # `slow_dr_mode` selects which DestinationRule shape targets `slowsvc`, so the
 # connect-timeout probe can re-use one black-holed dial to prove three separate
 # contracts (issues #2465 + #2469):
-#   local           the plain rule in this namespace applies (baseline)
-#   unexported      the SAME rule, exported ONLY to a namespace this client is
-#                   not in, must NOT apply -> the dial falls back to the
-#                   built-in 5000ms default
+#   local           the public service-namespace rule applies (baseline)
+#   unexported      the SAME service-namespace rule becomes namespace-local
+#                   via `.` and must NOT apply to the client -> the dial falls
+#                   back to the built-in 5000ms default
 #   client-vs-root  a client-namespace rule and a root-namespace rule both
 #                   target the host; Istio's lookup order must pick the CLIENT
 #                   one even though `istio-system` sorts LAST lexically
@@ -673,10 +676,10 @@ render_client_config() {
     unexported)
       slow_destination_rules="$(cat <<YAML
     - name: slowsvc-connect-timeout
-      namespace: $NS
-      host: slowsvc.$NS.svc.cluster.local
+      namespace: $SLOW_SERVICE_NAMESPACE
+      host: $SLOW_HOST
       export_to:
-        - "$UNEXPORTED_NAMESPACE"
+        - "."
       traffic_policy:
         connect_timeout_ms: $slow_connect_timeout_ms
 YAML
@@ -686,14 +689,14 @@ YAML
       slow_destination_rules="$(cat <<YAML
     - name: slowsvc-connect-timeout
       namespace: $NS
-      host: slowsvc.$NS.svc.cluster.local
+      host: $SLOW_HOST
       export_to:
         - "*"
       traffic_policy:
         connect_timeout_ms: $slow_connect_timeout_ms
     - name: slowsvc-root-default
       namespace: $ROOT_NAMESPACE
-      host: slowsvc.$NS.svc.cluster.local
+      host: $SLOW_HOST
       export_to:
         - "*"
       traffic_policy:
@@ -704,8 +707,10 @@ YAML
     *)
       slow_destination_rules="$(cat <<YAML
     - name: slowsvc-connect-timeout
-      namespace: $NS
-      host: slowsvc.$NS.svc.cluster.local
+      namespace: $SLOW_SERVICE_NAMESPACE
+      host: $SLOW_HOST
+      export_to:
+        - "*"
       traffic_policy:
         connect_timeout_ms: $slow_connect_timeout_ms
 YAML
@@ -754,9 +759,9 @@ mesh:
           name: ws
       selector:
         namespace: $NS
-    - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/slowsvc
+    - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$SLOW_SERVICE_NAMESPACE/sa/slowsvc
       service_name: slowsvc
-      namespace: $NS
+      namespace: $SLOW_SERVICE_NAMESPACE
       trust_domain: $TRUST_DOMAIN
       service_account: slowsvc
       addresses:
@@ -766,7 +771,7 @@ mesh:
           protocol: http
           name: http
       selector:
-        namespace: $NS
+        namespace: $SLOW_SERVICE_NAMESPACE
   services:
     - name: svc
       namespace: $NS
@@ -793,13 +798,22 @@ mesh:
       workloads:
         - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/wssvc
     - name: slowsvc
-      namespace: $NS
+      namespace: $SLOW_SERVICE_NAMESPACE
       ports:
         - port: 8080
           protocol: http
           name: http
       workloads:
-        - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/slowsvc
+        - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$SLOW_SERVICE_NAMESPACE/sa/slowsvc
+  # A permissive Sidecar is required only to place the cross-namespace
+  # slowsvc Service in this client's outbound view. `export_to` and the
+  # DestinationRule lookup resolver remain independent gates after host scope.
+  sidecars:
+    - name: client-egress
+      namespace: $NS
+      egress_inherits_defaults: false
+      egress:
+        - hosts: ["*/*"]
   # VirtualService-derived CORS (issue #1973): Istio applies VS policy on the
   # CLIENT sidecar, so the policy rides the client slice and the sidecar
   # synthesizes a cors plugin onto its materialized svc outbound route. The
@@ -1451,8 +1465,9 @@ reprobe_slowsvc_with_dr_mode() {
 # baseline: the observed fail time when the 2000ms rule DOES apply.
 #
 # Phase 3 keeps that rule byte-for-byte but exports it only to
-# `$UNEXPORTED_NAMESPACE`. The client is not in that namespace, so the rule must
-# be invisible and the dial must fall back to the built-in 5000ms default. This
+# its own declaring namespace (`$SLOW_SERVICE_NAMESPACE`) via `export_to: ['.']`.
+# The client lives in `$NS`, so the rule must be invisible and the dial must
+# fall back to the built-in 5000ms default. This
 # is the fail-CLOSED direction: if `exportTo` were ignored, the timing would
 # stay at ~2s.
 #
@@ -1464,14 +1479,14 @@ reprobe_slowsvc_with_dr_mode() {
 # `(namespace, name)` order would let the ROOT rule win and the dial would take
 # ~8s. Istio's lookup order requires the client-namespace rule, i.e. ~2s.
 #
-# This fixture is single-namespace, so the client and target-service tiers
-# coincide here; the client-beats-SERVICE tier with the namespaces deliberately
-# sorted BOTH ways is covered by
-# `tests/integration/mesh_destination_rule_visibility_tests.rs`.
+# The target service lives in `$SLOW_SERVICE_NAMESPACE`, distinct from the
+# client namespace `$NS`, so this is also a live multi-namespace lookup path.
+# The full client/service/root matrix, including lexical inversions in both
+# directions, remains covered by the external integration tests.
 probe_export_to_visibility() {
   local baseline_t2="$1"
 
-  log "DR exportTo phase 3: 2000ms rule exported only to $UNEXPORTED_NAMESPACE (expect the ${DEFAULT_CONNECT_WINDOW_LO}-${DEFAULT_CONNECT_WINDOW_HI}s default window)"
+  log "DR exportTo phase 3: $SLOW_SERVICE_NAMESPACE rule is namespace-local while client is in $NS (expect the ${DEFAULT_CONNECT_WINDOW_LO}-${DEFAULT_CONNECT_WINDOW_HI}s default window)"
   local status3 t3
   reprobe_slowsvc_with_dr_mode unexported "$CONNECT_TIMEOUT_PHASE2_MS" \
     sidecar.destination_rule.export_to_namespace_visibility || return 1
@@ -1491,7 +1506,7 @@ sys.exit(0 if observed > baseline + 1.5 else 1)
   if [[ "$ok" == "true" ]]; then
     record_live_assertion sidecar.destination_rule.export_to_namespace_visibility pass \
       client slowsvc \
-      "unexported-rule-not-applied exported_to=$UNEXPORTED_NAMESPACE client_ns=$NS baseline=${baseline_t2}s observed=${t3}s status=$status3"
+      "namespace-local-rule-not-applied rule_ns=$SLOW_SERVICE_NAMESPACE client_ns=$NS baseline=${baseline_t2}s observed=${t3}s status=$status3"
   else
     record_live_assertion sidecar.destination_rule.export_to_namespace_visibility fail \
       client slowsvc \

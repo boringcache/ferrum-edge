@@ -2811,8 +2811,7 @@ mod virtual_service_cors {
 
     /// Sharing the evaluator is only safe if this list gets the same
     /// fail-closed boundary check `DestinationRule.exportTo` gets — otherwise
-    /// hostile values would reach the shared helper's lenient
-    /// entry-normalization instead of being refused.
+    /// hostile values could reach policy evaluation instead of being refused.
     #[test]
     fn hostile_export_to_values_are_rejected_not_interpreted() {
         for (label, export_to) in [

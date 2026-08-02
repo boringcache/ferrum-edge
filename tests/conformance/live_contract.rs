@@ -617,10 +617,10 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
         "sidecar.request_auth.missing_jwt_rejected",
         "sidecar.request_auth.invalid_jwt_rejected",
         "sidecar.destination_rule.tcp_connect_timeout",
-        // Issues #2465 / #2469: a DestinationRule exported only to another
-        // namespace cannot change this client's effective policy, and a
-        // client-namespace rule beats a root-namespace default even though the
-        // root namespace sorts LAST lexically.
+        // Issues #2465 / #2469: a target-service DestinationRule exported only
+        // to its own namespace cannot change a client in another namespace,
+        // and a client-namespace rule beats a root-namespace default even
+        // though the root namespace sorts LAST lexically.
         "sidecar.destination_rule.export_to_namespace_visibility",
         "sidecar.destination_rule.lookup_tier_client_wins",
         "sidecar.destination_rule.tcp_max_connections",

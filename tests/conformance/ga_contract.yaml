@@ -32,9 +32,9 @@ capabilities:
     # Issue #2465. Visibility is enforced BEFORE DestinationRule lookup and
     # before a per-node slice is serialized, so a namespace-local rule never
     # reaches a subscriber outside its declared visibility. The live backing is
-    # fail-CLOSED: the same rule that provably bounds the dial at 2000ms is
-    # re-exported to a namespace the client is not in, and the observed connect
-    # time must fall back to the built-in 5000ms default.
+    # fail-CLOSED: the cross-namespace target-service rule that provably bounds
+    # the dial at 2000ms is changed from public to namespace-local (`.`), and
+    # the observed connect time must fall back to the built-in 5000ms default.
     live_assertions:
       - sidecar.destination_rule.export_to_namespace_visibility
     platform_profile: kind-spire-sidecar

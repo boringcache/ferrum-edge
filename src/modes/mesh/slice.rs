@@ -2306,7 +2306,7 @@ where
             client_namespace = %scope.client_namespace,
             ambiguous_destinations = ambiguous_groups,
             "Multiple DestinationRules from the same namespace target one destination; \
-             they merge in deterministic (namespace, name) order"
+             they merge in deterministic (namespace, name, normalized host) order"
         );
     }
     admitted

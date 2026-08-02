@@ -1201,9 +1201,10 @@ pub fn service_entry_exported_to_namespace(entry: &ServiceEntry, workload_namesp
 /// native/file/carrier sources (Kubernetes translation materializes Istio's
 /// public default as an explicit `["*"]` instead of leaving the list empty).
 ///
-/// Entries are trimmed before comparison so a padded carrier value cannot
-/// silently match nothing; anything beyond `*`, `.`, and a well-formed
-/// namespace name is rejected at validation, never interpreted here.
+/// Every source canonicalizes entries before this evaluator runs. Deliberately
+/// do not reinterpret padded or otherwise unnormalized input here: an invalid
+/// value must match nothing until boundary normalization and validation have
+/// accepted it, never accidentally widen visibility.
 pub(crate) fn export_visibility_admits(
     export_to: &[String],
     declaring_namespace: &str,
@@ -1216,7 +1217,6 @@ pub(crate) fn export_visibility_admits(
     }
 
     export_to.iter().any(|target| {
-        let target = target.trim();
         target == "*"
             || target == workload_namespace
             || (target == "." && declaring_namespace == workload_namespace)
@@ -2385,9 +2385,9 @@ pub struct MeshVirtualServiceCorsPolicy {
 /// drift apart on what `.`, `*`, an explicit namespace, or an EMPTY list
 /// means. `validate_virtual_service_cors_policies` runs the same
 /// [`validate_mesh_export_to`] fail-closed boundary check DestinationRules
-/// get, so the shared helper's entry trimming can only ever canonicalize a
-/// value the resource's own author wrote — never reinterpret one validation
-/// would have rejected.
+/// get, while config-source normalization canonicalizes accepted entries
+/// before this evaluator sees them. The evaluator itself never reinterprets
+/// unnormalized input.
 pub fn virtual_service_cors_policy_exported_to_namespace(
     policy: &MeshVirtualServiceCorsPolicy,
     workload_namespace: &str,
@@ -4595,6 +4595,12 @@ fn normalize_mesh_fields_internal(
         for host in &mut se.hosts {
             *host = normalize_mesh_hostname_like(host);
         }
+        for entry in &mut se.export_to {
+            let trimmed = entry.trim();
+            if trimmed.len() != entry.len() {
+                *entry = trimmed.to_string();
+            }
+        }
         for ep in &mut se.endpoints {
             ep.address.make_ascii_lowercase();
         }
@@ -4607,6 +4613,16 @@ fn normalize_mesh_fields_internal(
     normalize_mesh_policy_fields(policies);
     for dr in destination_rules {
         dr.host = normalize_mesh_hostname_like(&dr.host);
+        // `exportTo` is semantic identity carried through native, file, and
+        // xDS JSON. Canonicalize the same whitespace the evaluator and
+        // validator recognize so equivalent visibility does not produce
+        // different carrier bytes or defeat slice dedupe.
+        for entry in &mut dr.export_to {
+            let trimmed = entry.trim();
+            if trimmed.len() != entry.len() {
+                *entry = trimmed.to_string();
+            }
+        }
     }
     // Same treatment as DestinationRule hosts: synthesis matches
     // `policy.host` against service FQDNs via `destination_rule_host_matches`
@@ -4614,6 +4630,12 @@ fn normalize_mesh_fields_internal(
     // like `" Svc.Default "` would silently attach no CORS plugin.
     for policy in virtual_service_cors_policies {
         policy.host = normalize_mesh_hostname_like(&policy.host);
+        for entry in &mut policy.export_to {
+            let trimmed = entry.trim();
+            if trimmed.len() != entry.len() {
+                *entry = trimmed.to_string();
+            }
+        }
     }
     for sidecar in sidecars {
         for egress in &mut sidecar.egress {

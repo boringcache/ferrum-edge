@@ -18,7 +18,7 @@
 //! * Slice narrowing: a namespace-local rule never reaches an external
 //!   subscriber, an allowlisted namespace does, an unlisted one does not.
 //! * Lookup tiers with the namespaces deliberately sorted BOTH ways, so a
-//!   passing result cannot be an accident of `(namespace, name)` order.
+//!   passing result cannot be an accident of lexical resource order.
 //! * Client → service → root fallback, a custom root namespace, and
 //!   same-tier merge determinism.
 //! * Carrier/native parity and reload/dedupe behaviour for a visibility-only
@@ -406,6 +406,30 @@ fn native_validation_accepts_supported_export_to_values() {
     }
 }
 
+#[test]
+fn native_normalization_canonicalizes_export_to_for_carriers_and_dedupe() {
+    let mut mesh = MeshConfig {
+        destination_rules: vec![rule(
+            "beta",
+            "reviews-dr",
+            "reviews.beta.svc.cluster.local",
+            1111,
+            &[" alpha ", " . "],
+        )],
+        ..MeshConfig::default()
+    };
+
+    mesh.normalize();
+
+    assert_eq!(
+        mesh.destination_rules[0].export_to,
+        vec!["alpha".to_string(), ".".to_string()],
+        "native/file visibility must have one canonical representation before \
+         it is sliced, compared, or serialized into a carrier"
+    );
+    assert!(mesh.validate().is_empty());
+}
+
 // ── Slice narrowing: visibility (#2465) ──────────────────────────────────
 
 /// The headline #2465 scenario: `beta` owns `reviews` and declares its policy
@@ -509,7 +533,7 @@ fn a_namespace_local_root_namespace_rule_is_not_visible_mesh_wide() {
 
 // ── Slice narrowing: lookup tiers (#2469) ────────────────────────────────
 
-/// Both directions of the lexical/semantic conflict. `(namespace, name)`
+/// Both directions of the lexical/semantic conflict. Resource-name
 /// ordering must be irrelevant, so the same topology is asserted with the
 /// client namespace sorting BEFORE and AFTER the service namespace.
 #[test]
@@ -696,6 +720,39 @@ fn same_tier_rules_are_all_retained_in_deterministic_order() {
         admitted_rule_names(&mesh, "alpha"),
         "narrowing is deterministic across repeated builds"
     );
+}
+
+#[test]
+fn same_tier_duplicate_names_use_host_spelling_as_a_stable_final_tiebreak() {
+    let short = rule("beta", "shared-name", "reviews.beta", 1111, &["*"]);
+    let fqdn = rule(
+        "beta",
+        "shared-name",
+        "reviews.beta.svc.cluster.local",
+        2222,
+        &["*"],
+    );
+
+    for destination_rules in [
+        vec![short.clone(), fqdn.clone()],
+        vec![fqdn.clone(), short.clone()],
+    ] {
+        let mesh = MeshConfig {
+            services: vec![service_in("beta", "reviews")],
+            workloads: vec![
+                workload_in("beta", "reviews"),
+                workload_in("alpha", "web"),
+            ],
+            destination_rules,
+            sidecars: vec![permissive_sidecar("alpha")],
+            ..MeshConfig::default()
+        };
+        assert_eq!(
+            materialized_connect_timeout(mesh, "alpha", "beta"),
+            2222,
+            "the normalized FQDN sorts after the two-label spelling and must win regardless of source order"
+        );
+    }
 }
 
 // ── Materialization: the winning rule is the one that takes effect ───────

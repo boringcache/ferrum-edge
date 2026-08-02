@@ -1241,11 +1241,11 @@ fn reverse_translate(
     }
 
     // GAP-2K: Recover full `MeshDestinationRule` semantics from ECDS resources
-    // carrying the Ferrum-specific DR carrier type_url. Operators opt in
-    // CP-side by wrapping the original DR JSON in a TypedExtensionConfig with
-    // `inner.type_url == FERRUM_ECDS_DESTINATION_RULE_TYPE_URL`. Resources
-    // with other inner type_urls are silently skipped — they belong to
-    // unrelated extension configs.
+    // carrying the Ferrum-specific DR carrier type_url. Ferrum CP emits one
+    // reserved carrier per admitted DR; legacy operator-authored non-reserved
+    // carriers remain best-effort compatibility inputs. Resources with other
+    // inner type_urls are silently skipped — they belong to unrelated
+    // extension configs.
     let mut destination_rules = Vec::new();
     let mut dr_carrier_seen = false;
     for resource in accumulator.resources(ECDS_TYPE_URL) {
@@ -1313,7 +1313,7 @@ fn reverse_translate(
         debug!(
             "xDS slice has no DR-carrier ECDS resources; per-cluster DR fields \
              (connectTimeout, loadBalancer, outlierDetection, subsets, tls.sni, \
-             tls.subjectAltNames, tls.mode) are not recoverable from CDS/EDS alone. \
+             tls.subjectAltNames, tls.mode, exportTo) are not recoverable from CDS/EDS alone. \
              Set FERRUM_MESH_CONFIG_PROTOCOL=native or have the CP emit Ferrum \
              DR-carrier ECDS resources to round-trip full DR semantics."
         );
@@ -1719,7 +1719,25 @@ fn validate_ecds_destination_rule_carrier(resource: &AccumulatedResource) -> Res
             typed_extension.name
         )
     })?;
-    validate_reserved_destination_rule_carrier_name(&resource.name, namespace, name, &dr)
+    validate_reserved_destination_rule_carrier_name(&resource.name, namespace, name, &dr)?;
+
+    // `export_to` is the security boundary that bounds which subscribers may
+    // receive this policy. Validate it while the reserved carrier is still an
+    // ECDS response so an unsupported value NACKs and rolls the accumulator
+    // back, rather than ACKing the payload and discovering the error only at
+    // later materialization. Diagnostics are fixed-shape and never echo the
+    // carrier-supplied value.
+    let mut errors = Vec::new();
+    crate::modes::mesh::config::validate_mesh_export_to(
+        "xDS DestinationRule carrier",
+        &dr.export_to,
+        &mut errors,
+    );
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 fn decode_ecds_typed_extension(
@@ -4372,6 +4390,37 @@ mod tests {
     }
 
     #[test]
+    fn reserved_ecds_dr_carrier_invalid_export_to_is_rejected_fail_closed() {
+        let dr_json = r#"{
+            "name": "api-dr",
+            "namespace": "default",
+            "host": "api.default.svc.cluster.local",
+            "export_to": ["HOSTILE_SECRET_VALUE"]
+        }"#;
+        let mut accumulator = primed_accumulator();
+        let err = accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[dr_carrier_resource(
+                    &format!("{FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX}default/api-dr"),
+                    dr_json,
+                )],
+                "v1",
+            )
+            .expect_err("invalid export_to must reject the reserved carrier");
+
+        assert!(err.contains("xDS DestinationRule carrier.exportTo[0]"));
+        assert!(
+            !err.contains("HOSTILE_SECRET_VALUE"),
+            "the diagnostic must not echo the carrier-supplied value: {err}"
+        );
+        assert!(
+            accumulator.resources(ECDS_TYPE_URL).is_empty(),
+            "the rejected visibility update must not replace the last accepted ECDS state"
+        );
+    }
+
+    #[test]
     fn ecds_mixed_resources_only_valid_carrier_makes_it_through() {
         // Mixed slice: one valid DR-carrier + one unrelated inner type_url
         // + one DR-carrier with invalid JSON. The valid DR must land in the
@@ -4440,6 +4489,7 @@ mod tests {
   "name": "api-dr",
   "namespace": "default",
   "host": "api.default.svc.cluster.local",
+  "export_to": ["*"],
   "traffic_policy": {
     "connect_timeout_ms": 2000,
     "load_balancer": {"simple": "ROUND_ROBIN"},
@@ -4465,6 +4515,7 @@ mod tests {
         assert_eq!(dr.name, "api-dr");
         assert_eq!(dr.namespace, "default");
         assert_eq!(dr.host, "api.default.svc.cluster.local");
+        assert_eq!(dr.export_to, vec!["*".to_string()]);
         let policy = dr.traffic_policy.as_ref().expect("traffic_policy");
         assert_eq!(policy.connect_timeout_ms, Some(2000));
         assert!(matches!(

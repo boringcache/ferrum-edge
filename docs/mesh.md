@@ -66,7 +66,7 @@ Ferrum's mesh subsystem is in active build-out. The paths below ship in one bina
 
 > For the one-screen **product contract** (what to rely on, the GA promise, and the explicit non-goals), see [docs/mesh_supported_matrix.md](mesh_supported_matrix.md). The contract's **GA** tier is the maturity bar these tables label **Stable**, and it is machine-enforced *for the features enrolled in the conformance GA contract* — such a feature regressing (or its test being deleted) fails the conformance suite (`tests/conformance/ga_scope.rs`). The source of truth is `tests/conformance/ga_contract.yaml`; generated `target/conformance/coverage.md` includes the enrolled semantic rows and required live assertion IDs. That contract is populated incrementally as each area is verified, so it does **not** yet enroll every row labeled Stable here (e.g. SPIFFE inbound/HBONE peer trust-domain verification has no contract row of its own — only the inbound peer-SVID verification decision is pinned, under `mesh.identity.spire_svid_issuance`). Native `MeshSubscribe` and `Sidecar` + native config ARE GA-gated via `mesh.config_transport.native_subscribe`, live-backed by the required `sidecar.config.native_subscribe_delivered` assertion from the suite's CP + native-subscribe leg; SPIFFE identity plumbing is enrolled as `mesh.identity.spire_svid_issuance`.
 >
-> The contract's **live** half is backed by two suites: `mesh-e2e-sidecar` for the same-cluster sidecar rows, and `multicluster-federation` for the cross-cluster east-west rows (described at the end of this note). In `mesh-e2e-sidecar` (`tests/k8s/mesh_e2e_sidecar/`, workflow `.github/workflows/mesh-e2e-sidecar-live.yml`), a kind + SPIRE cluster drives the real captured sidecar datapath — STRICT-mTLS positive and plaintext-rejected negative, a destination-side AuthorizationPolicy 403, RequestAuthentication JWT (valid → 200, missing → 403, wrong-key signature → 401), a two-phase DestinationRule `connectTimeout` timing proof, a DR `maxConnections=1` WebSocket flow (one held session admitted, a concurrent upgrade rejected 503, recovery after release), and a CP + native-subscribe leg (a Ferrum CP in `cp` mode builds its mesh model from the cluster's real Services/pods via K8s pod discovery; a captured sidecar DP on `FERRUM_MESH_CONFIG_PROTOCOL=native` serves traffic only if the MeshSubscribe-delivered slice materialized its inbound routes, and its JWT-authenticated `GET /mesh/config-drift` must attribute the slice to the native transport) — emitting `sidecar.*` live assertions the workflow then validates against the contract (`tests/conformance/live_contract.rs`: required IDs present + passed for the exact suite/profile/commit, no duplicate or stale artifacts). Those Stable sidecar rows — PeerAuthentication STRICT, AuthorizationPolicy ALLOW/DENY, RequestAuthentication JWT, DR `connectTimeout`/`maxConnections`, VirtualService CORS, SPIFFE identity plumbing (`mesh.identity.spire_svid_issuance`, live-backed by `sidecar.spire.workload_entries` plus the SVID-carried STRICT-mTLS positive), and native `MeshSubscribe` config transport (`mesh.config_transport.native_subscribe`, live-backed by `sidecar.config.native_subscribe_delivered`) — are enrolled **vertically**: semantic conformance assertion → GA contract row → required live assertion. VS CORS is live-backed since issue #1973 closed: the mesh slice carries `virtual_service_cors_policies` (K8s translator emission per VS host, file-source expressible, own xDS ECDS carrier), the client sidecar synthesizes the `cors` plugin onto its materialized outbound routes, and the suite proves an allowed Origin reflected, a sidecar-answered Istio 200 preflight, plus unmatched actual and preflight forwarding without gateway-added CORS authorization. The complete M2 contract is **PR- and release-blocking**: a deploy-only smoke (`mesh-e2e-sidecar` in `ci.yml`) gates every PR touching the suite's surfaces; the dedicated live workflow's result — fixture **plus** artifact validation — is a merge-blocking required check (its `Mesh E2E Sidecar Live` gate job, required via branch protection, the same pattern as the Gateway API lab); and the live suite runs on every main push so `release.yml`'s `validate-release-sha` can refuse any tag whose SHA lacks a green, contract-validated live run. The cross-cluster east-west rows (`mesh.multicluster.*`, issue #2459) are enrolled the same way against the `multicluster-federation` suite (`tests/k8s/multicluster-federation/`, workflow `.github/workflows/multicluster-federation-live.yml`, platform profile `kind-spire-multicluster-federation`): semantics pinned by `tests/conformance/mesh_multicluster_federation.rs` plus the `EastWestGateway topology` row, live-gated by thirteen required `multicluster.*` assertions, and blocking at the same three points — the fixture's own fail-closed required-assertion check, the workflow's `Multicluster Federation Live` gate job (which re-validates the emitted `live-assertions.json` against the contract), and `release.yml` SHA validation. Poller-driven cross-cluster *endpoint discovery* stays Experimental and is excluded from every one of those rows.
+> The contract's **live** half is backed by two suites: `mesh-e2e-sidecar` for the same-cluster sidecar rows, and `multicluster-federation` for the cross-cluster east-west rows (described at the end of this note). In `mesh-e2e-sidecar` (`tests/k8s/mesh_e2e_sidecar/`, workflow `.github/workflows/mesh-e2e-sidecar-live.yml`), a kind + SPIRE cluster drives the real captured sidecar datapath — STRICT-mTLS positive and plaintext-rejected negative, a destination-side AuthorizationPolicy 403, RequestAuthentication JWT (valid → 200, missing → 403, wrong-key signature → 401), a two-phase DestinationRule `connectTimeout` timing proof, a cross-namespace `exportTo: ["."]` visibility withdrawal, a client-over-root lookup-tier timing proof, a DR `maxConnections=1` WebSocket flow (one held session admitted, a concurrent upgrade rejected 503, recovery after release), and a CP + native-subscribe leg (a Ferrum CP in `cp` mode builds its mesh model from the cluster's real Services/pods via K8s pod discovery; a captured sidecar DP on `FERRUM_MESH_CONFIG_PROTOCOL=native` serves traffic only if the MeshSubscribe-delivered slice materialized its inbound routes, and its JWT-authenticated `GET /mesh/config-drift` must attribute the slice to the native transport) — emitting `sidecar.*` live assertions the workflow then validates against the contract (`tests/conformance/live_contract.rs`: required IDs present + passed for the exact suite/profile/commit, no duplicate or stale artifacts). Those Stable sidecar rows — PeerAuthentication STRICT, AuthorizationPolicy ALLOW/DENY, RequestAuthentication JWT, DR `connectTimeout`/`maxConnections`/`exportTo` visibility/lookup hierarchy, VirtualService CORS, SPIFFE identity plumbing (`mesh.identity.spire_svid_issuance`, live-backed by `sidecar.spire.workload_entries` plus the SVID-carried STRICT-mTLS positive), and native `MeshSubscribe` config transport (`mesh.config_transport.native_subscribe`, live-backed by `sidecar.config.native_subscribe_delivered`) — are enrolled **vertically**: semantic conformance assertion → GA contract row → required live assertion. VS CORS is live-backed since issue #1973 closed: the mesh slice carries `virtual_service_cors_policies` (K8s translator emission per VS host, file-source expressible, own xDS ECDS carrier), the client sidecar synthesizes the `cors` plugin onto its materialized outbound routes, and the suite proves an allowed Origin reflected, a sidecar-answered Istio 200 preflight, plus unmatched actual and preflight forwarding without gateway-added CORS authorization. The complete M2 contract is **PR- and release-blocking**: a deploy-only smoke (`mesh-e2e-sidecar` in `ci.yml`) gates every PR touching the suite's surfaces; the dedicated live workflow's result — fixture **plus** artifact validation — is a merge-blocking required check (its `Mesh E2E Sidecar Live` gate job, required via branch protection, the same pattern as the Gateway API lab); and the live suite runs on every main push so `release.yml`'s `validate-release-sha` can refuse any tag whose SHA lacks a green, contract-validated live run. The cross-cluster east-west rows (`mesh.multicluster.*`, issue #2459) are enrolled the same way against the `multicluster-federation` suite (`tests/k8s/multicluster-federation/`, workflow `.github/workflows/multicluster-federation-live.yml`, platform profile `kind-spire-multicluster-federation`): semantics pinned by `tests/conformance/mesh_multicluster_federation.rs` plus the `EastWestGateway topology` row, live-gated by thirteen required `multicluster.*` assertions, and blocking at the same three points — the fixture's own fail-closed required-assertion check, the workflow `gate` job's emitted-artifact validation, and `release.yml` SHA validation. Poller-driven cross-cluster *endpoint discovery* stays Experimental and is excluded from every one of those rows.
 
 ### Config-source maturity
 
@@ -148,7 +148,7 @@ This section consolidates every known residual gap so operators do not have to r
 - **`ipBlocks` / `remoteIpBlocks` on the stream path now distinguish socket peer from forwarded address** — on the HTTP request path `ipBlocks`/`source.ip` is the immediate downstream socket peer (`direct_client_ip`) and `remoteIpBlocks`/`remote.ip` is the gateway-resolved, XFF-aware `client_ip`. On the **TCP stream path** (`on_stream_connect`) the same split now applies: `source.ip` = socket peer (`StreamConnectionContext.direct_client_ip`), `remote.ip` = resolved client IP (`StreamConnectionContext.client_ip`). When **inbound PROXY protocol** (`stream_proxy_protocol: true`) is enabled on a TCP stream proxy and the upstream LB is in `FERRUM_TRUSTED_PROXIES`, the forwarded address from the PROXY header becomes `client_ip` (used for `remote.ip` / `remoteIpBlocks`) while `direct_client_ip` retains the LB's own socket-peer IP (used for `source.ip` / `ipBlocks`). Without PROXY protocol both values equal the socket peer — this is the correct Envoy-parity behavior for raw TCP not fronted by a PROXY-protocol-capable LB. **UDP/DTLS** streams never receive PROXY protocol (it is TCP-borne), so `source.ip` and `remote.ip` always equal the socket peer on the UDP path. IP-block matchers fail closed when the IP they test is absent.
 - **DENY rules treat missing HTTP-only attributes as matches** — Istio semantics. Port-scope DENY rules that mention HTTP fields and can see TCP traffic, or they may over-match.
 
-### DestinationRule (parsed but inert / approximated / deferred)
+### DestinationRule limitations / approximations / deferred fields
 
 - **`connectionPool.http.maxRequestsPerConnection`** — **Deferred**: parsed and validated, but not projected or enforced because Ferrum has no backend close-after-N-requests behavior for the shared backend pools. K8s status lists it in `status.ferrum.translation.deferred_fields`; negative values are rejected and `0` is accepted as Istio's unlimited sentinel but still deferred. Use `http2MaxRequests` for HTTP/2-family concurrency.
 - **`connectionPool.tcp.maxConnections`** — enforced for **stream-family (TCP)** and **HTTP-family WebSocket** (H1/H2/H3) via an RAII guard on `ProxyState.backend_conn_limit`. The pooled multiplexed transports (reqwest H1/H2, direct H2, gRPC, H3, HBONE) do **not** enforce it because their backend-connection lifecycle is pool-internal (reuse, sharding, idle eviction) and a request-keyed counter would measure request concurrency rather than open connections — use `http2MaxRequests` / `h2_max_concurrent_streams` for HTTP/2-family concurrency instead. Full rationale in [DestinationRule `maxConnections` enforcement scope](#destinationrule-maxconnections-enforcement-scope).
@@ -400,7 +400,7 @@ This is the same mechanism as the [DestinationRule carrier](#ecds-destinationrul
 
 #### ECDS DestinationRule carrier (full DR semantics over xDS)
 
-Standard CDS/EDS bakes a `DestinationRule`'s traffic policy (LB algorithm, outlier detection, connection pool, per-subset TLS, subsets) into the Envoy `Cluster` resource at the CP, which means the original DR is unrecoverable from CDS/EDS alone. The ECDS DestinationRule carrier preserves the original DR JSON inside a standard ECDS `TypedExtensionConfig` resource so the Ferrum DP can rebuild the full `MeshDestinationRule` server-side. This is a Ferrum-specific carrier convention layered on top of the standard ECDS resource type — it uses the standard ECDS transport (`type.googleapis.com/envoy.config.core.v3.TypedExtensionConfig`) but a Ferrum-defined inner type URL, so it coexists with unrelated ECDS consumers on the same ADS stream.
+Standard CDS/EDS bakes a `DestinationRule`'s traffic policy (LB algorithm, outlier detection, connection pool, per-subset TLS, subsets) into the Envoy `Cluster` resource at the CP, which means the original DR is unrecoverable from CDS/EDS alone. The ECDS DestinationRule carrier preserves the normalized Ferrum DR model as JSON inside a standard ECDS `TypedExtensionConfig` resource so the Ferrum DP can rebuild the full `MeshDestinationRule` server-side. This is a Ferrum-specific carrier convention layered on top of the standard ECDS resource type — it uses the standard ECDS transport (`type.googleapis.com/envoy.config.core.v3.TypedExtensionConfig`) but a Ferrum-defined inner type URL, so it coexists with unrelated ECDS consumers on the same ADS stream.
 
 The DP recognizes the carrier by an exact match on the inner `type_url` constant:
 
@@ -416,19 +416,29 @@ type.googleapis.com/ferrum.config.extension.v3.DestinationRuleCarrier
 ECDS resource (Any)
   type_url = "type.googleapis.com/envoy.config.core.v3.TypedExtensionConfig"
   value    = encoded TypedExtensionConfig {
-    name         = "<dr-name>"               # informational, used in DP logs
+    name         = "ferrum-destination-rule-carrier/<namespace>/<dr-name>"
     typed_config = Any {
       type_url = "type.googleapis.com/ferrum.config.extension.v3.DestinationRuleCarrier"
-      value    = <raw bytes of the original MeshDestinationRule JSON>
+      value    = <raw bytes of the normalized MeshDestinationRule JSON>
     }
   }
 ```
 
-The inner `value` is the original DR document as UTF-8 JSON bytes — there is no protobuf wire encoding of the DR itself, just `serde_json` over the `MeshDestinationRule` shape consumed by the DP at `src/modes/mesh/config_consumer/xds_client.rs` (see `dr_carrier_resource()` and the recovery loop). The DP iterates ECDS resources, decodes each `TypedExtensionConfig`, and applies one of three behaviors per inner payload:
+The inner `value` is the normalized DR model as UTF-8 JSON bytes — there is no protobuf wire encoding of the DR itself, just `serde_json` over the `MeshDestinationRule` shape consumed by the DP at `src/modes/mesh/config_consumer/xds_client.rs` (see `dr_carrier_resource()` and the recovery loop). Normalization includes host canonicalization and trimming accepted `export_to` entries before slice comparison and carrier serialization. The DP iterates ECDS resources, decodes each `TypedExtensionConfig`, and applies one of three behaviors per inner payload:
 
-- Inner `type_url` matches the carrier constant and JSON parses cleanly: the recovered `MeshDestinationRule` is appended to `slice.destination_rules`.
+- The resource name uses the reserved
+  `ferrum-destination-rule-carrier/<namespace>/<name>` shape, the inner
+  `type_url` matches the carrier constant, the embedded namespace/name agree
+  with the reserved name, and JSON parses cleanly: the recovered
+  `MeshDestinationRule` is appended to `slice.destination_rules`.
 - Inner `type_url` is anything else: silently skipped (belongs to an unrelated ECDS consumer).
-- Inner `type_url` matches the carrier constant but JSON fails to parse: the DR is skipped with a `warn!` and the rest of the slice still applies — bad payloads do not fail the whole slice.
+- A reserved carrier with a missing/wrong inner type, mismatched embedded
+  identity, malformed JSON, or invalid `export_to` is rejected by the ECDS
+  accumulator and NACKs the response. Remaining semantic validation runs at
+  materialization and rejects the candidate slice. In both cases the
+  previously applied proxy generation remains live. A legacy, non-reserved
+  operator extension using the DR inner type remains best-effort and
+  namespace-local; Ferrum CP never emits that legacy shape.
 
 **Worked example.** Given this original DestinationRule:
 
@@ -462,7 +472,7 @@ the CP must emit one ECDS resource whose decoded `TypedExtensionConfig` looks li
 
 ```json
 {
-  "name": "api-dr",
+  "name": "ferrum-destination-rule-carrier/default/api-dr",
   "typed_config": {
     "type_url": "type.googleapis.com/ferrum.config.extension.v3.DestinationRuleCarrier",
     "value": "<UTF-8 bytes of the MeshDestinationRule JSON below>"
@@ -470,13 +480,14 @@ the CP must emit one ECDS resource whose decoded `TypedExtensionConfig` looks li
 }
 ```
 
-with the inner `value` bytes carrying the original DR as `MeshDestinationRule` JSON (note: the inner shape is the Ferrum `MeshDestinationRule` serde representation, not the Istio CRD YAML — Istio's nested `connectionPool.tcp.connectTimeout` flattens to `traffic_policy.connect_timeout_ms` in milliseconds, `outlierDetection.consecutive5xxErrors` → `outlier_detection.consecutive_errors`, `outlierDetection.interval` (a duration string) → `outlier_detection.interval_seconds` (a `u64`), and `tls.mode` values are lowercase `snake_case` (`istio_mutual`, `simple`, `mutual`, `disable`) per `MtlsMode`):
+with the inner `value` bytes carrying the normalized DR as `MeshDestinationRule` JSON (note: the inner shape is the Ferrum `MeshDestinationRule` serde representation, not the Istio CRD YAML — Istio's nested `connectionPool.tcp.connectTimeout` flattens to `traffic_policy.connect_timeout_ms` in milliseconds, `outlierDetection.consecutive5xxErrors` → `outlier_detection.consecutive_errors`, `outlierDetection.interval` (a duration string) → `outlier_detection.interval_seconds` (a `u64`), and `tls.mode` values are lowercase `snake_case` (`istio_mutual`, `simple`, `mutual`, `disable`) per `MtlsMode`):
 
 ```json
 {
   "name": "api-dr",
   "namespace": "default",
   "host": "api.default.svc.cluster.local",
+  "export_to": ["*"],
   "traffic_policy": {
     "connect_timeout_ms": 2000,
     "load_balancer": {"simple": "ROUND_ROBIN"},
@@ -489,11 +500,23 @@ with the inner `value` bytes carrying the original DR as `MeshDestinationRule` J
 
 The DP recovers this back into a `MeshDestinationRule` with `traffic_policy.load_balancer = Simple(RoundRobin)`, `outlier_detection` (consecutive-error + interval), `traffic_policy.connect_timeout_ms` projected onto `Proxy.backend_connect_timeout_ms` (and per-port settings onto `Upstream.port_overrides[port].connect_timeout_ms`), the `tls` block, and the `v1` subset all intact — i.e. every field that would have been baked out by a CDS-only path round-trips. Non-carrier ECDS resources sharing the same response are unaffected, so the channel can be shared with unrelated extension consumers.
 
-**Opt-in and the per-slice diagnostic.** Emission is purely CP-side opt-in — the DP always subscribes ECDS, but a CP that only emits CDS/EDS is fully supported. When the DP receives a slice with CDS clusters but zero carrier ECDS resources, it emits a single one-line `debug!` per slice apply listing the fields that cannot be round-tripped from CDS/EDS alone (`connectTimeout`, `loadBalancer`, `outlierDetection`, `subsets`, `tls.sni`, `tls.subjectAltNames`, `tls.mode`); see the `debug!` guarded by `!dr_carrier_seen && !accumulator.resources(CDS_TYPE_URL).is_empty()` in `src/modes/mesh/config_consumer/xds_client.rs`. Emitting any carrier resource silences that log for the slice.
+**Emission and the per-slice diagnostic.** Ferrum CP always emits one reserved
+carrier for every DestinationRule already admitted to that node's slice; there
+is no feature flag. The DP always subscribes to ECDS. A legacy or third-party
+Ferrum-shaped CP that emits only CDS/EDS remains routable in the documented
+degraded mode, but full DestinationRule semantics are unavailable. When the DP
+receives CDS clusters with zero DR-carrier ECDS resources, it emits a one-line
+`debug!` per slice apply listing the fields that cannot be round-tripped from
+CDS/EDS alone (`connectTimeout`, `loadBalancer`, `outlierDetection`, `subsets`,
+`tls.sni`, `tls.subjectAltNames`, `tls.mode`, `exportTo`); see the diagnostic
+guarded by `!dr_carrier_seen && !accumulator.resources(CDS_TYPE_URL).is_empty()`
+in `src/modes/mesh/config_consumer/xds_client.rs`.
 
 **Other notes.**
 
-- Configuration: no `FERRUM_MESH_*` env var gates the carrier path. The DP recognizes the marker whenever `FERRUM_MESH_CONFIG_PROTOCOL=xds`; turning the path on is a CP-authoring decision.
+- Configuration: no `FERRUM_MESH_*` env var gates the carrier path. Ferrum CP
+  emits it and the DP recognizes it whenever
+  `FERRUM_MESH_CONFIG_PROTOCOL=xds`.
 - Test pin: `ecds_dr_carrier_payload_recovers_destination_rule()` in `src/modes/mesh/config_consumer/xds_client.rs` round-trips the envelope and asserts that `traffic_policy.load_balancer` survives — i.e. fields baked out by a CDS-only path are recovered.
 
 ### Localized file source (no control plane)
@@ -701,7 +724,7 @@ subsets:
 
 Any other token — including Istio's `~`, an empty entry, a non-RFC-1123 namespace name, a list over 64 entries, or `*` combined with an explicit namespace — is **rejected**, not interpreted: Kubernetes translation reports `FerrumAccepted=False`/`Invalid` and native/file/xDS slice validation rejects the config so the previously accepted slice stays live. Diagnostics name the field and the offending index and never echo the operator-supplied value.
 
-Visibility is evaluated during slice construction, BEFORE lookup selection and before a per-node slice is serialized, so a namespace-local rule never reaches — let alone affects — a subscriber outside its declared visibility.
+Visibility is evaluated during slice construction, BEFORE lookup selection and before a per-node slice is serialized, so a namespace-local rule never reaches — let alone affects — a subscriber outside its declared visibility. The DP defensively runs the same evaluator again before materialization lookup, so a cross-wired or independently implemented native/xDS producer cannot bypass the boundary by sending an already-built slice.
 
 <a id="destinationrule-lookup-hierarchy"></a>
 **Lookup hierarchy** — issue #2469. For each destination host Ferrum resolves the winning rule by Istio's lookup path, most specific first:
@@ -727,7 +750,7 @@ When no owner can be established, tier 2 is **disabled** for that host: only the
 
 This is deliberately the fail-closed direction — it can only ever narrow which rules are admitted, never widen it. The visible consequence is that a DestinationRule declared in the target's namespace is dropped when Ferrum has no record of the target (for example a `reviews.beta` rule when no `beta/reviews` Service and no ServiceEntry are in the mesh model); express such a rule with a `.svc`-qualified host, or declare the backing `Service`/`ServiceEntry`.
 
-**Multiple DRs in the winning tier**: they are same-namespace by construction (one owner — Istio's merge case), so they apply in deterministic `(namespace, name)` order, last-writer-wins per field, and the slice builder logs a bounded warning naming only the count of ambiguous destinations. `(namespace, name)` order is an **intra-tier tiebreak only** and is never cross-tier precedence. Operators also see `debug!` log lines when subsets or proxy `backend_connect_timeout_ms` get overwritten.
+**Multiple DRs in the winning tier**: they are same-namespace by construction (one owner — Istio's merge case), so they apply in deterministic `(namespace, name, normalized host spelling)` order, last-writer-wins per field, and the slice builder logs a bounded warning naming only the count of ambiguous destinations. That order is an **intra-tier tiebreak only** and is never cross-tier precedence. Including host spelling covers native input that repeats one name for distinct hosts; Kubernetes still has unique `(namespace, name)` resource identity. Operators also see `debug!` log lines when subsets or proxy `backend_connect_timeout_ms` get overwritten.
 
 Visibility and the lookup hierarchy compose in that order: `exportTo` is absolute, so root-namespace fallback can never resurrect a rule the subscriber was never allowed to see.
 

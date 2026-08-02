@@ -71,9 +71,10 @@ CI today."
   and blocking**: the `mesh-e2e-sidecar` kind+SPIRE suite drives the real
   captured datapath (STRICT mTLS positive + plaintext-rejected negative,
   destination-side authz 403, JWT valid/missing/invalid, DR connectTimeout
-  two-phase timing, a DR exported only to another namespace proving it cannot
-  change this client's effective policy, a client-namespace rule beating a
-  root-namespace default whose namespace sorts LAST lexically,
+  two-phase timing, a cross-namespace target-service DR changed from public to
+  namespace-local proving it cannot change this client's effective policy, a
+  client-namespace rule beating a root-namespace default whose namespace sorts
+  LAST lexically,
   DR maxConnections=1 WebSocket hold/reject/release, and a
   CP + native-subscribe leg proving CP-delivered `MeshSubscribe` config end to
   end) on every relevant PR and every main push, the artifact is

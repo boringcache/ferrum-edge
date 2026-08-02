@@ -22,8 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   result. Visibility is now evaluated during slice construction — before
   lookup selection and before a per-node slice is serialized — and the winning
   tier is resolved per destination there and re-applied per upstream at
-  materialization, so `(namespace, name)` order is only ever an intra-tier
-  tiebreak. The two compose in that order: `exportTo` is absolute, so
+  materialization, where visibility is defensively rechecked before lookup, so
+  `(namespace, name, normalized host spelling)` order is only ever an
+  intra-tier tiebreak. The two compose in that order: `exportTo` is absolute, so
   root-namespace fallback cannot resurrect a rule a subscriber was never
   allowed to see. Supported values are `*`, `.`, and explicit namespace names;
   `~`, empty entries, non-RFC-1123 namespace names, lists over 64 entries, and

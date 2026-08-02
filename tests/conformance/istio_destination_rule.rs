@@ -684,8 +684,8 @@ fn dr_export_to_unsupported_values_rejected() {
 
 /// Istio's DestinationRule lookup path: the client's namespace, then the
 /// target service's namespace, then `meshConfig.rootNamespace`. The first tier
-/// with a visible rule wins outright; `(namespace, name)` ordering is an
-/// intra-tier tiebreak only and never cross-tier precedence.
+/// with a visible rule wins outright; resource ordering is an intra-tier
+/// tiebreak only and never cross-tier precedence.
 #[test]
 fn dr_lookup_hierarchy_client_then_service_then_root() {
     register_feature!(
@@ -693,7 +693,7 @@ fn dr_lookup_hierarchy_client_then_service_then_root() {
         feature = "DestinationRule lookup hierarchy (client → service → root namespace)",
         status = Status::Supported,
         maturity = Maturity::Ga,
-        notes = "Resolved in slice narrowing and re-applied per upstream at materialization. The configured istio_root_namespace is the final fallback tier. Composes with exportTo: a rule the subscriber cannot see is never a candidate for any tier. The service tier is granted only on evidence of ownership — the service inventory, a .svc-qualified host, or the namespace of exactly one visible ServiceEntry for an external host; an unknown or contested owner disables the tier rather than defaulting to the rule's own namespace.",
+        notes = "Resolved in slice narrowing and re-applied per upstream at materialization, where exportTo visibility is defensively rechecked before lookup. The configured istio_root_namespace is the final fallback tier. Composes with exportTo: a rule the subscriber cannot see is never a candidate for any tier. The service tier is granted only on evidence of ownership — the service inventory, a .svc-qualified host, or the namespace of exactly one visible ServiceEntry for an external host; an unknown or contested owner disables the tier rather than defaulting to the rule's own namespace.",
     );
 
     let host = "reviews.beta.svc.cluster.local";

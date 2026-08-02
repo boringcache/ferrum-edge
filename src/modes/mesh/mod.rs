@@ -56,8 +56,9 @@ use crate::modes::mesh::config::{
     MeshInboundTcpRoute, MeshJwtRule, MeshLoadBalancer, MeshLocalityLbSetting,
     MeshOutlierDetection, MeshPolicy, MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig,
     MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyAction, PolicyScope, Resolution,
-    ServiceEntry, ServiceEntryLocation, ServiceTargetPort, destination_rule_lookup_tier,
-    resolve_target_port, service_entry_exported_to_namespace,
+    ServiceEntry, ServiceEntryLocation, ServiceTargetPort,
+    destination_rule_exported_to_namespace, destination_rule_lookup_tier, resolve_target_port,
+    service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
@@ -6888,18 +6889,31 @@ fn synthesize_mesh_outbound_cors_plugins(
 ///
 /// Within the winning tier every rule is same-namespace by construction — one
 /// owner, Istio's merge case — and those apply in deterministic
-/// `(namespace, name)` order so the last-writer-wins-per-field outcome is
-/// reproducible across CP restarts and DP subscribers. `(namespace, name)`
-/// order is therefore an intra-tier tiebreak only; it is never cross-tier
-/// precedence.
+/// `(namespace, name, normalized host spelling)` order so the
+/// last-writer-wins-per-field outcome is reproducible across CP restarts and
+/// DP subscribers, including native input that repeats one name for distinct
+/// host spellings. This order is an intra-tier tiebreak only; it is never
+/// cross-tier precedence.
 fn apply_destination_rules(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) -> Result<(), anyhow::Error> {
+    let client_namespace = mesh_slice.namespace.as_str();
     let mut sorted_destination_rules: Vec<&MeshDestinationRule> =
-        mesh_slice.destination_rules.iter().collect();
-    sorted_destination_rules.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+        mesh_slice
+            .destination_rules
+            .iter()
+            // Re-apply the visibility boundary on the DP before ANY lookup or
+            // selection. Ferrum CP already narrows native/xDS slices, but this
+            // protects file/native/carrier consumers from a cross-wired or
+            // independently implemented producer that sends a rule the
+            // subscriber is not allowed to see.
+            .filter(|dr| destination_rule_exported_to_namespace(dr, client_namespace))
+            .collect();
+    sorted_destination_rules.sort_by(|a, b| {
+        (&a.namespace, &a.name, &a.host).cmp(&(&b.namespace, &b.name, &b.host))
+    });
 
     // Owning Service port per materialized per-port outbound upstream
     // (forward-derived from the slice, like `mesh_outbound_service_groups`).
@@ -6984,7 +6998,6 @@ fn apply_destination_rules(
     // root-namespace default — is the lowest-priority bucket. Skipping
     // losing-tier rules per upstream is what stops the `(namespace, name)`
     // ordering below from acting as cross-tier precedence.
-    let client_namespace = mesh_slice.namespace.as_str();
     let winning_tier_by_upstream: Vec<Option<DestinationRuleLookupTier>> = config
         .upstreams
         .iter()
@@ -20240,6 +20253,42 @@ mod tests {
 
         assert_eq!(config.upstreams[0].algorithm, LoadBalancerAlgorithm::Random);
         assert_eq!(config.proxies[0].backend_connect_timeout_ms, 9999);
+    }
+
+    #[test]
+    fn destination_rule_materialization_rechecks_export_visibility_before_lookup() {
+        let host = "reviews.beta.svc.cluster.local";
+        let mut upstream = destination_rule_test_upstream("u1", host);
+        upstream.namespace = "beta".to_string();
+        let mut config = GatewayConfig {
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![upstream],
+            ..GatewayConfig::default()
+        };
+        let original_timeout = config.proxies[0].backend_connect_timeout_ms;
+        let slice = MeshSlice {
+            namespace: "alpha".to_string(),
+            destination_rules: vec![MeshDestinationRule {
+                name: "private-service-policy".to_string(),
+                namespace: "beta".to_string(),
+                host: host.to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connect_timeout_ms: Some(1),
+                    load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+                export_to: vec![".".to_string()],
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("hidden DestinationRule is ignored");
+
+        assert_eq!(config.proxies[0].backend_connect_timeout_ms, original_timeout);
+        assert_eq!(config.upstreams[0].algorithm, LoadBalancerAlgorithm::RoundRobin);
     }
 
     #[test]
