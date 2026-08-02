@@ -8253,7 +8253,9 @@ fn is_spool_owned_file(path: &Path) -> bool {
 /// `None` so callers keep last-good gauges and let reconcile correct drift.
 fn spool_regular_file_len(path: &Path) -> Option<u64> {
     match fs::symlink_metadata(path) {
-        Ok(meta) if !meta.file_type().is_symlink() && meta.file_type().is_file() => Some(meta.len()),
+        Ok(meta) if !meta.file_type().is_symlink() && meta.file_type().is_file() => {
+            Some(meta.len())
+        }
         _ => None,
     }
 }

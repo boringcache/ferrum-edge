@@ -10,10 +10,10 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, PEER_REPUBLISH_MARKER,
     QuotaEvictionReport, SnapshotAccumulator, SpoolCompression, SpoolFinalOwnership, SpoolFsFault,
     SpoolManager, SpoolOwnerSpec, SpoolSettings, SpoolWriteHookPoint,
-    classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
-    clickhouse_insert_url_for_tests, compact_recovery_probe_for_tests,
-    compile_charge_event_projection, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
-    encode_spool_bytes_without_content_size_for_tests,
+    active_spool_inventory_walks_for_tests, classify_clickhouse_acknowledgement_for_tests,
+    classify_clickhouse_http_status_for_tests, clickhouse_insert_url_for_tests,
+    compact_recovery_probe_for_tests, compile_charge_event_projection, decode_spool_file_for_tests,
+    encode_spool_bytes_for_tests, encode_spool_bytes_without_content_size_for_tests,
     encode_spool_bytes_without_ratio_padding_for_tests, new_ulid,
     probe_charge_body_materialization_for_tests,
     probe_charge_body_materialization_with_projection_for_tests,
@@ -26,7 +26,6 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     spool_decompression_limit_for_tests, spool_index_entry_bytes_for_tests,
     spool_replay_peak_bytes_for_tests, spool_split_worklist_max_entries_for_tests,
     write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
-    active_spool_inventory_walks_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
 use ferrum_edge::plugins::utils::byte_budget::RetainedByteCeiling;
@@ -7913,9 +7912,7 @@ fn spool_usage_counters_track_write_evict_and_reconcile_lifecycle() {
         1,
         "status gauges must not synchronously discover planted files"
     );
-    let reconciled = spool
-        .reconcile_cached_usage_for_tests()
-        .expect("reconcile");
+    let reconciled = spool.reconcile_cached_usage_for_tests().expect("reconcile");
     assert_eq!(reconciled.files, 2);
     assert_eq!(
         reconciled.bytes,
