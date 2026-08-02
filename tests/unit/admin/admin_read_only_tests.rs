@@ -943,7 +943,10 @@ fn admin_mutation_handlers_use_admit_write_not_sync_gate_alone() {
     let independent_admission = admin_source
         .split("pub async fn admit_non_config_db_write")
         .nth(1)
-        .and_then(|tail| tail.split("pub(super) async fn admit_audited_operation").next())
+        .and_then(|tail| {
+            tail.split("pub(super) async fn admit_audited_operation")
+                .next()
+        })
         .expect("independent-store admission method remains inspectable");
     assert!(
         independent_admission.contains("evaluate_independent_store_write_gate"),

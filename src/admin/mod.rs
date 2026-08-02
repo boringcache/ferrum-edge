@@ -561,9 +561,7 @@ impl AdminState {
     /// durable audit handoff policy; read-only and database-availability gates
     /// remain unchanged for the operational action itself.
     #[allow(clippy::result_large_err)]
-    pub(super) async fn admit_audited_operation(
-        &self,
-    ) -> Result<(), Response<Full<Bytes>>> {
+    pub(super) async fn admit_audited_operation(&self) -> Result<(), Response<Full<Bytes>>> {
         if let Some(response) = self.prepare_audit_intent().await {
             return Err(response);
         }
