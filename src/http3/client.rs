@@ -3855,13 +3855,8 @@ mod h3_pool_health_tests {
             .set_nonblocking(true)
             .expect("set client UDP socket nonblocking");
         let runtime = quinn::default_runtime().expect("Tokio runtime");
-        let mut endpoint = Endpoint::new(
-            quinn::EndpointConfig::default(),
-            None,
-            socket,
-            runtime,
-        )
-        .expect("client endpoint");
+        let mut endpoint = Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
+            .expect("client endpoint");
         endpoint.set_default_client_config(client_config);
         endpoint
     }
