@@ -520,7 +520,7 @@ impl LdapAuth {
             return None;
         };
         let username_len = u64::try_from(username.len()).ok()?;
-        mac.update(&username_len.to_be_bytes());
+        mac.update(username_len.to_be_bytes());
         mac.update(username.as_bytes());
         mac.update(password.as_bytes());
         let digest = mac.finalize().into_bytes();

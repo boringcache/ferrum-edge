@@ -6165,7 +6165,7 @@ fn verify_country_mmdb_path_digest(
     }
     verify_country_mmdb_path_still_matches(path, opened_version)?;
 
-    let observed_digest: CountryMmdbDigest = hasher.finalize().into();
+    let observed_digest: CountryMmdbDigest = hasher.finalize();
     if &observed_digest != expected_digest {
         return Err(CountryMmdbLoadError::Invalid(format!(
             "MaxMind database path target '{path}' was replaced while it was being loaded"
@@ -6291,7 +6291,7 @@ fn load_validated_country_mmdb_inner(
     }
     verify_country_mmdb_path_still_matches(path, &file_version)?;
 
-    let digest: CountryMmdbDigest = hasher.finalize().into();
+    let digest: CountryMmdbDigest = hasher.finalize();
     #[cfg(not(unix))]
     verify_country_mmdb_path_digest(path, &file_version, &digest)?;
     // Charge the same content identity used by the snapshot cache. This runs
@@ -6363,7 +6363,7 @@ fn load_validated_country_mmdb_inner(
     }
     verify_country_mmdb_path_still_matches(path, &file_version)?;
 
-    let loaded_digest: CountryMmdbDigest = Sha256::digest(&bytes).into();
+    let loaded_digest: CountryMmdbDigest = Sha256::digest(&bytes);
     if loaded_digest != digest {
         return Err(CountryMmdbLoadError::Invalid(format!(
             "MaxMind database file '{path}' changed between identity and snapshot reads"

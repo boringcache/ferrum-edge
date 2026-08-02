@@ -50,7 +50,7 @@ pub fn static_config_digest(domain: &str, config: &Value) -> [u8; 32] {
     hasher.update((domain.len() as u64).to_be_bytes());
     hasher.update(domain.as_bytes());
     hash_canonical_value(&mut hasher, config);
-    hasher.finalize().into()
+    hasher.finalize()
 }
 
 /// Fold every enrolled plugin instance's static digest, **in configured
@@ -79,7 +79,7 @@ pub fn presentation_policy_digest<'a>(
         hasher.update(digest);
     }
     hasher.update(count.to_be_bytes());
-    hasher.finalize().into()
+    hasher.finalize()
 }
 
 /// Hash a JSON value canonically.

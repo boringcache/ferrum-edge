@@ -16,7 +16,7 @@ impl TokenKey {
     pub fn from_token(token: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
-        let digest: [u8; 32] = hasher.finalize().into();
+        let digest: [u8; 32] = hasher.finalize();
         Self { digest }
     }
 

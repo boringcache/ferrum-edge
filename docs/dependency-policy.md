@@ -415,35 +415,34 @@ Ferrum ships two mutually exclusive cryptographic-backend cargo features
 | Feature | Backend | Lockfile |
 |---|---|---|
 | `crypto-ring` (default) | `ring` + `rustls/ring` | the committed `Cargo.lock` |
-| `fips` | `aws-lc-fips-sys` via `aws-lc-rs/fips` and `rustls/fips` | resolved at build time |
+| `fips` | `aws-lc-fips-sys` via `aws-lc-rs/fips` and `rustls/fips` | the committed `Cargo.lock` |
 
 Rules:
 
-- **The backend is never selected inline on a dependency.** `rustls`, `tonic`,
-  `sqlx`, `ldap3`, `quinn`, `rcgen`, `x509-parser`, `jsonwebtoken`,
-  `hyper-rustls`, and `instant-acme` all take their crypto arm from the feature
-  pair. An inline selection would win on both profiles.
-  `quinn` and `rcgen` additionally carry `default-features = false`, because
-  their default sets select ring.
+- **The backend is never selected inline on a dependency.** `rustls`,
+  `tokio-rustls`, `reqwest`, `sqlx`, `ldap3`, `quinn`, `rcgen`, `x509-parser`,
+  `jsonwebtoken`, `hyper-rustls`, and `instant-acme` all take their crypto arm
+  from the feature pair. An inline selection would win on both profiles.
+  `rustls`, `tokio-rustls`, `quinn`, and `rcgen` carry
+  `default-features = false`, because their default sets select a provider;
+  reqwest uses `rustls-no-provider` for the same reason.
 - **Additive is not sufficient.** `sqlx-core`, `quinn-proto`, `tonic`, `ldap3`,
   and `hyper-rustls` each gate their aws-lc arm on the *absence* of their ring
   arm, so "also enable aws-lc" produces a build that looks switched and is not.
   This is the whole reason the features are exclusive rather than layered.
 - **The declared contract is not the audited one.**
   `.github/scripts/check_fips_feature_policy.py` reads what cargo actually
-  resolved (`cargo tree -e features --no-dev-dependencies`) for *both* profiles and
+  resolved (`cargo tree -e features,no-dev`) for *both* profiles and
   fails on any surviving ring selection in the FIPS graph. It runs in the
   required `FIPS Feature Policy` job of `.github/workflows/fips-build.yml`.
-  `--no-dev-dependencies` is load-bearing: test fixtures pin `ring` and `rustls/ring` as
+  `no-dev` is load-bearing: test fixtures pin `ring` and `rustls/ring` as
   dev-dependencies so the suite compiles under both profiles, and a
   dev-dependency is never linked into a shipped binary.
-- **The FIPS profile is not in the committed `Cargo.lock`.** Adding
-  `aws-lc-fips-sys` to the ordinary lockfile would put a non-validated build's
-  supply chain on every developer and every release artifact for no benefit.
-  The FIPS CI job therefore builds without `--locked` and restores the committed
-  lock before re-verifying that the ordinary profile still resolves against it.
-  A FIPS *release* pins its own lockfile as a deployment artifact — see
-  `docs/fips.md`.
+- **Both profiles are pinned in the committed `Cargo.lock`.** A lockfile entry
+  does not compile or link the FIPS-only package into an ordinary artifact;
+  feature selection still controls the build. Both resolved-graph audits and
+  the hosted FIPS build therefore use `--locked`, and a FIPS release retains
+  that exact lockfile as deployment evidence — see `docs/fips.md`.
 - **`aws-lc-sys` may still be compiled next to `aws-lc-fips-sys`.** `dimpl` and
   rustls's `aws_lc_rs` arm request it unconditionally. `aws-lc-rs` binds
   `aws-lc-fips-sys` whenever its `fips` feature is on, so the validated module

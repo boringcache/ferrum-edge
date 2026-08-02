@@ -95,7 +95,8 @@ jobs:
         # which is why it cannot be replaced with a prebuilt artifact here.
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build golang-go
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build golang-go libcurl4-openssl-dev
 
       - name: Install protoc
         run: |

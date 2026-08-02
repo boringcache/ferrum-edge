@@ -486,7 +486,7 @@ impl HmacAuth {
     fn authorization_fingerprint(ctx: &RequestContext) -> Option<[u8; 32]> {
         ctx.headers
             .get("authorization")
-            .map(|header| Sha256::digest(header.as_bytes()).into())
+            .map(|header| Sha256::digest(header.as_bytes()))
     }
 
     fn digest_header_ref(ctx: &RequestContext) -> Option<&str> {
@@ -751,10 +751,10 @@ impl AuthMechanism for HmacAuth {
             digest_header,
             request_body_sha256: ctx
                 .request_body_sha256
-                .unwrap_or_else(|| Sha256::digest([]).into()),
+                .unwrap_or_else(|| Sha256::digest([])),
             request_body_sha512: ctx
                 .request_body_sha512
-                .unwrap_or_else(|| Sha512::digest([]).into()),
+                .unwrap_or_else(|| Sha512::digest([])),
         }))
     }
 
@@ -926,6 +926,7 @@ mod tests {
     //! `tests/unit/plugins/hmac_auth_tests.rs`.
 
     use super::HmacAuth;
+    use crate::fips::approved::{Sha256, Sha512};
     use base64::Engine as _;
 
     fn sha256_digest_header(body: &[u8]) -> String {

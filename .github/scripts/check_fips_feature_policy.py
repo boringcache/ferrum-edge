@@ -65,7 +65,8 @@ REQUIRED_FIPS_ONLY = ("aws-lc-rs/fips",)
 # feature: the backend belongs to the mutually exclusive feature pair, and an
 # inline selection would silently win on both profiles.
 FORBIDDEN_INLINE_DECLARATIONS = {
-    "rustls": ("ring",),
+    "rustls": ("ring", "aws_lc_rs", "aws-lc-rs", "fips"),
+    "tokio-rustls": ("ring", "aws_lc_rs", "aws-lc-rs", "fips"),
     "tonic": ("tls-ring", "tls-aws-lc"),
     "sqlx": ("runtime-tokio-rustls", "tls-rustls", "tls-rustls-ring"),
     "ldap3": ("tls-rustls-ring", "tls-rustls-aws-lc-rs"),
@@ -73,11 +74,12 @@ FORBIDDEN_INLINE_DECLARATIONS = {
     "instant-acme": ("ring", "aws-lc-rs", "fips"),
     "x509-parser": ("verify", "verify-aws"),
     "jsonwebtoken": ("rust_crypto", "aws_lc_rs"),
+    "reqwest": ("rustls",),
 }
 
 # Dependencies that must be declared with `default-features = false`, because
 # their default feature set selects a crypto backend.
-REQUIRE_DEFAULT_FEATURES_OFF = ("quinn", "rcgen")
+REQUIRE_DEFAULT_FEATURES_OFF = ("quinn", "rcgen", "rustls", "tokio-rustls")
 
 # `cargo tree -e features` prints feature edges as `crate feature "name"`.
 FEATURE_EDGE = re.compile(r'^[^a-zA-Z0-9]*([A-Za-z0-9_.-]+) feature "([A-Za-z0-9_.-]+)"')
@@ -270,9 +272,14 @@ def check_tree(path: Path, profile: str) -> list[str]:
     failures: list[str] = []
     for crate, feature in sorted(required):
         if (crate, feature) not in selections:
+            observed = sorted(
+                selected_feature
+                for selected_crate, selected_feature in selections
+                if selected_crate == crate
+            )
             failures.append(
                 f"[{profile}] resolved graph is missing the required selection "
-                f"{crate}/{feature}"
+                f"{crate}/{feature}; observed {crate} features: {observed}"
             )
     for crate, feature in sorted(forbidden):
         if (crate, feature) in selections:

@@ -80,7 +80,7 @@ impl GatePolicyStamp {
             digest.update([u8::from(gates.get(scope).copied().unwrap_or(false))]);
         }
         Self(Arc::new(GatePublication {
-            fingerprint: digest.finalize().into(),
+            fingerprint: digest.finalize(),
         }))
     }
 

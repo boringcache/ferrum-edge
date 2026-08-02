@@ -92,6 +92,8 @@ http = "1"
 #
 # `ring` and `aws-lc-rs` are the ring-API-compatible backends behind
 # `crate::fips::backend` (randomness, HMAC, digests, signature verification).
+# The direct rustls/tokio-rustls dependencies and reqwest deliberately select
+# no provider here; the exclusive feature pair below supplies that provider.
 ring = { version = "0.17", optional = true }
 # `default-features = false` deliberately omits `aws-lc-sys`: the `fips` feature
 # selects `aws-lc-fips-sys` instead, and `aws-lc-rs` binds whichever of the two
@@ -100,8 +102,8 @@ ring = { version = "0.17", optional = true }
 # crates may be *built*; only the FIPS one is *linked into the API surface*.
 # See docs/fips.md §"What the module boundary is".
 aws-lc-rs = { version = "1.16", default-features = false, features = ["alloc", "ring-io", "ring-sig-verify"], optional = true }
-rustls = { version = "0.23", features = ["std"] }
-tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 rustls-pemfile = "2"
 webpki-roots = "1.0"
 zeroize = "1"
@@ -211,8 +213,9 @@ pin-project-lite = "0.2"
 # `HTTP_PROXY` / `HTTPS_PROXY` env vars from the operator's shell is almost
 # never the intent (and a misconfigured env var would silently route
 # backend traffic through an unintended hop). Everything else from the
-# pre-0.13 default set is re-enabled explicitly.
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "http2", "charset"] }
+# pre-0.13 default set is re-enabled explicitly. `rustls-no-provider` is
+# load-bearing: `crypto-ring` / `fips`, not reqwest, selects the provider.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "stream", "http2", "charset"] }
 hickory-resolver = { version = "0.26", features = ["tokio", "system-config"] }
 base64 = "0.22"
 url = "2"

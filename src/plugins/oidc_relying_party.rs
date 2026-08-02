@@ -817,7 +817,7 @@ impl OidcRelyingParty {
                 Some(&state),
             );
         };
-        let browser_binding_hash: [u8; 32] = Sha256::digest(browser_binding.as_bytes()).into();
+        let browser_binding_hash: [u8; 32] = Sha256::digest(browser_binding.as_bytes());
         let Some(flow) = self
             .session
             .state_cache
@@ -1485,7 +1485,7 @@ impl OidcRelyingParty {
         let code_verifier = random_b64(64)?;
         let nonce = random_b64(32)?;
         let browser_binding = random_b64(32)?;
-        let browser_binding_hash: [u8; 32] = Sha256::digest(browser_binding.as_bytes()).into();
+        let browser_binding_hash: [u8; 32] = Sha256::digest(browser_binding.as_bytes());
         let original_url = original_url(ctx, &self.behavior);
         let flow = FlowState {
             code_verifier,
@@ -1668,7 +1668,7 @@ impl OidcRelyingParty {
     }
 
     fn correlation_cookie_name(&self, state: &str) -> String {
-        let state_hash: [u8; 32] = Sha256::digest(state.as_bytes()).into();
+        let state_hash: [u8; 32] = Sha256::digest(state.as_bytes());
         derived_cookie_name(&self.session.correlation_cookie_name_prefix, &state_hash)
     }
 
@@ -2354,7 +2354,7 @@ fn session_context_seed(
     // representation deterministic, independent of input object key order.
     let serialized = serde_json::to_vec(&normalized)
         .map_err(|_| "oidc_relying_party: failed to derive session context".to_string())?;
-    Ok(Sha256::digest(serialized).into())
+    Ok(Sha256::digest(serialized))
 }
 
 fn normalized_client_auth_context(provider: &Map<String, Value>) -> NormalizedClientAuthContext {
@@ -2393,7 +2393,7 @@ fn session_context_id(seed: &[u8; 32], cookie_name: &str) -> [u8; 32] {
     hasher.update(seed);
     hasher.update((cookie_name.len() as u64).to_be_bytes());
     hasher.update(cookie_name.as_bytes());
-    hasher.finalize().into()
+    hasher.finalize()
 }
 
 fn derived_cookie_name(prefix: &str, context_seed: &[u8; 32]) -> String {
@@ -3436,8 +3436,8 @@ mod tests {
         assert_eq!(cookie_value(&callback, &first.1), Some(first.2.as_str()));
         assert_eq!(cookie_value(&callback, &second.1), Some(second.2.as_str()));
 
-        let first_hash: [u8; 32] = Sha256::digest(first.2.as_bytes()).into();
-        let second_hash: [u8; 32] = Sha256::digest(second.2.as_bytes()).into();
+        let first_hash: [u8; 32] = Sha256::digest(first.2.as_bytes());
+        let second_hash: [u8; 32] = Sha256::digest(second.2.as_bytes());
         assert!(
             plugin
                 .session

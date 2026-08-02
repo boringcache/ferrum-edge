@@ -452,7 +452,7 @@ impl AiPromptCompressor {
                 .as_ref()
                 .and_then(|tags| strip_markers_from_json_strings(body, tags))
                 .map(|output| CompressionOutput {
-                    source_sha256: Sha256::digest(body).into(),
+                    source_sha256: Sha256::digest(body),
                     output,
                     stats: None,
                 })
@@ -481,7 +481,7 @@ impl AiPromptCompressor {
             .and_then(|tags| strip_markers_from_json_strings(&serialized, tags))
             .unwrap_or(serialized);
         Some(CompressionOutput {
-            source_sha256: Sha256::digest(body).into(),
+            source_sha256: Sha256::digest(body),
             output,
             stats: Some(stats),
         })
@@ -497,7 +497,7 @@ impl AiPromptCompressor {
         let body = body.to_vec();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            Sha256::digest(&body).into()
+            Sha256::digest(&body)
         })
         .await
         .ok()

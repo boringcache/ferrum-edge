@@ -1737,7 +1737,7 @@ fn dns01_txt_record_name(identifier: &str) -> Option<String> {
 }
 
 fn key_authorization_sha256(key_authorization: &str) -> [u8; 32] {
-    Sha256::digest(key_authorization.as_bytes()).into()
+    Sha256::digest(key_authorization.as_bytes())
 }
 
 fn key_authorization_sha256_base64url(key_authorization: &str) -> String {
