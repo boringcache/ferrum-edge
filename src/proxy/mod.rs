@@ -18283,8 +18283,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // Consume the one-shot record of whether that chain installed a complete
     // final gateway/protocol terminal. Taken here — at the single trusted site,
     // immediately after the chain — so it can never survive into another phase.
-    let final_body_policy_terminal_replacement =
-        ctx.take_final_body_policy_terminal_replacement();
+    let final_body_policy_terminal_replacement = ctx.take_final_body_policy_terminal_replacement();
 
     // Authoritative final client-visible BODY policy, re-decided over the exact
     // header map the chain above just closed (`GHSA-62jg-v563-4q23`). No-ops

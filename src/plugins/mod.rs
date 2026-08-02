@@ -4118,8 +4118,7 @@ impl RequestContext {
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
             gateway_capacity_response_selected: self.gateway_capacity_response_selected,
             gateway_representation_response_selected: self.gateway_representation_response_selected,
-            final_body_policy_terminal_replacement: self
-                .final_body_policy_terminal_replacement,
+            final_body_policy_terminal_replacement: self.final_body_policy_terminal_replacement,
             // Final request-body hooks cannot produce a response-body capacity
             // refusal. Keep the live response path's one-shot signal on the
             // original context instead of duplicating it into this compatibility
