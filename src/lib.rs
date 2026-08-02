@@ -5975,6 +5975,24 @@ pub mod _test_support {
         crate::proxy::body::inspected_streaming_body(rx)
     }
 
+    /// Build one standards-correct AWS event-stream message for external
+    /// gateway tests without exposing a production message-construction API.
+    pub fn encode_aws_event_stream_message_for_test(headers: &[u8], payload: &[u8]) -> Vec<u8> {
+        crate::plugins::utils::ai_usage_stream::encode_aws_event_stream_message(headers, payload)
+    }
+
+    /// Build the CRC-valid twelve-byte AWS event-stream prelude used by hostile
+    /// length and checksum regression fixtures.
+    pub fn encode_aws_event_stream_prelude_for_test(
+        total_length: u32,
+        headers_length: u32,
+    ) -> [u8; 12] {
+        crate::plugins::utils::ai_usage_stream::encode_aws_event_stream_prelude(
+            total_length,
+            headers_length,
+        )
+    }
+
     pub fn mesh_tcp_egress_connection_accounting_for_test(
         cache: &crate::load_balancer::LoadBalancerCache,
         namespace: &str,

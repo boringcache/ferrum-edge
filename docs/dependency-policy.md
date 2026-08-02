@@ -41,6 +41,7 @@ crate). Keep the version aligned with the transitive copy already in
 |---|---|
 | `crossbeam-utils` | `CachePadded` on hot overload atomics |
 | `crossbeam-queue` | lock-free MPMC ring for router-cache eviction samples |
+| `crc32fast` | AWS Bedrock event-stream prelude/message CRC32 validation before lengths or usage payloads are trusted |
 | `unsafe-libyaml` | API-spec YAML event composition + bounded alias expansion (#3307); already transitive via `serde_yaml` |
 
 ## Vendored crate inventory

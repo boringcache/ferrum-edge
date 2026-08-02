@@ -1,5 +1,6 @@
 //! Tests for ai_rate_limiter plugin
 
+use base64::Engine;
 use ferrum_edge::plugins::{
     Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext,
     ai_rate_limiter::AiRateLimiter,
@@ -6940,7 +6941,7 @@ fn sse_frame(value: serde_json::Value) -> Vec<u8> {
 
 /// One standards-correct `application/vnd.amazon.eventstream` message.
 fn bedrock_event_stream_message(payload: &[u8]) -> Vec<u8> {
-    ferrum_edge::plugins::utils::ai_usage_stream::encode_aws_event_stream_message(b"", payload)
+    ferrum_edge::_test_support::encode_aws_event_stream_message_for_test(b"", payload)
 }
 
 #[tokio::test]
@@ -6995,7 +6996,6 @@ async fn bedrock_event_stream_is_charged_from_invocation_metrics() {
     }))
     .unwrap();
     let encoded = {
-        use base64::Engine;
         base64::engine::general_purpose::STANDARD.encode(inner)
     };
     let payload = serde_json::to_vec(&json!({"bytes": encoded})).unwrap();
@@ -7370,19 +7370,23 @@ enum GatewayStreamBodyVariant {
     H3,
 }
 
-fn gemini_usage_sse_chunks() -> Vec<Bytes> {
-    let first = Bytes::from(sse_frame(json!({
-        "candidates": [{"content": {"parts": [{"text": "he"}]}}]
-    })));
-    let last = Bytes::from(sse_frame(json!({
-        "candidates": [{"content": {"parts": [{"text": "llo"}]}}],
-        "usageMetadata": {
-            "promptTokenCount": 30,
-            "candidatesTokenCount": 20,
-            "totalTokenCount": 50
+fn bedrock_usage_event_stream_chunks() -> Vec<Bytes> {
+    let inner = serde_json::to_vec(&json!({
+        "type": "message_stop",
+        "amazon-bedrock-invocationMetrics": {
+            "inputTokenCount": 30,
+            "outputTokenCount": 20
         }
-    })));
-    vec![first, last]
+    }))
+    .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(inner);
+    let payload = serde_json::to_vec(&json!({"bytes": encoded})).unwrap();
+    let message = bedrock_event_stream_message(&payload);
+    let split = message.len() / 2;
+    vec![
+        Bytes::copy_from_slice(&message[..split]),
+        Bytes::copy_from_slice(&message[split..]),
+    ]
 }
 
 async fn drain_proxy_body_data(mut body: ferrum_edge::proxy::ProxyBody) -> Vec<u8> {
@@ -7400,6 +7404,7 @@ async fn drive_gateway_stream_variant(
     variant: GatewayStreamBodyVariant,
     plugin: &Arc<AiRateLimiter>,
     ctx: &mut RequestContext,
+    content_type: &str,
     chunks: Vec<Bytes>,
     complete: bool,
 ) -> Vec<u8> {
@@ -7408,7 +7413,7 @@ async fn drive_gateway_stream_variant(
         &chain,
         ctx,
         200,
-        Some("text/event-stream"),
+        Some(content_type),
     )
     .expect("a meterable AI SSE stream must attach an inspector");
 
@@ -7496,7 +7501,8 @@ async fn h1_h2_h3_gateway_streams_drive_ai_rate_limiter_and_reconcile() {
             variant,
             &plugin,
             &mut ctx,
-            gemini_usage_sse_chunks(),
+            "application/vnd.amazon.eventstream",
+            bedrock_usage_event_stream_chunks(),
             true,
         )
         .await;
@@ -7504,7 +7510,7 @@ async fn h1_h2_h3_gateway_streams_drive_ai_rate_limiter_and_reconcile() {
         assert_eq!(
             observed_usage(&plugin).await,
             50,
-            "{variant:?}: terminal usageMetadata must reconcile the reservation"
+            "{variant:?}: CRC-validated Bedrock usage must reconcile the reservation"
         );
         assert!(
             instance_released(&plugin, &ctx),
@@ -7531,7 +7537,15 @@ async fn h1_h2_h3_client_disconnect_still_terminally_reconciles() {
         let partial = vec![Bytes::from(sse_frame(
             json!({"candidates": [{"content": {"parts": [{"text": "he"}]}}]}),
         ))];
-        drive_gateway_stream_variant(variant, &plugin, &mut ctx, partial, false).await;
+        drive_gateway_stream_variant(
+            variant,
+            &plugin,
+            &mut ctx,
+            "text/event-stream",
+            partial,
+            false,
+        )
+        .await;
 
         assert_eq!(
             observed_usage(&plugin).await,
