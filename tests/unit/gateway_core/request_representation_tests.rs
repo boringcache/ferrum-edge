@@ -674,7 +674,10 @@ fn a_stacked_decode_is_charged_at_its_concurrent_peak() {
         "a budget short of the CONCURRENT peak must refuse, even though it \
          exceeds the surviving plaintext's own allocation"
     );
-    assert_eq!(short.available_bytes(), peak_blocks.saturating_sub(1) * UNIT);
+    assert_eq!(
+        short.available_bytes(),
+        peak_blocks.saturating_sub(1) * UNIT
+    );
 
     let exact = probe(peak_blocks);
     let total = exact.available_bytes();

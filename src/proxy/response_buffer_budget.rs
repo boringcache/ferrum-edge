@@ -508,7 +508,10 @@ fn request_decode_budget() -> &'static Budget {
 #[allow(dead_code)] // binary startup caller; dead in the separately compiled library unit
 pub(crate) fn init_request_decode(total_bytes: usize) {
     if REQUEST_DECODE_BUDGET
-        .set(Budget::new(REQUEST_DECODE_WORST_CASE_PEAK_BYTES, total_bytes))
+        .set(Budget::new(
+            REQUEST_DECODE_WORST_CASE_PEAK_BYTES,
+            total_bytes,
+        ))
         .is_err()
     {
         tracing::warn!(
