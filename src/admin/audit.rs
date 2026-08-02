@@ -1049,16 +1049,14 @@ fn read_local_fallback_events_unlocked(path: &Path) -> Result<Vec<AuditEvent>, a
             "audit local fallback data file exceeds maximum size"
         ));
     }
-    let size = usize::try_from(len).map_err(|_| {
-        anyhow!("audit local fallback data file exceeds maximum size")
-    })?;
+    let size = usize::try_from(len)
+        .map_err(|_| anyhow!("audit local fallback data file exceeds maximum size"))?;
     // Reserve exactly the fstat'd size before reading so a hostile multi-GiB
     // file cannot force amortized growth; the take(+1) bound is defense in
     // depth if the inode grows after the size check.
     let mut raw = Vec::new();
-    raw.try_reserve_exact(size).map_err(|_| {
-        anyhow!("audit local fallback data file exceeds available memory")
-    })?;
+    raw.try_reserve_exact(size)
+        .map_err(|_| anyhow!("audit local fallback data file exceeds available memory"))?;
     let mut limited = (&mut file).take((AUDIT_LOCAL_FALLBACK_MAX_BYTES as u64).saturating_add(1));
     limited
         .read_to_end(&mut raw)
@@ -1186,9 +1184,7 @@ fn write_local_fallback_events_unlocked(
 ) -> Result<(), anyhow::Error> {
     let body = serde_json::to_vec_pretty(events)?;
     if body.len() > AUDIT_LOCAL_FALLBACK_MAX_BYTES {
-        return Err(anyhow!(
-            "audit local fallback payload exceeds maximum size"
-        ));
+        return Err(anyhow!("audit local fallback payload exceeds maximum size"));
     }
     let tmp_name = format!("{}.{}.tmp", AUDIT_LOCAL_FALLBACK_FILE_NAME, Uuid::new_v4());
     let tmp = dir.join(tmp_name);

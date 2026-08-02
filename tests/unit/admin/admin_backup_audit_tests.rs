@@ -2,9 +2,9 @@
 
 use ferrum_edge::admin::audit::{
     self, AUDIT_LOCAL_FALLBACK_MAX_BYTES, AUDIT_REQUEST_ID_MAX_LEN, AuditActor, AuditAdmitSink,
-    AuditEvent, AuditRequestContext, BACKUP_RESOURCES_INVALID_SENTINEL, append_local_fallback_event,
-    backup_failure_diff, backup_resources_audit_value, backup_success_diff,
-    extract_or_generate_request_id, list_local_fallback_events,
+    AuditEvent, AuditRequestContext, BACKUP_RESOURCES_INVALID_SENTINEL,
+    append_local_fallback_event, backup_failure_diff, backup_resources_audit_value,
+    backup_success_diff, extract_or_generate_request_id, list_local_fallback_events,
 };
 use ferrum_edge::admin::jwt_auth::AdminRole;
 use hyper::HeaderMap;
@@ -390,10 +390,7 @@ fn local_fallback_rejects_corrupt_data_file() {
 
     let err = list_local_fallback_events(dir.path()).expect_err("corrupt");
     let msg = err.to_string();
-    assert!(
-        msg.contains("corrupt"),
-        "unexpected error: {msg}"
-    );
+    assert!(msg.contains("corrupt"), "unexpected error: {msg}");
     assert!(
         !msg.contains("SECRET-CANARY"),
         "corrupt reject must not echo file contents: {msg}"
