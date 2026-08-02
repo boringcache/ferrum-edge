@@ -755,22 +755,16 @@ impl AuditSpool {
                 Ok(record) => record,
                 Err(_) => {
                     report.corrupt = report.corrupt.saturating_add(1);
-                    match self.quarantine(&path) {
-                        Ok(false) => {
-                            report.capacity_discarded = report.capacity_discarded.saturating_add(1);
-                        }
-                        Ok(true) | Err(_) => {}
+                    if let Ok(false) = self.quarantine(&path) {
+                        report.capacity_discarded = report.capacity_discarded.saturating_add(1);
                     }
                     continue;
                 }
             };
             if record.destination != self.destination {
                 report.destination_mismatch = report.destination_mismatch.saturating_add(1);
-                match self.quarantine(&path) {
-                    Ok(false) => {
-                        report.capacity_discarded = report.capacity_discarded.saturating_add(1);
-                    }
-                    Ok(true) | Err(_) => {}
+                if let Ok(false) = self.quarantine(&path) {
+                    report.capacity_discarded = report.capacity_discarded.saturating_add(1);
                 }
                 continue;
             }
@@ -809,11 +803,8 @@ impl AuditSpool {
             } else {
                 // A non-finalized body found under `pending/` is malformed.
                 report.corrupt = report.corrupt.saturating_add(1);
-                match self.quarantine(&path) {
-                    Ok(false) => {
-                        report.capacity_discarded = report.capacity_discarded.saturating_add(1);
-                    }
-                    Ok(true) | Err(_) => {}
+                if let Ok(false) = self.quarantine(&path) {
+                    report.capacity_discarded = report.capacity_discarded.saturating_add(1);
                 }
             }
         }

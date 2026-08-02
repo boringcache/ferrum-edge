@@ -3003,7 +3003,10 @@ pub async fn handle_post_api_spec(
     let audit_enabled = state.admin_audit_enabled;
     let audit_actor = actor.clone();
     let audit_spec = spec.clone();
-    let persistence = audit::spawn_with_request_slot(async move {
+    // This settlement captures the complete extracted bundle and compensation
+    // graph. Keep its future frame on the heap before the task-local audit
+    // wrapper moves it, so small-stack test/worker threads cannot overflow.
+    let persistence = audit::spawn_with_request_slot(Box::pin(async move {
         let result = run_api_spec_persistence_while_held(
             settlement_db,
             &settlement_namespace,
@@ -3037,7 +3040,7 @@ pub async fn handle_post_api_spec(
             }
         }
         result
-    })
+    }))
     .await
     .unwrap_or_else(|error| {
         Err(ApiSpecError::Internal(format!(
@@ -3254,7 +3257,7 @@ pub async fn handle_put_api_spec(
     let audit_actor = actor.clone();
     let audit_spec = spec.clone();
     let audit_previous_spec = existing_spec.clone();
-    let persistence = audit::spawn_with_request_slot(async move {
+    let persistence = audit::spawn_with_request_slot(Box::pin(async move {
         let result = run_api_spec_persistence_while_held(
             settlement_db,
             &settlement_namespace,
@@ -3298,7 +3301,7 @@ pub async fn handle_put_api_spec(
             }
         }
         result
-    })
+    }))
     .await
     .unwrap_or_else(|error| {
         Err(ApiSpecError::Internal(format!(
@@ -3750,7 +3753,7 @@ pub async fn handle_delete_api_spec(
     let audit_enabled = state.admin_audit_enabled;
     let audit_actor = actor.clone();
     let audit_spec = existing.clone();
-    let persistence = match audit::spawn_with_request_slot(async move {
+    let persistence = match audit::spawn_with_request_slot(Box::pin(async move {
         let result = run_api_spec_persistence_while_held(
             settlement_db,
             &settlement_namespace,
@@ -3786,7 +3789,7 @@ pub async fn handle_delete_api_spec(
             }
         }
         result
-    })
+    }))
     .await
     .unwrap_or_else(|error| {
         Err(ApiSpecError::Internal(format!(
