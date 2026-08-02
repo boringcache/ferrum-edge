@@ -458,6 +458,10 @@ async fn late_header_rename_cannot_bypass_waf_on_backend_response() {
     let mut ctx = ctx_for("GET", "/orders");
     let mut headers = json_headers();
     headers.insert("x-pending-secret".to_string(), "value".to_string());
+    headers.insert(
+        "set-cookie".to_string(),
+        "backend-session=must-not-cross-rejection".to_string(),
+    );
 
     let reject = run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut headers)
         .await
@@ -467,6 +471,11 @@ async fn late_header_rename_cannot_bypass_waf_on_backend_response() {
     assert!(
         !header_names_contain(&reject.2, PROTECTED_HEADER),
         "the refused header must not survive onto the rejection: {:?}",
+        reject.2
+    );
+    assert!(
+        !header_names_contain(&reject.2, "set-cookie"),
+        "an untouched backend cookie must not cross onto a gateway-authored rejection: {:?}",
         reject.2
     );
 }

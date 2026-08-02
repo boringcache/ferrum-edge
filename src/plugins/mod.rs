@@ -3675,8 +3675,13 @@ impl RequestContext {
         &mut self,
         response_headers: &HashMap<String, String>,
     ) {
-        if !(self.grpc_deadline_at.is_some() || self.gateway_deadline_response_selected) {
-            self.buffered_deadline_response_header_provenance = None;
+        // A final response-header policy also enables this provenance without a
+        // gRPC deadline so its rejection can retain gateway-authored output
+        // without preserving same-named backend fields. Keep an existing state
+        // in that case; callers that need neither contract arrive with `None`.
+        if !(self.grpc_deadline_at.is_some() || self.gateway_deadline_response_selected)
+            && self.buffered_deadline_response_header_provenance.is_none()
+        {
             return;
         }
         match self.buffered_deadline_response_header_provenance.as_mut() {

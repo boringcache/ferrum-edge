@@ -17689,7 +17689,10 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // observers, and the HEAD/204/205/304 wire preparation, so a rejection here
     // is normalized by exactly the same boundaries as every other rejection that
     // flows through this finalizer.
-    enforce_final_client_visible_response_header_policy(plugins, ctx, status, headers, body).await;
+    enforce_final_client_visible_response_header_policy(
+        plugins, ctx, status, headers, body, false,
+    )
+    .await;
 
     // A failed WebSocket handshake is still an ordinary HTTP response, but its
     // transport-owned fields must come only from a successful H1 Upgrade or
@@ -17820,9 +17823,10 @@ pub(crate) async fn run_after_proxy_hooks(
     // selected by header name. Body-policy provenance is also required without
     // an RPC deadline: the eventual rejection must preserve gateway decorators
     // while shedding the rejected backend representation.
-    if plugins
-        .iter()
-        .any(|plugin| plugin.may_enforce_response_body_policy(ctx))
+    if plugins.iter().any(|plugin| {
+        plugin.may_enforce_response_body_policy(ctx)
+            || plugin.enforces_final_client_visible_response_headers(ctx)
+    })
     {
         ctx.begin_buffered_replacement_response_header_provenance(response_headers);
     } else {
@@ -17965,6 +17969,7 @@ pub(crate) async fn run_after_proxy_hooks(
                     &mut status_code,
                     &mut headers,
                     &mut body,
+                    true,
                 )
                 .await;
                 return Some(AfterProxyReject {
@@ -18017,6 +18022,7 @@ pub(crate) async fn run_after_proxy_hooks(
         &mut rejection_status,
         response_headers,
         &mut rejection_body,
+        true,
     )
     .await
     {
@@ -19790,8 +19796,8 @@ fn final_response_policy_conversion_failure_parts() -> RejectedResponseParts {
     }
 }
 
-/// Gateway-owned response decorators that survive a final-header-policy
-/// rejection.
+/// Gateway-owned response decorators that survive a SYNTHETIC
+/// final-header-policy rejection.
 ///
 /// This phase runs after the `after_proxy` chain has already completed and
 /// consumed its one-shot state into the header map, so it cannot re-run those
@@ -19801,11 +19807,12 @@ fn final_response_policy_conversion_failure_parts() -> RejectedResponseParts {
 /// contract, request-correlation and tracing fields, and the one-shot rotated
 /// session cookie `oidc_relying_party` stages during the reject-path chain.
 ///
-/// Everything NOT listed is dropped, which is what keeps the rejected header
-/// from being resurrected by the rebuild: a backend- or synthetic-controlled
-/// field, and the stale representation metadata of the discarded body, are both
-/// outside the set. A policy that objects to something inside the set is still
-/// caught, because the rebuild is re-evaluated once.
+/// Ordinary backend responses do not use this name list: they rebuild from the
+/// request context's line-aware gateway provenance, so a backend field that
+/// happens to share one of these names is never mistaken for a decorator.
+/// Everything NOT listed on the synthetic path is dropped. A policy that objects
+/// to something inside the set is still caught because the rebuild is
+/// re-evaluated once.
 const PRESERVED_GATEWAY_RESPONSE_DECORATORS: [&str; 17] = [
     "set-cookie",
     "vary",
@@ -19837,13 +19844,25 @@ fn install_final_header_policy_rejection(
     response_body: &mut Bytes,
     reject: RejectedResponseParts,
     preserve_decorators: bool,
+    preserve_from_gateway_provenance: bool,
 ) {
     if preserve_decorators {
-        response_headers.retain(|name, _| {
-            PRESERVED_GATEWAY_RESPONSE_DECORATORS
-                .iter()
-                .any(|preserved| name.eq_ignore_ascii_case(preserved))
-        });
+        if preserve_from_gateway_provenance {
+            // Ordinary backend responses have a pristine baseline plus
+            // line-aware gateway mutation provenance. Retain only the gateway
+            // contribution: matching a trusted header NAME is not sufficient,
+            // because the backend can also supply Set-Cookie, CSP, CORS, or
+            // request-id fields.
+            ctx.retain_deadline_response_gateway_headers(response_headers);
+        } else {
+            // Synthetic/reject responses are gateway-owned and carry one-shot
+            // state that cannot be reconstructed by re-running the hooks.
+            response_headers.retain(|name, _| {
+                PRESERVED_GATEWAY_RESPONSE_DECORATORS
+                    .iter()
+                    .any(|preserved| name.eq_ignore_ascii_case(preserved))
+            });
+        }
     } else {
         response_headers.clear();
     }
@@ -19933,6 +19952,7 @@ async fn enforce_final_client_visible_response_header_policy(
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Bytes,
+    preserve_from_gateway_provenance: bool,
 ) -> bool {
     if !plugins
         .iter()
@@ -19962,6 +19982,7 @@ async fn enforce_final_client_visible_response_header_policy(
         response_body,
         reject,
         true,
+        preserve_from_gateway_provenance,
     );
 
     // Re-evaluate exactly once, so a preserved decoration cannot carry a refused
@@ -19986,6 +20007,7 @@ async fn enforce_final_client_visible_response_header_policy(
             response_body,
             reject,
             false,
+            preserve_from_gateway_provenance,
         );
     }
     true
