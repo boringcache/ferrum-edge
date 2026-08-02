@@ -9,8 +9,12 @@
 Adds an internal `__rustls-ring` feature alongside reqwest's existing
 `__rustls-aws-lc-rs` arm. When no process-default rustls provider has been
 installed yet, reqwest selects the provider named by that mutually exclusive
-feature pair. Selecting both is a compile error; selecting neither retains the
-upstream `No provider set` failure for the public `rustls-no-provider` mode.
+Ferrum feature pair. Cargo unifies features across reqwest consumers, so an
+ordinary Ring build can also inherit reqwest's upstream AWS-LC default through
+a transitive consumer; in that combined reqwest graph Ring deliberately takes
+precedence. Hosted policy rejects `__rustls-ring` from the FIPS graph, while
+selecting neither retains the upstream `No provider set` failure for the public
+`rustls-no-provider` mode.
 
 ## Why Ferrum Edge needs it
 

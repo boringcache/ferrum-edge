@@ -203,7 +203,7 @@ c3a03ed9e78fc494b54985d65f05581c268c6e629d206ac0dc5cb9d7358be76d  vendor/h3-0.0.
 dd87e27dfbaa888cb77ea34592648a7743636b8dce07e49543bddda0fcfc73bc  vendor/reqwest-0.13.3-ferrum-patched/LICENSE-MIT
 d353552b3feae9e57c7a8ce10be9b6d22bd6df5268602cd2e01f21c345a8cd5c  vendor/reqwest-0.13.3-ferrum-patched/README.md
 60948ec5a44c995beb2dd22f6d4ca1f48a56cf01f8fc3174ed809a1e3dd9ce59  vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/body.rs
-7c7ae081f931528a31a8dfae7a18ad8363e8f5ed0268bb70401cb27224fcb5b5  vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/client.rs
+695280d271ccb4d461b607bebb885e0585ca58729029c2883ef621a751292dc2  vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/client.rs
 50e69deaa2fc495e70c232d40ac623ab01b6039929615582a5f145d6aeb2113e  vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/h3_client/connect.rs
 0b0876288eeba6c39331b3bd6b8b01cd4ab01e0362a1e859d961fcc5d520b43a  vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/h3_client/dns.rs
 3d7a499aec889845749098bf620dbd8c7e5338b5104a28dd12d3c8162532cab5  vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/h3_client/mod.rs

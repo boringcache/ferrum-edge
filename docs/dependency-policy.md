@@ -426,8 +426,11 @@ Rules:
   from the feature pair. An inline selection would win on both profiles.
   `rustls`, `tokio-rustls`, `quinn`, and `rcgen` carry
   `default-features = false`, because their default sets select a provider;
-  reqwest uses `rustls-no-provider` plus the vendored mutually exclusive
-  `__rustls-ring` / `__rustls-aws-lc-rs` fallback pair for the same reason.
+  reqwest uses `rustls-no-provider` plus vendored `__rustls-ring` /
+  `__rustls-aws-lc-rs` fallback arms for the same reason. Because Cargo unifies
+  dependency features, Ring takes precedence if a transitive reqwest consumer
+  also enables the upstream AWS-LC default in the ordinary profile; the hosted
+  resolved-graph audit rejects Ring entirely from the FIPS profile.
 - **Additive is not sufficient.** `sqlx-core`, `quinn-proto`, `tonic`, `ldap3`,
   and `hyper-rustls` each gate their aws-lc arm on the *absence* of their ring
   arm, so "also enable aws-lc" produces a build that looks switched and is not.

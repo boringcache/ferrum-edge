@@ -2458,9 +2458,11 @@ impl Default for Client {
 
 #[cfg(feature = "__rustls")]
 fn default_rustls_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    #[cfg(all(feature = "__rustls-ring", feature = "__rustls-aws-lc-rs"))]
-    compile_error!("reqwest rustls provider features are mutually exclusive");
-
+    // Cargo features are additive across every reqwest consumer. A transitive
+    // consumer may therefore enable reqwest's upstream AWS-LC default while
+    // Ferrum's ordinary profile explicitly selects Ring. Ring takes precedence
+    // in that ordinary graph; the hosted FIPS feature-policy audit rejects any
+    // FIPS graph in which `__rustls-ring` is present.
     #[cfg(feature = "__rustls-ring")]
     return Arc::new(rustls::crypto::ring::default_provider());
 
