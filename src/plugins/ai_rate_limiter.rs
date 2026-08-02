@@ -117,24 +117,26 @@ mod meta {
     /// runs twice for one request (a synthetic 2xx short-circuit followed by a
     /// response-body rejection that re-runs the reject hooks).
     pub const FEDERATION_TOKENS_RECORDED: &str = "ai_ratelimit_federation_tokens_recorded";
-    /// Idempotency marker for the reservation-RELEASE paths only: set the first
-    /// time this instance *releases* its reservation (any `reconcile_usage`
-    /// call with `actual_tokens == None`), then checked before a later release
-    /// so no second release can apply. One request can reach a release more
-    /// than once across phases — a non-2xx release in `after_proxy`, the
-    /// streamed-response terminal hook, a buffered `on_response_body` pass, and
-    /// a later gateway-rejection re-run of `after_proxy` are all reachable for
-    /// the same response. In local mode the per-entry `reservation_id` already
-    /// makes the second release a no-op (the entry is gone), but the Redis
-    /// backend has no per-entry id — it only subtracts `reserved` from the
+    /// Idempotency marker for the reservation lifecycle once this instance has
+    /// finished with it. Set after an authoritative actual-token *charge*, after
+    /// a reservation *release* (`reconcile_usage` with `actual_tokens == None`),
+    /// and after streamed `on_unmetered_response: "reject"` keep-charged
+    /// accounting (which cannot rewrite a committed stream). Checked only before
+    /// a later *release* so no second release can apply. One request can reach a
+    /// release more than once across phases — a non-2xx release in `after_proxy`,
+    /// the streamed-response terminal hook, a buffered `on_response_body` pass,
+    /// and a later gateway-rejection re-run of `after_proxy` are all reachable
+    /// for the same response. In local mode the per-entry `reservation_id`
+    /// already makes the second release a no-op (the entry is gone), but the
+    /// Redis backend has no per-entry id — it only subtracts `reserved` from the
     /// shared window, so a double-release double-subtracts and under-counts the
     /// consumer's own window, permitting oversubscription.
     ///
-    /// Scope is deliberately narrow: the authoritative actual-token *charge*
-    /// path (`reconcile_usage` with `Some(actual_tokens)`) does NOT consult or
-    /// set this marker. That path runs at most once per request, and
-    /// `adjust_usage` advances the sliding window's running-sum/eviction
-    /// bookkeeping, so gating it would drop a legitimate usage record.
+    /// The authoritative actual-token *charge* path does NOT *consult* this
+    /// marker before charging (that path runs at most once per request, and
+    /// `adjust_usage` advances sliding-window bookkeeping, so gating it would
+    /// drop a legitimate usage record). It *does* set the marker afterwards so a
+    /// subsequent release is a clean no-op.
     pub const RESERVATION_RELEASED: &str = "ai_ratelimit_reservation_reconciled";
     /// This instance classified the request as an AI call. Gate for the
     /// `on_unmetered_response` policy AND for response-body/stream inspection:
@@ -1102,15 +1104,17 @@ impl AiRateLimiter {
 
         // The `on_unmetered_response` policy (charge_estimate / warn / reject)
         // only applies when `before_proxy` identified this as an AI request.
-        // `on_response_body` calls this for EVERY buffered 2xx (the plugin forces
-        // full response buffering), so without this gate a `reject`-mode limiter
-        // would turn a GET, a 204/empty-body 200, a non-JSON 2xx, or a non-LLM
-        // JSON 2xx on the same proxy into a 502 — a proxy-wide blast radius. Gate
-        // on the AI-request marker, NOT `reserved_tokens > 0`: `completion_tokens`
-        // mode reserves 0 for valid AI calls with no output cap, and those must
-        // still be subject to the policy. A non-AI response is left untouched
-        // (no reject, no charge); any reservation it somehow carries is 0, so the
-        // skipped `adjust_usage` is a no-op anyway.
+        // `on_response_body` still runs for every response this instance (or a
+        // co-located plugin) pinned onto the buffered path — including non-AI
+        // JSON that some other plugin buffered — so without this gate a
+        // `reject`-mode limiter would turn a GET, a 204/empty-body 200, a
+        // non-JSON 2xx, or a non-LLM JSON 2xx on the same proxy into a 502 — a
+        // proxy-wide blast radius. Gate on the AI-request marker, NOT
+        // `reserved_tokens > 0`: `completion_tokens` mode reserves 0 for valid
+        // AI calls with no output cap, and those must still be subject to the
+        // policy. A non-AI response is left untouched (no reject, no charge);
+        // any reservation it somehow carries is 0, so the skipped
+        // `adjust_usage` is a no-op anyway.
         if !self.request_was_ai_call(ctx) {
             return PluginResult::Continue;
         }
@@ -2266,17 +2270,26 @@ impl Plugin for AiRateLimiter {
         //    docs/plugins.md; tightening it (a minimum-reservation floor) is a
         //    follow-up.
         //
-        // 2. Reservations are self-healing only via window/TTL expiry.
-        //    Reconciliation (`reconcile_usage` in `after_proxy` /
-        //    `on_response_body`) is best-effort: several paths reserve here but
-        //    never reconcile — fail-closed early returns (e.g. BAD_GATEWAY),
-        //    client disconnect before the buffered response, or another plugin
-        //    rejecting in `after_proxy` so `on_response_body` never runs. In
-        //    those cases the estimate stays charged until the sliding window /
-        //    Redis TTL drops it, so a burst of aborted requests can transiently
-        //    over-count usage. The window/TTL is the deliberate backstop;
-        //    eagerly releasing on every early-abort branch would require
-        //    touching broad proxy code and is intentionally out of scope here.
+        // 2. Reconciliation is exact on every terminal outcome the proxy can
+        //    observe; window/TTL is only a cancellation backstop.
+        //    `reconcile_usage` / `reconcile_streamed_usage` run from:
+        //      - buffered JSON 2xx → `on_response_body`
+        //      - meterable streams → `on_response_stream_terminated` (completion,
+        //        backend body error, client-disconnect Drop; inspector-cap
+        //        refusal still resolves via `on_unmetered_response`)
+        //      - genuine non-2xx backend → status-only `after_proxy` release
+        //      - genuine pre-provider / failed-dispatch gateway rejection →
+        //        reject-replay `after_proxy` via `should_release_gateway_rejection`
+        //      - federation → reject-path `after_proxy` (sole federation charger)
+        //    A later after_proxy / body-policy rejection of a provider-consumed
+        //    2xx deliberately KEEPS the charge. Streamed `on_unmetered_response:
+        //    "reject"` cannot substitute a 502 after headers are committed; it
+        //    keeps the reservation charged and marks the release path consumed
+        //    so reject-replay cannot free it. Window/TTL remains only for
+        //    cancellation-only cases that truly cannot await reconciliation
+        //    (request-task abort, deferred-logger Drop outside a Tokio runtime).
+        //    Docs must not claim ordinary non-2xx / reject-replay /
+        //    client-disconnect paths leak when these hooks handle them.
         //
         // 3. The estimate reads the *pre-transform* request body
         //    (`ctx.metadata["request_body"]`, the buffered inbound body). Body
@@ -2481,12 +2494,13 @@ impl Plugin for AiRateLimiter {
         // always runs in rejection context and never records here — federation
         // reconciliation is handled by the `ai_federation_provider` branch below.
         //
-        // Gated on the presence of a token reservation
-        // (`RESERVED_TOKENS_METADATA_KEY`), mirroring the proxy-side write in
-        // `run_after_proxy_hooks`: without a reservation the keep/release decision
-        // is moot (`should_release_gateway_rejection` requires `reserved > 0`), so
-        // recording the status only adds dead metadata — and a transaction-log
-        // field — to every request on the proxy, including non-AI ones.
+        // Gated on this instance's reserved-tokens metadata (mirroring the
+        // proxy-side presence check on `RESERVED_TOKENS_METADATA_KEY` in
+        // `run_after_proxy_hooks`): without a reservation the keep/release
+        // decision is moot (`should_release_gateway_rejection` requires
+        // `reserved > 0`), so recording the status only adds dead metadata —
+        // and a transaction-log field — to every request on the proxy,
+        // including non-AI ones.
         let in_rejection_context = ctx
             .metadata
             .get(REJECTION_RESPONSE_METADATA_KEY)

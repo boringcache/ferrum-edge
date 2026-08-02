@@ -2011,6 +2011,146 @@ async fn gateway_rejection_releases_reservation_in_after_proxy() {
     );
 }
 
+/// Docs lock for the reservation-lifecycle table in `docs/plugins.md`.
+///
+/// Root's exact-head review blocked merge while docs still claimed ordinary
+/// reject-replay / client-disconnect paths "never reconcile". These outcomes
+/// are what the docs now promise; keep the table and this test in sync.
+#[tokio::test]
+async fn reservation_lifecycle_docs_match_observable_terminal_outcomes() {
+    fn fresh_limiter(on_unmetered_response: &str) -> AiRateLimiter {
+        AiRateLimiter::new(
+            &json!({
+                "token_limit": 10_000,
+                "window_seconds": 60,
+                "limit_by": "ip",
+                "on_unmetered_response": on_unmetered_response,
+                "expose_headers": true
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap()
+    }
+
+    // 1) Genuine pre-provider gateway rejection → release.
+    {
+        let plugin = fresh_limiter("charge_estimate");
+        let mut ctx = ai_request_ctx(180, "pre-provider reject");
+        let mut headers = HashMap::new();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert!(reserved_tokens(&ctx) > 0);
+        ctx.metadata
+            .insert("ferrum:rejection_response".to_string(), "true".to_string());
+        assert_continue(plugin.after_proxy(&mut ctx, 502, &mut HashMap::new()).await);
+        assert_eq!(
+            observed_usage(&plugin).await,
+            0,
+            "pre-provider gateway rejection must release"
+        );
+    }
+
+    // 2) Genuine non-2xx backend → after_proxy release (body/stream later no-op).
+    {
+        let plugin = fresh_limiter("charge_estimate");
+        let mut ctx = ai_request_ctx(180, "backend 503");
+        let mut headers = HashMap::new();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert!(reserved_tokens(&ctx) > 0);
+        assert_continue(plugin.after_proxy(&mut ctx, 503, &mut HashMap::new()).await);
+        assert_eq!(
+            observed_usage(&plugin).await,
+            0,
+            "non-2xx backend must release from after_proxy"
+        );
+        // Re-running the buffered non-2xx body path must not double-release.
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 503, &mut json_headers(), b"{}")
+                .await,
+        );
+        assert_eq!(observed_usage(&plugin).await, 0);
+    }
+
+    // 3) Provider-consumed 2xx later rejected by a body-policy / after_proxy
+    //    reject-replay → keep charged.
+    {
+        let plugin = fresh_limiter("charge_estimate");
+        let mut ctx = ai_request_ctx(180, "guardrail rejects consumed 2xx");
+        let mut headers = HashMap::new();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        let reserved = reserved_tokens(&ctx);
+        assert!(reserved > 0);
+        assert_continue(plugin.after_proxy(&mut ctx, 200, &mut HashMap::new()).await);
+        ctx.metadata
+            .insert("ferrum:rejection_response".to_string(), "true".to_string());
+        assert_continue(plugin.after_proxy(&mut ctx, 403, &mut HashMap::new()).await);
+        assert_eq!(
+            observed_usage(&plugin).await,
+            reserved,
+            "provider-consumed 2xx later rejected must stay charged"
+        );
+    }
+
+    // 4) Client disconnect mid-stream → terminal hook reconciles (keeps estimate
+    //    under charge_estimate when no authoritative usage arrived).
+    {
+        let plugin = Arc::new(fresh_limiter("charge_estimate"));
+        let mut ctx = ai_request_ctx(180, "client disconnect mid-stream");
+        let mut headers = HashMap::new();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        let reserved = reserved_tokens(&ctx);
+        assert!(reserved > 0);
+        let partial = sse_frame(json!({"choices": [{"delta": {"content": "hi"}}]}));
+        drive_stream(
+            &plugin,
+            &mut ctx,
+            200,
+            "text/event-stream",
+            &[&partial],
+            BodyOutcome::client_disconnect(partial.len() as u64),
+        )
+        .await;
+        assert_eq!(
+            observed_usage(&plugin).await,
+            reserved,
+            "client disconnect must resolve via the terminal stream hook"
+        );
+    }
+
+    // 5) Streamed unmetered reject cannot free the reservation on reject-replay.
+    {
+        let reject_plugin = Arc::new(fresh_limiter("reject"));
+        let mut ctx = ai_request_ctx(180, "streamed reject keep-charged");
+        let mut headers = HashMap::new();
+        assert_continue(reject_plugin.before_proxy(&mut ctx, &mut headers).await);
+        let reserved = reserved_tokens(&ctx);
+        assert!(reserved > 0);
+        let partial = sse_frame(json!({"choices": [{"delta": {"content": "hi"}}]}));
+        drive_stream(
+            &reject_plugin,
+            &mut ctx,
+            200,
+            "text/event-stream",
+            &[&partial],
+            BodyOutcome::success(partial.len() as u64),
+        )
+        .await;
+        assert_eq!(observed_usage(&reject_plugin).await, reserved);
+        ctx.metadata
+            .insert("ferrum:rejection_response".to_string(), "true".to_string());
+        assert_continue(
+            reject_plugin
+                .after_proxy(&mut ctx, 502, &mut HashMap::new())
+                .await,
+        );
+        assert_eq!(
+            observed_usage(&reject_plugin).await,
+            reserved,
+            "streamed reject keep-charged must survive gateway reject-replay"
+        );
+    }
+}
+
 #[tokio::test]
 async fn response_body_plugin_reject_keeps_reservation_after_2xx_backend() {
     // codex P2: when the backend returned a successful (2xx) response but a
