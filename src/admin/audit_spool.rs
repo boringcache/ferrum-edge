@@ -589,7 +589,7 @@ impl AuditSpool {
         bytes
             .try_reserve_exact(metadata.len().min(64 * 1024) as usize)
             .map_err(|_| SpoolError::new(SpoolErrorKind::Corrupt))?;
-        file.by_ref()
+        std::io::Read::by_ref(&mut file)
             .take(self.max_record_bytes.saturating_add(1))
             .read_to_end(&mut bytes)
             .map_err(|_| SpoolError::new(SpoolErrorKind::Io))?;
