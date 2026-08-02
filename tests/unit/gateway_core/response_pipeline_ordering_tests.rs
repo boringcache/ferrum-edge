@@ -19,8 +19,11 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 use ferrum_edge::_test_support::{
-    finalize_synthetic_response_for_test, run_after_proxy_hooks_reject_for_test,
+    finalize_synthetic_response_for_test, gateway_capacity_response_selected_for_test,
+    mark_buffered_response_capacity_refusal_pending_for_test,
+    run_after_proxy_hooks_reject_for_test,
     set_original_response_content_encoding_for_test, stamp_original_response_metadata_for_test,
+    take_buffered_response_capacity_refusal_pending_for_test,
     transform_buffered_response_body_with_deadline_full_for_test,
 };
 use ferrum_edge::plugins::{
@@ -34,6 +37,38 @@ const BLOCKED_TOKEN: &str = "leak-secret";
 
 /// The protected header name an operator's WAF response-header rule blocks.
 const PROTECTED_HEADER: &str = "x-public-secret";
+
+/// Final-body policy test double that reports the same one-shot bounded-scratch
+/// refusal used by production response inspectors. It deliberately has no body
+/// transform or transport encoder after it, covering the escape window where a
+/// pending signal previously reached publication unconsumed.
+struct FinalPolicyCapacityRefusal;
+
+#[async_trait::async_trait]
+impl Plugin for FinalPolicyCapacityRefusal {
+    fn name(&self) -> &str {
+        "final_policy_capacity_refusal"
+    }
+
+    fn requires_response_body_buffering(&self) -> bool {
+        true
+    }
+
+    fn enforces_final_client_visible_response_body(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
+    async fn finalize_client_visible_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> ferrum_edge::plugins::PluginResult {
+        mark_buffered_response_capacity_refusal_pending_for_test(ctx);
+        ferrum_edge::plugins::PluginResult::Continue
+    }
+}
 
 fn ctx_for(method: &str, path: &str) -> RequestContext {
     let mut ctx = RequestContext::new(
@@ -238,6 +273,35 @@ async fn run_buffered_transform(
 
 fn header_names_contain(headers: &HashMap<String, String>, name: &str) -> bool {
     headers.keys().any(|key| key.eq_ignore_ascii_case(name))
+}
+
+/// A one-shot capacity refusal raised by the authoritative final body policy
+/// must install the shared terminal immediately even when no transport encoder
+/// follows. Otherwise the original protected bytes could be published while the
+/// refusal marker merely lingered on the request context.
+#[tokio::test]
+async fn final_body_policy_capacity_refusal_cannot_escape_without_transport_stage() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(FinalPolicyCapacityRefusal)];
+    let mut ctx = ctx_for("GET", "/synthetic-capacity");
+    let mut status = 200u16;
+    let mut headers = json_headers();
+    let mut body = bytes::Bytes::from_static(br#"{"secret":"must-not-publish"}"#);
+
+    finalize_synthetic_response_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+
+    assert_eq!(status, 503);
+    assert!(gateway_capacity_response_selected_for_test(&ctx));
+    assert!(!take_buffered_response_capacity_refusal_pending_for_test(
+        &mut ctx
+    ));
+    assert!(!String::from_utf8_lossy(&body).contains("must-not-publish"));
 }
 
 // ─────────────── 1. late body rewrites cannot bypass body policy ───────────────

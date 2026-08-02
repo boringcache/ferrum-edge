@@ -17472,6 +17472,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
                     response_status,
                     response_headers,
                     response_body,
+                    InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
                 )
                 .await
             {
@@ -17502,6 +17503,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
             response_status,
             response_headers,
             response_body,
+            InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
         )
         .await
     {
@@ -19687,6 +19689,7 @@ async fn run_final_client_visible_response_body_policy(
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Bytes,
+    initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
 ) -> bool {
     let mut selected_reject = None;
     for plugin in plugins.iter() {
@@ -19706,7 +19709,23 @@ async fn run_final_client_visible_response_body_policy(
         .await
         .into_plugin_result(ctx);
         match result {
-            PluginResult::Continue => {}
+            PluginResult::Continue => {
+                // A final policy can reuse an ordinary inspection hook whose
+                // bounded scratch allocation reports refusal through this
+                // one-shot signal. Consume it HERE, before an absent transport
+                // stage could let it escape to publication. Installing through
+                // the shared helper preserves the HTTP/gRPC/gRPC-Web terminal
+                // shape and the health-neutral capacity classification.
+                if install_pending_buffered_response_capacity_refusal(
+                    ctx,
+                    response_status,
+                    response_headers,
+                    response_body,
+                    initial_response_header_policy_source,
+                ) {
+                    return true;
+                }
+            }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let reject = match plugin_result_into_reject_parts(reject) {
                     Some(reject) => reject,
@@ -20060,6 +20079,9 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
             response_status,
             response_headers,
             response_body,
+            InitialResponseHeaderPolicySource::Prefiltered(
+                initial_response_header_policy_plugins,
+            ),
         )
         .await
         {
@@ -20251,6 +20273,9 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
                 response_status,
                 response_headers,
                 response_body,
+                InitialResponseHeaderPolicySource::Prefiltered(
+                    initial_response_header_policy_plugins,
+                ),
             )
             .await
         {
