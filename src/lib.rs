@@ -6038,6 +6038,109 @@ pub mod _test_support {
         crate::proxy::body::inspected_streaming_body(rx)
     }
 
+    /// H1/reqwest-style inspection seam: feed decoded body byte chunks through
+    /// a [`ResponseStreamInspector`] into the shared [`inspected_streaming_body`]
+    /// channel that production `run_response_inspection` uses.
+    ///
+    /// Pair with [`inspected_proxy_body_for_test`] (direct-H2 / native-H3
+    /// `run_proxy_body_response_inspection`) so external tests can prove an
+    /// attached inspector is driven on every HTTP body variant without standing
+    /// up a separate server framework.
+    pub fn inspected_byte_chunks_body_for_test(
+        chunks: Vec<bytes::Bytes>,
+        mut inspector: Box<dyn crate::plugins::ResponseStreamInspector>,
+    ) -> crate::proxy::ProxyBody {
+        use crate::plugins::ResponseStreamAction;
+        use http_body::Frame;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            for chunk in chunks {
+                if tx.is_closed() {
+                    return;
+                }
+                let action = tokio::select! {
+                    biased;
+                    _ = tx.closed() => return,
+                    action = inspector.on_chunk(&chunk) => action,
+                };
+                match action {
+                    ResponseStreamAction::Forward(out) => {
+                        if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
+                            return;
+                        }
+                    }
+                    ResponseStreamAction::Terminate(final_bytes) => {
+                        if let Some(fb) = final_bytes
+                            && !fb.is_empty()
+                        {
+                            let _ = tx.send(Ok(Frame::data(fb))).await;
+                        }
+                        return;
+                    }
+                }
+            }
+            let action = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                action = inspector.on_end() => action,
+            };
+            match action {
+                ResponseStreamAction::Forward(out) => {
+                    if !out.is_empty() {
+                        let _ = tx.send(Ok(Frame::data(out))).await;
+                    }
+                }
+                ResponseStreamAction::Terminate(final_bytes) => {
+                    if let Some(fb) = final_bytes
+                        && !fb.is_empty()
+                    {
+                        let _ = tx.send(Ok(Frame::data(fb))).await;
+                    }
+                }
+            }
+        });
+        crate::proxy::body::inspected_streaming_body(rx)
+    }
+
+    /// Build one standards-correct AWS event-stream message for external
+    /// gateway tests without exposing a production message-construction API.
+    ///
+    /// Encoding lives here (not in the production parser module) so the binary
+    /// target does not carry test-only constructors as dead code.
+    pub fn encode_aws_event_stream_message_for_test(headers: &[u8], payload: &[u8]) -> Vec<u8> {
+        const PRELUDE_LEN: usize = 12;
+        const MESSAGE_CRC_LEN: usize = 4;
+        let total = PRELUDE_LEN
+            .saturating_add(headers.len())
+            .saturating_add(payload.len())
+            .saturating_add(MESSAGE_CRC_LEN);
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(&encode_aws_event_stream_prelude_for_test(
+            total as u32,
+            headers.len() as u32,
+        ));
+        out.extend_from_slice(headers);
+        out.extend_from_slice(payload);
+        let message_crc = crc32fast::hash(&out);
+        out.extend_from_slice(&message_crc.to_be_bytes());
+        out
+    }
+
+    /// Build the CRC-valid twelve-byte AWS event-stream prelude used by hostile
+    /// length and checksum regression fixtures.
+    pub fn encode_aws_event_stream_prelude_for_test(
+        total_length: u32,
+        headers_length: u32,
+    ) -> [u8; 12] {
+        let mut prelude = [0u8; 12];
+        prelude[0..4].copy_from_slice(&total_length.to_be_bytes());
+        prelude[4..8].copy_from_slice(&headers_length.to_be_bytes());
+        let prelude_crc = crc32fast::hash(&prelude[0..8]);
+        prelude[8..12].copy_from_slice(&prelude_crc.to_be_bytes());
+        prelude
+    }
+
     pub fn mesh_tcp_egress_connection_accounting_for_test(
         cache: &crate::load_balancer::LoadBalancerCache,
         namespace: &str,

@@ -1443,6 +1443,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "crc32fast",
  "crossbeam-queue",
  "crossbeam-utils",
  "dashmap",
