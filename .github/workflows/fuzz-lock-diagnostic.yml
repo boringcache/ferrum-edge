@@ -19,6 +19,8 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Print the exact isolated fuzz lockfile repair
+        env:
+          RUSTC_WRAPPER: ""
         run: |
           set -euo pipefail
           cargo metadata --manifest-path fuzz/Cargo.toml --format-version 1 >/dev/null
