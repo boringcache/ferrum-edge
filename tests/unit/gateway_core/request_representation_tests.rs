@@ -338,8 +338,18 @@ fn multiple_claiming_instances_all_reach_the_same_decision() {
 async fn waf_scans_the_staged_plaintext_not_the_wire_octets() {
     let plugin = Waf::new(&json!({
         "mode": "enforce",
+        "include_default_rules": false,
         "request_body_inspection": true,
-        "default_rule_action": "enforce",
+        "custom_rules": [{
+            "id": "TEST-STAGED-PLAINTEXT",
+            "name": "staged plaintext marker",
+            "category": "custom",
+            "severity": "high",
+            "target": "body_text",
+            "match_kind": "contains",
+            "pattern": "__proto__",
+            "action": "enforce"
+        }],
     }))
     .expect("waf config");
     let mut ctx = ctx_with_json_post();
@@ -351,7 +361,7 @@ async fn waf_scans_the_staged_plaintext_not_the_wire_octets() {
         .await;
     assert!(matches!(opaque, PluginResult::Continue));
 
-    // With it, the SQLi signature inside the document is found and blocked.
+    // With it, the body-only marker inside the document is found and blocked.
     let mut ctx = ctx_with_json_post();
     ferrum_edge::_test_support::stage_final_request_body_plaintext(
         &mut ctx,
