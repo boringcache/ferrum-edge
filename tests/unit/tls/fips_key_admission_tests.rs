@@ -219,8 +219,12 @@ fn certificate_diagnostics_never_carry_a_path_or_key_material() {
         !error.contains("/etc/ferrum/secret.key"),
         "diagnostic must not carry a path: {error}"
     );
+    let diagnostic_label = error
+        .split_once(':')
+        .map(|(label, _)| label)
+        .expect("certificate admission diagnostic must carry a surface label");
     assert!(
-        error.matches('A').count() <= keys::MAX_SURFACE_LABEL_CHARS,
+        diagnostic_label.chars().count() <= keys::MAX_SURFACE_LABEL_CHARS,
         "label must be bounded to {} chars: {error}",
         keys::MAX_SURFACE_LABEL_CHARS
     );
