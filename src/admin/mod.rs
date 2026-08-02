@@ -476,10 +476,12 @@ impl AdminState {
     pub async fn admit_write(
         &self,
     ) -> Result<crate::config::db_backend::DbWriteTopologyPermit, Response<Full<Bytes>>> {
-        if self.admin_audit_enabled {
-            audit::note_fail_closed_rejection();
-        }
-        if let Some(response) = self.evaluate_non_topology_write_gate() {
+        // Mutation admission re-attempts the bounded durable prepare even when
+        // the previous attempt latched an unavailable reason. Otherwise a
+        // transient spool I/O error would permanently wedge fail-closed writes
+        // after the filesystem recovered. Observe-only health still uses the
+        // cached reason through `evaluate_write_gate()`.
+        if let Some(response) = self.evaluate_independent_store_write_gate() {
             return Err(response);
         }
         if let Some(ref db) = self.db {
@@ -533,25 +535,39 @@ impl AdminState {
     /// topology (managed TLS / ACME file stores).
     ///
     /// Applies the pre-existing non-topology Admin write gates (explicit
-    /// read-only mode and database-unavailable) only. Does **not** acquire a
-    /// config-DB write-topology pin and does **not** apply
+    /// read-only mode and database-unavailable), then durably prepares the
+    /// audit intent before the independent-store mutation. Does **not** acquire
+    /// a config-DB write-topology pin and does **not** apply
     /// `FERRUM_DB_FAILOVER_ALLOW_WRITES`, so slow ACME network work cannot
     /// defer failover/failback and independent TLS stores are not gated by
     /// sticky DB failover policy.
-    // Returning the response by value keeps this synchronous gate identical to
-    // the async `admit_write` contract and lets every handler return it without
-    // an extra allocation/dereference layer on an already exceptional path.
+    // Returning the response by value keeps this gate identical to the async
+    // `admit_write` contract and lets every handler return it without an extra
+    // allocation/dereference layer on an already exceptional path.
     #[allow(clippy::result_large_err)]
-    pub fn admit_non_config_db_write(&self) -> Result<(), Response<Full<Bytes>>> {
-        // Managed TLS / ACME stores do not emit config-database audit events.
-        // Applying the audit fail-closed gate here would block an unaudited
-        // route only when the unrelated audit sink is unavailable while still
-        // allowing the exact same unaudited mutation when it is healthy.
+    pub async fn admit_non_config_db_write(&self) -> Result<(), Response<Full<Bytes>>> {
         if let Some(response) = self.evaluate_independent_store_write_gate() {
-            Err(response)
-        } else {
-            Ok(())
+            return Err(response);
         }
+        if let Some(response) = self.prepare_audit_intent().await {
+            return Err(response);
+        }
+        Ok(())
+    }
+
+    /// Admit an audited operational action that does not mutate either the
+    /// configuration database or an independently persisted store (for
+    /// example, an explicit TLS source reload). It participates only in the
+    /// durable audit handoff policy; read-only and database-availability gates
+    /// remain unchanged for the operational action itself.
+    #[allow(clippy::result_large_err)]
+    pub(super) async fn admit_audited_operation(
+        &self,
+    ) -> Result<(), Response<Full<Bytes>>> {
+        if let Some(response) = self.prepare_audit_intent().await {
+            return Err(response);
+        }
+        Ok(())
     }
 
     fn evaluate_non_topology_write_gate(&self) -> Option<Response<Full<Bytes>>> {

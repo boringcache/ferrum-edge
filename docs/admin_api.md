@@ -574,11 +574,13 @@ See [admin_backup_restore.md](admin_backup_restore.md) for details.
 
 When `FERRUM_ADMIN_AUDIT_ENABLED=true`, an audited admin mutation is made durable **before it runs**, not after it commits. `POST /batch` is all-or-nothing (issue #2401), so it emits exactly one audit event when its graph commits and none at all when it does not. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, outcome, and a JSON `diff` object with redacted consumer credentials and sensitive plugin configuration. Basic credential mutations remain visible by type and action, but every Basic value, entry field, shape, and count is replaced by one stable `[REDACTED]` marker before persistence. Loki plugin diffs preserve only the endpoint scheme/host/port and redact its path, query, authorization, and all custom-header values. Redis-backed plugin diffs replace `redis_integrity_key` (and any other `*_integrity_key` signing secret) with `[REDACTED]` and strip `redis_url` userinfo/query/fragment while keeping its scheme/host/port/database. Every redaction above is applied before the durable spool write, so a spooled or retained record carries exactly the same redacted representation as the `audit_events` row.
 
-This pipeline covers configuration-database mutations (CRUD, credentials, API
-specs, batch, and restore). Managed TLS and ACME mutations use independent
-file-backed stores and do not currently emit these configuration audit events;
-they therefore retain their own read-only/database-availability admission gates
-but do not consult the configuration audit pipeline's `fail_closed` state.
+This pipeline covers every Admin action that emits an ordinary mutation audit
+event: configuration-database mutations (CRUD, credentials, API specs, batch,
+and restore), managed TLS/ACME file-store mutations, and explicit TLS rotation.
+The TLS/ACME stores remain independent of config-database topology, but their
+audit handoff still happens before the action. A `fail_closed` audit outage
+therefore refuses the audited TLS/ACME action without applying sticky database
+failover policy to that independent store or operational reload.
 
 ### Durable evidence before the mutation (issue #2421)
 

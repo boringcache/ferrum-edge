@@ -1439,7 +1439,9 @@ paths:
         Enqueues an immediate source poll for an active TLS source watcher.
         This is an operational reload rather than a persisted configuration
         mutation, so it is available in read-only file, DP, and mesh modes with
-        an operator or admin JWT.
+        an operator or admin JWT. When ordinary admin mutation auditing is
+        enabled, its audit intent is durably admitted before the reload request;
+        a fail-closed audit outage returns `503` without requesting the reload.
         Supported surfaces are `proxy_https`, `backend_tls`, `admin_https`,
         `dtls`, `database_tls`, `cp_grpc`, `dp_grpc`, `svid`, and `all`. Aliases
         `frontend`, `backend`, `admin`, `frontend_dtls`, `db`, `database`,
@@ -1500,6 +1502,8 @@ paths:
                     type: array
                     items:
                       type: string
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /admin/tls/validate:
     post:

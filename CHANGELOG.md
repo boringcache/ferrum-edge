@@ -43,8 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admission, drains every accepted queue entry, interrupts retry waits, and
   explicitly aborts **and joins** the delivery worker rather than detaching it;
   a memory-only deadline loss is counted and latches degraded health. Managed
-  TLS/ACME file-store mutations remain outside this configuration audit stream
-  and do not inherit its `fail_closed` gate. New `FERRUM_ADMIN_AUDIT_{SPOOL_DIR,
+  TLS/ACME file-store mutations and explicit TLS rotation actions, which also
+  emit audit events, now take the same durable pre-action handoff without
+  inheriting config-database topology gates. New `FERRUM_ADMIN_AUDIT_{SPOOL_DIR,
   UNAVAILABLE_POLICY,QUEUE_CAPACITY,SPOOL_MAX_RECORDS,RETAINED_MAX_RECORDS,
   MAX_DELIVERY_ATTEMPTS}` settings, `ferrum_admin_audit_*` Prometheus families,
   and an authenticated `/health` `audit_pipeline` object.
