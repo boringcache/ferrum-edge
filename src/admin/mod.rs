@@ -2268,7 +2268,10 @@ pub async fn handle_admin_request(
         && is_namespace_scoped_route(segments_peek.as_slice())
         && let Some(resp) = enforce_namespace_claim(&auth, &namespace, &path)
     {
-        if matches!(segments_peek.as_slice(), ["backup"]) {
+        // `GET` only: `/backup` has no other method, so auditing a denied
+        // `POST`/`PUT`/`DELETE` here would fabricate a `backup` security record
+        // for an export that was never a reachable route.
+        if method == Method::GET && matches!(segments_peek.as_slice(), ["backup"]) {
             let resources = backup_resources_query_audit_value(query.as_deref());
             let event = audit::AuditEvent::new(
                 &auth,

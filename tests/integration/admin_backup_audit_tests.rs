@@ -122,6 +122,28 @@ fn token(subject: &str, role: Option<&str>) -> String {
     .unwrap()
 }
 
+/// Mint an admin token carrying an `ns` claim so the namespace-claim gate can
+/// be exercised without touching process-global environment state.
+fn token_with_ns(subject: &str, ns: &str) -> String {
+    let now = Utc::now();
+    let claims = json!({
+        "iss": JWT_ISSUER,
+        "sub": subject,
+        "role": "admin",
+        "ns": ns,
+        "iat": now.timestamp(),
+        "nbf": now.timestamp(),
+        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "jti": uuid::Uuid::new_v4().to_string(),
+    });
+    encode(
+        &Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+    )
+    .unwrap()
+}
+
 fn test_pool_config() -> DbPoolConfig {
     DbPoolConfig {
         max_connections: 2,
@@ -613,6 +635,55 @@ async fn backup_invalid_namespace_is_audited_in_default_namespace_without_echoin
 
     let captured = logs.contents();
     assert_logs_omit_hostile_canaries(&captured, &[hostile_ns, &admin]);
+}
+
+/// A namespace-claim denial must audit the real `GET /backup` attempt, and must
+/// not fabricate a `backup` security record for a method that has no backup
+/// route — otherwise any authenticated caller could inflate the audit trail
+/// with records describing exports that were never reachable.
+#[tokio::test]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
+async fn namespace_claim_denial_audits_get_backup_only() {
+    let fallback = TempDir::new().unwrap();
+    let mut state = cached_only_state(sample_cached_config());
+    state.admin_require_namespace_claim = true;
+    state.admin_audit_fallback_dir = Some(fallback.path().to_path_buf());
+
+    let (base, _shutdown) = start_admin(state).await;
+    let scoped = token_with_ns("ns-scoped-admin", "other-ns");
+
+    let post = reqwest::Client::new()
+        .post(format!("{base}/backup"))
+        .bearer_auth(&scoped)
+        .header("X-Ferrum-Namespace", "ferrum")
+        .send()
+        .await
+        .expect("POST backup");
+    assert_eq!(post.status().as_u16(), 403);
+    assert!(
+        list_local_fallback_events(fallback.path())
+            .expect("list fallback")
+            .is_empty(),
+        "non-GET /backup must not record a backup security event"
+    );
+
+    let (status, _body, _) = get_backup_with_headers(
+        &base,
+        "/backup",
+        &scoped,
+        Some("ns-denied-1"),
+        None,
+        Some("ferrum"),
+    )
+    .await;
+    assert_eq!(status, 403);
+
+    let events = list_local_fallback_events(fallback.path()).expect("list fallback");
+    assert_eq!(events.len(), 1, "GET /backup denial must be audited");
+    assert_eq!(events[0].action, "backup");
+    assert_eq!(events[0].outcome, audit::outcome::DENIED.as_str());
+    assert_eq!(events[0].request_id, "ns-denied-1");
+    assert_eq!(events[0].diff["failure_category"], "namespace_denied");
 }
 
 #[tokio::test]

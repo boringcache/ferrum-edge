@@ -29,7 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   targets are rejected before chmod/flock. Local fallback lock acquisition is
   non-blocking (in-process `try_lock`, Unix `flock(LOCK_EX|LOCK_NB)`,
   Windows immediate share denial) so contention fails closed instead of
-  hanging a blocking-pool thread. Backup `resources=` filters are
+  hanging a blocking-pool thread. The fallback retains the newest 4096
+  events; eviction at capacity emits a content-free
+  `audit_local_fallback_evicted` warning so rollover of older security
+  records is never silent. Backup `resources=` filters are
   a closed allow-list; unknown tokens are rejected with static client text
   and never persisted raw in audit metadata (#2422).
 - Kubernetes controller watch scopes now rebuild their reflector from an

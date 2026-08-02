@@ -821,6 +821,16 @@ pub fn append_local_fallback_event(dir: &Path, event: &AuditEvent) -> Result<(),
     if events.len() > AUDIT_LOCAL_FALLBACK_CAPACITY {
         let overflow = events.len() - AUDIT_LOCAL_FALLBACK_CAPACITY;
         events.drain(0..overflow);
+        // Eviction must never be silent. Denied attempts append here too, so a
+        // caller that can reach this path repeatedly could otherwise roll the
+        // oldest export records out of the store without leaving any trace.
+        // Counts only — never event contents.
+        warn!(
+            surface = "audit_local_fallback_evicted",
+            evicted = overflow,
+            retained = AUDIT_LOCAL_FALLBACK_CAPACITY,
+            "Local audit fallback store is at capacity; oldest security records were dropped"
+        );
     }
     write_local_fallback_events_unlocked(dir, &path, &events)
 }
