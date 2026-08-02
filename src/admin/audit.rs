@@ -66,7 +66,9 @@
 //! connection string, or credential metadata. Failure surfaces carry a static
 //! reason label and the audit event id only.
 
-use crate::admin::audit_spool::{AuditSpool, SpoolError, SpoolErrorKind, SpooledAuditRecord};
+use crate::admin::audit_spool::{
+    AuditSpool, RetainOutcome, SpoolError, SpoolErrorKind, SpooledAuditRecord,
+};
 use crate::admin::jwt_auth::{AdminClaims, AdminRole};
 use crate::config::db_backend::DatabaseBackend;
 use anyhow::anyhow;
@@ -1292,14 +1294,17 @@ impl AuditPipeline {
     }
 
     /// Finish one event: remove it from the spool after acceptance.
-    fn note_delivered(&self, record: &SpooledAuditRecord) {
+    ///
+    /// Blocking filesystem work (unlink + directory fsync). Callers run it on
+    /// the blocking pool through `settle_delivered`.
+    fn note_delivered(&self, event_id: &str) {
         self.metrics.delivered.fetch_add(1, Ordering::Relaxed);
         if let Some(spool) = self.spool.as_ref() {
-            if spool.remove_pending(record.id()).is_err() {
+            if spool.remove_pending(event_id).is_err() {
                 // The record stays durable and will be replayed; a duplicate
                 // insert is a no-op because delivery is idempotent on the id.
                 warn!(
-                    audit_event_id = %record.id(),
+                    audit_event_id = %event_id,
                     surface = "audit_spool_remove",
                     "Delivered admin audit event could not be removed from the spool; it will \
                      be replayed idempotently"
@@ -1313,34 +1318,50 @@ impl AuditPipeline {
 
     /// Move an event that exhausted its retry budget into operator-visible
     /// retention. Never silently deletes while retention capacity remains.
-    fn note_unrecoverable(&self, record: &SpooledAuditRecord) {
-        self.mark_degraded(AuditUnavailableReason::DeliveryExhausted);
+    ///
+    /// Blocking filesystem work (rename + directory fsyncs). Callers run it on
+    /// the blocking pool through `settle_unrecoverable`.
+    fn note_unrecoverable(&self, event_id: &str) {
         let Some(spool) = self.spool.as_ref() else {
+            self.mark_degraded(AuditUnavailableReason::DeliveryExhausted);
             self.metrics
                 .dropped_no_spool
                 .fetch_add(1, Ordering::Relaxed);
             self.evidence_lost.store(true, Ordering::Relaxed);
             error!(
-                audit_event_id = %record.id(),
+                audit_event_id = %event_id,
                 surface = "audit_event_unrecoverable",
                 reason = AuditUnavailableReason::DeliveryExhausted.as_str(),
                 "Admin audit event exhausted delivery retries with no durable spool configured"
             );
             return;
         };
-        self.metrics.retained.fetch_add(1, Ordering::Relaxed);
-        match spool.retain_unrecoverable(record.id()) {
-            Ok(true) => {
+        let outcome = spool.retain_unrecoverable(event_id);
+        if !matches!(outcome, Ok(RetainOutcome::AlreadySettled)) {
+            // Sticky degradation is first-reason-wins, so raise the cause the
+            // caller observed before any more specific escalation below.
+            self.mark_degraded(AuditUnavailableReason::DeliveryExhausted);
+        }
+        match outcome {
+            Ok(RetainOutcome::AlreadySettled) => {
+                // Another delivery attempt for this stable id already succeeded
+                // and removed the record. Nothing was retained and nothing was
+                // lost, so this must not latch sticky degraded/evidence-lost
+                // health for evidence that is in fact in the backend.
+                self.mark_capacity_available();
+            }
+            Ok(RetainOutcome::Retained) => {
+                self.metrics.retained.fetch_add(1, Ordering::Relaxed);
                 self.mark_capacity_available();
                 error!(
-                    audit_event_id = %record.id(),
+                    audit_event_id = %event_id,
                     surface = "audit_event_unrecoverable",
                     reason = AuditUnavailableReason::DeliveryExhausted.as_str(),
                     "Admin audit event exhausted delivery retries and was retained for operator \
                      remediation"
                 );
             }
-            Ok(false) => {
+            Ok(RetainOutcome::Discarded) => {
                 self.mark_capacity_available();
                 self.metrics
                     .dropped_retained_capacity
@@ -1348,7 +1369,7 @@ impl AuditPipeline {
                 self.evidence_lost.store(true, Ordering::Relaxed);
                 self.mark_degraded(AuditUnavailableReason::RetainedCapacity);
                 error!(
-                    audit_event_id = %record.id(),
+                    audit_event_id = %event_id,
                     surface = "audit_event_unrecoverable",
                     reason = AuditUnavailableReason::RetainedCapacity.as_str(),
                     "Admin audit retained-record capacity is exhausted; the newest unrecoverable \
@@ -1359,7 +1380,7 @@ impl AuditPipeline {
                 self.mark_unavailable(AuditUnavailableReason::from_spool_error(&error));
                 self.mark_degraded(AuditUnavailableReason::from_spool_error(&error));
                 error!(
-                    audit_event_id = %record.id(),
+                    audit_event_id = %event_id,
                     surface = "audit_event_unrecoverable",
                     reason = error.reason(),
                     "Admin audit event could not be moved into retained state"
@@ -2382,6 +2403,65 @@ async fn deliver_record(
     outcome
 }
 
+/// Settle a delivered record's durable half on the blocking pool.
+///
+/// `remove_pending`, `retain_unrecoverable`, and `update_attempts` unlink,
+/// rename, or rewrite a record and then **fsync** a directory. That is real
+/// filesystem latency, and the delivery worker shares the serving runtime with
+/// the data plane, so it belongs on the blocking pool exactly like the
+/// prepare/finalize/list/read paths. A failed offload only happens while the
+/// runtime is stopping; the record stays durable and replays idempotently.
+async fn settle_delivered(pipeline: &Arc<AuditPipeline>, event_id: &str) {
+    let settle_pipeline = Arc::clone(pipeline);
+    let id = event_id.to_string();
+    if tokio::task::spawn_blocking(move || settle_pipeline.note_delivered(&id))
+        .await
+        .is_err()
+    {
+        warn!(
+            audit_event_id = %event_id,
+            surface = "audit_spool_remove",
+            "Delivered admin audit event could not be settled; it stays durable and replays \
+             idempotently"
+        );
+    }
+}
+
+/// Retain an exhausted record on the blocking pool. See `settle_delivered`.
+async fn settle_unrecoverable(pipeline: &Arc<AuditPipeline>, event_id: &str) {
+    let settle_pipeline = Arc::clone(pipeline);
+    let id = event_id.to_string();
+    if tokio::task::spawn_blocking(move || settle_pipeline.note_unrecoverable(&id))
+        .await
+        .is_err()
+    {
+        warn!(
+            audit_event_id = %event_id,
+            surface = "audit_event_unrecoverable",
+            "Admin audit event could not be moved into retained state; it stays durable for the \
+             next process generation"
+        );
+    }
+}
+
+/// Persist advisory attempt bookkeeping on the blocking pool. Best effort: a
+/// failure only costs retry-budget accuracy, never the record itself.
+async fn persist_attempts(pipeline: &Arc<AuditPipeline>, record: &SpooledAuditRecord) {
+    let Some(spool) = pipeline.spool.clone() else {
+        return;
+    };
+    let snapshot = record.clone();
+    let result = tokio::task::spawn_blocking(move || spool.update_attempts(&snapshot)).await;
+    if let Ok(Err(error)) = result {
+        warn!(
+            audit_event_id = %record.event.id,
+            surface = "audit_spool_attempts",
+            reason = error.reason(),
+            "Could not persist admin audit delivery attempt count"
+        );
+    }
+}
+
 async fn deliver_record_inner(
     pipeline: &Arc<AuditPipeline>,
     delivery: &Arc<dyn AuditEventDelivery>,
@@ -2390,7 +2470,7 @@ async fn deliver_record_inner(
     loop {
         match delivery.deliver(&record.event).await {
             Ok(()) => {
-                pipeline.note_delivered(record);
+                settle_delivered(pipeline, &record.event.id).await;
                 return DeliveryOutcome::Delivered;
             }
             Err(_) => {
@@ -2407,25 +2487,14 @@ async fn deliver_record_inner(
                     "Failed to persist admin audit event; persistence detail withheld"
                 );
                 if record.attempts >= pipeline.config.max_delivery_attempts {
-                    pipeline.note_unrecoverable(record);
+                    settle_unrecoverable(pipeline, &record.event.id).await;
                     return if pipeline.spool.is_some() {
                         DeliveryOutcome::Retained
                     } else {
                         DeliveryOutcome::Dropped
                     };
                 }
-                if let Some(spool) = pipeline.spool.as_ref()
-                    && let Err(error) = spool.update_attempts(record)
-                {
-                    // Losing attempt bookkeeping only costs budget accuracy;
-                    // the record itself is still durable.
-                    warn!(
-                        audit_event_id = %record.event.id,
-                        surface = "audit_spool_attempts",
-                        reason = error.reason(),
-                        "Could not persist admin audit delivery attempt count"
-                    );
-                }
+                persist_attempts(pipeline, record).await;
                 pipeline.metrics.retries.fetch_add(1, Ordering::Relaxed);
                 if !sleep_unless_draining(pipeline, retry_delay(record.attempts)).await {
                     if pipeline.spool.is_some() {
@@ -2500,7 +2569,7 @@ async fn replay_spool(pipeline: &Arc<AuditPipeline>, delivery: &Arc<dyn AuditEve
             Err(_) => continue,
         };
         if record.attempts >= pipeline.config.max_delivery_attempts {
-            pipeline.note_unrecoverable(&record);
+            settle_unrecoverable(pipeline, &record.event.id).await;
             continue;
         }
         pipeline.metrics.replayed.fetch_add(1, Ordering::Relaxed);

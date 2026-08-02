@@ -23,8 +23,8 @@ use ferrum_edge::admin::audit::{
     note_request_actor, sanitize_audit_namespace, sanitize_audit_path, scope_request, update_diff,
 };
 use ferrum_edge::admin::audit_spool::{
-    AUDIT_DIFF_OMITTED_MARKER, AUDIT_SPOOL_RECORD_VERSION, AuditSpool, SpoolErrorKind,
-    SpooledAuditRecord, is_valid_record_id, record_id_from_file_name,
+    AUDIT_DIFF_OMITTED_MARKER, AUDIT_SPOOL_RECORD_VERSION, AuditSpool, RetainOutcome,
+    SpoolErrorKind, SpooledAuditRecord, is_valid_record_id, record_id_from_file_name,
 };
 use ferrum_edge::admin::jwt_auth::AdminRole;
 use ferrum_edge::grpc::auth::AllowedNamespaces;
@@ -439,6 +439,54 @@ fn a_prepared_record_is_never_deliverable_as_an_outcome() {
             .expect_err("finalize rejects")
             .kind,
         SpoolErrorKind::InvalidRecord
+    );
+}
+
+#[test]
+fn an_already_settled_record_is_not_reported_as_discarded_evidence() {
+    let dir = TempDir::new().expect("temp dir");
+    let spool = AuditSpool::open(
+        dir.path().to_path_buf(),
+        Uuid::new_v4().to_string(),
+        TEST_DESTINATION.to_string(),
+        64,
+        8,
+    )
+    .expect("spool opens");
+
+    // At-least-once delivery lets one attempt settle and remove a record while
+    // another attempt for the same stable id is still burning its retry
+    // budget. That second attempt must not be reported as a capacity discard:
+    // a discard latches permanent `evidence_lost`, and nothing was lost here.
+    assert_eq!(
+        spool
+            .retain_unrecoverable(&Uuid::new_v4().to_string())
+            .expect("retain reports an outcome"),
+        RetainOutcome::AlreadySettled
+    );
+
+    // A record that is genuinely pending is still retained for the operator.
+    let record = SpooledAuditRecord::with_bounded_diff(
+        event(),
+        TEST_DESTINATION,
+        spool.generation(),
+        /* finalized */ true,
+        1024 * 1024,
+    );
+    spool.finalize(&record).expect("finalize is durable");
+    assert_eq!(
+        spool
+            .retain_unrecoverable(record.id())
+            .expect("retain reports an outcome"),
+        RetainOutcome::Retained
+    );
+    assert_eq!(count_json(&dir.path().join("failed")), 1);
+    // Retaining the same id twice reports the record it already preserved.
+    assert_eq!(
+        spool
+            .retain_unrecoverable(record.id())
+            .expect("retain reports an outcome"),
+        RetainOutcome::Retained
     );
 }
 

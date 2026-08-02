@@ -257,6 +257,21 @@ pub struct ClaimReport {
     pub live_instances: u64,
 }
 
+/// What happened to a record handed to [`AuditSpool::retain_unrecoverable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainOutcome {
+    /// The record is in `failed/` for operator remediation.
+    Retained,
+    /// Retained capacity was already exhausted, so the record was discarded.
+    /// This is real, permanent evidence loss.
+    Discarded,
+    /// There was nothing to retain: an earlier delivery of the same stable id
+    /// already settled and removed the record. Distinguished from `Discarded`
+    /// because reporting a discard here would latch permanent `evidence_lost`
+    /// for a record that was never actually lost.
+    AlreadySettled,
+}
+
 /// Exclusive, process-lifetime ownership lock over one instance directory.
 #[derive(Debug)]
 pub struct OwnerLock {
@@ -528,26 +543,32 @@ impl AuditSpool {
 
     /// Move a pending record into operator-visible retention.
     ///
-    /// Returns `Ok(true)` when the record was retained and `Ok(false)` when the
-    /// retained ceiling was already reached and the record had to be discarded.
     /// Discarding the *newest* arrival preserves the oldest evidence, which is
-    /// what an operator reconciling a gap needs first.
-    pub fn retain_unrecoverable(&self, id: &str) -> Result<bool, SpoolError> {
+    /// what an operator reconciling a gap needs first. A record that is no
+    /// longer pending is reported as [`RetainOutcome::AlreadySettled`] rather
+    /// than as a discard: at-least-once delivery means the same stable id can
+    /// be settled by one attempt while another is still burning its retry
+    /// budget, and that is not evidence loss.
+    pub fn retain_unrecoverable(&self, id: &str) -> Result<RetainOutcome, SpoolError> {
         let pending = record_path(&self.pending_dir(), id)?;
         let failed = record_path(&self.failed_dir(), id)?;
         if !pending.exists() {
-            return Ok(failed.exists());
+            return Ok(if failed.exists() {
+                RetainOutcome::Retained
+            } else {
+                RetainOutcome::AlreadySettled
+            });
         }
         if self.retained_capacity_exhausted() {
             self.remove_pending(id)?;
-            return Ok(false);
+            return Ok(RetainOutcome::Discarded);
         }
         fs::rename(&pending, &failed).map_err(|_| SpoolError::new(SpoolErrorKind::Io))?;
         sync_dir(&self.pending_dir())?;
         sync_dir(&self.failed_dir())?;
         decrement(&self.pending_count);
         self.retained_count.fetch_add(1, Ordering::Relaxed);
-        Ok(true)
+        Ok(RetainOutcome::Retained)
     }
 
     /// Read one pending record.
