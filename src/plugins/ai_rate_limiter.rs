@@ -959,9 +959,7 @@ impl AiRateLimiter {
     /// distinction lets pre-`before_proxy` decompression reserve immediately
     /// from refreshed plaintext while retaining the rare final-body fallback.
     fn classify_request_tokens(&self, ctx: &RequestContext) -> Option<(bool, u64)> {
-        let Some(body) = ctx.metadata.get("request_body") else {
-            return None;
-        };
+        let body = ctx.metadata.get("request_body")?;
         let Ok(json) = serde_json::from_str::<Value>(body) else {
             return None;
         };
