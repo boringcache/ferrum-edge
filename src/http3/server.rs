@@ -7386,6 +7386,9 @@ async fn handle_h3_request(
             let phase_start = std::time::Instant::now();
             let mut response_body_reject = None;
             for plugin in plugins.iter() {
+                if plugin.enforces_final_client_visible_response_body(&ctx) {
+                    continue;
+                }
                 let deadline = ctx.grpc_deadline_at();
                 let result = match crate::plugins::await_grpc_deadline(
                     deadline,

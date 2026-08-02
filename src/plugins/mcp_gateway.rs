@@ -4875,6 +4875,12 @@ impl Plugin for McpGateway {
         true
     }
 
+    fn rejection_replacement_is_final_body_policy_terminal(&self) -> bool {
+        // Enforcement replacements are gateway-authored JSON-RPC error
+        // envelopes and never retain the refused backend tool-result bytes.
+        true
+    }
+
     fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
         self.enabled
             && self.mode == McpGatewayMode::AggregateRouter
