@@ -898,6 +898,10 @@ impl Plugin for SpecExpose {
         true
     }
 
+    fn rejection_replacement_is_final_body_policy_terminal(&self) -> bool {
+        true
+    }
+
     fn warn_on_rejection_response_replacement(&self) -> bool {
         false
     }

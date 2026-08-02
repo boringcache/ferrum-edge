@@ -54,10 +54,9 @@
 //! Nothing here is ever logged. The returned values are opaque digests; the
 //! inputs are credentials, identities, and addresses.
 
+use crate::fips::approved::Sha256;
 use std::collections::HashMap;
 use std::net::IpAddr;
-
-use sha2::{Digest, Sha256};
 
 use crate::plugins::RequestContext;
 use crate::util::body_limit::{ContentLength, parse_content_length};
@@ -289,7 +288,7 @@ impl PartitionHasher {
     }
 
     pub fn digest(self) -> [u8; 32] {
-        self.hasher.finalize().into()
+        self.hasher.finalize()
     }
 
     pub fn hex(self) -> String {
@@ -300,12 +299,12 @@ impl PartitionHasher {
 /// SHA-256 of one value, used for credential material that must never appear in
 /// a key, a log line, or `RequestContext::metadata`.
 pub fn value_digest(value: &str) -> [u8; 32] {
-    Sha256::digest(value.as_bytes()).into()
+    Sha256::digest(value.as_bytes())
 }
 
 /// SHA-256 of one raw field-line, for wire values that need not be valid UTF-8.
 pub fn bytes_digest(value: &[u8]) -> [u8; 32] {
-    Sha256::digest(value).into()
+    Sha256::digest(value)
 }
 
 /// Bind the gateway-resolved canonical peer address, or refuse.

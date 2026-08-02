@@ -136,9 +136,9 @@ pub fn bootstrap_dev_root(config: BootstrapConfig) -> Result<BootstrappedRoot, C
 }
 
 fn random_positive_serial_bytes() -> Result<[u8; 8], CaError> {
-    use ring::rand::SecureRandom;
+    use crate::fips::backend::rand::SecureRandom;
 
-    let rng = ring::rand::SystemRandom::new();
+    let rng = crate::fips::backend::rand::SystemRandom::new();
     let mut serial_bytes = [0u8; 8];
     rng.fill(&mut serial_bytes)
         .map_err(|e| CaError::Internal(format!("rng failed: {e}")))?;

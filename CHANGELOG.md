@@ -57,6 +57,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   namespace) on a native/file/xDS source are now a config rejection instead of
   being interpreted at evaluation time.
 
+- Audited admin mutations are durable **before they run** (issue #2421).
+  The admin write gate fsyncs a pre-mutation audit intent — a stable event id
+  plus the authenticated actor, method, sanitized path / namespace, canonical
+  socket source address, and bounded request id — into
+  `FERRUM_ADMIN_AUDIT_SPOOL_DIR` before the
+  configuration mutation is invoked, and durably finalizes that same id with
+  `success` or `failure` once the mutation returns. A crash between commit and
+  finalize replays as an explicit `outcome: unknown_outcome` event, never a
+  silent deletion and never an inferred outcome. Records live under
+  per-process-generation instance directories whose ownership lock is held
+  exclusively for the process lifetime, so several gateways may share one spool
+  root and no process can classify its own in-flight record; every record is
+  bound to a non-secret audit-destination identity (backend type, namespace, and
+  a digest of the redacted connection URL) so a reconfigured gateway cannot
+  replay another deployment's evidence into the wrong database. Discovery and
+  replay start with the mode's database backend rather than waiting for a later
+  mutation. Mutation settlement tasks explicitly carry the request audit slot
+  across `tokio::spawn`, and cancellation ownership transfers before spawn so a
+  disconnected client cannot race the detailed outcome against a generic
+  fallback record. The blocking prepare/fsync is itself detached and settles a
+  cancellation that arrived mid-write as `unknown_outcome`, so the newly
+  durable intent cannot remain dormant in a live process generation. Delivery
+  is at-least-once on the stable id and every backend
+  insert is insert-only and idempotent (PostgreSQL/SQLite `ON CONFLICT (id) DO
+  NOTHING`, MySQL `ON DUPLICATE KEY UPDATE id = id`, MongoDB `insert_one` with
+  duplicate-key treated as success), so a duplicate delivery converges to the
+  existing immutable row instead of replacing it. Directory fsync failures are
+  treated as durability failures; corrupt, unrecoverable, and
+  foreign-destination records are quarantined under `<spool>/failed/` and that
+  degradation is sticky until the evidence is resolved. Health and metrics reads
+  are O(1) from atomics and cached background state. Graceful shutdown closes
+  admission, drains every accepted queue entry, interrupts retry waits, and
+  explicitly aborts **and joins** the delivery worker rather than detaching it;
+  a memory-only deadline loss is counted and latches degraded health. Managed
+  TLS/ACME file-store mutations and explicit TLS rotation actions, which also
+  emit audit events, now take the same durable pre-action handoff without
+  inheriting config-database topology gates. New `FERRUM_ADMIN_AUDIT_{SPOOL_DIR,
+  UNAVAILABLE_POLICY,QUEUE_CAPACITY,SPOOL_MAX_RECORDS,RETAINED_MAX_RECORDS,
+  MAX_DELIVERY_ATTEMPTS}` settings, `ferrum_admin_audit_*` Prometheus families,
+  and an authenticated `/health` `audit_pipeline` object.
+
+- Admin audit events gain optional `source_address`, `request_id`, and
+  `outcome` fields (folded into the baseline `audit_events` schema).
+  `GET /backup` always admits a durable security record before releasing
+  unredacted configuration (independent of `FERRUM_ADMIN_AUDIT_ENABLED`,
+  which continues to gate ordinary mutation audit events only): synchronous
+  primary insert when available, otherwise the bounded local fallback under
+  `FERRUM_ADMIN_AUDIT_FALLBACK_PATH`, failing closed with `503` if neither
+  sink admits the event. Authenticated denied/failed backup attempts are
+  audited with fixed failure categories only; backup payload bytes and
+  secrets never enter audit events or logs. Local fallback publication uses
+  same-directory atomic replace (Unix `rename(2)`; Windows
+  `MoveFileExW(MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)`) so
+  repeated appends succeed when the destination already exists, without
+  unlinking the live file first. Local fallback reads open the data file
+  without following symlinks, validate the opened handle (regular file,
+  owner-only mode, Unix single-link), and refuse inputs above
+  `AUDIT_LOCAL_FALLBACK_MAX_BYTES` (16 MiB) before parse. Hard-linked lock
+  targets are rejected before chmod/flock. Local fallback lock acquisition is
+  non-blocking (in-process `try_lock`, Unix `flock(LOCK_EX|LOCK_NB)`,
+  Windows immediate share denial) so contention fails closed instead of
+  hanging a blocking-pool thread. The fallback retains the newest 4096
+  events; eviction at capacity emits a content-free
+  `audit_local_fallback_evicted` warning so rollover of older security
+  records is never silent. Backup `resources=` filters are
+  a closed allow-list; unknown tokens are rejected with static client text
+  and never persisted raw in audit metadata (#2422).
 - Kubernetes controller watch scopes now rebuild their reflector from an
   authoritative list when they go idle past `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`
   (default `300`, `0` disables, clamped to `0`–`86400`). kube-rs raises an
@@ -120,6 +187,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Durable `api_chargeback_sink` ClickHouse requests now pin
+  `wait_for_async_insert=1` whenever the setting is omitted, even when Ferrum
+  also omits `async_insert`. This prevents a ClickHouse user/profile default
+  from turning an acknowledged export into fire-and-forget buffering before
+  Ferrum advances or deletes durable spool state (#3040). The explicit
+  `allow_lossy_async_insert` opt-in remains available for operators that accept
+  that loss mode.
+
 - H1/H2 WebSocket backend dials now use the effective proxy of the target they
   are actually dialing (#2416). The WebSocket branch previously received only
   the retry-capped base proxy: retry rotation moved the URL, the admission
@@ -175,6 +250,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to a subscriber's slice at all, and DestinationRules in the configured root
   namespace are now admitted (they previously were not).
 
+- Required CI owners now declare `merge_group` triggers and event-aware
+  base/head selection so a future `main` merge queue can run the six required
+  checks (`Tests`, `Merge Coverage`, `Gateway API Conformance`,
+  `Mesh E2E Sidecar Live`, `Trusted Cross Build Policy`,
+  `Multicluster Federation Live`) on the synthesized queue SHA without
+  deadlocking. Repository ruleset/branch-protection enablement remains a
+  separate root-owned step (#2458).
 - Gateway API and Istio status planning now build immutable per-reconcile
   indexes and reuse one primary translation/materialization (plus skip errors)
   instead of retranslating a filtered snapshot once per status object, and

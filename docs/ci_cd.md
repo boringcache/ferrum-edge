@@ -13,18 +13,19 @@ Ferrum Edge includes comprehensive CI/CD pipelines for automated testing, buildi
 - [Binaries and Downloads](#binaries-and-downloads)
 - [Image Signatures, SBOMs, and Provenance](#image-signatures-sboms-and-provenance)
 - [GitHub Actions Secrets](#github-actions-secrets)
+- [Root Merge Gate Attestation](#root-merge-gate-attestation)
 
 ## Pipeline Overview
 
-The publish-critical flows are `ci.yml` and `release.yml`: CI validates PRs and
-`main`, then publishes `latest` artifacts from `main`; Release publishes
-versioned artifacts from `v*` tags. Additional workflows provide coverage,
-scheduled dependency governance, live datapath/conformance labs, manual
-benchmark suites, and repository maintenance automation.
+The publish-critical flows are `ci.yml` and `release.yml`: CI validates PRs,
+merge-queue groups, and `main`, then publishes `latest` artifacts from `main`;
+Release publishes versioned artifacts from `v*` tags. Additional workflows
+provide coverage, scheduled dependency governance, live datapath/conformance
+labs, manual benchmark suites, and repository maintenance automation.
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| **CI** (`ci.yml`) | Pull Requests, push to `main` | Required validation for PRs and `main`; latest binaries and Docker images after `main` validation |
+| **CI** (`ci.yml`) | Pull Requests, `merge_group`, push to `main` | Required validation for PRs, merge-queue groups, and `main`; latest binaries and Docker images after `main` validation |
 | **Release** (`release.yml`) | Push tag matching `v*` | Validate the tagged SHA, then publish versioned binaries, GitHub release, and Docker tags |
 
 ## Workflow Inventory
@@ -34,14 +35,14 @@ adding, removing, or materially changing a workflow.
 
 | Workflow file | Display name | Triggers | Role |
 |---|---|---|---|
-| `ci.yml` | CI | PRs, push to `main`, manual | Required validation gate plus `latest` prerelease and Docker image publishing from `main`. |
-| `coverage.yml` | Coverage | PRs, push to `main`, weekly schedule, manual | Coverage planning/reporting and coverage floor enforcement; `Merge Coverage` is directly required on PRs. |
+| `ci.yml` | CI | PRs, `merge_group`, push to `main`, manual | Required validation gate plus `latest` prerelease and Docker image publishing from `main`. The `Tests` check runs on PRs and merge-queue groups. |
+| `coverage.yml` | Coverage | PRs, `merge_group`, push to `main`, weekly schedule, manual | Coverage planning/reporting and coverage floor enforcement; `Merge Coverage` is directly required on PRs and merge-queue groups. |
 | `release.yml` | Release | `v*` tag push | Versioned binary, GitHub Release, and Docker publishing after CI/Coverage validation. |
-| `gateway-api-conformance.yml` | Gateway API Conformance | PRs, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs. |
-| `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs. |
-| `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface; `Trusted Cross Build Policy` must be directly required after the bootstrap workflow merges. |
+| `gateway-api-conformance.yml` | Gateway API Conformance | PRs, `merge_group`, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs and merge-queue groups. |
+| `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs and merge-queue groups. |
+| `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface on PRs; merge-group mode verifies the synthesized combined SHA with `contents: read` only. `Trusted Cross Build Policy` is directly required. |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
-| `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs. |
+| `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs and merge-queue groups. |
 | `dependency-audit.yml` | Dependency Audit | Weekly schedule, manual | Scheduled supply-chain governance beyond the per-PR audit gate. |
 | `fuzz.yml` | Fuzz | Weekly schedule, manual | Sanitizer-backed libFuzzer lane for hostile parser targets; see [fuzz.md](fuzz.md). |
 | `scaling-regression.yml` | Scheduled Scaling Regression | Weekly schedule, manual | Runs the 30k proxy scale and 10k proxy load-stress tests excluded from PR CI. |
@@ -55,21 +56,22 @@ adding, removing, or materially changing a workflow.
 | `gateways-protocol-benchmark.yml` | Gateways Protocol Benchmark | Manual | Gateway/protocol benchmark harness. |
 | `connection-saturation-benchmark.yml` | Connection Saturation Benchmark | Manual | Connection saturation benchmark suite. |
 | `scale-benchmark.yml` | Resources Scale Benchmark | Manual | Large resource/config scale benchmark suite. |
+| `root-merge-gate-attestation.yml` | Root Merge Gate Attestation | Manual (`workflow_dispatch` on `main` only) | Supplies the single required human-root approval for one exact independently reviewed PR head after hosted checks and review-thread resolution; see [Root Merge Gate Attestation](#root-merge-gate-attestation). |
 
 ### CI Pipeline Flow
 
 ```
-Pull Request
-    ├─► Trusted Cross Build Policy (`pull_request_target`, base code only)
-            └─► Validate proposed Cross/Cargo config, workflows, repo-local
-                actions, and referenced scripts as hostile data
-    ├─► CI plan
+Pull Request / Merge Queue group
+    ├─► Trusted Cross Build Policy
+            ├─► PR: `pull_request_target`, base code only, PR tree as data
+            └─► Merge group: synthesized queue SHA, `contents: read`, no secrets
+    ├─► CI plan (event-aware base/head; merge_group uses payload base_sha)
             ├─► Docs/license/agent-only: lightweight Tests aggregate
             └─► Full CI
                     ├─► Format + integration-shard coverage (in CI plan)
                     ├─► Unit+inline-lib / integration-shard / functional-shard tests
                     ├─► Lint, dependency audit, vendored regressions
-                    ├─► Fuzz smoke (libFuzzer + proptest budgets)
+                    ├─► Fuzz smoke (libFuzzer + property budgets)
                     ├─► eBPF/netns live checks when planner marks relevant
                     ├─► Planner-gated mesh / Helm / performance gates
                     └─► Five target release builds
@@ -87,6 +89,84 @@ Push to main
                     └─► Push per-arch Docker images to Docker Hub and GHCR
                             └─► Create multi-arch Docker manifest (`latest`, `main-<sha>`)
 ```
+
+### Required checks and merge queue
+
+Branch protection / repository rulesets for `main` must require these six
+GitHub Actions check names (exact spelling; source app is **GitHub Actions**,
+app id `15368`):
+
+| Required check name | Owning workflow | Owning job |
+|---|---|---|
+| `Tests` | `.github/workflows/ci.yml` | `test` |
+| `Merge Coverage` | `.github/workflows/coverage.yml` | `coverage-merge` |
+| `Gateway API Conformance` | `.github/workflows/gateway-api-conformance.yml` | `gate` |
+| `Mesh E2E Sidecar Live` | `.github/workflows/mesh-e2e-sidecar-live.yml` | `gate` |
+| `Trusted Cross Build Policy` | `.github/workflows/cross-build-policy.yml` | `verify` |
+| `Multicluster Federation Live` | `.github/workflows/multicluster-federation-live.yml` | `gate` |
+
+Each owner declares a `merge_group` (`types: [checks_requested]`) trigger in
+addition to its existing `pull_request` / `pull_request_target` / `push` /
+schedule / manual triggers. Merge queues run required checks on the
+`merge_group` event against a synthesized `gh-readonly-queue/main/...` commit.
+`github.sha` / `merge_group.head_sha` is the exact code under validation;
+`merge_group.base_sha` is the queue base. Workflows must not read
+`github.event.pull_request.*` on `merge_group` (those fields are absent) and
+must not silently fall back to a base/`main`-only check. Path-sensitive skips
+are allowed only when that base/head range is derived successfully; otherwise
+the required check fails closed or runs fully.
+
+Concurrency groups include the event name and a PR number or merge-group head
+SHA so a merge-group run cannot cancel an unrelated PR (or another group).
+
+**`merge_group` runs execute candidate workflow YAML.** GitHub loads workflow
+files for a `merge_group` event from the synthesized queue commit, so unlike
+`pull_request_target` there is no trusted-base copy of the workflow itself.
+Merge-group runs still read their *executable inputs* from the payload base
+(`verify_cross_build_policy.py`, `pr_ci_plan.py`, `live_suite_path_filter.py`
+are all extracted from `merge_group.base_sha`), but the surrounding job
+definition is candidate-supplied. The protected-file boundary therefore rests
+on the queue's entry precondition: a merge queue admits a pull request only
+after its required checks have already passed **on the pull request**, and the
+PR-side `Trusted Cross Build Policy` run executes the base branch's workflow
+under `pull_request_target` and rejects any change to
+`.github/workflows/cross-build-policy.yml` or
+`.github/scripts/verify_cross_build_policy.py`. Consequences for operators:
+
+- Do **not** follow the common "trigger required checks on `merge_group` only"
+  advice for these six owners. Every owner must keep reporting on the pull
+  request as well, and all six must stay *required* so a failing PR-side check
+  blocks queue entry. `verify_required_ci.py` enforces both the `merge_group`
+  trigger and an unfiltered `pull_request` / `pull_request_target` trigger for
+  each owner.
+- `merge_group.base_sha` is the group's parent commit — the base branch tip
+  plus any entries already ahead of this one in the queue — not necessarily the
+  current `main` tip. Every entry ahead of it cleared the same required checks
+  against its own base before being queued, which is what keeps the payload
+  base usable as a trusted baseline.
+
+**Admin / no-bypass intent (settings owned by root, not this workflow change):**
+apply rules to administrators, block force pushes and branch deletion, require
+up-to-date merge-queue results, and document any narrowly scoped automation
+bypass. This repository change only prepares workflow triggers and contracts;
+it does **not** enable the merge queue or mutate branch protection.
+
+**Staged enablement (root-owned after this prerequisite merges):**
+
+1. Merge the workflow/`docs/ci_cd.md` prerequisite so all six owners report on
+   `merge_group`.
+2. Enable the `main` ruleset / branch protection with the six required checks
+   above, merge queue enabled, admin enforcement as intended.
+3. Open a throwaway test PR, enqueue it, confirm each required check runs on
+   the synthesized SHA (not a stale PR SHA), and confirm release automation
+   still has only the permissions it needs.
+4. Only after that live exercise should closing language such as
+   `Closes #2458` be used on the settings follow-up.
+
+`.github/scripts/verify_required_ci.py` statically enforces merge_group
+triggers, unfiltered `pull_request` / `pull_request_target` triggers,
+check-name parity, event-aware SHA/base markers, and concurrency markers for
+all six owners.
 
 ### Release Pipeline Flow
 
@@ -109,16 +189,23 @@ Push tag v* (e.g., v0.2.0)
 
 ## CI Pipeline (ci.yml)
 
-The CI workflow is triggered by every pull request and every push to `main`.
-The `CI Plan` job first selects `full` or `light` mode. Pull requests whose
-entire diff is limited to ordinary documentation, `.agents/**`, `.claude/**`,
-Markdown outside `vendor/`, or license files use light mode and preserve a fast
-`Tests` aggregate without starting the Rust/build matrix. Documentation that
+The CI workflow is triggered by every pull request, every merge-queue
+`merge_group` check request, and every push to `main`.
+The `CI Plan` job first selects `full` or `light` mode. Pull requests and
+merge-group runs whose entire diff is limited to ordinary documentation,
+`.agents/**`, `.claude/**`, Markdown outside `vendor/`, or license files use
+light mode and preserve a fast `Tests` aggregate without starting the Rust/build
+matrix. Documentation that
 deliberately triggers a live datapath suite (including the mesh, SPIRE,
 configuration, NodeWaypoint, and CI contract/runbook files) remains full mode.
-The planner runs `git diff --check` for PR diff hygiene and disables rename
-detection when classifying paths, so both the source and destination of a rename
-are checked.
+The planner runs `git diff --check` for PR/merge-group diff hygiene and disables
+rename detection when classifying paths, so both the source and destination of a
+rename are checked. The same `--no-renames` fail-closed classification applies
+to `coverage.yml` coverage planning, `gateway-api-conformance.yml` relevance
+filtering, and the `performance-regression` path classifier on both
+`pull_request` and `merge_group` diffs. Merge-group planning diffs
+`merge_group.base_sha...HEAD` and executes the planner from that base SHA so a
+queued planner edit cannot self-classify as light.
 Any unrecognized path, an empty/unavailable diff, a mixed code-and-docs change,
 a push to `main`, or a manual run fails over to full mode. The decision table
 and its executable examples live in `.github/scripts/pr_ci_plan.py`. PR
@@ -189,14 +276,17 @@ and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
 matrix pass.
 
-Branch protection must require six independent PR checks: the unchanged `Tests`
-aggregate from `ci.yml`, `Merge Coverage` from `coverage.yml`, `Gateway API
-Conformance` from `gateway-api-conformance.yml`, `Mesh E2E Sidecar Live` from
-`mesh-e2e-sidecar-live.yml`, `Multicluster Federation Live` from
-`multicluster-federation-live.yml`, and `Trusted Cross Build Policy` from
-`cross-build-policy.yml`. Each dedicated workflow triggers on every pull
-request and fails closed on planning or validation failures. They are required
-directly rather than mirrored by runner-holding polling jobs in `ci.yml`.
+Branch protection must require six independent PR **and** merge-queue checks:
+the unchanged `Tests` aggregate from `ci.yml`, `Merge Coverage` from
+`coverage.yml`, `Gateway API Conformance` from `gateway-api-conformance.yml`,
+`Mesh E2E Sidecar Live` from `mesh-e2e-sidecar-live.yml`,
+`Multicluster Federation Live` from `multicluster-federation-live.yml`, and
+`Trusted Cross Build Policy` from `cross-build-policy.yml`. Each dedicated
+workflow triggers on every pull request and on `merge_group`, and fails closed
+on planning or validation failures. They are required directly rather than
+mirrored by runner-holding polling jobs in `ci.yml`. See
+[Required checks and merge queue](#required-checks-and-merge-queue) for the
+operator contract, queue SHA semantics, and staged enablement procedure.
 
 `cross-build-policy.yml` is bootstrapped by the change that introduces it, so
 it cannot emit a `pull_request_target` check until it exists on the default
@@ -204,8 +294,17 @@ branch. After that change merges and the first check is visible, a repository
 administrator must add `Trusted Cross Build Policy` to the required checks for
 `main`. Ordinary pull requests must not modify the trusted verifier or its
 workflow; such maintenance requires an explicit branch-protection bypass.
+Merge-group mode reuses the same check name while validating the synthesized
+queue commit with read-only permissions.
 
-CI uses `concurrency.group: ci-publish-${{ github.ref }}` with `cancel-in-progress: true`, so a newer push to the same branch cancels the older CI run. On `main`, that can interrupt an in-flight publish job such as Docker manifest creation. If the cancellation left publishing incomplete, re-run the newest workflow attempt (the one for the latest `main` SHA) — re-running the older, canceled run would re-publish stale binaries and images as `latest`.
+CI uses
+`concurrency.group: ci-publish-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}`
+with `cancel-in-progress: true`, so a newer push to the same PR or the same
+merge-group head cancels the older run without cancelling unrelated lanes. On
+`main`, that can interrupt an in-flight publish job such as Docker manifest
+creation. If the cancellation left publishing incomplete, re-run the newest
+workflow attempt (the one for the latest `main` SHA) — re-running the older,
+canceled run would re-publish stale binaries and images as `latest`.
 
 ### Jobs
 
@@ -363,7 +462,10 @@ benchmarks): workflow verifier `--self-test`, repository-contract verification,
 evaluator `--self-test`, and `python3 -m py_compile` on
 `tests/performance/multi_protocol/run_protocol_regression_scenarios.py`. PRs then
 apply a performance-sensitive path filter; unrelated PRs skip the expensive
-benchmark and report success. The PR gate covers proxy and connection hot paths,
+benchmark and report success. On pull requests and merge-queue groups, changed
+files are collected with `git diff --name-only --no-renames` so both sides of a
+rename are classified and a move into an irrelevant path cannot suppress the
+benchmark. The PR gate covers proxy and connection hot paths,
 the file-mode startup path used by this benchmark, performance fixtures, and
 dependency/build-graph inputs. Plugin-internal, admin, secrets, and unrelated
 operating-mode changes are excluded because this plain HTTP/1.1 file-mode route
@@ -1799,6 +1901,64 @@ gh secret set DOCKERHUB_TOKEN --body "your-token"
 3. Value: your-username
 4. Click "Add secret"
 ```
+
+## Root Merge Gate Attestation
+
+`root-merge-gate-attestation.yml` is a prerequisite for the forthcoming no-bypass
+`main` ruleset. The repository currently has a single human administrator, so the
+ruleset's one-approval requirement is satisfied only after that human has
+independently reviewed one exact PR head and then dispatches this workflow with
+matching inputs.
+
+This workflow is **not** a ruleset bypass. The planned ruleset will have **no
+bypass actors**. The workflow only supplies the required approval for **one
+exact root-reviewed head SHA**. All other protections still apply:
+
+- required hosted CI checks (including coverage and release-critical live checks)
+- every review thread resolved
+- stale approvals dismissed on material pushes
+- last-push approval required
+- merge-queue validation of the combined result before landing
+
+### Security and audit contract
+
+| Boundary | Enforcement |
+|---|---|
+| Trigger surface | `workflow_dispatch` only; no `pull_request`, `pull_request_target`, `merge_group`, `push`, or schedule triggers |
+| Trusted workflow copy | Runs only when `github.ref` is `refs/heads/main` in `ferrum-edge/ferrum-edge`; any other ref or repository fails closed |
+| Human authorization | `github.actor` and `github.triggering_actor` must both be `jeremyjpj0916`; unauthorized dispatches and reruns fail visibly |
+| Permissions | `contents: read` and `pull-requests: write` only |
+| Code execution | No checkout and no execution of PR or repository code; GitHub API calls only |
+| Input validation | `pr_number` must be a positive integer; `expected_head_sha` must be exactly 40 lowercase hex characters; inputs are never interpolated into shell syntax, paths, or API endpoints before validation |
+| PR eligibility | PR must be open, non-draft, target `main`, originate from this repository (not a fork), and its live head SHA must equal `expected_head_sha` |
+| Review threads | All review threads are fetched with GraphQL pagination; any unresolved thread, query error, or malformed/missing field fails closed |
+| Race safety | Approval is submitted with an explicit `commit_id`; the full PR eligibility validation (open, non-draft, base `main`, same repository, exact head SHA) is re-run immediately before submission so a push or state change between validation and approval cannot approve a newer or ineligible head |
+| Actions approval setting | Repository setting `can_approve_pull_request_reviews` (“Allow GitHub Actions to create and approve pull requests”) must remain enabled and is audited before the no-bypass ruleset is activated. GitHub’s documented behavior counts enabled Actions reviews toward required approvals; this repository was independently verified as enabled. The live #3040 merge-queue exercise will prove that an attestation approval satisfies the actual ruleset |
+| Concurrency | `root-merge-gate-attestation-<pr_number>` with `cancel-in-progress: false` so overlapping dispatches do not cancel an in-flight attestation |
+
+### Operator inputs
+
+Dispatch the workflow from the `main` branch copy in the Actions UI (or
+equivalent API) with:
+
+1. **`pr_number`** — the pull request to attest.
+2. **`expected_head_sha`** — the full 40-character lowercase hex SHA of the PR
+   head the root orchestrator independently reviewed. It must match the PR's
+   current head at dispatch time.
+
+If the PR head moves after review, dispatch again with the new SHA only after
+re-reviewing that exact head.
+
+### Audit evidence
+
+Each successful attestation leaves two linked records:
+
+1. **Workflow run** — the Actions run URL shows the authorized actor, inputs,
+   and pass/fail outcome.
+2. **Pull request review** — a single `APPROVE` review whose body states that
+   it is the root merge-gate attestation, repeats the bound head SHA, names the
+   authorizing actor, and links the workflow run. The review is bound to
+   `commit_id` and does not quote or incorporate PR-authored text.
 
 ## Customizing CI/CD
 

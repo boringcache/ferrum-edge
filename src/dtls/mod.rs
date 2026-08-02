@@ -1715,18 +1715,17 @@ pub(crate) fn load_dtls_certificate_with_key_drop_hook(
     // Ferrum-managed DER owner without relying on manual zeroize call sites.
     let key_der = ZeroizingDtlsKeyDer::adopt(parsed_key, drop_hook)?;
 
-    // Ferrum pins rustls's ring provider. Parse from a borrow — do not
+    // Ferrum pins rustls's build-selected provider. Parse from a borrow — do not
     // `clone_key()` into `CertifiedKey::from_der`, which would create another
     // owned DER allocation that ring drops without clearing.
     let borrowed_key = key_der.private_key_der();
-    let signing_key =
-        rustls::crypto::ring::sign::any_supported_type(&borrowed_key).map_err(|error| {
-            anyhow::anyhow!(
-                "DTLS certificate {} and private key {} do not form a valid pair: {error}",
-                cert_material.display_source_id,
-                key_material.display_source_id
-            )
-        })?;
+    let signing_key = crate::fips::any_supported_signing_key(&borrowed_key).map_err(|error| {
+        anyhow::anyhow!(
+            "DTLS certificate {} and private key {} do not form a valid pair: {error}",
+            cert_material.display_source_id,
+            key_material.display_source_id
+        )
+    })?;
     let certified_key = rustls::sign::CertifiedKey::new(certificate_chain.clone(), signing_key);
     match certified_key.keys_match() {
         // Preserve rustls `CertifiedKey::from_der` semantics: Unknown is not fatal.
@@ -2196,9 +2195,8 @@ mod tests {
     /// loaded CI runners while still distinguishing the configured budget.
     #[tokio::test]
     async fn dtls_backend_handshake_honors_connect_timeout_ms() {
-        let _ = rustls::crypto::CryptoProvider::install_default(
-            rustls::crypto::ring::default_provider(),
-        );
+        let _ =
+            rustls::crypto::CryptoProvider::install_default(crate::fips::base_crypto_provider());
 
         // Black-hole peer: bind a UDP socket that never replies. The client
         // socket is `connect()`-ed to it so all datagrams go to /dev/null.

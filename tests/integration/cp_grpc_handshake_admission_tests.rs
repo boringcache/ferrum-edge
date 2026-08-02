@@ -29,13 +29,18 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use futures_util::StreamExt;
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::pki_types::{CertificateRevocationListDer, ServerName};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
+use serde_json::json;
+use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 
 use ferrum_edge::modes::control_plane::{cp_grpc_plain_incoming, cp_grpc_tls_incoming};
+use ferrum_edge::tls::backend::BackendTlsConfigBuilder;
+use ferrum_edge::tls::source::{CertSource, MaterialKind};
+use ferrum_edge::tls::{TlsPolicy, load_tls_config_with_client_auth_from_sources};
 use ferrum_edge::util::conn_limit::ConnLimiter;
 
 use crate::scaffolding::certs::TestCa;
@@ -52,7 +57,7 @@ const NEGATIVE_WINDOW: Duration = Duration::from_millis(750);
 const LONG_HANDSHAKE_TIMEOUT_SECS: u64 = 120;
 
 fn ensure_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = ferrum_edge::fips::base_crypto_provider().install_default();
 }
 
 fn pem_certs(pem: &str) -> Vec<rustls::pki_types::CertificateDer<'static>> {
@@ -72,7 +77,7 @@ fn server_config(ca: &TestCa) -> Arc<ServerConfig> {
     ensure_crypto_provider();
     let (cert_pem, key_pem) = ca.valid().expect("server leaf");
     let config =
-        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        ServerConfig::builder_with_provider(Arc::new(ferrum_edge::fips::base_crypto_provider()))
             .with_safe_default_protocol_versions()
             .expect("protocol versions")
             .with_no_client_auth()
@@ -92,12 +97,12 @@ fn mtls_server_config(ca: &TestCa) -> Arc<ServerConfig> {
     }
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
         Arc::new(roots),
-        Arc::new(rustls::crypto::ring::default_provider()),
+        Arc::new(ferrum_edge::fips::base_crypto_provider()),
     )
     .build()
     .expect("client verifier");
     let config =
-        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        ServerConfig::builder_with_provider(Arc::new(ferrum_edge::fips::base_crypto_provider()))
             .with_safe_default_protocol_versions()
             .expect("protocol versions")
             .with_client_cert_verifier(verifier)
@@ -114,7 +119,7 @@ fn client_config(ca: &TestCa) -> Arc<ClientConfig> {
         roots.add(cert).expect("add ca to client roots");
     }
     Arc::new(
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        ClientConfig::builder_with_provider(Arc::new(ferrum_edge::fips::base_crypto_provider()))
             .with_safe_default_protocol_versions()
             .expect("protocol versions")
             .with_root_certificates(roots)
@@ -131,7 +136,7 @@ fn mtls_client_config(ca: &TestCa) -> Arc<ClientConfig> {
     }
     let (cert_pem, key_pem) = ca.client_auth().expect("client leaf");
     Arc::new(
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        ClientConfig::builder_with_provider(Arc::new(ferrum_edge::fips::base_crypto_provider()))
             .with_safe_default_protocol_versions()
             .expect("protocol versions")
             .with_root_certificates(roots)
@@ -203,6 +208,134 @@ async fn complete_handshake(
     let connector = TlsConnector::from(config);
     let server_name = ServerName::try_from("localhost")?;
     Ok(connector.connect(server_name, stream).await?)
+}
+
+/// Drive an in-memory rustls handshake to completion. Both configs are built
+/// through Ferrum's production TLS constructors; this helper only replaces the
+/// socket so the assertion is deterministic and independent of runner timing.
+fn drive_in_memory_handshake(
+    client_config: ClientConfig,
+    server_config: Arc<ServerConfig>,
+) -> (ClientConnection, ServerConnection) {
+    let server_name = ServerName::try_from("localhost").expect("static server name");
+    let mut client = ClientConnection::new(Arc::new(client_config), server_name)
+        .expect("construct backend TLS client");
+    let mut server = ServerConnection::new(server_config).expect("construct frontend TLS server");
+
+    for _ in 0..32 {
+        let mut to_server = Vec::new();
+        while client.wants_write() {
+            client
+                .write_tls(&mut to_server)
+                .expect("serialize client handshake records");
+        }
+        if !to_server.is_empty() {
+            let mut records = to_server.as_slice();
+            while !records.is_empty() {
+                let read = server
+                    .read_tls(&mut records)
+                    .expect("read client handshake records");
+                assert!(read > 0, "server TLS reader must make progress");
+                server
+                    .process_new_packets()
+                    .expect("process client handshake records");
+            }
+        }
+
+        let mut to_client = Vec::new();
+        while server.wants_write() {
+            server
+                .write_tls(&mut to_client)
+                .expect("serialize server handshake records");
+        }
+        if !to_client.is_empty() {
+            let mut records = to_client.as_slice();
+            while !records.is_empty() {
+                let read = client
+                    .read_tls(&mut records)
+                    .expect("read server handshake records");
+                assert!(read > 0, "client TLS reader must make progress");
+                client
+                    .process_new_packets()
+                    .expect("process server handshake records");
+            }
+        }
+
+        if !client.is_handshaking() && !server.is_handshaking() {
+            return (client, server);
+        }
+    }
+
+    panic!("frontend/backend TLS handshake did not converge");
+}
+
+#[test]
+fn frontend_and_backend_builders_complete_a_real_tls_handshake() {
+    ensure_crypto_provider();
+    let ca = TestCa::new("fips-surface-handshake").expect("test CA");
+    let (cert_pem, key_pem) = ca.valid().expect("frontend certificate");
+    let tls_policy = TlsPolicy::from_env_config(&ferrum_edge::config::EnvConfig::default())
+        .expect("default TLS policy");
+
+    let cert_source = CertSource::parse(cert_pem, MaterialKind::Cert);
+    let key_source = CertSource::parse(key_pem, MaterialKind::Key);
+    let server_config = load_tls_config_with_client_auth_from_sources(
+        &cert_source,
+        &key_source,
+        None,
+        false,
+        &tls_policy,
+        30,
+        &[],
+    )
+    .expect("build production frontend TLS config");
+
+    let temp_dir = TempDir::new().expect("temporary CA directory");
+    let ca_path = temp_dir.path().join("ca.pem");
+    std::fs::write(&ca_path, &ca.cert_pem).expect("write backend CA");
+    let ca_path_string = ca_path.display().to_string();
+    let mut proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(json!({
+        "id": "fips-backend-handshake",
+        "listen_path": "/fips-handshake",
+        "backend_scheme": "https",
+        "backend_host": "localhost",
+        "backend_port": 443,
+        "backend_tls_server_ca_cert_path": ca_path_string,
+    }))
+    .expect("backend proxy fixture");
+    proxy.resolved_tls.server_ca_cert_path = Some(ca_path.display().to_string());
+    proxy.resolved_tls.verify_server_cert = true;
+
+    let crls: Vec<CertificateRevocationListDer<'static>> = Vec::new();
+    let client_config = BackendTlsConfigBuilder {
+        proxy: &proxy,
+        policy: Some(&tls_policy),
+        global_ca: None,
+        global_no_verify: false,
+        global_client_cert: None,
+        global_client_key: None,
+        crls: &crls,
+    }
+    .build_rustls()
+    .expect("build production backend TLS config");
+
+    let (client, server) = drive_in_memory_handshake(client_config, server_config);
+    assert_eq!(client.protocol_version(), server.protocol_version());
+    let negotiated = client
+        .negotiated_cipher_suite()
+        .expect("a rustls cipher suite must be negotiated");
+    assert_eq!(
+        negotiated.suite(),
+        server
+            .negotiated_cipher_suite()
+            .expect("server negotiated cipher suite")
+            .suite()
+    );
+    #[cfg(feature = "fips")]
+    assert!(
+        negotiated.fips(),
+        "the FIPS surface handshake must negotiate an approved cipher suite"
+    );
 }
 
 #[tokio::test]

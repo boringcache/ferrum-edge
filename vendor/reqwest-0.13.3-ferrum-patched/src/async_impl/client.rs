@@ -2458,11 +2458,19 @@ impl Default for Client {
 
 #[cfg(feature = "__rustls")]
 fn default_rustls_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    #[cfg(not(feature = "__rustls-aws-lc-rs"))]
-    panic!("No provider set");
+    // Cargo features are additive across every reqwest consumer. A transitive
+    // consumer may therefore enable reqwest's upstream AWS-LC default while
+    // Ferrum's ordinary profile explicitly selects Ring. Ring takes precedence
+    // in that ordinary graph; the hosted FIPS feature-policy audit rejects any
+    // FIPS graph in which `__rustls-ring` is present.
+    #[cfg(feature = "__rustls-ring")]
+    return Arc::new(rustls::crypto::ring::default_provider());
 
-    #[cfg(feature = "__rustls-aws-lc-rs")]
-    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+    #[cfg(all(not(feature = "__rustls-ring"), feature = "__rustls-aws-lc-rs"))]
+    return Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+
+    #[cfg(not(any(feature = "__rustls-ring", feature = "__rustls-aws-lc-rs")))]
+    panic!("No provider set");
 }
 
 impl Client {

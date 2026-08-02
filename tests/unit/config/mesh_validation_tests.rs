@@ -661,12 +661,17 @@ fn mesh_policy_rejects_mid_string_port_pattern() {
         ..RequestMatch::default()
     });
     let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    let matched = errors
+        .iter()
+        .find(|e| e.contains("port_patterns") && e.contains("not an admissible port pattern"));
     assert!(
-        errors
-            .iter()
-            .any(|e| e.contains("not a valid port pattern")),
+        matched.is_some(),
         "expected port-pattern error, got: {:?}",
         errors
+    );
+    assert!(
+        !matched.expect("port_patterns error").contains("8*9"),
+        "port_patterns diagnostic must not echo operator-supplied pattern"
     );
 }
 
@@ -677,13 +682,236 @@ fn mesh_policy_rejects_named_port_pattern() {
         ..RequestMatch::default()
     });
     let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    let matched = errors
+        .iter()
+        .find(|e| e.contains("port_patterns") && e.contains("not an admissible port pattern"));
     assert!(
-        errors
-            .iter()
-            .any(|e| e.contains("not a valid port pattern")),
+        matched.is_some(),
         "expected port-pattern error, got: {:?}",
         errors
     );
+    assert!(
+        !matched.expect("port_patterns error").contains("http"),
+        "port_patterns diagnostic must not echo operator-supplied pattern"
+    );
+}
+
+#[test]
+fn mesh_policy_accepts_not_port_wildcard_patterns() {
+    let policy = policy_with_request_match(RequestMatch {
+        not_port_patterns: vec!["8*".into(), "*443".into(), "*".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    assert!(
+        errors.is_empty(),
+        "expected no errors for bounded notPorts patterns, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_rejects_mid_string_not_port_pattern() {
+    let policy = policy_with_request_match(RequestMatch {
+        not_port_patterns: vec!["8*9".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    let matched = errors
+        .iter()
+        .find(|e| e.contains("not_port_patterns") && e.contains("not an admissible port pattern"));
+    assert!(
+        matched.is_some(),
+        "expected not_port_patterns field-specific error, got: {:?}",
+        errors
+    );
+    assert!(
+        !matched.expect("not_port_patterns error").contains("8*9"),
+        "not_port_patterns diagnostic must not echo operator-supplied pattern"
+    );
+}
+
+#[test]
+fn mesh_policy_rejects_named_not_port_pattern() {
+    let policy = policy_with_request_match(RequestMatch {
+        not_port_patterns: vec!["http".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    let matched = errors
+        .iter()
+        .find(|e| e.contains("not_port_patterns") && e.contains("not an admissible port pattern"));
+    assert!(
+        matched.is_some(),
+        "expected not_port_patterns field-specific error, got: {:?}",
+        errors
+    );
+    assert!(
+        !matched.expect("not_port_patterns error").contains("http"),
+        "not_port_patterns diagnostic must not echo operator-supplied pattern"
+    );
+}
+
+#[test]
+fn mesh_policy_not_port_patterns_alone_are_constrained() {
+    let policy = policy_with_request_match(RequestMatch {
+        not_port_patterns: vec!["8*".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    assert!(
+        errors.is_empty(),
+        "a to[] arm with only not_port_patterns must remain a valid constraint, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_accepts_boundary_and_leading_zero_port_patterns() {
+    let policy = policy_with_request_match(RequestMatch {
+        port_patterns: vec![
+            "*".into(),
+            "8*".into(),
+            "65535*".into(),
+            "*0".into(),
+            "*443".into(),
+            "*0001".into(),
+        ],
+        not_port_patterns: vec!["*0001".into(), "65535*".into(), "*0".into()],
+        ..RequestMatch::default()
+    });
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    assert!(
+        errors.is_empty(),
+        "boundary/leading-zero-in-suffix witnesses must be admissible, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_rejects_impossible_port_patterns_without_echoing_raw_value() {
+    const HOSTILE: &str = "70000*<script>";
+    for (field_patterns, field_name, raw) in [
+        (
+            RequestMatch {
+                port_patterns: vec!["0*".into()],
+                ..RequestMatch::default()
+            },
+            "port_patterns",
+            "0*",
+        ),
+        (
+            RequestMatch {
+                port_patterns: vec!["00001*".into()],
+                ..RequestMatch::default()
+            },
+            "port_patterns",
+            "00001*",
+        ),
+        (
+            RequestMatch {
+                port_patterns: vec!["65536*".into()],
+                ..RequestMatch::default()
+            },
+            "port_patterns",
+            "65536*",
+        ),
+        (
+            RequestMatch {
+                port_patterns: vec!["70000*".into()],
+                ..RequestMatch::default()
+            },
+            "port_patterns",
+            "70000*",
+        ),
+        (
+            RequestMatch {
+                port_patterns: vec!["99999*".into()],
+                ..RequestMatch::default()
+            },
+            "port_patterns",
+            "99999*",
+        ),
+        (
+            RequestMatch {
+                port_patterns: vec!["*70000".into()],
+                ..RequestMatch::default()
+            },
+            "port_patterns",
+            "*70000",
+        ),
+        (
+            RequestMatch {
+                port_patterns: vec!["*99999".into()],
+                ..RequestMatch::default()
+            },
+            "port_patterns",
+            "*99999",
+        ),
+        (
+            RequestMatch {
+                port_patterns: vec![HOSTILE.into()],
+                ..RequestMatch::default()
+            },
+            "port_patterns",
+            HOSTILE,
+        ),
+        (
+            RequestMatch {
+                not_port_patterns: vec!["70000*".into()],
+                ..RequestMatch::default()
+            },
+            "not_port_patterns",
+            "70000*",
+        ),
+        (
+            RequestMatch {
+                not_port_patterns: vec!["99999*".into()],
+                ..RequestMatch::default()
+            },
+            "not_port_patterns",
+            "99999*",
+        ),
+        (
+            RequestMatch {
+                not_port_patterns: vec!["0*".into()],
+                ..RequestMatch::default()
+            },
+            "not_port_patterns",
+            "0*",
+        ),
+        (
+            RequestMatch {
+                not_port_patterns: vec!["*70000".into()],
+                ..RequestMatch::default()
+            },
+            "not_port_patterns",
+            "*70000",
+        ),
+        (
+            RequestMatch {
+                not_port_patterns: vec![HOSTILE.into()],
+                ..RequestMatch::default()
+            },
+            "not_port_patterns",
+            HOSTILE,
+        ),
+    ] {
+        let policy = policy_with_request_match(field_patterns);
+        let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+        let matched = errors
+            .iter()
+            .find(|e| e.contains(field_name) && e.contains("not an admissible port pattern"));
+        assert!(
+            matched.is_some(),
+            "expected field-specific {field_name} admission error for {raw:?}, got: {errors:?}"
+        );
+        let message = matched.expect("admission error");
+        assert!(
+            !message.contains(raw),
+            "{field_name} diagnostic must not echo operator-supplied pattern {raw:?}: {message}"
+        );
+    }
 }
 
 #[test]

@@ -13,12 +13,9 @@
 
 use std::sync::OnceLock;
 
-use hmac::{Hmac, KeyInit, Mac};
+use crate::fips::approved::{HmacSha256, HmacSha256Key};
+use crate::fips::backend::rand::SecureRandom;
 use regex::{Regex, RegexSet};
-use ring::rand::SecureRandom;
-use sha2::Sha256;
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// Process-wide random HMAC key used when no `hash_secret` is configured.
 ///
@@ -33,7 +30,7 @@ fn fallback_hmac_key(plugin_name: &str) -> Result<&'static [u8; 32], String> {
         return Ok(key);
     }
     let mut key = [0u8; 32];
-    ring::rand::SystemRandom::new()
+    crate::fips::backend::rand::SystemRandom::new()
         .fill(&mut key)
         .map_err(|_| format!("{plugin_name}: failed to generate a random redaction hash key"))?;
     // Two concurrent constructions may both generate; `get_or_init` makes one
@@ -91,7 +88,7 @@ pub struct PiiRedactor {
     hash_values: bool,
     /// Pre-keyed HMAC template, cloned per match (keying an HMAC is the
     /// expensive part; cloning the initialized state is cheap).
-    hash_mac: HmacSha256,
+    hash_mac: HmacSha256Key,
 }
 
 impl PiiRedactor {
@@ -151,7 +148,7 @@ impl PiiRedactor {
             Some(secret) => secret.as_bytes(),
             None => fallback_hmac_key(plugin_name)?,
         };
-        let hash_mac = HmacSha256::new_from_slice(key).map_err(|_| {
+        let hash_mac = HmacSha256Key::new_from_slice(key).map_err(|_| {
             // HMAC-SHA256 accepts keys of any length, so this is unreachable in
             // practice; surface it as a config error rather than panic.
             format!("{plugin_name}: failed to initialize the redaction hash key")
@@ -172,7 +169,7 @@ impl PiiRedactor {
     /// payload (a fixed JSON wrapper around one secret) is an offline
     /// brute-force oracle for the secret.
     pub fn keyed_hash_hex(&self, bytes: &[u8]) -> String {
-        let mut mac = self.hash_mac.clone();
+        let mut mac = self.hash_mac.begin();
         mac.update(bytes);
         hex::encode(mac.finalize().into_bytes())
     }
@@ -181,7 +178,7 @@ impl PiiRedactor {
     /// [`keyed_hash_hex`](Self::keyed_hash_hex), for hashing streamed bodies
     /// chunk-by-chunk without buffering them.
     pub fn keyed_hasher(&self) -> KeyedBodyHasher {
-        KeyedBodyHasher(self.hash_mac.clone())
+        KeyedBodyHasher(self.hash_mac.begin())
     }
 
     /// Redact every PII span in `text`. Returns the input unchanged when nothing
@@ -203,7 +200,7 @@ impl PiiRedactor {
                         // Never emit the raw matched value — only a keyed-hash
                         // prefix so identical secrets remain correlatable
                         // without being brute-forceable offline.
-                        let mut mac = self.hash_mac.clone();
+                        let mut mac = self.hash_mac.begin();
                         mac.update(caps[0].as_bytes());
                         format!(
                             "[REDACTED:{name}:{}]",

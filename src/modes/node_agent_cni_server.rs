@@ -688,9 +688,9 @@ fn unix_path_len(path: &Path) -> usize {
 
 #[cfg(unix)]
 fn random_stage_suffix() -> u64 {
-    use ring::rand::SecureRandom;
+    use crate::fips::backend::rand::SecureRandom;
 
-    let rng = ring::rand::SystemRandom::new();
+    let rng = crate::fips::backend::rand::SystemRandom::new();
     let mut bytes = [0u8; 8];
     if rng.fill(&mut bytes).is_ok() {
         return u64::from_ne_bytes(bytes);
