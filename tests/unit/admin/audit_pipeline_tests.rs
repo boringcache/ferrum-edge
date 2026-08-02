@@ -8,9 +8,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Barrier};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -22,11 +22,11 @@ use ferrum_edge::admin::audit::{
     AuditWorker, audit_destination_identity, credential_update_diff, new_request_slot,
     note_request_actor, sanitize_audit_namespace, sanitize_audit_path, scope_request, update_diff,
 };
-use ferrum_edge::admin::jwt_auth::AdminRole;
 use ferrum_edge::admin::audit_spool::{
     AUDIT_DIFF_OMITTED_MARKER, AUDIT_SPOOL_RECORD_VERSION, AuditSpool, SpoolErrorKind,
     SpooledAuditRecord, is_valid_record_id, record_id_from_file_name,
 };
+use ferrum_edge::admin::jwt_auth::AdminRole;
 use ferrum_edge::grpc::auth::AllowedNamespaces;
 use serde_json::json;
 use tempfile::TempDir;
@@ -300,7 +300,11 @@ async fn cancellation_while_prepare_is_in_flight_finalizes_unknown_outcome() {
                     },
                 );
                 prepare_audit_intent_with_barriers_for_test(
-                    pipeline, slot, event(), started, release,
+                    pipeline,
+                    slot,
+                    event(),
+                    started,
+                    release,
                 )
                 .await
             })
@@ -332,7 +336,9 @@ async fn cancellation_while_prepare_is_in_flight_finalizes_unknown_outcome() {
     let spool = pipeline.spool().expect("durable spool");
     let ids = spool.list_pending_ids(2);
     assert_eq!(ids.len(), 1, "one cancellation record remains pending");
-    let record = spool.read_pending(&ids[0]).expect("pending record is readable");
+    let record = spool
+        .read_pending(&ids[0])
+        .expect("pending record is readable");
     assert_eq!(record.event.outcome, AuditOutcome::UnknownOutcome.as_str());
     assert_eq!(
         record.event.diff["outcome_evidence"],
