@@ -6527,7 +6527,7 @@ fn test_shared_paths_reconcile_aborted_gateway_encoding() {
     // Pin that every shared buffered response-body transform loop restores
     // identity when compression marks an encode abort.
     let proxy = include_str!("../../../src/proxy/mod.rs");
-    let h3 = include_str!("../../../src/http3/cross_protocol.rs");
+    let h3_cross = include_str!("../../../src/http3/cross_protocol.rs");
     assert!(
         proxy
             .matches("reconcile_aborted_gateway_response_encoding")
@@ -6536,9 +6536,10 @@ fn test_shared_paths_reconcile_aborted_gateway_encoding() {
         "H1/H2 shared transform helpers must reconcile aborted gateway encodings"
     );
     assert!(
-        h3.matches("reconcile_aborted_gateway_response_encoding")
+        h3_cross
+            .matches("crate::proxy::transform_buffered_response_body_with_deadline(")
             .count()
-            >= 2,
-        "H3 cross-protocol buffered transforms must reconcile aborted gateway encodings"
+            == 2,
+        "both H3 cross-protocol buffered paths must reach the shared encoding-reconciliation funnel"
     );
 }

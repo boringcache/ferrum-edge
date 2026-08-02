@@ -2149,8 +2149,11 @@ fn h1_h2_h3_paths_reach_shared_body_transform_finalize() {
         "native H3 buffered path must use the shared transform helper"
     );
     assert!(
-        h3_cross.contains("crate::plugins::finalize_response_body_transformation("),
-        "H3 cross-protocol path must finalize after a body rewrite"
+        h3_cross
+            .matches("crate::proxy::transform_buffered_response_body_with_deadline(")
+            .count()
+            == 2,
+        "both H3 cross-protocol buffered paths must use the shared transform/finalize funnel"
     );
 }
 

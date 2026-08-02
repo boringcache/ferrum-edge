@@ -1628,6 +1628,25 @@ impl Plugin for Waf {
         outcome.truncated = truncated;
         self.finish_scan(ctx, outcome)
     }
+
+    /// Preserve the established final-body hook contract for direct callers.
+    /// The proxy skips this compatibility hook after it has invoked the
+    /// authoritative client-visible phase, so production scans once.
+    async fn on_final_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        self.finalize_client_visible_response_body(
+            ctx,
+            response_status,
+            response_headers,
+            body,
+        )
+        .await
+    }
 }
 
 fn proxy_id(ctx: &RequestContext) -> &str {

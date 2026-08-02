@@ -16,7 +16,9 @@ use ferrum_edge::plugins::waf::Waf;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::json;
 
-const BLOCKED_JSON: &str = r#"{"note":"' OR 1=1 --","approved":false}"#;
+// FE-PROTO-001 is a level-1 request-body rule. Query-only SQLi rules would not
+// prove that the staged body bytes reached the body scanner.
+const BLOCKED_JSON: &str = r#"{"note":"__proto__","approved":false}"#;
 
 fn ctx_with_json_post() -> RequestContext {
     let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/api".into());

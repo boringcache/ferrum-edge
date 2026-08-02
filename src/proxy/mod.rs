@@ -17518,6 +17518,12 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     if !terminal_body_response_selected {
         let mut response_body_reject = None;
         for plugin in plugins.iter() {
+            // Participants already decided in the authoritative pre-encoding
+            // phase. Their legacy hook remains callable directly, but must not
+            // re-run against the same production response.
+            if plugin.enforces_final_client_visible_response_body(ctx) {
+                continue;
+            }
             let deadline = ctx.grpc_deadline_at();
             let result = crate::plugins::await_request_plugin_deadline_with_provenance(
                 deadline,
@@ -20049,6 +20055,12 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     grpc_web_response_content_type: Option<&str>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> (bool, bool) {
+    // In this funnel, GatewayGenerated means an earlier response-body policy
+    // already replaced the backend response with its terminal. Presentation and
+    // protocol transforms may still shape that terminal, but no later policy may
+    // inspect the gateway error body and overwrite the decision that selected it.
+    let final_policy_eligible = origin
+        == crate::plugins::response_representation::RepresentationOrigin::Backend;
     // Provenance is established before the gate, exactly as it is before the
     // deadline replacement path: a representation rejection is a gateway-authored
     // terminal response, so it must keep the gateway's own decorators (CORS,
@@ -20106,15 +20118,18 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
         // final client-visible phase is non-rewriting, and skipping it here would
         // silently drop `waf` response scanning and `body_validator` response
         // validation for exactly the statuses a client can select.
-        if run_final_client_visible_response_body_policy(
-            plugins,
-            ctx,
-            response_status,
-            response_headers,
-            response_body,
-            InitialResponseHeaderPolicySource::Prefiltered(initial_response_header_policy_plugins),
-        )
-        .await
+        if final_policy_eligible
+            && run_final_client_visible_response_body_policy(
+                plugins,
+                ctx,
+                response_status,
+                response_headers,
+                response_body,
+                InitialResponseHeaderPolicySource::Prefiltered(
+                    initial_response_header_policy_plugins,
+                ),
+            )
+            .await
         {
             return (true, true);
         }
@@ -20298,6 +20313,7 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
             ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
         }
         if stage == ResponseTransformStage::Semantic
+            && final_policy_eligible
             && run_final_client_visible_response_body_policy(
                 plugins,
                 ctx,
@@ -27505,6 +27521,9 @@ async fn handle_proxy_request_inner(
                 if !after_proxy_rejected && !response_body_rejected {
                     let phase_start = Instant::now();
                     for plugin in plugins.iter() {
+                        if plugin.enforces_final_client_visible_response_body(&ctx) {
+                            continue;
+                        }
                         let deadline = ctx.grpc_deadline_at();
                         let result = crate::plugins::await_request_plugin_deadline_with_provenance(
                             deadline,
@@ -29624,6 +29643,9 @@ async fn handle_proxy_request_inner(
         let phase_start = Instant::now();
         let mut response_body_reject = None;
         for plugin in plugins.iter() {
+            if plugin.enforces_final_client_visible_response_body(&ctx) {
+                continue;
+            }
             let deadline = ctx.grpc_deadline_at();
             let result = crate::plugins::await_request_plugin_deadline_with_provenance(
                 deadline,

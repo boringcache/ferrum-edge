@@ -3685,6 +3685,25 @@ impl Plugin for AiResponseGuard {
         self.undelivered_redaction_reject(ctx, detected)
     }
 
+    /// Preserve the established final-body hook contract for direct callers.
+    /// The proxy skips this compatibility hook after it has invoked the
+    /// authoritative client-visible phase, so production performs one decision.
+    async fn on_final_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        self.finalize_client_visible_response_body(
+            ctx,
+            response_status,
+            response_headers,
+            body,
+        )
+        .await
+    }
+
     fn on_response_body_transformed(
         &self,
         _ctx: &mut RequestContext,
