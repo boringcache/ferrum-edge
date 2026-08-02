@@ -5,13 +5,14 @@ use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, ConditionMatch, EastWestGateway, IngressListenerUnsupported, JwtHeader,
     MAX_MESH_REMOTE_CLUSTERS, MeshConfig, MeshDestinationRule, MeshEndpoint, MeshJwtRule,
-    MeshOutlierDetection, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshRule,
-    MeshService, MeshSidecar, MeshSidecarEgress, MeshSidecarIngress, MeshSubset,
-    MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig, MeshLocalityDistribute, MeshLocalityLbSetting, MeshTrafficPolicy,
-    MeshTrafficPolicyTls, MtlsMode, MultiClusterConfig, NodeWaypointEndpoint, ParsedCidr,
-    PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, RequestMatch,
-    Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet,
-    Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
+    MeshLocalityDistribute, MeshLocalityLbSetting, MeshOutlierDetection, MeshPolicy,
+    MeshProxyConfig, MeshRequestAuthentication, MeshRule, MeshService, MeshSidecar,
+    MeshSidecarEgress, MeshSidecarIngress, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource,
+    MeshTracingConfig, MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, MultiClusterConfig,
+    NodeWaypointEndpoint, ParsedCidr, PeerAuthentication, PolicyAction, PolicyScope,
+    PrincipalMatch, RemoteCluster, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation,
+    ServicePort, TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadRef,
+    WorkloadSelector, validate_mesh_config,
 };
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -2788,7 +2789,9 @@ fn mesh_config_validate_rejects_combined_failover_priority_modes() {
     };
     let errors = mesh.validate();
     assert!(
-        errors.iter().any(|e| e.contains("must set only one of distribute, failover, or failover_priority")),
+        errors
+            .iter()
+            .any(|e| e.contains("must set only one of distribute, failover, or failover_priority")),
         "expected native mutual-exclusivity rejection, got: {errors:?}"
     );
 }

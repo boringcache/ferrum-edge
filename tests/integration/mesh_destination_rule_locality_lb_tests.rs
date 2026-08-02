@@ -339,23 +339,22 @@ fn k8s_translator_rejects_combined_failover_priority_and_distribute() {
     );
 }
 
-
 #[test]
 fn k8s_translator_rejects_combined_failover_priority_and_failover() {
     let object = istio_object(
         "DestinationRule",
         "reviews",
         serde_json::json!({
-        "host": "reviews.default.svc.cluster.local",
-        "trafficPolicy": {
-            "loadBalancer": {
-                "localityLbSetting": {
-                    "failover": [{"from": "us-west", "to": "us-east"}],
-                    "failoverPriority": ["topology.kubernetes.io/region"]
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failover": [{"from": "us-west", "to": "us-east"}],
+                        "failoverPriority": ["topology.kubernetes.io/region"]
+                    }
                 }
             }
-        }
-    })
+        }),
     );
     let err = translate_k8s_objects(&[object], k8s_options())
         .expect_err("combined failover + failoverPriority must be rejected");
@@ -372,15 +371,15 @@ fn k8s_translator_rejects_non_string_failover_priority_entry() {
         "DestinationRule",
         "reviews",
         serde_json::json!({
-        "host": "reviews.default.svc.cluster.local",
-        "trafficPolicy": {
-            "loadBalancer": {
-                "localityLbSetting": {
-                    "failoverPriority": [1]
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failoverPriority": [1]
+                    }
                 }
             }
-        }
-    })
+        }),
     );
     let err = translate_k8s_objects(&[object], k8s_options())
         .expect_err("non-string failoverPriority entry must be rejected");
@@ -397,15 +396,15 @@ fn k8s_translator_rejects_whitespace_failover_priority_entry() {
         "DestinationRule",
         "reviews",
         serde_json::json!({
-        "host": "reviews.default.svc.cluster.local",
-        "trafficPolicy": {
-            "loadBalancer": {
-                "localityLbSetting": {
-                    "failoverPriority": [" version"]
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failoverPriority": [" version"]
+                    }
                 }
             }
-        }
-    })
+        }),
     );
     let err = translate_k8s_objects(&[object], k8s_options())
         .expect_err("leading whitespace failoverPriority entry must be rejected");

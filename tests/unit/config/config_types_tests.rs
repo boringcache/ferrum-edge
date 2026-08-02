@@ -274,7 +274,6 @@ fn upstream_locality_lb_setting_round_trips_through_serde() {
     assert_eq!(setting.failover[0].to, "us-east");
 }
 
-
 #[test]
 fn parse_failover_priority_entry_rejects_adversarial_shapes() {
     use ferrum_edge::config::types::parse_failover_priority_entry;

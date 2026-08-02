@@ -4,10 +4,11 @@
 //! least connections, least latency, consistent hashing, and random.
 
 use crate::config::types::{
-    GatewayConfig, LoadBalancerAlgorithm, LocalityPreference, Proxy, SubsetDefinition, Upstream,
-    UpstreamLocalityLbSetting, UpstreamPortOverride, UpstreamTarget, FAILOVER_PRIORITY_LABEL_NETWORK,
-    FAILOVER_PRIORITY_LABEL_REGION, FAILOVER_PRIORITY_LABEL_SUBZONE, FAILOVER_PRIORITY_LABEL_ZONE,
-    FAILOVER_PRIORITY_LABEL_CLUSTER, FAILOVER_PRIORITY_LABEL_HOSTNAME, parse_failover_priority_entry,
+    FAILOVER_PRIORITY_LABEL_CLUSTER, FAILOVER_PRIORITY_LABEL_HOSTNAME,
+    FAILOVER_PRIORITY_LABEL_NETWORK, FAILOVER_PRIORITY_LABEL_REGION,
+    FAILOVER_PRIORITY_LABEL_SUBZONE, FAILOVER_PRIORITY_LABEL_ZONE, GatewayConfig,
+    LoadBalancerAlgorithm, LocalityPreference, Proxy, SubsetDefinition, Upstream,
+    UpstreamLocalityLbSetting, UpstreamPortOverride, UpstreamTarget, parse_failover_priority_entry,
 };
 use crate::health_check::ProxyHealthState;
 use arc_swap::ArcSwap;
@@ -1944,11 +1945,8 @@ fn build_locality_lb_state(
     // source labels are empty — missing labels compare as "" on both sides,
     // matching Istio's map lookup semantics.
     if !setting.failover_priority.is_empty() {
-        let ranks = compute_failover_priority_ranks(
-            &setting.failover_priority,
-            source_labels,
-            targets,
-        );
+        let ranks =
+            compute_failover_priority_ranks(&setting.failover_priority, source_labels, targets);
         return Some(LocalityLbState {
             enabled: true,
             distribute_weights: None,
@@ -2161,9 +2159,10 @@ fn compute_failover_priority_ranks(
     {
         return targets.iter().map(|_| lowest).collect();
     }
-    let includes_network = failover_priority
-        .first()
-        .is_some_and(|entry| parse_failover_priority_entry(entry).is_some_and(|(key, _)| key == FAILOVER_PRIORITY_LABEL_NETWORK));
+    let includes_network = failover_priority.first().is_some_and(|entry| {
+        parse_failover_priority_entry(entry)
+            .is_some_and(|(key, _)| key == FAILOVER_PRIORITY_LABEL_NETWORK)
+    });
 
     // Resolve (key, expected_value) once for the source so the per-target loop
     // stays allocation-free.
@@ -2212,8 +2211,12 @@ fn endpoint_failover_priority_label<'a>(target: &'a UpstreamTarget, key: &str) -
         return value.as_str();
     }
     match key {
-        FAILOVER_PRIORITY_LABEL_REGION => locality_segment(target.locality.as_deref(), 0).unwrap_or(""),
-        FAILOVER_PRIORITY_LABEL_ZONE => locality_segment(target.locality.as_deref(), 1).unwrap_or(""),
+        FAILOVER_PRIORITY_LABEL_REGION => {
+            locality_segment(target.locality.as_deref(), 0).unwrap_or("")
+        }
+        FAILOVER_PRIORITY_LABEL_ZONE => {
+            locality_segment(target.locality.as_deref(), 1).unwrap_or("")
+        }
         FAILOVER_PRIORITY_LABEL_SUBZONE => {
             locality_segment(target.locality.as_deref(), 2).unwrap_or("")
         }
@@ -2764,12 +2767,8 @@ impl LoadBalancer {
         // `enabled: false` disables every locality-aware path; `distribute`
         // and `failover` are mutually exclusive at evaluation time so the
         // pre-compute below is allowed to populate one, the other, or neither.
-        let locality_lb = build_locality_lb_state(
-            locality_lb_setting,
-            source_locality,
-            source_labels,
-            targets,
-        );
+        let locality_lb =
+            build_locality_lb_state(locality_lb_setting, source_locality, source_labels, targets);
 
         // Strict local-first locality LB: precompute which targets are LOCAL so
         // the request path can restrict to them when no source locality

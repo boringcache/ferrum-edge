@@ -1759,8 +1759,7 @@ fn translate_locality_lb_setting(
                     ),
                 ));
             };
-            let Some((key, _override)) =
-                crate::config::types::parse_failover_priority_entry(raw)
+            let Some((key, _override)) = crate::config::types::parse_failover_priority_entry(raw)
             else {
                 return Err(invalid_resource(
                     object,

@@ -1610,7 +1610,8 @@ fn project_mesh_source_locality(
 fn mesh_source_workload_labels(
     mesh_slice: &MeshSlice,
 ) -> std::collections::HashMap<String, String> {
-    let mut labels = mesh_slice.labels.clone();
+    // Convert BTreeMap slice labels to HashMap for Upstream.source_labels.
+    let mut labels: HashMap<String, String> = mesh_slice.labels.clone().into_iter().collect();
     let source_workload = mesh_source_workload(mesh_slice);
     let locality = source_workload
         .and_then(|workload| workload.locality.as_deref())
@@ -1675,7 +1676,6 @@ fn mesh_source_workload(mesh_slice: &MeshSlice) -> Option<&crate::modes::mesh::c
     }
     matched
 }
-
 
 fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
     // The source workload is ALWAYS the LOCAL sidecar — never a remote-cluster

@@ -1443,11 +1443,17 @@ mod tests {
             vec![8080],
         );
         wl.selector.labels.insert("version".into(), "v1".into());
-        wl.selector.labels.insert("mesh.remote".into(), "true".into());
+        wl.selector
+            .labels
+            .insert("mesh.remote".into(), "true".into());
         wl.locality = Some("us-west/us-west-1/a".into());
         wl.network = Some("net-a".into());
         wl.cluster = Some("cluster-a".into());
-        let svc = service("reviews", vec!["spiffe://cluster.local/ns/default/sa/reviews"], vec![8080]);
+        let svc = service(
+            "reviews",
+            vec!["spiffe://cluster.local/ns/default/sa/reviews"],
+            vec![8080],
+        );
         let tags = mesh_hbone_target_tags(&svc, &wl, AppProtocol::Http, Some("http"));
         assert_eq!(tags.get("version").map(String::as_str), Some("v1"));
         assert!(
@@ -1455,7 +1461,8 @@ mod tests {
             "reserved mesh.remote workload label must not forge provenance; got {tags:?}"
         );
         assert_eq!(
-            tags.get("topology.kubernetes.io/region").map(String::as_str),
+            tags.get("topology.kubernetes.io/region")
+                .map(String::as_str),
             Some("us-west")
         );
         assert_eq!(

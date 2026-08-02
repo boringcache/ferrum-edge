@@ -3915,7 +3915,11 @@ fn validate_mesh_traffic_policy(
         validate_mesh_traffic_policy_tls(format!("{context}.tls"), tls, errors);
     }
     if let Some(locality) = policy.locality_lb_setting.as_ref() {
-        validate_mesh_locality_lb_setting(format!("{context}.locality_lb_setting"), locality, errors);
+        validate_mesh_locality_lb_setting(
+            format!("{context}.locality_lb_setting"),
+            locality,
+            errors,
+        );
     }
 }
 
@@ -3936,7 +3940,9 @@ fn validate_mesh_locality_lb_setting(
 
     for (idx, entry) in locality.distribute.iter().enumerate() {
         if entry.from.trim().is_empty() {
-            errors.push(format!("{context}.distribute[{idx}].from: must not be empty"));
+            errors.push(format!(
+                "{context}.distribute[{idx}].from: must not be empty"
+            ));
         }
         if entry.to.is_empty() {
             errors.push(format!("{context}.distribute[{idx}].to: must not be empty"));

@@ -2441,14 +2441,9 @@ fn failover_priority_recomputes_on_endpoint_reload() {
     );
     let cache = LoadBalancerCache::new(&config(initial));
     let snapshot = cache.load();
-    let selection = LoadBalancerCache::select_target_from(
-        &snapshot,
-        "ferrum",
-        "u1",
-        "before",
-        no_health(),
-    )
-    .expect("selected");
+    let selection =
+        LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "before", no_health())
+            .expect("selected");
     assert_eq!(selection.target.host, "v1-a.local");
 
     // Reload endpoints: only a v2 endpoint remains healthy-candidate pool,
@@ -2516,8 +2511,14 @@ fn failover_priority_enabled_false_suppresses_label_tiers() {
 fn failover_priority_order_of_keys_is_significant() {
     // Swapping the configured key order must change which endpoint wins.
     let source_labels = HashMap::from([
-        ("topology.kubernetes.io/region".to_string(), "us-west".to_string()),
-        ("topology.kubernetes.io/zone".to_string(), "us-west-1".to_string()),
+        (
+            "topology.kubernetes.io/region".to_string(),
+            "us-west".to_string(),
+        ),
+        (
+            "topology.kubernetes.io/zone".to_string(),
+            "us-west-1".to_string(),
+        ),
     ]);
     let targets = vec![
         labeled_target(
@@ -2580,14 +2581,15 @@ fn failover_priority_reads_mesh_network_cluster_fallback_tags() {
     // When topology.istio.io/network is absent, the LB still resolves
     // failoverPriority against the mesh.network / mesh.cluster tags stamped
     // by outbound materialization.
-    let source_labels = HashMap::from([(
-        "topology.istio.io/network".to_string(),
-        "net-a".to_string(),
-    )]);
+    let source_labels =
+        HashMap::from([("topology.istio.io/network".to_string(), "net-a".to_string())]);
     let mut same = labeled_target("same.local", None, &[]);
-    same.tags.insert("mesh.network".to_string(), "net-a".to_string());
+    same.tags
+        .insert("mesh.network".to_string(), "net-a".to_string());
     let mut other = labeled_target("other.local", None, &[]);
-    other.tags.insert("mesh.network".to_string(), "net-b".to_string());
+    other
+        .tags
+        .insert("mesh.network".to_string(), "net-b".to_string());
     let up = upstream_with_failover_priority(
         source_labels,
         vec![same, other],
@@ -2618,18 +2620,12 @@ fn failover_priority_network_first_demotes_without_dropping_later_matches() {
             labeled_target(
                 "cross-net-v1.local",
                 None,
-                &[
-                    ("topology.istio.io/network", "net-b"),
-                    ("version", "v1"),
-                ],
+                &[("topology.istio.io/network", "net-b"), ("version", "v1")],
             ),
             labeled_target(
                 "cross-net-v2.local",
                 None,
-                &[
-                    ("topology.istio.io/network", "net-b"),
-                    ("version", "v2"),
-                ],
+                &[("topology.istio.io/network", "net-b"), ("version", "v2")],
             ),
         ],
         vec![
