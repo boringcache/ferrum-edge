@@ -8873,10 +8873,29 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         let start = std::time::Instant::now();
         let diff = serde_json::to_string(&event.diff)?;
-        sqlx::query(&self.q("INSERT INTO audit_events \
+        // Insert-only and idempotent on the primary key (issue #2421).
+        // Durable-spool replay after a crash, a partial failure, or a shutdown
+        // deadline re-delivers the *same* `id`, so a second delivery must
+        // converge to the one already-durable row instead of raising a
+        // duplicate-key error the retry loop would keep burning attempts on.
+        // Neither branch ever mutates an existing audit row: PostgreSQL/SQLite
+        // use `DO NOTHING`, and MySQL's `ON DUPLICATE KEY UPDATE id = id`
+        // assigns the primary key to itself, which is a no-op write of no
+        // column. `INSERT IGNORE` is deliberately not used because it also
+        // downgrades unrelated errors (truncation, bad values) to warnings and
+        // would silently accept a malformed audit row. This is a single
+        // statement, so it needs no transaction.
+        let on_conflict = if self.db_type == "mysql" {
+            " ON DUPLICATE KEY UPDATE id = id"
+        } else {
+            " ON CONFLICT (id) DO NOTHING"
+        };
+        sqlx::query(&self.q(&format!(
+            "INSERT INTO audit_events \
              (id, ts, actor, action, resource_type, resource_id, namespace, \
               source_address, request_id, outcome, diff) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?){on_conflict}"
+        )))
         .bind(&event.id)
         .bind(audit_ts_string(&event.ts))
         .bind(&event.actor)

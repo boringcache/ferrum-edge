@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Audited admin mutations are durable **before they run** (issue #2421).
+  The admin write gate fsyncs a pre-mutation audit intent — a stable event id
+  plus the authenticated actor, method, sanitized path / namespace, canonical
+  socket source address, and bounded request id — into
+  `FERRUM_ADMIN_AUDIT_SPOOL_DIR` before the
+  configuration mutation is invoked, and durably finalizes that same id with
+  `success` or `failure` once the mutation returns. A crash between commit and
+  finalize replays as an explicit `outcome: unknown_outcome` event, never a
+  silent deletion and never an inferred outcome. Records live under
+  per-process-generation instance directories whose ownership lock is held
+  exclusively for the process lifetime, so several gateways may share one spool
+  root and no process can classify its own in-flight record; every record is
+  bound to a non-secret audit-destination identity (backend type, namespace, and
+  a digest of the redacted connection URL) so a reconfigured gateway cannot
+  replay another deployment's evidence into the wrong database. Discovery and
+  replay start with the mode's database backend rather than waiting for a later
+  mutation. Mutation settlement tasks explicitly carry the request audit slot
+  across `tokio::spawn`, and cancellation ownership transfers before spawn so a
+  disconnected client cannot race the detailed outcome against a generic
+  fallback record. The blocking prepare/fsync is itself detached and settles a
+  cancellation that arrived mid-write as `unknown_outcome`, so the newly
+  durable intent cannot remain dormant in a live process generation. Delivery
+  is at-least-once on the stable id and every backend
+  insert is insert-only and idempotent (PostgreSQL/SQLite `ON CONFLICT (id) DO
+  NOTHING`, MySQL `ON DUPLICATE KEY UPDATE id = id`, MongoDB `insert_one` with
+  duplicate-key treated as success), so a duplicate delivery converges to the
+  existing immutable row instead of replacing it. Directory fsync failures are
+  treated as durability failures; corrupt, unrecoverable, and
+  foreign-destination records are quarantined under `<spool>/failed/` and that
+  degradation is sticky until the evidence is resolved. Health and metrics reads
+  are O(1) from atomics and cached background state. Graceful shutdown closes
+  admission, drains every accepted queue entry, interrupts retry waits, and
+  explicitly aborts **and joins** the delivery worker rather than detaching it;
+  a memory-only deadline loss is counted and latches degraded health. Managed
+  TLS/ACME file-store mutations and explicit TLS rotation actions, which also
+  emit audit events, now take the same durable pre-action handoff without
+  inheriting config-database topology gates. New `FERRUM_ADMIN_AUDIT_{SPOOL_DIR,
+  UNAVAILABLE_POLICY,QUEUE_CAPACITY,SPOOL_MAX_RECORDS,RETAINED_MAX_RECORDS,
+  MAX_DELIVERY_ATTEMPTS}` settings, `ferrum_admin_audit_*` Prometheus families,
+  and an authenticated `/health` `audit_pipeline` object.
+
 - Admin audit events gain optional `source_address`, `request_id`, and
   `outcome` fields (folded into the baseline `audit_events` schema).
   `GET /backup` always admits a durable security record before releasing
