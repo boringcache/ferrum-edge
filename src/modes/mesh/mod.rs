@@ -11200,6 +11200,7 @@ fn start_mesh_admin_listeners(
         mode: "mesh".to_string(),
         read_only: true,
         admin_audit_enabled: env_config.admin_audit_enabled,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: env_config.admin_require_namespace_claim,
         startup_ready: Some(startup_ready.clone()),
         serving_degraded: Some(serving_degraded.clone()),
@@ -14637,7 +14638,7 @@ pub mod startup_rollback_test_seams {
     }
 
     fn ensure_crypto_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = crate::fips::base_crypto_provider().install_default();
     }
 
     fn probe_runtime_config() -> MeshRuntimeConfig {
@@ -15003,7 +15004,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn ensure_crypto_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = crate::fips::base_crypto_provider().install_default();
     }
 
     /// The SVID slot `load_mesh_frontend_server_identity` resolves the

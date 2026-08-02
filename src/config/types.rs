@@ -6148,7 +6148,7 @@ fn verify_country_mmdb_path_digest(
     opened_version: &CountryMmdbFileVersion,
     expected_digest: &CountryMmdbDigest,
 ) -> Result<(), CountryMmdbLoadError> {
-    use sha2::{Digest as _, Sha256};
+    use crate::fips::approved::Sha256;
     use std::io::Read as _;
 
     let mut path_file = std::fs::File::open(path).map_err(|error| {
@@ -6214,7 +6214,7 @@ fn verify_country_mmdb_path_digest(
     }
     verify_country_mmdb_path_still_matches(path, opened_version)?;
 
-    let observed_digest: CountryMmdbDigest = hasher.finalize().into();
+    let observed_digest: CountryMmdbDigest = hasher.finalize();
     if &observed_digest != expected_digest {
         return Err(CountryMmdbLoadError::Invalid(format!(
             "MaxMind database path target '{path}' was replaced while it was being loaded"
@@ -6244,7 +6244,7 @@ fn load_validated_country_mmdb_inner(
     validation_generation: Option<u64>,
     aggregate_budget: Option<&mut CountryMmdbAggregateBudget>,
 ) -> Result<Arc<CountryMmdbSnapshot>, CountryMmdbLoadError> {
-    use sha2::{Digest as _, Sha256};
+    use crate::fips::approved::Sha256;
     use std::io::{Read as _, Seek as _, SeekFrom};
 
     // Reject FIFOs, devices, sockets, and directories before opening. On Unix
@@ -6340,7 +6340,7 @@ fn load_validated_country_mmdb_inner(
     }
     verify_country_mmdb_path_still_matches(path, &file_version)?;
 
-    let digest: CountryMmdbDigest = hasher.finalize().into();
+    let digest: CountryMmdbDigest = hasher.finalize();
     #[cfg(not(unix))]
     verify_country_mmdb_path_digest(path, &file_version, &digest)?;
     // Charge the same content identity used by the snapshot cache. This runs
@@ -6412,7 +6412,7 @@ fn load_validated_country_mmdb_inner(
     }
     verify_country_mmdb_path_still_matches(path, &file_version)?;
 
-    let loaded_digest: CountryMmdbDigest = Sha256::digest(&bytes).into();
+    let loaded_digest: CountryMmdbDigest = Sha256::digest(&bytes);
     if loaded_digest != digest {
         return Err(CountryMmdbLoadError::Invalid(format!(
             "MaxMind database file '{path}' changed between identity and snapshot reads"
@@ -8024,9 +8024,7 @@ pub(crate) fn hash_basic_auth_password_with_secret(
     password: &str,
     secret: Option<&str>,
 ) -> Result<String, BasicAuthCredentialPreparationError> {
-    use hmac::{Hmac, KeyInit, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
+    use crate::fips::approved::HmacSha256;
 
     let secret = secret.ok_or_else(|| {
         BasicAuthCredentialPreparationError::ServerConfiguration(

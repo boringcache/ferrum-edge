@@ -1,3 +1,4 @@
+use crate::fips::approved::Sha256;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -5,7 +6,6 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as DashEntry;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct TokenKey {
@@ -16,7 +16,7 @@ impl TokenKey {
     pub fn from_token(token: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(token.as_bytes());
-        let digest: [u8; 32] = hasher.finalize().into();
+        let digest: [u8; 32] = hasher.finalize();
         Self { digest }
     }
 

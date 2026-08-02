@@ -43,8 +43,8 @@
 //! }
 //! ```
 
+use crate::fips::backend::rand::SecureRandom;
 use async_trait::async_trait;
-use ring::rand::SecureRandom;
 use serde_json::{Map, Value};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::callsite::{DefaultCallsite, Identifier};
@@ -341,7 +341,7 @@ impl WsFrameLogging {
         }
         let payload_fingerprint_key = if include_payload_preview {
             let mut key = [0u8; 32];
-            ring::rand::SystemRandom::new()
+            crate::fips::backend::rand::SystemRandom::new()
                 .fill(&mut key)
                 .map_err(|_| {
                     "ws_frame_logging: failed to generate payload fingerprint key".to_string()
@@ -565,8 +565,9 @@ fn reject_unknown_keys(object: &Map<String, Value>) -> Result<(), String> {
 /// `full_len` is the total payload length reported to operators, and
 /// `truncated` indicates the digest only covers a prefix of the payload.
 fn payload_fingerprint(key: &[u8; 32], hashed: &[u8], full_len: usize, truncated: bool) -> String {
-    let hmac_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
-    let digest = ring::hmac::sign(&hmac_key, hashed);
+    let hmac_key =
+        crate::fips::backend::hmac::Key::new(crate::fips::backend::hmac::HMAC_SHA256, key);
+    let digest = crate::fips::backend::hmac::sign(&hmac_key, hashed);
     // 6 bytes -> 12 lowercase hex chars: enough entropy to correlate frames
     // within a plugin instance while staying compact in log lines.
     let prefix = hex::encode(&digest.as_ref()[..6]);

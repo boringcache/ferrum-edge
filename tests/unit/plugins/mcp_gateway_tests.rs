@@ -8919,6 +8919,10 @@ async fn validate_tool_results_accepts_local_ref_and_combinator_output_schema() 
         "SSE/uninspectable tool-result rejects must be replaceable under enforcement"
     );
     assert!(
+        plugin.rejection_replacement_is_final_body_policy_terminal(),
+        "the fixed JSON-RPC rejection envelope is the final gateway terminal"
+    );
+    assert!(
         plugin.may_enforce_response_body_policy(&ctx),
         "routed tools/call with a compiled outputSchema must stage private enforcement"
     );

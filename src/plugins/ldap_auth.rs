@@ -38,19 +38,18 @@
 //! closes DNS-rebinding windows without replacing the hostname used for TLS
 //! certificate and SNI verification.
 
+use crate::fips::approved::HmacSha256;
+use crate::fips::backend::rand::SecureRandom;
 use async_trait::async_trait;
 use base64::Engine;
 use dashmap::DashMap;
-use hmac::{Hmac, KeyInit, Mac};
 use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, Scope, SearchEntry, SearchOptions, StdStream};
-use ring::rand::SecureRandom;
 use rustls::ClientConfig;
 #[cfg(test)]
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::CertificateRevocationListDer;
 use serde_json::Map;
 use serde_json::Value;
-use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -69,8 +68,6 @@ use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use super::utils::PluginHttpClient;
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
 use super::{RequestContext, strip_auth_scheme};
-
-type HmacSha256 = Hmac<Sha256>;
 
 pub const LDAP_AUTH_DEFAULT_CACHE_TTL_SECONDS: u64 = 0;
 pub const LDAP_AUTH_MAX_CACHE_TTL_SECONDS: u64 = 86_400;
@@ -451,7 +448,7 @@ impl LdapAuth {
             None
         } else {
             let mut key = Zeroizing::new([0u8; 32]);
-            ring::rand::SystemRandom::new()
+            crate::fips::backend::rand::SystemRandom::new()
                 .fill(key.as_mut())
                 .map_err(|_| "ldap_auth: failed to generate cache HMAC key".to_string())?;
             Some(key)
@@ -523,7 +520,7 @@ impl LdapAuth {
             return None;
         };
         let username_len = u64::try_from(username.len()).ok()?;
-        mac.update(&username_len.to_be_bytes());
+        mac.update(username_len.to_be_bytes());
         mac.update(username.as_bytes());
         mac.update(password.as_bytes());
         let digest = mac.finalize().into_bytes();
@@ -1371,7 +1368,7 @@ fn build_ldap_tls_config(
     // unit tests that exercise `LdapAuth::new()` before `install_default()`
     // has run. Always supplying the provider explicitly avoids that ordering
     // hazard.
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(crate::fips::base_crypto_provider());
     let builder = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("ldap_auth: failed to build rustls client config: {e}"))?;
@@ -1730,7 +1727,7 @@ mod tests {
 
     fn ensure_crypto_provider() {
         INIT_CRYPTO.call_once(|| {
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            let _ = crate::fips::base_crypto_provider().install_default();
         });
     }
 
@@ -1811,15 +1808,11 @@ mod tests {
 
     #[test]
     fn cache_key_is_random_keyed_hmac_not_bare_password_digest() {
-        use sha2::Digest;
-
         let first = cached_test_plugin(4);
         let second = cached_test_plugin(4);
         let first_key = must_some(first.cache_key("alice", "password"), "first cache key");
         let second_key = must_some(second.cache_key("alice", "password"), "second cache key");
-        let digest = sha2::Sha256::digest(b"password");
-        let mut bare_password_digest = [0u8; 32];
-        bare_password_digest.copy_from_slice(&digest);
+        let bare_password_digest = crate::fips::approved::Sha256::digest(b"password");
 
         assert_ne!(first_key.0, bare_password_digest);
         assert_ne!(first_key.0, second_key.0);
@@ -1951,7 +1944,7 @@ mod tests {
             ),
             "private key should be present",
         );
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(crate::fips::base_crypto_provider());
         let builder = must(
             rustls::ServerConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions(),

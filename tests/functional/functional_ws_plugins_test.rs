@@ -1133,3 +1133,236 @@ async fn test_ws_size_rejection_preserved_over_rate_limiter_backend_direction_e2
 
     echo_handle.abort();
 }
+
+// ============================================================================
+// WAF WebSocket application-message inspection (GHSA-6j3m-vf5h-pgcx)
+// ============================================================================
+
+/// Token that no built-in WAF rule matches, so a block can only come from the
+/// custom rule configured by these tests.
+const WAF_PROHIBITED_TOKEN: &str = "ferrum-prohibited-token";
+
+/// `waf` plugin config with one enforcing rule on the given body target.
+fn waf_plugin_config_yaml(target: &str) -> String {
+    format!(
+        r#"  - id: "ws-waf"
+    plugin_name: "waf"
+    scope: "proxy"
+    proxy_id: "ws-echo-proxy"
+    enabled: true
+    config:
+      include_default_rules: false
+      response_inspection: true
+      response_body_inspection: true
+      custom_rules:
+        - id: "CUSTOM-WS-BLOCK"
+          name: "prohibited token"
+          category: "custom"
+          target: "{target}"
+          match_kind: "contains"
+          pattern: "{WAF_PROHIBITED_TOKEN}"
+          action: "enforce""#
+    )
+}
+
+async fn spawn_waf_ws_gateway(backend_port: u16, target: &str) -> TestGateway {
+    spawn_ws_plugins_gateway(
+        backend_port,
+        &waf_plugin_config_yaml(target),
+        r#"      - plugin_config_id: "ws-waf""#,
+    )
+    .await
+}
+
+type TestWsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Read until the gateway's policy Close arrives, failing on an echo reply.
+async fn expect_waf_policy_close(ws: &mut TestWsStream) {
+    let close = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(close @ Message::Close(_))) => break close,
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                other => panic!("expected a WAF policy close, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("WAF policy close timed out");
+
+    let Message::Close(Some(close)) = close else {
+        panic!("WAF close carried no code/reason");
+    };
+    assert_eq!(
+        close.code,
+        CloseCode::Policy,
+        "WAF message rejection must use RFC 6455 code 1008"
+    );
+    assert!(
+        !close.reason.as_str().contains(WAF_PROHIBITED_TOKEN),
+        "close reason must never echo message bytes"
+    );
+}
+
+/// H1 upgrade: a clean message is proxied, and a message carrying a token an
+/// enforcing WAF body rule rejects never reaches the backend.
+#[ignore]
+#[tokio::test]
+async fn test_waf_blocks_prohibited_client_message_e2e() {
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
+
+    let gateway = spawn_waf_ws_gateway(backend_port, "body_text").await;
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway.proxy_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect WebSocket");
+
+    ws.send(Message::Text("an ordinary lookup".into()))
+        .await
+        .expect("send clean message");
+    let reply = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("clean echo timed out")
+        .expect("stream ended")
+        .expect("clean echo error");
+    assert_eq!(reply, Message::Text("Echo: an ordinary lookup".into()));
+
+    ws.send(Message::Text(WAF_PROHIBITED_TOKEN.into()))
+        .await
+        .expect("send prohibited message");
+    expect_waf_policy_close(&mut ws).await;
+
+    echo_handle.abort();
+}
+
+/// A Binary opcode is not a bypass: WebSocket messages carry no `Content-Type`,
+/// so the HTTP `inspect_binary_body` selector deliberately does not gate them.
+#[ignore]
+#[tokio::test]
+async fn test_waf_blocks_prohibited_binary_message_e2e() {
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
+
+    let gateway = spawn_waf_ws_gateway(backend_port, "body_text").await;
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway.proxy_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect WebSocket");
+
+    let payload = WAF_PROHIBITED_TOKEN.as_bytes().to_vec();
+    ws.send(Message::Binary(payload.into()))
+        .await
+        .expect("send prohibited binary message");
+    expect_waf_policy_close(&mut ws).await;
+
+    echo_handle.abort();
+}
+
+/// Fragmentation is invisible to the rule engine: the token is split across an
+/// initial non-final Text frame and a final Continuation frame, so neither
+/// fragment contains it. The parser reassembles before the WAF message hook,
+/// so the complete message is still rejected.
+#[ignore]
+#[tokio::test]
+async fn test_waf_blocks_prohibited_fragmented_message_e2e() {
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
+
+    let gateway = spawn_waf_ws_gateway(backend_port, "body_text").await;
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway.proxy_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect WebSocket");
+
+    let (head, tail) = WAF_PROHIBITED_TOKEN.split_at(8);
+    ws.send(Message::Frame(Frame::message(
+        head.as_bytes().to_vec(),
+        OpCode::Data(Data::Text),
+        false,
+    )))
+    .await
+    .expect("send initial fragment");
+    ws.send(Message::Frame(Frame::message(
+        tail.as_bytes().to_vec(),
+        OpCode::Data(Data::Continue),
+        true,
+    )))
+    .await
+    .expect("send final continuation");
+
+    expect_waf_policy_close(&mut ws).await;
+
+    echo_handle.abort();
+}
+
+/// Backend→client messages are governed by the response body rule set, so a
+/// prohibited payload coming back from the backend is rejected too.
+#[ignore]
+#[tokio::test]
+async fn test_waf_blocks_prohibited_backend_message_e2e() {
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
+
+    let gateway = spawn_waf_ws_gateway(backend_port, "response_body").await;
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway.proxy_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect WebSocket");
+
+    // Only the response direction is governed, so this message reaches the
+    // backend; the echo carrying it back is what the WAF rejects.
+    ws.send(Message::Text(WAF_PROHIBITED_TOKEN.into()))
+        .await
+        .expect("send message echoed back by the backend");
+    expect_waf_policy_close(&mut ws).await;
+
+    echo_handle.abort();
+}
+
+/// Control frames are protocol machinery, never application payload: a Ping
+/// whose payload matches an enforcing rule must still be answered normally.
+#[ignore]
+#[tokio::test]
+async fn test_waf_never_scans_websocket_control_frames_e2e() {
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
+
+    let gateway = spawn_waf_ws_gateway(backend_port, "body_text").await;
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway.proxy_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect WebSocket");
+
+    let payload = WAF_PROHIBITED_TOKEN.as_bytes().to_vec();
+    ws.send(Message::Ping(payload.clone().into()))
+        .await
+        .expect("send ping carrying the token");
+
+    let pong = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Pong(data))) => break data,
+                Some(Ok(Message::Ping(_))) => continue,
+                other => panic!("expected a pong, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("pong timed out");
+    assert_eq!(pong.as_ref(), payload.as_slice());
+
+    // The session is still usable afterwards.
+    ws.send(Message::Text("still open".into()))
+        .await
+        .expect("send follow-up message");
+    let reply = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("follow-up echo timed out")
+        .expect("stream ended")
+        .expect("follow-up echo error");
+    assert_eq!(reply, Message::Text("Echo: still open".into()));
+
+    echo_handle.abort();
+}

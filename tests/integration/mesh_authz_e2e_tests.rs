@@ -1586,6 +1586,51 @@ async fn stream_port_scoped_deny_ignores_non_matching_port_and_admits_relay() {
     );
 }
 
+fn allow_except_not_port_pattern(name: &str, pattern: &str) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: vec![RequestMatch {
+                not_port_patterns: vec![pattern.to_string()],
+                ..RequestMatch::default()
+            }],
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Allow,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn stream_not_port_pattern_denies_matching_app_port() {
+    let allow = allow_except_not_port_pattern("allow-except-6-prefix", "6*");
+    let plugin = build_mesh_authz_for_workload(&[], vec![allow]);
+
+    let mut blocked = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut blocked).await,
+            PluginResult::Reject { .. }
+        ),
+        "stream app port 6379 matching notPorts 6* must fall through to implicit deny"
+    );
+
+    let mut allowed = inbound_stream_ctx(5432, CLIENT_SPIFFE);
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut allowed).await,
+            PluginResult::Continue
+        ),
+        "stream app port 5432 outside notPorts 6* must be allowed"
+    );
+}
+
 /// Build a `MeshAuthz` plugin that enforces a single `MeshPolicy` (no workload
 /// selector — mesh-wide). Used by stream-path IP-split tests below.
 fn build_stream_authz(policy: MeshPolicy) -> MeshAuthz {
