@@ -6958,11 +6958,12 @@ components:
           description: >-
             Fixed-cardinality result: `success`, `failure`, `denied`,
             `validation_failed`, `unavailable`, or `unknown_outcome`.
-            `unknown_outcome` marks an audited mutation whose process died
-            between the config-database commit and the durable finalize
-            (issue #2421): the change may or may not have taken effect, and the
-            outcome is recorded as unknowable rather than inferred. Omitted when
-            empty (legacy mutation events).
+            `unknown_outcome` marks an audited mutation whose trustworthy
+            outcome observer was lost to process exit or request cancellation
+            after preparation and before durable finalize (issue #2421): the
+            change may or may not have taken effect, and the outcome is recorded
+            as unknowable rather than inferred. Omitted when empty (legacy
+            mutation events).
         diff:
           type: object
           additionalProperties: true
@@ -11262,6 +11263,33 @@ components:
         - degraded
         - degraded_reason
         - evidence_lost
+        - queue_capacity
+        - spool_max_records
+        - retained_max_records
+        - max_delivery_attempts
+        - accepted_total
+        - prepared_total
+        - finalized_total
+        - unknown_outcome_total
+        - enqueued_total
+        - delivered_total
+        - retries_total
+        - delivery_failures_total
+        - retained_total
+        - replayed_total
+        - corrupt_records_total
+        - destination_mismatch_total
+        - truncated_diffs_total
+        - dropped_durable_handoff_failed_total
+        - dropped_no_durable_spool_total
+        - dropped_retained_capacity_total
+        - fail_open_unaudited_mutations_total
+        - fail_closed_rejections_total
+        - queue_depth
+        - delivery_in_flight
+        - spool_prepared_records
+        - spool_pending_records
+        - spool_retained_records
       properties:
         enabled:
           type: boolean
@@ -11355,9 +11383,10 @@ components:
           type: integer
           format: uint64
           description: >-
-            Prepared records adopted from a prior process generation that died
-            before the mutation outcome was known. Stored with
-            `outcome = unknown_outcome`; never inferred as success or failure.
+            Prepared records whose trustworthy outcome observer was lost to
+            process exit or request cancellation before the mutation outcome
+            was known. Stored with `outcome = unknown_outcome`; never inferred
+            as success or failure.
         enqueued_total:
           type: integer
           format: uint64

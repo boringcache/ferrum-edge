@@ -133,9 +133,10 @@ pub enum AuditOutcome {
     Denied,
     ValidationFailed,
     Unavailable,
-    /// A prepared record from a prior process generation was never finalized.
-    /// The mutation may or may not have committed; the outcome is unknowable
-    /// and is recorded as exactly that, never inferred (issue #2421).
+    /// A prepared record lost its trustworthy outcome observer (process exit or
+    /// request-task cancellation before settlement ownership). The mutation
+    /// may or may not have committed; the outcome is recorded as unknowable,
+    /// never inferred (issue #2421).
     UnknownOutcome,
 }
 
@@ -939,7 +940,10 @@ pub struct AuditPipeline {
     generation: String,
     spool: Option<Arc<AuditSpool>>,
     metrics: Arc<AuditPipelineMetrics>,
-    available: AtomicBool,
+    /// `None` means durable admission is available; every other value is the
+    /// exact reason the fail-closed gate must refuse the next audited mutation.
+    /// One atomic keeps the availability bit and reason from contradicting one
+    /// another in health snapshots.
     last_unavailable_reason: AtomicU8,
     /// Sticky degradation, deliberately *not* cleared by a later delivery.
     degraded_reason: AtomicU8,
@@ -997,13 +1001,11 @@ impl AuditPipeline {
             );
         }
 
-        let available = !config.enabled || spool.is_some();
         let pipeline = Self {
             config,
             generation,
             spool,
             metrics,
-            available: AtomicBool::new(available),
             last_unavailable_reason: AtomicU8::new(reason as u8),
             degraded_reason: AtomicU8::new(AuditUnavailableReason::None as u8),
             evidence_lost: AtomicBool::new(false),
@@ -1055,7 +1057,9 @@ impl AuditPipeline {
 
     /// True when a committed mutation can still be durably audited.
     pub fn is_available(&self) -> bool {
-        !self.config.enabled || self.available.load(Ordering::Acquire)
+        !self.config.enabled
+            || self.last_unavailable_reason.load(Ordering::Acquire)
+                == AuditUnavailableReason::None as u8
     }
 
     pub fn last_unavailable_reason(&self) -> AuditUnavailableReason {
@@ -1073,8 +1077,7 @@ impl AuditPipeline {
 
     fn mark_unavailable(&self, reason: AuditUnavailableReason) {
         self.last_unavailable_reason
-            .store(reason as u8, Ordering::Relaxed);
-        self.available.store(false, Ordering::Release);
+            .store(reason as u8, Ordering::Release);
     }
 
     /// Record sticky evidence damage.
@@ -1108,7 +1111,7 @@ impl AuditPipeline {
             .store(AuditUnavailableReason::None as u8, Ordering::Relaxed);
     }
 
-    /// Restore availability after a successful durable handoff or delivery.
+    /// Restore availability after a successful durable prepare.
     ///
     /// Memory-only mode never becomes "available": there is no durable handoff
     /// to recover, so a delivered event must not paper over the fact that a
@@ -1119,8 +1122,37 @@ impl AuditPipeline {
             return;
         }
         self.last_unavailable_reason
-            .store(AuditUnavailableReason::None as u8, Ordering::Relaxed);
-        self.available.store(true, Ordering::Release);
+            .store(AuditUnavailableReason::None as u8, Ordering::Release);
+    }
+
+    /// Finalization proves the spool is writable but does not free a record
+    /// slot: prepared evidence merely becomes pending evidence. It can recover
+    /// an I/O failure, but never a saturation failure.
+    fn mark_available_after_finalize(&self) {
+        let observed = self.last_unavailable_reason.load(Ordering::Acquire);
+        if observed == AuditUnavailableReason::SpoolSaturated as u8
+            || observed == AuditUnavailableReason::NoDurableSpool as u8
+        {
+            return;
+        }
+        let _ = self.last_unavailable_reason.compare_exchange(
+            observed,
+            AuditUnavailableReason::None as u8,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Delivery or retention removes a pending record and therefore resolves
+    /// an observed pending-capacity failure. It must not clear an unrelated
+    /// spool I/O failure.
+    fn mark_capacity_available(&self) {
+        let _ = self.last_unavailable_reason.compare_exchange(
+            AuditUnavailableReason::SpoolSaturated as u8,
+            AuditUnavailableReason::None as u8,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
     }
 
     /// Whether the admin write gate must refuse audited mutations right now.
@@ -1245,7 +1277,7 @@ impl AuditPipeline {
             Ok(()) => {
                 self.metrics.finalized.fetch_add(1, Ordering::Relaxed);
                 self.refresh_spool_gauges();
-                self.mark_available();
+                self.mark_available_after_finalize();
                 Ok(record)
             }
             Err(error) => {
@@ -1270,17 +1302,16 @@ impl AuditPipeline {
                     "Delivered admin audit event could not be removed from the spool; it will \
                      be replayed idempotently"
                 );
+            } else {
+                self.mark_capacity_available();
             }
             self.refresh_spool_gauges();
         }
-        self.mark_available();
     }
 
     /// Move an event that exhausted its retry budget into operator-visible
     /// retention. Never silently deletes while retention capacity remains.
     fn note_unrecoverable(&self, record: &SpooledAuditRecord) {
-        self.metrics.retained.fetch_add(1, Ordering::Relaxed);
-        self.mark_unavailable(AuditUnavailableReason::DeliveryExhausted);
         self.mark_degraded(AuditUnavailableReason::DeliveryExhausted);
         let Some(spool) = self.spool.as_ref() else {
             self.metrics.dropped_no_spool.fetch_add(1, Ordering::Relaxed);
@@ -1293,8 +1324,10 @@ impl AuditPipeline {
             );
             return;
         };
+        self.metrics.retained.fetch_add(1, Ordering::Relaxed);
         match spool.retain_unrecoverable(record.id()) {
             Ok(true) => {
+                self.mark_capacity_available();
                 error!(
                     audit_event_id = %record.id(),
                     surface = "audit_event_unrecoverable",
@@ -1304,11 +1337,11 @@ impl AuditPipeline {
                 );
             }
             Ok(false) => {
+                self.mark_capacity_available();
                 self.metrics
                     .dropped_retained_capacity
                     .fetch_add(1, Ordering::Relaxed);
                 self.evidence_lost.store(true, Ordering::Relaxed);
-                self.mark_unavailable(AuditUnavailableReason::RetainedCapacity);
                 self.mark_degraded(AuditUnavailableReason::RetainedCapacity);
                 error!(
                     audit_event_id = %record.id(),
@@ -1330,6 +1363,43 @@ impl AuditPipeline {
             }
         }
         self.refresh_spool_gauges();
+    }
+
+    /// Account for a memory-only record whose retry wait was interrupted by
+    /// shutdown. It cannot be deferred to a later process and was never placed
+    /// in retained storage, so report a real drop rather than inflating the
+    /// retained counter.
+    fn note_shutdown_memory_loss(&self, record: &SpooledAuditRecord) {
+        self.metrics.dropped_no_spool.fetch_add(1, Ordering::Relaxed);
+        self.mark_unavailable(AuditUnavailableReason::NoDurableSpool);
+        self.evidence_lost.store(true, Ordering::Relaxed);
+        self.mark_degraded(AuditUnavailableReason::NoDurableSpool);
+        error!(
+            audit_event_id = %record.id(),
+            surface = "audit_shutdown",
+            reason = AuditUnavailableReason::NoDurableSpool.as_str(),
+            "Admin audit shutdown interrupted delivery of a memory-only event; the event \
+             cannot survive process exit"
+        );
+    }
+
+    /// Account for a finalized memory-only record that could not enter a live
+    /// delivery queue. The event has no durable representation, so returning a
+    /// successful handoff would be a silent audit gap.
+    fn note_memory_enqueue_loss(
+        &self,
+        reason: AuditUnavailableReason,
+        event_id: &str,
+    ) -> Result<(), anyhow::Error> {
+        self.metrics.dropped_no_spool.fetch_add(1, Ordering::Relaxed);
+        self.mark_unavailable(reason);
+        self.evidence_lost.store(true, Ordering::Relaxed);
+        self.mark_degraded(AuditUnavailableReason::NoDurableSpool);
+        Err(anyhow!(
+            "admin audit event {} was not enqueued ({})",
+            event_id,
+            reason.as_str()
+        ))
     }
 
     /// Adopt records abandoned by prior process generations.
@@ -1387,6 +1457,14 @@ impl AuditPipeline {
     pub fn reconcile(&self) {
         if let Some(spool) = self.spool.as_ref() {
             spool.resync_counts();
+            let stats = spool.stats();
+            if stats
+                .prepared_records
+                .saturating_add(stats.pending_records)
+                < self.config.spool_max_records
+            {
+                self.mark_capacity_available();
+            }
         }
         self.refresh_spool_gauges();
         self.clear_degraded_if_resolved();
@@ -1411,7 +1489,6 @@ static DISABLED_PIPELINE: LazyLock<Arc<AuditPipeline>> = LazyLock::new(|| {
         generation: Uuid::new_v4().to_string(),
         spool: None,
         metrics: Arc::new(AuditPipelineMetrics::default()),
-        available: AtomicBool::new(true),
         last_unavailable_reason: AtomicU8::new(AuditUnavailableReason::None as u8),
         degraded_reason: AtomicU8::new(AuditUnavailableReason::None as u8),
         evidence_lost: AtomicBool::new(false),
@@ -1516,6 +1593,10 @@ struct AuditRequestSlotInner {
 #[derive(Debug, Default)]
 pub struct AuditRequestSlot {
     inner: Mutex<AuditRequestSlotInner>,
+    /// A cancellation-safe settlement task owns finalization once true. The
+    /// parent request must then leave the prepared intent alone if it is
+    /// cancelled while that task continues.
+    cancellation_transferred: AtomicBool,
 }
 
 impl AuditRequestSlot {
@@ -1577,12 +1658,110 @@ pub fn new_request_slot(method: &str, path: &str, namespace: &str) -> Arc<AuditR
     slot
 }
 
+struct AuditScopeCompletion {
+    slot: Arc<AuditRequestSlot>,
+    completed: bool,
+    owns_transferred_cancellation: bool,
+}
+
+impl Drop for AuditScopeCompletion {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if !self.owns_transferred_cancellation
+            && self.slot.cancellation_transferred.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let slot = Arc::clone(&self.slot);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            // The prepared record remains durable and will be claimed as an
+            // unknown outcome by the next process generation.
+            return;
+        };
+        // Drop detaches only this tiny cancellation finalizer; its durable
+        // input already exists on disk, so runtime shutdown still leaves the
+        // next process able to adopt it.
+        std::mem::drop(runtime.spawn(async move {
+            finalize_unconsumed_intent_with_evidence(
+                &slot,
+                AuditOutcome::UnknownOutcome,
+                "request_task_cancelled_before_outcome_was_observed",
+                None,
+            )
+            .await;
+        }));
+    }
+}
+
 /// Run `future` with `slot` installed as the current request's audit slot.
 pub async fn scope_request<F: std::future::Future>(
     slot: Arc<AuditRequestSlot>,
     future: F,
 ) -> F::Output {
-    AUDIT_REQUEST_SLOT.scope(slot, future).await
+    scope_request_with_cancellation_ownership(slot, future, false).await
+}
+
+async fn scope_request_with_cancellation_ownership<F: std::future::Future>(
+    slot: Arc<AuditRequestSlot>,
+    future: F,
+    owns_transferred_cancellation: bool,
+) -> F::Output {
+    let mut completion = AuditScopeCompletion {
+        slot: Arc::clone(&slot),
+        completed: false,
+        owns_transferred_cancellation,
+    };
+    let output = AUDIT_REQUEST_SLOT.scope(slot, future).await;
+    completion.completed = true;
+    output
+}
+
+/// Spawn mutation-owned work with the current request's audit slot installed.
+///
+/// Tokio task-local state is not inherited by `tokio::spawn`. Admin CRUD and
+/// API-spec persistence deliberately outlive cancellation of the request task,
+/// so they must carry this slot explicitly or their successful audit event
+/// cannot adopt the pre-mutation intent's stable id.
+pub fn spawn_with_request_slot<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let slot = current_slot();
+    if let Some(slot) = slot.as_ref() {
+        // Transfer cancellation responsibility before spawning so the parent
+        // cannot race task scheduling and finalize the same intent first.
+        slot.cancellation_transferred
+            .store(true, Ordering::Release);
+    }
+    tokio::spawn(async move {
+        match slot {
+            Some(slot) => {
+                let output = scope_request_with_cancellation_ownership(
+                    Arc::clone(&slot),
+                    future,
+                    true,
+                )
+                .await;
+                // The parent request can be cancelled while this settlement
+                // task intentionally keeps running. If persistence did not
+                // emit a detailed success event, finalize the intent here as a
+                // failed persistence attempt so it cannot remain stranded in
+                // a live generation forever.
+                finalize_unconsumed_intent_with_evidence(
+                    &slot,
+                    AuditOutcome::Failure,
+                    "spawned_mutation_persistence_did_not_emit_success_event",
+                    None,
+                )
+                .await;
+                output
+            }
+            None => future.await,
+        }
+    })
 }
 
 fn current_slot() -> Option<Arc<AuditRequestSlot>> {
@@ -1620,17 +1799,16 @@ pub async fn prepare_request_intent(enabled: bool) -> Option<&'static str> {
         return None;
     }
     let Some(slot) = current_slot() else {
-        return None;
+        return note_prepare_context_failure(&pipeline);
     };
-    // Outer `None`: the slot lock is poisoned, or there is no authenticated
-    // actor to attribute an intent to (nothing to prepare).
-    let Some(Some(event)) = slot.with(build_intent_event) else {
-        return None;
-    };
-    // Inner `None`: this request already prepared an intent (a handler that
-    // takes the write gate more than once reuses the same stable id).
-    let Some(event) = event else {
-        return None;
+    // A poisoned slot or missing authenticated actor may not bypass a
+    // fail-closed audit policy.
+    let event = match slot.with(build_intent_event) {
+        Some(Some(Some(event))) => event,
+        // This request already prepared an intent (a handler that takes the
+        // write gate more than once reuses the same stable id).
+        Some(Some(None)) => return None,
+        None | Some(None) => return note_prepare_context_failure(&pipeline),
     };
     let action = event.action.clone();
     let resource_id = event.resource_id.clone();
@@ -1672,10 +1850,40 @@ pub async fn prepare_request_intent(enabled: bool) -> Option<&'static str> {
     }
 }
 
+/// Refuse or explicitly account for an audited mutation whose trustworthy
+/// request context could not be prepared. This is an invariant failure, not a
+/// reason to turn a `fail_closed` deployment into fail-open behavior.
+fn note_prepare_context_failure(pipeline: &Arc<AuditPipeline>) -> Option<&'static str> {
+    let reason = AuditUnavailableReason::PrepareFailed;
+    pipeline
+        .metrics
+        .dropped_handoff
+        .fetch_add(1, Ordering::Relaxed);
+    if pipeline.config.policy == AuditUnavailablePolicy::FailClosed {
+        pipeline
+            .metrics
+            .fail_closed_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        return Some(reason.as_str());
+    }
+    pipeline
+        .metrics
+        .fail_open_unaudited
+        .fetch_add(1, Ordering::Relaxed);
+    warn!(
+        surface = "audit_intent_prepare",
+        reason = reason.as_str(),
+        policy = AuditUnavailablePolicy::FailOpen.as_str(),
+        "Admin mutation proceeding without trustworthy pre-mutation audit context \
+         (FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_open)"
+    );
+    None
+}
+
 /// Build the intent event from slot state.
 ///
-/// `None` means there is nothing to prepare; `Some(None)` means the slot is
-/// already prepared or has no authenticated actor.
+/// `None` means the slot has no authenticated actor; `Some(None)` means this
+/// request already prepared an intent.
 fn build_intent_event(inner: &mut AuditRequestSlotInner) -> Option<Option<AuditEvent>> {
     if inner.prepared.is_some() {
         return Some(None);
@@ -1736,9 +1944,27 @@ fn adopt_prepared_intent(event: &mut AuditEvent) -> bool {
 ///
 /// Called from the admin dispatcher once the response is known. The mutation
 /// *returned*, so the outcome is knowable: a 2xx response finalizes as success
-/// and anything else as failure. Delivery is left to the worker's replay scan,
-/// which is why this needs no database handle.
+/// and anything else as failure. The already-registered backend worker accepts
+/// the finalized record without requiring this path to retain a database
+/// handle; a durable record can still defer to replay if the worker is gone.
 pub async fn finalize_unconsumed_intent(slot: &Arc<AuditRequestSlot>, status: u16) {
+    let (outcome, evidence) = if (200..400).contains(&status) {
+        (
+            AuditOutcome::Success,
+            "mutation_completed_without_handler_audit_event",
+        )
+    } else {
+        (AuditOutcome::Failure, "mutation_did_not_complete")
+    };
+    finalize_unconsumed_intent_with_evidence(slot, outcome, evidence, Some(status)).await;
+}
+
+async fn finalize_unconsumed_intent_with_evidence(
+    slot: &Arc<AuditRequestSlot>,
+    outcome: AuditOutcome,
+    evidence: &'static str,
+    status: Option<u16>,
+) {
     let pipeline = pipeline();
     if !pipeline.config.enabled {
         return;
@@ -1753,14 +1979,11 @@ pub async fn finalize_unconsumed_intent(slot: &Arc<AuditRequestSlot>, status: u1
     let Some(actor) = slot.with(|inner| inner.actor.clone()).flatten() else {
         return;
     };
-    let (outcome, evidence) = if (200..400).contains(&status) {
-        (
-            AuditOutcome::Success,
-            "mutation_completed_without_handler_audit_event",
-        )
-    } else {
-        (AuditOutcome::Failure, "mutation_did_not_complete")
-    };
+    let unknown_outcome = outcome == AuditOutcome::UnknownOutcome;
+    let mut diff = json!({ "outcome_evidence": evidence });
+    if let Some(status) = status {
+        diff["status"] = json!(status);
+    }
     let event = AuditEvent {
         id: prepared.id,
         ts: Utc::now(),
@@ -1776,11 +1999,26 @@ pub async fn finalize_unconsumed_intent(slot: &Arc<AuditRequestSlot>, status: u1
             .with(|inner| inner.request_id.clone())
             .unwrap_or_default(),
         outcome: outcome.as_str().to_string(),
-        diff: json!({ "outcome_evidence": evidence, "status": status }),
+        diff,
     };
     let event_id = event.id.clone();
-    let result = tokio::task::spawn_blocking(move || pipeline.finalize_event(event)).await;
-    if !matches!(result, Ok(Ok(_))) {
+    let result = tokio::task::spawn_blocking(move || {
+        let record = pipeline.finalize_event(event).map_err(|reason| {
+            anyhow!(
+                "admin audit intent finalization failed ({})",
+                reason.as_str()
+            )
+        })?;
+        if unknown_outcome {
+            pipeline
+                .metrics
+                .unknown_outcome
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        enqueue_finalized_without_db(&pipeline, record)
+    })
+    .await;
+    if !matches!(result, Ok(Ok(()))) {
         warn!(
             audit_event_id = %event_id,
             surface = "audit_intent_finalize",
@@ -1843,7 +2081,13 @@ impl AuditWorker {
     }
 
     fn sender(&self) -> Option<mpsc::Sender<AuditEnvelope>> {
-        self.tx.lock().ok().and_then(|guard| guard.clone())
+        self.tx.lock().ok().and_then(|guard| {
+            if self.pipeline.draining.load(Ordering::Acquire) {
+                None
+            } else {
+                guard.clone()
+            }
+        })
     }
 
     /// Durable finalize + enqueue. Errors only when the *durable* step failed.
@@ -1863,6 +2107,14 @@ impl AuditWorker {
                 ));
             }
         };
+        self.enqueue_finalized(record)
+    }
+
+    /// Enqueue a record whose outcome representation was already finalized.
+    /// Used by the dispatcher fallback as well as ordinary handler events so
+    /// memory-only mode never relies on a replay scan that does not exist.
+    fn enqueue_finalized(&self, record: SpooledAuditRecord) -> Result<(), anyhow::Error> {
+        let event_id = record.id().to_string();
         let durable = self.pipeline.spool.is_some();
         let Some(tx) = self.sender() else {
             return self.note_enqueue_failure(
@@ -1912,29 +2164,18 @@ impl AuditWorker {
             );
             return Ok(());
         }
-        self.pipeline
-            .metrics
-            .dropped_no_spool
-            .fetch_add(1, Ordering::Relaxed);
-        self.pipeline.mark_unavailable(reason);
-        self.pipeline.evidence_lost.store(true, Ordering::Relaxed);
-        self.pipeline
-            .mark_degraded(AuditUnavailableReason::NoDurableSpool);
-        Err(anyhow!(
-            "admin audit event {} was not enqueued ({})",
-            event_id,
-            reason.as_str()
-        ))
+        self.pipeline.note_memory_enqueue_loss(reason, event_id)
     }
 
     /// Close admission and drain within `timeout`.
     ///
     /// Cancellation-aware: the drain signal interrupts every retry wait and
     /// replay loop instead of letting a 30 s backoff outlive the shutdown
-    /// budget. If the deadline still expires, the task is explicitly aborted
-    /// **and joined** — it is never detached — and undelivered records stay in
-    /// the durable spool for the next process, so an expired deadline costs
-    /// latency, never durability.
+    /// budget, while closing the sender makes the worker consume every already
+    /// accepted queue entry before it exits. If the deadline still expires, the
+    /// task is explicitly aborted **and joined** — it is never detached.
+    /// Durable records stay in the spool for the next process. Memory-only
+    /// records are explicitly counted as lost and latch degraded health.
     pub async fn shutdown(&self, timeout: Duration) -> bool {
         self.pipeline.draining.store(true, Ordering::Release);
         // Wake every task parked on a retry backoff or a replay tick.
@@ -1949,22 +2190,52 @@ impl AuditWorker {
         match tokio::time::timeout(timeout, &mut handle).await {
             Ok(_) => true,
             Err(_) => {
+                let queued = self.pipeline.metrics.queue_depth.load(Ordering::Relaxed);
                 let in_flight = self
                     .pipeline
                     .metrics
                     .delivery_in_flight
                     .load(Ordering::Relaxed);
-                warn!(
-                    surface = "audit_shutdown",
-                    in_flight,
-                    "Admin audit drain deadline expired; aborting the delivery worker. \
-                     Undelivered events remain durable and replayable"
-                );
+                let undelivered = queued.saturating_add(in_flight);
+                if self.pipeline.spool.is_some() {
+                    warn!(
+                        surface = "audit_shutdown",
+                        queued,
+                        in_flight,
+                        "Admin audit drain deadline expired; aborting the delivery worker. \
+                         Undelivered events remain durable and replayable"
+                    );
+                } else {
+                    self.pipeline
+                        .metrics
+                        .dropped_no_spool
+                        .fetch_add(undelivered, Ordering::Relaxed);
+                    self.pipeline
+                        .mark_unavailable(AuditUnavailableReason::NoDurableSpool);
+                    self.pipeline.evidence_lost.store(true, Ordering::Relaxed);
+                    self.pipeline
+                        .mark_degraded(AuditUnavailableReason::NoDurableSpool);
+                    error!(
+                        surface = "audit_shutdown",
+                        queued,
+                        in_flight,
+                        "Admin audit drain deadline expired with no durable spool; aborting the \
+                         delivery worker and recording undelivered events as lost"
+                    );
+                }
                 handle.abort();
                 // Join the aborted task rather than dropping the handle: a
                 // dropped handle detaches the task, which is exactly the
                 // silently-abandoned work this drain exists to prevent.
                 let _ = handle.await;
+                self.pipeline
+                    .metrics
+                    .queue_depth
+                    .store(0, Ordering::Relaxed);
+                self.pipeline
+                    .metrics
+                    .delivery_in_flight
+                    .store(0, Ordering::Relaxed);
                 false
             }
         }
@@ -1983,6 +2254,7 @@ fn retry_delay(attempt: u32) -> Duration {
 enum DeliveryOutcome {
     Delivered,
     Retained,
+    Dropped,
     /// Shutdown interrupted the retry loop; the record stays durable.
     Deferred,
 }
@@ -2056,7 +2328,11 @@ async fn deliver_record_inner(
                 );
                 if record.attempts >= pipeline.config.max_delivery_attempts {
                     pipeline.note_unrecoverable(record);
-                    return DeliveryOutcome::Retained;
+                    return if pipeline.spool.is_some() {
+                        DeliveryOutcome::Retained
+                    } else {
+                        DeliveryOutcome::Dropped
+                    };
                 }
                 if let Some(spool) = pipeline.spool.as_ref()
                     && let Err(error) = spool.update_attempts(record)
@@ -2072,7 +2348,14 @@ async fn deliver_record_inner(
                 }
                 pipeline.metrics.retries.fetch_add(1, Ordering::Relaxed);
                 if !sleep_unless_draining(pipeline, retry_delay(record.attempts)).await {
-                    return DeliveryOutcome::Deferred;
+                    if pipeline.spool.is_some() {
+                        return DeliveryOutcome::Deferred;
+                    }
+                    // A memory-only record cannot be deferred across process
+                    // shutdown. Account it as unrecoverable now so an accepted
+                    // mutation is never silently abandoned.
+                    pipeline.note_shutdown_memory_loss(record);
+                    return DeliveryOutcome::Dropped;
                 }
             }
         }
@@ -2175,9 +2458,6 @@ async fn run_worker(
     loop {
         tokio::select! {
             biased;
-            _ = pipeline.cancel.notified(), if pipeline.draining.load(Ordering::Acquire) => {
-                break;
-            }
             maybe_envelope = rx.recv() => {
                 let Some(envelope) = maybe_envelope else {
                     // Admission closed: drain the durable backlog once, then exit.
@@ -2189,7 +2469,10 @@ async fn run_worker(
                     deliver_record(&pipeline, &delivery, envelope.record).await,
                     DeliveryOutcome::Deferred
                 ) {
-                    break;
+                    // The current record remains durable. Continue consuming
+                    // the closed queue so healthy records can still be
+                    // delivered and every failed record is left replayable.
+                    continue;
                 }
             }
             _ = replay.tick() => {
@@ -2254,13 +2537,47 @@ fn spawn_backend_worker(key: usize, db: &Arc<dyn DatabaseBackend>) -> AuditSinkE
     AuditSinkEntry { backend, worker }
 }
 
-fn worker_for_db(db: Arc<dyn DatabaseBackend>) -> Arc<AuditWorker> {
+/// Enqueue a dispatcher-finalized fallback event without requiring the request
+/// path to retain a database handle. Production startup registers the backend
+/// worker before serving Admin traffic. A durable record can safely defer when
+/// that worker is unavailable; a memory-only record must be counted as lost.
+fn enqueue_finalized_without_db(
+    pipeline: &Arc<AuditPipeline>,
+    record: SpooledAuditRecord,
+) -> Result<(), anyhow::Error> {
+    let worker = AUDIT_SINKS.iter().find_map(|entry| {
+        entry
+            .backend
+            .upgrade()
+            .is_some()
+            .then(|| Arc::clone(&entry.worker))
+    });
+    if let Some(worker) = worker {
+        return worker.enqueue_finalized(record);
+    }
+    if pipeline.spool.is_some() {
+        warn!(
+            audit_event_id = %record.id(),
+            surface = "audit_enqueue",
+            reason = AuditUnavailableReason::WorkerUnavailable.as_str(),
+            "Finalized admin audit intent deferred to durable spool replay because no live \
+             delivery worker is registered"
+        );
+        return Ok(());
+    }
+    pipeline.note_memory_enqueue_loss(AuditUnavailableReason::WorkerUnavailable, record.id())
+}
+
+fn worker_for_db(db: Arc<dyn DatabaseBackend>) -> Option<Arc<AuditWorker>> {
+    if pipeline().draining.load(Ordering::Acquire) {
+        return None;
+    }
     let key = db_key(&db);
     // Fast path: live entry for this exact backend pointer.
     if let Some(entry) = AUDIT_SINKS.get(&key)
         && entry_matches_backend(&entry, &db)
     {
-        return Arc::clone(&entry.worker);
+        return Some(Arc::clone(&entry.worker));
     }
 
     // Slow path: take the entry write lock so the spawn-and-insert is atomic.
@@ -2273,7 +2590,7 @@ fn worker_for_db(db: Arc<dyn DatabaseBackend>) -> Arc<AuditWorker> {
         .entry(key)
         .or_insert_with(|| spawn_backend_worker(key, &db));
     if entry_matches_backend(&entry, &db) {
-        return Arc::clone(&entry.worker);
+        return Some(Arc::clone(&entry.worker));
     }
 
     // The existing entry references a different (stale) backend at the same
@@ -2284,7 +2601,7 @@ fn worker_for_db(db: Arc<dyn DatabaseBackend>) -> Arc<AuditWorker> {
     let entry = spawn_backend_worker(key, &db);
     let worker = Arc::clone(&entry.worker);
     AUDIT_SINKS.insert(key, entry);
-    worker
+    Some(worker)
 }
 
 /// Start durable audit delivery for `db` during production startup.
@@ -2323,12 +2640,41 @@ pub async fn record(
         event.outcome = AuditOutcome::Success.as_str().to_string();
     }
 
+    let pipeline = pipeline();
     let worker = worker_for_db(db);
     // The durable write is blocking filesystem work. This is the admin mutation
     // path, never a proxy hot path, so moving it onto the blocking pool is the
     // correct trade: it keeps the reactor free while the response waits for
     // durability.
-    tokio::task::spawn_blocking(move || worker.record(event))
+    tokio::task::spawn_blocking(move || match worker {
+        Some(worker) => worker.record(event),
+        None => {
+            let event_id = event.id.clone();
+            let record = pipeline.finalize_event(event).map_err(|reason| {
+                anyhow!(
+                    "admin audit durable handoff failed ({}) for audit event {}",
+                    reason.as_str(),
+                    event_id
+                )
+            })?;
+            if pipeline.spool.is_some() {
+                warn!(
+                    audit_event_id = %event_id,
+                    surface = "audit_enqueue",
+                    reason = AuditUnavailableReason::WorkerUnavailable.as_str(),
+                    "Admin audit delivery is draining; finalized event deferred to durable \
+                     spool replay"
+                );
+                Ok(())
+            } else {
+                pipeline.note_shutdown_memory_loss(&record);
+                Err(anyhow!(
+                    "admin audit event {} could not be retained after delivery admission closed",
+                    event_id
+                ))
+            }
+        }
+    })
         .await
         .unwrap_or_else(|error| Err(anyhow!("admin audit durable handoff task failed: {error}")))
 }
@@ -2336,8 +2682,14 @@ pub async fn record(
 /// Drain every registered audit worker within `timeout`.
 ///
 /// Called from each serving mode's shutdown path **before** the database Arc is
-/// dropped. Anything still undelivered stays in the durable spool.
+/// dropped. Anything still undelivered stays in the durable spool; explicitly
+/// configured memory-only work is accounted as lost if the deadline expires.
 pub async fn shutdown(timeout: Duration) {
+    // Close process-wide worker admission before taking the registry snapshot.
+    // Mutation settlement tasks intentionally survive request cancellation; a
+    // late success can still finalize into the durable spool, but it must not
+    // create an untracked worker after this drain has begun.
+    pipeline().draining.store(true, Ordering::Release);
     let workers: Vec<Arc<AuditWorker>> = AUDIT_SINKS
         .iter()
         .map(|entry| Arc::clone(&entry.worker))

@@ -923,6 +923,22 @@ fn admin_mutation_handlers_use_admit_write_not_sync_gate_alone() {
         "managed TLS/ACME handlers must not pin sticky config-DB failover topology"
     );
 
+    let admin_source = include_str!("../../../src/admin/mod.rs");
+    let independent_admission = admin_source
+        .split("pub fn admit_non_config_db_write")
+        .nth(1)
+        .and_then(|tail| tail.split("fn evaluate_non_topology_write_gate").next())
+        .expect("independent-store admission method remains inspectable");
+    assert!(
+        independent_admission.contains("evaluate_independent_store_write_gate"),
+        "managed TLS/ACME admission must retain read-only and database-availability gates"
+    );
+    assert!(
+        !independent_admission.contains("note_fail_closed_rejection")
+            && !independent_admission.contains("evaluate_non_topology_write_gate"),
+        "managed TLS/ACME stores do not emit config audit events and must not inherit the audit fail-closed gate"
+    );
+
     // Config-DB handler call sites must not use the sync gate alone.
     for (name, src) in config_db_sources {
         for (idx, line) in src.lines().enumerate() {

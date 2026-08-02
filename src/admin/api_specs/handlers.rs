@@ -3003,7 +3003,7 @@ pub async fn handle_post_api_spec(
     let audit_enabled = state.admin_audit_enabled;
     let audit_actor = actor.clone();
     let audit_spec = spec.clone();
-    let persistence = tokio::spawn(async move {
+    let persistence = audit::spawn_with_request_slot(async move {
         let result = run_api_spec_persistence_while_held(
             settlement_db,
             &settlement_namespace,
@@ -3254,7 +3254,7 @@ pub async fn handle_put_api_spec(
     let audit_actor = actor.clone();
     let audit_spec = spec.clone();
     let audit_previous_spec = existing_spec.clone();
-    let persistence = tokio::spawn(async move {
+    let persistence = audit::spawn_with_request_slot(async move {
         let result = run_api_spec_persistence_while_held(
             settlement_db,
             &settlement_namespace,
@@ -3750,7 +3750,7 @@ pub async fn handle_delete_api_spec(
     let audit_enabled = state.admin_audit_enabled;
     let audit_actor = actor.clone();
     let audit_spec = existing.clone();
-    let persistence = match tokio::spawn(async move {
+    let persistence = match audit::spawn_with_request_slot(async move {
         let result = run_api_spec_persistence_while_held(
             settlement_db,
             &settlement_namespace,

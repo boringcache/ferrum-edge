@@ -206,6 +206,15 @@ impl AuditEventDelivery for RecordingDelivery {
     }
 }
 
+struct NeverDelivery;
+
+#[async_trait]
+impl AuditEventDelivery for NeverDelivery {
+    async fn deliver(&self, _event: &AuditEvent) -> Result<(), anyhow::Error> {
+        std::future::pending().await
+    }
+}
+
 /// Poll until `predicate` holds or the budget expires. Delivery is retried on a
 /// bounded backoff, so the assertions are eventual rather than immediate.
 async fn wait_until(budget: Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -224,6 +233,44 @@ async fn wait_until(budget: Duration, mut predicate: impl FnMut() -> bool) -> bo
 // ---------------------------------------------------------------------------
 // Two-phase durability
 // ---------------------------------------------------------------------------
+
+#[test]
+fn spawned_mutation_persistence_explicitly_propagates_the_request_audit_slot() {
+    let crud = include_str!("../../../src/admin/crud.rs");
+    let compact_crud: String = crud.chars().filter(|ch| !ch.is_whitespace()).collect();
+    for raw_spawn in [
+        "tokio::spawn(persist_create_to_settlement",
+        "tokio::spawn(persist_update_to_settlement",
+        "tokio::spawn(persist_delete_to_settlement",
+        "tokio::spawn(persist_undecodable_update_repair",
+        "tokio::spawn(persist_undecodable_delete_repair",
+    ] {
+        assert!(
+            !compact_crud.contains(raw_spawn),
+            "mutation persistence must not lose its task-local audit intent: {raw_spawn}"
+        );
+    }
+    assert_eq!(
+        compact_crud
+            .matches("audit::spawn_with_request_slot(persist_")
+            .count(),
+        5,
+        "every generic CRUD persistence spawn carries the prepared intent"
+    );
+
+    let api_specs = include_str!("../../../src/admin/api_specs/handlers.rs");
+    let compact_api_specs: String = api_specs
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    assert_eq!(
+        compact_api_specs
+            .matches("audit::spawn_with_request_slot(asyncmove")
+            .count(),
+        3,
+        "API-spec create, replace, and delete carry the prepared intent"
+    );
+}
 
 #[test]
 fn intent_is_durable_before_the_mutation_and_finalized_after_it() {
@@ -342,7 +389,7 @@ fn fail_closed_blocks_mutations_once_the_handoff_fails() {
     let pipeline = pipeline(cfg);
 
     assert!(pipeline.fail_closed_block_reason().is_none());
-    pipeline
+    let first_id = pipeline
         .prepare_intent(event())
         .expect("first intent is durable");
     // The generation's durable ceiling is reached, so the next mutation has no
@@ -357,6 +404,57 @@ fn fail_closed_blocks_mutations_once_the_handoff_fails() {
         "the write gate refuses further audited mutations"
     );
     assert!(!pipeline.is_available());
+
+    let mut finalized = event_with(&first_id, json!({"finalized": true}));
+    finalized.outcome = AuditOutcome::Success.as_str().to_string();
+    pipeline
+        .finalize_event(finalized)
+        .expect("the admitted intent can still be finalized");
+    assert_eq!(
+        pipeline.fail_closed_block_reason(),
+        Some("spool_saturated"),
+        "finalizing an intent does not free capacity and must not reopen admission"
+    );
+}
+
+#[tokio::test]
+async fn successful_delivery_reopens_fail_closed_admission_after_saturation() {
+    let dir = TempDir::new().expect("temp dir");
+    let mut cfg = config(Some(&dir));
+    cfg.policy = AuditUnavailablePolicy::FailClosed;
+    cfg.spool_max_records = 1;
+    let pipeline = pipeline(cfg);
+    let delivery = Arc::new(RecordingDelivery::default());
+    let worker = AuditWorker::spawn_for_delivery(
+        Arc::clone(&pipeline),
+        Arc::clone(&delivery) as Arc<dyn AuditEventDelivery>,
+    );
+
+    let id = pipeline
+        .prepare_intent(event())
+        .expect("first intent is durable");
+    assert_eq!(
+        pipeline.prepare_intent(event()),
+        Err(AuditUnavailableReason::SpoolSaturated)
+    );
+    let mut finalized = event_with(&id, json!({"delivered": true}));
+    finalized.outcome = AuditOutcome::Success.as_str().to_string();
+    worker.record(finalized).expect("finalized handoff succeeds");
+
+    assert!(
+        wait_until(Duration::from_secs(5), || delivery
+            .accepted_ids()
+            .contains(&id))
+        .await,
+        "the pending record is delivered"
+    );
+    assert!(pipeline.is_available());
+    assert!(pipeline.fail_closed_block_reason().is_none());
+    pipeline
+        .prepare_intent(event())
+        .expect("freed capacity admits the next mutation");
+
+    worker.shutdown(Duration::from_secs(5)).await;
 }
 
 #[test]
@@ -711,6 +809,10 @@ async fn a_later_delivery_success_does_not_clear_sticky_evidence_loss() {
     );
     let degraded_reason = pipeline.degraded_reason();
     assert_eq!(degraded_reason, AuditUnavailableReason::DeliveryExhausted);
+    assert!(
+        pipeline.is_available(),
+        "retaining an exhausted event does not prevent the next durable handoff"
+    );
 
     // A different record now delivers successfully.
     delivery.recover();
@@ -732,6 +834,53 @@ async fn a_later_delivery_success_does_not_clear_sticky_evidence_loss() {
     );
     assert_eq!(pipeline.degraded_reason(), degraded_reason);
     assert!(pipeline.status().metrics.retained_total >= 1);
+    worker.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn retained_capacity_loss_degrades_without_deadlocking_fail_closed_admission() {
+    let dir = TempDir::new().expect("temp dir");
+    let mut cfg = config(Some(&dir));
+    cfg.policy = AuditUnavailablePolicy::FailClosed;
+    cfg.retained_max_records = 1;
+    cfg.max_delivery_attempts = 1;
+    let pipeline = pipeline(cfg);
+    let delivery = RecordingDelivery::failing();
+    let worker = AuditWorker::spawn_for_delivery(
+        Arc::clone(&pipeline),
+        Arc::clone(&delivery) as Arc<dyn AuditEventDelivery>,
+    );
+
+    for _ in 0..2 {
+        let (id, _) = prepare_then_finalize(&pipeline, AuditOutcome::Success);
+        let mut finalized = event_with(&id, json!({"exhaust": true}));
+        finalized.outcome = AuditOutcome::Success.as_str().to_string();
+        worker.record(finalized).expect("durable handoff succeeds");
+    }
+
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            pipeline
+                .status()
+                .metrics
+                .dropped_retained_capacity_total
+                == 1
+        })
+        .await,
+        "the bounded retained store reports the discarded newest event"
+    );
+    let status = pipeline.status();
+    assert!(status.degraded);
+    assert!(status.evidence_lost);
+    assert!(
+        status.available,
+        "retained-capacity exhaustion does not make the writable spool unavailable"
+    );
+    assert!(
+        pipeline.fail_closed_block_reason().is_none(),
+        "fail_closed still admits a mutation when its durable prepare can succeed"
+    );
+
     worker.shutdown(Duration::from_secs(5)).await;
 }
 
@@ -1026,6 +1175,88 @@ fn credential_redaction_survives_the_durable_representation() {
 // ---------------------------------------------------------------------------
 // Shutdown
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn shutdown_drains_every_accepted_memory_only_record() {
+    let pipeline = pipeline(config(None));
+    let delivery = Arc::new(RecordingDelivery::default());
+    let worker = AuditWorker::spawn_for_delivery(
+        Arc::clone(&pipeline),
+        Arc::clone(&delivery) as Arc<dyn AuditEventDelivery>,
+    );
+
+    let ids: Vec<String> = (0..6)
+        .map(|_| {
+            let event = event();
+            let id = event.id.clone();
+            worker.record(event).expect("memory record is accepted");
+            id
+        })
+        .collect();
+
+    assert!(worker.shutdown(Duration::from_secs(5)).await);
+    let accepted = delivery.accepted_ids();
+    assert!(
+        ids.iter().all(|id| accepted.contains(id)),
+        "closing admission drains every accepted queue entry"
+    );
+    let status = pipeline.status();
+    assert_eq!(status.metrics.queue_depth, 0);
+    assert_eq!(status.metrics.delivery_in_flight, 0);
+    assert_eq!(status.metrics.dropped_no_durable_spool_total, 0);
+}
+
+#[tokio::test]
+async fn shutdown_accounts_failed_memory_only_records_instead_of_abandoning_them() {
+    let mut cfg = config(None);
+    cfg.max_delivery_attempts = 50;
+    let pipeline = pipeline(cfg);
+    let delivery = RecordingDelivery::failing();
+    let worker = AuditWorker::spawn_for_delivery(
+        Arc::clone(&pipeline),
+        Arc::clone(&delivery) as Arc<dyn AuditEventDelivery>,
+    );
+
+    for _ in 0..3 {
+        worker.record(event()).expect("memory record is accepted");
+    }
+
+    assert!(worker.shutdown(Duration::from_secs(5)).await);
+    let status = pipeline.status();
+    assert_eq!(status.metrics.queue_depth, 0);
+    assert_eq!(status.metrics.delivery_in_flight, 0);
+    assert_eq!(status.metrics.dropped_no_durable_spool_total, 3);
+    assert_eq!(status.metrics.retained_total, 0);
+    assert!(status.evidence_lost);
+    assert!(status.degraded);
+}
+
+#[tokio::test]
+async fn shutdown_deadline_accounts_aborted_memory_only_work() {
+    let pipeline = pipeline(config(None));
+    let delivery = Arc::new(NeverDelivery);
+    let worker = AuditWorker::spawn_for_delivery(
+        Arc::clone(&pipeline),
+        Arc::clone(&delivery) as Arc<dyn AuditEventDelivery>,
+    );
+
+    worker.record(event()).expect("memory record is accepted");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            pipeline.status().metrics.delivery_in_flight == 1
+        })
+        .await,
+        "the record entered delivery before shutdown"
+    );
+
+    assert!(!worker.shutdown(Duration::from_millis(25)).await);
+    let status = pipeline.status();
+    assert_eq!(status.metrics.queue_depth, 0);
+    assert_eq!(status.metrics.delivery_in_flight, 0);
+    assert_eq!(status.metrics.dropped_no_durable_spool_total, 1);
+    assert!(status.evidence_lost);
+    assert!(status.degraded);
+}
 
 #[tokio::test]
 async fn shutdown_interrupts_the_retry_backoff_and_never_detaches_the_worker() {

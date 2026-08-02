@@ -2553,7 +2553,7 @@
   {
     "name": "ferrum_admin_audit_unknown_outcome_total",
     "type": "counter",
-    "help": "Prepared admin audit records adopted from a prior process generation whose mutation outcome is unknowable.",
+    "help": "Prepared admin audit records whose trustworthy outcome observer was lost to process exit or request cancellation.",
     "labels": [
       "namespace"
     ],
@@ -2649,7 +2649,7 @@
   {
     "name": "ferrum_admin_audit_destination_mismatch_total",
     "type": "counter",
-    "help": "Durable admin audit records quarantined because they target a different audit destination or instance.",
+    "help": "Durable admin audit records quarantined because they target a different database or namespace destination.",
     "labels": [
       "namespace"
     ],

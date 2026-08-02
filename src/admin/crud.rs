@@ -2148,17 +2148,19 @@ pub(crate) async fn handle_delete<R: AdminResource>(
             // Issue #2997: the target row exists but cannot be decoded. Skip
             // namespace-snapshot recovery (that load fails for the same row) and
             // delete by id so admin remains the in-band repair path.
-            let persistence = match tokio::spawn(persist_undecodable_delete_repair::<R>(
-                OwnedWriteSettlementContext {
-                    db: db_arc.clone(),
-                    namespace: namespace.to_string(),
-                    guard: namespace_config_admission_guard.take(),
-                    http_client: super::plugin_validation_http_client(state),
-                    state: state.clone(),
-                    actor: actor.clone(),
-                },
-                id.to_string(),
-            ))
+            let persistence = match audit::spawn_with_request_slot(
+                persist_undecodable_delete_repair::<R>(
+                    OwnedWriteSettlementContext {
+                        db: db_arc.clone(),
+                        namespace: namespace.to_string(),
+                        guard: namespace_config_admission_guard.take(),
+                        http_client: super::plugin_validation_http_client(state),
+                        state: state.clone(),
+                        actor: actor.clone(),
+                    },
+                    id.to_string(),
+                ),
+            )
             .await
             {
                 Ok(result) => result,
@@ -2202,7 +2204,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         return Ok(map_after_validate_error::<R>(error));
     }
 
-    let persistence = match tokio::spawn(persist_delete_to_settlement(
+    let persistence = match audit::spawn_with_request_slot(persist_delete_to_settlement(
         OwnedWriteSettlementContext {
             db: db_arc.clone(),
             namespace: namespace.to_string(),
@@ -4981,7 +4983,7 @@ async fn handle_write<R: AdminResource>(
 
     match action {
         WriteAction::Create => {
-            let persistence = match tokio::spawn(persist_create_to_settlement(
+            let persistence = match audit::spawn_with_request_slot(persist_create_to_settlement(
                 OwnedWriteSettlementContext {
                     db: db_arc.clone(),
                     namespace: namespace.to_string(),
@@ -5005,18 +5007,20 @@ async fn handle_write<R: AdminResource>(
         }
         WriteAction::Update { id } => {
             if undecodable_update_repair {
-                let persistence = match tokio::spawn(persist_undecodable_update_repair(
-                    OwnedWriteSettlementContext {
-                        db: db_arc.clone(),
-                        namespace: namespace.to_string(),
-                        guard: namespace_config_admission_guard.take(),
-                        http_client: super::plugin_validation_http_client(state),
-                        state: state.clone(),
-                        actor: actor.clone(),
-                    },
-                    id.to_string(),
-                    resource.clone(),
-                ))
+                let persistence = match audit::spawn_with_request_slot(
+                    persist_undecodable_update_repair(
+                        OwnedWriteSettlementContext {
+                            db: db_arc.clone(),
+                            namespace: namespace.to_string(),
+                            guard: namespace_config_admission_guard.take(),
+                            http_client: super::plugin_validation_http_client(state),
+                            state: state.clone(),
+                            actor: actor.clone(),
+                        },
+                        id.to_string(),
+                        resource.clone(),
+                    ),
+                )
                 .await
                 {
                     Ok(result) => result,
@@ -5036,19 +5040,21 @@ async fn handle_write<R: AdminResource>(
                         &json!({"error": "Update persistence is missing the prior resource"}),
                     ));
                 };
-                let persistence = match tokio::spawn(persist_update_to_settlement(
-                    OwnedWriteSettlementContext {
-                        db: db_arc.clone(),
-                        namespace: namespace.to_string(),
-                        guard: namespace_config_admission_guard.take(),
-                        http_client: super::plugin_validation_http_client(state),
-                        state: state.clone(),
-                        actor: actor.clone(),
-                    },
-                    id.to_string(),
-                    resource.clone(),
-                    previous,
-                ))
+                let persistence = match audit::spawn_with_request_slot(
+                    persist_update_to_settlement(
+                        OwnedWriteSettlementContext {
+                            db: db_arc.clone(),
+                            namespace: namespace.to_string(),
+                            guard: namespace_config_admission_guard.take(),
+                            http_client: super::plugin_validation_http_client(state),
+                            state: state.clone(),
+                            actor: actor.clone(),
+                        },
+                        id.to_string(),
+                        resource.clone(),
+                        previous,
+                    ),
+                )
                 .await
                 {
                     Ok(result) => result,

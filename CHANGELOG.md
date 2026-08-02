@@ -24,17 +24,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a digest of the redacted connection URL) so a reconfigured gateway cannot
   replay another deployment's evidence into the wrong database. Discovery and
   replay start with the mode's database backend rather than waiting for a later
-  mutation. Delivery is at-least-once on the stable id and every backend insert
-  is insert-only and idempotent (PostgreSQL/SQLite `ON CONFLICT (id) DO
+  mutation. Mutation settlement tasks explicitly carry the request audit slot
+  across `tokio::spawn`, and cancellation ownership transfers before spawn so a
+  disconnected client cannot race the detailed outcome against a generic
+  fallback record. Delivery is at-least-once on the stable id and every backend
+  insert is insert-only and idempotent (PostgreSQL/SQLite `ON CONFLICT (id) DO
   NOTHING`, MySQL `ON DUPLICATE KEY UPDATE id = id`, MongoDB `insert_one` with
   duplicate-key treated as success), so a duplicate delivery converges to the
   existing immutable row instead of replacing it. Directory fsync failures are
   treated as durability failures; corrupt, unrecoverable, and
   foreign-destination records are quarantined under `<spool>/failed/` and that
   degradation is sticky until the evidence is resolved. Health and metrics reads
-  are O(1) from atomics and cached background state. Graceful shutdown
-  interrupts retry waits and explicitly aborts **and joins** the delivery worker
-  rather than detaching it. New `FERRUM_ADMIN_AUDIT_{SPOOL_DIR,
+  are O(1) from atomics and cached background state. Graceful shutdown closes
+  admission, drains every accepted queue entry, interrupts retry waits, and
+  explicitly aborts **and joins** the delivery worker rather than detaching it;
+  a memory-only deadline loss is counted and latches degraded health. Managed
+  TLS/ACME file-store mutations remain outside this configuration audit stream
+  and do not inherit its `fail_closed` gate. New `FERRUM_ADMIN_AUDIT_{SPOOL_DIR,
   UNAVAILABLE_POLICY,QUEUE_CAPACITY,SPOOL_MAX_RECORDS,RETAINED_MAX_RECORDS,
   MAX_DELIVERY_ATTEMPTS}` settings, `ferrum_admin_audit_*` Prometheus families,
   and an authenticated `/health` `audit_pipeline` object.

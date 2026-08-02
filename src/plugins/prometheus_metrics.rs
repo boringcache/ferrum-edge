@@ -2072,7 +2072,7 @@ impl MetricsRegistry {
             ),
             (
                 "ferrum_admin_audit_unknown_outcome_total",
-                "Prepared admin audit records adopted from a prior process generation whose mutation outcome is unknowable.",
+                "Prepared admin audit records whose trustworthy outcome observer was lost to process exit or request cancellation.",
                 audit_pipeline.unknown_outcome_total,
             ),
             (
@@ -2112,7 +2112,7 @@ impl MetricsRegistry {
             ),
             (
                 "ferrum_admin_audit_destination_mismatch_total",
-                "Durable admin audit records quarantined because they target a different audit destination or instance.",
+                "Durable admin audit records quarantined because they target a different database or namespace destination.",
                 audit_pipeline.destination_mismatch_total,
             ),
             (
@@ -2152,10 +2152,6 @@ impl MetricsRegistry {
             (
                 "retained_capacity",
                 audit_pipeline.dropped_retained_capacity_total,
-            ),
-            (
-                "destination_mismatch",
-                audit_pipeline.destination_mismatch_total,
             ),
         ] {
             output.push_str(&format!(

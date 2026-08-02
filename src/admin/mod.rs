@@ -543,10 +543,11 @@ impl AdminState {
     // an extra allocation/dereference layer on an already exceptional path.
     #[allow(clippy::result_large_err)]
     pub fn admit_non_config_db_write(&self) -> Result<(), Response<Full<Bytes>>> {
-        if self.admin_audit_enabled {
-            audit::note_fail_closed_rejection();
-        }
-        if let Some(response) = self.evaluate_non_topology_write_gate() {
+        // Managed TLS / ACME stores do not emit config-database audit events.
+        // Applying the audit fail-closed gate here would block an unaudited
+        // route only when the unrelated audit sink is unavailable while still
+        // allowing the exact same unaudited mutation when it is healthy.
+        if let Some(response) = self.evaluate_independent_store_write_gate() {
             Err(response)
         } else {
             Ok(())
@@ -554,11 +555,8 @@ impl AdminState {
     }
 
     fn evaluate_non_topology_write_gate(&self) -> Option<Response<Full<Bytes>>> {
-        if self.read_only {
-            return Some(json_response(
-                StatusCode::FORBIDDEN,
-                &json!({"error": "Admin API is in read-only mode"}),
-            ));
+        if let Some(response) = self.evaluate_independent_store_write_gate() {
+            return Some(response);
         }
         // Audit fail-closed policy (issue #2421). Refusing a mutation that
         // cannot be durably audited is strictly better than performing it and
@@ -574,6 +572,18 @@ impl AdminState {
                     "error": "Admin mutations are refused because the audit pipeline cannot durably record events (FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed)",
                     "audit_unavailable_reason": reason
                 }),
+            ));
+        }
+        None
+    }
+
+    /// Common gates for mutations of stores independent from config-DB
+    /// topology and from the config-DB audit event stream.
+    fn evaluate_independent_store_write_gate(&self) -> Option<Response<Full<Bytes>>> {
+        if self.read_only {
+            return Some(json_response(
+                StatusCode::FORBIDDEN,
+                &json!({"error": "Admin API is in read-only mode"}),
             ));
         }
         if let Some(ref flag) = self.db_available
