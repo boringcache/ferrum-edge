@@ -2359,14 +2359,16 @@ pub mod _test_support {
     /// Run the production per-session plugin-collection step, including
     /// `Plugin::bind_ws_session` substitution, and return the parser-policy and
     /// post-reassembly hook lists a real upgrade would relay with.
+    pub type WebSocketRelayPluginListsForTest = (
+        Vec<Arc<dyn crate::plugins::Plugin>>,
+        Vec<Arc<dyn crate::plugins::Plugin>>,
+    );
+
     pub fn collect_websocket_relay_plugins_for_test(
         plugins: &[Arc<dyn crate::plugins::Plugin>],
         requires_websocket_framing: bool,
         upgrade_ctx: &crate::plugins::RequestContext,
-    ) -> (
-        Vec<Arc<dyn crate::plugins::Plugin>>,
-        Vec<Arc<dyn crate::plugins::Plugin>>,
-    ) {
+    ) -> WebSocketRelayPluginListsForTest {
         crate::proxy::collect_websocket_relay_plugins(
             plugins,
             requires_websocket_framing,
