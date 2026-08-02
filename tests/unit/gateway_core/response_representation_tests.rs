@@ -5,9 +5,9 @@
 //! `response_transformer` plugin and a real `RequestContext` carrying the same
 //! pre-`after_proxy` snapshot the proxy stamps. That helper is the single body
 //! phase the H1/H2, buffered gRPC, and native H3 paths all call, so asserting on
-//! it asserts on all three; the H3 cross-protocol bridges and the synthetic
-//! short-circuit call the same gate through
-//! `admit_buffered_response_body_transforms`.
+//! it asserts on all three; the H3 cross-protocol bridges call the same shared
+//! funnel, while the synthetic short-circuit calls the same representation gate
+//! through `admit_buffered_response_body_transforms`.
 //!
 //! The property under test is the one the advisory turned on: a configured body
 //! policy must never *appear* to have applied. Either the protected field is

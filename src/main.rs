@@ -759,6 +759,14 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         env_config.response_buffer_max_total_bytes,
     );
 
+    // Same rule for the aggregate budget that bounds governed REQUEST decodes
+    // (GHSA-3973-47g5-4mcx + GHSA-pwcm-6rh8-f2gh): published before the first
+    // listener binds, so no governed compressed upload can ever be decoded
+    // against a budget the operator did not configure.
+    crate::proxy::response_buffer_budget::init_request_decode(
+        env_config.request_decode_max_total_bytes,
+    );
+
     // Initialize DTLS buffer config from resolved EnvConfig before any DTLS sessions.
     crate::dtls::init_dtls_buf_config(
         env_config.dtls_max_plaintext_bytes,

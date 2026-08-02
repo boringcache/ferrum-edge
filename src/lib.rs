@@ -802,6 +802,62 @@ pub mod _test_support {
         (transformed, result)
     }
 
+    /// The same production stage, with the aggregate request-decode budget bound
+    /// to an ISOLATED semaphore.
+    ///
+    /// This is how a test observes the CHARGE LIFETIME of a governed request
+    /// decode end to end: the gate charges while staging the plaintext, the
+    /// claiming hooks read it, and the stage releases it on its way out — the
+    /// native-H3 shape, where the hooks receive the real `RequestContext` rather
+    /// than a throwaway clone.
+    pub async fn run_request_body_stage_with_context_in_budget_for_test(
+        probe: &ResponseBufferBudgetProbe,
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> (Vec<u8>, crate::plugins::PluginResult) {
+        let deadline = ctx.grpc_deadline_at();
+        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            plugins,
+            Some(&mut *ctx),
+            deadline,
+            headers,
+            body.to_vec(),
+        )
+        .await;
+        let result = crate::proxy::run_final_request_body_hooks_with_provenance_in(
+            plugins,
+            Some(&mut *ctx),
+            deadline,
+            headers,
+            &transformed,
+            probe.0.handle(),
+        )
+        .await
+        .into_plugin_result(ctx);
+        (transformed, result)
+    }
+
+    /// Whether the gateway selected the fixed request-representation terminal
+    /// (`400`) for this request — the typed provenance that keeps the synthetic
+    /// response-body policy pipeline from re-deciding the gateway's own error
+    /// payload.
+    pub fn gateway_representation_response_selected_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.gateway_representation_response_selected()
+    }
+
+    /// Whether the final request-body hook stage left a decoded plaintext view
+    /// staged on this context. Production clears it as the stage returns, so an
+    /// assertion here is an assertion about the charge's lifetime.
+    pub fn final_request_body_plaintext_staged_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.final_request_body_was_decoded()
+    }
+
     /// Run the shared final backend-header-policy pass exactly as every dispatch
     /// ladder does: after all `before_proxy` header transforms, over the
     /// finalized backend-visible header map (`GHSA-xhp5-hqj8-3mwg`).
@@ -4766,6 +4822,13 @@ pub mod _test_support {
         crate::proxy::stamp_original_response_metadata(ctx, response_status, response_headers);
     }
 
+    /// Stamp the immutable inbound request flavor used by buffered rejection
+    /// normalization. Tests use the production classification seam rather than
+    /// inferring native gRPC from a mutable response Content-Type.
+    pub fn mark_native_grpc_request_for_test(ctx: &mut crate::plugins::RequestContext) {
+        ctx.set_request_http_flavor(crate::config::types::HttpFlavor::Grpc);
+    }
+
     /// Force the representation gate's pristine origin-encoding marker so a
     /// defensive identity-only decoder branch can be exercised independently of
     /// the production snapshotter, which intentionally stamps only non-identity
@@ -4818,14 +4881,18 @@ pub mod _test_support {
         response_headers: &mut HashMap<String, String>,
         response_body: &mut bytes::Bytes,
     ) {
-        crate::proxy::apply_synthetic_response_body_hooks(
+        // The returned policy witness only matters to the shared finalizer,
+        // which re-decides body policy after its deliberately-late reject-path
+        // `after_proxy` chain; drive `finalize_synthetic_response_for_test` to
+        // exercise that.
+        let _ = crate::proxy::apply_synthetic_response_body_hooks(
             plugins,
             ctx,
             response_status,
             response_headers,
             response_body,
         )
-        .await
+        .await;
     }
 
     /// Drive the complete shared H1/H2/H3 synthetic-response finalizer,
@@ -6279,12 +6346,12 @@ pub mod _test_support {
     /// Conservative heap ceiling the representation gate reserves for one
     /// `gzip`/`x-gzip` decode pass before it constructs the decoder.
     pub const RESPONSE_DECODE_GZIP_SCRATCH_BYTES: usize =
-        crate::plugins::response_representation::GZIP_DECODER_SCRATCH_BYTES;
+        crate::plugins::charged_decode::GZIP_DECODER_SCRATCH_BYTES;
 
     /// Conservative heap ceiling the representation gate reserves for one `br`
     /// decode pass before it constructs the decoder.
     pub const RESPONSE_DECODE_BROTLI_SCRATCH_BYTES: usize =
-        crate::plugins::response_representation::BROTLI_DECODER_SCRATCH_BYTES;
+        crate::plugins::charged_decode::BROTLI_DECODER_SCRATCH_BYTES;
 
     /// The output-buffer capacity the production decode ends up holding for a
     /// decoded body of `decoded_len` bytes under `limit`, computed with the
@@ -6295,10 +6362,7 @@ pub mod _test_support {
     /// output size surfaces as a precise arithmetic mismatch instead of a
     /// seemingly flaky admission assertion.
     pub fn projected_decode_output_capacity_for_test(decoded_len: usize, limit: usize) -> usize {
-        crate::plugins::response_representation::projected_decode_output_capacity(
-            decoded_len,
-            limit,
-        )
+        crate::plugins::charged_decode::projected_decode_output_capacity(decoded_len, limit)
     }
 
     /// The decode ceiling the gate applies when no smaller response-body limit
@@ -6512,6 +6576,184 @@ pub mod _test_support {
             }
         }
     }
+
+    /// What the shared REQUEST representation gate decided for one finalized
+    /// backend-visible body, projected so external tests can assert on it
+    /// without reaching into the crate-private posture.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum FinalRequestRepresentationOutcome {
+        /// Nothing to prove: either no configured final request-body policy
+        /// claims these bytes, or they are already identity-coded.
+        Inspectable,
+        /// Claimed and decoded. Carries the plaintext the claiming hooks receive
+        /// through `RequestContext::inspectable_final_request_body`.
+        Decoded(Vec<u8>),
+        /// Claimed and uninspectable, carrying the gate's low-cardinality reason.
+        Rejected(&'static str),
+        /// Claimed, but the aggregate request-decode budget could not admit the
+        /// decode's working set. The GATEWAY-local capacity terminal, which is
+        /// deliberately not a `Rejected` reason.
+        CapacityRefused,
+    }
+
+    /// Drive the PRODUCTION request representation gate
+    /// (`evaluate_final_request_body_posture`) over one finalized
+    /// `(headers, body)` pair, charged against the process-global request-decode
+    /// budget.
+    ///
+    /// This is the same call `run_final_request_body_hooks_with_provenance`
+    /// makes immediately before the first final hook, so an assertion here is an
+    /// assertion about the real fail-closed decision rather than a reimplemented
+    /// one (`GHSA-3973-47g5-4mcx`).
+    pub fn evaluate_final_request_representation(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> FinalRequestRepresentationOutcome {
+        evaluate_final_request_representation_against(
+            plugins,
+            ctx,
+            headers,
+            body,
+            crate::proxy::response_buffer_budget::BudgetRef::request_decode(),
+        )
+    }
+
+    /// The same production gate, charged against an ISOLATED budget so a
+    /// parallel test binary can observe admission and release deterministically
+    /// without mutating the process-global semaphore under its neighbors.
+    ///
+    /// The staged plaintext is dropped before this returns on the `Decoded` arm
+    /// (the projection copies the bytes out), so a caller that wants to assert
+    /// the charge is HELD while the view is live must use
+    /// [`ChargedRequestPlaintext`] instead.
+    pub fn evaluate_final_request_representation_in(
+        probe: &ResponseBufferBudgetProbe,
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> FinalRequestRepresentationOutcome {
+        evaluate_final_request_representation_against(plugins, ctx, headers, body, probe.0.handle())
+    }
+
+    fn evaluate_final_request_representation_against(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        budget: crate::proxy::response_buffer_budget::BudgetRef<'_>,
+    ) -> FinalRequestRepresentationOutcome {
+        use crate::plugins::request_representation::{
+            FinalRequestBodyPosture, evaluate_final_request_body_posture,
+        };
+        match evaluate_final_request_body_posture(plugins, ctx, headers, body, budget) {
+            FinalRequestBodyPosture::Inspectable => FinalRequestRepresentationOutcome::Inspectable,
+            FinalRequestBodyPosture::Decoded(plaintext) => {
+                FinalRequestRepresentationOutcome::Decoded(plaintext.to_vec())
+            }
+            FinalRequestBodyPosture::Reject(rejection) => {
+                FinalRequestRepresentationOutcome::Rejected(rejection.reason())
+            }
+            FinalRequestBodyPosture::CapacityRefused => {
+                FinalRequestRepresentationOutcome::CapacityRefused
+            }
+        }
+    }
+
+    /// The gate's staged plaintext, still holding its aggregate-budget charge.
+    ///
+    /// Tests hold this to observe that the reservation is alive for exactly as
+    /// long as the inspection view is readable, and that dropping it — the way
+    /// every production disposal path does — returns the charge.
+    pub struct ChargedRequestPlaintext(bytes::Bytes);
+
+    impl ChargedRequestPlaintext {
+        /// The staged plaintext bytes.
+        pub fn as_bytes(&self) -> &[u8] {
+            &self.0
+        }
+
+        /// Stage this view on a context exactly as the gate does, transferring
+        /// the charge into the context.
+        pub fn stage_on(self, ctx: &mut crate::plugins::RequestContext) {
+            ctx.stage_governed_request_body_plaintext(self.0);
+        }
+    }
+
+    /// Run the production gate against an isolated budget and RETAIN the charged
+    /// plaintext, so a test can assert on the budget while the view is live.
+    ///
+    /// `None` for every non-`Decoded` posture; use
+    /// [`evaluate_final_request_representation_in`] to assert on those.
+    pub fn charged_request_plaintext_in(
+        probe: &ResponseBufferBudgetProbe,
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> Option<ChargedRequestPlaintext> {
+        use crate::plugins::request_representation::{
+            FinalRequestBodyPosture, evaluate_final_request_body_posture,
+        };
+        match evaluate_final_request_body_posture(plugins, ctx, headers, body, probe.0.handle()) {
+            FinalRequestBodyPosture::Decoded(plaintext) => Some(ChargedRequestPlaintext(plaintext)),
+            _ => None,
+        }
+    }
+
+    /// Stage a plaintext view exactly as the gate stages it, so a test can call
+    /// a plugin's final request-body hook and observe that it inspects the
+    /// decoded document rather than the wire octets.
+    ///
+    /// This seam takes an UNCHARGED `Vec` on purpose: it exists to exercise
+    /// plugin hooks against a known document, not to exercise the budget. Tests
+    /// that assert on the budget go through [`charged_request_plaintext_in`].
+    pub fn stage_final_request_body_plaintext(
+        ctx: &mut crate::plugins::RequestContext,
+        plaintext: Vec<u8>,
+    ) {
+        ctx.stage_governed_request_body_plaintext(bytes::Bytes::from(plaintext));
+    }
+
+    /// Clear a staged plaintext view exactly as the gate does at the start of
+    /// every final-request-body hook run, so a test can observe that a retry or
+    /// re-finalization releases the previous decode's charge.
+    pub fn clear_final_request_body_plaintext(ctx: &mut crate::plugins::RequestContext) {
+        ctx.clear_governed_request_body_plaintext();
+    }
+
+    /// Client-visible HTTP status for a request-decode capacity refusal.
+    pub const REQUEST_DECODE_OVERLOAD_STATUS: u16 =
+        crate::proxy::response_buffer_budget::REQUEST_DECODE_OVERLOAD_STATUS;
+
+    /// gRPC status for the same refusal.
+    pub const REQUEST_DECODE_OVERLOAD_GRPC_STATUS: u32 =
+        crate::proxy::response_buffer_budget::REQUEST_DECODE_OVERLOAD_GRPC_STATUS;
+
+    /// Fixed, redaction-safe client body for the same refusal.
+    pub const REQUEST_DECODE_OVERLOAD_BODY: &str =
+        crate::proxy::response_buffer_budget::REQUEST_DECODE_OVERLOAD_BODY;
+
+    /// Fixed `grpc-message` for the same refusal.
+    pub const REQUEST_DECODE_OVERLOAD_GRPC_MESSAGE: &str =
+        crate::proxy::response_buffer_budget::REQUEST_DECODE_OVERLOAD_GRPC_MESSAGE;
+
+    /// Fixed, redaction-safe client message for a request representation the
+    /// gate could not reduce to plaintext.
+    pub const REQUEST_REPRESENTATION_UNINSPECTABLE_MESSAGE: &str =
+        crate::plugins::request_representation::REQUEST_REPRESENTATION_UNINSPECTABLE_MESSAGE;
+
+    /// The decode ceiling the request gate applies when no smaller route
+    /// request-body limit is active.
+    pub const MAX_DECODED_REQUEST_INSPECTION_BYTES: usize =
+        crate::plugins::request_representation::MAX_DECODED_REQUEST_INSPECTION_BYTES;
+
+    /// The floor the request-decode budget is clamped to: `br` decoder scratch
+    /// plus two decode ceilings, i.e. one worst-case governed request.
+    pub const REQUEST_DECODE_WORST_CASE_PEAK_BYTES: usize =
+        crate::proxy::response_buffer_budget::REQUEST_DECODE_WORST_CASE_PEAK_BYTES;
 
     /// What the shared representation gate decided for one buffered response,
     /// projected so external tests can assert on it without reaching into the

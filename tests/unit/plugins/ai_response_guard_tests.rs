@@ -5225,7 +5225,7 @@ async fn test_refused_redaction_construction_does_not_serve_the_detected_body() 
 
     // The final seam must therefore reject rather than let the original through.
     let final_result = plugin
-        .on_final_response_body(&mut ctx, 200, &headers, body)
+        .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
         .await;
     match final_result {
         PluginResult::Reject {
@@ -5276,7 +5276,7 @@ async fn test_completed_redaction_discharges_the_final_seam() {
     assert!(
         matches!(
             plugin
-                .on_final_response_body(&mut ctx, 200, &headers, &redacted)
+                .finalize_client_visible_response_body(&mut ctx, 200, &headers, &redacted)
                 .await,
             PluginResult::Continue
         ),
@@ -5300,7 +5300,7 @@ async fn test_clean_and_warn_responses_never_arm_the_final_seam() {
     ));
     assert!(matches!(
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, clean)
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, clean)
             .await,
         PluginResult::Continue
     ));
@@ -5321,7 +5321,7 @@ async fn test_clean_and_warn_responses_never_arm_the_final_seam() {
     ));
     assert!(matches!(
         warner
-            .on_final_response_body(&mut warn_ctx, 200, &headers, dirty)
+            .finalize_client_visible_response_body(&mut warn_ctx, 200, &headers, dirty)
             .await,
         PluginResult::Continue
     ));
