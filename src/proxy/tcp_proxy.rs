@@ -2482,8 +2482,7 @@ async fn handle_tcp_connection_inner(
             })
     });
     let shared_port_sni = if shared_port_uses_sni {
-        let sni =
-            super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
+        let sni = super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
         stream_ctx.sni_hostname = sni.clone();
         sni
     } else {
