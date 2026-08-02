@@ -1155,14 +1155,34 @@ fn workload_entry_status(
         .get("service")
         .and_then(Value::as_str)
         .unwrap_or(object.metadata.name.as_str());
+    // Derive the expected Service identity once and keep it for the full status
+    // scope so host-parser borrows remain valid after branches (avoids E0597 on
+    // temporary Option). Used both to correlate translator-stamped workloads and
+    // for rejected/not-materialised diagnostics.
+    let expected_service_key = workload_entry_service_key_from_host(
+        service_host,
+        &object.metadata.namespace,
+        cluster_domain,
+    );
+    let expected_service_name = expected_service_key
+        .as_ref()
+        .map(|key| key.name.as_str())
+        .unwrap_or(service_host);
+    let expected_service_namespace = expected_service_key
+        .as_ref()
+        .map(|key| key.namespace.as_str())
+        .unwrap_or(object.metadata.namespace.as_str());
     // Prefer the translator-stamped attachment when present so status mirrors
     // the authoritative association carried into the mesh slice (not merely the
-    // raw host string). Fall back to deterministic host parsing for diagnostics
-    // when the WorkloadEntry was rejected or not materialised.
+    // raw host string). Correlate by namespace, expected Service identity, and
+    // optional address so multiple accepted entries in one namespace (especially
+    // with absent/empty addresses) do not pick another entry's workload.
     let stamped = result.ok().and_then(|translation| {
         translation.config.mesh.as_ref().and_then(|mesh| {
             mesh.workloads.iter().find(|workload| {
                 workload.namespace == object.metadata.namespace
+                    && workload.service_name == expected_service_name
+                    && workload.attached_service_namespace() == expected_service_namespace
                     && (address.is_empty()
                         || workload
                             .addresses
@@ -1171,17 +1191,6 @@ fn workload_entry_status(
             })
         })
     });
-    // Keep the fallback key alive for the full status scope so name/namespace
-    // borrows remain valid after the branch (avoids E0597 on temporary Option).
-    let fallback_service_key = if stamped.is_none() {
-        workload_entry_service_key_from_host(
-            service_host,
-            &object.metadata.namespace,
-            cluster_domain,
-        )
-    } else {
-        None
-    };
     let (service_name, service_namespace, cross_namespace) = if let Some(workload) = stamped {
         let service_namespace = workload.attached_service_namespace();
         (
@@ -1190,16 +1199,8 @@ fn workload_entry_status(
             service_namespace != object.metadata.namespace.as_str(),
         )
     } else {
-        let service_name = fallback_service_key
-            .as_ref()
-            .map(|key| key.name.as_str())
-            .unwrap_or(service_host);
-        let service_namespace = fallback_service_key
-            .as_ref()
-            .map(|key| key.namespace.as_str())
-            .unwrap_or(object.metadata.namespace.as_str());
-        let cross_namespace = service_namespace != object.metadata.namespace.as_str();
-        (service_name, service_namespace, cross_namespace)
+        let cross_namespace = expected_service_namespace != object.metadata.namespace.as_str();
+        (expected_service_name, expected_service_namespace, cross_namespace)
     };
 
     match result {
@@ -3377,6 +3378,73 @@ mod tests {
         assert_eq!(
             detail["translation"]["cross_namespace_service"].as_bool(),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn workload_entry_status_correlates_stamped_workload_by_service_identity() {
+        // Multiple accepted WorkloadEntries in one namespace with absent addresses
+        // must each report their own attached service — not the first stamped
+        // workload that shares namespace + empty address.
+        let payments_svc = object(
+            "v1",
+            "Service",
+            "payments",
+            json!({ "ports": [{ "port": 8080, "name": "http" }] }),
+        );
+        let reviews_svc = object(
+            "v1",
+            "Service",
+            "reviews",
+            json!({ "ports": [{ "port": 8080, "name": "http" }] }),
+        );
+        let we_payments = object(
+            "networking.istio.io/v1",
+            "WorkloadEntry",
+            "vm-payments",
+            json!({
+                "serviceAccount": "payments",
+                "service": "payments.default.svc.cluster.local"
+            }),
+        );
+        let we_reviews = object(
+            "networking.istio.io/v1",
+            "WorkloadEntry",
+            "vm-reviews",
+            json!({
+                "serviceAccount": "reviews",
+                "service": "reviews.default.svc.cluster.local"
+            }),
+        );
+        let updates = plan_istio_status_updates(
+            &[payments_svc, reviews_svc, we_payments, we_reviews],
+            options(),
+        );
+        let payments_update = updates
+            .iter()
+            .find(|update| update.kind == "WorkloadEntry" && update.name == "vm-payments")
+            .expect("payments WorkloadEntry status update");
+        let reviews_update = updates
+            .iter()
+            .find(|update| update.kind == "WorkloadEntry" && update.name == "vm-reviews")
+            .expect("reviews WorkloadEntry status update");
+        let payments_detail = payments_update.ferrum_detail.as_ref().unwrap();
+        let reviews_detail = reviews_update.ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            payments_detail["translation"]["service"].as_str(),
+            Some("payments")
+        );
+        assert_eq!(
+            payments_detail["translation"]["service_namespace"].as_str(),
+            Some("default")
+        );
+        assert_eq!(
+            reviews_detail["translation"]["service"].as_str(),
+            Some("reviews")
+        );
+        assert_eq!(
+            reviews_detail["translation"]["service_namespace"].as_str(),
+            Some("default")
         );
     }
 
