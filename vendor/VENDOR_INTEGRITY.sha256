@@ -198,12 +198,12 @@ b76031a8233b6afe4089eb3967f9965e59cf3be9f1b2239aada5c527a9e3251c  vendor/h3-0.0.
 67a6d6ef94c8204df4005f0d33140c14955fec7154d435881c11e3c5c6861fab  vendor/h3-0.0.8-ferrum-patched/src/stream.rs
 f949117f4c335c064cbafd4c855f92002948d64d2f74b61d850625e37bd3be07  vendor/h3-0.0.8-ferrum-patched/src/webtransport/mod.rs
 c3a03ed9e78fc494b54985d65f05581c268c6e629d206ac0dc5cb9d7358be76d  vendor/h3-0.0.8-ferrum-patched/src/webtransport/session_id.rs
-fbc8e934d51a8130bc1238e2e5ac3cb17f03f41a6eeea9ff2e6f37f74c49dbc2  vendor/reqwest-0.13.3-ferrum-patched/Cargo.toml
+5a62c632e480f07edb899e31f759cc37ee09a7db4c6ac52ee687b4a50711c2ac  vendor/reqwest-0.13.3-ferrum-patched/Cargo.toml
 751963a8b88c0e3a9f27e98933079fbcf09b9998b2c13ac49c2e4d58444520d6  vendor/reqwest-0.13.3-ferrum-patched/LICENSE-APACHE
 dd87e27dfbaa888cb77ea34592648a7743636b8dce07e49543bddda0fcfc73bc  vendor/reqwest-0.13.3-ferrum-patched/LICENSE-MIT
 d353552b3feae9e57c7a8ce10be9b6d22bd6df5268602cd2e01f21c345a8cd5c  vendor/reqwest-0.13.3-ferrum-patched/README.md
 60948ec5a44c995beb2dd22f6d4ca1f48a56cf01f8fc3174ed809a1e3dd9ce59  vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/body.rs
-6d89660383a98ac86d998604643b3daab1ca3e1f7b0ca9ca61c1316cca01d62a  vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/client.rs
+7c7ae081f931528a31a8dfae7a18ad8363e8f5ed0268bb70401cb27224fcb5b5  vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/client.rs
 50e69deaa2fc495e70c232d40ac623ab01b6039929615582a5f145d6aeb2113e  vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/h3_client/connect.rs
 0b0876288eeba6c39331b3bd6b8b01cd4ab01e0362a1e859d961fcc5d520b43a  vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/h3_client/dns.rs
 3d7a499aec889845749098bf620dbd8c7e5338b5104a28dd12d3c8162532cab5  vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/h3_client/mod.rs
@@ -229,7 +229,7 @@ cf9875316437ff762962a867bb3650dfe93f5cb6ec0a8e3397bfa20e36fb9c44  vendor/reqwest
 7ca80ad7e849a2ac7b98bafe3a287ecd3580c8fa3dce873d0daabcc41b78ae7f  vendor/reqwest-0.13.3-ferrum-patched/src/dns/resolve.rs
 9878b654f2f1aca1cef1a018f1262cbfc40ad98c5007a50367e43bc42c1a3c1c  vendor/reqwest-0.13.3-ferrum-patched/src/error.rs
 761e9d0e04f652b201317d746cbe2a538de0604240914913fbe968114d88893d  vendor/reqwest-0.13.3-ferrum-patched/src/into_url.rs
-ed6cd55caeafcd6d188893972af62d4d1fbd64d7247af1a331595f6f316b752c  vendor/reqwest-0.13.3-ferrum-patched/src/lib.rs
+2b86cabc8c75ed8e74ed331feefe5f779101e0afcd42e405134ab100e7604c88  vendor/reqwest-0.13.3-ferrum-patched/src/lib.rs
 7d5d3ed0fe95b0c82f1081e0907f4691d53c929dbe0f2c6134dceaca304839ba  vendor/reqwest-0.13.3-ferrum-patched/src/proxy.rs
 b8a618396c45884e5557314a0fb99ec01c1868b77132e2cc81aa0a4ac4831c06  vendor/reqwest-0.13.3-ferrum-patched/src/redirect.rs
 12cf82de2499a426686ed4f3719cce73e269b7b9ddc9c88458e7378beb2c58a8  vendor/reqwest-0.13.3-ferrum-patched/src/response.rs

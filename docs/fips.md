@@ -184,10 +184,12 @@ reload, which rebuilds through the same constructor.
   the RFC 6455 `Sec-WebSocket-Accept` handshake value (a cache-poisoning guard
   over a fixed public GUID — it carries no key and protects nothing), and
   content-addressing digests listed in the inventory as `outside-boundary`.
-- The Kubernetes and MongoDB clients have their provider-selecting default
+- Reqwest, Kubernetes, and MongoDB clients have their provider-selecting default
   features disabled. Their rustls transports follow the same mutually exclusive
   `crypto-ring` / `fips` feature pair as Ferrum's frontend, backend, and control
-  plane TLS, so neither client can re-enable Ring transitively in a FIPS build.
+  plane TLS, so none can re-enable Ring transitively in a FIPS build. Reqwest's
+  paired internal provider arms also give library/test clients a deterministic
+  fallback before the binary bootstrap installs the same process-wide provider.
 
 **Rejected configurations**
 

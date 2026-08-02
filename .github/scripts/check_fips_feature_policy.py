@@ -57,6 +57,7 @@ REQUIRED_FEATURE_PAIRS = (
     ("rcgen/ring", "rcgen/fips"),
     ("x509-parser/verify", "x509-parser/verify-aws"),
     ("jsonwebtoken/rust_crypto", "jsonwebtoken/aws_lc_rs"),
+    ("reqwest/__rustls-ring", "reqwest/__rustls-aws-lc-rs"),
     ("hyper-rustls?/ring", "hyper-rustls?/fips"),
     ("instant-acme?/ring", "instant-acme?/fips"),
     ("kube/ring", "kube/aws-lc-rs"),
@@ -119,6 +120,7 @@ FORBIDDEN_RESOLVED_FIPS = {
     ("rcgen", "ring"),
     ("jsonwebtoken", "rust_crypto"),
     ("x509-parser", "verify"),
+    ("reqwest", "__rustls-ring"),
     ("rustls-webpki", "ring"),
     ("webpki", "ring"),
 }
@@ -126,12 +128,14 @@ FORBIDDEN_RESOLVED_FIPS = {
 # Feature selections that must be present in a resolved `fips` graph.
 REQUIRED_RESOLVED_FIPS = {
     ("aws-lc-rs", "fips"),
+    ("reqwest", "__rustls-aws-lc-rs"),
     ("rustls", "fips"),
 }
 
 # The ordinary profile's contract, so a change that quietly moves the default
 # build onto a different backend is caught too.
 REQUIRED_RESOLVED_RING = {
+    ("reqwest", "__rustls-ring"),
     ("rustls", "ring"),
 }
 FORBIDDEN_RESOLVED_RING = {
