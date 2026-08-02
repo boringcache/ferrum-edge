@@ -561,16 +561,16 @@ route header rule relabelling a `text/plain` body as `application/json` would
 otherwise activate JSON policies over bytes they were never asked about under the
 published header map.
 
-So the body-hook phase returns a **witness** of what it decided over — the exact
-plaintext bytes, plus the policy-scope headers it read them under — and the
-finalizer re-decides once the chain has closed the map, before the header phase
-below. The scope is every `Content-*` field except `Content-Length` (derived from
-bytes the witness already pins) and the `Content-Security-Policy` family (a client
-directive and a gateway decorator, not a description of these bytes), plus
-`grpc-status` / `grpc-message` (which decide `body_validator`'s
-empty-terminal-error exemption). The comparison is made after
-normalizing the gateway's own transport encoding back out, so `compression`
-adding `Content-Encoding: gzip` is not a scope change: an unchanged
+So the body-hook phase returns a **witness** of what it decided over — the HTTP
+status, exact plaintext bytes, and policy-scope headers it read them under — and
+the finalizer re-decides once the chain has closed the map, before the header
+phase below. The scope is every `Content-*` field except `Content-Length`
+(derived from bytes the witness already pins) and the `Content-Security-Policy`
+family (a client directive and a gateway decorator, not a description of these
+bytes), plus `grpc-status` / `grpc-message` (which decide `body_validator`'s
+empty-terminal-error exemption). HTTP status is compared exactly; headers are
+compared after normalizing the gateway's own transport encoding back out, so
+`compression` adding `Content-Encoding: gzip` is not a scope change: an unchanged
 representation is never re-inspected, re-called-out-to, or re-charged. Both the
 authoritative phase and the legacy `on_final_response_body` participants
 (`ai_semantic_firewall`) are re-decided together.

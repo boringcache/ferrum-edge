@@ -262,17 +262,19 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     not move gateway compression back ahead of it, and do not move these
     decisions back into `on_final_response_body` — that hook runs after transport
     encoding.
-    On the SYNTHETIC lifecycle the phase returns a WITNESS (the exact plaintext
-    bytes plus the policy-scope headers it read them under) and is RE-DECIDED at
-    the end of `apply_reject_after_proxy_and_synthetic_body_hooks`, after the
+    On the SYNTHETIC lifecycle the phase returns a WITNESS (the HTTP status,
+    exact plaintext bytes, and policy-scope headers it read them under) and is
+    RE-DECIDED at the end of
+    `apply_reject_after_proxy_and_synthetic_body_hooks`, after the
     deliberately-late reject-path `after_proxy` chain, because that chain is the
     last thing that can relabel the representation and thereby activate a policy
     that never saw these bytes. Scope is every `Content-*` field except
     `Content-Length` and the `Content-Security-Policy` family, plus
-    `grpc-status`/`grpc-message`, compared AFTER normalizing
-    the gateway's own transport encoding back out — so an unchanged representation
-    is never re-inspected or re-charged, and `compression` alone never triggers a
-    sweep. The legacy `on_final_response_body` participants
+    `grpc-status`/`grpc-message`; HTTP status is compared exactly. Headers are
+    compared AFTER normalizing the gateway's own transport encoding back out — so
+    an unchanged representation is never re-inspected or re-charged, and
+    `compression` alone never triggers a sweep. The legacy
+    `on_final_response_body` participants
     (`ai_semantic_firewall`) are re-decided in the same sweep. A refusal rebuilds
     through the same `PRESERVED_GATEWAY_RESPONSE_DECORATORS` path as 10c, then the
     rebuild is checked STRUCTURALLY (it must carry exactly the gateway-authored

@@ -62,6 +62,17 @@ struct OneShotGatewayDecorator;
 /// exposes a rename source to the still-later response transformer.
 struct LateHeaderBearingReject;
 
+/// Late reject-path replacement that changes only the HTTP status. Its body is
+/// byte-identical to the representation accepted before the chain ran.
+struct LateIdenticalBodyStatusReject;
+
+/// Final-body policy that applies only after the late chain changes the status.
+struct StatusScopedFinalBodyPolicy {
+    calls: Arc<AtomicUsize>,
+}
+
+const STATUS_SCOPED_BODY: &str = r#"{"same":"bytes"}"#;
+
 #[async_trait::async_trait]
 impl Plugin for FinalPolicyCapacityRefusal {
     fn name(&self) -> &str {
@@ -330,6 +341,71 @@ impl Plugin for LateHeaderBearingReject {
             status_code: 502,
             body: r#"{"error":"upstream rejected"}"#.to_string(),
             headers: HashMap::from([("x-pending-secret".to_string(), "value".to_string())]),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Plugin for LateIdenticalBodyStatusReject {
+    fn name(&self) -> &str {
+        "late_identical_body_status_reject"
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    fn may_replace_rejection_response(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> ferrum_edge::plugins::PluginResult {
+        ferrum_edge::plugins::PluginResult::Reject {
+            status_code: 418,
+            body: STATUS_SCOPED_BODY.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Plugin for StatusScopedFinalBodyPolicy {
+    fn name(&self) -> &str {
+        "status_scoped_final_body_policy"
+    }
+
+    fn requires_response_body_buffering(&self) -> bool {
+        true
+    }
+
+    fn enforces_final_client_visible_response_body(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
+    fn may_enforce_response_body_policy(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
+    async fn finalize_client_visible_response_body(
+        &self,
+        _ctx: &mut RequestContext,
+        response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> ferrum_edge::plugins::PluginResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if response_status != 418 {
+            return ferrum_edge::plugins::PluginResult::Continue;
+        }
+        ferrum_edge::plugins::PluginResult::Reject {
+            status_code: 502,
+            body: r#"{"error":"status-scoped representation refused"}"#.to_string(),
+            headers: HashMap::new(),
         }
     }
 }
@@ -1348,6 +1424,39 @@ async fn body_policy_is_re_decided_only_when_the_late_chain_changes_policy_scope
             "{label}: the first decision reads the pre-chain representation"
         );
     }
+}
+
+/// A status transition is part of a body policy's applicability just as much
+/// as representation headers are. Byte-identical replacement must not suppress
+/// re-decision when a late reject-path hook changes only the status.
+#[tokio::test]
+async fn body_policy_is_re_decided_when_the_late_chain_changes_only_status() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(StatusScopedFinalBodyPolicy {
+            calls: Arc::clone(&calls),
+        }),
+        Arc::new(LateIdenticalBodyStatusReject),
+    ];
+    let mut ctx = ctx_for("GET", "/cache-hit");
+    let mut status = 200u16;
+    let mut headers = json_headers();
+    let mut body = bytes::Bytes::from_static(STATUS_SCOPED_BODY.as_bytes());
+
+    finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)
+        .await;
+
+    assert_eq!(status, 502, "the newly applicable policy must fail closed");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one pre-chain decision and one status-triggered re-decision"
+    );
+    assert_ne!(
+        &body[..],
+        STATUS_SCOPED_BODY.as_bytes(),
+        "the status-scoped refusal must replace the byte-identical late body"
+    );
 }
 
 /// Gateway transport encoding is not a policy-scope change. `compression` adds

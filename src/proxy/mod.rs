@@ -17327,6 +17327,9 @@ const TRANSPORT_ENCODING_OWNED_RESPONSE_HEADERS: [&str; 2] = ["content-encoding"
 /// `application/json` — and activate a policy that never saw these bytes under
 /// the header map the client actually receives (`GHSA-62jg-v563-4q23`).
 pub(crate) struct FinalSyntheticBodyPolicyWitness {
+    /// HTTP status as the decision saw it. Body policies may scope enforcement
+    /// to particular response classes or exact status codes.
+    status: u16,
     /// Policy-scope headers as the decision saw them, over the plaintext body.
     scope: Vec<(String, String)>,
     /// The exact plaintext representation the policy decided over.
@@ -17342,8 +17345,9 @@ pub(crate) struct FinalSyntheticBodyPolicyWitness {
 }
 
 impl FinalSyntheticBodyPolicyWitness {
-    fn capture(headers: &HashMap<String, String>, body: &Bytes) -> Self {
+    fn capture(status: u16, headers: &HashMap<String, String>, body: &Bytes) -> Self {
         Self {
+            status,
             scope: final_response_body_policy_scope(headers),
             plaintext_body: body.clone(),
             plaintext_transport_headers: TRANSPORT_ENCODING_OWNED_RESPONSE_HEADERS
@@ -17480,7 +17484,7 @@ async fn evaluate_final_synthetic_client_visible_response_body_policy(
 /// Close the synthetic lifecycle's body-policy window: re-decide the final
 /// client-visible BODY policy once the reject-path `after_proxy` chain has made
 /// its last mutation, but ONLY when that chain actually changed something the
-/// policy scope depends on.
+/// policy decision depends on.
 ///
 /// The chain runs last on this lifecycle by design, so a late
 /// `response_transformer` header `rename` — or a route header rule — can relabel
@@ -17491,6 +17495,7 @@ async fn evaluate_final_synthetic_client_visible_response_body_policy(
 ///
 /// Scoping rules, so nothing is charged or called twice for a representation
 /// that did not change:
+/// - the HTTP status is pinned by the witness,
 /// - the plaintext bytes are pinned by the witness, and
 /// - the comparison is made after normalizing away the gateway's own transport
 ///   encoding, so `compression` adding `Content-Encoding: gzip` is not a scope
@@ -17536,7 +17541,10 @@ async fn reenforce_final_synthetic_client_visible_response_body_policy(
         // what would be published is the current pair; judge that instead.
         response_body.clone()
     };
-    if body_unchanged && final_response_body_policy_scope(&candidate_headers) == witness.scope {
+    if body_unchanged
+        && *response_status == witness.status
+        && final_response_body_policy_scope(&candidate_headers) == witness.scope
+    {
         return false;
     }
 
@@ -17869,6 +17877,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
                 // transport encoding, so a later re-decision reads the document
                 // rather than gzip octets.
                 policy_witness = Some(FinalSyntheticBodyPolicyWitness::capture(
+                    *response_status,
                     response_headers,
                     response_body,
                 ));
@@ -17909,6 +17918,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
             terminal_body_response_selected = true;
         } else {
             policy_witness = Some(FinalSyntheticBodyPolicyWitness::capture(
+                *response_status,
                 response_headers,
                 response_body,
             ));
@@ -18112,10 +18122,10 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
 
     // Authoritative final client-visible BODY policy, re-decided over the exact
     // header map the chain above just closed (`GHSA-62jg-v563-4q23`). No-ops
-    // unless that chain changed a field the policy scope depends on, so an
-    // unchanged representation is never inspected, called out to, or charged
-    // twice. Runs BEFORE the header phase so a body refusal is normalized by the
-    // same boundaries as every other rejection in this finalizer.
+    // unless that chain changed the status or a field the policy scope depends
+    // on, so an unchanged representation is never inspected, called out to, or
+    // charged twice. Runs BEFORE the header phase so a body refusal is normalized
+    // by the same boundaries as every other rejection in this finalizer.
     if let Some(witness) = synthetic_body_policy_witness {
         reenforce_final_synthetic_client_visible_response_body_policy(
             plugins, ctx, status, headers, body, witness,
