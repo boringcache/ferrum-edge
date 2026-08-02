@@ -9277,11 +9277,38 @@ pub trait Plugin: Send + Sync {
         self.requires_ws_frame_hooks() || self.websocket_size_limits().is_some()
     }
 
+    /// Bind this plugin to one accepted WebSocket session.
+    ///
+    /// Called exactly once per upgraded connection, from the shared H1/H2/H3
+    /// relay plugin-collection step, with the finalized upgrade
+    /// [`RequestContext`]. The relay substitutes the returned plugin for this
+    /// one, positionally, in both the parser-policy and frame-hook lists, so
+    /// configured priority order and per-frame dispatch are unchanged and each
+    /// message is still processed exactly once per configured instance.
+    ///
+    /// This exists because [`Plugin::on_ws_frame`] deliberately carries no
+    /// request context: a WebSocket session is one upgraded request, and a
+    /// policy plugin whose per-message decision depends on request-scoped state
+    /// (rule conditions, exemptions, whether the direction can actually block)
+    /// must resolve that state **once, at admission**, not re-derive it per
+    /// frame. Implementations must return an immutable, self-contained snapshot
+    /// and must not retain request headers, bodies, or credentials.
+    ///
+    /// Returning `None` (the default) keeps the shared instance in place.
+    fn bind_ws_session(self: Arc<Self>, _ctx: &RequestContext) -> Option<Arc<dyn Plugin>> {
+        None
+    }
+
     /// Called for each complete WebSocket message when a plugin opts in.
     ///
     /// Tungstenite reassembles Text/Binary continuation frames before this
     /// hook. Plugins that require actual wire-frame enforcement must contribute
     /// parser policy through [`Plugin::websocket_size_limits`] instead.
+    ///
+    /// The gateway never negotiates `permessage-deflate` (the client's
+    /// extension offer is stripped before the backend handshake and no
+    /// negotiated extension is echoed to the client), so payloads reaching this
+    /// hook are complete, uncompressed application messages.
     ///
     /// `connection_id` is a unique per-connection identifier (monotonic counter) that
     /// stateful plugins (e.g., ws_rate_limiting) can use to track per-connection state.

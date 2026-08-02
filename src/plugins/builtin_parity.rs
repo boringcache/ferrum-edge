@@ -387,9 +387,9 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "waf",
         classification: BuiltinPluginClassification::Public,
         priority: 2930,
-        active_phases: "authorize, on_final_request_body, after_proxy, finalize_client_visible_response_body, finalize_client_visible_response_headers, on_stream_connect, on_udp_datagram",
+        active_phases: "authorize, on_final_request_body, after_proxy, finalize_client_visible_response_body, finalize_client_visible_response_headers, on_ws_frame, on_stream_connect, on_udp_datagram",
         matrix_protocols: ALL_PROTOCOLS,
-        protocol_rationale: "HTTP-family always; TCP/UDP first-bytes and datagram inspection when a `stream` block is configured",
+        protocol_rationale: "HTTP-family always, including complete WebSocket text/binary application messages in both directions; TCP/UDP first-bytes and datagram inspection when a `stream` block is configured",
     },
     BuiltinPluginParityMeta {
         name: "fault_injection",

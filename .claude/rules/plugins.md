@@ -317,7 +317,17 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     not by a further policy pass.
 11. `on_final_response_body`: dedup/cache store, size limiting, response cache predictor
 12. `log`: stdout/statsd/http/tcp/kafka/loki/udp/ws/tx_debug/prometheus/chargeback
-13. `on_ws_frame`: WS size, rate, and frame logging
+13. `on_ws_frame`: WS size, rate, frame logging, and `waf` complete-message
+    body-rule inspection
+    - `waf` resolves every request-scoped predicate ONCE at upgrade admission
+      through `Plugin::bind_ws_session` (`GHSA-6j3m-vf5h-pgcx`); the relay
+      substitutes the session-bound instance positionally, so priority order is
+      unchanged and each configured instance processes each message once.
+      Client→backend messages run the request body rule set, backend→client the
+      response set; Text and Binary are both inspected and the HTTP media-type
+      selectors do not apply. Control frames are never scanned as application
+      payload, and `max_scan_bytes` / `on_body_too_large` / `on_scan_timeout`
+      fail closed with a fixed 1008 Close that never echoes message bytes.
     - First terminal Close from an admission/mutating hook wins; later mutating
       plugins are skipped for that frame while observational hooks
       (`observes_ws_frame_decisions`) may still record the final decision.
