@@ -62,6 +62,12 @@ jobs:
         run: |
           cargo tree -e features --no-dev-dependencies > /tmp/tree-crypto-ring.txt
 
+      # Temporary hosted diagnostic: the ordinary profile is required to stay
+      # compatible with the committed lockfile. Print Cargo's exact lockfile
+      # rewrite before the later --locked assertion rejects the stale file.
+      - name: Report ordinary lockfile drift
+        run: git diff -- Cargo.lock
+
       - name: Audit the ordinary feature graph
         run: |
           python3 .github/scripts/check_fips_feature_policy.py \
