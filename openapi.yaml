@@ -189,7 +189,8 @@ paths:
 
         **Unauthenticated** callers receive only `status` and `ready` (suitable
         for readiness probes). The **detailed** diagnostics — `mode`, `database`
-        connectivity/pool stats, `cached_config` proxy/consumer counts,
+        connectivity/pool stats, `fips` deployment-mode metadata,
+        `cached_config` proxy/consumer counts,
         `database_polling` degradation, `config_rejected`, mesh state,
         `logging`, `kafka_logging`, and `ai_transcript_audit` admitted capture
         ceilings — are
@@ -10901,7 +10902,7 @@ components:
       description: |
         Tiered: unauthenticated callers receive only `status` and `ready`. The
         remaining detailed fields (`timestamp`, `mode`, `database`,
-        `admin_writes_enabled`, `cached_config`, `database_polling`,
+        `admin_writes_enabled`, `fips`, `cached_config`, `database_polling`,
         `config_rejected`, `mesh`, `listener_failures`, `logging`,
         `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`) are
         present only when the caller is authenticated (admin JWT, metrics bearer
@@ -11020,6 +11021,81 @@ components:
                       type: integer
             failover_topology:
               $ref: "#/components/schemas/DatabaseFailoverTopology"
+        fips:
+          type: object
+          description: |
+            FIPS 140-2/140-3 deployment-mode metadata. Authenticated detail tier
+            only.
+
+            Ferrum Edge is **not** a validated cryptographic module and is not
+            independently FIPS-certified; `certified` is therefore always
+            `false`. `enforcing: true` means Ferrum is applying its fail-closed
+            FIPS admission policy, not that the deployment is compliant —
+            compliance additionally requires the exact validated module, build,
+            operating environment, and operational controls documented in
+            `docs/fips.md`.
+
+            No key material, module internal state, file path, or
+            operator-supplied value appears in this object.
+          required:
+            [
+              mode,
+              enforcing,
+              build_capable,
+              build_profile,
+              provider,
+              module_self_test_passed,
+              provider_algorithms_approved,
+              certified,
+              boundary_documentation,
+            ]
+          properties:
+            mode:
+              type: string
+              # Quoted: bare `off` is a YAML 1.1 boolean.
+              enum: ["off", "enforce"]
+              description: Resolved `FERRUM_FIPS_MODE` request.
+            enforcing:
+              type: boolean
+              description: Whether the fail-closed FIPS policy is being applied.
+            build_capable:
+              type: boolean
+              description: |
+                Whether this binary links the validated cryptographic module.
+                When `false`, a `FERRUM_FIPS_MODE=enforce` request fails closed
+                at startup rather than downgrading to a non-validated provider.
+            build_profile:
+              type: string
+              enum: [crypto-ring, fips]
+              description: |
+                The mutually exclusive cargo feature this binary was built with.
+                `crypto-ring` is the ordinary, non-FIPS build; `fips` links the
+                validated AWS-LC-FIPS module. This is the field an operator
+                compares against the artifact they intended to deploy.
+            provider:
+              type: string
+              enum: [ring, aws-lc-fips]
+              description: Identifier of the active cryptographic integration.
+            module_self_test_passed:
+              type: boolean
+              description: |
+                Whether the validated module reported that its power-on
+                self-tests passed. Always `false` when `build_capable` is
+                `false` — there is no module to have tested.
+            provider_algorithms_approved:
+              type: boolean
+              description: |
+                Whether rustls classifies the installed provider's algorithms as
+                FIPS-approved.
+            certified:
+              type: boolean
+              enum: [false]
+              description: |
+                Always `false`. Ferrum Edge makes no independent certification
+                claim about itself.
+            boundary_documentation:
+              type: string
+              description: Repository path documenting the module boundary.
         cached_config:
           type: object
           required: [available]

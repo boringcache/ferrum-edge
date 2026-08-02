@@ -617,7 +617,7 @@ pub fn audit_destination_identity(
     db_url: Option<&str>,
     namespace: &str,
 ) -> String {
-    use sha2::{Digest, Sha256};
+    use crate::fips::approved::Sha256;
     let db_type = db_type.unwrap_or("none");
     let redacted = db_url
         .map(crate::config::db_backend::redact_url)

@@ -5,10 +5,10 @@
 //! a SHA-256 digest of the **uncompressed** bytes is recorded for integrity
 //! verification.
 
+use crate::fips::approved::Sha256;
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 
 /// Compress `input` bytes using gzip at the default compression level (6).

@@ -1954,6 +1954,19 @@ async fn handle_admin_request_inner(
             }
         }
 
+        // FIPS deployment mode / provider metadata.
+        //
+        // Authenticated detail tier only. Every field is a boolean or a
+        // fixed-set string — no key material, no module internals, no paths,
+        // no operator-supplied values — but the combination of build profile
+        // and enforcement posture is still deployment intelligence that an
+        // anonymous caller has no need for, so it sits inside the `detailed`
+        // gate with the rest of the diagnostics. The payload carries an
+        // explicit `certified: false`: Ferrum is not itself a validated
+        // cryptographic module, and a status scraper must not be able to read
+        // "enforcing" as "certified". See docs/fips.md.
+        health_status["fips"] = crate::fips::status_metadata();
+
         // Admin audit delivery pipeline (issue #2421). An unavailable or
         // degraded pipeline degrades `status` so a stuck audit backlog is not
         // invisible behind an otherwise green probe. Both checks are single

@@ -69,6 +69,39 @@
       ]
     },
     {
+      "id": "reqwest-002-selectable-rustls-provider",
+      "label": "reqwest selectable rustls provider fallback",
+      "crate": "reqwest",
+      "vendored_version": "0.13.3",
+      "vendor_path": "vendor/reqwest-0.13.3-ferrum-patched",
+      "docs_path": "docs/upstream-reqwest-patches/002-selectable-rustls-provider/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "Library and test clients can construct reqwest before binary bootstrap; upstream's only fallback hard-wires AWS-LC and cannot preserve Ferrum's mutually exclusive Ring/AWS-LC-FIPS backend pair.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "seanmonstar/reqwest",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Reqwest ships a provider-neutral selectable fallback, or Ferrum retires the vendored crate.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        ".github/scripts/check_fips_feature_policy.py",
+        "tests/integration/admin_api_specs_handler_tests.rs",
+        "tests/integration/scripted_backend_smoke_tests.rs",
+        "tests/service_integration/consul.rs"
+      ]
+    },
+    {
       "id": "h3-001-recv-frame-drain-on-quic-close",
       "label": "h3 frame-drain on QUIC close",
       "crate": "h3",

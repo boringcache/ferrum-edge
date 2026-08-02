@@ -32,12 +32,12 @@ use crate::config::validation_pipeline::{
     ConfigValidationRejection, ValidationAction, ValidationPipeline,
     collect_rejecting_runtime_config_errors, validate_plugin_file_dependencies_off_thread,
 };
+use crate::fips::approved::Sha256;
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use dashmap::DashMap;
-use sha2::{Digest, Sha256};
 use sqlx::Executor;
 use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};

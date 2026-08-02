@@ -355,18 +355,30 @@ fn build_h3_quinn_server_config(
         .copied()
         .collect();
 
-    // If user didn't configure any TLS 1.3 suites, use defaults
+    let base_provider = crate::fips::base_crypto_provider();
+
+    // If the operator configured no TLS 1.3 suites, fall back to whichever of
+    // the TLS 1.3 defaults the active provider implements. Resolving against
+    // the provider rather than naming provider-qualified constants is what
+    // keeps a FIPS build from reintroducing ChaCha20-Poly1305 here: the FIPS
+    // module simply does not offer it, so it drops out.
     let h3_suites = if tls13_suites.is_empty() {
-        vec![
-            rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256,
-            rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384,
-            rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
-        ]
+        let defaults = base_provider
+            .cipher_suites
+            .iter()
+            .filter(|suite| suite.tls13().is_some())
+            .copied()
+            .collect::<Vec<_>>();
+        if defaults.is_empty() {
+            return Err(anyhow::anyhow!(
+                "the active crypto provider implements no TLS 1.3 cipher suites, so no HTTP/3 \
+                 (QUIC) listener can be built"
+            ));
+        }
+        defaults
     } else {
         tls13_suites
     };
-
-    let base_provider = rustls::crypto::ring::default_provider();
     let h3_provider = rustls::crypto::CryptoProvider {
         cipher_suites: h3_suites,
         kx_groups: tls_policy.crypto_provider.kx_groups.clone(),
@@ -442,7 +454,7 @@ fn build_h3_quinn_server_config(
     // rotating ticketer; if construction fails, the same bounded stateful cache
     // remains as the fail-safe resumption fallback.
     if server_tls_config.max_early_data_size == 0 {
-        match rustls::crypto::ring::Ticketer::new() {
+        match crate::fips::ticketer() {
             Ok(ticketer) => {
                 server_tls_config.ticketer = ticketer;
             }
@@ -664,7 +676,21 @@ pub async fn start_http3_listener_with_signal(
             &client_crls,
             &h3_config,
         )?;
-        quinn::Endpoint::server(server_config, addr)?
+        // Quinn's `Endpoint::server` convenience constructor is gated on its
+        // `ring` or non-FIPS `aws-lc-rs` feature. The FIPS provider uses the
+        // distinct `aws-lc-rs-fips` feature, so construct the same endpoint
+        // explicitly instead of making listener availability depend on a
+        // non-validated provider feature being compiled too.
+        let socket = std::net::UdpSocket::bind(addr)?;
+        socket.set_nonblocking(true)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| anyhow::anyhow!("HTTP/3 listener requires a Tokio runtime"))?;
+        quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime,
+        )?
     };
     let bound_addr = endpoint.local_addr().ok();
     let local_addr = bound_addr.unwrap_or(addr);
@@ -14771,7 +14797,7 @@ mod build_h3_quinn_server_config_mtls_tests {
     fn ensure_crypto_provider() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            let _ = crate::fips::base_crypto_provider().install_default();
         });
     }
 
