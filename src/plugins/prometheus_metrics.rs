@@ -2061,9 +2061,19 @@ impl MetricsRegistry {
                 audit_pipeline.accepted_total,
             ),
             (
-                "ferrum_admin_audit_events_spooled_total",
-                "Admin audit events made durable in the spool before the mutation response.",
-                audit_pipeline.spooled_total,
+                "ferrum_admin_audit_intents_prepared_total",
+                "Pre-mutation admin audit intents made durable (fsynced) before the configuration mutation was invoked.",
+                audit_pipeline.prepared_total,
+            ),
+            (
+                "ferrum_admin_audit_events_finalized_total",
+                "Admin audit intents durably finalized with the mutation's known outcome.",
+                audit_pipeline.finalized_total,
+            ),
+            (
+                "ferrum_admin_audit_unknown_outcome_total",
+                "Prepared admin audit records adopted from a prior process generation whose mutation outcome is unknowable.",
+                audit_pipeline.unknown_outcome_total,
             ),
             (
                 "ferrum_admin_audit_events_enqueued_total",
@@ -2101,6 +2111,11 @@ impl MetricsRegistry {
                 audit_pipeline.corrupt_records_total,
             ),
             (
+                "ferrum_admin_audit_destination_mismatch_total",
+                "Durable admin audit records quarantined because they target a different audit destination or instance.",
+                audit_pipeline.destination_mismatch_total,
+            ),
+            (
                 "ferrum_admin_audit_truncated_diffs_total",
                 "Admin audit events whose diff was replaced by a redacted marker because it exceeded the durable record ceiling.",
                 audit_pipeline.truncated_diffs_total,
@@ -2109,6 +2124,11 @@ impl MetricsRegistry {
                 "ferrum_admin_audit_fail_closed_rejections_total",
                 "Admin mutations refused up front because the audit pipeline is unavailable under the fail_closed policy.",
                 audit_pipeline.fail_closed_rejections_total,
+            ),
+            (
+                "ferrum_admin_audit_fail_open_unaudited_mutations_total",
+                "Admin mutations allowed to proceed without durable pre-mutation audit evidence under the fail_open policy.",
+                audit_pipeline.fail_open_unaudited_mutations_total,
             ),
         ] {
             output.push_str(&format!("# HELP {name} {help}\n"));
@@ -2133,6 +2153,10 @@ impl MetricsRegistry {
                 "retained_capacity",
                 audit_pipeline.dropped_retained_capacity_total,
             ),
+            (
+                "destination_mismatch",
+                audit_pipeline.destination_mismatch_total,
+            ),
         ] {
             output.push_str(&format!(
                 "ferrum_admin_audit_events_dropped_total{{reason=\"{reason}\"{ns_label}}} {value}\n"
@@ -2151,8 +2175,18 @@ impl MetricsRegistry {
                 audit_status.queue_capacity as i64,
             ),
             (
+                "ferrum_admin_audit_delivery_in_flight",
+                "Admin audit delivery attempts currently in flight.",
+                audit_pipeline.delivery_in_flight as i64,
+            ),
+            (
+                "ferrum_admin_audit_spool_prepared_records",
+                "Durable pre-mutation admin audit intents awaiting finalization.",
+                audit_pipeline.spool_prepared_records as i64,
+            ),
+            (
                 "ferrum_admin_audit_spool_pending_records",
-                "Durable admin audit records awaiting delivery (bounded scan; a saturated scan reports a floor).",
+                "Durable admin audit records awaiting delivery (O(1) admission counter; a saturated background scan reports a floor).",
                 audit_pipeline.spool_pending_records as i64,
             ),
             (
@@ -2164,6 +2198,16 @@ impl MetricsRegistry {
                 "ferrum_admin_audit_available",
                 "Whether the admin audit pipeline can durably record committed mutations (1) or not (0).",
                 i64::from(audit_status.available),
+            ),
+            (
+                "ferrum_admin_audit_degraded",
+                "Sticky evidence that admin audit records were corrupted, retained as unrecoverable, or permanently discarded (1) or not (0). A later successful delivery does not clear it.",
+                i64::from(audit_status.degraded),
+            ),
+            (
+                "ferrum_admin_audit_evidence_lost",
+                "Whether admin audit evidence has been permanently discarded (1) or not (0). Never clears.",
+                i64::from(audit_status.evidence_lost),
             ),
         ] {
             output.push_str(&format!("# HELP {name} {help}\n"));

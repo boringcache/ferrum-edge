@@ -12422,18 +12422,22 @@ mod inner {
             event: &crate::admin::audit::AuditEvent,
         ) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
-            // Idempotent on `_id` (issue #2421). Durable-spool replay after a
-            // crash, a partial failure, or a shutdown deadline re-delivers the
-            // same event id; a plain `insert_one` would raise duplicate-key
-            // (11000) and burn the bounded retry budget on an event that is
-            // already recorded. This is a single-document upsert, so it needs
-            // no multi-document transaction and therefore no replica set —
-            // audit delivery stays correct on standalone MongoDB.
+            // Insert-only and idempotent on `_id` (issue #2421). Durable-spool
+            // replay after a crash, a partial failure, or a shutdown deadline
+            // re-delivers the same event id. An audit row is immutable, so a
+            // duplicate must converge to the row that is already durable rather
+            // than replace it: `replace_one(...).upsert(true)` would silently
+            // overwrite an existing audit record, which is exactly the mutation
+            // an audit log must not permit. `insert_one` with duplicate-key
+            // (11000) treated as success is the insert-only equivalent, and it
+            // is a single-document write so it needs no multi-document
+            // transaction and therefore no replica set.
             let doc = audit_event_to_doc(event)?;
-            self.audit_events()
-                .replace_one(doc! { "_id": event.id.as_str() }, doc)
-                .upsert(true)
-                .await?;
+            if let Err(error) = self.audit_events().insert_one(doc).await
+                && !is_duplicate_key(&error)
+            {
+                return Err(error.into());
+            }
             self.check_slow_query("insert_audit_event", start);
             if self.audit_retention.is_enabled()
                 && let Err(error) = self
@@ -13340,6 +13344,9 @@ mod inner {
                 resource_type: "proxy".to_string(),
                 resource_id: "proxy-1".to_string(),
                 namespace: "ferrum".to_string(),
+                source_address: String::new(),
+                request_id: String::new(),
+                outcome: String::new(),
                 diff: serde_json::json!({
                     "changed": true,
                     "after": {

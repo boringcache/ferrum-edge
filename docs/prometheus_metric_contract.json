@@ -1269,7 +1269,7 @@
   {
     "name": "ferrum_mesh_bpf_tcp_events_total",
     "type": "counter",
-    "help": "TCP-layer events captured by the BPF SOCK_OPS program. event=\"rst\" counts abnormal ESTABLISHED→CLOSE transitions without sent/received attribution (SOCK_OPS state callbacks cannot distinguish direction).",
+    "help": "TCP-layer events captured by the BPF SOCK_OPS program. event=\"rst\" counts abnormal ESTABLISHED\u2192CLOSE transitions without sent/received attribution (SOCK_OPS state callbacks cannot distinguish direction).",
     "labels": [
       "event"
     ],
@@ -2527,9 +2527,33 @@
     "emission": "always"
   },
   {
-    "name": "ferrum_admin_audit_events_spooled_total",
+    "name": "ferrum_admin_audit_intents_prepared_total",
     "type": "counter",
-    "help": "Admin audit events made durable in the spool before the mutation response.",
+    "help": "Pre-mutation admin audit intents made durable (fsynced) before the configuration mutation was invoked.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_events_finalized_total",
+    "type": "counter",
+    "help": "Admin audit intents durably finalized with the mutation's known outcome.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_unknown_outcome_total",
+    "type": "counter",
+    "help": "Prepared admin audit records adopted from a prior process generation whose mutation outcome is unknowable.",
     "labels": [
       "namespace"
     ],
@@ -2623,6 +2647,18 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_admin_audit_destination_mismatch_total",
+    "type": "counter",
+    "help": "Durable admin audit records quarantined because they target a different audit destination or instance.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_admin_audit_truncated_diffs_total",
     "type": "counter",
     "help": "Admin audit events whose diff was replaced by a redacted marker because it exceeded the durable record ceiling.",
@@ -2638,6 +2674,18 @@
     "name": "ferrum_admin_audit_fail_closed_rejections_total",
     "type": "counter",
     "help": "Admin mutations refused up front because the audit pipeline is unavailable under the fail_closed policy.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_fail_open_unaudited_mutations_total",
+    "type": "counter",
+    "help": "Admin mutations allowed to proceed without durable pre-mutation audit evidence under the fail_open policy.",
     "labels": [
       "namespace"
     ],
@@ -2684,9 +2732,33 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_admin_audit_delivery_in_flight",
+    "type": "gauge",
+    "help": "Admin audit delivery attempts currently in flight.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_spool_prepared_records",
+    "type": "gauge",
+    "help": "Durable pre-mutation admin audit intents awaiting finalization.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_admin_audit_spool_pending_records",
     "type": "gauge",
-    "help": "Durable admin audit records awaiting delivery (bounded scan; a saturated scan reports a floor).",
+    "help": "Durable admin audit records awaiting delivery (O(1) admission counter; a saturated background scan reports a floor).",
     "labels": [
       "namespace"
     ],
@@ -2711,6 +2783,30 @@
     "name": "ferrum_admin_audit_available",
     "type": "gauge",
     "help": "Whether the admin audit pipeline can durably record committed mutations (1) or not (0).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_degraded",
+    "type": "gauge",
+    "help": "Sticky evidence that admin audit records were corrupted, retained as unrecoverable, or permanently discarded (1) or not (0). A later successful delivery does not clear it.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin_audit",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_admin_audit_evidence_lost",
+    "type": "gauge",
+    "help": "Whether admin audit evidence has been permanently discarded (1) or not (0). Never clears.",
     "labels": [
       "namespace"
     ],

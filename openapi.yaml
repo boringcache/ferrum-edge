@@ -3631,16 +3631,19 @@ paths:
       operationId: listAuditEvents
       summary: List admin audit events
       description: |
-        Returns successful admin API mutation events for the selected namespace.
-        Requires an admin-role JWT. Each event includes actor, action, resource
-        identity, timestamp, and a JSON diff. Consumer credential data is
-        redacted before it is written to the audit log. Sensitive plugin
-        configuration is redacted as well, through the same schema-aware
-        sensitivity contract used for non-admin plugin reads: credential-bearing
-        endpoint URLs keep only scheme/host/port with structural
-        `[REDACTED_PATH]`/`[REDACTED_QUERY]`/`[REDACTED_FRAGMENT]` markers and
-        never userinfo, all values of arbitrary header maps and webhook body
-        templates are replaced by `[REDACTED]`, as are
+        Returns successful admin API mutation events for the selected namespace,
+        plus unconditional security-sensitive backup export and authenticated
+        backup-attempt records. Requires an admin-role JWT. Each event
+        includes actor, action, resource identity, timestamp, and a JSON diff.
+        Events may also include `source_address` (canonical socket peer), a
+        bounded `request_id`, and a fixed-cardinality `outcome`. Consumer
+        credential data is redacted before it is written to the audit log.
+        Sensitive plugin configuration is redacted as well, through the same
+        schema-aware sensitivity contract used for non-admin plugin reads:
+        credential-bearing endpoint URLs keep only scheme/host/port with
+        structural `[REDACTED_PATH]`/`[REDACTED_QUERY]`/`[REDACTED_FRAGMENT]`
+        markers and never userinfo, all values of arbitrary header maps and
+        webhook body templates are replaced by `[REDACTED]`, as are
         `serverless_function.azure_function_key` and every
         `kafka_logging.producer_config` property outside the safe-tuning
         allow-list. Redis envelope signing keys (`redis_integrity_key` and any
@@ -3844,6 +3847,15 @@ paths:
         Falls back to the in-memory cached configuration when the database is
         unavailable, indicated by the `X-Data-Source: cached` response header.
 
+        A durable security audit record is always admitted before the
+        unredacted body is released (independent of
+        `FERRUM_ADMIN_AUDIT_ENABLED`, which gates ordinary mutation audit
+        events only): synchronous `audit_events` insert, or bounded local
+        fallback under `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` when the primary
+        store is unavailable. If admission fails, the endpoint returns `503`
+        without an attachment. Authenticated denials and validation failures
+        are audited with fixed-cardinality categories only.
+
         ### Size guidance
 
         The response is a single JSON document containing all requested
@@ -3867,6 +3879,14 @@ paths:
             Comma-separated list of resource types to include.
             Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`.
             When omitted, all resource types are included.
+            The parameter must appear at most once as `resources=<csv>`. A
+            key-only `resources` (no `=`), duplicate/ambiguous occurrences, or
+            other structurally malformed forms are rejected with `400` and the
+            same static error message — they never widen to an unfiltered
+            export. Unknown tokens are likewise rejected with `400` and a
+            static error message that does not echo the rejected token; they
+            are never persisted in audit events (malformed or unknown filters
+            are recorded as the fixed `invalid` sentinel only).
             Including `api_specs` also requires `proxies`, `upstreams`, and
             `plugin_configs` so the export stays directly restorable (owning
             proxy plus generated upstream/plugin relationships). Otherwise the
@@ -6901,7 +6921,9 @@ components:
           description: JWT `sub` claim of the admin actor
         action:
           type: string
-          description: Mutation action, such as `create`, `update`, `delete`, or `restore`
+          description: >-
+            Mutation or security-sensitive action, such as `create`, `update`,
+            `delete`, `restore`, or `backup`
         resource_type:
           type: string
           description: Mutated resource category
@@ -6911,11 +6933,49 @@ components:
         namespace:
           type: string
           description: Namespace selected by `X-Ferrum-Namespace`
+        source_address:
+          type: string
+          description: >-
+            Canonical admin connection peer address. Derived from the socket
+            peer only — never from client-spoofable forwarding headers. Omitted
+            when empty (legacy mutation events without request context).
+        request_id:
+          type: string
+          maxLength: 128
+          description: >-
+            Bounded request/correlation ID. Taken from a validated
+            `X-Request-Id` or `X-Correlation-Id` when present and safe;
+            otherwise generated. Omitted when empty.
+        outcome:
+          type: string
+          enum:
+            - success
+            - failure
+            - denied
+            - validation_failed
+            - unavailable
+            - unknown_outcome
+          description: >-
+            Fixed-cardinality result: `success`, `failure`, `denied`,
+            `validation_failed`, `unavailable`, or `unknown_outcome`.
+            `unknown_outcome` marks an audited mutation whose process died
+            between the config-database commit and the durable finalize
+            (issue #2421): the change may or may not have taken effect, and the
+            outcome is recorded as unknowable rather than inferred. Omitted when
+            empty (legacy mutation events).
         diff:
           type: object
           additionalProperties: true
           description: >-
-            Redacted JSON diff for the successful mutation. Basic credential
+            Redacted JSON diff for the successful mutation, or a fixed-shape
+            backup audit payload. Backup success diffs carry only
+            `data_source`, `resources`, `counts`, and `bytes` — never backup
+            body bytes or secrets. Backup failure diffs carry only
+            `failure_category` and `resources`. `resources` is either the
+            sentinel `all`, a sorted allow-listed name array
+            (`proxies`/`consumers`/`plugin_configs`/`upstreams`/`api_specs`),
+            or the fixed sentinel `invalid` when the request filter contained
+            unknown tokens (raw tokens are never stored). Basic credential
             changes expose only the credential type, action, and a stable
             `[REDACTED]` marker, never values, entry fields, shape, or count.
             Unknown/custom credential types are omitted from audit payloads so
@@ -11182,13 +11242,28 @@ components:
 
         Counts and closed-set reason labels only. Never contains an actor
         subject, a bearer token, a request body, an audit diff, a resource id,
-        an OS error string, or a spool filesystem path.
+        an OS error string, a database connection string, or a spool filesystem
+        path.
 
-        When `available` is `false`, `status` is forced to `degraded`, and under
+        Reads are O(1): every field comes from a process atomic or cached
+        background state, so an authenticated probe never triggers a filesystem
+        walk or a database query.
+
+        When `available` or `degraded` forces it, `status` is reported as
+        `degraded`, and under
         `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed` audited admin
-        mutations are refused with `503`.
+        mutations are refused with `503` **before** they are performed.
       required:
-        [enabled, durability, policy, available, last_unavailable_reason]
+        [
+          enabled,
+          durability,
+          policy,
+          available,
+          last_unavailable_reason,
+          degraded,
+          degraded_reason,
+          evidence_lost,
+        ]
       properties:
         enabled:
           type: boolean
@@ -11196,7 +11271,8 @@ components:
           type: string
           enum: [spool, memory, disabled]
           description: |
-            `spool` — events are fsynced before the mutation response.
+            `spool` — a pre-mutation intent is fsynced before the mutation
+            runs and finalized with its outcome afterwards.
             `memory` — no usable durable spool; a crash can lose committed
             mutations' audit events. `disabled` — auditing is off.
         policy:
@@ -11204,7 +11280,9 @@ components:
           enum: [fail_open, fail_closed]
         available:
           type: boolean
-          description: Whether committed mutations can currently be durably audited.
+          description: >-
+            Whether an audited mutation can currently be durably prepared before
+            it runs. Drives the `fail_closed` write gate.
         last_unavailable_reason:
           type: string
           enum:
@@ -11219,6 +11297,37 @@ components:
             - delivery_exhausted
             - retained_capacity
             - no_durable_spool
+            - destination_mismatch
+            - prepare_failed
+        degraded:
+          type: boolean
+          description: >-
+            Sticky evidence that durable records were corrupted, retained as
+            unrecoverable, or permanently discarded. A later successful delivery
+            does not clear it; only resolving the retained evidence under
+            `<spool>/failed/` does.
+        degraded_reason:
+          type: string
+          enum:
+            - none
+            - spool_unavailable
+            - spool_saturated
+            - spool_io_error
+            - invalid_record
+            - corrupt_record
+            - queue_saturated
+            - worker_unavailable
+            - delivery_exhausted
+            - retained_capacity
+            - no_durable_spool
+            - destination_mismatch
+            - prepare_failed
+        evidence_lost:
+          type: boolean
+          description: >-
+            Audit evidence was permanently discarded (retained capacity
+            exhausted, or a memory-only drop). Never clears while the process
+            runs.
         queue_capacity:
           type: integer
           format: uint64
@@ -11234,9 +11343,23 @@ components:
         accepted_total:
           type: integer
           format: uint64
-        spooled_total:
+        prepared_total:
           type: integer
           format: uint64
+          description: >-
+            Pre-mutation intents made durable (fsynced) before the configuration
+            mutation was invoked.
+        finalized_total:
+          type: integer
+          format: uint64
+          description: Intents durably finalized with the mutation's known outcome.
+        unknown_outcome_total:
+          type: integer
+          format: uint64
+          description: >-
+            Prepared records adopted from a prior process generation that died
+            before the mutation outcome was known. Stored with
+            `outcome = unknown_outcome`; never inferred as success or failure.
         enqueued_total:
           type: integer
           format: uint64
@@ -11259,6 +11382,12 @@ components:
         corrupt_records_total:
           type: integer
           format: uint64
+        destination_mismatch_total:
+          type: integer
+          format: uint64
+          description: >-
+            Durable records quarantined because they were bound to a different
+            audit destination (database/namespace) than this process.
         truncated_diffs_total:
           type: integer
           format: uint64
@@ -11272,10 +11401,22 @@ components:
         dropped_retained_capacity_total:
           type: integer
           format: uint64
+        fail_open_unaudited_mutations_total:
+          type: integer
+          format: uint64
+          description: >-
+            Mutations allowed to proceed with no durable pre-mutation evidence
+            under `fail_open`. Any non-zero value is an audit gap by policy.
         fail_closed_rejections_total:
           type: integer
           format: uint64
         queue_depth:
+          type: integer
+          format: uint64
+        delivery_in_flight:
+          type: integer
+          format: uint64
+        spool_prepared_records:
           type: integer
           format: uint64
         spool_pending_records:

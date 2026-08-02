@@ -33,10 +33,12 @@ use tracing::{debug, error, info, warn};
 
 use crate::admin::audit::AuditActor;
 use crate::admin::backup::{
-    ApiSpecsBackupSection, BackupCounts, BackupPayload, RestorePayload,
+    ApiSpecsBackupSection, BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR,
+    BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR, BackupCounts, BackupPayload, RestorePayload,
     clear_api_spec_ownership_tags, filter_config_by_namespace, parse_backup_resources,
     parse_confirm_api_spec_deletion, parse_restore_confirm,
-    validate_backup_api_specs_resource_filter, validate_restore_api_specs_section_with_total_limit,
+    validate_backup_api_specs_resource_filter, validate_backup_resources_allowlist,
+    validate_restore_api_specs_section_with_total_limit,
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
@@ -299,7 +301,13 @@ pub struct AdminState {
     pub mode: String,
     pub read_only: bool,
     /// Enables database-backed audit events for successful admin mutations.
+    /// Does not gate `GET /backup` security-record admission (always on).
     pub admin_audit_enabled: bool,
+    /// Optional override for the local security-audit fallback directory.
+    /// When `None`, uses [`audit::audit_local_fallback_dir`] (env/config).
+    /// Tests inject an isolated path here so they do not mutate process-global
+    /// environment state.
+    pub admin_audit_fallback_dir: Option<std::path::PathBuf>,
     /// When `true` (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`), namespace-scoped
     /// admin routes require the admin JWT to carry an `ns` claim authorizing
     /// the `X-Ferrum-Namespace` value (mirrors the CP↔DP gRPC plane's
@@ -488,9 +496,37 @@ impl AdminState {
             if !topology.primary_active {
                 db.note_failover_admin_write();
             }
+            if let Some(response) = self.prepare_audit_intent().await {
+                return Err(response);
+            }
             return Ok(permit);
         }
+        if let Some(response) = self.prepare_audit_intent().await {
+            return Err(response);
+        }
         Ok(crate::config::db_backend::DbWriteTopologyPermit::noop())
+    }
+
+    /// Durably prepare the pre-mutation audit intent for the in-flight request
+    /// (issue #2421).
+    ///
+    /// This is the last step of admission, immediately before the handler
+    /// performs the configuration mutation, so a committed mutation can never
+    /// exist without durable audit evidence. Under `fail_closed` a failed
+    /// handoff refuses the mutation with `503` and a closed static reason —
+    /// never a path or an OS error. Under `fail_open` the mutation proceeds
+    /// after a fixed-cardinality warning and counter, and the pipeline stops
+    /// claiming durable audit coverage on `/health` and `/metrics`.
+    async fn prepare_audit_intent(&self) -> Option<Response<Full<Bytes>>> {
+        let reason = audit::prepare_request_intent(self.admin_audit_enabled).await?;
+        audit::note_fail_closed_rejection();
+        Some(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({
+                "error": "Admin mutations are refused because the audit pipeline cannot durably record events (FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed)",
+                "audit_unavailable_reason": reason
+            }),
+        ))
     }
 
     /// Admit a mutation that does **not** touch the sticky config-database
@@ -1725,7 +1761,45 @@ fn metrics_unauthorized_response() -> Response<Full<Bytes>> {
 /// Handle an admin API request. `client_ip` is the peer address of the admin
 /// connection (admin uses the socket peer directly — it never trusts forwarded
 /// headers), used to evaluate [`MetricsAuthPolicy`] CIDR allowlists.
+///
+/// Wraps the dispatcher in a per-request audit slot (issue #2421). The slot is
+/// how the admin write gate reaches the request context it must make durable
+/// *before* a configuration mutation runs, and how the response path finalizes
+/// an intent that no handler turned into an audit event. Creating the slot is
+/// allocation-only: nothing touches the spool until an authenticated request
+/// actually reaches the write gate, so unauthenticated probes can never drive
+/// filesystem work.
 pub async fn handle_admin_request(
+    req: Request<Incoming>,
+    state: AdminState,
+    client_ip: std::net::IpAddr,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let slot = audit::new_request_slot(
+        req.method().as_str(),
+        req.uri().path(),
+        req.headers()
+            .get("x-ferrum-namespace")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(crate::config::types::DEFAULT_NAMESPACE),
+    );
+    let result = audit::scope_request(
+        Arc::clone(&slot),
+        handle_admin_request_inner(req, state, client_ip),
+    )
+    .await;
+    // The mutation returned, so the outcome is knowable. A prepared intent that
+    // no handler consumed is finalized here as success or failure — it is never
+    // left dangling to be replayed as `unknown_outcome`, which is reserved for
+    // records whose process died before the outcome was known.
+    let status = result
+        .as_ref()
+        .map(|response| response.status().as_u16())
+        .unwrap_or(500);
+    audit::finalize_unconsumed_intent(&slot, status).await;
+    result
+}
+
+async fn handle_admin_request_inner(
     req: Request<Incoming>,
     state: AdminState,
     client_ip: std::net::IpAddr,
@@ -1861,7 +1935,13 @@ pub async fn handle_admin_request(
         // otherwise green probe. This check is a lock-free atomic read: the
         // detailed projection below is what pays the bounded backlog rescan, so
         // an unauthenticated probe cannot drive filesystem work.
-        if state.admin_audit_enabled && !audit::pipeline_available() {
+        // Both checks are single atomic loads. `pipeline_degraded()` is sticky
+        // evidence that records were corrupted, retained as unrecoverable, or
+        // permanently discarded: a later successful delivery must not clear it,
+        // so it stays visible until the evidence itself is resolved.
+        if state.admin_audit_enabled
+            && (!audit::pipeline_available() || audit::pipeline_degraded())
+        {
             health_status["status"] = json!("degraded");
         }
 
@@ -2175,6 +2255,17 @@ pub async fn handle_admin_request(
         }
     };
 
+    // Peer address + bounded request ID for security-sensitive audit events.
+    // Built after authentication so unauthenticated probes never mint correlation
+    // state; the peer IP is the socket address, never a forwarding header.
+    let audit_request_ctx =
+        audit::AuditRequestContext::from_peer_and_headers(client_ip, req.headers());
+    // Attach the authenticated actor to this request's audit slot so the write
+    // gate can durably prepare an intent before any mutation runs (issue
+    // #2421). Nothing is written to the spool here: an authenticated read never
+    // reaches the write gate.
+    audit::note_request_actor(&auth, &audit_request_ctx);
+
     // API chargeback endpoint. Chargeback output contains customer/business data,
     // so it stays behind the standard admin JWT gate even though it is scrapeable.
     // Non-owning: an authenticated scrape before any `api_chargeback` plugin is
@@ -2255,7 +2346,33 @@ pub async fn handle_admin_request(
     // Extract namespace from X-Ferrum-Namespace header (defaults to "ferrum")
     let namespace = match extract_namespace(req.headers()) {
         Ok(ns) => ns,
-        Err(resp) => return Ok(resp),
+        Err(resp) => {
+            // Authenticated GET /backup must still leave a queryable security
+            // record when the namespace header fails validation. Store under the
+            // valid default audit namespace with fixed-cardinality metadata only
+            // — never the raw invalid namespace. Audit failure must not change
+            // the original HTTP rejection.
+            if method == Method::GET && path == "/backup" {
+                let resources = backup_resources_query_audit_value(query.as_deref());
+                let event = audit::AuditEvent::new(
+                    &auth,
+                    "backup",
+                    "gateway_config",
+                    crate::config::types::DEFAULT_NAMESPACE,
+                    crate::config::types::DEFAULT_NAMESPACE,
+                    audit::backup_namespace_validation_failure_diff(resources),
+                )
+                .with_request_context(&audit_request_ctx)
+                .with_outcome(audit::outcome::VALIDATION_FAILED);
+                audit::record_backup_attempt_best_effort(
+                    state.db.as_ref(),
+                    &event,
+                    state.admin_audit_fallback_dir.as_deref(),
+                )
+                .await;
+            }
+            return Ok(resp);
+        }
     };
 
     // api-specs routes manage their own body reading (configurable limit,
@@ -2273,6 +2390,28 @@ pub async fn handle_admin_request(
         && is_namespace_scoped_route(segments_peek.as_slice())
         && let Some(resp) = enforce_namespace_claim(&auth, &namespace, &path)
     {
+        // `GET` only: `/backup` has no other method, so auditing a denied
+        // `POST`/`PUT`/`DELETE` here would fabricate a `backup` security record
+        // for an export that was never a reachable route.
+        if method == Method::GET && matches!(segments_peek.as_slice(), ["backup"]) {
+            let resources = backup_resources_query_audit_value(query.as_deref());
+            let event = audit::AuditEvent::new(
+                &auth,
+                "backup",
+                "gateway_config",
+                namespace.as_str(),
+                namespace.as_str(),
+                audit::backup_failure_diff(audit::failure_category::NAMESPACE_DENIED, resources),
+            )
+            .with_request_context(&audit_request_ctx)
+            .with_outcome(audit::outcome::DENIED);
+            audit::record_backup_attempt_best_effort(
+                state.db.as_ref(),
+                &event,
+                state.admin_audit_fallback_dir.as_deref(),
+            )
+            .await;
+        }
         drop(req.into_body());
         return Ok(resp);
     }
@@ -2643,9 +2782,33 @@ pub async fn handle_admin_request(
         (Method::GET, ["backup"]) => {
             // Backup returns unredacted credentials and consul tokens — Admin only.
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                let resources = backup_resources_query_audit_value(query.as_deref());
+                let event = audit::AuditEvent::new(
+                    &auth,
+                    "backup",
+                    "gateway_config",
+                    namespace.as_str(),
+                    namespace.as_str(),
+                    audit::backup_failure_diff(audit::failure_category::FORBIDDEN, resources),
+                )
+                .with_request_context(&audit_request_ctx)
+                .with_outcome(audit::outcome::DENIED);
+                audit::record_backup_attempt_best_effort(
+                    state.db.as_ref(),
+                    &event,
+                    state.admin_audit_fallback_dir.as_deref(),
+                )
+                .await;
                 return Ok(resp);
             }
-            handle_backup(&state, query.as_deref(), &namespace).await
+            handle_backup(
+                &state,
+                &auth,
+                query.as_deref(),
+                &namespace,
+                &audit_request_ctx,
+            )
+            .await
         }
         (Method::POST, ["restore"]) => {
             // As with `/batch`: the pre-body gate already ran, and this replays
@@ -6725,6 +6888,166 @@ fn backup_admission_unavailable_response() -> Response<Full<Bytes>> {
     )
 }
 
+/// Fail closed when a security-sensitive backup audit event cannot be admitted
+/// before releasing unredacted configuration.
+fn backup_audit_admit_failed_response() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &json!({
+            "error": "Backup aborted: security audit record could not be admitted"
+        }),
+    )
+}
+
+fn backup_counts_audit_value(
+    proxy_count: usize,
+    consumer_count: usize,
+    plugin_config_count: usize,
+    upstream_count: usize,
+    api_specs_count: usize,
+) -> Value {
+    json!({
+        "proxies": proxy_count,
+        "consumers": consumer_count,
+        "plugin_configs": plugin_config_count,
+        "upstreams": upstream_count,
+        "api_specs": api_specs_count,
+    })
+}
+
+struct BackupExportPayload<'filter, 'value> {
+    resource_filter: Option<&'filter HashSet<&'value str>>,
+    source: &'static str,
+    body_bytes: Vec<u8>,
+    proxy_count: usize,
+    consumer_count: usize,
+    plugin_config_count: usize,
+    upstream_count: usize,
+    api_specs_count: usize,
+}
+
+async fn finalize_backup_export(
+    state: &AdminState,
+    actor: &AuditActor,
+    namespace: &str,
+    request_ctx: &audit::AuditRequestContext,
+    payload: BackupExportPayload<'_, '_>,
+) -> Response<Full<Bytes>> {
+    let BackupExportPayload {
+        resource_filter,
+        source,
+        body_bytes,
+        proxy_count,
+        consumer_count,
+        plugin_config_count,
+        upstream_count,
+        api_specs_count,
+    } = payload;
+    let resources = audit::backup_resources_audit_value(resource_filter);
+    let event = audit::AuditEvent::new(
+        actor,
+        "backup",
+        "gateway_config",
+        namespace,
+        namespace,
+        audit::backup_success_diff(
+            source,
+            resources,
+            backup_counts_audit_value(
+                proxy_count,
+                consumer_count,
+                plugin_config_count,
+                upstream_count,
+                api_specs_count,
+            ),
+            body_bytes.len(),
+        ),
+    )
+    .with_request_context(request_ctx)
+    .with_outcome(audit::outcome::SUCCESS);
+
+    match audit::admit_security_sensitive_event(
+        state.db.as_ref(),
+        &event,
+        state.admin_audit_fallback_dir.as_deref(),
+    )
+    .await
+    {
+        Ok(_) => {
+            info!(
+                "Backup: {} proxies, {} consumers, {} plugin_configs, {} upstreams, {} api_specs ({} bytes)",
+                proxy_count,
+                consumer_count,
+                plugin_config_count,
+                upstream_count,
+                api_specs_count,
+                body_bytes.len()
+            );
+            backup_attachment_response(body_bytes, source)
+        }
+        Err(_error) => backup_audit_admit_failed_response(),
+    }
+}
+
+async fn audit_backup_failure(
+    state: &AdminState,
+    actor: &AuditActor,
+    namespace: &str,
+    request_ctx: &audit::AuditRequestContext,
+    resource_filter: Option<&HashSet<&str>>,
+    category: audit::BackupFailureCategory,
+    outcome: audit::AuditOutcome,
+) {
+    audit_backup_failure_with_resources(
+        state,
+        actor,
+        namespace,
+        request_ctx,
+        audit::backup_resources_audit_value(resource_filter),
+        category,
+        outcome,
+    )
+    .await;
+}
+
+async fn audit_backup_failure_with_resources(
+    state: &AdminState,
+    actor: &AuditActor,
+    namespace: &str,
+    request_ctx: &audit::AuditRequestContext,
+    resources: serde_json::Value,
+    category: audit::BackupFailureCategory,
+    outcome: audit::AuditOutcome,
+) {
+    let event = audit::AuditEvent::new(
+        actor,
+        "backup",
+        "gateway_config",
+        namespace,
+        namespace,
+        audit::backup_failure_diff(category, resources),
+    )
+    .with_request_context(request_ctx)
+    .with_outcome(outcome);
+    audit::record_backup_attempt_best_effort(
+        state.db.as_ref(),
+        &event,
+        state.admin_audit_fallback_dir.as_deref(),
+    )
+    .await;
+}
+
+/// Canonical audit `resources` value from the raw backup query string.
+///
+/// Absent → `"all"`; structurally malformed or unknown tokens → `"invalid"`;
+/// allow-listed names → sorted array. Never persists raw hostile tokens.
+fn backup_resources_query_audit_value(query: Option<&str>) -> serde_json::Value {
+    match parse_backup_resources(query) {
+        Ok(ref filter) => audit::backup_resources_audit_value(filter.as_ref()),
+        Err(_) => json!(audit::BACKUP_RESOURCES_INVALID_SENTINEL),
+    }
+}
+
 /// Outcome of a database-backed export that includes the versioned
 /// `api_specs` section under the namespace config admission guard.
 enum ConsistentApiSpecsBackup {
@@ -6934,17 +7257,68 @@ async fn build_consistent_api_specs_backup(
 /// Export the current gateway config as a JSON backup payload.
 async fn handle_backup(
     state: &AdminState,
+    actor: &AuditActor,
     query: Option<&str>,
     namespace: &str,
+    request_ctx: &audit::AuditRequestContext,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let resource_filter = parse_backup_resources(query);
+    let resource_filter = match parse_backup_resources(query) {
+        Ok(filter) => filter,
+        Err(_) => {
+            // Key-only / duplicate / ambiguous `resources` must fail closed with
+            // the same static no-echo client text and fixed `invalid` audit
+            // sentinel as unknown tokens — never widen to an unfiltered export.
+            audit_backup_failure_with_resources(
+                state,
+                actor,
+                namespace,
+                request_ctx,
+                json!(audit::BACKUP_RESOURCES_INVALID_SENTINEL),
+                audit::failure_category::VALIDATION_FAILED,
+                audit::outcome::VALIDATION_FAILED,
+            )
+            .await;
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR}),
+            ));
+        }
+    };
+    // Reject unknown resources= tokens fail-closed with static client text
+    // that never echoes the rejected token.
+    if let Err(_error) = validate_backup_resources_allowlist(resource_filter.as_ref()) {
+        audit_backup_failure(
+            state,
+            actor,
+            namespace,
+            request_ctx,
+            resource_filter.as_ref(),
+            audit::failure_category::VALIDATION_FAILED,
+            audit::outcome::VALIDATION_FAILED,
+        )
+        .await;
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR}),
+        ));
+    }
     // Fail closed before database/spec loading when a filtered export would
     // emit api_specs without the owning/generated resource classes required
     // for a directly restorable payload.
-    if let Err(error) = validate_backup_api_specs_resource_filter(resource_filter.as_ref()) {
+    if let Err(_error) = validate_backup_api_specs_resource_filter(resource_filter.as_ref()) {
+        audit_backup_failure(
+            state,
+            actor,
+            namespace,
+            request_ctx,
+            resource_filter.as_ref(),
+            audit::failure_category::VALIDATION_FAILED,
+            audit::outcome::VALIDATION_FAILED,
+        )
+        .await;
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
-            &json!({"error": error}),
+            &json!({"error": BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR}),
         ));
     }
 
@@ -6964,6 +7338,16 @@ async fn handle_backup(
             Ok(guard) => guard,
             Err(_error) => {
                 warn_persistence_failure_redacted("backup_namespace_admission_acquire");
+                audit_backup_failure(
+                    state,
+                    actor,
+                    namespace,
+                    request_ctx,
+                    resource_filter.as_ref(),
+                    audit::failure_category::UNAVAILABLE,
+                    audit::outcome::UNAVAILABLE,
+                )
+                .await;
                 return Ok(backup_admission_unavailable_response());
             }
         };
@@ -6984,10 +7368,30 @@ async fn handle_backup(
                 // Never emit a payload assembled after the lease was lost —
                 // even a completed Ready body may straddle two generations.
                 warn_persistence_failure_redacted("backup_namespace_admission_lost");
+                audit_backup_failure(
+                    state,
+                    actor,
+                    namespace,
+                    request_ctx,
+                    resource_filter.as_ref(),
+                    audit::failure_category::UNAVAILABLE,
+                    audit::outcome::UNAVAILABLE,
+                )
+                .await;
                 return Ok(backup_admission_unavailable_response());
             }
             Err(_error) => {
                 warn_persistence_failure_redacted("backup_namespace_admission_before_export");
+                audit_backup_failure(
+                    state,
+                    actor,
+                    namespace,
+                    request_ctx,
+                    resource_filter.as_ref(),
+                    audit::failure_category::UNAVAILABLE,
+                    audit::outcome::UNAVAILABLE,
+                )
+                .await;
                 return Ok(backup_admission_unavailable_response());
             }
         };
@@ -7002,18 +7406,35 @@ async fn handle_backup(
                 upstream_count,
                 api_specs_count,
             } => {
-                info!(
-                    "Backup: {} proxies, {} consumers, {} plugin_configs, {} upstreams, {} api_specs ({} bytes)",
-                    proxy_count,
-                    consumer_count,
-                    plugin_config_count,
-                    upstream_count,
-                    api_specs_count,
-                    body_bytes.len()
-                );
-                return Ok(backup_attachment_response(body_bytes, "database"));
+                return Ok(finalize_backup_export(
+                    state,
+                    actor,
+                    namespace,
+                    request_ctx,
+                    BackupExportPayload {
+                        resource_filter: resource_filter.as_ref(),
+                        source: "database",
+                        body_bytes,
+                        proxy_count,
+                        consumer_count,
+                        plugin_config_count,
+                        upstream_count,
+                        api_specs_count,
+                    },
+                )
+                .await);
             }
             ConsistentApiSpecsBackup::SpecsUnavailable => {
+                audit_backup_failure(
+                    state,
+                    actor,
+                    namespace,
+                    request_ctx,
+                    resource_filter.as_ref(),
+                    audit::failure_category::UNAVAILABLE,
+                    audit::outcome::UNAVAILABLE,
+                )
+                .await;
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({"error": "Database unavailable while exporting API specs"}),
@@ -7036,6 +7457,16 @@ async fn handle_backup(
         match state.cached_gateway_config() {
             Some(c) => (filter_config_by_namespace(&c, namespace), "cached"),
             None => {
+                audit_backup_failure(
+                    state,
+                    actor,
+                    namespace,
+                    request_ctx,
+                    resource_filter.as_ref(),
+                    audit::failure_category::UNAVAILABLE,
+                    audit::outcome::UNAVAILABLE,
+                )
+                .await;
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({"error": "Database unavailable and no cached config"}),
@@ -7053,6 +7484,16 @@ async fn handle_backup(
                 match state.cached_gateway_config() {
                     Some(c) => (filter_config_by_namespace(&c, namespace), "cached"),
                     None => {
+                        audit_backup_failure(
+                            state,
+                            actor,
+                            namespace,
+                            request_ctx,
+                            resource_filter.as_ref(),
+                            audit::failure_category::UNAVAILABLE,
+                            audit::outcome::UNAVAILABLE,
+                        )
+                        .await;
                         return Ok(json_response(
                             StatusCode::SERVICE_UNAVAILABLE,
                             &json!({"error": "Database unavailable and no cached config"}),
@@ -7065,6 +7506,16 @@ async fn handle_backup(
         match state.cached_gateway_config() {
             Some(c) => (filter_config_by_namespace(&c, namespace), "cached"),
             None => {
+                audit_backup_failure(
+                    state,
+                    actor,
+                    namespace,
+                    request_ctx,
+                    resource_filter.as_ref(),
+                    audit::failure_category::UNAVAILABLE,
+                    audit::outcome::UNAVAILABLE,
+                )
+                .await;
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({"error": "No database configured and no cached config available"}),
@@ -7086,17 +7537,23 @@ async fn handle_backup(
         api_specs_count,
     ) = serialize_backup_payload(config, source, resource_filter.as_ref(), None);
 
-    info!(
-        "Backup: {} proxies, {} consumers, {} plugin_configs, {} upstreams, {} api_specs ({} bytes)",
-        proxy_count,
-        consumer_count,
-        plugin_config_count,
-        upstream_count,
-        api_specs_count,
-        body_bytes.len()
-    );
-
-    Ok(backup_attachment_response(body_bytes, source))
+    Ok(finalize_backup_export(
+        state,
+        actor,
+        namespace,
+        request_ctx,
+        BackupExportPayload {
+            resource_filter: resource_filter.as_ref(),
+            source,
+            body_bytes,
+            proxy_count,
+            consumer_count,
+            plugin_config_count,
+            upstream_count,
+            api_specs_count,
+        },
+    )
+    .await)
 }
 
 async fn validate_restore_candidate_on_blocking_pool(

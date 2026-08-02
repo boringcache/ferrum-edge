@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Admin audit events gain optional `source_address`, `request_id`, and
+  `outcome` fields (folded into the baseline `audit_events` schema).
+  `GET /backup` always admits a durable security record before releasing
+  unredacted configuration (independent of `FERRUM_ADMIN_AUDIT_ENABLED`,
+  which continues to gate ordinary mutation audit events only): synchronous
+  primary insert when available, otherwise the bounded local fallback under
+  `FERRUM_ADMIN_AUDIT_FALLBACK_PATH`, failing closed with `503` if neither
+  sink admits the event. Authenticated denied/failed backup attempts are
+  audited with fixed failure categories only; backup payload bytes and
+  secrets never enter audit events or logs. Local fallback publication uses
+  same-directory atomic replace (Unix `rename(2)`; Windows
+  `MoveFileExW(MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)`) so
+  repeated appends succeed when the destination already exists, without
+  unlinking the live file first. Local fallback reads open the data file
+  without following symlinks, validate the opened handle (regular file,
+  owner-only mode, Unix single-link), and refuse inputs above
+  `AUDIT_LOCAL_FALLBACK_MAX_BYTES` (16 MiB) before parse. Hard-linked lock
+  targets are rejected before chmod/flock. Local fallback lock acquisition is
+  non-blocking (in-process `try_lock`, Unix `flock(LOCK_EX|LOCK_NB)`,
+  Windows immediate share denial) so contention fails closed instead of
+  hanging a blocking-pool thread. The fallback retains the newest 4096
+  events; eviction at capacity emits a content-free
+  `audit_local_fallback_evicted` warning so rollover of older security
+  records is never silent. Backup `resources=` filters are
+  a closed allow-list; unknown tokens are rejected with static client text
+  and never persisted raw in audit metadata (#2422).
 - Kubernetes controller watch scopes now rebuild their reflector from an
   authoritative list when they go idle past `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`
   (default `300`, `0` disables, clamped to `0`–`86400`). kube-rs raises an

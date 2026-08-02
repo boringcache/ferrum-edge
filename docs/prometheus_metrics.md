@@ -61,20 +61,33 @@ Scrape rendering stays allocation-light: the inventory is a documentation/CI con
 
 | Family | Type | Labels | Guidance |
 |--------|------|--------|----------|
-| `ferrum_admin_audit_available` | gauge | `namespace` | `0` means committed admin mutations currently have no durable audit handoff. Under `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed` further audited mutations are refused with `503`. |
+| `ferrum_admin_audit_available` | gauge | `namespace` | `0` means an audited admin mutation currently has no durable pre-mutation handoff. Under `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed` such mutations are refused with `503` before they run. |
+| `ferrum_admin_audit_degraded` | gauge | `namespace` | Sticky: durable records were corrupted, retained as unrecoverable, or discarded. A later successful delivery does **not** clear it — only resolving `<spool>/failed/` does. |
+| `ferrum_admin_audit_evidence_lost` | gauge | `namespace` | Permanent: audit evidence was discarded (retained capacity exhausted, or a memory-only drop). Never clears while the process runs. |
+| `ferrum_admin_audit_spool_prepared_records` | gauge | `namespace` | Pre-mutation intents awaiting finalization. A steady non-zero floor means mutations are in flight; a growing value means finalization is failing. |
 | `ferrum_admin_audit_spool_pending_records` | gauge | `namespace` | Durable backlog awaiting insertion into `audit_events`. A steadily rising value means the configured database is rejecting or slow-walking audit inserts. |
-| `ferrum_admin_audit_retained_records` | gauge | `namespace` | Records that exhausted `FERRUM_ADMIN_AUDIT_MAX_DELIVERY_ATTEMPTS`. These are held under `<spool>/failed/` for manual reconciliation and are never replayed automatically. |
-| `ferrum_admin_audit_events_dropped_total` | counter | `reason`, `namespace` | Any non-zero value is an audit gap. `durable_handoff_failed` = the spool write failed; `no_durable_spool` = the deployment runs memory-only; `retained_capacity` = retained storage is full. |
+| `ferrum_admin_audit_retained_records` | gauge | `namespace` | Records that exhausted `FERRUM_ADMIN_AUDIT_MAX_DELIVERY_ATTEMPTS`, were corrupt, or targeted a different audit destination. These are held under `<spool>/failed/` for manual reconciliation and are never replayed automatically. |
+| `ferrum_admin_audit_unknown_outcome_total` | counter | `namespace` | Intents adopted from a prior process generation that crashed between commit and finalize. The mutation may or may not have taken effect; the event is stored with `outcome = unknown_outcome` and must be reconciled by hand. |
+| `ferrum_admin_audit_destination_mismatch_total` | counter | `namespace` | Durable records bound to a different audit destination (database/namespace) were quarantined rather than delivered. Expect this after repointing a gateway at a new database while a backlog existed. |
+| `ferrum_admin_audit_fail_open_unaudited_mutations_total` | counter | `namespace` | Mutations that proceeded with no durable pre-mutation evidence under `fail_open`. Any non-zero value is an audit gap by policy choice. |
+| `ferrum_admin_audit_events_dropped_total` | counter | `reason`, `namespace` | Any non-zero value is an audit gap. `durable_handoff_failed` = the spool write failed; `no_durable_spool` = the deployment runs memory-only; `retained_capacity` = retained storage is full; `destination_mismatch` = records were quarantined as foreign. |
 
 **Suggested alerts:** `min_over_time(ferrum_admin_audit_available[5m]) == 0`;
+`ferrum_admin_audit_degraded == 1`;
 `increase(ferrum_admin_audit_events_dropped_total[15m]) > 0`;
+`increase(ferrum_admin_audit_unknown_outcome_total[15m]) > 0`;
+`increase(ferrum_admin_audit_fail_open_unaudited_mutations_total[15m]) > 0`;
 `ferrum_admin_audit_retained_records > 0`.
 
-**Reconciliation:** delivery is at-least-once on a stable event id, and every
-backend insert is idempotent on that id, so a replayed record converges to one
-`audit_events` row. To reconcile a gap, compare
-`ferrum_admin_audit_events_accepted_total` against
-`ferrum_admin_audit_events_delivered_total` and inspect
+**Reconciliation:** the intent is fsynced before the mutation runs and the same
+stable id is finalized after it returns, so a committed mutation always has
+durable evidence. Delivery is at-least-once on that id and every backend insert
+is insert-only and idempotent, so a replayed record converges to exactly one
+immutable `audit_events` row — a duplicate delivery is success, never
+replacement. To reconcile a gap, compare
+`ferrum_admin_audit_intents_prepared_total` against
+`ferrum_admin_audit_events_delivered_total`, query `audit_events` for
+`outcome = 'unknown_outcome'`, and inspect
 `<FERRUM_ADMIN_AUDIT_SPOOL_DIR>/failed/`.
 
 ## Complete family inventory
@@ -116,21 +129,29 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_admin_active_connections` | gauge | `namespace` | `admin` | `documented_only` | `conditional` | Admin/management-plane connections currently in flight. |
 | `ferrum_admin_audit_available` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Whether the admin audit pipeline can durably record committed mutations (1) or not (0). |
 | `ferrum_admin_audit_corrupt_records_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Durable admin audit records quarantined as corrupt (bad version, unparseable, oversized, or id mismatch). |
+| `ferrum_admin_audit_degraded` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Sticky evidence that admin audit records were corrupted, retained as unrecoverable, or permanently discarded (1) or not (0). A later successful delivery does not clear it. |
 | `ferrum_admin_audit_delivery_failures_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit delivery attempts that returned an error from the database backend. |
+| `ferrum_admin_audit_delivery_in_flight` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit delivery attempts currently in flight. |
 | `ferrum_admin_audit_delivery_retries_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Bounded-backoff retries scheduled after a transient admin audit delivery failure. |
+| `ferrum_admin_audit_destination_mismatch_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Durable admin audit records quarantined because they target a different audit destination or instance. |
 | `ferrum_admin_audit_events_accepted_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events accepted from a committed admin mutation. |
 | `ferrum_admin_audit_events_delivered_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events accepted by the configured database backend. |
 | `ferrum_admin_audit_events_dropped_total` | counter | `reason`, `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events lost without a durable record, by reason. |
 | `ferrum_admin_audit_events_enqueued_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events admitted to the bounded in-memory delivery queue. |
+| `ferrum_admin_audit_events_finalized_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit intents durably finalized with the mutation's known outcome. |
 | `ferrum_admin_audit_events_replayed_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Durable admin audit records re-read from the spool for delivery (restart, queue overflow, or an expired shutdown drain). |
 | `ferrum_admin_audit_events_retained_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events that exhausted the delivery-attempt budget and were retained for operator remediation. |
-| `ferrum_admin_audit_events_spooled_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events made durable in the spool before the mutation response. |
+| `ferrum_admin_audit_evidence_lost` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Whether admin audit evidence has been permanently discarded (1) or not (0). Never clears. |
 | `ferrum_admin_audit_fail_closed_rejections_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin mutations refused up front because the audit pipeline is unavailable under the fail_closed policy. |
+| `ferrum_admin_audit_fail_open_unaudited_mutations_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin mutations allowed to proceed without durable pre-mutation audit evidence under the fail_open policy. |
+| `ferrum_admin_audit_intents_prepared_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Pre-mutation admin audit intents made durable (fsynced) before the configuration mutation was invoked. |
 | `ferrum_admin_audit_queue_capacity` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Configured depth of the bounded in-memory admin audit delivery queue. |
 | `ferrum_admin_audit_queue_depth` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events currently waiting in the bounded in-memory delivery queue. |
 | `ferrum_admin_audit_retained_records` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Durable admin audit records retained as unrecoverable for operator remediation. |
-| `ferrum_admin_audit_spool_pending_records` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Durable admin audit records awaiting delivery (bounded scan; a saturated scan reports a floor). |
+| `ferrum_admin_audit_spool_pending_records` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Durable admin audit records awaiting delivery (O(1) admission counter; a saturated background scan reports a floor). |
+| `ferrum_admin_audit_spool_prepared_records` | gauge | `namespace` | `admin_audit` | `documented_only` | `always` | Durable pre-mutation admin audit intents awaiting finalization. |
 | `ferrum_admin_audit_truncated_diffs_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Admin audit events whose diff was replaced by a redacted marker because it exceeded the durable record ceiling. |
+| `ferrum_admin_audit_unknown_outcome_total` | counter | `namespace` | `admin_audit` | `documented_only` | `always` | Prepared admin audit records adopted from a prior process generation whose mutation outcome is unknowable. |
 | `ferrum_admin_max_connections` | gauge | `namespace` | `admin` | `documented_only` | `conditional` | Configured admin connection cap (0 = unlimited). |
 | `ferrum_admin_max_connections_per_ip` | gauge | `namespace` | `admin` | `documented_only` | `conditional` | Configured per-source-IP admin connection cap (0 = unlimited). |
 | `ferrum_admin_rejected_connections_total` | counter | `reason`, `namespace` | `admin` | `documented_only` | `conditional` | Admin connections rejected by the connection limiter, by reason. |

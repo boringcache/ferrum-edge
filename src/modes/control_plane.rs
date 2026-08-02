@@ -2158,6 +2158,12 @@ pub async fn run(
         env_config.admin_max_connections,
         env_config.admin_max_connections_per_ip,
     ));
+    // Start durable audit delivery now (issue #2421): discovery, adoption of
+    // records abandoned by a prior process generation, and replay must not wait
+    // for a later mutation to lazily spawn the worker. A process that receives
+    // no new mutations still has to drain the backlog it inherited.
+    crate::admin::audit::start_delivery(env_config.admin_audit_enabled, db.clone());
+
     let admin_state = AdminState {
         db: Some(db.clone()),
         jwt_manager,
@@ -2166,6 +2172,7 @@ pub async fn run(
         mode: "cp".into(),
         read_only: env_config.admin_read_only,
         admin_audit_enabled: env_config.admin_audit_enabled,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: env_config.admin_require_namespace_claim,
         startup_ready: Some(startup_ready.clone()),
         serving_degraded: Some(serving_degraded.clone()),

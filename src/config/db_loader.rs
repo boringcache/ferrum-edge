@@ -8873,15 +8873,18 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         let start = std::time::Instant::now();
         let diff = serde_json::to_string(&event.diff)?;
-        // Idempotent on the primary key (issue #2421). Durable-spool replay
-        // after a crash, a partial failure, or a shutdown deadline re-delivers
-        // the *same* `id`, so a second insert must converge to one row instead
-        // of raising a duplicate-key error the retry loop would keep burning
-        // attempts on. This is a single statement, so it needs no transaction.
-        // MySQL uses `ON DUPLICATE KEY UPDATE id = id` rather than
-        // `INSERT IGNORE`, which would also downgrade unrelated errors
-        // (truncation, bad values) to warnings and silently accept a malformed
-        // audit row.
+        // Insert-only and idempotent on the primary key (issue #2421).
+        // Durable-spool replay after a crash, a partial failure, or a shutdown
+        // deadline re-delivers the *same* `id`, so a second delivery must
+        // converge to the one already-durable row instead of raising a
+        // duplicate-key error the retry loop would keep burning attempts on.
+        // Neither branch ever mutates an existing audit row: PostgreSQL/SQLite
+        // use `DO NOTHING`, and MySQL's `ON DUPLICATE KEY UPDATE id = id`
+        // assigns the primary key to itself, which is a no-op write of no
+        // column. `INSERT IGNORE` is deliberately not used because it also
+        // downgrades unrelated errors (truncation, bad values) to warnings and
+        // would silently accept a malformed audit row. This is a single
+        // statement, so it needs no transaction.
         let on_conflict = if self.db_type == "mysql" {
             " ON DUPLICATE KEY UPDATE id = id"
         } else {
@@ -8889,8 +8892,9 @@ impl DatabaseStore {
         };
         sqlx::query(&self.q(&format!(
             "INSERT INTO audit_events \
-             (id, ts, actor, action, resource_type, resource_id, namespace, diff) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?){on_conflict}"
+             (id, ts, actor, action, resource_type, resource_id, namespace, \
+              source_address, request_id, outcome, diff) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?){on_conflict}"
         )))
         .bind(&event.id)
         .bind(audit_ts_string(&event.ts))
@@ -8899,6 +8903,9 @@ impl DatabaseStore {
         .bind(&event.resource_type)
         .bind(&event.resource_id)
         .bind(&event.namespace)
+        .bind(&event.source_address)
+        .bind(&event.request_id)
+        .bind(&event.outcome)
         .bind(diff)
         .execute(&self.pool())
         .await?;
@@ -9174,7 +9181,8 @@ impl DatabaseStore {
         let total: i64 = count_query.fetch_one(pool).await?.try_get("cnt")?;
 
         let sql = self.q(&format!(
-            "SELECT id, ts, actor, action, resource_type, resource_id, namespace, diff \
+            "SELECT id, ts, actor, action, resource_type, resource_id, namespace, \
+             source_address, request_id, outcome, diff \
              FROM audit_events WHERE {where_clause} \
              ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?"
         ));
@@ -10702,6 +10710,9 @@ fn row_to_audit_event(row: &AnyRow) -> Result<crate::admin::audit::AuditEvent, a
         resource_type: row.try_get("resource_type")?,
         resource_id: row.try_get("resource_id")?,
         namespace: row.try_get("namespace")?,
+        source_address: row.try_get("source_address")?,
+        request_id: row.try_get("request_id")?,
+        outcome: row.try_get("outcome")?,
         diff,
     })
 }

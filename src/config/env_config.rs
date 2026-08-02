@@ -1944,6 +1944,7 @@ pub struct EnvConfig {
     /// Admin API read-only mode (default: false, always true in DP mode)
     pub admin_read_only: bool,
     /// Enable database-backed Admin API mutation audit events. Default: false.
+    /// Does not gate `GET /backup` security-record admission (always on).
     pub admin_audit_enabled: bool,
     /// Optional age-based audit retention in days (`FERRUM_AUDIT_RETENTION_DAYS`).
     /// Unset disables age prune. When set, must be in `1..=36_500`. Distinct from
@@ -3071,16 +3072,6 @@ impl EnvConfig {
         };
         let admin_audit_unavailable_policy =
             crate::admin::audit::AuditUnavailablePolicy::parse(&admin_audit_unavailable_policy)?;
-        let admin_audit_pipeline = crate::admin::audit::AuditPipelineConfig {
-            enabled: admin_audit_enabled,
-            spool_dir: admin_audit_spool_dir,
-            policy: admin_audit_unavailable_policy,
-            queue_capacity: admin_audit_queue_capacity,
-            spool_max_records: admin_audit_spool_max_records,
-            retained_max_records: admin_audit_retained_max_records,
-            max_delivery_attempts: admin_audit_max_delivery_attempts,
-        };
-        admin_audit_pipeline.validate()?;
 
         env_config! {
             conf = conf, mode = &mode;
@@ -3120,6 +3111,27 @@ impl EnvConfig {
             mongo_server_selection_timeout_seconds: Option<u64> = "FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS";
             mongo_connect_timeout_seconds: Option<u64> = "FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS";
         }
+        // Durable audit pipeline (issue #2421). Built here because every
+        // durable record is bound to a non-secret audit-destination identity
+        // derived from the backend type, the namespace, and a digest of the
+        // *redacted* connection URL, so a reconfigured gateway can never replay
+        // another deployment's audit evidence into the wrong database. The
+        // connection secret itself is neither stored nor logged.
+        let admin_audit_pipeline = crate::admin::audit::AuditPipelineConfig {
+            enabled: admin_audit_enabled,
+            spool_dir: admin_audit_spool_dir,
+            policy: admin_audit_unavailable_policy,
+            destination: crate::admin::audit::audit_destination_identity(
+                db_type.as_deref(),
+                db_url.as_deref(),
+                &namespace,
+            ),
+            queue_capacity: admin_audit_queue_capacity,
+            spool_max_records: admin_audit_spool_max_records,
+            retained_max_records: admin_audit_retained_max_records,
+            max_delivery_attempts: admin_audit_max_delivery_attempts,
+        };
+        admin_audit_pipeline.validate()?;
         if resolve_var(conf, "FERRUM_DB_POLL_INTERVAL")
             .as_deref()
             .is_some_and(|raw| raw.trim() == "0")
