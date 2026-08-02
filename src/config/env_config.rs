@@ -1962,6 +1962,12 @@ pub struct EnvConfig {
     /// indefinitely by count). Non-zero values must be in `1..=10_000_000`.
     /// Newest events win under deterministic `(ts, id)` ordering.
     pub audit_retention_max_rows: Option<u64>,
+    /// Durable audit delivery pipeline settings (issue #2421): spool root,
+    /// unavailability policy, and the bounded queue / spool / retry budgets.
+    /// Installed process-wide by `crate::admin::audit::initialize` before mode
+    /// dispatch, so a `fail_closed` deployment refuses to start with an
+    /// unusable spool rather than discovering it on the first mutation.
+    pub admin_audit_pipeline: crate::admin::audit::AuditPipelineConfig,
     /// Require admin JWTs to carry an `ns` claim authorizing the
     /// `X-Ferrum-Namespace` value on namespace-scoped admin routes.
     /// Mirrors `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` on the gRPC plane.
@@ -2838,6 +2844,7 @@ impl Default for EnvConfig {
             admin_audit_enabled: false,
             audit_retention_days: None,
             audit_retention_max_rows: Some(crate::admin::audit::AUDIT_RETENTION_MAX_ROWS_DEFAULT),
+            admin_audit_pipeline: crate::admin::audit::AuditPipelineConfig::default(),
             admin_require_namespace_claim: false,
             admin_tls_no_verify: false,
             stream_proxy_bind_address: "0.0.0.0".into(),
@@ -3044,6 +3051,18 @@ impl EnvConfig {
             audit_retention_days: Option<u64> = "FERRUM_AUDIT_RETENTION_DAYS";
             audit_retention_max_rows: u64 = "FERRUM_AUDIT_RETENTION_MAX_ROWS"
                 => crate::admin::audit::AUDIT_RETENTION_MAX_ROWS_DEFAULT;
+            admin_audit_spool_dir: String = "FERRUM_ADMIN_AUDIT_SPOOL_DIR"
+                => crate::admin::audit::AUDIT_SPOOL_DIR_DEFAULT.to_string();
+            admin_audit_unavailable_policy: String = "FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY"
+                => crate::admin::audit::AuditUnavailablePolicy::FailOpen.as_str().to_string();
+            admin_audit_queue_capacity: usize = "FERRUM_ADMIN_AUDIT_QUEUE_CAPACITY"
+                => crate::admin::audit::AUDIT_QUEUE_CAPACITY_DEFAULT;
+            admin_audit_spool_max_records: u64 = "FERRUM_ADMIN_AUDIT_SPOOL_MAX_RECORDS"
+                => crate::admin::audit::AUDIT_SPOOL_MAX_RECORDS_DEFAULT;
+            admin_audit_retained_max_records: u64 = "FERRUM_ADMIN_AUDIT_RETAINED_MAX_RECORDS"
+                => crate::admin::audit::AUDIT_RETAINED_MAX_RECORDS_DEFAULT;
+            admin_audit_max_delivery_attempts: u32 = "FERRUM_ADMIN_AUDIT_MAX_DELIVERY_ATTEMPTS"
+                => crate::admin::audit::AUDIT_MAX_DELIVERY_ATTEMPTS_DEFAULT;
             admin_require_namespace_claim: bool = "FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM" => false;
         }
         let audit_retention_policy = crate::admin::audit::AuditRetentionPolicy::from_parts(
@@ -3052,6 +3071,16 @@ impl EnvConfig {
         )?;
         let audit_retention_days = audit_retention_policy.retention_days;
         let audit_retention_max_rows = audit_retention_policy.max_rows_per_namespace;
+        // An empty spool directory explicitly opts out of durable delivery.
+        // `AuditPipelineConfig::validate` rejects that combination under
+        // `fail_closed`, so opting out can never silently weaken a deployment
+        // that asked to fail closed.
+        let admin_audit_spool_dir = {
+            let trimmed = admin_audit_spool_dir.trim();
+            (!trimmed.is_empty()).then(|| std::path::PathBuf::from(trimmed))
+        };
+        let admin_audit_unavailable_policy =
+            crate::admin::audit::AuditUnavailablePolicy::parse(&admin_audit_unavailable_policy)?;
 
         env_config! {
             conf = conf, mode = &mode;
@@ -3091,6 +3120,27 @@ impl EnvConfig {
             mongo_server_selection_timeout_seconds: Option<u64> = "FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS";
             mongo_connect_timeout_seconds: Option<u64> = "FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS";
         }
+        // Durable audit pipeline (issue #2421). Built here because every
+        // durable record is bound to a non-secret audit-destination identity
+        // derived from the backend type, the namespace, and a digest of the
+        // *redacted* connection URL, so a reconfigured gateway can never replay
+        // another deployment's audit evidence into the wrong database. The
+        // connection secret itself is neither stored nor logged.
+        let admin_audit_pipeline = crate::admin::audit::AuditPipelineConfig {
+            enabled: admin_audit_enabled,
+            spool_dir: admin_audit_spool_dir,
+            policy: admin_audit_unavailable_policy,
+            destination: crate::admin::audit::audit_destination_identity(
+                db_type.as_deref(),
+                db_url.as_deref(),
+                &namespace,
+            ),
+            queue_capacity: admin_audit_queue_capacity,
+            spool_max_records: admin_audit_spool_max_records,
+            retained_max_records: admin_audit_retained_max_records,
+            max_delivery_attempts: admin_audit_max_delivery_attempts,
+        };
+        admin_audit_pipeline.validate()?;
         if resolve_var(conf, "FERRUM_DB_POLL_INTERVAL")
             .as_deref()
             .is_some_and(|raw| raw.trim() == "0")
@@ -3969,6 +4019,7 @@ impl EnvConfig {
             admin_audit_enabled,
             audit_retention_days,
             audit_retention_max_rows,
+            admin_audit_pipeline,
             admin_require_namespace_claim,
             admin_tls_no_verify,
             enable_http3,

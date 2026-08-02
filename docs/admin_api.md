@@ -572,7 +572,126 @@ See [admin_backup_restore.md](admin_backup_restore.md) for details.
 
 ## Audit Log
 
-When `FERRUM_ADMIN_AUDIT_ENABLED=true`, successful admin mutations enqueue a database-backed audit event before the mutation response is returned. The response waits only for bounded queue enqueue, not durable database persistence. Audit persistence is best-effort after the mutation commits: if enqueue or persistence fails, Ferrum logs the failure and still returns the mutation result so operators do not retry an already-applied write. `POST /batch` is all-or-nothing (issue #2401), so it emits exactly one audit event when its graph commits and none at all when it does not. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, and a JSON `diff` object with redacted consumer credentials and sensitive plugin configuration. Basic credential mutations remain visible by type and action, but every Basic value, entry field, shape, and count is replaced by one stable `[REDACTED]` marker before persistence. Loki plugin diffs preserve only the endpoint scheme/host/port and redact its path, query, authorization, and all custom-header values. Redis-backed plugin diffs replace `redis_integrity_key` (and any other `*_integrity_key` signing secret) with `[REDACTED]` and strip `redis_url` userinfo/query/fragment while keeping its scheme/host/port/database.
+When `FERRUM_ADMIN_AUDIT_ENABLED=true`, an audited admin mutation is made durable **before it runs**, not after it commits. `POST /batch` is all-or-nothing (issue #2401), so it emits exactly one audit event when its graph commits and none at all when it does not. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, outcome, and a JSON `diff` object with redacted consumer credentials and sensitive plugin configuration. Basic credential mutations remain visible by type and action, but every Basic value, entry field, shape, and count is replaced by one stable `[REDACTED]` marker before persistence. Loki plugin diffs preserve only the endpoint scheme/host/port and redact its path, query, authorization, and all custom-header values. Redis-backed plugin diffs replace `redis_integrity_key` (and any other `*_integrity_key` signing secret) with `[REDACTED]` and strip `redis_url` userinfo/query/fragment while keeping its scheme/host/port/database. Every redaction above is applied before the durable spool write, so a spooled or retained record carries exactly the same redacted representation as the `audit_events` row.
+
+This pipeline covers every Admin action that emits an ordinary mutation audit
+event: configuration-database mutations (CRUD, credentials, API specs, batch,
+and restore), managed TLS/ACME file-store mutations, and explicit TLS rotation.
+The TLS/ACME stores remain independent of config-database topology, but their
+audit handoff still happens before the action. A `fail_closed` audit outage
+therefore refuses the audited TLS/ACME action without applying sticky database
+failover policy to that independent store or operational reload.
+
+### Durable evidence before the mutation (issue #2421)
+
+1. **Prepare.** The admin write gate durably creates an *audit intent* — a
+   stable event id plus the minimal audit request context (authenticated actor
+   subject, method, sanitized path and namespace, canonical socket source
+   address, bounded request id) —
+   fsyncing both the record and its directory **before** the configuration
+   mutation is invoked.
+2. **Finalize.** Once the mutation returns, the same stable id is durably
+   finalized with its real outcome (`success` or `failure`) and diff, and only
+   then is the prepared record unlinked. The outcome is never written before
+   the mutation result is known.
+3. **Deliver.** Insertion into `audit_events` happens asynchronously with
+   bounded exponential backoff (250 ms → 30 s, capped by
+   `FERRUM_ADMIN_AUDIT_MAX_DELIVERY_ATTEMPTS`), and the durable record is
+   deleted only after the backend accepts the event.
+
+There is therefore no window in which a configuration mutation is committed with
+no durable audit evidence.
+
+- **Unknowable outcomes are recorded as such.** A crash between commit and
+  finalize leaves the prepared record on disk. A later process generation
+  replays it as an explicit `outcome: unknown_outcome` event with
+  `diff.outcome_evidence = prior_process_generation_did_not_finalize`. Such a
+  record is never deleted silently and never promoted to a known success or
+  failure — the mutation may or may not have taken effect, and reconciling that
+  is an operator decision.
+- **Ownership across processes.** Records live under
+  `<spool>/instances/<generation>/`, whose `owner.lock` this process holds with
+  an exclusive, non-blocking OS lock for its entire lifetime. A process adopts
+  only instance directories whose lock it can take — exactly the generations
+  that are no longer running — so it can never classify its own in-flight
+  prepared record, and several gateway processes may share one configured spool
+  root safely.
+- **Destination binding.** Every record carries a non-secret audit-destination
+  identity (database type, namespace, and a SHA-256 digest of the *redacted*
+  connection URL). A record whose destination does not match the adopting
+  process is quarantined into `<spool>/failed/` rather than delivered, so
+  repointing a gateway cannot replay one deployment's audit evidence into
+  another's database or namespace. The connection secret itself is never stored
+  or logged.
+- **Startup replay.** Discovery, adoption, and replay begin when the mode's
+  database backend starts, not when a later mutation happens to arrive, so a
+  process that receives no new mutations still drains the backlog it inherited.
+- **Request cancellation.** Mutation persistence tasks explicitly inherit the
+  request audit slot because Tokio task-local state is not inherited by
+  `tokio::spawn`. Cancellation ownership transfers before the task is spawned,
+  so a disconnected client cannot make the parent finalize an intent while the
+  settlement task is still committing it. If no task owns settlement when a
+  request is cancelled, the prepared record is finalized as
+  `unknown_outcome`. The blocking prepare/fsync itself is owned by a detached
+  settlement task: if cancellation arrives while that write is still in flight,
+  the task installs the newly durable id into the request slot and immediately
+  finalizes it as `unknown_outcome`, rather than leaving it dormant under a live
+  process generation until restart. If the runtime is already stopping, it
+  remains durable for next-process adoption instead of being deleted.
+- **Delivery semantics: at-least-once with a stable id.** All four backends
+  insert **insert-only and idempotently** on that id (PostgreSQL/SQLite
+  `ON CONFLICT (id) DO NOTHING`, MySQL `ON DUPLICATE KEY UPDATE id = id` — a
+  no-op assignment that mutates no column, not `INSERT IGNORE`, which would also
+  downgrade unrelated errors; MongoDB `insert_one` with a duplicate key treated
+  as success). A duplicate delivery of the same id is success, never
+  replacement: an `audit_events` row is immutable. The MongoDB path is a
+  single-document write, so it needs no multi-document transaction and works on
+  standalone deployments.
+- **Unrecoverable evidence is retained, not dropped.** After the attempt budget
+  is exhausted, the record moves to `<spool>/failed/` for operator remediation.
+  Corrupt records (bad version, unparseable, oversized, non-finalized, or an id
+  that disagrees with the filename) and foreign-destination records are
+  quarantined there too and are never replayed.
+- **Hostile-filesystem hardening.** Spool directories are created owner-only
+  (`0700` on Unix) and validated as non-symlink real directories; record files
+  are created `O_EXCL`/`O_NOFOLLOW` at `0600`, read back through a no-follow
+  open validated as a single-link regular file, and published with an atomic
+  same-directory rename. Record filenames derive from the event UUID and are
+  charset-validated before any path join, so no actor- or operator-controlled
+  string reaches the filesystem. A **directory fsync failure is a durability
+  failure**, not a warning: the record is not reported as durable.
+- **Shutdown.** Serving modes drain accepted audit work before the database
+  handle is released, bounded by `FERRUM_SHUTDOWN_DRAIN_SECONDS` (clamped to
+  5–60 s). Every retry wait and replay loop is cancellation-aware, so the drain
+  signal interrupts a 30 s backoff instead of outliving the budget. If the
+  deadline still expires, the worker is explicitly aborted **and joined** — it
+  is never detached. With a configured spool, anything undelivered stays
+  durable for the next process, so an expired deadline costs latency, not
+  events. In explicitly configured memory-only `fail_open` mode, undelivered
+  entries cannot survive process exit; they are counted as dropped and latch
+  `audit_pipeline.evidence_lost` plus degraded health instead of being silently
+  abandoned or falsely reported as durable.
+- **Unavailability policy.** With
+  `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_closed`, a failed pre-mutation
+  handoff refuses that mutation with `503` and a closed-set
+  `audit_unavailable_reason` **before** it is performed, so a change that cannot
+  be audited is never made. With `fail_open` (default) the mutation proceeds,
+  but only after an explicit fixed-cardinality warning and
+  `ferrum_admin_audit_fail_open_unaudited_mutations_total`, and the pipeline
+  stops claiming durable audit coverage.
+- **Observability.** Authenticated `/health` and `/status` carry an
+  `audit_pipeline` object (backlog, retries, failures, retained/unrecoverable
+  state, drops, sticky degradation, and closed-set reason labels), and an
+  unavailable or degraded pipeline forces `status: degraded`. Every field is
+  read from a process atomic or cached background state, so the reads are O(1):
+  no admin request path performs a filesystem walk or a database query for audit
+  observability. Evidence of corrupt, unrecoverable, or capacity-discarded
+  records is **sticky** — a later successful delivery does not clear it; only
+  resolving `<spool>/failed/` does, and a record actually discarded for capacity
+  latches `evidence_lost` permanently. The same counters are exported as
+  `ferrum_admin_audit_*` Prometheus families. These surfaces expose counts and
+  static labels only — never an actor subject, token, request body, audit diff,
+  connection string, or spool path.
 
 Audit events may also carry `source_address` (canonical admin socket peer — never a client-spoofable forwarding header), a bounded `request_id` (from a validated `X-Request-Id` / `X-Correlation-Id`, otherwise generated), and a fixed-cardinality `outcome`. Mutation events that predate request-context capture omit those fields (empty / skipped in JSON).
 
