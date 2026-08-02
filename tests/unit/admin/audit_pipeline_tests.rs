@@ -481,12 +481,13 @@ fn an_already_settled_record_is_not_reported_as_discarded_evidence() {
         RetainOutcome::Retained
     );
     assert_eq!(count_json(&dir.path().join("failed")), 1);
-    // Retaining the same id twice reports the record it already preserved.
+    // Retaining the same id twice distinguishes the prior retention so the
+    // retained-event counter remains one event, not one delivery attempt.
     assert_eq!(
         spool
             .retain_unrecoverable(record.id())
             .expect("retain reports an outcome"),
-        RetainOutcome::Retained
+        RetainOutcome::AlreadyRetained
     );
 }
 

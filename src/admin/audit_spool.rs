@@ -262,6 +262,9 @@ pub struct ClaimReport {
 pub enum RetainOutcome {
     /// The record is in `failed/` for operator remediation.
     Retained,
+    /// An earlier exhausted attempt already moved this stable id to `failed/`.
+    /// No new retention occurred, so counters must not increment again.
+    AlreadyRetained,
     /// Retained capacity was already exhausted, so the record was discarded.
     /// This is real, permanent evidence loss.
     Discarded,
@@ -554,7 +557,7 @@ impl AuditSpool {
         let failed = record_path(&self.failed_dir(), id)?;
         if !pending.exists() {
             return Ok(if failed.exists() {
-                RetainOutcome::Retained
+                RetainOutcome::AlreadyRetained
             } else {
                 RetainOutcome::AlreadySettled
             });

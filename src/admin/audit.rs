@@ -1361,6 +1361,12 @@ impl AuditPipeline {
                      remediation"
                 );
             }
+            Ok(RetainOutcome::AlreadyRetained) => {
+                // Another exhausted attempt already retained this stable id.
+                // Preserve degraded health, but do not count one retained
+                // record more than once.
+                self.mark_capacity_available();
+            }
             Ok(RetainOutcome::Discarded) => {
                 self.mark_capacity_available();
                 self.metrics
