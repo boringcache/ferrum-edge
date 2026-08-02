@@ -1194,13 +1194,42 @@ impl AiRateLimiter {
             .and_then(|value| value.parse::<u64>().ok())
     }
 
-    fn extract_token_count(&self, body: &[u8]) -> Option<u64> {
+    /// Resolve an observed provider counter for reservation reconciliation.
+    ///
+    /// A partial counter is authoritative as a lower bound only. In particular,
+    /// TGI may report `details.generated_tokens` without `details.prefill`, and
+    /// Anthropic can terminate after reporting only one component. In
+    /// `total_tokens` mode those observations must never release the prompt or
+    /// completion portion the provider did not report. Keep the larger of the
+    /// existing reservation and the partial observation; a complete selected
+    /// counter still replaces the estimate normally.
+    fn reconciliation_tokens(
+        &self,
+        ctx: &RequestContext,
+        observed_tokens: Option<u64>,
+        selected_mode_complete: bool,
+    ) -> Option<u64> {
+        observed_tokens.map(|tokens| {
+            if selected_mode_complete {
+                tokens
+            } else {
+                tokens.max(self.reserved_tokens(ctx))
+            }
+        })
+    }
+
+    fn extract_token_count(&self, ctx: &RequestContext, body: &[u8]) -> Option<u64> {
         let json: Value = serde_json::from_slice(body).ok()?;
         let provider = match self.configured_provider {
             Some(provider) => provider,
             None => detect_response_provider(&json)?,
         };
-        extract_response_usage(&json, provider).total_for_mode(&self.count_mode)
+        let usage = extract_response_usage(&json, provider);
+        self.reconciliation_tokens(
+            ctx,
+            usage.total_for_mode(&self.count_mode),
+            usage.is_complete_for_mode(&self.count_mode),
+        )
     }
 
     /// Buffered-SSE usage extraction.
@@ -1210,7 +1239,7 @@ impl AiRateLimiter {
     /// the gateway or collected first. Only reachable when some other plugin
     /// pinned an event stream onto the buffered path; this limiter no longer
     /// does (GHSA-q2r2-6r7h-f69x).
-    fn extract_token_count_from_sse(&self, body: &[u8]) -> Option<u64> {
+    fn extract_token_count_from_sse(&self, ctx: &RequestContext, body: &[u8]) -> Option<u64> {
         let body = std::str::from_utf8(body).ok()?;
         let mut usage = UsageAccumulator::default();
         for line in body.lines() {
@@ -1220,7 +1249,11 @@ impl AiRateLimiter {
                 usage.apply_sse_data(data, self.configured_provider);
             }
         }
-        usage.total_for_mode(&self.count_mode)
+        self.reconciliation_tokens(
+            ctx,
+            usage.total_for_mode(&self.count_mode),
+            usage.is_complete_for_mode(&self.count_mode),
+        )
     }
 
     /// Reconcile a STREAMED response's terminal usage.
@@ -2708,7 +2741,14 @@ impl Plugin for AiRateLimiter {
                     Err(poisoned) => poisoned.into_inner().clone(),
                 };
                 if usage.observed() {
-                    (usage.total_for_mode(&self.count_mode), "stream_usage")
+                    (
+                        self.reconciliation_tokens(
+                            ctx,
+                            usage.total_for_mode(&self.count_mode),
+                            usage.is_complete_for_mode(&self.count_mode),
+                        ),
+                        "stream_usage",
+                    )
                 } else {
                     (
                         self.read_tokens_from_metadata(&ctx.metadata),
@@ -2834,7 +2874,7 @@ impl Plugin for AiRateLimiter {
 
             if is_event_stream_content_type(content_type) {
                 unmetered_detail = "sse_without_usage";
-                return self.extract_token_count_from_sse(body);
+                return self.extract_token_count_from_sse(ctx, body);
             }
 
             // A Bedrock event stream normally reaches the incremental
@@ -2849,7 +2889,11 @@ impl Plugin for AiRateLimiter {
                 );
                 extractor.push(body);
                 extractor.finish();
-                return extractor.usage().total_for_mode(&self.count_mode);
+                return self.reconciliation_tokens(
+                    ctx,
+                    extractor.usage().total_for_mode(&self.count_mode),
+                    extractor.usage().is_complete_for_mode(&self.count_mode),
+                );
             }
 
             if !is_json_content_type(content_type) {
@@ -2858,7 +2902,7 @@ impl Plugin for AiRateLimiter {
             }
 
             unmetered_detail = "json_without_usage";
-            self.extract_token_count(body)
+            self.extract_token_count(ctx, body)
         });
 
         let result = self

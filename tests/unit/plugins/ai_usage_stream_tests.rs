@@ -184,6 +184,13 @@ fn tgi_generate_stream_final_details_are_extracted() {
         extract(UsageStreamFormat::Sse, &[&body], "total_tokens"),
         Some(42)
     );
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, Some(AiProvider::Tgi));
+    extractor.push(&body);
+    extractor.finish();
+    assert!(
+        !extractor.usage().is_complete_for_mode("total_tokens"),
+        "generated_tokens alone is only a lower bound for total_tokens"
+    );
 }
 
 #[test]
@@ -218,6 +225,10 @@ fn tgi_prefill_tokens_supply_the_prompt_count() {
         extract(UsageStreamFormat::Sse, &[&body], "total_tokens"),
         Some(7)
     );
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, Some(AiProvider::Tgi));
+    extractor.push(&body);
+    extractor.finish();
+    assert!(extractor.usage().is_complete_for_mode("total_tokens"));
 }
 
 // ─── GHSA-rxj9: Bedrock event-stream framing ────────────────────────────

@@ -82,6 +82,9 @@ impl AiTokenUsage {
     /// explicitly reported. `Some(0)` is preserved only for an explicit numeric
     /// zero. Total mode may combine or fall back to a single reported component,
     /// but only when at least one component or an explicit total was present.
+    /// Callers that reconcile a pre-reservation must pair this with
+    /// [`Self::is_complete_for_mode`]: a partial component is an authoritative
+    /// lower bound, not authority to release the unreported portion.
     pub fn total_for_mode(&self, count_mode: &str) -> Option<u64> {
         match count_mode {
             "prompt_tokens" => self.prompt_tokens,
@@ -94,6 +97,22 @@ impl AiTokenUsage {
                     (None, Some(completion)) => Some(completion),
                     _ => None,
                 }),
+        }
+    }
+
+    /// Whether the selected counter fully represents the configured mode.
+    ///
+    /// A single prompt or completion component is complete for its own mode but
+    /// only a lower bound for `total_tokens`. The total is complete when the
+    /// provider supplied it explicitly or both components are present.
+    pub fn is_complete_for_mode(&self, count_mode: &str) -> bool {
+        match count_mode {
+            "prompt_tokens" => self.prompt_tokens.is_some(),
+            "completion_tokens" => self.completion_tokens.is_some(),
+            _ => {
+                self.total_tokens.is_some()
+                    || (self.prompt_tokens.is_some() && self.completion_tokens.is_some())
+            }
         }
     }
 }
@@ -646,6 +665,10 @@ mod tests {
         assert_eq!(partial.total_for_mode("prompt_tokens"), Some(12));
         assert_eq!(partial.total_for_mode("completion_tokens"), None);
         assert_eq!(partial.total_for_mode("total_tokens"), Some(12));
+        assert!(partial.is_complete_for_mode("prompt_tokens"));
+        assert!(!partial.is_complete_for_mode("completion_tokens"));
+        assert!(!partial.is_complete_for_mode("total_tokens"));
+        assert!(explicit_zero.is_complete_for_mode("total_tokens"));
     }
 
     #[test]

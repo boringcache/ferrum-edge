@@ -120,6 +120,20 @@ impl UsageAccumulator {
         .total_for_mode(count_mode)
     }
 
+    /// Whether the selected counter is complete rather than a partial lower
+    /// bound. A lone prompt/completion counter is authoritative for that
+    /// component's mode, but not for `total_tokens`.
+    pub fn is_complete_for_mode(&self, count_mode: &str) -> bool {
+        match count_mode {
+            "prompt_tokens" => self.prompt_tokens.is_some(),
+            "completion_tokens" => self.completion_tokens.is_some(),
+            _ => {
+                self.total_tokens.is_some()
+                    || (self.prompt_tokens.is_some() && self.completion_tokens.is_some())
+            }
+        }
+    }
+
     fn record(&mut self, usage: &AiTokenUsage) {
         if usage.prompt_tokens.is_none()
             && usage.completion_tokens.is_none()

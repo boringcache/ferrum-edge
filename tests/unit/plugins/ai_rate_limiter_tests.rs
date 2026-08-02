@@ -7119,6 +7119,59 @@ async fn tgi_native_stream_is_charged_from_generated_tokens() {
 }
 
 #[tokio::test]
+async fn tgi_partial_total_usage_never_releases_unreported_prompt_reservation() {
+    let plugin = Arc::new(
+        AiRateLimiter::new(
+            &json!({
+                "token_limit": 1_000_000,
+                "window_seconds": 60,
+                "limit_by": "ip",
+                "count_mode": "total_tokens",
+                "provider": "tgi"
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap(),
+    );
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({
+            "inputs": "a deliberately non-empty prompt whose tokens are not present in TGI details",
+            "parameters": {"max_new_tokens": 64}
+        })
+        .to_string(),
+    );
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = instance_reserved(&plugin, &ctx);
+    assert!(reserved > 64, "total mode must reserve prompt plus output cap");
+
+    let last = sse_frame(json!({
+        "generated_text": "hello",
+        "details": {"finish_reason": "eos_token", "generated_tokens": 9}
+    }));
+    drive_stream(
+        &plugin,
+        &mut ctx,
+        200,
+        "text/event-stream",
+        &[&last],
+        BodyOutcome::success(last.len() as u64),
+    )
+    .await;
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        reserved,
+        "completion-only usage must not release the unreported prompt portion"
+    );
+}
+
+#[tokio::test]
 async fn streamed_response_without_terminal_usage_keeps_the_reservation() {
     let plugin = streaming_limiter("charge_estimate");
     let mut ctx = ai_request_ctx(400, "stream with no usage event");
@@ -7213,12 +7266,13 @@ async fn reject_mode_keeps_the_charge_on_a_committed_stream() {
 }
 
 #[tokio::test]
-async fn client_disconnect_mid_stream_still_charges_the_partial_usage() {
+async fn client_disconnect_mid_stream_keeps_the_larger_reservation_for_partial_usage() {
     let plugin = streaming_limiter("charge_estimate");
     let mut ctx = ai_request_ctx(4000, "long stream the client abandons");
     let mut headers = HashMap::new();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
-    assert!(instance_reserved(&plugin, &ctx) > 0);
+    let reserved = instance_reserved(&plugin, &ctx);
+    assert!(reserved > 77);
 
     // Anthropic reports input tokens up front; the client leaves before the
     // terminal `message_delta`.
@@ -7236,8 +7290,8 @@ async fn client_disconnect_mid_stream_still_charges_the_partial_usage() {
 
     assert_eq!(
         observed_usage(&plugin).await,
-        77,
-        "an abandoned stream must still charge the counters the provider reported"
+        reserved,
+        "partial usage must not release the unreported completion reservation"
     );
 }
 
