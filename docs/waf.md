@@ -381,6 +381,96 @@ where the residual risk matters:
   decoded to their literal payload, but the body is flagged with the
   `encoding_evasion` signal instead of passing silently.
 
+## WebSocket message inspection
+
+WebSocket support is not handshake-only. In addition to running the ordinary
+HTTP pipeline over the upgrade request (path, query, headers, cookies, method),
+the WAF inspects **complete application messages** on the upgraded session in
+both directions (private advisory `GHSA-6j3m-vf5h-pgcx`). This applies
+identically to HTTP/1.1 upgrades and HTTP/2 / HTTP/3 Extended CONNECT, because
+all three frontends share one frame relay.
+
+**Body targets map to complete messages, not wire frames.**
+
+| Direction | Rule set | Gated by |
+| --- | --- | --- |
+| client → backend | `body_text`, `body_json_path`, body Luhn/CIDR rules, body-scoped encoding specials (`FE-ENCODING-001/002`) | `request_inspection` + `request_body_inspection` |
+| backend → client | `response_body`, response Luhn/CIDR rules, the same encoding specials | `response_inspection` + `response_body_inspection` |
+
+Both **Text** and **Binary** messages are inspected, and both use the same
+scanner as the corresponding HTTP body (raw bytes, lossy-UTF-8 text, and the
+layered decoded variants). The HTTP media-type selectors — `body_methods`,
+`body_content_types`, `inspect_multipart`, `inspect_binary_body` — deliberately
+do **not** apply here: a WebSocket message carries no `Content-Type`, so
+honoring them would let a client bypass an enforcing rule simply by choosing the
+Binary opcode.
+
+**Control frames are never scanned as application payload.** Ping, Pong, and
+Close pass through untouched, so keepalive and close semantics are unchanged.
+
+**Fragmentation and compression.** No WAF-side reassembly or decompression
+exists, and none is needed:
+
+- Continuation frames are reassembled by the parser before the message hook
+  runs. Physical fragments are metered separately, and a message that never
+  completes is bounded by `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES` /
+  `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS`, which close both peers.
+- `permessage-deflate` is never negotiated end to end: the client's
+  `Sec-WebSocket-Extensions` offer is stripped before the backend handshake and
+  no negotiated extension is echoed back to the client. Payloads reaching the
+  WAF are therefore always uncompressed.
+
+**Fail-closed behavior** mirrors the HTTP body path, with the connection Close
+taking the place of an HTTP rejection response:
+
+| Condition | Outcome |
+| --- | --- |
+| Enforcing rule hit (global `mode: enforce` + rule `action: enforce`) | Close 1008 |
+| Per-message anomaly score ≥ `scoring.block_threshold` while enforcing | Close 1008 |
+| Message larger than `max_scan_bytes` | `on_body_too_large`: `fail_closed` (default) closes when that direction carries an enforcing body policy, else prefix-scans; `scan_truncated` prefix-scans; `skip` forwards uninspected; `block` closes whenever globally enforcing |
+| Uninspectable message representation | Closes when that direction carries an enforcing body policy |
+| Scan exceeded `scan_budget_ms` with no confirmed blocking hit | `on_scan_timeout`: `block` closes, `allow` / `log_and_allow` forward |
+
+Every close uses RFC 6455 code 1008 with a compiled-in reason
+(`message rejected by security policy`, `message exceeds inspectable size`,
+`message could not be inspected`). Reasons never echo message bytes, rule ids,
+or any peer-controlled value.
+
+**Anomaly scoring is per complete message**, not accumulated across the session.
+A long-lived connection has no request-scoped accumulator, and carrying one
+would let an unbounded, attacker-driven counter decide admission — and would
+make an identical benign message pass or block depending on session history.
+
+**Multiple instances.** Every configured `waf` instance binds and scans
+independently, with its own exemption and condition verdicts. The relay's
+first-terminal-Close rule then applies, so one message is blocked at most once
+and later instances are not invoked for it.
+
+**Observability.** A closed WebSocket session has no per-message
+transaction-summary surface, so message findings are emitted as
+fixed-cardinality `waf`-target log events instead of `waf.*` transaction
+metadata: one event for every block (always, since the close is the only other
+signal), plus one per matched rule and one per non-blocking
+oversize/uninspectable/scan-timeout signal when `log_to_stdout` is enabled. No
+message bytes are logged. Monitor-mode WebSocket findings are non-blocking and
+there is no per-message transaction metadata surface, so enable
+`log_to_stdout` when staging WebSocket policy in `mode: monitor`; otherwise
+those findings intentionally produce no operator-visible signal.
+
+**Operational note.** Configuring WAF body rules on a WebSocket proxy opts that
+proxy's sessions into the parsed frame relay; the raw tunnel-mode fast path
+cannot inspect messages and is not used for them. This also makes the session
+subject to the parsed relay's `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` ceiling;
+an oversized frame closes with code 1009 even when
+`FERRUM_WEBSOCKET_TUNNEL_MODE=true`. Message scanning performs decoded-variant
+and rule-set work for every complete message up to `max_scan_bytes`, and the
+scan budget is evaluated after that bounded scan completes. For high-rate
+WebSocket workloads, size `max_scan_bytes` to the protocol's real message
+envelope and pair WAF with `ws_rate_limiting` to bound repeated per-message
+work. A WAF with no body rule set, or with body inspection disabled in both
+directions, keeps the previous handshake-only behavior and does not force
+parsed framing.
+
 ## Stream (TCP/UDP) inspection
 
 Beyond HTTP-family traffic, the WAF can inspect raw TCP streams and UDP/DTLS
