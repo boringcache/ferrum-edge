@@ -439,6 +439,11 @@ impl MeshGrpcServer {
         slice_request: MeshSliceRequest,
         previous_slice: &MeshSlice,
     ) -> Result<(MeshSlice, Option<MeshConfigUpdate>), Status> {
+        crate::fips::policy::check_gateway_config(config).map_err(|error| {
+            Status::failed_precondition(format!(
+                "FIPS policy rejected the mesh configuration: {error}"
+            ))
+        })?;
         let next_slice = MeshSlice::from_gateway_config(config, slice_request);
         if previous_slice.content_eq(&next_slice) {
             return Ok((next_slice, None));
@@ -472,6 +477,14 @@ impl MeshGrpcServer {
         );
         candidate.normalize_fields();
         candidate.normalize_mesh_fields();
+        // A policy rejection must not advance the per-stream accumulator: the
+        // next accepted delta has to apply to the last known-good base. This is
+        // intentionally before the assignment below, while serialization
+        // failures still retain the established advance-on-consumption
+        // behaviour documented there.
+        crate::fips::policy::check_gateway_config(&candidate).map_err(|error| {
+            Status::failed_precondition(format!("FIPS policy rejected the mesh delta: {error}"))
+        })?;
         // Advance the per-stream base BEFORE building the wire frame: the delta
         // is logically consumed regardless of whether THIS frame serializes.
         // Deferring this past the `?` below would drop the delta from the
@@ -629,6 +642,11 @@ impl MeshConfigSync for MeshGrpcServer {
         );
         initial_config.normalize_fields();
         initial_config.normalize_mesh_fields();
+        crate::fips::policy::check_gateway_config(&initial_config).map_err(|error| {
+            Status::failed_precondition(format!(
+                "FIPS policy rejected the initial mesh configuration: {error}"
+            ))
+        })?;
         let initial_slice = MeshSlice::from_gateway_config(&initial_config, slice_request.clone());
         let initial = Self::build_mesh_config_update_from_slice(initial_slice.clone())?;
 

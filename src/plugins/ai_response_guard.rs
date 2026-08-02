@@ -1322,15 +1322,24 @@ impl AiResponseGuard {
         }
     }
 
+    /// Whether this instance's configuration can actually refuse a response.
+    ///
+    /// `require_json` / `required_fields` reject independently of `action`; the
+    /// detection rules only reject or redact when `action` is not `warn`. A
+    /// `warn`-only instance is pass-through by construction, which is why it
+    /// neither rejects an uninspectable representation nor CLAIMS one at the
+    /// shared representation gate.
+    fn has_enforcing_disposition(&self) -> bool {
+        self.require_json || !self.required_fields.is_empty() || self.action != GuardAction::Warn
+    }
+
     fn respond_to_uninspectable(
         &self,
         ctx: &mut RequestContext,
         reason: &'static str,
         message: &'static str,
     ) -> PluginResult {
-        let must_reject = self.require_json
-            || !self.required_fields.is_empty()
-            || self.action != GuardAction::Warn;
+        let must_reject = self.has_enforcing_disposition();
         if must_reject {
             Self::mark_rejected(ctx, reason);
             PluginResult::Reject {
@@ -3574,13 +3583,112 @@ impl Plugin for AiResponseGuard {
     /// The gateway's own capacity terminal is not affected: when the transform
     /// phase installs it, the response is already replaced and this hook is not
     /// reached at all.
-    async fn on_final_response_body(
+    /// Claim an ORIGIN-ENCODED buffered response so the shared representation
+    /// gate decodes it to plaintext — or fails it closed — before detection
+    /// (`GHSA-4vqr-427g-5cg7`).
+    ///
+    /// Narrow on purpose. An identity-coded response is already what this plugin
+    /// inspects, so it is left on its pre-existing path; native gRPC framing is
+    /// declined because its contract is descriptor-based and its per-message
+    /// coding is `grpc-encoding` rather than `Content-Encoding`; and gateway
+    /// compression is not a reason to claim, because it now runs in the deferred
+    /// transport-encoding stage, after every decision and rewrite here.
+    ///
+    /// Disposition-aware for the same reason the uninspectable-response answer
+    /// is: a `warn`-only instance passes every finding through, so claiming on
+    /// its behalf would turn an origin coding this gateway cannot decode into a
+    /// `502` for a configuration that was never allowed to refuse anything.
+    fn enforces_response_body_policy(
+        &self,
+        ctx: &RequestContext,
+        response_content_type: Option<&str>,
+        _response_body: &[u8],
+    ) -> bool {
+        self.has_validation_rules
+            && self.has_enforcing_disposition()
+            && !ctx.is_native_grpc_request()
+            && !response_content_type
+                .is_some_and(crate::plugins::utils::body_transform::is_framed_grpc_content_type)
+            && ctx
+                .metadata
+                .contains_key(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY)
+    }
+
+    /// Configuration- and request-only over-approximation, consulted before the
+    /// response `Content-Type` is known.
+    fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
+        self.has_validation_rules
+            && self.has_enforcing_disposition()
+            && !ctx.is_native_grpc_request()
+    }
+
+    fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {
+        self.should_buffer_response_body(ctx)
+    }
+
+    /// The final verification seam for a promised redaction, plus the
+    /// re-evaluation of the exact representation the client receives.
+    ///
+    /// Two failures are decided here, and both fail closed:
+    ///
+    /// 1. **An undischarged redaction.** A `redact` detection returns `Continue`
+    ///    from inspection and relies on the producer phase to install the
+    ///    replacement. Every way that can fail — a refused retained ceiling, a
+    ///    refused scratch pass, a serialization error, a representation the
+    ///    rewriter declines — surfaces as `None`, which the shared transform loop
+    ///    reads as "unchanged". An outstanding promise here means the original
+    ///    detected body is still in flight (`GHSA-pwcm-6rh8-f2gh`).
+    /// 2. **Residual detected content after the semantic transforms.** Inspection
+    ///    runs at phase 9, before `response_transformer` (priority 4000). A
+    ///    configured rename can move backend-controlled content into a protected
+    ///    field — `pending_choices` → `choices` — after the guard's only pass, and
+    ///    add/update/remove rules can equally introduce blocked text, drop a
+    ///    required field, or expand a completion past its length bound
+    ///    (`GHSA-62jg-v563-4q23`). Re-running detection over the published bytes
+    ///    is what makes the metadata a statement about the delivered
+    ///    representation instead of the pre-transform one.
+    ///
+    /// The re-run is a RESIDUAL scan, not a second redaction round: no transform
+    /// remains to install a replacement, so a fresh `redact` detection becomes
+    /// the same rejection as an undischarged promise. `warn` keeps passing
+    /// through, so a monitoring deployment is not silently converted into a
+    /// blocking one. Detection is local pattern matching, so nothing is charged
+    /// twice by running it again.
+    ///
+    /// The gateway's own capacity terminal is not affected: when the transform
+    /// phase installs it, the response is already replaced and this phase is not
+    /// reached at all.
+    async fn finalize_client_visible_response_body(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
-        _response_headers: &HashMap<String, String>,
-        _body: &[u8],
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
     ) -> PluginResult {
+        if let Some(detected) = ctx
+            .ai_response_guard_pending_redactions
+            .remove(&self.instance_id)
+        {
+            warn!(
+                "ai_response_guard: detected content was not redacted before delivery (types: {}), rejecting response",
+                detected
+            );
+            return self.undelivered_redaction_reject(ctx, detected);
+        }
+
+        // Re-inspect the published representation. `on_response_body` needs a
+        // mutable header map; it is given a scratch copy because this phase is
+        // non-rewriting and the client-visible headers are already final.
+        let mut scratch_headers = response_headers.clone();
+        let result = self
+            .on_response_body(ctx, response_status, &mut scratch_headers, body)
+            .await;
+        if !matches!(result, PluginResult::Continue) {
+            return result;
+        }
+        // A `redact` disposition registers a promise instead of rejecting. There
+        // is no producer left to discharge it, so an outstanding promise here is
+        // residual detected content in the delivered bytes.
         let Some(detected) = ctx
             .ai_response_guard_pending_redactions
             .remove(&self.instance_id)
@@ -3588,23 +3696,24 @@ impl Plugin for AiResponseGuard {
             return PluginResult::Continue;
         };
         warn!(
-            "ai_response_guard: detected content was not redacted before delivery (types: {}), rejecting response",
+            "ai_response_guard: detected content is still present in the final client-visible response (types: {}), rejecting response",
             detected
         );
-        Self::mark_rejected(ctx, detected.clone());
-        let types_json: Vec<String> = detected
-            .split(',')
-            .filter(|name| !name.is_empty())
-            .map(|name| format!("\"{}\"", escape_json_string(name)))
-            .collect();
-        PluginResult::Reject {
-            status_code: 502,
-            body: format!(
-                r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
-                types_json.join(","),
-            ),
-            headers: HashMap::new(),
-        }
+        self.undelivered_redaction_reject(ctx, detected)
+    }
+
+    /// Preserve the established final-body hook contract for direct callers.
+    /// The proxy skips this compatibility hook after it has invoked the
+    /// authoritative client-visible phase, so production performs one decision.
+    async fn on_final_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        self.finalize_client_visible_response_body(ctx, response_status, response_headers, body)
+            .await
     }
 
     fn on_response_body_transformed(
@@ -3625,6 +3734,30 @@ impl Plugin for AiResponseGuard {
 }
 
 impl AiResponseGuard {
+    /// The shared terminal for detected content that is still in the bytes the
+    /// client would receive — whether the promised redaction never ran or a later
+    /// semantic transform reintroduced it.
+    fn undelivered_redaction_reject(
+        &self,
+        ctx: &mut RequestContext,
+        detected: String,
+    ) -> PluginResult {
+        Self::mark_rejected(ctx, detected.clone());
+        let types_json: Vec<String> = detected
+            .split(',')
+            .filter(|name| !name.is_empty())
+            .map(|name| format!("\"{}\"", escape_json_string(name)))
+            .collect();
+        PluginResult::Reject {
+            status_code: 502,
+            body: format!(
+                r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
+                types_json.join(","),
+            ),
+            headers: HashMap::new(),
+        }
+    }
+
     /// Clear this instance's promised-redaction marker when — and only when — a
     /// replacement was actually produced.
     ///

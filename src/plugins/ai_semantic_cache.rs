@@ -58,10 +58,8 @@ use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
-use hmac::{Hmac, KeyInit, Mac};
 use instant_distance::{Builder as HnswBuilder, HnswMap, Point as HnswPoint, Search as HnswSearch};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::mem;
@@ -86,9 +84,8 @@ use super::utils::redis_rate_limiter::{
 use super::utils::replay_partition::{self, AnonymousCallerScope, PartitionHasher};
 use super::utils::response_body::read_response_body_bounded;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use crate::fips::approved::{HmacSha256, Sha256};
 use crate::util::unknown_keys::reject_unknown_keys;
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// The single response field this plugin writes, in the bounded form
 /// `Plugin::response_trailer_policy` hands to the plugin cache. Built once per
@@ -923,20 +920,20 @@ fn redis_quarantine_fingerprint_content(data: &[u8]) -> [u8; 32] {
     hasher.update(b"ai_semantic_cache.redis_quarantine.content.v1\0");
     hasher.update((data.len() as u64).to_le_bytes());
     hasher.update(data);
-    hasher.finalize().into()
+    hasher.finalize()
 }
 
 fn redis_quarantine_fingerprint_oversized(length: usize) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"ai_semantic_cache.redis_quarantine.oversized.v1\0");
     hasher.update((length as u64).to_le_bytes());
-    hasher.finalize().into()
+    hasher.finalize()
 }
 
 fn redis_quarantine_fingerprint_empty() -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"ai_semantic_cache.redis_quarantine.empty.v1\0");
-    hasher.finalize().into()
+    hasher.finalize()
 }
 
 pub struct AiSemanticCache {
@@ -5212,41 +5209,41 @@ struct RedisEnvelopeMacInput<'a> {
 fn compute_redis_envelope_mac(key: &[u8], envelope: &RedisEnvelopeMacInput<'_>) -> Option<Vec<u8>> {
     let mut mac = HmacSha256::new_from_slice(key).ok()?;
     mac.update(b"ai_semantic_cache.v4\0");
-    mac.update(&(envelope.redis_key.len() as u64).to_le_bytes());
+    mac.update((envelope.redis_key.len() as u64).to_le_bytes());
     mac.update(envelope.redis_key.as_bytes());
-    mac.update(&[envelope.version]);
-    mac.update(&envelope.sealed_at_epoch_seconds.to_le_bytes());
-    mac.update(&envelope.status_code.to_le_bytes());
+    mac.update([envelope.version]);
+    mac.update(envelope.sealed_at_epoch_seconds.to_le_bytes());
+    mac.update(envelope.status_code.to_le_bytes());
     let mut header_pairs: Vec<(&str, &str)> = envelope
         .headers
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
     header_pairs.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(b.1)));
-    mac.update(&(header_pairs.len() as u64).to_le_bytes());
+    mac.update((header_pairs.len() as u64).to_le_bytes());
     for (name, value) in header_pairs {
-        mac.update(&(name.len() as u64).to_le_bytes());
+        mac.update((name.len() as u64).to_le_bytes());
         mac.update(name.as_bytes());
-        mac.update(&(value.len() as u64).to_le_bytes());
+        mac.update((value.len() as u64).to_le_bytes());
         mac.update(value.as_bytes());
     }
-    mac.update(&(envelope.body.len() as u64).to_le_bytes());
+    mac.update((envelope.body.len() as u64).to_le_bytes());
     mac.update(envelope.body);
     if let Some(scope) = envelope.semantic_scope_key {
-        mac.update(&[1]);
-        mac.update(&(scope.len() as u64).to_le_bytes());
+        mac.update([1]);
+        mac.update((scope.len() as u64).to_le_bytes());
         mac.update(scope.as_bytes());
     } else {
-        mac.update(&[0]);
+        mac.update([0]);
     }
     if let Some(values) = envelope.embedding {
-        mac.update(&[1]);
-        mac.update(&(values.len() as u64).to_le_bytes());
+        mac.update([1]);
+        mac.update((values.len() as u64).to_le_bytes());
         for value in values {
-            mac.update(&value.to_le_bytes());
+            mac.update(value.to_le_bytes());
         }
     } else {
-        mac.update(&[0]);
+        mac.update([0]);
     }
     Some(mac.finalize().into_bytes().to_vec())
 }

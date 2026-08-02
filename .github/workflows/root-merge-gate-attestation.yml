@@ -1,0 +1,221 @@
+name: Root Merge Gate Attestation
+
+# Repository prerequisite: the "Allow GitHub Actions to create and approve pull
+# requests" setting (`can_approve_pull_request_reviews`) must remain enabled.
+# This repository was independently verified as enabled before the no-bypass
+# ruleset is activated. GitHub's documented behavior counts enabled Actions
+# reviews toward required approvals. The live #3040 merge-queue exercise will
+# prove that an attestation approval satisfies the actual ruleset.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to attest
+        required: true
+        type: string
+      expected_head_sha:
+        description: Exact 40-character lowercase hex head SHA independently reviewed
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: root-merge-gate-attestation-${{ github.event.inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  attest:
+    name: Root merge-gate attestation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Attest reviewed pull request head
+        env:
+          PR_NUMBER_INPUT: ${{ github.event.inputs.pr_number }}
+          EXPECTED_SHA_INPUT: ${{ github.event.inputs.expected_head_sha }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const refuse = (message) => {
+              throw new Error(`Refusal: ${message}`);
+            };
+
+            const requireObject = (value, name) => {
+              if (value === null || typeof value !== "object" || Array.isArray(value)) {
+                refuse(`${name} must be an object`);
+              }
+              return value;
+            };
+
+            const requireString = (value, name) => {
+              if (typeof value !== "string" || value.length === 0) {
+                refuse(`${name} must be a non-empty string`);
+              }
+              return value;
+            };
+
+            const requireBoolean = (value, name) => {
+              if (typeof value !== "boolean") {
+                refuse(`${name} must be a boolean`);
+              }
+              return value;
+            };
+
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            const prNumberInput = process.env.PR_NUMBER_INPUT;
+            const expectedSha = process.env.EXPECTED_SHA_INPUT;
+            const triggeringActor = process.env.TRIGGERING_ACTOR;
+
+            if (context.ref !== "refs/heads/main") {
+              refuse(`workflow must execute from refs/heads/main (got ${context.ref})`);
+            }
+            if (repository !== "ferrum-edge/ferrum-edge") {
+              refuse(`unexpected repository ${repository}`);
+            }
+            if (context.actor !== "jeremyjpj0916") {
+              refuse(`unauthorized actor ${context.actor}`);
+            }
+            if (triggeringActor !== "jeremyjpj0916") {
+              refuse(`unauthorized triggering actor ${triggeringActor}`);
+            }
+            if (!/^[1-9][0-9]*$/.test(prNumberInput || "")) {
+              refuse("invalid pr_number: must be a positive integer");
+            }
+            if (!/^[0-9a-f]{40}$/.test(expectedSha || "")) {
+              refuse("invalid expected_head_sha: must be exactly 40 lowercase hexadecimal characters");
+            }
+
+            const prNumber = Number(prNumberInput);
+            if (!Number.isSafeInteger(prNumber) || prNumber <= 0) {
+              refuse("invalid pr_number: must fit in a positive safe integer");
+            }
+
+            const validatePullRequest = (raw, contextLabel = "") => {
+              const pr = requireObject(raw, "pull request response");
+              const state = requireString(pr.state, "state");
+              const draft = requireBoolean(pr.draft, "draft");
+              const base = requireObject(pr.base, "base");
+              const head = requireObject(pr.head, "head");
+              const headRepo = requireObject(head.repo, "head.repo");
+              const baseRef = requireString(base.ref, "base.ref");
+              const headRepository = requireString(headRepo.full_name, "head.repo.full_name");
+              const headSha = requireString(head.sha, "head.sha");
+              const suffix = contextLabel ? ` ${contextLabel}` : "";
+
+              if (state !== "open") {
+                refuse(`pull request #${prNumber} is not open (state=${state})${suffix}`);
+              }
+              if (draft) {
+                refuse(`pull request #${prNumber} is a draft${suffix}`);
+              }
+              if (baseRef !== "main") {
+                refuse(`pull request #${prNumber} does not target main (base=${baseRef})${suffix}`);
+              }
+              if (headRepository !== repository) {
+                refuse(`pull request #${prNumber} head is not from ${repository}${suffix}`);
+              }
+              if (headSha !== expectedSha) {
+                refuse(`pull request #${prNumber} head sha ${headSha} does not match expected ${expectedSha}${suffix}`);
+              }
+            };
+
+            const fetchPullRequest = async () => {
+              const response = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+              validatePullRequest(response.data);
+            };
+
+            await fetchPullRequest();
+
+            const reviewThreadsQuery = `
+              query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    reviewThreads(first: 100, after: $after) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes { isResolved }
+                    }
+                  }
+                }
+              }
+            `;
+
+            let cursor = null;
+            let unresolvedCount = 0;
+            const seenCursors = new Set();
+            for (let page = 0; page < 1000; page += 1) {
+              const result = requireObject(await github.graphql(reviewThreadsQuery, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                number: prNumber,
+                after: cursor,
+              }), "GraphQL response");
+              const graphqlRepository = requireObject(result.repository, "repository");
+              const graphqlPr = requireObject(graphqlRepository.pullRequest, "pullRequest");
+              const threads = requireObject(graphqlPr.reviewThreads, "reviewThreads");
+              const pageInfo = requireObject(threads.pageInfo, "reviewThreads.pageInfo");
+              if (!Array.isArray(threads.nodes)) {
+                refuse("reviewThreads.nodes must be an array");
+              }
+              for (const node of threads.nodes) {
+                const thread = requireObject(node, "review thread node");
+                if (!requireBoolean(thread.isResolved, "review thread node isResolved")) {
+                  unresolvedCount += 1;
+                }
+              }
+
+              const hasNextPage = requireBoolean(pageInfo.hasNextPage, "pageInfo.hasNextPage");
+              if (!hasNextPage) {
+                cursor = null;
+                break;
+              }
+              const nextCursor = requireString(pageInfo.endCursor, "pageInfo.endCursor");
+              if (seenCursors.has(nextCursor)) {
+                refuse("review thread pagination repeated a cursor");
+              }
+              seenCursors.add(nextCursor);
+              cursor = nextCursor;
+              if (page === 999) {
+                refuse("review thread pagination exceeded the page limit");
+              }
+            }
+
+            if (unresolvedCount > 0) {
+              refuse(`pull request #${prNumber} has ${unresolvedCount} unresolved review thread(s)`);
+            }
+
+            const finalResponse = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            validatePullRequest(finalResponse.data, "immediately before approval");
+
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${repository}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              commit_id: expectedSha,
+              event: "APPROVE",
+              body: [
+                "Root merge-gate attestation",
+                "",
+                `This approval is explicitly bound to commit \`${expectedSha}\`.`,
+                `Authorizing actor: ${context.actor}`,
+                `Workflow run: ${runUrl}`,
+              ].join("\n"),
+            });
+
+            core.info(`Submitted root merge-gate APPROVE review for pull request #${prNumber} at commit ${expectedSha}`);

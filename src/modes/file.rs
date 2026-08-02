@@ -1039,6 +1039,7 @@ pub async fn serve(
         mode: "file".to_string(),
         read_only: true,
         admin_audit_enabled: env_config.admin_audit_enabled,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: env_config.admin_require_namespace_claim,
         startup_ready: Some(startup_ready.clone()),
         // File mode has no post-start listener supervision that flips readiness;

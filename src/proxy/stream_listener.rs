@@ -259,7 +259,7 @@ impl BackendTlsReloadKey {
 /// listeners whose cached verifier compiled the old revocation list. Cold
 /// path — computed once per reconcile, never per connection.
 fn crl_list_fingerprint(crls: &crate::tls::CrlList) -> Option<String> {
-    use sha2::{Digest, Sha256};
+    use crate::fips::approved::Sha256;
     if crls.is_empty() {
         return None;
     }

@@ -7,9 +7,9 @@
 
 pub mod subscription;
 
+use crate::fips::approved::Sha256;
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};

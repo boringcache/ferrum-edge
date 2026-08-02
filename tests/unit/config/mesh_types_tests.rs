@@ -425,6 +425,107 @@ fn mesh_normalize_trims_request_match_port_pattern_whitespace() {
 }
 
 #[test]
+fn mesh_normalize_trims_request_match_not_port_pattern_whitespace() {
+    let mut mesh = MeshConfig {
+        mesh_policies: vec![MeshPolicy {
+            name: "p".into(),
+            namespace: "default".into(),
+            scope: PolicyScope::MeshWide,
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: vec![RequestMatch {
+                    not_port_patterns: vec![" *443 ".to_string()],
+                    ..RequestMatch::default()
+                }],
+                when: Vec::new(),
+                request_principals: Vec::new(),
+                not_request_principals: Vec::new(),
+                source_negation: Default::default(),
+                never_matches: false,
+                action: PolicyAction::Allow,
+            }],
+        }],
+        ..MeshConfig::default()
+    };
+
+    mesh.normalize();
+    let request = &mesh.mesh_policies[0].rules[0].to[0];
+    assert_eq!(request.not_port_patterns, vec!["*443"]);
+}
+
+#[test]
+fn request_match_not_port_patterns_serde_round_trip_skips_empty() {
+    let with_patterns = RequestMatch {
+        not_ports: vec![8080],
+        not_port_patterns: vec!["8*".to_string()],
+        ..RequestMatch::default()
+    };
+    let encoded = serde_json::to_value(&with_patterns).expect("serialize");
+    assert_eq!(
+        encoded.get("not_port_patterns"),
+        Some(&serde_json::json!(["8*"]))
+    );
+    let decoded: RequestMatch = serde_json::from_value(encoded).expect("deserialize");
+    assert_eq!(decoded.not_ports, vec![8080]);
+    assert_eq!(decoded.not_port_patterns, vec!["8*"]);
+
+    let legacy = serde_json::json!({
+        "not_ports": [9090]
+    });
+    let from_legacy: RequestMatch = serde_json::from_value(legacy).expect("legacy deserialize");
+    assert_eq!(from_legacy.not_ports, vec![9090]);
+    assert!(from_legacy.not_port_patterns.is_empty());
+
+    let empty_patterns = RequestMatch {
+        not_ports: vec![443],
+        ..RequestMatch::default()
+    };
+    let empty_encoded = serde_json::to_value(&empty_patterns).expect("serialize empty");
+    assert!(
+        empty_encoded.get("not_port_patterns").is_none(),
+        "empty not_port_patterns must skip serialization for carrier parity"
+    );
+}
+
+#[test]
+fn mesh_slice_carrier_preserves_not_port_patterns_across_json() {
+    use ferrum_edge::modes::mesh::slice::MeshSlice;
+
+    let slice = MeshSlice {
+        version: "v-not-ports".to_string(),
+        mesh_policies: vec![MeshPolicy {
+            name: "allow-except-8".into(),
+            namespace: "default".into(),
+            scope: PolicyScope::MeshWide,
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: vec![RequestMatch {
+                    not_port_patterns: vec!["8*".to_string(), "*443".to_string()],
+                    not_ports: vec![7070],
+                    ..RequestMatch::default()
+                }],
+                when: Vec::new(),
+                request_principals: Vec::new(),
+                not_request_principals: Vec::new(),
+                source_negation: Default::default(),
+                never_matches: false,
+                action: PolicyAction::Allow,
+            }],
+        }],
+        ..MeshSlice::default()
+    };
+
+    let encoded = serde_json::to_value(&slice).expect("slice serialize");
+    let decoded: MeshSlice = serde_json::from_value(encoded).expect("slice deserialize");
+    let request = &decoded.mesh_policies[0].rules[0].to[0];
+    assert_eq!(request.not_ports, vec![7070]);
+    assert_eq!(
+        request.not_port_patterns,
+        vec!["8*".to_string(), "*443".to_string()]
+    );
+}
+
+#[test]
 fn mesh_normalize_lowercases_multi_cluster_sni_hosts() {
     let mut mesh = MeshConfig {
         multi_cluster: Some(MultiClusterConfig {

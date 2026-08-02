@@ -53,6 +53,7 @@ fn create_test_admin_state(config: &TestConfig, read_only: bool) -> AdminState {
         mode: "test".to_string(),
         read_only,
         admin_audit_enabled: false,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
@@ -193,6 +194,7 @@ async fn test_admin_state_mode_field() {
         mode: "production".to_string(),
         read_only: false,
         admin_audit_enabled: false,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
@@ -244,6 +246,7 @@ async fn test_check_write_allowed_permits_when_db_available() {
         mode: "database".to_string(),
         read_only: false,
         admin_audit_enabled: false,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
@@ -287,6 +290,7 @@ async fn test_check_write_allowed_blocks_when_db_unavailable() {
         mode: "database".to_string(),
         read_only: false,
         admin_audit_enabled: false,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
@@ -336,6 +340,7 @@ async fn test_check_write_allowed_blocks_when_read_only() {
         mode: "database".to_string(),
         read_only: true,
         admin_audit_enabled: false,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
@@ -384,6 +389,7 @@ async fn test_check_write_allowed_permits_when_no_db_flag() {
         mode: "file".to_string(),
         read_only: false,
         admin_audit_enabled: false,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
@@ -427,6 +433,7 @@ async fn test_db_available_flag_transitions() {
         mode: "database".to_string(),
         read_only: false,
         admin_audit_enabled: false,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
@@ -498,6 +505,7 @@ async fn test_check_write_allowed_blocks_on_failover_without_opt_in() {
         mode: "database".to_string(),
         read_only: false,
         admin_audit_enabled: false,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
@@ -571,6 +579,7 @@ async fn test_check_write_allowed_opt_in_is_policy_pure() {
         mode: "database".to_string(),
         read_only: false,
         admin_audit_enabled: false,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
@@ -658,6 +667,7 @@ async fn test_admit_write_pins_and_blocks_on_failover_without_opt_in() {
         mode: "database".to_string(),
         read_only: false,
         admin_audit_enabled: false,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
@@ -691,6 +701,7 @@ async fn test_admit_write_pins_and_blocks_on_failover_without_opt_in() {
     // Independent TLS/ACME stores must not inherit sticky DB failover policy.
     state
         .admit_non_config_db_write()
+        .await
         .expect("admit_non_config_db_write must ignore failover topology");
 }
 
@@ -707,6 +718,7 @@ async fn test_admit_non_config_db_write_keeps_read_only_and_db_unavailable_gates
         mode: "database".to_string(),
         read_only: true,
         admin_audit_enabled: false,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
@@ -731,7 +743,7 @@ async fn test_admit_non_config_db_write_keeps_read_only_and_db_unavailable_gates
         admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
-    let Err(read_only_err) = read_only_state.admit_non_config_db_write() else {
+    let Err(read_only_err) = read_only_state.admit_non_config_db_write().await else {
         panic!("admit_non_config_db_write must honor read-only mode");
     };
     assert_eq!(read_only_err.status(), hyper::StatusCode::FORBIDDEN);
@@ -741,7 +753,7 @@ async fn test_admit_non_config_db_write_keeps_read_only_and_db_unavailable_gates
         db_available: Some(db_flag),
         ..read_only_state
     };
-    let Err(unavailable_err) = unavailable_state.admit_non_config_db_write() else {
+    let Err(unavailable_err) = unavailable_state.admit_non_config_db_write().await else {
         panic!("admit_non_config_db_write must honor database-unavailable");
     };
     assert_eq!(
@@ -786,6 +798,7 @@ async fn test_admit_write_retains_pin_for_mutation_lifetime_on_primary() {
         mode: "database".to_string(),
         read_only: false,
         admin_audit_enabled: false,
+        admin_audit_fallback_dir: None,
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
@@ -903,12 +916,46 @@ fn admin_mutation_handlers_use_admit_write_not_sync_gate_alone() {
         "config-database mutation handlers must call admit_write"
     );
     assert!(
-        tls_source.contains("admit_non_config_db_write()"),
+        tls_source.contains("admit_non_config_db_write().await"),
         "managed TLS/ACME handlers must call admit_non_config_db_write"
+    );
+    assert!(
+        tls_source.contains("admit_audited_operation().await"),
+        "audited TLS rotation must take the durable audit handoff before running"
     );
     assert!(
         !tls_source.contains("admit_write().await"),
         "managed TLS/ACME handlers must not pin sticky config-DB failover topology"
+    );
+
+    let admin_source = include_str!("../../../src/admin/mod.rs");
+    let config_admission = admin_source
+        .split("pub async fn admit_write")
+        .nth(1)
+        .and_then(|tail| tail.split("async fn prepare_audit_intent").next())
+        .expect("config-database admission method remains inspectable");
+    assert!(
+        config_admission.contains("evaluate_independent_store_write_gate")
+            && config_admission.contains("prepare_audit_intent().await")
+            && !config_admission.contains("evaluate_non_topology_write_gate"),
+        "mutation admission must re-attempt durable prepare so fail-closed recovers after transient spool errors"
+    );
+    let independent_admission = admin_source
+        .split("pub async fn admit_non_config_db_write")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("pub(super) async fn admit_audited_operation")
+                .next()
+        })
+        .expect("independent-store admission method remains inspectable");
+    assert!(
+        independent_admission.contains("evaluate_independent_store_write_gate"),
+        "managed TLS/ACME admission must retain read-only and database-availability gates"
+    );
+    assert!(
+        independent_admission.contains("prepare_audit_intent().await")
+            && !independent_admission.contains("evaluate_non_topology_write_gate"),
+        "managed TLS/ACME audit events must be durably prepared before their independent-store mutation"
     );
 
     // Config-DB handler call sites must not use the sync gate alone.

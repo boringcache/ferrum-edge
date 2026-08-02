@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use ring::rand::SecureRandom;
+use crate::fips::backend::rand::SecureRandom;
 
 pub const BACKOFF_INITIAL_SECS: u64 = 1;
 pub const BACKOFF_MAX_SECS: u64 = 30;
@@ -12,7 +12,7 @@ pub fn jittered_backoff(backoff_secs: u64) -> Duration {
 }
 
 pub fn random_backoff_entropy() -> u64 {
-    let rng = ring::rand::SystemRandom::new();
+    let rng = crate::fips::backend::rand::SystemRandom::new();
     let mut bytes = [0u8; 8];
     if rng.fill(&mut bytes).is_ok() {
         return u64::from_ne_bytes(bytes);

@@ -241,6 +241,14 @@ fn configuration_md_rejects_stale_istio_capability_claims() {
         "docs/configuration.md must document negative-match translation"
     );
     assert!(
+        CONFIGURATION_MD.contains("not_port_patterns"),
+        "docs/configuration.md must document wildcard notPorts projection into not_port_patterns"
+    );
+    assert!(
+        !CONFIGURATION_MD.contains("wildcard `notPorts` patterns are rejected at translation time"),
+        "docs/configuration.md must not claim wildcard notPorts are rejected"
+    );
+    assert!(
         CONFIGURATION_MD.contains("all ten watched/translated Istio kinds"),
         "docs/configuration.md must claim status for all ten watched kinds"
     );
