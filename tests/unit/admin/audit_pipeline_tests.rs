@@ -543,9 +543,14 @@ fn concurrent_prepares_enforce_the_strict_generation_ceiling() {
         1,
         "exactly one concurrent intent may consume the only durable slot"
     );
-    assert!(outcomes.iter().filter(|outcome| outcome.is_err()).all(|outcome| {
-        outcome.as_ref().expect_err("failed prepare").kind == SpoolErrorKind::Saturated
-    }));
+    assert!(
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.is_err())
+            .all(|outcome| {
+                outcome.as_ref().expect_err("failed prepare").kind == SpoolErrorKind::Saturated
+            })
+    );
 
     let instance = instance_dirs(dir.path())
         .into_iter()
