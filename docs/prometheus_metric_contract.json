@@ -206,7 +206,7 @@
   {
     "name": "chargeback_sink_spool_bytes",
     "type": "gauge",
-    "help": "Chargeback sink on-disk owned spool bytes (active, temp, corrupt, and dead-lettered files).",
+    "help": "Chargeback sink on-disk owned spool bytes (active, temp, in-flight claim, corrupt, and dead-lettered files).",
     "labels": [],
     "subsystem": "api_chargeback_sink",
     "export_surface": "/metrics",
@@ -236,7 +236,7 @@
   {
     "name": "chargeback_sink_spool_files",
     "type": "gauge",
-    "help": "Chargeback sink on-disk owned spool file count (active, temp, corrupt, and dead-lettered files).",
+    "help": "Chargeback sink on-disk owned spool file count (active, temp, in-flight claim, corrupt, and dead-lettered files).",
     "labels": [],
     "subsystem": "api_chargeback_sink",
     "export_surface": "/metrics",

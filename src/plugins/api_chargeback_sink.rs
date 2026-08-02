@@ -4240,12 +4240,12 @@ fn render_prometheus_for_sinks(
         ));
     }
     output.push_str(
-        "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, corrupt, and dead-lettered files).\n",
+        "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, in-flight claim, corrupt, and dead-lettered files).\n",
     );
     output.push_str("# TYPE chargeback_sink_spool_bytes gauge\n");
     output.push_str(&format!("chargeback_sink_spool_bytes {}\n", spool_bytes));
     output.push_str(
-        "# HELP chargeback_sink_spool_files Chargeback sink on-disk owned spool file count (active, temp, corrupt, and dead-lettered files).\n",
+        "# HELP chargeback_sink_spool_files Chargeback sink on-disk owned spool file count (active, temp, in-flight claim, corrupt, and dead-lettered files).\n",
     );
     output.push_str("# TYPE chargeback_sink_spool_files gauge\n");
     output.push_str(&format!("chargeback_sink_spool_files {}\n", spool_files));
@@ -7463,7 +7463,15 @@ impl SpoolManager {
     }
 
     /// Remove a claim whose rows were fully delivered.
+    ///
+    /// Takes the writer lock around unlink + gauge update so a concurrent
+    /// `reconcile_cached_usage` cannot inventory the still-present claim and
+    /// then publish absolute gauges that resurrect the deleted file/bytes.
     fn remove_delivered_claim(&self, claim: &Path) -> Result<(), String> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
         self.assert_managed_path(claim)?;
         let accounted_len = spool_regular_file_len(claim);
         match fs::remove_file(claim) {

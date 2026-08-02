@@ -1847,13 +1847,13 @@ async fn prometheus_counts_quarantined_owned_spool_bytes() {
     );
     assert!(
         prom.contains(
-            "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, corrupt, and dead-lettered files)."
+            "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, in-flight claim, corrupt, and dead-lettered files)."
         ),
         "prometheus HELP must describe the owned-byte ceiling contract"
     );
     assert!(
         prom.contains(
-            "# HELP chargeback_sink_spool_files Chargeback sink on-disk owned spool file count (active, temp, corrupt, and dead-lettered files)."
+            "# HELP chargeback_sink_spool_files Chargeback sink on-disk owned spool file count (active, temp, in-flight claim, corrupt, and dead-lettered files)."
         ),
         "prometheus HELP must describe owned file accounting"
     );
@@ -7928,6 +7928,52 @@ fn spool_usage_counters_track_write_evict_and_reconcile_lifecycle() {
         .reconcile_cached_usage_for_tests()
         .expect("second reconcile");
     assert_eq!(again, reconciled);
+}
+
+#[tokio::test]
+async fn spool_usage_counters_track_successful_replay_deletion() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let event = sample_event("usage-replay-delete-1");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: 1024 * 1024,
+        replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
+        compression: SpoolCompression::None,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    spool
+        .write_events(std::slice::from_ref(&event))
+        .expect("write spool event");
+    let after_write = spool.cached_stats_for_tests();
+    assert_eq!(after_write.files, 1);
+    assert_eq!(after_write.bytes, encoded_len);
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect("successful replay");
+
+    let after_replay = spool.cached_stats_for_tests();
+    assert_eq!(
+        after_replay.files, 0,
+        "successful delivery must subtract the removed claim from maintained gauges"
+    );
+    assert_eq!(after_replay.bytes, 0);
+    let reconciled = spool
+        .reconcile_cached_usage_for_tests()
+        .expect("reconcile after replay");
+    assert_eq!(
+        reconciled, after_replay,
+        "reconcile must confirm replay deletion left an empty owned spool"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
