@@ -355,18 +355,30 @@ fn build_h3_quinn_server_config(
         .copied()
         .collect();
 
-    // If user didn't configure any TLS 1.3 suites, use defaults
+    let base_provider = crate::fips::base_crypto_provider();
+
+    // If the operator configured no TLS 1.3 suites, fall back to whichever of
+    // the TLS 1.3 defaults the active provider implements. Resolving against
+    // the provider rather than naming provider-qualified constants is what
+    // keeps a FIPS build from reintroducing ChaCha20-Poly1305 here: the FIPS
+    // module simply does not offer it, so it drops out.
     let h3_suites = if tls13_suites.is_empty() {
-        vec![
-            rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256,
-            rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384,
-            rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
-        ]
+        let defaults = base_provider
+            .cipher_suites
+            .iter()
+            .filter(|suite| suite.tls13().is_some())
+            .copied()
+            .collect::<Vec<_>>();
+        if defaults.is_empty() {
+            return Err(anyhow::anyhow!(
+                "the active crypto provider implements no TLS 1.3 cipher suites, so no HTTP/3 \
+                 (QUIC) listener can be built"
+            ));
+        }
+        defaults
     } else {
         tls13_suites
     };
-
-    let base_provider = rustls::crypto::ring::default_provider();
     let h3_provider = rustls::crypto::CryptoProvider {
         cipher_suites: h3_suites,
         kx_groups: tls_policy.crypto_provider.kx_groups.clone(),
@@ -442,7 +454,7 @@ fn build_h3_quinn_server_config(
     // rotating ticketer; if construction fails, the same bounded stateful cache
     // remains as the fail-safe resumption fallback.
     if server_tls_config.max_early_data_size == 0 {
-        match rustls::crypto::ring::Ticketer::new() {
+        match crate::fips::ticketer() {
             Ok(ticketer) => {
                 server_tls_config.ticketer = ticketer;
             }
@@ -664,7 +676,21 @@ pub async fn start_http3_listener_with_signal(
             &client_crls,
             &h3_config,
         )?;
-        quinn::Endpoint::server(server_config, addr)?
+        // Quinn's `Endpoint::server` convenience constructor is gated on its
+        // `ring` or non-FIPS `aws-lc-rs` feature. The FIPS provider uses the
+        // distinct `aws-lc-rs-fips` feature, so construct the same endpoint
+        // explicitly instead of making listener availability depend on a
+        // non-validated provider feature being compiled too.
+        let socket = std::net::UdpSocket::bind(addr)?;
+        socket.set_nonblocking(true)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| anyhow::anyhow!("HTTP/3 listener requires a Tokio runtime"))?;
+        quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime,
+        )?
     };
     let bound_addr = endpoint.local_addr().ok();
     let local_addr = bound_addr.unwrap_or(addr);
@@ -3319,6 +3345,7 @@ async fn handle_h3_request(
         owned_proxy_headers,
         &mut ctx,
         needs_ctx_headers_for_body_hooks,
+        http_flavor,
     );
 
     // Egress baggage strip — see `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`. The
@@ -7385,6 +7412,9 @@ async fn handle_h3_request(
             let phase_start = std::time::Instant::now();
             let mut response_body_reject = None;
             for plugin in plugins.iter() {
+                if plugin.enforces_final_client_visible_response_body(&ctx) {
+                    continue;
+                }
                 let deadline = ctx.grpc_deadline_at();
                 let result = match crate::plugins::await_grpc_deadline(
                     deadline,
@@ -13173,24 +13203,28 @@ fn strip_query_params(url: &str) -> &str {
 
 /// Resolve the per-request `proxy_headers` map for the H3 dispatch path.
 ///
-/// When `needs_ctx_headers` is `false` (the common case: no context-aware
-/// final request-body hooks active), the headers are *moved* out of
-/// `ctx.headers` via `std::mem::take`, matching the pre-existing zero-alloc
-/// hot path. Downstream H3 code after this point does not read
-/// `ctx.headers`, so leaving the map empty is safe.
+/// When `needs_ctx_headers` is `false` and this is not a WebSocket upgrade (the
+/// common case: no context-aware final request-body hooks or session binding
+/// active), the headers are *moved* out of `ctx.headers` via
+/// `std::mem::take`, matching the pre-existing zero-alloc hot path. Downstream
+/// H3 code after this point does not read `ctx.headers`, so leaving the map
+/// empty is safe.
 ///
 /// When `needs_ctx_headers` is `true` (e.g. WAF or another plugin that
-/// overrides `needs_final_request_body_context`), the map is cloned so the
-/// body hook can still read `ctx.headers` for content-type/content-length
-/// gates and rule conditions.
+/// overrides `needs_final_request_body_context`) or the request is a WebSocket
+/// upgrade, the map is cloned. Body hooks need content-type/content-length
+/// gates; WebSocket session binding needs the original upgrade headers for
+/// WAF rule conditions and header-present exemptions.
 fn own_h3_proxy_headers(
     owned_proxy_headers: Option<HashMap<String, String>>,
     ctx: &mut RequestContext,
     needs_ctx_headers: bool,
+    http_flavor: HttpFlavor,
 ) -> HashMap<String, String> {
+    let preserve_ctx_headers = needs_ctx_headers || http_flavor == HttpFlavor::WebSocket;
     match owned_proxy_headers {
         Some(headers) => headers,
-        None if needs_ctx_headers => ctx.headers.clone(),
+        None if preserve_ctx_headers => ctx.headers.clone(),
         None => std::mem::take(&mut ctx.headers),
     }
 }
@@ -13397,6 +13431,7 @@ mod native_h3_retry_refinement_tests {
 #[cfg(test)]
 mod h3_proxy_header_tests {
     use super::own_h3_proxy_headers;
+    use crate::config::types::HttpFlavor;
     use crate::plugins::RequestContext;
     use std::collections::HashMap;
 
@@ -13413,7 +13448,7 @@ mod h3_proxy_header_tests {
         ctx.headers
             .insert("content-type".to_string(), "application/json".to_string());
 
-        let proxy_headers = own_h3_proxy_headers(None, &mut ctx, true);
+        let proxy_headers = own_h3_proxy_headers(None, &mut ctx, true, HttpFlavor::Plain);
 
         assert_eq!(
             proxy_headers.get("content-type").map(String::as_str),
@@ -13439,7 +13474,7 @@ mod h3_proxy_header_tests {
         ctx.headers
             .insert("content-type".to_string(), "application/json".to_string());
 
-        let proxy_headers = own_h3_proxy_headers(None, &mut ctx, false);
+        let proxy_headers = own_h3_proxy_headers(None, &mut ctx, false, HttpFlavor::Plain);
 
         assert_eq!(
             proxy_headers.get("content-type").map(String::as_str),
@@ -13465,7 +13500,7 @@ mod h3_proxy_header_tests {
             .insert("content-type".to_string(), "application/json".to_string());
         let owned = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
 
-        let proxy_headers = own_h3_proxy_headers(Some(owned), &mut ctx, true);
+        let proxy_headers = own_h3_proxy_headers(Some(owned), &mut ctx, true, HttpFlavor::Plain);
 
         assert_eq!(
             proxy_headers.get("content-type").map(String::as_str),
@@ -13474,6 +13509,33 @@ mod h3_proxy_header_tests {
         assert_eq!(
             ctx.headers.get("content-type").map(String::as_str),
             Some("application/json")
+        );
+    }
+
+    #[test]
+    fn websocket_session_binding_preserves_upgrade_headers_without_body_hooks() {
+        // WebSocket upgrades are GET/CONNECT and normally do not request the
+        // final HTTP body-hook context. Their session policy still binds after
+        // this handoff and must retain header-conditioned WAF rules and
+        // header-present exemptions on the native H3 path.
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "CONNECT".to_string(),
+            "/ws".to_string(),
+        );
+        ctx.headers
+            .insert("x-tenant".to_string(), "acme".to_string());
+
+        let proxy_headers = own_h3_proxy_headers(None, &mut ctx, false, HttpFlavor::WebSocket);
+
+        assert_eq!(
+            proxy_headers.get("x-tenant").map(String::as_str),
+            Some("acme")
+        );
+        assert_eq!(
+            ctx.headers.get("x-tenant").map(String::as_str),
+            Some("acme"),
+            "H3 WebSocket session binding must receive the upgrade headers"
         );
     }
 }
@@ -14735,7 +14797,7 @@ mod build_h3_quinn_server_config_mtls_tests {
     fn ensure_crypto_provider() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            let _ = crate::fips::base_crypto_provider().install_default();
         });
     }
 

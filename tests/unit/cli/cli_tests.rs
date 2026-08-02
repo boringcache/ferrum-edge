@@ -499,6 +499,7 @@ fn test_apply_run_overrides_sets_mode() {
                 spec: None,
                 mode: Some("database".to_string()),
                 verbose: 0,
+                fips_mode: None,
             };
             ferrum_edge::cli::apply_run_overrides(&args);
             assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "database");
@@ -524,6 +525,7 @@ fn test_apply_run_overrides_verbose_levels() {
                     spec: None,
                     mode: Some("file".to_string()),
                     verbose: level,
+                    fips_mode: None,
                 };
                 ferrum_edge::cli::apply_run_overrides(&args);
                 assert_eq!(std::env::var("FERRUM_LOG_LEVEL").unwrap(), expected);
@@ -551,6 +553,7 @@ fn test_apply_run_overrides_no_verbose_does_not_set_log_level() {
                 spec: None,
                 mode: Some("file".to_string()),
                 verbose: 0,
+                fips_mode: None,
             };
             ferrum_edge::cli::apply_run_overrides(&args);
             assert!(std::env::var("FERRUM_LOG_LEVEL").is_err());
@@ -612,6 +615,7 @@ fn test_infer_file_mode_from_spec_path() {
                 spec: Some("/tmp/some-spec.yaml".into()),
                 mode: None,
                 verbose: 0,
+                fips_mode: None,
             };
             ferrum_edge::cli::apply_run_overrides(&args);
             assert_eq!(
@@ -649,6 +653,7 @@ fn test_apply_run_overrides_explicit_mode_not_overridden_by_spec() {
                 spec: Some("/tmp/spec.yaml".into()),
                 mode: Some("database".to_string()),
                 verbose: 0,
+                fips_mode: None,
             };
             ferrum_edge::cli::apply_run_overrides(&args);
             ferrum_edge::cli::infer_file_mode();
@@ -752,6 +757,7 @@ fn test_run_explicit_spec_does_not_override_conf_file_mode() {
                 spec: Some(spec_path.clone()),
                 mode: None,
                 verbose: 0,
+                fips_mode: None,
             };
             ferrum_edge::cli::apply_run_overrides(&args);
             assert!(
@@ -792,6 +798,7 @@ fn test_validate_explicit_spec_does_not_override_conf_file_mode() {
                 spec: Some(spec_path),
                 mode: None,
                 verbose: 0,
+                fips_mode: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             ferrum_edge::cli::infer_file_mode();
@@ -824,6 +831,7 @@ fn test_apply_validate_overrides_sets_spec_path() {
                 spec: Some("/etc/ferrum/config.yaml".into()),
                 mode: None,
                 verbose: 0,
+                fips_mode: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert_eq!(
@@ -848,6 +856,7 @@ fn test_apply_validate_overrides_sets_mode() {
                 spec: None,
                 mode: Some("file".to_string()),
                 verbose: 0,
+                fips_mode: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
@@ -867,6 +876,7 @@ fn test_apply_validate_overrides_explicit_mode_not_overridden_by_spec() {
                 spec: Some("/tmp/spec.yaml".into()),
                 mode: Some("database".to_string()),
                 verbose: 0,
+                fips_mode: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             ferrum_edge::cli::infer_file_mode();
@@ -891,6 +901,7 @@ fn test_apply_validate_overrides_verbose_levels() {
                     spec: None,
                     mode: Some("file".to_string()),
                     verbose: level,
+                    fips_mode: None,
                 };
                 ferrum_edge::cli::apply_validate_overrides(&args);
                 assert_eq!(std::env::var("FERRUM_LOG_LEVEL").unwrap(), expected);
@@ -918,6 +929,7 @@ fn test_apply_validate_overrides_no_verbose_does_not_set_log_level() {
                 spec: None,
                 mode: Some("file".to_string()),
                 verbose: 0,
+                fips_mode: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert!(std::env::var("FERRUM_LOG_LEVEL").is_err());
@@ -937,6 +949,7 @@ fn test_validate_mode_and_spec_sets_env_before_infer() {
                 spec: Some("/tmp/config.yaml".into()),
                 mode: Some("file".to_string()),
                 verbose: 0,
+                fips_mode: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert_eq!(
@@ -962,6 +975,7 @@ fn test_apply_validate_overrides_mode_wins_over_env() {
                 spec: None,
                 mode: Some("file".to_string()),
                 verbose: 0,
+                fips_mode: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert_eq!(
@@ -990,6 +1004,7 @@ fn test_apply_validate_overrides_verbose_wins_over_env() {
                 spec: None,
                 mode: None,
                 verbose: 2,
+                fips_mode: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert_eq!(

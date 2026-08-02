@@ -9695,7 +9695,8 @@ fn ai_rate_limiter_provider_enum_matches_runtime() {
             "google",
             "cohere",
             "mistral",
-            "bedrock"
+            "bedrock",
+            "tgi"
         ],
         "provider enum must match the runtime accepted set"
     );
@@ -9738,6 +9739,10 @@ fn ai_rate_limiter_provider_enum_matches_runtime() {
     assert!(
         section.contains("`bedrock`"),
         "docs must enumerate bedrock as an accepted provider"
+    );
+    assert!(
+        section.contains("`tgi`"),
+        "docs must enumerate tgi as an accepted provider (GHSA-rxj9-f483-g53f)"
     );
 }
 
@@ -9874,5 +9879,9 @@ fn observability_sink_endpoint_schemas_document_credential_redaction() {
     assert!(
         params.contains("/redacted"),
         "insert_query_params description must document the redacted diagnostic form: {params}"
+    );
+    assert!(
+        params.contains("every durable request") && params.contains("user/profile default"),
+        "insert_query_params description must document the profile-default durability pin: {params}"
     );
 }

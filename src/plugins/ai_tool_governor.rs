@@ -96,7 +96,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 use url::Url;
 
-use sha2::{Digest, Sha256};
+use crate::fips::approved::Sha256;
 
 use crate::util::json_dup_keys;
 use crate::util::unknown_keys::reject_unknown_keys;

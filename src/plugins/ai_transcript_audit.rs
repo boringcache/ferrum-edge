@@ -51,13 +51,13 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use crate::fips::approved::Sha256;
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
@@ -811,7 +811,7 @@ struct StreamCaptureWork {
 /// allocation or global lock added to the chunk path, and the only contending
 /// writer is the one-shot expiry/terminal transition.
 enum StreamCaptureLifecycle {
-    Active(StreamCaptureWork),
+    Active(Box<StreamCaptureWork>),
     Complete(Option<StreamCaptured>),
     /// `hashed_bytes` is retained for external lifecycle probes after expiry
     /// revokes capture; production emission paths only match on the variant.
@@ -4030,14 +4030,16 @@ impl Plugin for AiTranscriptAudit {
             .try_acquire_owned()
             .ok()?;
         let slot = Arc::new(StreamSlot {
-            capture: Mutex::new(StreamCaptureLifecycle::Active(StreamCaptureWork {
-                accumulated: Vec::new(),
-                hasher: self.redactor.keyed_hasher(),
-                hashed_bytes: 0,
-                hash_capped: false,
-                truncated: false,
-                redaction_scan_limited: false,
-            })),
+            capture: Mutex::new(StreamCaptureLifecycle::Active(Box::new(
+                StreamCaptureWork {
+                    accumulated: Vec::new(),
+                    hasher: self.redactor.keyed_hasher(),
+                    hashed_bytes: 0,
+                    hash_capped: false,
+                    truncated: false,
+                    redaction_scan_limited: false,
+                },
+            ))),
             sample_hit,
             record_lease: Mutex::new(record_lease),
             downstream_terminated: AtomicBool::new(false),

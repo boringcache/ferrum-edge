@@ -139,8 +139,8 @@ mod tests {
 
     #[tokio::test]
     async fn reload_task_swaps_on_change_and_keeps_old_on_failure() {
+        use crate::fips::base_crypto_provider as default_provider;
         use crate::tls::source::{CertSource, MaterialKind};
-        use rustls::crypto::ring::default_provider;
         let _ = default_provider().install_default();
 
         // Build a placeholder initial config so the slot holds Some(..).
@@ -261,7 +261,7 @@ mod tests {
 
         Arc::new(
             rustls::ServerConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
+                crate::fips::base_crypto_provider(),
             ))
             .with_safe_default_protocol_versions()
             .expect("default protocol versions")

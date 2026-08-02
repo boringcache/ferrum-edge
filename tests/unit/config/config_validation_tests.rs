@@ -541,6 +541,10 @@ fn cp_full_and_incremental_rejection_share_plugin_security_composition_validatio
         rejecting_body.contains("config.validate_resource_ids()"),
         "shared rejecting contract must fail closed on malformed IDs/namespaces"
     );
+    assert!(
+        rejecting_body.contains("crate::fips::policy::check_gateway_config(config)"),
+        "shared rejecting contract must apply FIPS document admission to CP full and delta candidates"
+    );
 
     let control_plane = include_str!("../../../src/modes/control_plane.rs");
     let full_start = control_plane

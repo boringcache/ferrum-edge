@@ -238,6 +238,49 @@ impl PluginTlsPosture {
         Self::FailClosedCaBundle { source_id, reason }
     }
 
+    /// Reduce a builder to a posture that can complete no request.
+    ///
+    /// Reached only when [`crate::fips::ensure_internal_client_crypto_provider`]
+    /// reports that the installed process-default rustls provider is not the
+    /// FIPS-approved one an enforcing process requires. There is no safe client
+    /// to hand back at that point and no error channel to return through —
+    /// these constructors are infallible by design — so the client is made
+    /// inert instead: an empty trust store means no server certificate can be
+    /// verified, and `https_only` means no plaintext fallback is attempted
+    /// either. Every outbound call then fails closed with a transport error,
+    /// which is the same shape callers already handle for an unreachable sink.
+    ///
+    /// This is applied *instead of* [`Self::apply`], never after it, and that
+    /// ordering is load-bearing rather than stylistic. `tls_certs_only`
+    /// **extends** the builder's root set — it does not replace it — so calling
+    /// it with an empty list after `CustomCaBundle` already pushed the
+    /// operator's roots leaves those roots in place and the "inert" client can
+    /// still verify and reach any peer under that CA. `SkipVerification` is
+    /// worse: it sets `danger_accept_invalid_certs(true)`, which nothing here
+    /// clears, so the client would accept every certificate and complete every
+    /// request. Certificate verification is therefore re-asserted explicitly
+    /// too, so a future reordering cannot silently reopen either hole.
+    fn apply_inert_crypto_posture(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        builder
+            .tls_danger_accept_invalid_certs(false)
+            .https_only(true)
+            .tls_certs_only(Vec::<reqwest::Certificate>::new())
+    }
+
+    /// Apply the configured posture, or the inert one when the process-default
+    /// crypto provider is not the approved provider this process requires.
+    fn apply_or_inert(
+        &self,
+        builder: reqwest::ClientBuilder,
+        inert: bool,
+    ) -> reqwest::ClientBuilder {
+        if inert {
+            Self::apply_inert_crypto_posture(builder)
+        } else {
+            self.apply(builder)
+        }
+    }
+
     fn apply(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
         match self {
             Self::PlatformRoots => builder,
@@ -292,6 +335,8 @@ fn build_dns_cached_fallback_client(
     tls_posture: &PluginTlsPosture,
     http2_prior_knowledge: bool,
 ) -> reqwest::Client {
+    let crypto_provider = crate::fips::ensure_internal_client_crypto_provider();
+    let provider_mismatch = crypto_provider.is_err();
     // Never auto-follow redirects on a shared outbound client (SSRF posture,
     // matches src/connection_pool.rs and the configured clients above).
     let mut builder = reqwest::Client::builder()
@@ -301,7 +346,15 @@ fn build_dns_cached_fallback_client(
         let resolver = DnsCacheResolver::new(dns_cache);
         builder = builder.dns_resolver(Arc::new(resolver));
     }
-    builder = tls_posture.apply(builder);
+    if let Err(error) = &crypto_provider {
+        tracing::error!(
+            %error,
+            "Refusing to build a usable plugin HTTP client: the process-default crypto provider \
+             is not the FIPS-approved one this enforcing process requires. The client is left \
+             unable to establish any connection."
+        );
+    }
+    builder = tls_posture.apply_or_inert(builder, provider_mismatch);
     if http2_prior_knowledge {
         builder = builder.http2_prior_knowledge();
     }
@@ -312,10 +365,11 @@ fn build_dns_cached_fallback_client(
              TLS posture as a last resort.",
             e
         );
-        let mut builder = tls_posture.apply(
+        let mut builder = tls_posture.apply_or_inert(
             reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none()),
+            provider_mismatch,
         );
         if http2_prior_knowledge {
             builder = builder.http2_prior_knowledge();
@@ -331,6 +385,9 @@ fn build_dns_cached_fallback_client(
                 let mut builder = reqwest::Client::builder()
                     .no_proxy()
                     .redirect(reqwest::redirect::Policy::none());
+                if provider_mismatch {
+                    builder = PluginTlsPosture::apply_inert_crypto_posture(builder);
+                }
                 if http2_prior_knowledge {
                     builder = builder.http2_prior_knowledge();
                 }
@@ -361,6 +418,7 @@ fn build_configured_plugin_client(
     tls_posture: &PluginTlsPosture,
     http2_prior_knowledge: bool,
 ) -> reqwest::Client {
+    let crypto_provider = crate::fips::ensure_internal_client_crypto_provider();
     let mut builder = reqwest::Client::builder()
         .no_proxy()
         .pool_max_idle_per_host(pool_config.max_idle_per_host)
@@ -390,7 +448,17 @@ fn build_configured_plugin_client(
     //   - custom CA configured -> trust ONLY that parsed bundle
     //   - invalid custom CA    -> empty trust store (fail closed)
     //   - no CA configured     -> reqwest 0.13 defaults
-    builder = tls_posture.apply(builder);
+    //   - non-approved crypto provider under enforced FIPS -> inert (replaces
+    //     the configured posture outright; see `apply_inert_crypto_posture`)
+    if let Err(error) = &crypto_provider {
+        tracing::error!(
+            %error,
+            "Refusing to build a usable plugin HTTP client: the process-default crypto provider \
+             is not the FIPS-approved one this enforcing process requires. The client is left \
+             unable to establish any connection."
+        );
+    }
+    builder = tls_posture.apply_or_inert(builder, crypto_provider.is_err());
 
     if pool_config.enable_http_keep_alive {
         builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
