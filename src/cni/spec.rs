@@ -185,12 +185,13 @@ impl CniInvocation {
                 if matches!(command, CniCommand::Add | CniCommand::Check) && netns.is_none() {
                     return Err(CniError::missing_env("CNI_NETNS"));
                 }
-                if netns.as_deref().is_some_and(|path| !is_safe_cni_netns_path(path)) {
+                if netns
+                    .as_deref()
+                    .is_some_and(|path| !is_safe_cni_netns_path(path))
+                {
                     return Err(CniError::missing_env("CNI_NETNS"));
                 }
-                let ifname = env::var("CNI_IFNAME")
-                    .ok()
-                    .filter(|v| !v.trim().is_empty());
+                let ifname = env::var("CNI_IFNAME").ok().filter(|v| !v.trim().is_empty());
                 if !ifname.as_deref().is_some_and(is_safe_cni_ifname) {
                     return Err(CniError::missing_env("CNI_IFNAME"));
                 }
@@ -481,9 +482,8 @@ pub fn ingest_valid_attachments(
 /// unbounded allocation from hostile input.
 pub fn read_stdin_bounded(max_bytes: usize) -> Result<String, CniError> {
     use std::io::Read;
-    let mut limited = std::io::stdin().take(
-        u64::try_from(max_bytes.saturating_add(1)).unwrap_or(u64::MAX),
-    );
+    let mut limited =
+        std::io::stdin().take(u64::try_from(max_bytes.saturating_add(1)).unwrap_or(u64::MAX));
     let mut buf = Vec::new();
     limited
         .read_to_end(&mut buf)

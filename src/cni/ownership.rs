@@ -180,8 +180,7 @@ pub fn is_safe_cni_pod_uid(value: &str) -> bool {
     if value.is_empty() || value.len() > MAX_CNI_ATTACHMENT_FIELD_BYTES {
         return false;
     }
-    if value.contains('/') || value.contains('\\') || value.contains("..") || value.contains('\0')
-    {
+    if value.contains('/') || value.contains('\\') || value.contains("..") || value.contains('\0') {
         return false;
     }
     let mut chars = value.chars();
@@ -477,8 +476,8 @@ pub fn cni_ownership_store_is_rejected() -> bool {
 /// Returns `Ok(None)` when durability is disabled. Returns `Ok(Some(records))`
 /// on a successful load (including missing-file empty). Returns `Err` after
 /// marking the store rejected so GC fails closed.
-pub fn load_configured_cni_ownership(
-) -> Result<Option<Vec<DurableCniOwnershipRecord>>, CniOwnershipStoreError> {
+pub fn load_configured_cni_ownership()
+-> Result<Option<Vec<DurableCniOwnershipRecord>>, CniOwnershipStoreError> {
     let mut runtime = lock_runtime();
     let Some(path) = runtime.path.clone() else {
         runtime.rejected = false;

@@ -5319,9 +5319,11 @@ impl EnvConfig {
             if self.node_agent_cni_enabled
                 && self.node_agent_cni_socket_path != self.node_agent_cni_socket_path.trim()
             {
-                return Err("FERRUM_NODE_AGENT_CNI_SOCKET_PATH must not contain surrounding \
+                return Err(
+                    "FERRUM_NODE_AGENT_CNI_SOCKET_PATH must not contain surrounding \
                      whitespace"
-                    .into());
+                        .into(),
+                );
             }
             if self.node_agent_cni_enabled
                 && !std::path::Path::new(self.node_agent_cni_socket_path.trim()).is_absolute()

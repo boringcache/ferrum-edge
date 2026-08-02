@@ -34,7 +34,8 @@ fn sample_cleanup() -> DurableCniCleanupSnapshot {
 fn ownership_store_path_is_bound_to_exact_socket_path_identity() {
     let a = ownership_store_path_for_socket("/var/run/ferrum/node-agent-cni.sock")
         .expect("socket parent");
-    let b = ownership_store_path_for_socket("/var/run/ferrum/other-cni.sock").expect("socket parent");
+    let b =
+        ownership_store_path_for_socket("/var/run/ferrum/other-cni.sock").expect("socket parent");
     assert_ne!(
         a, b,
         "distinct sockets in the same parent must not share a durable store file"
@@ -42,14 +43,12 @@ fn ownership_store_path_is_bound_to_exact_socket_path_identity() {
     assert_eq!(a.parent(), b.parent());
     let id_a = ownership_store_id_for_socket("/var/run/ferrum/node-agent-cni.sock").expect("id");
     assert!(
-        a.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| {
-                name.starts_with(CNI_OWNERSHIP_STORE_FILENAME_PREFIX)
-                    && name.ends_with(CNI_OWNERSHIP_STORE_FILENAME_SUFFIX)
-                    && name.contains(&id_a)
-                    && !name.contains("node-agent-cni.sock")
-            }),
+        a.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
+            name.starts_with(CNI_OWNERSHIP_STORE_FILENAME_PREFIX)
+                && name.ends_with(CNI_OWNERSHIP_STORE_FILENAME_SUFFIX)
+                && name.contains(&id_a)
+                && !name.contains("node-agent-cni.sock")
+        }),
         "store filename must embed a digest identity without raw socket path bytes: {a:?}"
     );
     assert_eq!(
@@ -103,9 +102,11 @@ fn durable_ownership_round_trip_persists_cleanup_snapshot() {
 
     // Missing file is empty ownership, not an error.
     let missing = dir.path().join("missing.v2");
-    assert!(load_durable_cni_ownership(&missing)
-        .expect("missing")
-        .is_empty());
+    assert!(
+        load_durable_cni_ownership(&missing)
+            .expect("missing")
+            .is_empty()
+    );
 
     configure_cni_ownership_store(Some(path));
     reset_cni_ownership_store_for_tests();
@@ -192,7 +193,8 @@ fn malformed_oversized_and_hostile_durable_state_fail_closed_without_echo() {
     let truncated = br#"{"version":2,"attachments":[{"container_id":"ctr""#;
     assert!(parse_durable_cni_ownership_bytes(truncated).is_err());
 
-    let legacy_v1 = br#"{"version":1,"attachments":[{"container_id":"ctr","ifname":"eth0","pod_uid":"uid"}]}"#;
+    let legacy_v1 =
+        br#"{"version":1,"attachments":[{"container_id":"ctr","ifname":"eth0","pod_uid":"uid"}]}"#;
     assert!(
         parse_durable_cni_ownership_bytes(legacy_v1).is_err(),
         "replaced schema must fail closed on legacy identity-only documents"
@@ -235,8 +237,7 @@ fn hard_linked_durable_ownership_store_is_rejected() {
     store_durable_cni_ownership(&path, &records).expect("store");
     let link = dir.path().join("hardlink.v2");
     std::fs::hard_link(&path, &link).expect("hardlink");
-    let write_err =
-        store_durable_cni_ownership(&path, &records).expect_err("hardlink write");
+    let write_err = store_durable_cni_ownership(&path, &records).expect_err("hardlink write");
     assert!(
         write_err.to_string().contains("hard-linked")
             || write_err.to_string().contains("non-regular"),

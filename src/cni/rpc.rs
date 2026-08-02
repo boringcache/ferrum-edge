@@ -20,8 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cni::spec::{
     CniValidAttachment, MAX_CNI_ATTACHMENT_FIELD_BYTES, ingest_valid_attachments,
-    is_safe_cni_container_id, is_safe_cni_ifname, is_safe_cni_netns_path,
-    is_safe_cni_network_name,
+    is_safe_cni_container_id, is_safe_cni_ifname, is_safe_cni_netns_path, is_safe_cni_network_name,
 };
 
 /// Hard cap on a single RPC message. ADD/DEL/CHECK stay tiny; GC may carry a
