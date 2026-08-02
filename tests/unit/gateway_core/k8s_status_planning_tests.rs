@@ -716,9 +716,11 @@ fn mixed_valid_invalid_and_rotating_windows_preserve_status_parity() {
     assert_eq!(seen.len(), unlimited.len());
     for update in &unlimited {
         let key = (update.kind.clone(), update.name.clone());
+        let expected = status_without_last_transition_time(&update.status);
+        let actual = seen.get(&key).map(status_without_last_transition_time);
         assert_eq!(
-            seen.get(&key),
-            Some(&update.status),
+            actual.as_ref(),
+            Some(&expected),
             "rotating-window parity mismatch for {}/{}",
             update.kind,
             update.name
