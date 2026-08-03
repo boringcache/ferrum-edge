@@ -398,6 +398,7 @@ identity:
 
 ```text
 <spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/spool.meta.json
+<spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/.spool-quota.lock
 <spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/<YYYYMMDD>/<ULID>.<owner_tag>.ndjson.zst
 <spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/<YYYYMMDD>/<ULID>.<owner_tag>.ndjson.zst.rejected.ndjson
 <spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/<YYYYMMDD>/<ULID>.<owner_tag>.ndjson.zst.rejected.meta
@@ -614,12 +615,12 @@ fields are never logged.
   `chargeback_sink_spool_prepare_failures_total`) and mutates nothing.
 - Permanently rejected rows (and single-row 413 failures) are appended verbatim
   to one owner-only (`0600` on Unix) sibling `.rejected.ndjson` temp. The temp is
-  quota-admitted under the spool write lock before each bounded replay batch of
-  separators/rows is written, so an uncompressed rejected payload derived from
-  a compressed source never transiently exceeds `spool.max_bytes`. A quota
-  refusal removes the temp and restores the authoritative source for a
-  later/operator-assisted attempt. The completed temp is
-  fsynced, atomically renamed, and directory-fsynced before the sibling
+  quota-admitted under the namespace-wide spool lock before each bounded replay
+  batch of separators/rows is written, so an uncompressed rejected payload
+  derived from a compressed source never transiently exceeds
+  `spool.max_bytes`. A quota refusal removes the temp and restores the
+  authoritative source for a later/operator-assisted attempt. The completed
+  temp is fsynced, atomically renamed, and directory-fsynced before the sibling
   `.rejected.meta` document is published; only then is the authoritative source
   removed. The metadata contains the payload filename, byte length, SHA-256,
   aggregate
@@ -704,8 +705,16 @@ sink under its managed namespace (after compression when `compression` is
 
 Ordinary pending writes are serialized/compressed and sized **before** quota
 admission. The incrementally streamed dead-letter payload is admitted before
-each bounded replay-batch append. Admission holds the spool write lock with
-eviction so concurrent writers cannot over-admit. Existing owned bytes plus the
+each bounded replay-batch append. Admission, inventory/eviction, and the
+corresponding append/publication/removal are one transaction under the stable
+owner-namespace `.spool-quota.lock`: every manager instance, overlapping plugin
+generation, and cooperating Ferrum process sharing that namespace takes the
+same exclusive OS file lock. The lock is opened without following symlinks,
+pinned against pathname replacement, required to be a private regular file with
+one hard link on Unix (Windows pins a no-delete handle), and revalidated with
+`spool.meta.json` after acquisition; lock, identity, or process-mutex poisoning
+failures refuse the mutation. The zero-length coordination file is not billing
+data and is excluded from quota and status counts. Existing owned bytes plus the
 incoming bytes must stay within `max_bytes`; when space is short, the oldest
 **evictable** owned file is dropped
 and `chargeback_sink_spool_drops_total` is incremented. If a single encoded batch

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, PEER_REPUBLISH_MARKER,
     QuotaEvictionReport, SnapshotAccumulator, SpoolCompression, SpoolFinalOwnership, SpoolFsFault,
-    SpoolManager, SpoolOwnerSpec, SpoolSettings, SpoolWriteHookPoint,
+    SpoolManager, SpoolOwnerSpec, SpoolSettings, SpoolStats, SpoolWriteHookPoint,
     classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
     clickhouse_insert_url_for_tests, compact_recovery_probe_for_tests,
     compile_charge_event_projection, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
@@ -20,7 +20,8 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     probe_charge_body_materialization_with_projection_for_tests,
     probe_compact_recovery_retry_for_tests, probe_empty_dead_letter_publish_for_tests,
     probe_shared_spool_batch_clone_for_tests, probe_streaming_replay_batch_range_errors_for_tests,
-    render_prometheus, render_status_json, replay_spool_once_for_tests,
+    publish_dead_letter_payload_for_tests, render_prometheus, render_status_json,
+    replay_spool_once_for_tests,
     replay_spool_once_with_batch_size_for_tests, replay_spool_once_with_ceiling_for_tests,
     serialize_json_each_row, serialize_json_each_row_projected, set_spool_write_hook_for_tests,
     spool_artifact_byte_limit_for_tests, spool_claim_lease_secs_for_tests,
@@ -1553,6 +1554,309 @@ impl Drop for ClearSpoolWriteHookGuard {
     fn drop(&mut self) {
         set_spool_write_hook_for_tests(None);
     }
+}
+
+/// Deterministically parks the first quota admission while publishing when a
+/// second independent manager has reached the namespace-lock boundary.
+struct SharedQuotaRaceGate {
+    root: std::path::PathBuf,
+    lock_attempts: Mutex<usize>,
+    lock_attempts_cv: Condvar,
+    first_admission_parked: Mutex<bool>,
+    first_admission_cv: Condvar,
+    release: Mutex<bool>,
+    release_cv: Condvar,
+    admission_claimed: AtomicBool,
+}
+
+impl SharedQuotaRaceGate {
+    fn new(root: std::path::PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            root,
+            lock_attempts: Mutex::new(0),
+            lock_attempts_cv: Condvar::new(),
+            first_admission_parked: Mutex::new(false),
+            first_admission_cv: Condvar::new(),
+            release: Mutex::new(false),
+            release_cv: Condvar::new(),
+            admission_claimed: AtomicBool::new(false),
+        })
+    }
+
+    fn observe(&self, point: SpoolWriteHookPoint, root: &Path) {
+        if root != self.root.as_path() {
+            return;
+        }
+        match point {
+            SpoolWriteHookPoint::BeforeNamespaceLock => {
+                let mut attempts = self.lock_attempts.lock().expect("lock-attempt gate");
+                *attempts = attempts.saturating_add(1);
+                self.lock_attempts_cv.notify_all();
+            }
+            SpoolWriteHookPoint::QuotaAdmissionReady
+                if !self.admission_claimed.swap(true, Ordering::SeqCst) =>
+            {
+                {
+                    let mut parked = self
+                        .first_admission_parked
+                        .lock()
+                        .expect("admission parked gate");
+                    *parked = true;
+                    self.first_admission_cv.notify_all();
+                }
+                let mut released = self.release.lock().expect("admission release gate");
+                while !*released {
+                    released = self
+                        .release_cv
+                        .wait(released)
+                        .expect("admission release wait");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn wait_for_first_admission(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut parked = self
+            .first_admission_parked
+            .lock()
+            .expect("admission parked gate");
+        while !*parked {
+            let now = Instant::now();
+            assert!(now < deadline, "first quota admission did not park");
+            let (next, timeout) = self
+                .first_admission_cv
+                .wait_timeout(parked, deadline.saturating_duration_since(now))
+                .expect("admission parked wait");
+            parked = next;
+            assert!(!timeout.timed_out() || *parked, "first quota admission timed out");
+        }
+    }
+
+    fn wait_for_lock_attempts(&self, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut attempts = self.lock_attempts.lock().expect("lock-attempt gate");
+        while *attempts < expected {
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "namespace lock attempts did not reach {expected}; observed {attempts}"
+            );
+            let (next, timeout) = self
+                .lock_attempts_cv
+                .wait_timeout(attempts, deadline.saturating_duration_since(now))
+                .expect("lock-attempt wait");
+            attempts = next;
+            assert!(
+                !timeout.timed_out() || *attempts >= expected,
+                "namespace lock attempt wait timed out"
+            );
+        }
+    }
+
+    fn release(&self) {
+        let mut release = self.release.lock().expect("admission release gate");
+        *release = true;
+        self.release_cv.notify_all();
+    }
+}
+
+struct ClearSharedQuotaRaceHook {
+    gate: Arc<SharedQuotaRaceGate>,
+}
+
+impl Drop for ClearSharedQuotaRaceHook {
+    fn drop(&mut self) {
+        self.gate.release();
+        set_spool_write_hook_for_tests(None);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn replaced_namespace_coordination_inode_refuses_spool_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a")
+        .unwrap();
+    let lock = spool.namespace_root_for_tests().join(".spool-quota.lock");
+    let displaced = spool.namespace_root_for_tests().join("displaced-quota-lock");
+    fs::rename(&lock, &displaced).unwrap();
+    fs::write(&lock, b"").unwrap();
+
+    let error = spool
+        .write_events(&[sample_event("replaced-quota-lock")])
+        .expect_err("a replaced coordination inode must fail closed");
+
+    assert!(error.contains("coordination"), "unexpected error: {error}");
+    assert_eq!(spool.scan_stats().unwrap(), SpoolStats::default());
+}
+
+#[cfg(unix)]
+#[test]
+fn hard_linked_namespace_coordination_inode_refuses_spool_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a")
+        .unwrap();
+    let lock = spool.namespace_root_for_tests().join(".spool-quota.lock");
+    let alias = spool.namespace_root_for_tests().join("quota-lock-alias");
+    fs::hard_link(&lock, &alias).unwrap();
+
+    let error = spool
+        .write_events(&[sample_event("hard-linked-quota-lock")])
+        .expect_err("a hard-linked coordination inode must fail closed");
+
+    assert!(error.contains("hard link"), "unexpected error: {error}");
+    assert_eq!(spool.scan_stats().unwrap(), SpoolStats::default());
+}
+
+#[test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+fn independent_managers_cannot_over_admit_ordinary_spool_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let event = sample_event("shared-quota-ordinary");
+    let encoded_len = serialize_json_each_row(std::slice::from_ref(&event))
+        .unwrap()
+        .len() as u64;
+    let settings = spool_settings(temp.path(), encoded_len);
+    let ceiling = leaked_chargeback_test_ceiling(16 * 1024 * 1024);
+    let first = Arc::new(
+        SpoolManager::for_tests_with_owner_faults_ages_and_ceiling(
+            settings.clone(),
+            &test_owner_spec("node-a"),
+            101,
+            SpoolFsFault::None,
+            0,
+            3_600,
+            ceiling,
+        )
+        .unwrap(),
+    );
+    let second = Arc::new(
+        SpoolManager::for_tests_with_owner_faults_ages_and_ceiling(
+            settings,
+            &test_owner_spec("node-a"),
+            102,
+            SpoolFsFault::None,
+            0,
+            3_600,
+            ceiling,
+        )
+        .unwrap(),
+    );
+    let gate = SharedQuotaRaceGate::new(first.namespace_root_for_tests().to_path_buf());
+    let _clear = ClearSharedQuotaRaceHook {
+        gate: Arc::clone(&gate),
+    };
+    let hook_gate = Arc::clone(&gate);
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point, root| {
+        hook_gate.observe(point, root);
+    })));
+
+    let first_manager = Arc::clone(&first);
+    let first_event = event.clone();
+    let first_writer = thread::spawn(move || first_manager.write_events(&[first_event]));
+    gate.wait_for_first_admission();
+
+    let second_manager = Arc::clone(&second);
+    let second_writer = thread::spawn(move || second_manager.write_events(&[event]));
+    gate.wait_for_lock_attempts(2);
+    gate.release();
+
+    first_writer.join().expect("first writer thread").unwrap();
+    second_writer.join().expect("second writer thread").unwrap();
+    let stats = first.scan_stats().unwrap();
+    assert_eq!(stats.files, 1, "the second admission must evict, not overlap");
+    assert!(stats.bytes <= encoded_len, "shared namespace exceeded quota: {stats:?}");
+    assert_eq!(ceiling.used(), 0);
+}
+
+#[test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+fn independent_managers_cannot_over_admit_streamed_dead_letter_appends() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = br#"{"event_id":"shared-quota-dead-letter"}"#.to_vec();
+    let source_bytes = row.len() as u64;
+    let max_bytes = source_bytes.saturating_mul(3);
+    let settings = spool_settings(temp.path(), max_bytes);
+    let ceiling = leaked_chargeback_test_ceiling(16 * 1024 * 1024);
+    let first = Arc::new(
+        SpoolManager::for_tests_with_owner_faults_ages_and_ceiling(
+            settings.clone(),
+            &test_owner_spec("node-a"),
+            201,
+            SpoolFsFault::None,
+            0,
+            3_600,
+            ceiling,
+        )
+        .unwrap(),
+    );
+    let second = Arc::new(
+        SpoolManager::for_tests_with_owner_faults_ages_and_ceiling(
+            settings,
+            &test_owner_spec("node-a"),
+            202,
+            SpoolFsFault::None,
+            0,
+            3_600,
+            ceiling,
+        )
+        .unwrap(),
+    );
+    let day = first.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let source_a = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FD1"));
+    let source_b = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FD2"));
+    fs::write(&source_a, &row).unwrap();
+    fs::write(&source_b, &row).unwrap();
+    let claim_a = first
+        .hold_replay_claim_for_tests(&source_a)
+        .unwrap()
+        .unwrap();
+    let claim_b = second
+        .hold_replay_claim_for_tests(&source_b)
+        .unwrap()
+        .unwrap();
+    let claim_a_path = claim_a.claim_path_for_tests().to_path_buf();
+    let claim_b_path = claim_b.claim_path_for_tests().to_path_buf();
+
+    let gate = SharedQuotaRaceGate::new(first.namespace_root_for_tests().to_path_buf());
+    let _clear = ClearSharedQuotaRaceHook {
+        gate: Arc::clone(&gate),
+    };
+    let hook_gate = Arc::clone(&gate);
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point, root| {
+        hook_gate.observe(point, root);
+    })));
+
+    let first_manager = Arc::clone(&first);
+    let first_row = row.clone();
+    let first_append = thread::spawn(move || {
+        publish_dead_letter_payload_for_tests(&first_manager, &claim_a_path, &first_row)
+    });
+    gate.wait_for_first_admission();
+
+    let second_manager = Arc::clone(&second);
+    let second_append = thread::spawn(move || {
+        publish_dead_letter_payload_for_tests(&second_manager, &claim_b_path, &row)
+    });
+    // First helper acquires once to create its temp and again for the parked
+    // append; the second helper's create is the third lock attempt.
+    gate.wait_for_lock_attempts(3);
+    gate.release();
+
+    let first_result = first_append.join().expect("first append thread");
+    let second_result = second_append.join().expect("second append thread");
+    assert!(first_result.is_ok(), "first append failed: {first_result:?}");
+    let error = second_result.expect_err("second protected append must fail closed");
+    assert!(error.contains("cannot fit within spool.max_bytes"), "{error}");
+    assert!(claim_a.claim_path_for_tests().exists());
+    assert!(claim_b.claim_path_for_tests().exists());
+    let stats = first.scan_stats().unwrap();
+    assert_eq!(stats.files, 3, "two claims plus one dead-letter payload remain");
+    assert!(stats.bytes <= max_bytes, "streamed append exceeded quota: {stats:?}");
+    assert_eq!(ceiling.used(), 0);
 }
 
 /// A peer sharing the volume removes a selected candidate and replaces it with
@@ -3850,7 +4154,9 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
             SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
             // This test gates only the write boundary; quota-eviction snapshots
             // are not part of the stall it asserts.
-            SpoolWriteHookPoint::QuotaInventoryTaken => {}
+            SpoolWriteHookPoint::BeforeNamespaceLock
+            | SpoolWriteHookPoint::QuotaAdmissionReady
+            | SpoolWriteHookPoint::QuotaInventoryTaken => {}
         }
     })));
 
@@ -4208,7 +4514,9 @@ async fn saturated_spool_delivery_does_not_count_failed_high_water_diversion() {
             SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
             // Quota inventory snapshots are unrelated to the delivery-channel
             // saturation boundary this test intentionally stalls.
-            SpoolWriteHookPoint::QuotaInventoryTaken => {}
+            SpoolWriteHookPoint::BeforeNamespaceLock
+            | SpoolWriteHookPoint::QuotaAdmissionReady
+            | SpoolWriteHookPoint::QuotaInventoryTaken => {}
         }
     })));
 
@@ -8311,7 +8619,9 @@ fn compact_snapshot_recovery_serializes_take_write_restore_attempts() {
         match point {
             SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
             SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
-            SpoolWriteHookPoint::QuotaInventoryTaken => {}
+            SpoolWriteHookPoint::BeforeNamespaceLock
+            | SpoolWriteHookPoint::QuotaAdmissionReady
+            | SpoolWriteHookPoint::QuotaInventoryTaken => {}
         }
     })));
 

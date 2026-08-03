@@ -270,6 +270,10 @@ fn spool_streaming_replay_minimum_bytes(decoded_bound: u64, compressed: bool) ->
 /// deriving the owner tag. 64 KiB is orders of magnitude above the real record
 /// and keeps a planted manifest from allocating inside the billing process.
 const SPOOL_MAX_META_BYTES: usize = 64 * 1024;
+/// Stable advisory-lock inode shared by every cooperating writer for one
+/// ownership-bound namespace. The zero-length coordination file is not a
+/// billing artifact and is excluded from quota/status inventory.
+const SPOOL_COORDINATION_LOCK_FILENAME: &str = ".spool-quota.lock";
 /// Bound one ClickHouse attempt so the derived cross-process claim lease remains
 /// finite and representable. Ten minutes is already substantially above the
 /// default five-second export timeout.
@@ -6152,6 +6156,31 @@ impl SpoolOwnerSpec<'_> {
     }
 }
 
+/// Pinned identity for the stable namespace coordination inode.
+///
+/// Keeping one handle open prevents inode-number reuse from making a replaced
+/// pathname look like the original lock. Mutation transactions use a fresh
+/// descriptor so closing the transaction guard releases its OS lock without a
+/// fallible explicit unlock step.
+struct SpoolNamespaceLock {
+    path: PathBuf,
+    identity: SpoolFileIdentity,
+    pinned: File,
+}
+
+/// Exclusive namespace lock released by closing its descriptor.
+struct SpoolNamespaceFileGuard {
+    _file: File,
+}
+
+/// Complete mutation guard: process-local serialization plus the durable
+/// cross-process namespace lock. Field order releases the file lock before the
+/// local mutex guard.
+struct SpoolMutationGuard<'a> {
+    _namespace: SpoolNamespaceFileGuard,
+    _local: MutexGuard<'a, ()>,
+}
+
 pub struct SpoolManager {
     cfg: SpoolSettings,
     owner: SpoolOwner,
@@ -6163,7 +6192,11 @@ pub struct SpoolManager {
     last_drop_warn_at: AtomicI64,
     last_unbound_warn_at: AtomicI64,
     live_storage_prepared: AtomicBool,
+    /// Serializes this manager before it contends for the namespace-wide file
+    /// lock. Correctness never relies on this process-local guard alone.
     write_lock: Mutex<()>,
+    /// Pinned identity of the stable cross-process coordination inode.
+    namespace_lock: OnceLock<SpoolNamespaceLock>,
     /// Foreign or unattributable temps are reconciled only once this old.
     stale_temp_age_secs: u64,
     /// Lifetime of an in-flight replay claim before another owner may recover it.
@@ -6210,11 +6243,107 @@ impl SpoolManager {
             last_unbound_warn_at: AtomicI64::new(0),
             live_storage_prepared: AtomicBool::new(false),
             write_lock: Mutex::new(()),
+            namespace_lock: OnceLock::new(),
             stale_temp_age_secs: options.stale_temp_age_secs,
             claim_lease_secs: options.claim_lease_secs,
             fs_ops: options.fs_ops,
             ceiling: options.ceiling,
             projection: options.projection,
+        })
+    }
+
+    fn coordination_lock_path(&self) -> PathBuf {
+        self.namespace_root.join(SPOOL_COORDINATION_LOCK_FILENAME)
+    }
+
+    /// Create/adopt and pin the stable namespace coordination inode.
+    ///
+    /// The caller holds `write_lock` and has already canonicalized the managed
+    /// root. Concurrent managers may open the same newly-created inode; a
+    /// symlink, non-file, hard link, or path/descriptor identity mismatch fails
+    /// closed and never becomes a second lock domain.
+    fn initialize_namespace_lock_locked(&self) -> Result<(), String> {
+        let path = self.coordination_lock_path();
+        self.assert_managed_path(&path)?;
+        if let Some(anchor) = self.namespace_lock.get() {
+            self.validate_namespace_lock_path(anchor)?;
+            return Ok(());
+        }
+        let file = open_spool_coordination_file(&path, true)?;
+        let identity = validate_spool_coordination_file(&path, &file)?;
+        let anchor = SpoolNamespaceLock {
+            path,
+            identity,
+            pinned: file,
+        };
+        self.namespace_lock.set(anchor).map_err(|_| {
+            format!(
+                "{PLUGIN_NAME}: spool namespace coordination lock was initialized concurrently"
+            )
+        })
+    }
+
+    fn validate_namespace_lock_path(&self, anchor: &SpoolNamespaceLock) -> Result<(), String> {
+        self.assert_managed_path(&anchor.path)?;
+        let current = validate_spool_coordination_file(&anchor.path, &anchor.pinned)?;
+        if current != anchor.identity {
+            return Err(format!(
+                "{PLUGIN_NAME}: spool namespace coordination lock changed identity"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Acquire the ownership-bound cross-process lock after `write_lock`.
+    fn acquire_namespace_lock_locked(&self) -> Result<SpoolNamespaceFileGuard, String> {
+        let anchor = self.namespace_lock.get().ok_or_else(|| {
+            format!(
+                "{PLUGIN_NAME}: spool namespace coordination lock is not initialized"
+            )
+        })?;
+        self.validate_namespace_lock_path(anchor)?;
+        let file = open_spool_coordination_file(&anchor.path, false)?;
+        let before = validate_spool_coordination_file(&anchor.path, &file)?;
+        if before != anchor.identity {
+            return Err(format!(
+                "{PLUGIN_NAME}: refusing a replaced spool namespace coordination lock"
+            ));
+        }
+        file.lock().map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to acquire spool namespace coordination lock '{}': {error}",
+                anchor.path.display()
+            )
+        })?;
+        // Revalidate after acquisition so a pathname replacement racing the
+        // open/lock interval is never accepted as the shared lock domain.
+        let after = validate_spool_coordination_file(&anchor.path, &file)?;
+        if after != anchor.identity {
+            return Err(format!(
+                "{PLUGIN_NAME}: spool namespace coordination lock changed identity while acquiring it"
+            ));
+        }
+        Ok(SpoolNamespaceFileGuard { _file: file })
+    }
+
+    /// Serialize one namespace mutation across manager instances and Ferrum
+    /// processes, then revalidate the durable owner record under that lock.
+    fn lock_spool_mutation(&self) -> Result<SpoolMutationGuard<'_>, String> {
+        if let Some(hook) = snapshot_spool_write_hook_for_tests() {
+            hook(
+                SpoolWriteHookPoint::BeforeNamespaceLock,
+                &self.namespace_root,
+            );
+        }
+        let local = self
+            .write_lock
+            .lock()
+            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        let namespace = self.acquire_namespace_lock_locked()?;
+        self.validate_namespace_meta()?;
+        Ok(SpoolMutationGuard {
+            _namespace: namespace,
+            _local: local,
         })
     }
 
@@ -6397,10 +6526,7 @@ impl SpoolManager {
         claim: &mut SpoolClaimHandle,
         lease_deadline_unix: i64,
     ) -> Result<(), String> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        let _guard = self.lock_spool_mutation()?;
         self.renew_claim_locked_at(claim, lease_deadline_unix)
     }
 
@@ -6409,10 +6535,7 @@ impl SpoolManager {
     #[doc(hidden)]
     #[allow(dead_code)] // external unit tests only
     pub fn claim_replay_file_for_tests(&self, path: &Path) -> Result<Option<PathBuf>, String> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        let _guard = self.lock_spool_mutation()?;
         Ok(self
             .claim_replay_file_locked(path)?
             .map(|claim| claim.path().to_path_buf()))
@@ -6426,10 +6549,7 @@ impl SpoolManager {
         &self,
         path: &Path,
     ) -> Result<Option<SpoolClaimHandle>, String> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        let _guard = self.lock_spool_mutation()?;
         self.claim_replay_file_locked(path)
     }
 
@@ -6439,10 +6559,7 @@ impl SpoolManager {
         &self,
         inflight: &Path,
     ) -> Result<Option<PathBuf>, String> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        let _guard = self.lock_spool_mutation()?;
         self.release_claim_locked(inflight)
     }
 
@@ -6462,10 +6579,7 @@ impl SpoolManager {
         &self,
         incoming_len: u64,
     ) -> Result<QuotaEvictionReport, String> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        let _guard = self.lock_spool_mutation()?;
         self.evict_until_can_admit_with_report(incoming_len)
     }
 
@@ -6530,17 +6644,19 @@ impl SpoolManager {
         if events.is_empty() {
             return Err(format!("{PLUGIN_NAME}: refusing to spool empty batch"));
         }
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        if !self.live_storage_prepared.load(Ordering::Acquire) {
+            self.prepare_live_storage()?;
+        }
+        // Serialize/compress before taking the blocking cross-process lock. The
+        // resulting exact encoded length is what the locked quota transaction
+        // admits, and no managed filesystem state changes during materialization.
+        let bytes = self.materialize_spool_artifact(events)?;
+        let _guard = self.lock_spool_mutation()?;
         // Optional test seam: runs under the writer lock so injected stalls
         // model real compression/write/fsync latency without changing the
         // request-path enqueue contract. Snapshot the hook once so AfterWrite
         // cannot observe a different (later-installed) hook than BeforeWrite.
         let _after_hook = SpoolWriteHookAfterGuard::enter(&self.namespace_root);
-        self.prepare_live_storage_locked()?;
-        let bytes = self.materialize_spool_artifact(events)?;
         let incoming_len = bytes.len() as u64;
         if incoming_len > SPOOL_MAX_ARTIFACT_BYTES {
             return Err(format!(
@@ -6736,11 +6852,13 @@ impl SpoolManager {
 
     fn prepare_live_storage_locked_inner(&self) -> Result<(), String> {
         ensure_path_within_root(&self.cfg.dir, &self.namespace_root)?;
-        if self.live_storage_prepared.load(Ordering::Acquire)
+        let already_prepared = self.live_storage_prepared.load(Ordering::Acquire)
             && self.cfg.dir.is_dir()
-            && self.namespace_root.is_dir()
-        {
+            && self.namespace_root.is_dir();
+        if already_prepared {
             self.verify_stable_namespace_root()?;
+            self.initialize_namespace_lock_locked()?;
+            let _namespace_guard = self.acquire_namespace_lock_locked()?;
             self.validate_namespace_meta()?;
             // Recover only claims whose owning process/generation is demonstrably
             // gone or whose lease expired; a live delivery keeps its claim.
@@ -6751,6 +6869,8 @@ impl SpoolManager {
         reject_symlinked_managed_chain(&self.cfg.dir, &self.namespace_root)?;
         ensure_private_dir(&self.namespace_root)?;
         self.resolve_canonical_root()?;
+        self.initialize_namespace_lock_locked()?;
+        let _namespace_guard = self.acquire_namespace_lock_locked()?;
         self.persist_or_validate_namespace_meta()?;
         self.scan_unbound_records();
         self.recover_expired_claims()?;
@@ -7005,6 +7125,7 @@ impl SpoolManager {
             }
             let mut remaining_bytes = inventory.stats.bytes;
             if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
+                self.notify_quota_admission_ready_for_tests();
                 return Ok(report);
             }
 
@@ -7023,6 +7144,7 @@ impl SpoolManager {
             let mut inventory_stale = false;
             for entry in &inventory.entries {
                 if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
+                    self.notify_quota_admission_ready_for_tests();
                     return Ok(report);
                 }
                 if !self.is_evictable_owned_file(entry.path.as_path(), wall_clock) {
@@ -7089,6 +7211,7 @@ impl SpoolManager {
             }
 
             if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
+                self.notify_quota_admission_ready_for_tests();
                 return Ok(report);
             }
             return Err(format!(
@@ -7098,12 +7221,21 @@ impl SpoolManager {
         }
     }
 
+    fn notify_quota_admission_ready_for_tests(&self) {
+        if let Some(hook) = snapshot_spool_write_hook_for_tests() {
+            hook(
+                SpoolWriteHookPoint::QuotaAdmissionReady,
+                &self.namespace_root,
+            );
+        }
+    }
+
     /// Whether one owned file may be dropped to make room for a new batch.
     ///
-    /// Eviction runs per [`SpoolManager`], so two accepted generations in one
-    /// process (or two processes sharing the volume) hold different writer
-    /// locks. A temp that a peer is actively publishing is therefore protected
-    /// by exactly the reconciliation predicate: unlinking it would leave the
+    /// Eviction runs under the namespace-wide filesystem lock shared by every
+    /// cooperating generation/process. A temp that a non-cooperating or stale
+    /// peer is actively publishing is additionally protected by the
+    /// reconciliation predicate: unlinking it would leave the
     /// peer's already-fsynced payload with no directory entry to rename onto,
     /// failing that publish and silently losing a billing batch. Crash-left
     /// temps stay reclaimable, so quota pressure still makes progress.
@@ -7450,6 +7582,7 @@ impl SpoolManager {
 
     /// Remove a claim whose rows were fully delivered.
     fn remove_delivered_claim(&self, claim: &Path) -> Result<(), String> {
+        let _guard = self.lock_spool_mutation()?;
         self.assert_managed_path(claim)?;
         match fs::remove_file(claim) {
             Ok(()) => Ok(()),
@@ -8021,10 +8154,7 @@ fn quarantine_spool_file(spool: &SpoolManager, path: &Path) -> Result<PathBuf, S
     let quarantine_path = path.with_file_name(format!("{base}.corrupt"));
     // Quarantine is a rename inside the managed tree, so it takes the same
     // writer lock and containment/symlink proof as every other spool mutation.
-    let _guard = spool
-        .write_lock
-        .lock()
-        .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+    let _guard = spool.lock_spool_mutation()?;
     spool.assert_managed_path(path)?;
     spool.assert_managed_path(&quarantine_path)?;
     fs::rename(path, &quarantine_path).map_err(|error| {
@@ -8103,10 +8233,7 @@ struct DeadLetterPayloadWriter {
 impl DeadLetterPayloadWriter {
     fn open(spool: &SpoolManager, source_path: &Path) -> Result<Self, String> {
         let (temp_path, final_path) = dead_letter_payload_paths(spool, source_path)?;
-        let _guard = spool
-            .write_lock
-            .lock()
-            .map_err(|_| format!("{PLUGIN_NAME}: spool write lock poisoned"))?;
+        let _guard = spool.lock_spool_mutation()?;
         spool.assert_managed_path(source_path)?;
         spool.assert_managed_path(&temp_path)?;
         spool.assert_managed_path(&final_path)?;
@@ -8160,10 +8287,7 @@ impl DeadLetterPayloadWriter {
         let incoming_bytes = u64::try_from(incoming_bytes).map_err(|_| {
             format!("{PLUGIN_NAME}: dead-letter payload append byte count is not addressable")
         })?;
-        let _guard = spool
-            .write_lock
-            .lock()
-            .map_err(|_| format!("{PLUGIN_NAME}: spool write lock poisoned"))?;
+        let _guard = spool.lock_spool_mutation()?;
         spool.assert_managed_path(&self.temp_path)?;
         spool.assert_managed_path(&self.final_path)?;
         // The live temp and authoritative source already appear in the owned
@@ -8219,10 +8343,7 @@ impl DeadLetterPayloadWriter {
         }
         drop(file);
 
-        let _guard = spool
-            .write_lock
-            .lock()
-            .map_err(|_| format!("{PLUGIN_NAME}: spool write lock poisoned"))?;
+        let _guard = spool.lock_spool_mutation()?;
         spool.assert_managed_path(&self.temp_path)?;
         spool.assert_managed_path(&self.final_path)?;
         // A prior attempt may have published the payload before metadata or
@@ -8325,10 +8446,7 @@ fn write_dead_letter_meta(
                 error.reason()
             )
         })?;
-    let _guard = spool
-        .write_lock
-        .lock()
-        .map_err(|_| format!("{PLUGIN_NAME}: spool write lock poisoned"))?;
+    let _guard = spool.lock_spool_mutation()?;
     spool.assert_managed_path(&meta_path)?;
     spool.assert_managed_path(&tmp_path)?;
     spool.assert_managed_path(source_path)?;
@@ -8494,12 +8612,18 @@ pub fn encode_spool_bytes_without_content_size_for_tests(
 ///
 /// Used by external unit tests to inject deliberate stalls around
 /// [`SpoolManager::write_events`] without relying on wall-clock sleeps, and to
-/// mutate the spool tree at the exact instant a quota-eviction snapshot has been
-/// taken so the disappearing-candidate race is deterministic rather than timed.
+/// force namespace-lock/quota-admission interleavings or mutate the spool tree
+/// at the exact instant a quota-eviction snapshot has been taken, so races are
+/// deterministic rather than timed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpoolWriteHookPoint {
+    /// A manager is about to contend for the namespace-wide filesystem lock.
+    BeforeNamespaceLock,
     BeforeWrite,
     AfterWrite,
+    /// A quota snapshot proves the incoming mutation fits, but the mutation has
+    /// not started. The namespace-wide lock remains held across this point.
+    QuotaAdmissionReady,
     /// One quota-eviction inventory snapshot has been taken and the tree is over
     /// the ceiling; deletions from that snapshot have not started yet.
     QuotaInventoryTaken,
@@ -8710,6 +8834,121 @@ impl SpoolFileIdentity {
             }
         }
     }
+}
+
+fn open_spool_coordination_file(path: &Path, create: bool) -> Result<File, String> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false);
+    #[cfg(unix)]
+    {
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open the reparse point itself so validation rejects it instead of
+        // following a planted junction/symlink into another lock domain. Share
+        // reads/writes so peer managers can contend on the byte-range lock, but
+        // deny delete/rename while any manager's anchor remains pinned.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to securely open spool namespace coordination lock '{}': {error}",
+            path.display()
+        )
+    })
+}
+
+fn validate_spool_coordination_file(
+    path: &Path,
+    file: &File,
+) -> Result<SpoolFileIdentity, String> {
+    let mut metadata = file.metadata().map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to stat spool namespace coordination lock '{}': {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "{PLUGIN_NAME}: spool namespace coordination lock '{}' is not a regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() != 0 {
+        return Err(format!(
+            "{PLUGIN_NAME}: spool namespace coordination lock '{}' is not empty",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.nlink() != 1 {
+            return Err(format!(
+                "{PLUGIN_NAME}: spool namespace coordination lock '{}' must have exactly one hard link",
+                path.display()
+            ));
+        }
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|error| {
+                    format!(
+                        "{PLUGIN_NAME}: failed to secure spool namespace coordination lock '{}': {error}",
+                        path.display()
+                    )
+                })?;
+            metadata = file.metadata().map_err(|error| {
+                format!(
+                    "{PLUGIN_NAME}: failed to restat spool namespace coordination lock '{}': {error}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    let path_metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to stat spool namespace coordination path '{}': {error}",
+            path.display()
+        )
+    })?;
+    if !path_metadata.file_type().is_file() {
+        return Err(format!(
+            "{PLUGIN_NAME}: spool namespace coordination path '{}' is not a regular file",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_metadata.nlink() != 1 {
+            return Err(format!(
+                "{PLUGIN_NAME}: spool namespace coordination path '{}' must have exactly one hard link",
+                path.display()
+            ));
+        }
+    }
+    let file_identity = SpoolFileIdentity::from_metadata(&metadata);
+    let path_identity = SpoolFileIdentity::from_metadata(&path_metadata);
+    if file_identity != path_identity {
+        return Err(format!(
+            "{PLUGIN_NAME}: spool namespace coordination path '{}' does not name the opened lock file",
+            path.display()
+        ));
+    }
+    Ok(file_identity)
 }
 
 /// Charged streaming reader for one claimed spool artifact.
@@ -9578,6 +9817,48 @@ pub fn probe_empty_dead_letter_publish_for_tests(
     writer.publish(spool).map(|_| ())
 }
 
+/// Publish one production-format dead-letter payload through the real streamed
+/// append/admission protocol. External concurrency tests use this to isolate
+/// the filesystem transaction from HTTP failure classification.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn publish_dead_letter_payload_for_tests(
+    spool: &SpoolManager,
+    source_path: &Path,
+    row: &[u8],
+) -> Result<PathBuf, String> {
+    if row.is_empty() || row.len() > SPOOL_MAX_ROW_BYTES {
+        return Err(format!(
+            "{PLUGIN_NAME}: dead-letter append probe row is outside the hard row bound"
+        ));
+    }
+    let payload = materialize_reserved_payload(spool.ceiling, row.len(), |writer| {
+        writer.write_all(row).map_err(|error| error.to_string())
+    })
+    .map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to materialize dead-letter append probe: {}",
+            error.reason()
+        )
+    })?;
+    let line_reservation = spool
+        .ceiling
+        .try_acquire(SPOOL_INDEX_ENTRY_BYTES)
+        .ok_or_else(|| {
+            format!(
+                "{PLUGIN_NAME}: dead-letter append probe could not reserve its row index"
+            )
+        })?;
+    let batch = StreamingReplayBatch {
+        payload,
+        lines: vec![(0, row.len())],
+        _line_reservation: line_reservation,
+    };
+    let mut writer = DeadLetterPayloadWriter::open(spool, source_path)?;
+    writer.append_batch(spool, &batch, &[0])?;
+    writer.publish(spool).map(|published| published.path)
+}
+
 /// Bytes one spool line-index / worklist entry occupies.
 #[doc(hidden)]
 #[allow(dead_code)]
@@ -10301,10 +10582,7 @@ async fn replay_spool_once(
     let files = spool.list_replayable_spool_files()?;
     for file in files {
         let mut claim = {
-            let _guard = spool
-                .write_lock
-                .lock()
-                .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+            let _guard = spool.lock_spool_mutation()?;
             match spool.claim_replay_file_locked(&file)? {
                 Some(claim) => claim,
                 // Another accepted generation or process won the atomic claim.
@@ -10323,10 +10601,7 @@ async fn replay_spool_once(
                 spool
                     .metrics
                     .record_failure(FailureReason::Serialize, error.clone());
-                let _guard = spool
-                    .write_lock
-                    .lock()
-                    .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+                let _guard = spool.lock_spool_mutation()?;
                 spool.release_claim_locked(claim.path())?;
                 return Err(error);
             }
@@ -10361,10 +10636,7 @@ async fn replay_spool_once(
             Ok(line_count) => line_count,
             Err(SpoolDecodeError::CeilingExhausted(error)) => {
                 drop(preflight);
-                let _guard = spool
-                    .write_lock
-                    .lock()
-                    .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+                let _guard = spool.lock_spool_mutation()?;
                 spool.release_claim_locked(claim.path())?;
                 return Err(error);
             }
@@ -10409,10 +10681,7 @@ async fn replay_spool_once(
         ) {
             Ok(reader) => reader,
             Err(SpoolDecodeError::CeilingExhausted(error)) => {
-                let _guard = spool
-                    .write_lock
-                    .lock()
-                    .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+                let _guard = spool.lock_spool_mutation()?;
                 spool.release_claim_locked(claim.path())?;
                 return Err(error);
             }
@@ -10449,10 +10718,7 @@ async fn replay_spool_once(
                     // replayable. Any already-published dead-letter payload is
                     // still ownership-bound evidence and is safely replaced by
                     // a later successful replay.
-                    let _guard = spool
-                        .write_lock
-                        .lock()
-                        .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+                    let _guard = spool.lock_spool_mutation()?;
                     spool.release_claim_locked(claim.path())?;
                     return Err(error);
                 }
@@ -10467,10 +10733,7 @@ async fn replay_spool_once(
                 // Retryable delivery failure: release the claim back to a durable
                 // replayable name and stop the tick so ordering is preserved
                 // across transient outages.
-                let _guard = spool
-                    .write_lock
-                    .lock()
-                    .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+                let _guard = spool.lock_spool_mutation()?;
                 spool.release_claim_locked(claim.path())?;
                 return Err(error);
             }
@@ -10726,11 +10989,9 @@ async fn replay_stream_batch(
         }
         attempts = attempts.saturating_add(1);
         {
-            let _guard = spool.write_lock.lock().map_err(|_| {
-                ReplayStreamError::Retryable(format!(
-                    "{PLUGIN_NAME}: spool writer lock is poisoned"
-                ))
-            })?;
+            let _guard = spool
+                .lock_spool_mutation()
+                .map_err(ReplayStreamError::Retryable)?;
             spool
                 .renew_claim_locked(claim)
                 .map_err(ReplayStreamError::Retryable)?;
@@ -10870,10 +11131,7 @@ fn finalize_replayed_spool_file(
     };
     let meta_path = write_dead_letter_meta(spool, file, &meta)?;
     {
-        let _guard = spool
-            .write_lock
-            .lock()
-            .map_err(|_| format!("{PLUGIN_NAME}: spool write lock poisoned"))?;
+        let _guard = spool.lock_spool_mutation()?;
         spool.assert_managed_path(file)?;
         fs::remove_file(file).map_err(|error| {
             format!(
@@ -10887,10 +11145,7 @@ fn finalize_replayed_spool_file(
         Ordering::Relaxed,
     );
     let quota_result = {
-        let _guard = spool
-            .write_lock
-            .lock()
-            .map_err(|_| format!("{PLUGIN_NAME}: spool write lock poisoned"))?;
+        let _guard = spool.lock_spool_mutation()?;
         spool.evict_until_can_admit(0)
     };
     if let Err(error) = quota_result {
