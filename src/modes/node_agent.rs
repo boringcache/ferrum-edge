@@ -19,6 +19,7 @@ use dashmap::DashMap;
 use futures_util::{Stream, StreamExt};
 use k8s_openapi::api::core::v1::{Container, Pod, PodSpec, PodStatus, Probe};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use kube::api::ListParams;
 use kube::runtime::watcher::{self as kube_watcher, Event};
 use kube::{Client, api::Api};
 use tracing::{debug, error, info, warn};
@@ -62,6 +63,18 @@ const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const DEFAULT_BPF_FS_PATH: &str = "/sys/fs/bpf";
 const DEFAULT_FALLBACK_MODE: &str = "fail";
 const CNI_METADATA_FETCH_TIMEOUT: Duration = Duration::from_millis(750);
+/// Live Kubernetes ADD-dependency probe budget for CNI STATUS.
+///
+/// Equal to the ADD metadata GET budget so STATUS cannot occupy the serial
+/// node-agent CNI work loop longer than an ADD metadata attempt. Both stay
+/// well under the ferrum-cni RPC client timeout (`DEFAULT_RPC_TIMEOUT` = 5s).
+const CNI_STATUS_KUBE_PROBE_TIMEOUT: Duration = CNI_METADATA_FETCH_TIMEOUT;
+/// Sanitized STATUS failure when the Kubernetes API refuses the readiness probe.
+const CNI_STATUS_KUBE_UNAVAILABLE_REASON: &str =
+    "Kubernetes API dependency is unavailable; not ready for ADD";
+/// Sanitized STATUS failure when the readiness probe exceeds its bound.
+const CNI_STATUS_KUBE_TIMEOUT_REASON: &str =
+    "Kubernetes API dependency probe timed out; not ready for ADD";
 const POD_ENROLLMENT_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 const UDP_CAPTURE_READINESS_POLL: Duration = Duration::from_millis(250);
 const UDP_HANDSHAKE_ORPHAN_GRACE: Duration = Duration::from_secs(30);
@@ -1899,6 +1912,20 @@ async fn apply_cni_request_with_kube_metadata(
     if let Err(reason) = request.validate() {
         return (CniRpcResponse::Error { reason }, None);
     }
+    if request.verb == RpcVerb::Status {
+        // CNI 1.1: STATUS must fail when an external service needed for ADD is
+        // unavailable. Initial sync (`startup_ready`) is gated in the main loop
+        // before this call; prove live Kubernetes API readiness here as well.
+        if let Err(reason) =
+            probe_kube_add_dependency_ready(kube_client, config.node_name.as_str()).await
+        {
+            return (CniRpcResponse::Error { reason }, None);
+        }
+        return (
+            apply_cni_request(backend, pod_states, config, metrics, request),
+            None,
+        );
+    }
     if request.verb != RpcVerb::Add {
         return (
             apply_cni_request(backend, pod_states, config, metrics, request),
@@ -1935,6 +1962,69 @@ async fn apply_cni_request_with_kube_metadata(
         }
     }
 }
+
+/// Read-only, low-cost Kubernetes readiness probe for CNI STATUS.
+///
+/// Issues a node-scoped pods list with `limit=1` using the same get/list/watch
+/// permissions ADD metadata lookups already require. The call is bounded by
+/// [`CNI_STATUS_KUBE_PROBE_TIMEOUT`] so a stuck API cannot head-of-line block
+/// the serial CNI work loop beyond that window. Failure reasons are sanitized
+/// constants — never raw Kubernetes errors, URLs, tokens, or node/namespace
+/// names — for the RPC boundary.
+async fn probe_kube_add_dependency_ready(
+    kube_client: &Client,
+    node_name: &str,
+) -> Result<(), String> {
+    let pods: Api<Pod> = Api::all(kube_client.clone());
+    // Field selector matches the watcher scope; limit keeps the probe cheap.
+    let list_params = ListParams::default()
+        .fields(&format!("spec.nodeName={node_name}"))
+        .limit(1);
+    match tokio::time::timeout(CNI_STATUS_KUBE_PROBE_TIMEOUT, pods.list(&list_params)).await {
+        Ok(Ok(_list)) => Ok(()),
+        Ok(Err(err)) => {
+            // Log locally for operators; never forward raw kube detail over RPC.
+            debug!(
+                error = %err,
+                timeout_ms = CNI_STATUS_KUBE_PROBE_TIMEOUT.as_millis(),
+                "CNI STATUS Kubernetes API readiness probe failed"
+            );
+            Err(CNI_STATUS_KUBE_UNAVAILABLE_REASON.to_string())
+        }
+        Err(_elapsed) => {
+            debug!(
+                timeout_ms = CNI_STATUS_KUBE_PROBE_TIMEOUT.as_millis(),
+                "CNI STATUS Kubernetes API readiness probe timed out"
+            );
+            Err(CNI_STATUS_KUBE_TIMEOUT_REASON.to_string())
+        }
+    }
+}
+
+/// Test seam for CNI STATUS live Kubernetes ADD-dependency readiness (#3225).
+#[allow(dead_code)] // External integration tests exercise this through `_test_support`.
+pub(crate) async fn apply_cni_request_with_kube_metadata_for_test(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    kube_client: &Client,
+    request: &CniRpcRequest,
+) -> (CniRpcResponse, Option<String>) {
+    apply_cni_request_with_kube_metadata(
+        backend,
+        pod_states,
+        config,
+        metrics,
+        kube_client,
+        request,
+    )
+    .await
+}
+
+/// External tests advance paused Tokio time against this exact STATUS probe budget.
+#[allow(dead_code)] // Re-exported through `_test_support` for integration coverage.
+pub(crate) const CNI_STATUS_KUBE_PROBE_TIMEOUT_FOR_TEST: Duration = CNI_STATUS_KUBE_PROBE_TIMEOUT;
 
 fn apply_cni_add_from_pod(
     backend: &mut dyn EbpfBackend,
@@ -2168,9 +2258,10 @@ pub fn apply_cni_request(
             }
         }
         RpcVerb::Status => {
-            // Reaching this arm means the CNI listener accepted the request,
-            // validation passed, and the main-loop readiness gate already
-            // confirmed initial pod sync. STATUS carries no attachment work.
+            // Reaching this arm means validation passed. Production STATUS
+            // additionally proves live Kubernetes ADD-dependency readiness in
+            // `apply_cni_request_with_kube_metadata` (after the main-loop
+            // initial-sync gate). This pure path carries no attachment work.
             CniRpcResponse::Ok
         }
         RpcVerb::Gc => {

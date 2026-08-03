@@ -23,18 +23,32 @@
 //! round-trips) and one error path (server replies with `Error` →
 //! `send_rpc` decodes it correctly).
 
+use std::collections::HashSet;
+use std::convert::Infallible;
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tempfile::tempdir;
-use tokio::sync::watch;
-
+use dashmap::DashMap;
+use ferrum_edge::_test_support::{
+    CNI_STATUS_KUBE_PROBE_TIMEOUT, apply_cni_request_with_kube_metadata_for_test,
+};
+use ferrum_edge::capture::{CaptureConfig, CaptureMode};
 use ferrum_edge::cni::client::send_rpc;
 use ferrum_edge::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
-use ferrum_edge::ebpf::NodeAgentMetrics;
+use ferrum_edge::ebpf::{
+    CaptureContract, FallbackMode, MockEbpfBackend, NodeAgentMetrics, PodAttachmentState,
+};
+use ferrum_edge::modes::node_agent::NodeAgentConfig;
 use ferrum_edge::modes::node_agent_cni_server::{cni_work_channel, spawn_cni_listener};
+use http::{Method, Request, Response, StatusCode};
+use kube::Client;
+use kube::client::Body;
+use serde_json::json;
+use tempfile::tempdir;
+use tokio::sync::{oneshot, watch};
+use tower::service_fn;
 
 /// Build a minimal RPC request with the given verb and a stable pod
 /// identity so tests don't repeat 6 fields each.
@@ -1091,4 +1105,297 @@ fn cni_rpc_status_boundary_rejects_attachment_specific_fields() {
     let mut with_netns = valid_status;
     with_netns.netns_path = Some("/var/run/netns/cni-1".to_string());
     assert!(with_netns.validate().is_err());
+}
+
+// ── STATUS live Kubernetes ADD-dependency readiness ─────────────────────────
+
+const STATUS_PROBE_NODE: &str = "status-probe-node";
+
+fn status_probe_config() -> NodeAgentConfig {
+    let mut capture_config = CaptureConfig::explicit(15006, 15001);
+    capture_config.mode = CaptureMode::Ebpf;
+    NodeAgentConfig {
+        node_name: STATUS_PROBE_NODE.to_string(),
+        capture_config,
+        cgroup_root: "/nonexistent".to_string(),
+        bpf_fs_path: "/nonexistent".to_string(),
+        fallback_mode: FallbackMode::Fail,
+        excluded_namespaces: HashSet::new(),
+        capture_contract: CaptureContract::local_pod_defaults(),
+        trust_domain: "cluster.local".to_string(),
+        node_waypoint_pod_registry_dir: None,
+    }
+}
+
+fn status_rpc_request() -> CniRpcRequest {
+    CniRpcRequest {
+        verb: RpcVerb::Status,
+        network_name: "ferrum-mesh-chain".to_string(),
+        pod_namespace: String::new(),
+        pod_name: String::new(),
+        pod_uid: None,
+        container_id: String::new(),
+        ifname: None,
+        netns_path: None,
+        args: std::collections::HashMap::new(),
+        valid_attachments: Vec::new(),
+    }
+}
+
+fn empty_pod_list_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "apiVersion": "v1",
+                "kind": "PodList",
+                "metadata": { "resourceVersion": "1" },
+                "items": []
+            }))
+            .expect("serialize empty PodList"),
+        ))
+        .expect("build empty PodList response")
+}
+
+fn kube_error_response(status: StatusCode, message: &str) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "message": message,
+                "reason": "ServiceUnavailable",
+                "code": status.as_u16()
+            }))
+            .expect("serialize kube Status"),
+        ))
+        .expect("build kube error response")
+}
+
+fn assert_status_probe_list_request(request: &Request<Body>) {
+    assert_eq!(request.method(), Method::GET);
+    let path = request.uri().path();
+    assert_eq!(path, "/api/v1/pods", "STATUS probe must list cluster pods");
+    let query = request.uri().query().unwrap_or_default();
+    assert!(
+        query.contains("limit=1"),
+        "STATUS probe must stay low-cost: {query}"
+    );
+    assert!(
+        query.contains(&format!("fieldSelector=spec.nodeName={STATUS_PROBE_NODE}"))
+            || query.contains(&format!(
+                "fieldSelector=spec.nodeName%3D{STATUS_PROBE_NODE}"
+            )),
+        "STATUS probe must reuse the watcher node scope: {query}"
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MockProbeOutcome {
+    Ready,
+    Unavailable,
+}
+
+#[derive(Default)]
+struct MockStatusProbeState {
+    outcomes: Vec<MockProbeOutcome>,
+    hits: usize,
+}
+
+fn mock_status_probe_client(state: Arc<Mutex<MockStatusProbeState>>) -> Client {
+    let service = service_fn(move |request: Request<Body>| {
+        let state = state.clone();
+        async move {
+            assert_status_probe_list_request(&request);
+            let mut guard = state.lock().expect("lock mock STATUS probe state");
+            let idx = guard.hits;
+            guard.hits += 1;
+            let outcome = guard
+                .outcomes
+                .get(idx)
+                .copied()
+                .unwrap_or(MockProbeOutcome::Ready);
+            let response = match outcome {
+                MockProbeOutcome::Ready => empty_pod_list_response(),
+                MockProbeOutcome::Unavailable => kube_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "injected https://kube.example/token=secret namespace=hostile failure",
+                ),
+            };
+            Ok::<_, Infallible>(response)
+        }
+    });
+    Client::new(service, "default")
+}
+
+fn mock_hanging_status_probe_client(release: oneshot::Receiver<()>) -> Client {
+    let release = Arc::new(Mutex::new(Some(release)));
+    let service = service_fn(move |request: Request<Body>| {
+        let release = release.clone();
+        async move {
+            assert_status_probe_list_request(&request);
+            if let Some(rx) = release.lock().expect("lock hang gate").take() {
+                // Park until the sender is dropped or the outer timeout cancels
+                // this future — no spawn, no wall-clock sleep, no task leak.
+                let _ = rx.await;
+            }
+            Ok::<_, Infallible>(empty_pod_list_response())
+        }
+    });
+    Client::new(service, "default")
+}
+
+fn assert_sanitized_status_error(response: &CniRpcResponse) {
+    let CniRpcResponse::Error { reason } = response else {
+        panic!("expected STATUS Error, got {response:?}");
+    };
+    assert!(
+        reason.contains("not ready for ADD"),
+        "unexpected STATUS reason: {reason}"
+    );
+    assert!(
+        !reason.contains("https://")
+            && !reason.contains("token=")
+            && !reason.contains("namespace=")
+            && !reason.contains("hostile")
+            && !reason.contains("kube.example")
+            && !reason.contains(STATUS_PROBE_NODE),
+        "STATUS must not echo raw Kubernetes/dependency detail: {reason}"
+    );
+}
+
+async fn run_status_with_client(
+    kube_client: &Client,
+) -> (CniRpcResponse, DashMap<String, PodAttachmentState>) {
+    let mut backend = MockEbpfBackend::default();
+    let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+    let metrics = NodeAgentMetrics::default();
+    let config = status_probe_config();
+    let (response, enrolled) = apply_cni_request_with_kube_metadata_for_test(
+        &mut backend,
+        &pod_states,
+        &config,
+        &metrics,
+        kube_client,
+        &status_rpc_request(),
+    )
+    .await;
+    assert!(enrolled.is_none(), "STATUS must never enroll");
+    assert!(pod_states.is_empty(), "STATUS must not mutate enrollment");
+    assert!(
+        backend.operations.is_empty()
+            && backend.cgroup_attachments.is_empty()
+            && backend.tc_attachments.is_empty()
+            && backend.detached_pods.is_empty(),
+        "STATUS must not touch BPF/enrollment state"
+    );
+    (response, pod_states)
+}
+
+/// Live Kubernetes dependency success → STATUS Ok without enrollment mutation.
+#[tokio::test]
+async fn cni_status_kube_dependency_ready_returns_ok() {
+    let state = Arc::new(Mutex::new(MockStatusProbeState {
+        outcomes: vec![MockProbeOutcome::Ready],
+        hits: 0,
+    }));
+    let client = mock_status_probe_client(state.clone());
+    let (response, _) = run_status_with_client(&client).await;
+    assert_eq!(response, CniRpcResponse::Ok);
+    assert_eq!(state.lock().expect("lock").hits, 1);
+}
+
+/// API refusal → sanitized STATUS Error (code-50 path at the binary boundary).
+#[tokio::test]
+async fn cni_status_kube_dependency_failure_returns_sanitized_error() {
+    let state = Arc::new(Mutex::new(MockStatusProbeState {
+        outcomes: vec![MockProbeOutcome::Unavailable],
+        hits: 0,
+    }));
+    let client = mock_status_probe_client(state.clone());
+    let (response, _) = run_status_with_client(&client).await;
+    assert_sanitized_status_error(&response);
+    let CniRpcResponse::Error { reason } = &response else {
+        unreachable!();
+    };
+    assert!(
+        reason.contains("unavailable"),
+        "failure path should name unavailability: {reason}"
+    );
+    assert_eq!(state.lock().expect("lock").hits, 1);
+}
+
+/// Stuck dependency is cancelled by the documented probe budget (no HoL beyond it).
+#[tokio::test(start_paused = true)]
+async fn cni_status_kube_dependency_timeout_is_bounded() {
+    let (_hold_tx, hold_rx) = oneshot::channel::<()>();
+    let client = mock_hanging_status_probe_client(hold_rx);
+
+    let mut backend = MockEbpfBackend::default();
+    let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+    let metrics = NodeAgentMetrics::default();
+    let config = status_probe_config();
+
+    let probe = apply_cni_request_with_kube_metadata_for_test(
+        &mut backend,
+        &pod_states,
+        &config,
+        &metrics,
+        &client,
+        &status_rpc_request(),
+    );
+    tokio::pin!(probe);
+
+    // Poll the probe so the timeout is armed, then advance just under the budget.
+    tokio::select! {
+        biased;
+        _ = &mut probe => panic!("STATUS must not finish before the probe timeout"),
+        _ = async {
+            tokio::time::advance(CNI_STATUS_KUBE_PROBE_TIMEOUT - Duration::from_millis(1)).await;
+        } => {}
+    }
+
+    tokio::time::advance(Duration::from_millis(2)).await;
+    let (response, enrolled) = probe.await;
+    assert!(enrolled.is_none());
+    assert!(pod_states.is_empty());
+    assert_sanitized_status_error(&response);
+    let CniRpcResponse::Error { reason } = &response else {
+        unreachable!();
+    };
+    assert!(
+        reason.contains("timed out"),
+        "timeout path should name the timeout: {reason}"
+    );
+
+    // A subsequent STATUS against a healthy dependency must proceed (no sticky
+    // hang after the bounded failure).
+    let ready_state = Arc::new(Mutex::new(MockStatusProbeState {
+        outcomes: vec![MockProbeOutcome::Ready],
+        hits: 0,
+    }));
+    let ready_client = mock_status_probe_client(ready_state);
+    let (recovered, _) = run_status_with_client(&ready_client).await;
+    assert_eq!(recovered, CniRpcResponse::Ok);
+}
+
+/// Dependency outage then recovery: STATUS fails closed, then succeeds again.
+#[tokio::test]
+async fn cni_status_kube_dependency_recovers_after_outage() {
+    let state = Arc::new(Mutex::new(MockStatusProbeState {
+        outcomes: vec![MockProbeOutcome::Unavailable, MockProbeOutcome::Ready],
+        hits: 0,
+    }));
+    let client = mock_status_probe_client(state.clone());
+
+    let (first, _) = run_status_with_client(&client).await;
+    assert_sanitized_status_error(&first);
+
+    let (second, _) = run_status_with_client(&client).await;
+    assert_eq!(second, CniRpcResponse::Ok);
+    assert_eq!(state.lock().expect("lock").hits, 2);
 }
