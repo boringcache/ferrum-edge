@@ -225,7 +225,8 @@ pub const INVENTORY: &[CryptoOperation] = &[
         disposition: Disposition::Rejected,
         rationale: "the driver performs authentication and protocol cryptography with its own \
                     hmac, pbkdf2, sha1, sha2, and md-5 dependencies; selecting its AWS-LC \
-                    rustls feature routes TLS only, so policy refuses every MongoDB config store",
+                    rustls feature routes TLS only, so \
+                    fips::policy::check_env_config_enforced refuses every MongoDB config store",
     },
     // ── JWT / JWK ───────────────────────────────────────────────────────
     CryptoOperation {
