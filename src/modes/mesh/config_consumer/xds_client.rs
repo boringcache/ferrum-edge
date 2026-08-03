@@ -1453,6 +1453,7 @@ fn reverse_translate(
         // that the partial labels cannot satisfy".
         labels_ambiguous: recovered.labels_ambiguous
             && !recovered_labels_are_authoritative(recovered.labels_ambiguous, &config.labels),
+        virtual_service_l4_proxies: recovered.virtual_service_l4_proxies,
         // Required xDS types are coherent before a slice is built, so this is
         // the shared observability version for the installed mesh slice.
         version: composite_required_version(accumulator),
@@ -1630,6 +1631,7 @@ struct RecoveredSliceCarriers {
     declared_ingress_http_ports: usize,
     labels: Option<BTreeMap<String, String>>,
     labels_ambiguous: bool,
+    virtual_service_l4_proxies: Vec<serde_json::Value>,
     /// Authoritative config revision (issue #2473) recovered from the
     /// `ConfigRevision` carrier. `None` when the CP's config authority is
     /// unordered (or predates the carrier) — the DP freshness gate then treats
@@ -1884,6 +1886,9 @@ fn apply_recovered_carrier(
         }
         MeshSliceCarrier::WorkloadLabels(value) => recovered.labels = Some(value),
         MeshSliceCarrier::LabelsAmbiguous(value) => recovered.labels_ambiguous = value,
+        MeshSliceCarrier::VirtualServiceL4Proxies(value) => {
+            recovered.virtual_service_l4_proxies = value
+        }
         MeshSliceCarrier::MeshPolicies(value) => recovered.mesh_policies = value,
         MeshSliceCarrier::VirtualServiceCorsPolicies(value) => {
             recovered.virtual_service_cors_policies = value
@@ -4517,7 +4522,8 @@ mod tests {
     }
 
     /// A representative protected slice: authz policy + PeerAuthentication +
-    /// ServiceEntry + trust bundle + request auth + proxy config + workloads.
+    /// ServiceEntry + trust bundle + request auth + proxy config + workloads +
+    /// a namespace-projected VirtualService L4 proxy.
     fn representative_protected_slice() -> MeshSlice {
         use crate::identity::spiffe::{SpiffeId, TrustDomain};
         use crate::modes::mesh::config::{
@@ -4575,6 +4581,15 @@ mod tests {
             namespace: "default".to_string(),
             version: "v1".to_string(),
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+            virtual_service_l4_proxies: vec![serde_json::json!({
+                "id": "istio-vs-l4_tcp__default__db__0-0",
+                "namespace": "default",
+                "backend_scheme": "tcp",
+                "backend_host": "db.default.svc.cluster.local",
+                "backend_port": 3306,
+                "listen_port": 3306,
+                "stream_match": {"arms": [{"gateways": ["mesh"]}]}
+            })],
             workloads: vec![workload.clone()],
             ambient_udp_source_workloads: vec![workload.clone()],
             node_waypoint_assertors: vec![
@@ -4738,6 +4753,10 @@ mod tests {
         assert_eq!(recovered.destination_rules, native.destination_rules);
         assert_eq!(recovered.trust_bundles, native.trust_bundles);
         assert_eq!(recovered.proxy_configs, native.proxy_configs);
+        assert_eq!(
+            recovered.virtual_service_l4_proxies,
+            native.virtual_service_l4_proxies
+        );
         assert_eq!(recovered.workloads, native.workloads);
         assert_eq!(
             recovered.ambient_udp_source_workloads,

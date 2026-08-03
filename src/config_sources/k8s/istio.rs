@@ -2728,8 +2728,11 @@ fn virtual_service_l4_proxy_id(
     // underscores, and the generated numeric suffix does not either, so HTTP
     // VirtualService IDs built as `istio-vs-<namespace>-<name>-<suffix>` cannot
     // collide with L4 IDs for hyphenated names such as `foo-tls`.
-    format!("istio-vs-l4_{route_kind}__{namespace}__{vs_name}__{block_index}-{match_index}")
-        .replace(['/', '.'], "-")
+    format!(
+        "{}{route_kind}__{namespace}__{vs_name}__{block_index}-{match_index}",
+        crate::proxy::stream_match::ISTIO_VS_L4_PROXY_ID_PREFIX
+    )
+    .replace(['/', '.'], "-")
 }
 
 /// Strictly parse top-level `spec.gateways` for the L4 translation path.
@@ -10692,6 +10695,23 @@ extensionProviders:
         assert_eq!(arm.source_subnets, vec!["10.1.0.0/16".to_string()]);
         assert_eq!(arm.destination_subnets, vec!["10.2.0.0/16".to_string()]);
         assert_eq!(arm.gateways, vec!["mesh".to_string()]);
+
+        let slice = crate::modes::mesh::slice::MeshSlice::from_gateway_config(
+            &result.config,
+            crate::modes::mesh::slice::MeshSliceRequest {
+                node_id: "sidecar-a".to_string(),
+                namespace: "default".to_string(),
+                workload_spiffe_id: Some(
+                    "spiffe://cluster.local/ns/default/sa/billing".to_string(),
+                ),
+                ..crate::modes::mesh::slice::MeshSliceRequest::default()
+            },
+        );
+        assert_eq!(
+            slice.virtual_service_l4_proxies.len(),
+            1,
+            "namespace-projected VirtualService L4 proxies must ride MeshSlice"
+        );
     }
 
     #[test]

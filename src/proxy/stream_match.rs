@@ -8,10 +8,10 @@
 //! without allocating or re-parsing CIDRs, labels, or gateway names.
 //!
 //! Evidence always comes from trustworthy connection / workload metadata
-//! (socket peer, `SO_ORIGINAL_DST`, peer SPIFFE, slice workload labels, and the
-//! listener's configured gateway binding). Missing evidence denies any
-//! predicate that requires it — never match by absence or client-controlled
-//! headers.
+//! (socket peer, `SO_ORIGINAL_DST`, peer SPIFFE, an authoritative local Sidecar
+//! workload projection, slice workload labels, and the listener's configured
+//! gateway binding). Missing evidence denies any predicate that requires it —
+//! never match by absence or client-controlled headers.
 
 use crate::identity::spiffe::SpiffeId;
 use crate::util::cidr::CidrSet;
@@ -21,6 +21,11 @@ use std::net::IpAddr;
 
 /// Reserved Istio gateway token meaning "apply on the mesh / sidecar".
 pub const MESH_GATEWAY_TOKEN: &str = "mesh";
+
+/// Managed proxy-id prefix for slice-carried Istio VirtualService L4 routes.
+/// Kubernetes object names cannot contain `_`, so this cannot collide with the
+/// translator's HTTP VirtualService ids.
+pub const ISTIO_VS_L4_PROXY_ID_PREFIX: &str = "istio-vs-l4_";
 
 /// Admission bounds for the serialized L4 matcher carrier. These limits keep
 /// hand-authored/admin/file config at parity with the public OpenAPI schema and
@@ -52,7 +57,10 @@ pub struct StreamMatchArm {
     /// Exact source-workload label subset. Empty = unconstrained.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub source_labels: BTreeMap<String, String>,
-    /// Exact source namespace (SPIFFE `ns/<ns>/…`). `None` = unconstrained.
+    /// Exact source-workload namespace. For Sidecar `mesh` applicability this
+    /// is resolved from the authoritative local workload during slice apply;
+    /// other topologies require exact authenticated source-workload evidence.
+    /// `None` = unconstrained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_namespace: Option<String>,
     /// Source IP CIDRs (Istio `sourceSubnets`). Empty = unconstrained.
@@ -449,7 +457,9 @@ pub struct StreamMatchEvidence<'a> {
     pub source_ip: Option<IpAddr>,
     /// Original destination IP (`SO_ORIGINAL_DST` / capture metadata).
     pub destination_ip: Option<IpAddr>,
-    /// Source workload namespace from peer SPIFFE (`ns/<ns>/…`).
+    /// Source workload namespace. Sidecar mesh selectors are materialized from
+    /// the authoritative local workload before the hot path; remaining runtime
+    /// selectors derive this from exact authenticated workload evidence.
     pub source_namespace: Option<&'a str>,
     /// Source workload labels from the mesh slice / local workload inventory.
     pub source_labels: Option<&'a dyn SourceLabelLookup>,

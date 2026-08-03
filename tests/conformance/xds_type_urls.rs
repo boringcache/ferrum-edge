@@ -85,6 +85,9 @@ fn slice_with_one_service() -> MeshSlice {
         node_id: "conformance-node".to_string(),
         namespace: "default".to_string(),
         labels: BTreeMap::from([("app".to_string(), "echo".to_string())]),
+        virtual_service_l4_proxies: vec![serde_json::json!({
+            "id": "istio-vs-l4_tcp__default__db__0-0"
+        })],
         version: "test-1".to_string(),
         workloads: vec![workload],
         services: vec![service],
@@ -252,7 +255,8 @@ fn xds_ecds_dr_carrier_round_trip() {
 fn xds_mesh_slice_carriers_round_trip() {
     use ferrum_edge::xds::proto;
     use ferrum_edge::xds::{
-        FERRUM_ECDS_PEER_AUTH_TYPE_URL, FERRUM_ECDS_SERVICES_TYPE_URL, MeshSliceCarrier,
+        FERRUM_ECDS_PEER_AUTH_TYPE_URL, FERRUM_ECDS_SERVICES_TYPE_URL,
+        FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL, MeshSliceCarrier,
     };
     use prost::Message;
 
@@ -261,7 +265,7 @@ fn xds_mesh_slice_carriers_round_trip() {
         feature =
             "Ferrum mesh-slice ECDS carriers (type.googleapis.com/ferrum.config.extension.v3.*)",
         status = Status::Supported,
-        notes = "GAP-1a: security/policy slice fields and effective workload labels (authz, PeerAuth, JWT, ServiceEntry, trust bundles, ProxyConfig, workloads, services, outbound policy, sidecar egress scope) ride ECDS as Ferrum-specific carriers; DP requires the reserved resource name plus inner type_url. Ferrum-CP-to-Ferrum-DP only, NOT stock-Envoy/Istio-interoperable.",
+        notes = "GAP-1a: security/policy slice fields, VirtualService L4 proxies, and effective workload labels (authz, PeerAuth, JWT, ServiceEntry, trust bundles, ProxyConfig, workloads, services, outbound policy, sidecar egress scope) ride ECDS as Ferrum-specific carriers; DP requires the reserved resource name plus inner type_url. Ferrum-CP-to-Ferrum-DP only, NOT stock-Envoy/Istio-interoperable.",
     );
 
     let snapshot = translate_mesh_slice_to_snapshot(&slice_with_one_service());
@@ -272,6 +276,7 @@ fn xds_mesh_slice_carriers_round_trip() {
     let mut found_peer_auth = false;
     let mut found_services = false;
     let mut found_labels = false;
+    let mut found_l4_proxies = false;
     for resource in ecds {
         let typed =
             proto::TypedExtensionConfig::decode(resource.value.as_slice()).expect("decode TEC");
@@ -294,6 +299,11 @@ fn xds_mesh_slice_carriers_round_trip() {
                 assert_eq!(labels.get("app").map(String::as_str), Some("echo"));
                 found_labels = true;
             }
+            Some(MeshSliceCarrier::VirtualServiceL4Proxies(proxies)) => {
+                assert_eq!(inner.type_url, FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL);
+                assert_eq!(proxies.len(), 1);
+                found_l4_proxies = true;
+            }
             _ => {}
         }
     }
@@ -308,6 +318,10 @@ fn xds_mesh_slice_carriers_round_trip() {
     assert!(
         found_labels,
         "effective workload labels must ride ECDS so selector policies keep matching"
+    );
+    assert!(
+        found_l4_proxies,
+        "VirtualService L4 proxies must ride ECDS so mesh sidecars receive stream routes"
     );
 }
 
