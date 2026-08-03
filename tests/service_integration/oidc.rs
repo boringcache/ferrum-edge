@@ -167,6 +167,23 @@ fn cookie_name(set_cookie: &str) -> &str {
         .expect("cookie name")
 }
 
+fn assert_cookie_cleared(headers: &HashMap<String, String>, name: &str) {
+    let set_cookie = headers.get("set-cookie").expect("logout Set-Cookie");
+    let empty_pair = format!("{name}=");
+    assert!(
+        set_cookie.lines().any(|line| {
+            line.split(';')
+                .next()
+                .is_some_and(|pair| pair.trim() == empty_pair)
+                && line
+                    .split(';')
+                    .skip(1)
+                    .any(|attribute| attribute.trim().eq_ignore_ascii_case("max-age=0"))
+        }),
+        "logout must expire an empty {name} cookie"
+    );
+}
+
 async fn wait_for_browser_challenge(plugin: &Arc<dyn Plugin>) -> BrowserChallenge {
     let mut last = String::new();
     for _ in 0..60 {
@@ -438,12 +455,10 @@ async fn oidc_live_discovery_login_session_and_claims() {
         .query_params
         .insert("code".to_string(), cb_nonce.code);
     match plugin.on_request_received(&mut nonce_ctx).await {
-        PluginResult::Reject { status_code, .. } => {
-            assert!(
-                status_code == 400 || status_code == 401,
-                "nonce mismatch must fail closed, got {status_code}"
-            );
-        }
+        PluginResult::Reject { status_code, .. } => assert_eq!(
+            status_code, 400,
+            "nonce mismatch must be rejected by callback validation"
+        ),
         other => panic!("expected nonce rejection, got {other:?}"),
     }
 
@@ -471,12 +486,10 @@ async fn oidc_live_discovery_login_session_and_claims() {
     cb_ctx.query_params.insert("state".to_string(), cb.state);
     cb_ctx.query_params.insert("code".to_string(), cb.code);
     match wrong_iss_plugin.on_request_received(&mut cb_ctx).await {
-        PluginResult::Reject { status_code, .. } => {
-            assert!(
-                status_code == 400 || status_code == 401 || status_code == 503,
-                "issuer mismatch must fail closed, got {status_code}"
-            );
-        }
+        PluginResult::Reject { status_code, .. } => assert_eq!(
+            status_code, 400,
+            "issuer mismatch must be rejected by callback validation"
+        ),
         other => panic!("expected issuer rejection, got {other:?}"),
     }
 
@@ -496,9 +509,10 @@ async fn oidc_live_discovery_login_session_and_claims() {
     cb_ctx.query_params.insert("state".to_string(), cb.state);
     cb_ctx.query_params.insert("code".to_string(), cb.code);
     match wrong_aud_plugin.on_request_received(&mut cb_ctx).await {
-        PluginResult::Reject { status_code, .. } => {
-            assert!(status_code == 400 || status_code == 401 || status_code == 503);
-        }
+        PluginResult::Reject { status_code, .. } => assert_eq!(
+            status_code, 400,
+            "audience mismatch must be rejected by callback validation"
+        ),
         other => panic!("expected audience rejection, got {other:?}"),
     }
 
@@ -537,9 +551,10 @@ async fn oidc_live_discovery_login_session_and_claims() {
     cb_ctx.query_params.insert("state".to_string(), cb.state);
     cb_ctx.query_params.insert("code".to_string(), cb.code);
     match wrong_sig_plugin.on_request_received(&mut cb_ctx).await {
-        PluginResult::Reject { status_code, .. } => {
-            assert!(status_code == 400 || status_code == 401 || status_code == 503);
-        }
+        PluginResult::Reject { status_code, .. } => assert_eq!(
+            status_code, 400,
+            "signature mismatch must be rejected by callback validation"
+        ),
         other => panic!("expected signature rejection, got {other:?}"),
     }
 
@@ -652,6 +667,10 @@ async fn oidc_live_session_expiry_refresh_and_logout() {
     );
 
     // Logout against the refreshed session.
+    let expected_end_session = discovery
+        .get("end_session_endpoint")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let mut logout_ctx = session_ctx(&renewed, LOGOUT_PATH);
     match plugin.on_request_received(&mut logout_ctx).await {
         PluginResult::Reject {
@@ -659,54 +678,31 @@ async fn oidc_live_session_expiry_refresh_and_logout() {
             headers,
             ..
         } => {
-            let location = headers.get("location").cloned().unwrap_or_default();
-            assert!(
-                location.contains("/oauth2/sessions/logout")
-                    || location.contains("logout")
-                    || location == "http://127.0.0.1/"
-                    || location.ends_with('/'),
-                "logout should clear session and/or hit end-session"
-            );
-            let cleared = headers.get("set-cookie").cloned().unwrap_or_default();
-            assert!(
-                cleared.contains("ferrum_oidc_si=")
-                    || cleared.contains(cookie_name(&renewed))
-                    || cleared.contains("Max-Age=0")
-                    || cleared.contains("max-age=0"),
-                "logout must clear the Ferrum session cookie"
-            );
+            let location = headers.get("location").expect("logout Location");
+            if let Some(end_session) = &expected_end_session {
+                assert!(
+                    location.starts_with(end_session),
+                    "RP-initiated logout must redirect to the discovered end-session endpoint"
+                );
+            } else {
+                assert_eq!(location, "http://127.0.0.1/");
+            }
+            assert_cookie_cleared(&headers, cookie_name(&renewed));
         }
         other => panic!("expected logout redirect, got {other:?}"),
     }
 
-    // Post-logout session must not authenticate.
-    let mut after = session_ctx(&renewed, "/app");
+    // A cookie-backed session is stateless, so manually replaying the old
+    // sealed value is not a valid server-side revocation test. Emulate the
+    // browser applying the verified Max-Age=0 deletion and require a new login.
+    let mut after = html_ctx("/app");
     match plugin
         .authenticate(&mut after, &ConsumerIndex::new(&[]))
         .await
     {
         PluginResult::Reject {
             status_code: 302, ..
-        }
-        | PluginResult::Reject {
-            status_code: 401, ..
         } => {}
-        PluginResult::Continue => {
-            // If logout only cleared via Set-Cookie and the old cookie value is
-            // still presented by the client, Continue is possible only when the
-            // sealed payload remains valid — require the cleared cookie path.
-            // Re-run with an empty cookie jar to prove local logout semantics.
-            let mut empty = html_ctx("/app");
-            match plugin
-                .authenticate(&mut empty, &ConsumerIndex::new(&[]))
-                .await
-            {
-                PluginResult::Reject {
-                    status_code: 302, ..
-                } => {}
-                other => panic!("logged-out browser must challenge, got {other:?}"),
-            }
-        }
-        other => panic!("unexpected post-logout result {other:?}"),
+        other => panic!("logged-out browser must challenge, got {other:?}"),
     }
 }

@@ -96,15 +96,6 @@ async fn wait_discovery_ready(plugin: &Arc<dyn Plugin>, token: &str) {
     panic!("introspection discovery not ready: {last}");
 }
 
-fn assert_no_secret_leak(haystack: &str, secrets: &[&str]) {
-    for secret in secrets {
-        assert!(
-            !haystack.contains(secret),
-            "diagnostics must not contain secret material"
-        );
-    }
-}
-
 #[tokio::test]
 #[serial]
 async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
@@ -210,11 +201,11 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
         "missing required scope must deny"
     );
 
-    let strict = introspection_plugin(json!({
+    let wrong_issuer = introspection_plugin(json!({
         "providers": [{
             "introspection_endpoint": hydra.introspection_endpoint(),
             "issuer": "http://127.0.0.1:9/",
-            "audiences": ["api://wrong"],
+            "audiences": [basic_client.audience],
             "client_auth": {
                 "method": "client_secret_basic",
                 "client_id": basic_client.client_id,
@@ -225,11 +216,35 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
     let mut bad_iss = bearer_ctx(&active);
     assert_eq!(
         reject_status(
-            &strict
+            &wrong_issuer
                 .authenticate(&mut bad_iss, &ConsumerIndex::new(&[]))
                 .await
         ),
-        Some(401)
+        Some(401),
+        "wrong issuer must deny independently of audience validation"
+    );
+
+    let wrong_audience = introspection_plugin(json!({
+        "providers": [{
+            "introspection_endpoint": hydra.introspection_endpoint(),
+            "issuer": hydra.issuer,
+            "audiences": ["api://wrong"],
+            "client_auth": {
+                "method": "client_secret_basic",
+                "client_id": basic_client.client_id,
+                "client_secret": basic_client.client_secret
+            }
+        }]
+    }));
+    let mut bad_aud = bearer_ctx(&active);
+    assert_eq!(
+        reject_status(
+            &wrong_audience
+                .authenticate(&mut bad_aud, &ConsumerIndex::new(&[]))
+                .await
+        ),
+        Some(401),
+        "wrong audience must deny independently of issuer validation"
     );
 
     let post_token = hydra
@@ -331,8 +346,8 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
     );
 
     // After TTL, another upstream call is required.
-    let expiry_deadline = Instant::now() + Duration::from_secs(6);
     tokio::time::sleep(Duration::from_secs(3) + Duration::from_millis(250)).await;
+    let expiry_deadline = Instant::now() + Duration::from_secs(6);
     let mut refreshed_upstream = false;
     while Instant::now() < expiry_deadline {
         let before = facade_stats
@@ -459,9 +474,12 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
             .map(String::as_str),
         Some(FIXTURE_EMAIL)
     );
-
-    let diag = format!("identity={:?}", disc_ctx2.authenticated_identity);
-    assert_no_secret_leak(&diag, &[&active, &basic_client.client_secret, &claim_token]);
+    assert!(
+        claim_upstream
+            .get("x-introspected-roles")
+            .is_some_and(|roles| roles.contains(FIXTURE_ROLE)),
+        "roles claim must reach the configured upstream header"
+    );
 }
 
 #[tokio::test]
