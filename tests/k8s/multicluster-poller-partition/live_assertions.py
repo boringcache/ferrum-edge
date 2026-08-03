@@ -127,36 +127,15 @@ def state_matches(
     if not isinstance(configured, list):
         raise SystemExit(1)
     rows = [row for row in configured if row.get("cluster_name") == peer]
-    expected = {
-        "discovered": discovered == "true",
-        "trust_source": trust_source,
-        "outbound_trust_active": outbound == "true",
-        "inbound_trust_active": inbound == "true",
-    }
-    if len(rows) != 1 or any(
-        rows[0].get(key) != value for key, value in expected.items()
-    ):
+    if discovered not in {"true", "false", "any"}:
         raise SystemExit(1)
-
-
-def trust_state_matches(
-    peer: str,
-    trust_source: str,
-    outbound: str,
-    inbound: str,
-) -> None:
-    payload = read_stdin_json()
-    if not isinstance(payload, dict):
-        raise SystemExit(1)
-    configured = payload.get("configured")
-    if not isinstance(configured, list):
-        raise SystemExit(1)
-    rows = [row for row in configured if row.get("cluster_name") == peer]
     expected = {
         "trust_source": trust_source,
         "outbound_trust_active": outbound == "true",
         "inbound_trust_active": inbound == "true",
     }
+    if discovered != "any":
+        expected["discovered"] = discovered == "true"
     if len(rows) != 1 or any(
         rows[0].get(key) != value for key, value in expected.items()
     ):
@@ -296,8 +275,6 @@ def main(argv: list[str]) -> None:
         )
     elif operation == "state-matches" and len(argv) == 7:
         state_matches(*argv[2:])
-    elif operation == "trust-state-matches" and len(argv) == 6:
-        trust_state_matches(*argv[2:])
     elif operation == "no-configured-state" and len(argv) == 2:
         no_configured_state()
     elif operation == "ages-between" and len(argv) == 5:
