@@ -23,7 +23,7 @@ use super::spec::{
     is_safe_cni_ifname, is_safe_cni_network_name,
 };
 use crate::fips::approved::Sha256;
-use crate::tls::private_file::replace_private_file;
+use crate::tls::private_file::replace_private_file_with_snapshot;
 
 /// On-disk schema version. Unknown versions fail closed. This branch replaces
 /// the prior identity-only document in place (no legacy shim).
@@ -428,12 +428,18 @@ pub fn store_durable_cni_ownership(
     // authoritative.
     require_real_directory(parent)?;
     refuse_symlink(path)?;
-    // Validate an existing destination by descriptor before the shared private
-    // file publisher snapshots or replaces it. This rejects hard links and
-    // non-regular files on writes as well as reads.
-    drop(open_durable_ownership_file(path)?);
+    // Validate and snapshot an existing destination through the same bounded,
+    // no-follow descriptor used for reads. Passing that snapshot into the
+    // publisher prevents a second pathname read from reopening a symlink,
+    // FIFO, hard-link, or oversized-file TOCTOU window before replacement.
+    let mut previous_file = open_durable_ownership_file(path)?;
+    let previous = match previous_file.as_mut() {
+        Some(file) => Some(read_bounded_file(file)?),
+        None => None,
+    };
     let bytes = encode_durable_cni_ownership(records)?;
-    replace_private_file(path, &bytes).map_err(|_| CniOwnershipStoreError::Io)
+    replace_private_file_with_snapshot(path, &bytes, previous.as_deref())
+        .map_err(|_| CniOwnershipStoreError::Io)
 }
 
 /// Process-global durable store configuration and load fence for the live

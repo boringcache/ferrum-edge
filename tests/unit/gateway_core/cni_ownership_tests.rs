@@ -281,3 +281,27 @@ fn hard_linked_durable_ownership_store_is_rejected() {
         "expected hard-link rejection, got: {err}"
     );
 }
+
+#[test]
+fn oversized_existing_store_is_rejected_before_replacement() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("cni-owned-attachments.oversized.v2");
+    std::fs::write(&path, vec![b'x'; MAX_CNI_OWNERSHIP_STORE_BYTES + 1])
+        .expect("seed oversized destination");
+    let records = vec![DurableCniOwnershipRecord {
+        network_name: "ferrum-mesh".into(),
+        container_id: "ctr-a".into(),
+        ifname: "eth0".into(),
+        pod_uid: "pod-uid-1".into(),
+        cleanup: sample_cleanup(),
+    }];
+
+    let err = store_durable_cni_ownership(&path, &records)
+        .expect_err("oversized prior state must fail closed before publication");
+    assert!(err.to_string().contains("size"));
+    assert_eq!(
+        std::fs::metadata(&path).expect("destination remains").len(),
+        (MAX_CNI_OWNERSHIP_STORE_BYTES + 1) as u64,
+        "rejected prior state must not be replaced"
+    );
+}

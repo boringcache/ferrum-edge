@@ -493,7 +493,7 @@ async fn ferrum_cni_binary_gc_rejects_pre_1_1_version() {
             "cniVersion": "1.0.0",
             "name": "ferrum-mesh-chain",
             "type": "ferrum-cni",
-            "cni.dev/valid-attachments": []
+            "cni.dev/attachments": []
         })
         .to_string();
         let mut child = Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
@@ -547,21 +547,21 @@ async fn ferrum_cni_binary_gc_rejects_omitted_valid_attachment_set() {
     assert!(
         payload["msg"]
             .as_str()
-            .is_some_and(|message| message.contains("cni.dev/valid-attachments")),
+            .is_some_and(|message| message.contains("cni.dev/attachments")),
         "unexpected payload: {payload}"
     );
 }
 
-/// The historical private spelling is a reserved-key misspelling, not a
-/// compatibility alias for the authoritative CNI 1.1 wire field.
+/// The non-standard spelling previously accepted by Ferrum is a reserved-key
+/// misspelling, not a compatibility alias for the CNI 1.1 wire field.
 #[tokio::test]
-async fn ferrum_cni_binary_gc_rejects_old_attachment_key() {
+async fn ferrum_cni_binary_gc_rejects_nonstandard_valid_attachments_key() {
     let output = tokio::task::spawn_blocking(|| {
         run_ferrum_cni_gc(serde_json::json!({
             "cniVersion": "1.1.0",
             "name": "ferrum-mesh-chain",
             "type": "ferrum-cni",
-            "cni.dev/attachments": []
+            "cni.dev/valid-attachments": []
         }))
     })
     .await
@@ -700,7 +700,7 @@ async fn ferrum_cni_binary_gc_exits_zero_on_ok() {
             "name": "ferrum-mesh-chain",
             "type": "ferrum-cni",
             "ferrum": { "socketPath": socket_path_str },
-            "cni.dev/valid-attachments": []
+            "cni.dev/attachments": []
         })
         .to_string();
 
