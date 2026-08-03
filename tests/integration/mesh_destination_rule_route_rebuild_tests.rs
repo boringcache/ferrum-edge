@@ -14,8 +14,8 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use ferrum_edge::config::types::{
     Consumer, DnsSdConfig, GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, Proxy,
-    SdProvider, ServiceDiscoveryConfig, Upstream, UpstreamLocalityLbSetting, UpstreamPortOverride,
-    UpstreamTarget,
+    MeshSdConfig, SdProvider, ServiceDiscoveryConfig, Upstream, UpstreamLocalityLbSetting,
+    UpstreamPortOverride, UpstreamTarget,
 };
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -28,6 +28,8 @@ use ferrum_edge::modes::mesh::{
     MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
 };
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
+
+use super::mesh_test_support::{service_for, workload_for};
 
 fn runtime() -> MeshRuntimeConfig {
     MeshRuntimeConfig {
@@ -215,8 +217,26 @@ fn destination_rule(idle_ms: Option<u64>, tls_sni: Option<&str>) -> MeshDestinat
     }
 }
 
-fn prepared_with_dr(dr: Option<MeshDestinationRule>) -> GatewayConfig {
-    let stamp = Utc::now() - Duration::seconds(30);
+/// Production mesh applies these reserved resources through
+/// `ProxyState::update_mesh_config` with trusted materialization IDs. That
+/// entrypoint is intentionally crate-private, so external tests using the
+/// public update path remove the unrelated generated plugins and exercise the
+/// same request-epoch publication with ordinary resources.
+fn remove_trusted_mesh_plugins_for_public_update_fixture(config: &mut GatewayConfig) {
+    config
+        .plugin_configs
+        .retain(|plugin| !plugin.id.starts_with("__mesh_"));
+    for proxy in &mut config.proxies {
+        proxy
+            .plugins
+            .retain(|association| !association.plugin_config_id.starts_with("__mesh_"));
+    }
+}
+
+fn prepared_with_dr_at(
+    dr: Option<MeshDestinationRule>,
+    stamp: chrono::DateTime<Utc>,
+) -> GatewayConfig {
     let mut proxy = http_proxy();
     proxy.created_at = stamp;
     proxy.updated_at = stamp;
@@ -242,6 +262,60 @@ fn prepared_with_dr(dr: Option<MeshDestinationRule>) -> GatewayConfig {
             proxy.updated_at = stamp;
         }
     }
+    remove_trusted_mesh_plugins_for_public_update_fixture(&mut prepared);
+    prepared
+}
+
+fn prepared_with_dr(dr: Option<MeshDestinationRule>) -> GatewayConfig {
+    prepared_with_dr_at(dr, Utc::now() - Duration::seconds(30))
+}
+
+fn prepared_mesh_sd_with_dr(stamp: chrono::DateTime<Utc>, idle_ms: u64) -> GatewayConfig {
+    let workload = workload_for("reviews", "default", [("app", "reviews")], ["10.0.0.9"]);
+    let service = service_for("reviews", "default", &[&workload]);
+    let mut proxy = http_proxy();
+    proxy.created_at = stamp;
+    proxy.updated_at = stamp;
+    let mut upstream = sd_upstream();
+    upstream.targets.clear();
+    upstream.service_discovery = Some(ServiceDiscoveryConfig {
+        provider: SdProvider::Mesh,
+        dns_sd: None,
+        kubernetes: None,
+        consul: None,
+        mesh: Some(MeshSdConfig {
+            service_name: "reviews".to_string(),
+            namespace: Some("default".to_string()),
+            port: Some(8080),
+            poll_interval_seconds: 300,
+            topology: Default::default(),
+        }),
+        default_weight: 1,
+    });
+    upstream.created_at = stamp;
+    upstream.updated_at = stamp;
+    let mut config = GatewayConfig {
+        proxies: vec![proxy],
+        upstreams: vec![upstream],
+        mesh: Some(Box::new(MeshConfig {
+            services: vec![service],
+            workloads: vec![workload],
+            destination_rules: vec![destination_rule(Some(idle_ms), None)],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+    let mut prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh prepare");
+    for proxy in &mut prepared.proxies {
+        proxy.created_at = stamp;
+        proxy.updated_at = stamp;
+    }
+    for upstream in &mut prepared.upstreams {
+        upstream.created_at = stamp;
+        upstream.updated_at = stamp;
+    }
+    remove_trusted_mesh_plugins_for_public_update_fixture(&mut prepared);
     prepared
 }
 
@@ -480,7 +554,8 @@ async fn update_config_removes_dr_fallback_and_restores_route_defaults() {
 
 #[tokio::test]
 async fn update_config_dr_noop_and_repeated_reload_are_stable() {
-    let prepared = prepared_with_dr(Some(destination_rule(Some(7_000), None)));
+    let stamp = Utc::now() - Duration::seconds(30);
+    let prepared = prepared_with_dr_at(Some(destination_rule(Some(7_000), None)), stamp);
     let (state, _handles) = new_proxy_state(prepared.clone());
     assert_eq!(route_fallback_idle_ms(&state), Some(7_000));
 
@@ -497,7 +572,7 @@ async fn update_config_dr_noop_and_repeated_reload_are_stable() {
     assert_eq!(route_fallback_idle_ms(&state), Some(7_000));
 
     // Repeated reload with a real DR pool change then a second identical apply.
-    let changed = prepared_with_dr(Some(destination_rule(Some(9_000), None)));
+    let changed = prepared_with_dr_at(Some(destination_rule(Some(9_000), None)), stamp);
     assert_eq!(
         state.update_config(changed.clone()),
         ConfigApplyOutcome::Applied
@@ -522,14 +597,21 @@ async fn update_config_applies_mesh_dr_prepare_without_proxy_resource_edit() {
     // Proxy `updated_at` bump — the invalidation signal must fire from the
     // projected fields alone (or the mesh-block / upstream timestamp delta
     // the mesh apply already produces).
-    let initial = prepared_with_dr(Some(destination_rule(
-        Some(1_500),
-        Some("initial.reviews.mesh.internal"),
-    )));
-    let updated = prepared_with_dr(Some(destination_rule(
-        Some(3_500),
-        Some("updated.reviews.mesh.internal"),
-    )));
+    let stamp = Utc::now() - Duration::seconds(30);
+    let initial = prepared_with_dr_at(
+        Some(destination_rule(
+            Some(1_500),
+            Some("initial.reviews.mesh.internal"),
+        )),
+        stamp,
+    );
+    let updated = prepared_with_dr_at(
+        Some(destination_rule(
+            Some(3_500),
+            Some("updated.reviews.mesh.internal"),
+        )),
+        stamp,
+    );
 
     assert_eq!(
         initial
@@ -567,12 +649,13 @@ async fn update_config_unrelated_mesh_policy_does_not_require_proxy_edit_for_dr(
     // Pin the "no unrelated event" acceptance criterion: a DestinationRule
     // projection change is sufficient by itself. The prior generation already
     // carries a non-DR mesh block; swapping only the DR still republishes.
-    let mut base = prepared_with_dr(Some(destination_rule(Some(2_200), None)));
+    let stamp = Utc::now() - Duration::seconds(30);
+    let mut base = prepared_with_dr_at(Some(destination_rule(Some(2_200), None)), stamp);
     if let Some(mesh) = base.mesh.as_mut() {
         // Keep a stable non-DR mesh field so the candidate is not "mesh absent".
         mesh.istio_root_namespace = "istio-system".to_string();
     }
-    let mut next = prepared_with_dr(Some(destination_rule(Some(8_800), None)));
+    let mut next = prepared_with_dr_at(Some(destination_rule(Some(8_800), None)), stamp);
     if let Some(mesh) = next.mesh.as_mut() {
         mesh.istio_root_namespace = "istio-system".to_string();
     }
@@ -882,8 +965,9 @@ async fn update_config_rebuilds_lb_for_projected_dr_change_with_unrelated_consum
     assert!(
         state
             .consumer_index
-            .find_by_username("unrelated-user")
-            .is_none()
+            .consumers()
+            .iter()
+            .all(|consumer| consumer.username != "unrelated-user")
     );
 
     assert_eq!(state.update_config(new_config), ConfigApplyOutcome::Applied);
@@ -916,8 +1000,9 @@ async fn update_config_rebuilds_lb_for_projected_dr_change_with_unrelated_consum
     assert!(
         state
             .consumer_index
-            .find_by_username("unrelated-user")
-            .is_some(),
+            .consumers()
+            .iter()
+            .any(|consumer| consumer.username == "unrelated-user"),
         "unrelated consumer delta must still publish into the consumer index"
     );
     let unrelated_after = state
@@ -990,8 +1075,9 @@ async fn update_config_withdraws_projected_lb_policy_with_unrelated_consumer_del
     assert!(
         state
             .consumer_index
-            .find_by_username("withdraw-user")
-            .is_some()
+            .consumers()
+            .iter()
+            .any(|consumer| consumer.username == "withdraw-user")
     );
 }
 
@@ -1063,5 +1149,49 @@ async fn empty_delta_same_timestamp_upstream_target_change_republishes_load_bala
         ),
         ("reviews-v2.default.svc.cluster.local", 9080),
         "an upstream content change hidden from timestamp-based ConfigDelta must still replace the affected balancer"
+    );
+}
+
+#[tokio::test]
+async fn empty_delta_dr_rebuild_preserves_live_service_discovery_targets() {
+    let stamp = Utc::now() - Duration::seconds(30);
+    let old_config = prepared_mesh_sd_with_dr(stamp, 1_000);
+    let new_config = prepared_mesh_sd_with_dr(stamp, 9_000);
+    let delta = ferrum_edge::config_delta::ConfigDelta::compute(&old_config, &new_config);
+    assert!(
+        delta.is_empty(),
+        "fixture must exercise the timestamp-neutral out-of-band publish path"
+    );
+
+    let (state, _handles) = new_proxy_state(old_config);
+    state.start_service_discovery(None);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let snapshot = state.load_balancer_cache.load();
+            let live = LoadBalancerCache::get_upstream_from(&snapshot, "default", "reviews-u");
+            let discovered = live.is_some_and(|upstream| {
+                upstream.targets.len() == 1
+                    && upstream.targets[0].host == "10.0.0.9"
+                    && upstream.targets[0].port == 8080
+            });
+            if discovered {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("mesh service discovery should publish its first target set");
+
+    assert_eq!(state.update_config(new_config), ConfigApplyOutcome::Applied);
+    assert_eq!(route_fallback_idle_ms(&state), Some(9_000));
+    let after = state.load_balancer_cache.load();
+    let upstream = LoadBalancerCache::get_upstream_from(&after, "default", "reviews-u")
+        .expect("reviews upstream after DR rebuild");
+    assert_eq!(
+        (upstream.targets[0].host.as_str(), upstream.targets[0].port),
+        ("10.0.0.9", 8080),
+        "a DR-only policy rebuild must not roll back the live discovered target set to authored static targets"
     );
 }

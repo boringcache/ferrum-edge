@@ -8894,6 +8894,87 @@ impl ProxyState {
             .collect()
     }
 
+    /// Keep the live target set when rebuilding policy for an unchanged
+    /// service-discovery source.
+    ///
+    /// The request epoch's upstream index can contain a newer merged
+    /// static+discovered target set than `GatewayConfig.upstreams`: discovery
+    /// updates the LB epoch without mutating the authored config snapshot. A
+    /// DR-only rebuild from the config's static targets would therefore roll
+    /// discovery back. The running task would not necessarily repair it because
+    /// its `last_discovered` value already matches the provider response.
+    ///
+    /// Preserve targets only when both the discovery configuration and the
+    /// authored target definitions (including the serde-skipped mesh policy
+    /// port key) are unchanged. A real target/provider edit must use the new
+    /// config verbatim.
+    fn preserve_live_discovery_targets(
+        current: &crate::load_balancer::LoadBalancerCacheInner,
+        old_config: &GatewayConfig,
+        modified: &mut [Upstream],
+    ) {
+        fn discovery_source_eq(a: &Upstream, b: &Upstream) -> bool {
+            if a.service_discovery.is_none() || b.service_discovery.is_none() {
+                return false;
+            }
+            match (
+                serde_json::to_value(&a.service_discovery),
+                serde_json::to_value(&b.service_discovery),
+            ) {
+                (Ok(a_value), Ok(b_value)) => a_value == b_value,
+                _ => false,
+            }
+        }
+
+        fn authored_targets_eq(a: &Upstream, b: &Upstream) -> bool {
+            if a.targets.len() != b.targets.len()
+                || !a.targets.iter().zip(&b.targets).all(|(a_target, b_target)| {
+                    a_target.service_port_policy_key == b_target.service_port_policy_key
+                })
+            {
+                return false;
+            }
+            match (
+                serde_json::to_value(&a.targets),
+                serde_json::to_value(&b.targets),
+            ) {
+                (Ok(a_value), Ok(b_value)) => a_value == b_value,
+                _ => false,
+            }
+        }
+
+        let old_upstreams: HashMap<(&str, &str), &Upstream> = old_config
+            .upstreams
+            .iter()
+            .map(|upstream| {
+                (
+                    (upstream.namespace.as_str(), upstream.id.as_str()),
+                    upstream,
+                )
+            })
+            .collect();
+
+        for replacement in modified {
+            let Some(old_upstream) = old_upstreams
+                .get(&(replacement.namespace.as_str(), replacement.id.as_str()))
+            else {
+                continue;
+            };
+            if !discovery_source_eq(old_upstream, replacement)
+                || !authored_targets_eq(old_upstream, replacement)
+            {
+                continue;
+            }
+            if let Some(live_upstream) = LoadBalancerCache::get_upstream_from(
+                current,
+                &replacement.namespace,
+                &replacement.id,
+            ) {
+                replacement.targets = live_upstream.targets.clone();
+            }
+        }
+    }
+
     /// Timestamp-neutral proxy content comparison for route-table reuse.
     ///
     /// Serialized proxy content catches ordinary route/backend/policy edits while
@@ -9203,6 +9284,11 @@ impl ProxyState {
                 lb_modified.push(upstream);
             }
         }
+        Self::preserve_live_discovery_targets(
+            &current.load_balancer,
+            &current.config,
+            &mut lb_modified,
+        );
 
         let plugin_inner = self.plugin_cache.build_delta_inner(
             &current.plugin_cache,
@@ -9571,7 +9657,7 @@ impl ProxyState {
                     // unrelated event (#3243).
                     let projected_routes_changed =
                         Self::projected_route_proxy_content_changed(&current.config, &new_config);
-                    let projected_lb_modified =
+                    let mut projected_lb_modified =
                         Self::projected_dr_dispatch_changed_upstreams(&current.config, &new_config);
                     let projected_lb_changed = !projected_lb_modified.is_empty();
                     if !mesh_changed
@@ -9605,6 +9691,11 @@ impl ProxyState {
                     // unless a projected DR-derived proxy field also changed.
                     let rebuild_routes = mesh_changed || projected_routes_changed;
                     route_changed.set(rebuild_routes);
+                    Self::preserve_live_discovery_targets(
+                        &current.load_balancer,
+                        &current.config,
+                        &mut projected_lb_modified,
+                    );
                     return Ok(Some(StagedRequestEpoch {
                         config: Arc::clone(&staged_config),
                         route_table: if rebuild_routes {
