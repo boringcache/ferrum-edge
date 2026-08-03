@@ -1043,9 +1043,8 @@ async fn empty_delta_same_timestamp_upstream_target_change_republishes_load_bala
 
     let (state, _handles) = new_proxy_state(old_config);
     let before = state.load_balancer_cache.load();
-    let before_upstream =
-        LoadBalancerCache::get_upstream_from(&before, "default", "reviews-u")
-            .expect("old reviews upstream");
+    let before_upstream = LoadBalancerCache::get_upstream_from(&before, "default", "reviews-u")
+        .expect("old reviews upstream");
     assert_eq!(
         before_upstream.targets[0].host,
         "reviews.default.svc.cluster.local"
@@ -1055,9 +1054,8 @@ async fn empty_delta_same_timestamp_upstream_target_change_republishes_load_bala
     assert_eq!(state.update_config(new_config), ConfigApplyOutcome::Applied);
 
     let after = state.load_balancer_cache.load();
-    let after_upstream =
-        LoadBalancerCache::get_upstream_from(&after, "default", "reviews-u")
-            .expect("updated reviews upstream");
+    let after_upstream = LoadBalancerCache::get_upstream_from(&after, "default", "reviews-u")
+        .expect("updated reviews upstream");
     assert_eq!(
         (
             after_upstream.targets[0].host.as_str(),

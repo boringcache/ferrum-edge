@@ -8846,9 +8846,12 @@ impl ProxyState {
             let skipped_fields_equal = a.resolved_subset_tls == b.resolved_subset_tls
                 && a.dispatch_port_override_fallback == b.dispatch_port_override_fallback
                 && a.targets.len() == b.targets.len()
-                && a.targets.iter().zip(&b.targets).all(|(a_target, b_target)| {
-                    a_target.service_port_policy_key == b_target.service_port_policy_key
-                });
+                && a.targets
+                    .iter()
+                    .zip(&b.targets)
+                    .all(|(a_target, b_target)| {
+                        a_target.service_port_policy_key == b_target.service_port_policy_key
+                    });
             if !skipped_fields_equal {
                 return false;
             }
@@ -8884,10 +8887,7 @@ impl ProxyState {
             .iter()
             .filter(|new_upstream| {
                 old_upstreams
-                    .get(&(
-                        new_upstream.namespace.as_str(),
-                        new_upstream.id.as_str(),
-                    ))
+                    .get(&(new_upstream.namespace.as_str(), new_upstream.id.as_str()))
                     .is_some_and(|old_upstream| !content_eq(old_upstream, new_upstream))
             })
             .cloned()
@@ -9198,10 +9198,8 @@ impl ProxyState {
             )
             .collect();
         for upstream in projected_lb_modified {
-            if lb_modified_keys.insert(NamespacedResourceId::new(
-                &upstream.namespace,
-                &upstream.id,
-            )) {
+            if lb_modified_keys.insert(NamespacedResourceId::new(&upstream.namespace, &upstream.id))
+            {
                 lb_modified.push(upstream);
             }
         }
