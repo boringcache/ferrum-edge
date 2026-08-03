@@ -436,6 +436,31 @@ pub fn strip_backend_request_headers_for_grpc(headers: &mut http::HeaderMap) {
     headers.insert(http::header::TE, http::HeaderValue::from_static("trailers"));
 }
 
+/// Sanitize client request trailers before forwarding them to a backend.
+///
+/// Trailers arrive after the initial request-header boundary, so they must not
+/// be allowed to reintroduce hop-by-hop fields or client-forged gateway
+/// assertions that were removed from the initial header block. This helper is
+/// shared by the native H3 relay and the H3-to-H2 gRPC bridge so their trailing
+/// metadata boundary cannot drift.
+pub(crate) fn sanitize_backend_request_trailers(trailers: &mut http::HeaderMap) {
+    let strip: Vec<http::HeaderName> = trailers
+        .keys()
+        .filter(|name| {
+            let name = name.as_str();
+            is_backend_request_strip_header(name)
+                || name == "x-consumer-username"
+                || name == "x-consumer-custom-id"
+                || name == "x-geo-country"
+                || name.starts_with("x-path-param-")
+        })
+        .cloned()
+        .collect();
+    for name in strip {
+        trailers.remove(name);
+    }
+}
+
 /// Remove reserved gateway-asserted headers from a request `HeaderMap`.
 ///
 /// `x-consumer-username` / `x-consumer-custom-id` are injected by the gateway

@@ -31,25 +31,21 @@
 //!   passed to reqwest directly via `Body::from(Vec<u8>)` — one
 //!   allocation, no bridge.
 //!
-//! - **gRPC flavor — request body buffered, response streamed when safe.**
-//!   The gRPC pool's `proxy_grpc_request_from_bytes` API takes `Bytes` for
-//!   retry-safe framing and trailer handling, so the request body is
-//!   collected up-front (unary gRPC request bodies are small and this is a
-//!   cross-protocol fallback path). The RESPONSE is streamed whenever no
-//!   retry is configured AND no plugin forces response-body buffering;
-//!   server-streaming / bidi gRPC RPCs flow frame-by-frame through the
-//!   bridge rather than accumulating fully in memory before the first byte
-//!   reaches the H3 client. When retries or body-buffering plugins are
-//!   configured, the response is buffered so the retry/plugin layer can
-//!   inspect it before forwarding.
+//! - **gRPC flavor — duplex streaming when replay is unnecessary.**
+//!   With no retry, request/response body buffering, or pre-buffered body, the
+//!   bridge splits the H3 stream and pumps request DATA plus trailing metadata
+//!   through a bounded channel-backed `GrpcBody` while relaying the H2 response
+//!   concurrently. Once dispatch starts this path is explicitly unreplayable.
+//!   Retry and body-plugin cases retain the complete buffered representation
+//!   and use `proxy_grpc_request_from_bytes`; their responses are buffered when
+//!   the retry/plugin layer must inspect them.
 //!
 //! - **Size limits.** The Plain path enforces `max_request_body_size_bytes`
 //!   inline in the streaming reader (413 on overflow mid-stream — a shared
 //!   `AtomicBool` signals the post-join branch so the reqwest stream error
-//!   isn't misclassified as 502). The gRPC path enforces
-//!   `max_grpc_recv_size_bytes` inside `drain_h3_body` so H3 gRPC matches
-//!   the H1/H2 gRPC ceiling (a single `https` proxy serves any HTTP
-//!   version uniformly rather than diverging by frontend).
+//!   isn't misclassified as 502). Streaming gRPC enforces
+//!   `max_grpc_recv_size_bytes` incrementally in `GrpcBody::Channel`; buffered
+//!   gRPC enforces the same ceiling in `drain_h3_body`.
 //!
 //! - **Error responses are flavor-aware.** Ordinary Plain failures emit HTTP
 //!   error payloads (502 JSON, 413 JSON, etc.). Recognized gRPC-Web requests
@@ -126,7 +122,7 @@ use crate::proxy::headers::{
     RejectBodyDisposition, ResponseTrailerGovernance, TrailerSectionKind, apply_response_headers,
     is_backend_response_strip_header, parse_connection_listed_headers,
     reconcile_streaming_backend_trailers, sanitize_client_response_headers_for_wire,
-    strip_response_hop_by_hop_trailers,
+    sanitize_backend_request_trailers, strip_response_hop_by_hop_trailers,
 };
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
@@ -4342,13 +4338,13 @@ where
         .await;
     }
 
-    // gRPC request body: the pool API takes `Bytes` for retry-safe framing
-    // and trailer handling. Buffer the H3 recv half here (unary gRPC bodies
-    // are small; streaming gRPC request bodies over the cross-protocol
-    // bridge would require a new GrpcBody variant in GrpcConnectionPool —
-    // future optimization). Size ceiling uses `max_grpc_recv_size_bytes`
-    // (not `max_request_body_size_bytes`) so H3 gRPC matches the H1/H2 gRPC
-    // limit — an `https` proxy serves any client HTTP version uniformly.
+    // This path is intentionally replayable: body-mutating plugins and retry
+    // policy require a complete request before the first upstream attempt.
+    // Streaming-safe calls are routed through `dispatch_grpc_streaming`, whose
+    // channel-backed `GrpcBody` commits DATA incrementally and disables retry.
+    // The size ceiling uses `max_grpc_recv_size_bytes` (not
+    // `max_request_body_size_bytes`) so H3 gRPC matches the H1/H2 gRPC limit —
+    // an `https` proxy serves any client HTTP version uniformly.
     let body_was_prebuffered = prebuffered_body.is_some();
     let body = if let Some(buffered) = prebuffered_body {
         buffered
@@ -5877,12 +5873,13 @@ pub(crate) async fn dispatch_grpc_streaming(
     // before the client half-closes.
     let (mut send_half, mut recv_half) = stream.split();
 
-    // Bounded channel bridges the H3 recv half to the gRPC pool's streaming
-    // body. The capacity provides upload backpressure (same env knob the plain
-    // bridge uses). `Err(())` signals a frontend upload failure so the backend
-    // is RST rather than handed a truncated-but-clean END_STREAM.
+    // Bounded channel bridges H3 request DATA and trailers to the gRPC pool's
+    // streaming body. The capacity provides upload backpressure (same env knob
+    // the plain bridge uses). `Err(())` signals a frontend upload failure so the
+    // backend is RST rather than handed a truncated-but-clean END_STREAM.
     let capacity = state.env_config.http3_request_body_channel_capacity.max(1);
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, ()>>(capacity);
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<Result<http_body::Frame<Bytes>, ()>>(capacity);
     let request_bytes_seen = Arc::new(AtomicU64::new(0));
     let pump_bytes = Arc::clone(&request_bytes_seen);
     // Set by the pump when the H3 recv half errors (the client reset its upload).
@@ -5890,6 +5887,8 @@ pub(crate) async fn dispatch_grpc_streaming(
     // fault (codex P2) — read in the dispatch Err arm below.
     let frontend_upload_failed = Arc::new(AtomicBool::new(false));
     let pump_frontend_failed = Arc::clone(&frontend_upload_failed);
+    let frontend_upload_malformed = Arc::new(AtomicBool::new(false));
+    let pump_frontend_malformed = Arc::clone(&frontend_upload_malformed);
     // Lets the response side terminate the pump promptly once the RPC is over
     // (e.g. a bidi server that sends its status before the client half-closes),
     // so the recv half is closed via STOP_SENDING(H3_NO_ERROR) instead of
@@ -5922,7 +5921,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                             let send_result = tokio::select! {
                                 biased;
                                 _ = pump_shutdown_signal.notified() => break,
-                                res = tx.send(Ok(body_bytes)) => res,
+                                res = tx.send(Ok(http_body::Frame::data(body_bytes))) => res,
                             };
                             if send_result.is_err() {
                                 // Backend dropped the request body (RPC done / RST):
@@ -5930,9 +5929,42 @@ pub(crate) async fn dispatch_grpc_streaming(
                                 break;
                             }
                         }
-                        // Clean client half-close: drop `tx` so the channel body
-                        // observes END_STREAM and forwards the FIN to the backend.
-                        Ok(None) => break,
+                        // DATA EOF may be followed by one trailers HEADERS block.
+                        // Preserve it as an H2 trailers frame so client-streaming
+                        // gRPC metadata is not silently dropped at the protocol
+                        // bridge. Malformed trailers fail the upload closed.
+                        Ok(None) => {
+                            let trailer_result = tokio::select! {
+                                biased;
+                                _ = pump_shutdown_signal.notified() => break,
+                                result = recv_half.recv_trailers() => result,
+                            };
+                            match trailer_result {
+                                Ok(Some(mut trailers)) if !trailers.is_empty() => {
+                                    sanitize_backend_request_trailers(&mut trailers);
+                                    if !trailers.is_empty() {
+                                        tokio::select! {
+                                            biased;
+                                            _ = pump_shutdown_signal.notified() => {}
+                                            _ = tx.send(Ok(http_body::Frame::trailers(
+                                                trailers,
+                                            ))) => {}
+                                        }
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(_e) => {
+                                    pump_frontend_malformed.store(true, Ordering::Release);
+                                    pump_frontend_failed.store(true, Ordering::Release);
+                                    tokio::select! {
+                                        biased;
+                                        _ = pump_shutdown_signal.notified() => {}
+                                        _ = tx.send(Err(())) => {}
+                                    }
+                                }
+                            }
+                            break;
+                        }
                         Err(_e) => {
                             // Frontend upload failure: flag it (so the dispatch Err
                             // arm records a client abort, not a backend fault) and
@@ -6062,38 +6094,46 @@ pub(crate) async fn dispatch_grpc_streaming(
         }
         Err(err) => {
             let bytes_sent = request_bytes_seen.load(Ordering::Relaxed);
-            let (grpc_status_code, grpc_message): (u32, &str) = match &err {
-                grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_) => (
-                    grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                    GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
-                ),
-                grpc_proxy::GrpcProxyError::BackendTimeout { .. } => (
-                    grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                    "Backend deadline exceeded",
-                ),
-                grpc_proxy::GrpcProxyError::ResourceExhausted(_) => (
-                    grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
-                    "Request payload exceeded backend limit",
-                ),
-                grpc_proxy::GrpcProxyError::ResponseTooLarge(_) => (
-                    grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
-                    "Response payload exceeded limit",
-                ),
-                // Gateway-local retention capacity, not an oversized payload:
-                // same resource/capacity status, distinct fixed message, and a
-                // health-neutral error class (GHSA-pwcm-6rh8-f2gh).
-                grpc_proxy::GrpcProxyError::ResponseBufferCapacity(_) => (
-                    crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
-                    crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
-                ),
-                grpc_proxy::GrpcProxyError::Internal(_) => {
-                    (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")
-                }
-                grpc_proxy::GrpcProxyError::BackendUnavailable { .. } => {
-                    (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
+            let malformed_upload = frontend_upload_malformed.load(Ordering::Acquire);
+            let (grpc_status_code, grpc_message): (u32, &str) = if malformed_upload {
+                (
+                    grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                    "Malformed request trailers",
+                )
+            } else {
+                match &err {
+                    grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_) => (
+                        grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                        GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                    ),
+                    grpc_proxy::GrpcProxyError::BackendTimeout { .. } => (
+                        grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                        "Backend deadline exceeded",
+                    ),
+                    grpc_proxy::GrpcProxyError::ResourceExhausted(_) => (
+                        grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                        "Request payload exceeded backend limit",
+                    ),
+                    grpc_proxy::GrpcProxyError::ResponseTooLarge(_) => (
+                        grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                        "Response payload exceeded limit",
+                    ),
+                    // Gateway-local retention capacity, not an oversized payload:
+                    // same resource/capacity status, distinct fixed message, and a
+                    // health-neutral error class (GHSA-pwcm-6rh8-f2gh).
+                    grpc_proxy::GrpcProxyError::ResponseBufferCapacity(_) => (
+                        crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+                        crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+                    ),
+                    grpc_proxy::GrpcProxyError::Internal(_) => {
+                        (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")
+                    }
+                    grpc_proxy::GrpcProxyError::BackendUnavailable { .. } => {
+                        (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
+                    }
                 }
             };
-            // Two pre-headers failures on this path are CLIENT/gateway-side, not
+            // Three pre-headers failures on this path are CLIENT/gateway-side, not
             // backend faults, and must train neither backend health nor adaptive
             // concurrency (both neutralized by `client_side_no_backend_signal`):
             //   * `ResourceExhausted` — the gateway rejected an oversized client
@@ -6101,16 +6141,23 @@ pub(crate) async fn dispatch_grpc_streaming(
             //   * a frontend upload abort — the H3 recv half errored, so the pump
             //     set `frontend_upload_failed` and RST the backend; the resulting
             //     `BackendUnavailable` is a consequence of the client reset.
-            // Both mirror the buffered H3 path, which releases the probe without
+            //   * malformed request trailers — the H3 decoder refused the
+            //     trailing block and the channel body RST the backend upload.
+            // All three mirror the buffered H3 path, which releases the probe without
             // training backend health (codex P2). Every other error keeps the
             // wire-boundary derivation so a real backend failure still trains the
             // limiter.
             let request_overflow = matches!(&err, grpc_proxy::GrpcProxyError::ResourceExhausted(_));
-            let frontend_aborted = frontend_upload_failed.load(Ordering::Acquire);
+            let frontend_aborted =
+                !malformed_upload && frontend_upload_failed.load(Ordering::Acquire);
             let client_deadline =
                 matches!(&err, grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_));
             let error_class = if request_overflow {
                 ErrorClass::RequestBodyTooLarge
+            } else if malformed_upload {
+                // Client-side malformed metadata: backend-health neutral. The
+                // distinct INVALID_ARGUMENT status above is the wire signal.
+                ErrorClass::ClientDisconnect
             } else if frontend_aborted {
                 ErrorClass::ClientDisconnect
             } else {
@@ -6118,6 +6165,7 @@ pub(crate) async fn dispatch_grpc_streaming(
             };
             let connection_error = !client_deadline
                 && !request_overflow
+                && !malformed_upload
                 && !frontend_aborted
                 && !crate::retry::request_reached_wire(error_class);
             warn!(
@@ -9591,8 +9639,12 @@ mod tests {
              via pump_shutdown or `pump.await` can hang on a full channel"
         );
         assert!(
-            body.contains("res = tx.send(Ok(body_bytes)) => res"),
+            body.contains("res = tx.send(Ok(http_body::Frame::data(body_bytes))) => res"),
             "the pump's data send must be a cancellable select arm racing pump_shutdown"
+        );
+        assert!(
+            body.contains("result = recv_half.recv_trailers() => result"),
+            "the pump must forward H3 request trailers after request DATA EOF"
         );
     }
 

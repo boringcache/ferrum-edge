@@ -261,16 +261,16 @@ pub enum GrpcBody {
     ///
     /// Used by the HTTP/3 cross-protocol gRPC bridge: H3's
     /// `h3::server::RequestStream` cannot be expressed as a hyper `Incoming`,
-    /// so a pump task reads `RequestStream::recv_data()` and pushes `Bytes`
-    /// chunks — or `Err(())` on a frontend upload failure (so a truncated
-    /// upload becomes a backend RST rather than a clean END_STREAM the backend
-    /// would mistake for a completed stream) — into the bounded sender. This
-    /// body polls the receiver. Inline size enforcement (`bytes_seen` /
+    /// so a pump task reads request DATA and trailing metadata and pushes
+    /// `Frame<Bytes>` values — or `Err(())` on a frontend upload failure (so a
+    /// truncated upload becomes a backend RST rather than a clean END_STREAM
+    /// the backend would mistake for a completed stream) — into the bounded
+    /// sender. This body polls the receiver. Inline size enforcement (`bytes_seen` /
     /// `max_bytes` / `exceeded`) and the upload observer match `Streaming`
     /// exactly; only the source differs. The same `Pin<&mut Self>` exclusivity
     /// argument as `Streaming` makes the plain `usize` counter safe.
     Channel {
-        receiver: tokio::sync::mpsc::Receiver<Result<Bytes, ()>>,
+        receiver: tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, ()>>,
         bytes_seen: usize,
         max_bytes: usize,
         exceeded: Arc<AtomicBool>,
@@ -338,7 +338,7 @@ impl http_body::Body for GrpcBody {
                     if *max_bytes > 0
                         && let Some(data) = frame.data_ref()
                     {
-                        *bytes_seen += data.len();
+                        *bytes_seen = bytes_seen.saturating_add(data.len());
                         if *bytes_seen > *max_bytes {
                             exceeded.store(true, Ordering::Release);
                             // Return an error to RST_STREAM the request,
@@ -364,9 +364,11 @@ impl http_body::Body for GrpcBody {
                 exceeded,
                 ..
             } => match receiver.poll_recv(cx) {
-                Poll::Ready(Some(Ok(data))) => {
-                    if *max_bytes > 0 {
-                        *bytes_seen += data.len();
+                Poll::Ready(Some(Ok(frame))) => {
+                    if *max_bytes > 0
+                        && let Some(data) = frame.data_ref()
+                    {
+                        *bytes_seen = bytes_seen.saturating_add(data.len());
                         if *bytes_seen > *max_bytes {
                             exceeded.store(true, Ordering::Release);
                             // RST_STREAM the request so the backend cannot
@@ -379,7 +381,7 @@ impl http_body::Body for GrpcBody {
                             .into())));
                         }
                     }
-                    Poll::Ready(Some(Ok(Frame::data(data))))
+                    Poll::Ready(Some(Ok(frame)))
                 }
                 // The pump task signals a frontend upload failure with `Err(())`
                 // so we RST the backend instead of sending a clean END_STREAM
@@ -2827,18 +2829,19 @@ pub async fn proxy_grpc_request_streaming(
 /// hyper `Incoming`.
 ///
 /// Used by the HTTP/3 cross-protocol gRPC bridge: H3's `RequestStream` cannot be
-/// expressed as a hyper `Incoming`, so a pump task feeds request DATA frames into
-/// `receiver` and this entry wraps it in a [`GrpcBody::Channel`]. Behaviour is
-/// otherwise identical to [`proxy_grpc_request_streaming`] — the response is
-/// always streamed (the request body is consumed on the wire, so retries are
-/// impossible), and request-size limits are enforced inline via the same byte
-/// counting. `body_size_exceeded` is the shared overflow flag the channel body
-/// sets on limit breach so the caller can surface `RESOURCE_EXHAUSTED`.
+/// expressed as a hyper `Incoming`, so a pump task feeds request DATA and trailer
+/// frames into `receiver` and this entry wraps it in a [`GrpcBody::Channel`].
+/// Behaviour is otherwise identical to [`proxy_grpc_request_streaming`] — the
+/// response is always streamed (the request body is consumed on the wire, so
+/// retries are impossible), and request-size limits are enforced inline against
+/// DATA via the same byte counting. `body_size_exceeded` is the shared overflow
+/// flag the channel body sets on limit breach so the caller can surface
+/// `RESOURCE_EXHAUSTED`.
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_grpc_request_streaming_channel(
     method: hyper::Method,
     headers: hyper::HeaderMap,
-    receiver: tokio::sync::mpsc::Receiver<Result<Bytes, ()>>,
+    receiver: tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, ()>>,
     proxy: &Proxy,
     backend_url: &str,
     grpc_pool: &GrpcConnectionPool,

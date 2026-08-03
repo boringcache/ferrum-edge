@@ -31,8 +31,8 @@ use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::pool::{GenericPool, PoolManager};
 use crate::proxy::headers::{
-    is_backend_request_strip_header, is_backend_response_strip_header,
-    parse_connection_listed_headers,
+    is_backend_response_strip_header, parse_connection_listed_headers,
+    sanitize_backend_request_trailers,
 };
 use crate::tls::backend::{
     BackendSvidGeneration, SvidGenerationMatcher, append_backend_tls_pool_key_fields,
@@ -2281,21 +2281,7 @@ impl Http3ConnectionPool {
                 // same backend-request strip + reserved-name filter before
                 // forwarding. HTTP/3 header names are always lowercase, so exact
                 // lowercase comparisons suffice.
-                let strip: Vec<http::header::HeaderName> = trailers
-                    .keys()
-                    .filter(|n| {
-                        let s = n.as_str();
-                        is_backend_request_strip_header(s)
-                            || s == "x-consumer-username"
-                            || s == "x-consumer-custom-id"
-                            || s == "x-geo-country"
-                            || s.starts_with("x-path-param-")
-                    })
-                    .cloned()
-                    .collect();
-                for name in strip {
-                    trailers.remove(&name);
-                }
+                sanitize_backend_request_trailers(&mut trailers);
                 // Only forward a still-non-empty block; an all-reserved trailer set
                 // collapses to nothing and must not emit an empty trailer frame.
                 if !trailers.is_empty() {
