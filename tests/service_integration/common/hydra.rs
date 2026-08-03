@@ -66,6 +66,23 @@ pub struct HydraContainer {
     pub isolation: String,
 }
 
+/// Token-endpoint client authentication registered with Hydra for a fixture
+/// client. Token helpers must shape requests to match this method.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenEndpointAuthMethod {
+    ClientSecretBasic,
+    ClientSecretPost,
+}
+
+impl TokenEndpointAuthMethod {
+    fn as_hydra_str(self) -> &'static str {
+        match self {
+            Self::ClientSecretBasic => "client_secret_basic",
+            Self::ClientSecretPost => "client_secret_post",
+        }
+    }
+}
+
 /// OAuth2 client seeded into Hydra for Ferrum plugins.
 #[derive(Clone)]
 pub struct HydraClient {
@@ -73,6 +90,7 @@ pub struct HydraClient {
     pub client_secret: String,
     pub redirect_uri: String,
     pub audience: String,
+    pub token_endpoint_auth_method: TokenEndpointAuthMethod,
 }
 
 /// Authorization-code callback parameters returned by Hydra after login+consent.
@@ -391,7 +409,7 @@ impl HydraContainer {
         &self,
         label: &str,
         redirect_uri: &str,
-        token_endpoint_auth_method: &str,
+        token_endpoint_auth_method: TokenEndpointAuthMethod,
         grant_types: &[&str],
     ) -> Result<HydraClient, BoxError> {
         let client_id = format!("ferrum-{label}-{}", self.isolation);
@@ -404,7 +422,7 @@ impl HydraContainer {
             "response_types": ["code", "id_token"],
             "scope": "openid offline_access profile email roles",
             "redirect_uris": [redirect_uri],
-            "token_endpoint_auth_method": token_endpoint_auth_method,
+            "token_endpoint_auth_method": token_endpoint_auth_method.as_hydra_str(),
             "audience": [audience],
             "subject_type": "public",
         });
@@ -428,6 +446,7 @@ impl HydraContainer {
             client_secret,
             redirect_uri: redirect_uri.to_string(),
             audience,
+            token_endpoint_auth_method,
         })
     }
 
@@ -614,7 +633,7 @@ impl HydraContainer {
     }
 
     /// Client-credentials opaque access token (no browser). Optionally request
-    /// an audience.
+    /// an audience. Request shaping follows `client.token_endpoint_auth_method`.
     pub async fn client_credentials_token(
         &self,
         client: &HydraClient,
@@ -629,14 +648,7 @@ impl HydraContainer {
             form.push(("audience", aud.to_string()));
         }
         let resp = self
-            .client
-            .post(format!(
-                "{}/oauth2/token",
-                self.public_url.trim_end_matches('/')
-            ))
-            .basic_auth(&client.client_id, Some(&client.client_secret))
-            .form(&form)
-            .send()
+            .token_request(client, &mut form)
             .await
             .map_err(|e| format!("client_credentials dial: {e}"))?;
         if !resp.status().is_success() {
@@ -684,21 +696,14 @@ impl HydraContainer {
         let callback = self
             .complete_authorization_redirect(auth.as_str(), &client.redirect_uri, &state)
             .await?;
-        let form = [
-            ("grant_type", "authorization_code"),
-            ("code", callback.code.as_str()),
-            ("redirect_uri", client.redirect_uri.as_str()),
-            ("code_verifier", verifier.as_str()),
+        let mut form = vec![
+            ("grant_type", "authorization_code".to_string()),
+            ("code", callback.code),
+            ("redirect_uri", client.redirect_uri.clone()),
+            ("code_verifier", verifier),
         ];
         let resp = self
-            .client
-            .post(format!(
-                "{}/oauth2/token",
-                self.public_url.trim_end_matches('/')
-            ))
-            .basic_auth(&client.client_id, Some(&client.client_secret))
-            .form(&form)
-            .send()
+            .token_request(client, &mut form)
             .await
             .map_err(|e| format!("auth_code token dial: {e}"))?;
         if !resp.status().is_success() {
@@ -718,6 +723,36 @@ impl HydraContainer {
             .and_then(Value::as_str)
             .map(str::to_string);
         Ok((access, refresh))
+    }
+
+    /// POST `/oauth2/token` using the client's registered auth method.
+    ///
+    /// `client_secret_basic` → HTTP Basic, form without credentials.
+    /// `client_secret_post` → credentials in the form body, no Authorization.
+    async fn token_request(
+        &self,
+        client: &HydraClient,
+        form: &mut Vec<(&str, String)>,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let url = format!(
+            "{}/oauth2/token",
+            self.public_url.trim_end_matches('/')
+        );
+        match client.token_endpoint_auth_method {
+            TokenEndpointAuthMethod::ClientSecretBasic => {
+                self.client
+                    .post(&url)
+                    .basic_auth(&client.client_id, Some(&client.client_secret))
+                    .form(form)
+                    .send()
+                    .await
+            }
+            TokenEndpointAuthMethod::ClientSecretPost => {
+                form.push(("client_id", client.client_id.clone()));
+                form.push(("client_secret", client.client_secret.clone()));
+                self.client.post(&url).form(form).send().await
+            }
+        }
     }
 }
 

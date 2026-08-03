@@ -24,7 +24,9 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::common::containers::fail_in_ci_else_skip;
-use crate::common::hydra::{FIXTURE_EMAIL, FIXTURE_ROLE, HydraContainer, start_hydra_container};
+use crate::common::hydra::{
+    FIXTURE_EMAIL, FIXTURE_ROLE, HydraContainer, TokenEndpointAuthMethod, start_hydra_container,
+};
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -109,7 +111,7 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
         .create_client(
             "intro-basic",
             redirect,
-            "client_secret_basic",
+            TokenEndpointAuthMethod::ClientSecretBasic,
             &["client_credentials", "authorization_code", "refresh_token"],
         )
         .await
@@ -118,11 +120,19 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
         .create_client(
             "intro-post",
             redirect,
-            "client_secret_post",
+            TokenEndpointAuthMethod::ClientSecretPost,
             &["client_credentials"],
         )
         .await
         .expect("post client");
+    assert_eq!(
+        basic_client.token_endpoint_auth_method,
+        TokenEndpointAuthMethod::ClientSecretBasic
+    );
+    assert_eq!(
+        post_client.token_endpoint_auth_method,
+        TokenEndpointAuthMethod::ClientSecretPost
+    );
 
     let active = hydra
         .client_credentials_token(&basic_client, "profile", Some(&basic_client.audience))
@@ -422,7 +432,7 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
         .create_client(
             "intro-claims",
             redirect,
-            "client_secret_basic",
+            TokenEndpointAuthMethod::ClientSecretBasic,
             &["authorization_code", "refresh_token"],
         )
         .await
@@ -519,7 +529,7 @@ async fn oauth2_live_introspection_failure_policy() {
         .create_client(
             "intro-fail",
             redirect,
-            "client_secret_basic",
+            TokenEndpointAuthMethod::ClientSecretBasic,
             &["client_credentials"],
         )
         .await

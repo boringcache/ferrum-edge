@@ -29,7 +29,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use crate::common::containers::fail_in_ci_else_skip;
 use crate::common::hydra::{
     FIXTURE_EMAIL, FIXTURE_ROLE, FIXTURE_SUBJECT, HydraClient, HydraContainer,
-    rewrite_authorization_nonce, start_hydra_container,
+    TokenEndpointAuthMethod, rewrite_authorization_nonce, start_hydra_container,
 };
 
 const SESSION_SECRET: &str = "01234567890123456789012345678901";
@@ -387,7 +387,7 @@ async fn oidc_live_discovery_login_session_and_claims() {
         .create_client(
             "oidc",
             &redirect_uri,
-            "client_secret_basic",
+            TokenEndpointAuthMethod::ClientSecretBasic,
             &["authorization_code", "refresh_token"],
         )
         .await
@@ -630,7 +630,7 @@ async fn oidc_live_session_expiry_refresh_and_logout() {
         .create_client(
             "oidc-sess",
             &redirect_uri,
-            "client_secret_basic",
+            TokenEndpointAuthMethod::ClientSecretBasic,
             &["authorization_code", "refresh_token"],
         )
         .await
