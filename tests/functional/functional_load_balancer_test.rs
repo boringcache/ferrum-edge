@@ -2377,10 +2377,7 @@ plugin_configs: []
         .write_all(config.as_bytes())
         .unwrap();
 
-    let s1 = tokio::spawn(serve_identifying_listener(
-        healthy_listener,
-        "tcp-healthy",
-    ));
+    let s1 = tokio::spawn(serve_identifying_listener(healthy_listener, "tcp-healthy"));
 
     let (mut gateway, proxy_port, _admin_port) =
         start_gateway_with_retry(config_path.to_str().unwrap()).await;
@@ -2406,11 +2403,7 @@ plugin_configs: []
             }
             Err(_) => false,
         };
-        consecutive_healthy = if healthy {
-            consecutive_healthy + 1
-        } else {
-            0
-        };
+        consecutive_healthy = if healthy { consecutive_healthy + 1 } else { 0 };
         if consecutive_healthy < 4 {
             sleep(Duration::from_millis(100)).await;
         }
