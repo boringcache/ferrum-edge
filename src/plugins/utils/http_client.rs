@@ -1434,7 +1434,9 @@ mod fallback_tests {
                 .await
                 .expect("read fallback resolver request");
             assert!(
-                request.get(..request_len).is_some_and(|bytes| bytes.starts_with(b"GET ")),
+                request
+                    .get(..request_len)
+                    .is_some_and(|bytes| bytes.starts_with(b"GET ")),
                 "fallback resolver listener did not receive an HTTP request"
             );
             socket
