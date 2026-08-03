@@ -1934,12 +1934,16 @@ async fn grpc_channel_body_forwards_frames_in_order_then_clean_eof() {
 
     let (tx, body, exceeded) = grpc_channel_body(0); // 0 = unlimited
     let pump = tokio::spawn(async move {
-        tx.send(Ok(http_body::Frame::data(bytes::Bytes::from_static(b"msg1"))))
-            .await
-            .unwrap();
-        tx.send(Ok(http_body::Frame::data(bytes::Bytes::from_static(b"msg2"))))
-            .await
-            .unwrap();
+        tx.send(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+            b"msg1",
+        ))))
+        .await
+        .unwrap();
+        tx.send(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+            b"msg2",
+        ))))
+        .await
+        .unwrap();
         // Drop `tx` → channel closes → body observes a clean END_STREAM.
     });
     let collected = body
@@ -2029,17 +2033,26 @@ async fn grpc_channel_body_forwards_request_trailers_after_data() {
 
     let (tx, mut body, _exceeded) = grpc_channel_body(64);
     let pump = tokio::spawn(async move {
-        tx.send(Ok(http_body::Frame::data(bytes::Bytes::from_static(b"message"))))
-            .await
-            .unwrap();
+        tx.send(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+            b"message",
+        ))))
+        .await
+        .unwrap();
         let mut trailers = http::HeaderMap::new();
-        trailers.insert("x-request-checksum", http::HeaderValue::from_static("sha256:test"));
+        trailers.insert(
+            "x-request-checksum",
+            http::HeaderValue::from_static("sha256:test"),
+        );
         tx.send(Ok(http_body::Frame::trailers(trailers)))
             .await
             .unwrap();
     });
 
-    let data = body.frame().await.expect("data frame").expect("data frame ok");
+    let data = body
+        .frame()
+        .await
+        .expect("data frame")
+        .expect("data frame ok");
     assert_eq!(data.into_data().expect("DATA").as_ref(), b"message");
     let trailers = body
         .frame()
@@ -2049,7 +2062,10 @@ async fn grpc_channel_body_forwards_request_trailers_after_data() {
         .into_trailers()
         .expect("TRAILERS");
     assert_eq!(trailers.get("x-request-checksum").unwrap(), "sha256:test");
-    assert!(body.frame().await.is_none(), "trailers must terminate the body");
+    assert!(
+        body.frame().await.is_none(),
+        "trailers must terminate the body"
+    );
     pump.await.unwrap();
 }
 

@@ -379,7 +379,9 @@ async fn h3_grpc_streaming_forwards_sanitized_request_trailers() {
         .expect("recv body+trailers");
     assert_eq!(status.as_u16(), 200);
     assert_eq!(
-        trailers.get("grpc-status").and_then(|value| value.to_str().ok()),
+        trailers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
         Some("0")
     );
 
@@ -820,11 +822,15 @@ async fn h3_grpc_backend_error_arrives_before_client_half_close() {
         .expect("recv body+trailers before request EOF");
     assert_eq!(status.as_u16(), 200);
     assert_eq!(
-        trailers.get("grpc-status").and_then(|value| value.to_str().ok()),
+        trailers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
         Some("13")
     );
     assert_eq!(
-        trailers.get("grpc-message").and_then(|value| value.to_str().ok()),
+        trailers
+            .get("grpc-message")
+            .and_then(|value| value.to_str().ok()),
         Some("rejected early")
     );
     assert!(
@@ -902,13 +908,18 @@ async fn h3_grpc_large_slow_upload_reaches_backend_before_eof() {
         .expect("recv body+trailers");
     assert_eq!(status.as_u16(), 200);
     assert_eq!(
-        trailers.get("grpc-status").and_then(|value| value.to_str().ok()),
+        trailers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
         Some("0")
     );
 
     let received = backend.received_streams().await;
     let expected_bytes = 32 * (payload.len() + 5);
-    assert_eq!(received.first().expect("backend request").body.len(), expected_bytes);
+    assert_eq!(
+        received.first().expect("backend request").body.len(),
+        expected_bytes
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

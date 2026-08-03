@@ -121,8 +121,8 @@ use crate::proxy::headers::{
     ClientResponseFraming, GatewayOwnedResponseHeaders, PrePolicyResponseHeaders,
     RejectBodyDisposition, ResponseTrailerGovernance, TrailerSectionKind, apply_response_headers,
     is_backend_response_strip_header, parse_connection_listed_headers,
-    reconcile_streaming_backend_trailers, sanitize_client_response_headers_for_wire,
-    sanitize_backend_request_trailers, strip_response_hop_by_hop_trailers,
+    reconcile_streaming_backend_trailers, sanitize_backend_request_trailers,
+    sanitize_client_response_headers_for_wire, strip_response_hop_by_hop_trailers,
 };
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
@@ -5878,8 +5878,7 @@ pub(crate) async fn dispatch_grpc_streaming(
     // the plain bridge uses). `Err(())` signals a frontend upload failure so the
     // backend is RST rather than handed a truncated-but-clean END_STREAM.
     let capacity = state.env_config.http3_request_body_channel_capacity.max(1);
-    let (tx, rx) =
-        tokio::sync::mpsc::channel::<Result<http_body::Frame<Bytes>, ()>>(capacity);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<http_body::Frame<Bytes>, ()>>(capacity);
     let request_bytes_seen = Arc::new(AtomicU64::new(0));
     let pump_bytes = Arc::clone(&request_bytes_seen);
     // Set by the pump when the H3 recv half errors (the client reset its upload).

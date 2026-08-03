@@ -887,7 +887,7 @@ async fn run_script(
                         }
                         None => {
                             return Err(
-                                "ReadRequestData: request reached EOF before DATA arrived".into(),
+                                "ReadRequestData: request reached EOF before DATA arrived".into()
                             );
                         }
                     };
