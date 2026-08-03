@@ -166,10 +166,7 @@ struct H3RequestPumpShutdownGuard {
 }
 
 impl H3RequestPumpShutdownGuard {
-    fn new(
-        shutdown: Arc<tokio::sync::Notify>,
-        backend_upload_cancelled: Arc<AtomicBool>,
-    ) -> Self {
+    fn new(shutdown: Arc<tokio::sync::Notify>, backend_upload_cancelled: Arc<AtomicBool>) -> Self {
         Self {
             shutdown: Some(shutdown),
             backend_upload_cancelled,
@@ -187,8 +184,7 @@ impl Drop for H3RequestPumpShutdownGuard {
             // Publish cancellation before waking the pump. Otherwise hyper can
             // poll DATA already queued by the pump in the notification-to-flag
             // window and forward it after the owning bridge was cancelled.
-            self.backend_upload_cancelled
-                .store(true, Ordering::Release);
+            self.backend_upload_cancelled.store(true, Ordering::Release);
             shutdown.notify_one();
         }
     }

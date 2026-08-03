@@ -2100,7 +2100,11 @@ async fn grpc_channel_body_cancellation_preempts_queued_data_with_error() {
         .await
         .expect("cancellation frame")
         .expect_err("cancellation must error the backend request body");
-    assert!(error.to_string().contains("cancelled before downstream EOF"));
+    assert!(
+        error
+            .to_string()
+            .contains("cancelled before downstream EOF")
+    );
     assert!(body.frame().await.is_none());
     assert!(!exceeded.load(Ordering::Acquire));
     assert_eq!(forwarded.load(Ordering::Relaxed), 0);
@@ -2134,7 +2138,11 @@ async fn grpc_channel_body_cancellation_stays_terminal_after_a_pending_poll() {
         .await
         .expect("cancellation frame")
         .expect_err("published cancellation must preempt newly queued data");
-    assert!(error.to_string().contains("cancelled before downstream EOF"));
+    assert!(
+        error
+            .to_string()
+            .contains("cancelled before downstream EOF")
+    );
     assert!(body.frame().await.is_none());
     assert!(!exceeded.load(Ordering::Acquire));
     assert_eq!(forwarded.load(Ordering::Relaxed), 0);

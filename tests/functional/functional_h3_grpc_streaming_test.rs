@@ -366,10 +366,7 @@ async fn h3_grpc_streaming_forwards_sanitized_request_trailers() {
         "x-consumer-username",
         http::HeaderValue::from_static("forged"),
     );
-    request_trailers.insert(
-        "x-geo-country",
-        http::HeaderValue::from_static("XX"),
-    );
+    request_trailers.insert("x-geo-country", http::HeaderValue::from_static("XX"));
     request_trailers.insert(
         "x-forwarded-for",
         http::HeaderValue::from_static("203.0.113.44"),
