@@ -486,6 +486,80 @@ fn merge_bind_failures(base: &mut Vec<StreamBindFailure>, additional: &[StreamBi
     }
 }
 
+/// Proxy fields needed to derive the same runtime listener key that
+/// [`StreamListenerManager::reconcile`] uses in `effective_desired`.
+struct StreamListenerKeyCandidate {
+    identity: NamespacedResourceId,
+    port: u16,
+    scheme: BackendScheme,
+    frontend_tls: bool,
+    passthrough: bool,
+    has_hosts: bool,
+    has_stream_match: bool,
+}
+
+/// Returns `(sni_group_ports, l4_group_ports)` using the same grouping rules
+/// as `reconcile`'s `passthrough_groups` / `l4_match_groups` construction.
+fn stream_listener_group_ports(
+    candidates: &[StreamListenerKeyCandidate],
+) -> (
+    std::collections::HashSet<u16>,
+    std::collections::HashSet<u16>,
+) {
+    let mut passthrough_by_port: std::collections::HashMap<u16, (usize, bool)> =
+        std::collections::HashMap::new();
+    let mut l4_by_port: std::collections::HashMap<u16, (usize, bool)> =
+        std::collections::HashMap::new();
+
+    for candidate in candidates {
+        if candidate.passthrough {
+            let entry = passthrough_by_port.entry(candidate.port).or_default();
+            entry.0 += 1;
+            entry.1 |= candidate.has_hosts;
+        } else if matches!(
+            candidate.scheme,
+            BackendScheme::Tcp | BackendScheme::Tcps
+        ) {
+            let entry = l4_by_port.entry(candidate.port).or_default();
+            entry.0 += 1;
+            entry.1 |= candidate.has_stream_match;
+        }
+    }
+
+    let sni_ports: std::collections::HashSet<u16> = passthrough_by_port
+        .into_iter()
+        .filter(|(_, (count, has_hosts))| *count > 1 || *has_hosts)
+        .map(|(port, _)| port)
+        .collect();
+
+    let l4_ports: std::collections::HashSet<u16> = l4_by_port
+        .into_iter()
+        .filter(|(port, (count, has_constrained))| {
+            *count > 1 && *has_constrained && !sni_ports.contains(port)
+        })
+        .map(|(port, _)| port)
+        .collect();
+
+    (sni_ports, l4_ports)
+}
+
+fn stream_listener_runtime_key(
+    candidate: &StreamListenerKeyCandidate,
+    sni_ports: &std::collections::HashSet<u16>,
+    l4_ports: &std::collections::HashSet<u16>,
+) -> String {
+    if candidate.passthrough && sni_ports.contains(&candidate.port) {
+        format!("__sni_{}", candidate.port)
+    } else if !candidate.passthrough
+        && matches!(candidate.scheme, BackendScheme::Tcp | BackendScheme::Tcps)
+        && l4_ports.contains(&candidate.port)
+    {
+        format!("__l4_{}", candidate.port)
+    } else {
+        candidate.identity.runtime_key()
+    }
+}
+
 #[cfg(test)]
 mod bind_failure_snapshot_tests {
     use super::*;
@@ -542,6 +616,88 @@ mod bind_failure_snapshot_tests {
         assert_eq!(later_reconcile.len(), 1);
         assert_eq!(later_reconcile[0].proxy_id, "async-bind");
         assert_eq!(later_reconcile[0].listen_port, 9443);
+    }
+}
+
+#[cfg(test)]
+mod stream_listener_runtime_key_tests {
+    use super::*;
+    use crate::config::types::default_namespace;
+
+    fn candidate(
+        id: &str,
+        port: u16,
+        scheme: BackendScheme,
+        passthrough: bool,
+        has_hosts: bool,
+        has_stream_match: bool,
+    ) -> StreamListenerKeyCandidate {
+        StreamListenerKeyCandidate {
+            identity: NamespacedResourceId::new(default_namespace(), id.to_string()),
+            port,
+            scheme,
+            frontend_tls: false,
+            passthrough,
+            has_hosts,
+            has_stream_match,
+        }
+    }
+
+    #[test]
+    fn shared_non_passthrough_l4_candidates_use_group_key() {
+        let port = 9443;
+        let candidates = vec![
+            candidate("catchall", port, BackendScheme::Tcp, false, false, false),
+            candidate("constrained", port, BackendScheme::Tcp, false, false, true),
+        ];
+        let (sni_ports, l4_ports) = stream_listener_group_ports(&candidates);
+        assert!(sni_ports.is_empty());
+        assert_eq!(l4_ports, std::collections::HashSet::from([port]));
+        assert_eq!(
+            stream_listener_runtime_key(&candidates[0], &sni_ports, &l4_ports),
+            format!("__l4_{port}")
+        );
+    }
+
+    #[test]
+    fn lone_constrained_tcp_candidate_stays_individual() {
+        let port = 9443;
+        let candidates = vec![candidate(
+            "solo",
+            port,
+            BackendScheme::Tcp,
+            false,
+            false,
+            true,
+        )];
+        let (sni_ports, l4_ports) = stream_listener_group_ports(&candidates);
+        assert!(sni_ports.is_empty());
+        assert!(l4_ports.is_empty());
+        assert_eq!(
+            stream_listener_runtime_key(&candidates[0], &sni_ports, &l4_ports),
+            candidates[0].identity.runtime_key()
+        );
+    }
+
+    #[test]
+    fn passthrough_sni_port_blocks_l4_grouping() {
+        let port = 9443;
+        let candidates = vec![
+            candidate("pt", port, BackendScheme::Tcp, true, true, false),
+            candidate("catchall", port, BackendScheme::Tcp, false, false, false),
+            candidate("constrained", port, BackendScheme::Tcp, false, false, true),
+        ];
+        let (sni_ports, l4_ports) = stream_listener_group_ports(&candidates);
+        assert_eq!(sni_ports, std::collections::HashSet::from([port]));
+        assert!(l4_ports.is_empty());
+        assert_eq!(
+            stream_listener_runtime_key(&candidates[0], &sni_ports, &l4_ports),
+            format!("__sni_{port}")
+        );
+        assert_eq!(
+            stream_listener_runtime_key(&candidates[1], &sni_ports, &l4_ports),
+            candidates[1].identity.runtime_key()
+        );
     }
 }
 
@@ -2214,65 +2370,44 @@ impl StreamListenerManager {
 
         loop {
             let current_config = self.config.load();
-            let desired: Vec<(NamespacedResourceId, u16, BackendScheme, bool, bool, bool)> =
-                current_config
-                    .proxies
-                    .iter()
-                    .filter(|p| p.dispatch_kind.is_stream())
-                    .filter_map(|p| {
-                        p.listen_port.map(|port| {
-                            (
-                                NamespacedResourceId::new(p.namespace.clone(), p.id.clone()),
-                                port,
-                                p.effective_scheme(),
-                                p.frontend_tls,
-                                p.passthrough,
-                                !p.hosts.is_empty(),
-                            )
-                        })
+            let candidates: Vec<StreamListenerKeyCandidate> = current_config
+                .proxies
+                .iter()
+                .filter(|p| p.dispatch_kind.is_stream())
+                .filter_map(|p| {
+                    p.listen_port.map(|port| StreamListenerKeyCandidate {
+                        identity: NamespacedResourceId::new(p.namespace.clone(), p.id.clone()),
+                        port,
+                        scheme: p.effective_scheme(),
+                        frontend_tls: p.frontend_tls,
+                        passthrough: p.passthrough,
+                        has_hosts: !p.hosts.is_empty(),
+                        has_stream_match: p
+                            .stream_match
+                            .as_ref()
+                            .is_some_and(|m| !m.is_empty()),
                     })
-                    .collect();
+                })
+                .collect();
 
-            if desired.is_empty() {
+            if candidates.is_empty() {
                 return Ok(());
             }
 
-            // Detect SNI port groups to map proxy_ids to their listener key.
-            let mut pt_ports: std::collections::HashMap<u16, (usize, bool)> =
-                std::collections::HashMap::new();
-            for (_, port, _, _, passthrough, has_hosts) in &desired {
-                if *passthrough {
-                    let entry = pt_ports.entry(*port).or_default();
-                    entry.0 += 1;
-                    entry.1 |= *has_hosts;
-                }
-            }
+            let (sni_ports, l4_ports) = stream_listener_group_ports(&candidates);
 
             let all_started = {
                 let listeners = self.listeners.lock().await;
-                desired
-                    .iter()
-                    .all(|(identity, port, scheme, frontend_tls, passthrough, _)| {
-                        // For SNI groups the listener key is "__sni_{port}";
-                        // individual listeners are keyed by the namespace-
-                        // qualified `namespace|id` runtime key, matching
-                        // `reconcile`'s `effective_desired`.
-                        let key = if *passthrough
-                            && pt_ports
-                                .get(port)
-                                .is_some_and(|(count, has_hosts)| *count > 1 || *has_hosts)
-                        {
-                            format!("__sni_{}", port)
-                        } else {
-                            identity.runtime_key()
-                        };
-                        listeners.get(&key).is_some_and(|handle| {
-                            handle.listen_port == *port
-                                && handle.scheme == *scheme
-                                && handle.frontend_tls == *frontend_tls
-                                && handle.started.load(Ordering::Acquire)
-                        })
+                candidates.iter().all(|candidate| {
+                    let key =
+                        stream_listener_runtime_key(candidate, &sni_ports, &l4_ports);
+                    listeners.get(&key).is_some_and(|handle| {
+                        handle.listen_port == candidate.port
+                            && handle.scheme == candidate.scheme
+                            && handle.frontend_tls == candidate.frontend_tls
+                            && handle.started.load(Ordering::Acquire)
                     })
+                })
             };
 
             if all_started {
