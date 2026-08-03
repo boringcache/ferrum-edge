@@ -2225,41 +2225,41 @@ fn translate_to_gemini(openai_body: &Value) -> Result<Vec<u8>, String> {
         body["generationConfig"] = Value::Object(gen_config);
     }
 
-    if let Some(tools) = openai_body.get("tools") {
-        if !tools.is_null() {
-            let tools = tools
-                .as_array()
-                .ok_or_else(|| "unsupported or malformed tools".to_string())?;
-            if !tools.is_empty() {
-                let mut declarations = Vec::with_capacity(tools.len());
-                for tool in tools {
-                    if tool.get("type").and_then(Value::as_str) != Some("function") {
-                        return Err("unsupported or malformed tools".to_string());
-                    }
-                    let function = tool
-                        .get("function")
-                        .and_then(Value::as_object)
-                        .ok_or_else(|| "unsupported or malformed tools".to_string())?;
-                    let name = function
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .filter(|n| valid_tool_name(n))
-                        .ok_or_else(|| "unsupported or malformed tools".to_string())?;
-                    let mut declaration = serde_json::Map::new();
-                    declaration.insert("name".to_string(), Value::String(name.to_string()));
-                    if let Some(description) = function.get("description").and_then(Value::as_str) {
-                        declaration.insert(
-                            "description".to_string(),
-                            Value::String(description.to_string()),
-                        );
-                    }
-                    if let Some(parameters) = function.get("parameters") {
-                        declaration.insert("parameters".to_string(), parameters.clone());
-                    }
-                    declarations.push(Value::Object(declaration));
+    if let Some(tools) = openai_body.get("tools")
+        && !tools.is_null()
+    {
+        let tools = tools
+            .as_array()
+            .ok_or_else(|| "unsupported or malformed tools".to_string())?;
+        if !tools.is_empty() {
+            let mut declarations = Vec::with_capacity(tools.len());
+            for tool in tools {
+                if tool.get("type").and_then(Value::as_str) != Some("function") {
+                    return Err("unsupported or malformed tools".to_string());
                 }
-                body["tools"] = json!([{ "functionDeclarations": declarations }]);
+                let function = tool
+                    .get("function")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| "unsupported or malformed tools".to_string())?;
+                let name = function
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|n| valid_tool_name(n))
+                    .ok_or_else(|| "unsupported or malformed tools".to_string())?;
+                let mut declaration = serde_json::Map::new();
+                declaration.insert("name".to_string(), Value::String(name.to_string()));
+                if let Some(description) = function.get("description").and_then(Value::as_str) {
+                    declaration.insert(
+                        "description".to_string(),
+                        Value::String(description.to_string()),
+                    );
+                }
+                if let Some(parameters) = function.get("parameters") {
+                    declaration.insert("parameters".to_string(), parameters.clone());
+                }
+                declarations.push(Value::Object(declaration));
             }
+            body["tools"] = json!([{ "functionDeclarations": declarations }]);
         }
     }
     if let Some(choice) = resolve_gemini_tool_choice(openai_body)? {
@@ -4222,11 +4222,11 @@ impl AnthropicSseNormalizer {
             return;
         }
         let mut terminal = terminal;
-        if terminal == StreamTerminal::MessageStop {
-            if let Err(message) = self.write_usage_line(out) {
-                self.emit_upstream_error(message, out);
-                terminal = StreamTerminal::ProviderError;
-            }
+        if terminal == StreamTerminal::MessageStop
+            && let Err(message) = self.write_usage_line(out)
+        {
+            self.emit_upstream_error(message, out);
+            terminal = StreamTerminal::ProviderError;
         }
         self.done_emitted = true;
         self.terminal = Some(terminal);
@@ -4766,11 +4766,11 @@ impl GeminiStreamNormalizer {
             return;
         }
         let mut terminal = terminal;
-        if terminal == StreamTerminal::MessageStop {
-            if let Err(message) = self.write_usage_line(out) {
-                self.emit_upstream_error(message, out);
-                terminal = StreamTerminal::ProviderError;
-            }
+        if terminal == StreamTerminal::MessageStop
+            && let Err(message) = self.write_usage_line(out)
+        {
+            self.emit_upstream_error(message, out);
+            terminal = StreamTerminal::ProviderError;
         }
         self.done_emitted = true;
         self.terminal = Some(terminal);
