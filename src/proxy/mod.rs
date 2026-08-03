@@ -8928,9 +8928,13 @@ impl ProxyState {
 
         fn authored_targets_eq(a: &Upstream, b: &Upstream) -> bool {
             if a.targets.len() != b.targets.len()
-                || !a.targets.iter().zip(&b.targets).all(|(a_target, b_target)| {
-                    a_target.service_port_policy_key == b_target.service_port_policy_key
-                })
+                || !a
+                    .targets
+                    .iter()
+                    .zip(&b.targets)
+                    .all(|(a_target, b_target)| {
+                        a_target.service_port_policy_key == b_target.service_port_policy_key
+                    })
             {
                 return false;
             }
@@ -8955,8 +8959,8 @@ impl ProxyState {
             .collect();
 
         for replacement in modified {
-            let Some(old_upstream) = old_upstreams
-                .get(&(replacement.namespace.as_str(), replacement.id.as_str()))
+            let Some(old_upstream) =
+                old_upstreams.get(&(replacement.namespace.as_str(), replacement.id.as_str()))
             else {
                 continue;
             };

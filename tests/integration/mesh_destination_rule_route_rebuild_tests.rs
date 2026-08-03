@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use ferrum_edge::config::types::{
-    Consumer, DnsSdConfig, GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, Proxy,
-    MeshSdConfig, SdProvider, ServiceDiscoveryConfig, Upstream, UpstreamLocalityLbSetting,
+    Consumer, DnsSdConfig, GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, MeshSdConfig,
+    Proxy, SdProvider, ServiceDiscoveryConfig, Upstream, UpstreamLocalityLbSetting,
     UpstreamPortOverride, UpstreamTarget,
 };
 use ferrum_edge::config::{EnvConfig, OperatingMode};
