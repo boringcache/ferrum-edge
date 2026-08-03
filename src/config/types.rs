@@ -6913,10 +6913,10 @@ impl Proxy {
                     "stream_match is only valid for stream proxies (tcp, tcps, udp, dtls)"
                         .to_string(),
                 );
-            } else if !criteria.is_empty() {
-                if let Err(e) = criteria.compile() {
-                    errors.push(format!("stream_match: {e}"));
-                }
+            } else if !criteria.is_empty()
+                && let Err(e) = criteria.compile()
+            {
+                errors.push(format!("stream_match: {e}"));
             }
         }
 
