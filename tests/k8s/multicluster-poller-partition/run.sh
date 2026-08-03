@@ -47,22 +47,6 @@ INITIAL_FEDERATION_FAILURES=0 INITIAL_DISCOVERY_FAILURES=0
 TRANSIENT_FEDERATION_FAILURE_DELTA=0 TRANSIENT_DISCOVERY_FAILURE_DELTA=0
 RECORDED=" "
 
-REQUIRED_LIVE_ASSERTIONS=(
-  multicluster_poller.initial.polled_trust_endpoints_installed
-  multicluster_poller.transient.last_good_retained
-  multicluster_poller.transient.cache_age_increased
-  multicluster_poller.endpoint.expired_fail_closed
-  multicluster_poller.endpoint.remote_target_removed
-  multicluster_poller.endpoint.recovered_same_generation
-  multicluster_poller.trust.expired_fail_closed
-  multicluster_poller.trust.inbound_outbound_recomputed
-  multicluster_poller.trust.recovered_same_generation
-  multicluster_poller.metrics.failure_backoff_recovery_bounded
-  multicluster_poller.metrics.admin_status_parity
-  multicluster_poller.withdrawal.inflight_generation_retired
-  multicluster_poller.withdrawal.retired_state_not_reinstalled
-)
-
 mkdir -p "$RESULTS_DIR" "$ARTIFACT_DIR"
 
 log() { printf '\n[multicluster-poller] %s\n' "$*"; }
@@ -282,7 +266,7 @@ spire_parent_id_for_node() {
 
 spire_register_workload() {
   # Closed call contract: exactly one node selector beyond ns/sa (see sole caller).
-  # A dynamic argv array here is an opaque executable surface to the trusted Cross
+  # A dynamic argv array here is opaque to the trusted build-policy
   # verifier for newly added automation, so keep the create dispatch fully literal.
   local context="$1" namespace="$2" spiffe_id="$3" parent_id="$4"
   local workload_namespace="$5" service_account="$6" node_selector="$7"
@@ -650,7 +634,16 @@ projected_config_withdrawn() {
 }
 
 signal_reload() {
-  local context="$1" pid
+  local context="$1" pod pid
+  pod="$(kubectl --context "$context" -n "$NS" --request-timeout=10s \
+    get pod -l app=echo --field-selector=status.phase=Running \
+      -o jsonpath='{.items[0].metadata.name}')" || return 1
+  [[ -n "$pod" ]] || { echo "no running echo pod found for ConfigMap refresh" >&2; return 1; }
+  # Mutate only the live Pod object. This prompts kubelet to refresh its projected
+  # ConfigMap without replacing the Pod or the in-flight poll generation.
+  kubectl --context "$context" -n "$NS" --request-timeout=10s \
+    annotate pod "$pod" \
+      "ferrum-edge.io/projected-config-refresh=withdrawal-$SECONDS" --overwrite
   wait_for_projected_withdrawal "projected withdrawn mesh config" 30 "$context"
   pid="$(kubectl --context "$context" -n "$NS" exec deploy/echo -c signal -- \
     pidof ferrum-edge)" || return 1
@@ -899,8 +892,21 @@ main() {
   scenario_trust_expiry
   scenario_inflight_withdrawal
   collect_diagnostics
+  # Keep the required assertion argv literal for trusted automation inspection.
   python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py require "$LIVE_ASSERTIONS_FILE" \
-    "${REQUIRED_LIVE_ASSERTIONS[@]}"
+    multicluster_poller.initial.polled_trust_endpoints_installed \
+    multicluster_poller.transient.last_good_retained \
+    multicluster_poller.transient.cache_age_increased \
+    multicluster_poller.endpoint.expired_fail_closed \
+    multicluster_poller.endpoint.remote_target_removed \
+    multicluster_poller.endpoint.recovered_same_generation \
+    multicluster_poller.trust.expired_fail_closed \
+    multicluster_poller.trust.inbound_outbound_recomputed \
+    multicluster_poller.trust.recovered_same_generation \
+    multicluster_poller.metrics.failure_backoff_recovery_bounded \
+    multicluster_poller.metrics.admin_status_parity \
+    multicluster_poller.withdrawal.inflight_generation_retired \
+    multicluster_poller.withdrawal.retired_state_not_reinstalled
   log "all poller partition boundaries passed"
 }
 
