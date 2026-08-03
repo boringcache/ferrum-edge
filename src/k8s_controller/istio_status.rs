@@ -18,9 +18,10 @@
 //!   matched and which `connectionPool` knobs landed vs. were deferred.
 //! - `VirtualService` — status reports host/HTTP-route counts. `tcp`/`tls` L4
 //!   route blocks are translated to stream proxies (port / SNI-passthrough);
-//!   HTTP `mirror`/`rewrite`/`redirect`/`corsPolicy` are translated. Unsupported
-//!   L4 match predicates (source/CIDR/gateways) and weighted splitting are
-//!   rejected fail-closed (`Invalid`).
+//!   HTTP `mirror`/`rewrite`/`redirect`/`corsPolicy` are translated. L4 match
+//!   predicates (source identity/labels, CIDRs, and gateways) compile onto the
+//!   stream matcher; malformed predicates and weighted splitting are rejected
+//!   fail-closed (`Invalid`).
 //! - `ServiceEntry` — status reports the resolved `resolution`/`location`
 //!   and host/endpoint/port counts.
 //! - `RequestAuthentication` — status reports the resolved scope and the
@@ -834,7 +835,8 @@ fn accepted_status(
 /// Status for `VirtualService`. The translator consumes `spec.http` routes
 /// (incl. `mirror` / `rewrite` / `redirect` / `corsPolicy`) and `spec.tcp` /
 /// `spec.tls` L4 route blocks (translated to stream proxies: port / SNI
-/// passthrough). Unsupported L4 match predicates / weighted splitting and any
+/// passthrough) with supported L4 match predicates compiled onto
+/// `Proxy.stream_match`. Malformed predicates, weighted splitting, and any
 /// other `K8sTranslateError` (bad backend, etc.) surface through the `Invalid`
 /// arm. `corsPolicy` is deferred only for a policy combination Ferrum cannot
 /// represent faithfully (a malformed/unknown origin matcher, an over-budget

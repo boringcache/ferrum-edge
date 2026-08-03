@@ -126,15 +126,15 @@ impl StreamMatchArm {
         let source_subnets = compile_cidr_list(&self.source_subnets, "source_subnets")?;
         let destination_subnets =
             compile_cidr_list(&self.destination_subnets, "destination_subnets")?;
-        for (key, value) in &self.source_labels {
+        for (index, (key, value)) in self.source_labels.iter().enumerate() {
             if !valid_kubernetes_label_key(key) {
                 return Err(format!(
-                    "source_labels key '{key}' is not a valid Kubernetes label key"
+                    "source_labels entry {index} has an invalid Kubernetes label key"
                 ));
             }
             if !valid_kubernetes_label_value(value) {
                 return Err(format!(
-                    "source_labels['{key}'] is not a valid Kubernetes label value"
+                    "source_labels entry {index} has an invalid Kubernetes label value"
                 ));
             }
         }
@@ -529,18 +529,24 @@ pub fn gateway_names_equal(configured: &str, binding: &str) -> bool {
 /// Canonicalize an Istio gateway reference relative to the VirtualService
 /// namespace. Accepts `mesh`, `name` (→ `{vs_namespace}/name`), or `ns/name`.
 pub fn canonicalize_gateway_name(raw: &str, vs_namespace: &str) -> Result<String, String> {
+    if raw.len() > MAX_STREAM_MATCH_GATEWAY_LENGTH {
+        return Err(format!(
+            "gateway name must be at most {MAX_STREAM_MATCH_GATEWAY_LENGTH} characters"
+        ));
+    }
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("gateway name must not be empty".to_string());
+    }
+    if trimmed != raw {
+        return Err("gateway name must not contain surrounding whitespace".to_string());
     }
     if trimmed == MESH_GATEWAY_TOKEN {
         return Ok(MESH_GATEWAY_TOKEN.to_string());
     }
     if let Some((ns, name)) = trimmed.split_once('/') {
         if ns.is_empty() || name.is_empty() || name.contains('/') {
-            return Err(format!(
-                "gateway '{trimmed}' must be 'mesh', '<name>', or '<namespace>/<name>'"
-            ));
+            return Err("gateway must be 'mesh', '<name>', or '<namespace>/<name>'".to_string());
         }
         validate_kubernetes_namespace(ns).map_err(|e| format!("gateway namespace: {e}"))?;
         validate_gateway_name_segment(name)?;
@@ -584,33 +590,24 @@ pub fn validate_canonical_gateway_ref(raw: &str) -> Result<(), String> {
 
 /// Validate a Kubernetes namespace (DNS-1123 label, 1-63 bytes).
 pub fn validate_kubernetes_namespace(namespace: &str) -> Result<(), String> {
-    validate_gateway_name_segment(namespace).map_err(|_| {
-        format!(
-            "namespace '{namespace}' must be a lowercase DNS-1123 label (1-63 chars)"
-        )
-    })
+    validate_gateway_name_segment(namespace)
+        .map_err(|_| "namespace must be a lowercase DNS-1123 label (1-63 chars)".to_string())
 }
 
 fn validate_gateway_name_segment(name: &str) -> Result<(), String> {
     // Istio Gateway metadata.name is a DNS-1123 label.
     if name.is_empty() || name.len() > 63 {
-        return Err(format!(
-            "gateway name '{name}' must be a DNS-1123 label (1-63 chars)"
-        ));
+        return Err("gateway name must be a DNS-1123 label (1-63 chars)".to_string());
     }
     let bytes = name.as_bytes();
     if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
-        return Err(format!(
-            "gateway name '{name}' must start and end with alphanumeric"
-        ));
+        return Err("gateway name must start and end with alphanumeric".to_string());
     }
     if !bytes
         .iter()
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
     {
-        return Err(format!(
-            "gateway name '{name}' must be a lowercase DNS-1123 label"
-        ));
+        return Err("gateway name must be a lowercase DNS-1123 label".to_string());
     }
     Ok(())
 }
@@ -816,6 +813,8 @@ mod tests {
             canonicalize_gateway_name("mesh", "default").unwrap(),
             "mesh"
         );
+        assert!(canonicalize_gateway_name(" ingress", "default").is_err());
+        assert!(canonicalize_gateway_name("ingress ", "default").is_err());
     }
 
     #[test]

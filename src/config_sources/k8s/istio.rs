@@ -2426,6 +2426,7 @@ fn parse_l4_match_arm(
     vs_gateways: &[String],
 ) -> Result<Option<crate::proxy::stream_match::StreamMatchArm>, K8sTranslateError> {
     use crate::proxy::stream_match::{
+        MAX_STREAM_MATCH_GATEWAYS, MAX_STREAM_MATCH_GATEWAY_LENGTH, MAX_STREAM_MATCH_LABELS,
         StreamMatchArm, canonicalize_gateway_name, valid_kubernetes_label_key,
         valid_kubernetes_label_value,
     };
@@ -2447,26 +2448,36 @@ fn parse_l4_match_arm(
                 format!("VirtualService {kind}[] match.sourceLabels must not be empty when set"),
             ));
         }
-        for (key, value) in labels {
+        if labels.len() > MAX_STREAM_MATCH_LABELS {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[] match.sourceLabels must contain at most {MAX_STREAM_MATCH_LABELS} entries"
+                ),
+            ));
+        }
+        for (index, (key, value)) in labels.iter().enumerate() {
             if !valid_kubernetes_label_key(key) {
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "VirtualService {kind}[] match.sourceLabels key '{key}' is not a valid Kubernetes label key"
+                        "VirtualService {kind}[] match.sourceLabels entry {index} has an invalid Kubernetes label key"
                     ),
                 ));
             }
             let Some(value) = value.as_str() else {
                 return Err(invalid_resource(
                     object,
-                    format!("VirtualService {kind}[] match.sourceLabels['{key}'] must be a string"),
+                    format!(
+                        "VirtualService {kind}[] match.sourceLabels entry {index} must have a string value"
+                    ),
                 ));
             };
             if !valid_kubernetes_label_value(value) {
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "VirtualService {kind}[] match.sourceLabels['{key}'] is not a valid Kubernetes label value"
+                        "VirtualService {kind}[] match.sourceLabels entry {index} has an invalid Kubernetes label value"
                     ),
                 ));
             }
@@ -2521,6 +2532,14 @@ fn parse_l4_match_arm(
                 format!("VirtualService {kind}[] match.gateways must not be empty when set"),
             ));
         }
+        if arr.len() > MAX_STREAM_MATCH_GATEWAYS {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[] match.gateways must contain at most {MAX_STREAM_MATCH_GATEWAYS} entries"
+                ),
+            ));
+        }
         let mut out = Vec::with_capacity(arr.len());
         for (i, entry) in arr.iter().enumerate() {
             let Some(raw) = entry.as_str() else {
@@ -2529,6 +2548,14 @@ fn parse_l4_match_arm(
                     format!("VirtualService {kind}[] match.gateways[{i}] must be a string"),
                 ));
             };
+            if raw.len() > MAX_STREAM_MATCH_GATEWAY_LENGTH {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "VirtualService {kind}[] match.gateways[{i}] must be at most {MAX_STREAM_MATCH_GATEWAY_LENGTH} characters"
+                    ),
+                ));
+            }
             let canonical =
                 canonicalize_gateway_name(raw, &object.metadata.namespace).map_err(|e| {
                     invalid_resource(
@@ -2566,6 +2593,15 @@ fn parse_l4_cidr_list(
             format!("VirtualService {kind}[] match.{field} must not be empty when set"),
         ));
     }
+    if arr.len() > crate::proxy::stream_match::MAX_STREAM_MATCH_SUBNETS {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService {kind}[] match.{field} must contain at most {} entries",
+                crate::proxy::stream_match::MAX_STREAM_MATCH_SUBNETS
+            ),
+        ));
+    }
     let mut out = Vec::with_capacity(arr.len());
     for (i, entry) in arr.iter().enumerate() {
         let Some(raw) = entry.as_str() else {
@@ -2578,6 +2614,15 @@ fn parse_l4_cidr_list(
             return Err(invalid_resource(
                 object,
                 format!("VirtualService {kind}[] match.{field}[{i}] must not be empty"),
+            ));
+        }
+        if raw.len() > crate::proxy::stream_match::MAX_STREAM_MATCH_CIDR_LENGTH {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[] match.{field}[{i}] must be at most {} characters",
+                    crate::proxy::stream_match::MAX_STREAM_MATCH_CIDR_LENGTH
+                ),
             ));
         }
         crate::util::cidr::CidrSet::parse_strict(raw).map_err(|e| {
@@ -2694,6 +2739,15 @@ fn parse_l4_virtual_service_gateways(
             "VirtualService spec.gateways must not be empty when set for L4 routing",
         ));
     }
+    if entries.len() > crate::proxy::stream_match::MAX_STREAM_MATCH_GATEWAYS {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService spec.gateways must contain at most {} entries for L4 routing",
+                crate::proxy::stream_match::MAX_STREAM_MATCH_GATEWAYS
+            ),
+        ));
+    }
     let mut gateways = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let Some(raw) = entry.as_str() else {
@@ -2702,6 +2756,15 @@ fn parse_l4_virtual_service_gateways(
                 format!("VirtualService spec.gateways[{index}] must be a string"),
             ));
         };
+        if raw.len() > crate::proxy::stream_match::MAX_STREAM_MATCH_GATEWAY_LENGTH {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService spec.gateways[{index}] must be at most {} characters",
+                    crate::proxy::stream_match::MAX_STREAM_MATCH_GATEWAY_LENGTH
+                ),
+            ));
+        }
         gateways.push(
             canonicalize_gateway_name(raw, &object.metadata.namespace).map_err(|error| {
                 invalid_resource(
@@ -10330,6 +10393,52 @@ extensionProviders:
         )
         .expect_err("bad CIDR must fail closed");
         assert!(format!("{err}").contains("sourceSubnets"), "got {err}");
+    }
+
+    #[test]
+    fn virtual_service_l4_match_bounds_fail_at_translation_boundary() {
+        let too_many_subnets = vec![
+            serde_json::Value::String("10.0.0.1/32".to_string());
+            crate::proxy::stream_match::MAX_STREAM_MATCH_SUBNETS + 1
+        ];
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["db.example.com"],
+                    "tcp": [{
+                        "match": [{"port": 3306, "sourceSubnets": too_many_subnets}],
+                        "route": [{"destination": {"host": "mysql.default.svc.cluster.local", "port": {"number": 3306}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("over-bound sourceSubnets must fail before matcher allocation");
+        assert!(
+            format!("{err}").contains("sourceSubnets must contain at most"),
+            "got {err}"
+        );
+
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["db.example.com"],
+                    "gateways": [" ingress"],
+                    "tcp": [{
+                        "match": [{"port": 3306}],
+                        "route": [{"destination": {"host": "mysql.default.svc.cluster.local", "port": {"number": 3306}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("whitespace-padded gateway must not be normalized into a trust binding");
+        assert!(
+            format!("{err}").contains("surrounding whitespace"),
+            "got {err}"
+        );
     }
 
     #[test]
