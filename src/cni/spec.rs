@@ -628,7 +628,9 @@ pub enum CniError {
     /// CNI 1.1 STATUS code 51: unavailable and existing attachments may be
     /// degraded. Reserved for cases where Ferrum knows capture/connectivity
     /// for already-enrolled pods may also be limited.
-    #[error("CNI plugin is not available and existing containers may have limited connectivity: {0}")]
+    #[error(
+        "CNI plugin is not available and existing containers may have limited connectivity: {0}"
+    )]
     NotAvailableDegraded(String),
 }
 

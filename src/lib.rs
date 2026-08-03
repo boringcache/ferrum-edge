@@ -7739,10 +7739,7 @@ pub mod _test_support {
         metrics: &crate::ebpf::NodeAgentMetrics,
         kube_client: &kube::Client,
         request: &crate::cni::rpc::CniRpcRequest,
-    ) -> (
-        crate::cni::rpc::CniRpcResponse,
-        Option<String>,
-    ) {
+    ) -> (crate::cni::rpc::CniRpcResponse, Option<String>) {
         crate::modes::node_agent::apply_cni_request_with_kube_metadata_for_test(
             backend,
             pod_states,

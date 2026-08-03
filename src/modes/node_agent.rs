@@ -2012,15 +2012,8 @@ pub(crate) async fn apply_cni_request_with_kube_metadata_for_test(
     kube_client: &Client,
     request: &CniRpcRequest,
 ) -> (CniRpcResponse, Option<String>) {
-    apply_cni_request_with_kube_metadata(
-        backend,
-        pod_states,
-        config,
-        metrics,
-        kube_client,
-        request,
-    )
-    .await
+    apply_cni_request_with_kube_metadata(backend, pod_states, config, metrics, kube_client, request)
+        .await
 }
 
 /// External tests advance paused Tokio time against this exact STATUS probe budget.
