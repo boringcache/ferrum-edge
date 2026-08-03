@@ -15132,14 +15132,8 @@ mod tests {
         let removable_uid = "removable-stale-uid";
         pod_states.insert(fenced_uid.to_string(), enrolled_pod_state(fenced_uid));
         pod_states.insert(removable_uid.to_string(), enrolled_pod_state(removable_uid));
-        remember_cni_owned_attachment(
-            &pod_states,
-            fenced_uid,
-            "ferrum-mesh",
-            "ctr-fenced",
-            "eth0",
-        )
-        .expect("remember fenced stale claim");
+        remember_cni_owned_attachment(&pod_states, fenced_uid, "ferrum-mesh", "ctr-fenced", "eth0")
+            .expect("remember fenced stale claim");
         remember_cni_owned_attachment(
             &pod_states,
             removable_uid,
@@ -15600,7 +15594,10 @@ mod tests {
         configure_cni_ownership_store(Some(store_path.clone()));
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let err = rehydrate_cni_owned_attachments(&pod_states).expect_err("reject");
-        assert!(err.contains("invalid"), "expected sanitized rejection: {err}");
+        assert!(
+            err.contains("invalid"),
+            "expected sanitized rejection: {err}"
+        );
         assert!(cni_ownership_store_is_rejected());
 
         let mut backend = MockEbpfBackend::default();
@@ -15662,8 +15659,7 @@ mod tests {
             backend.include_ports.contains_key(&909),
             "rejected detached snapshot must not authorize skipping persisted cgroup cleanup"
         );
-        let retained_durable_bytes =
-            std::fs::read(&store_path).expect("durable ownership remains");
+        let retained_durable_bytes = std::fs::read(&store_path).expect("durable ownership remains");
         assert_eq!(
             retained_durable_bytes.as_slice(),
             &durable_bytes[..],

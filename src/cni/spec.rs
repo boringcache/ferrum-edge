@@ -290,9 +290,9 @@ pub fn ingest_cni_args(raw: &str) -> Result<HashMap<String, String>, CniError> {
 
 fn is_safe_cni_arg_key(key: &str) -> bool {
     !key.is_empty()
-        && key.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
-        })
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
 }
 
 /// Extracted Kubernetes pod identity from CNI_ARGS.

@@ -149,9 +149,7 @@ mod cni_main {
         let Some(runtime_attachments) = net_config.valid_attachments.clone() else {
             return emit_error(
                 &cni_version,
-                &CniError::BadConfig(
-                    "GC request is missing cni.dev/valid-attachments".to_string(),
-                ),
+                &CniError::BadConfig("GC request is missing cni.dev/valid-attachments".to_string()),
             );
         };
         let valid_attachments = match ingest_valid_attachments(runtime_attachments) {
