@@ -14,7 +14,7 @@ Docker/kind install report.
 | Mode | Entry | Workflow / job |
 |---|---|---|
 | Live datapath (SPIRE-federated two kind clusters, bidirectional traffic + negatives + Stage-3 failure injection; fail-closed required-assertion gate) | `tests/k8s/multicluster-federation/run.sh` | `.github/workflows/multicluster-federation-live.yml` — path-filtered on PRs, force-run on every `main` push / `workflow_dispatch` (requires `FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE=true`) |
-| Poller partition / last-good retention (two Ferrum CP/DP deployments, verified TLS/mTLS, bound per-remote JWTs, four independent Toxiproxy links) | `tests/k8s/multicluster-poller-partition/run.sh` | `.github/workflows/multicluster-poller-partition-live.yml` — dedicated required `Multicluster Poller Partition Live` gate |
+| Poller partition / last-good retention (issue #3331; two Ferrum CP/DP deployments, verified TLS/mTLS, bound per-remote JWTs, four independent Toxiproxy links) | `tests/k8s/multicluster-poller-partition/run.sh` | `.github/workflows/multicluster-poller-partition-live.yml` — dedicated required `Multicluster Poller Partition Live` gate |
 | Deploy-only smoke (rollouts, no traffic) | same script with `FERRUM_MULTICLUSTER_DEPLOY_ONLY=1` | Legacy path-filtered `Mesh Multicluster Federation` CI job; a packaging/rollout check, not the authoritative datapath/release gate |
 
 In-process federation/discovery unit and integration coverage remains necessary
