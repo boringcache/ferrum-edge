@@ -6045,10 +6045,8 @@ impl ContentDecodingNormalizer {
     async fn fail_decode(&mut self, message: String) -> ResponseStreamAction {
         let mut out = NormalizedSseOut::unbounded();
         out.begin_call();
-        self.inner.emit_upstream_error(
-            provider_content_encoding_client_message(&message),
-            &mut out,
-        );
+        self.inner
+            .emit_upstream_error(provider_content_encoding_client_message(&message), &mut out);
         self.inner.finish_failure(&mut out);
         ResponseStreamAction::Terminate(Some(Bytes::from(out.take_call_bytes())))
     }
