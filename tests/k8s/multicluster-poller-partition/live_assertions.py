@@ -156,16 +156,31 @@ def remote_ages(peer: str) -> tuple[int, int]:
     payload = read_stdin_json()
     if not isinstance(payload, dict):
         raise SystemExit(1)
-    configured = next(
-        row for row in payload.get("configured", []) if row.get("cluster_name") == peer
-    )
-    discovered = next(
-        row for row in payload.get("discovered", []) if row.get("cluster_name") == peer
-    )
-    return (
-        int(configured["trust_bundle_age_seconds"]),
-        int(discovered["age_seconds"]),
-    )
+    configured_rows = payload.get("configured")
+    discovered_rows = payload.get("discovered")
+    if not isinstance(configured_rows, list) or not isinstance(
+        discovered_rows, list
+    ):
+        raise SystemExit(1)
+    configured = [
+        row
+        for row in configured_rows
+        if isinstance(row, dict) and row.get("cluster_name") == peer
+    ]
+    discovered = [
+        row
+        for row in discovered_rows
+        if isinstance(row, dict) and row.get("cluster_name") == peer
+    ]
+    if len(configured) != 1 or len(discovered) != 1:
+        raise SystemExit(1)
+    try:
+        return (
+            int(configured[0]["trust_bundle_age_seconds"]),
+            int(discovered[0]["age_seconds"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        raise SystemExit(1) from None
 
 
 def ages_between(peer: str, low: int, high: int) -> None:

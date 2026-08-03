@@ -98,36 +98,103 @@ preflight() {
   fi
 }
 
-wait_until() {
-  local label="$1" timeout="$2" predicate="$3"; shift 3
+wait_for_curl() {
+  local label="$1" timeout="$2"; shift 2
   local deadline=$((SECONDS + timeout))
   while (( SECONDS < deadline )); do
-    if run_wait_predicate "$predicate" "$@"; then return 0; fi
+    if curl "$@"; then return 0; fi
     sleep 1
   done
   echo "timed out waiting for $label (${timeout}s)" >&2
   return 1
 }
 
-# Keep polling dispatch explicit. Besides making the live contract auditable,
-# this prevents a caller-controlled executable word from becoming an opaque
-# tool-dispatch surface inside trusted CI automation.
-run_wait_predicate() {
-  local predicate="$1"; shift
-  case "$predicate" in
-    ages_increased_below_stale) ages_increased_below_stale "$@" ;;
-    curl) curl "$@" ;;
-    failure_counter_deltas_positive) failure_counter_deltas_positive "$@" ;;
-    fresh_state) fresh_state "$@" ;;
-    kubectl) kubectl "$@" ;;
-    no_configured_state) no_configured_state "$@" ;;
-    projected_config_withdrawn) projected_config_withdrawn "$@" ;;
-    proxy_activity_increased) proxy_activity_increased "$@" ;;
-    state_matches) state_matches "$@" ;;
-    traffic_not_found) traffic_not_found "$@" ;;
-    traffic_once) traffic_once "$@" ;;
-    *) echo "unsupported wait predicate: $predicate" >&2; return 2 ;;
-  esac
+wait_for_state() {
+  local label="$1" timeout="$2"; shift 2
+  local deadline=$((SECONDS + timeout))
+  while (( SECONDS < deadline )); do
+    if state_matches "$@"; then return 0; fi
+    sleep 1
+  done
+  echo "timed out waiting for $label (${timeout}s)" >&2
+  return 1
+}
+
+wait_for_fresh_state() {
+  local label="$1" timeout="$2"; shift 2
+  local deadline=$((SECONDS + timeout))
+  while (( SECONDS < deadline )); do
+    if fresh_state "$@"; then return 0; fi
+    sleep 1
+  done
+  echo "timed out waiting for $label (${timeout}s)" >&2
+  return 1
+}
+
+wait_for_traffic() {
+  local label="$1" timeout="$2"; shift 2
+  local deadline=$((SECONDS + timeout))
+  while (( SECONDS < deadline )); do
+    if traffic_once "$@"; then return 0; fi
+    sleep 1
+  done
+  echo "timed out waiting for $label (${timeout}s)" >&2
+  return 1
+}
+
+wait_for_not_found() {
+  local label="$1" timeout="$2"; shift 2
+  local deadline=$((SECONDS + timeout))
+  while (( SECONDS < deadline )); do
+    if traffic_not_found "$@"; then return 0; fi
+    sleep 1
+  done
+  echo "timed out waiting for $label (${timeout}s)" >&2
+  return 1
+}
+
+wait_for_ages_increased() {
+  local label="$1" timeout="$2"; shift 2
+  local deadline=$((SECONDS + timeout))
+  while (( SECONDS < deadline )); do
+    if ages_increased_below_stale "$@"; then return 0; fi
+    sleep 1
+  done
+  echo "timed out waiting for $label (${timeout}s)" >&2
+  return 1
+}
+
+wait_for_projected_withdrawal() {
+  local label="$1" timeout="$2"; shift 2
+  local deadline=$((SECONDS + timeout))
+  while (( SECONDS < deadline )); do
+    if projected_config_withdrawn "$@"; then return 0; fi
+    sleep 1
+  done
+  echo "timed out waiting for $label (${timeout}s)" >&2
+  return 1
+}
+
+wait_for_proxy_activity() {
+  local label="$1" timeout="$2"; shift 2
+  local deadline=$((SECONDS + timeout))
+  while (( SECONDS < deadline )); do
+    if proxy_activity_increased "$@"; then return 0; fi
+    sleep 1
+  done
+  echo "timed out waiting for $label (${timeout}s)" >&2
+  return 1
+}
+
+wait_for_no_configured_state() {
+  local label="$1" timeout="$2"; shift 2
+  local deadline=$((SECONDS + timeout))
+  while (( SECONDS < deadline )); do
+    if no_configured_state "$@"; then return 0; fi
+    sleep 1
+  done
+  echo "timed out waiting for $label (${timeout}s)" >&2
+  return 1
 }
 
 # Keep this policy-scanned fixture's dependency graph limited to the exact
@@ -238,7 +305,7 @@ create_clusters_and_fault_layer() {
     -host=0.0.0.0 -proxy-metrics >/dev/null
   TOXI_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$TOXIPROXY_CONTAINER")"
   [[ -n "$TOXI_IP" ]] || { echo "Toxiproxy IP discovery failed" >&2; return 1; }
-  wait_until "Toxiproxy API" 30 curl -fsS "http://$TOXI_IP:8474/version" >/dev/null
+  wait_for_curl "Toxiproxy API" 30 -fsS "http://$TOXI_IP:8474/version" >/dev/null
 
   create_proxy "$FED_AB" "$FED_AB_PORT" "$NODE_B:32443"
   create_proxy "$DISC_AB" "$DISC_AB_PORT" "$NODE_B:32551"
@@ -484,23 +551,10 @@ bounded_uint() {
   printf '%s\n' "$((10#$value))"
 }
 
-metric_uint_value() {
-  local value metric="$3"
-  value="$(metric_value "$@")" || return 1
-  bounded_uint "$value" "$metric"
-}
-
 metric_file_uint_value() {
   local value metric="$2"
   value="$(metric_file_value "$@")" || return 1
   bounded_uint "$value" "$metric"
-}
-
-failure_counter_deltas_positive() {
-  local ff df
-  ff="$(metric_uint_value "$1" "$2" ferrum_mesh_federation_poll_failures_total "trust_domain=\"$3\"")" || return 1
-  df="$(metric_uint_value "$1" "$2" ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"$4\"")" || return 1
-  (( ff > INITIAL_FEDERATION_FAILURES && df > INITIAL_DISCOVERY_FAILURES ))
 }
 
 ages_between() {
@@ -521,7 +575,9 @@ ages_increased_below_stale() {
   local ages trust_age endpoint_age
   ages="$(admin_ages "$1" "$2" "$3")" || return 1
   read -r trust_age endpoint_age <<<"$ages"
-  (( trust_age > INITIAL_TRUST_AGE && endpoint_age > INITIAL_ENDPOINT_AGE && endpoint_age < 8 && trust_age < 12 ))
+  (( trust_age >= 3 && endpoint_age >= 3 &&
+     trust_age > INITIAL_TRUST_AGE && endpoint_age > INITIAL_ENDPOINT_AGE &&
+     endpoint_age < 8 && trust_age < 12 ))
 }
 
 capture_boundary() {
@@ -546,7 +602,7 @@ projected_config_withdrawn() {
 
 signal_reload() {
   local context="$1" pid
-  wait_until "projected withdrawn mesh config" 30 projected_config_withdrawn "$context"
+  wait_for_projected_withdrawal "projected withdrawn mesh config" 30 "$context"
   pid="$(kubectl --context "$context" -n "$NS" exec deploy/echo -c signal -- \
     pidof ferrum-edge)" || return 1
   [[ "$pid" =~ ^[0-9]+$ ]] || { echo "invalid ferrum-edge pid" >&2; return 1; }
@@ -574,14 +630,13 @@ deploy_topology() {
 }
 
 scenario_initial() {
-  wait_until "A initial polled trust and endpoints" 90 state_matches "$CONTEXT_A" "$JWT_A" cluster-b true polled true true
-  wait_until "B initial polled trust and endpoints" 90 state_matches "$CONTEXT_B" "$JWT_B" cluster-a true polled true true
-  wait_until "A initial cache freshness" 20 fresh_state "$CONTEXT_A" "$JWT_A" cluster-b
-  read -r INITIAL_TRUST_AGE INITIAL_ENDPOINT_AGE < <(admin_ages "$CONTEXT_A" "$JWT_A" cluster-b)
+  wait_for_state "A initial polled trust and endpoints" 90 "$CONTEXT_A" "$JWT_A" cluster-b true polled true true
+  wait_for_state "B initial polled trust and endpoints" 90 "$CONTEXT_B" "$JWT_B" cluster-a true polled true true
+  wait_for_fresh_state "A initial cache freshness" 20 "$CONTEXT_A" "$JWT_A" cluster-b
   INITIAL_FEDERATION_SUCCESS_AT="$(metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_federation_last_success_timestamp_seconds "trust_domain=\"$TD_B\"")"
   INITIAL_DISCOVERY_SUCCESSES="$(metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_remote_discovery_poll_successes_total "cluster=\"cluster-b\"")"
-  wait_until "A to B initial traffic" 60 traffic_once "$CONTEXT_A" echo-b echo-b
-  wait_until "B to A initial traffic" 60 traffic_once "$CONTEXT_B" echo-a echo-a
+  wait_for_traffic "A to B initial traffic" 60 "$CONTEXT_A" echo-b echo-b
+  wait_for_traffic "B to A initial traffic" 60 "$CONTEXT_B" echo-a echo-a
   capture_boundary "$CONTEXT_A" "$JWT_A" poller.initial.polled_trust_endpoints_installed
   local initial_metrics="$RESULTS_DIR/poller.initial.polled_trust_endpoints_installed.prom"
   INITIAL_FEDERATION_FAILURES="$(metric_file_uint_value "$initial_metrics" ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"")"
@@ -590,18 +645,33 @@ scenario_initial() {
 }
 
 scenario_transient() {
+  read -r INITIAL_TRUST_AGE INITIAL_ENDPOINT_AGE < <(admin_ages "$CONTEXT_A" "$JWT_A" cluster-b)
   set_all_proxies false
-  wait_until "bounded poll failure deltas" 15 failure_counter_deltas_positive "$CONTEXT_A" "$JWT_A" "$TD_B" cluster-b
-  wait_until "last-good cache ages increase below both stale windows" 12 ages_increased_below_stale "$CONTEXT_A" "$JWT_A" cluster-b
+  # Observe the retained caches before doing any serial counter accounting.
+  # The endpoint window is only eight seconds; waiting for metrics first can
+  # consume that window and turn a short-partition assertion into an expiry.
+  wait_for_ages_increased "last-good cache ages increase below both stale windows" 7 "$CONTEXT_A" "$JWT_A" cluster-b
   traffic_once "$CONTEXT_A" echo-b echo-b; traffic_once "$CONTEXT_B" echo-a echo-a
-  capture_boundary "$CONTEXT_A" "$JWT_A" poller.transient.last_good_retained
-  record multicluster_poller.transient.last_good_retained pass "traffic-200-during-short-partition" "poller.transient.last_good_retained.{json,prom}"
-  record multicluster_poller.transient.cache_age_increased pass "trust-and-endpoint-age-3-to-7-seconds" "poller.transient.last_good_retained.json"
-  local ff df transient_metrics="$RESULTS_DIR/poller.transient.last_good_retained.prom"
+  local transient_json="$RESULTS_DIR/poller.transient.last_good_retained.json"
+  local transient_metrics="$RESULTS_DIR/poller.transient.last_good_retained.prom"
+  local snapshot_ages snapshot_trust_age snapshot_endpoint_age ff df
+  admin_json "$CONTEXT_A" "$JWT_A" > "$transient_json"
+  metrics "$CONTEXT_A" "$JWT_A" > "$transient_metrics"
+  set_all_proxies true
+  snapshot_ages="$(python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
+    admin-ages cluster-b < "$transient_json")"
+  read -r snapshot_trust_age snapshot_endpoint_age <<<"$snapshot_ages"
+  (( snapshot_trust_age >= 3 && snapshot_endpoint_age >= 3 &&
+     snapshot_trust_age > INITIAL_TRUST_AGE &&
+     snapshot_endpoint_age > INITIAL_ENDPOINT_AGE &&
+     snapshot_endpoint_age < 8 && snapshot_trust_age < 12 )) || {
+    echo "transient cache snapshot escaped stale bounds: trust=$snapshot_trust_age endpoint=$snapshot_endpoint_age" >&2
+    return 1
+  }
   ff="$(metric_file_uint_value "$transient_metrics" ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"")"
   df="$(metric_file_uint_value "$transient_metrics" ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"")"
   (( ff >= INITIAL_FEDERATION_FAILURES && df >= INITIAL_DISCOVERY_FAILURES )) || {
-    echo "failure counter regressed across partition boundary" >&2; return 1;
+    echo "failure counter regressed over partition boundary" >&2; return 1;
   }
   TRANSIENT_FEDERATION_FAILURE_DELTA=$((ff - INITIAL_FEDERATION_FAILURES))
   TRANSIENT_DISCOVERY_FAILURE_DELTA=$((df - INITIAL_DISCOVERY_FAILURES))
@@ -610,9 +680,10 @@ scenario_transient() {
     echo "unbounded partition failure deltas during backoff: federation=$TRANSIENT_FEDERATION_FAILURE_DELTA discovery=$TRANSIENT_DISCOVERY_FAILURE_DELTA" >&2
     return 1
   }
-  set_all_proxies true
-  wait_until "same-generation transient recovery" 40 fresh_state "$CONTEXT_A" "$JWT_A" cluster-b
-  wait_until "same-generation reverse recovery" 40 fresh_state "$CONTEXT_B" "$JWT_B" cluster-a
+  record multicluster_poller.transient.last_good_retained pass "traffic-200-during-short-partition" "poller.transient.last_good_retained.{json,prom}"
+  record multicluster_poller.transient.cache_age_increased pass "trust-and-endpoint-age-3-to-7-seconds" "poller.transient.last_good_retained.json"
+  wait_for_fresh_state "same-generation transient recovery" 40 "$CONTEXT_A" "$JWT_A" cluster-b
+  wait_for_fresh_state "same-generation reverse recovery" 40 "$CONTEXT_B" "$JWT_B" cluster-a
   local recovered_federation_at recovered_discovery_successes
   recovered_federation_at="$(metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_federation_last_success_timestamp_seconds "trust_domain=\"$TD_B\"")"
   recovered_discovery_successes="$(metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_remote_discovery_poll_successes_total "cluster=\"cluster-b\"")"
@@ -629,15 +700,15 @@ scenario_transient() {
 
 scenario_endpoint_expiry() {
   set_proxy "$DISC_AB" false
-  wait_until "endpoint stale eviction independent of trust" 40 state_matches "$CONTEXT_A" "$JWT_A" cluster-b false polled true true
-  wait_until "remote target removed with no-route reason" 20 traffic_not_found "$CONTEXT_A" echo-b
+  wait_for_state "endpoint stale eviction independent of trust" 40 "$CONTEXT_A" "$JWT_A" cluster-b false polled true true
+  wait_for_not_found "remote target removed with no-route reason" 20 "$CONTEXT_A" echo-b
   traffic_once "$CONTEXT_B" echo-a echo-a
   capture_boundary "$CONTEXT_A" "$JWT_A" poller.endpoint.expired_fail_closed_target_removed
   record multicluster_poller.endpoint.expired_fail_closed pass "endpoint-window-8s-404-Not-Found-trust-still-polled" "poller.endpoint.expired_fail_closed_target_removed.{json,prom}"
   record multicluster_poller.endpoint.remote_target_removed pass "configured-peer-not-discovered" "poller.endpoint.expired_fail_closed_target_removed.json"
   set_proxy "$DISC_AB" true
-  wait_until "endpoint reinstall by live generation" 45 state_matches "$CONTEXT_A" "$JWT_A" cluster-b true polled true true
-  wait_until "endpoint traffic recovery" 30 traffic_once "$CONTEXT_A" echo-b echo-b
+  wait_for_state "endpoint reinstall by live generation" 45 "$CONTEXT_A" "$JWT_A" cluster-b true polled true true
+  wait_for_traffic "endpoint traffic recovery" 30 "$CONTEXT_A" echo-b echo-b
   capture_boundary "$CONTEXT_A" "$JWT_A" poller.endpoint.recovered_same_generation
   record multicluster_poller.endpoint.recovered_same_generation pass "no-slice-change-200" "poller.endpoint.recovered_same_generation.{json,prom}"
 }
@@ -646,18 +717,18 @@ scenario_trust_expiry() {
   set_proxy "$FED_AB" false; set_proxy "$FED_BA" false
   # Trust and endpoint-discovery caches expire independently. Assert trust is
   # inactive here; the exact 404 checks below prove effective route removal.
-  wait_until "A trust stale eviction" 50 state_matches "$CONTEXT_A" "$JWT_A" cluster-b any none false false
-  wait_until "B trust stale eviction" 50 state_matches "$CONTEXT_B" "$JWT_B" cluster-a any none false false
-  wait_until "A trust fail closed with no-route reason" 15 traffic_not_found "$CONTEXT_A" echo-b
-  wait_until "B trust fail closed with no-route reason" 15 traffic_not_found "$CONTEXT_B" echo-a
+  wait_for_state "A trust stale eviction" 50 "$CONTEXT_A" "$JWT_A" cluster-b any none false false
+  wait_for_state "B trust stale eviction" 50 "$CONTEXT_B" "$JWT_B" cluster-a any none false false
+  wait_for_not_found "A trust fail closed with no-route reason" 15 "$CONTEXT_A" echo-b
+  wait_for_not_found "B trust fail closed with no-route reason" 15 "$CONTEXT_B" echo-a
   capture_boundary "$CONTEXT_A" "$JWT_A" poller.trust.expired_fail_closed_recomputed
   record multicluster_poller.trust.expired_fail_closed pass "trust-window-12s-bidirectional-404-Not-Found" "poller.trust.expired_fail_closed_recomputed.{json,prom}"
   record multicluster_poller.trust.inbound_outbound_recomputed pass "trust-source=none-outbound=false-inbound=false-bidirectional-404-Not-Found" "poller.trust.expired_fail_closed_recomputed.json"
   set_proxy "$FED_AB" true; set_proxy "$FED_BA" true
-  wait_until "A trust same-generation recovery" 60 state_matches "$CONTEXT_A" "$JWT_A" cluster-b true polled true true
-  wait_until "B trust same-generation recovery" 60 state_matches "$CONTEXT_B" "$JWT_B" cluster-a true polled true true
-  wait_until "A recovered traffic" 30 traffic_once "$CONTEXT_A" echo-b echo-b
-  wait_until "B recovered traffic" 30 traffic_once "$CONTEXT_B" echo-a echo-a
+  wait_for_state "A trust same-generation recovery" 60 "$CONTEXT_A" "$JWT_A" cluster-b true polled true true
+  wait_for_state "B trust same-generation recovery" 60 "$CONTEXT_B" "$JWT_B" cluster-a true polled true true
+  wait_for_traffic "A recovered traffic" 30 "$CONTEXT_A" echo-b echo-b
+  wait_for_traffic "B recovered traffic" 30 "$CONTEXT_B" echo-a echo-a
   capture_boundary "$CONTEXT_A" "$JWT_A" poller.trust.recovered_same_generation
   record multicluster_poller.trust.recovered_same_generation pass "trust-and-discovery-reinstalled-without-slice" "poller.trust.recovered_same_generation.{json,prom}"
 }
@@ -668,13 +739,13 @@ scenario_inflight_withdrawal() {
   disc_before="$(proxy_received_downstream_bytes "$DISC_AB")"
   add_latency "$FED_AB"; add_latency "$DISC_AB"
   fault_started=$SECONDS
-  wait_until "federation poll in flight" 20 proxy_activity_increased "$FED_AB" "$fed_before"
-  wait_until "discovery poll in flight" 20 proxy_activity_increased "$DISC_AB" "$disc_before"
+  wait_for_proxy_activity "federation poll in flight" 20 "$FED_AB" "$fed_before"
+  wait_for_proxy_activity "discovery poll in flight" 20 "$DISC_AB" "$disc_before"
   local local_bundle
   local_bundle="$(spire_bundle_b64der "$CONTEXT_A")"
   apply_mesh_config "$CONTEXT_A" cluster-a "$TD_A" echo-a region-a "$local_bundle" ""
   signal_reload "$CONTEXT_A"
-  wait_until "withdrawn RemoteCluster accepted" 40 no_configured_state "$CONTEXT_A" "$JWT_A"
+  wait_for_no_configured_state "withdrawn RemoteCluster accepted" 40 "$CONTEXT_A" "$JWT_A"
   (( SECONDS - fault_started < 50 )) || {
     echo "withdrawal did not retire the generation before the delayed responses could complete" >&2
     return 1
