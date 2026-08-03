@@ -6913,7 +6913,10 @@ async fn test_gemini_json_array_chunk_splits_and_malformed_separators_fail_close
     let concat_out = run_gemini_normalizer(5, concat, "application/json").await;
     assert!(concat_out.contains("\"content\":\"One\""), "{concat_out}");
     assert!(concat_out.contains("\"content\":\"Two\""), "{concat_out}");
-    assert!(concat_out.contains("\"finish_reason\":\"stop\""), "{concat_out}");
+    assert!(
+        concat_out.contains("\"finish_reason\":\"stop\""),
+        "{concat_out}"
+    );
 
     let hostile = [
         // leading comma
@@ -6963,10 +6966,7 @@ async fn test_gemini_keeps_claim_model_and_pins_response_id() {
     );
     let changed_out = run_gemini_normalizer(4096, changed, "text/event-stream").await;
     assert!(changed_out.contains("upstream_error"), "{changed_out}");
-    assert!(
-        changed_out.contains("responseId"),
-        "{changed_out}"
-    );
+    assert!(changed_out.contains("responseId"), "{changed_out}");
 
     // Non-string / empty / oversized responseId fail closed.
     for hostile in [
@@ -7033,7 +7033,10 @@ async fn test_gemini_multi_event_tool_calls_get_distinct_ids_and_indexes() {
         }
     }
     assert_eq!(call_ids.len(), 2, "expected two tool call ids: {out}");
-    assert_ne!(call_ids[0], call_ids[1], "call ids must be distinct: {call_ids:?}");
+    assert_ne!(
+        call_ids[0], call_ids[1],
+        "call ids must be distinct: {call_ids:?}"
+    );
     assert!(
         call_ids[0].ends_with("_0_0") && call_ids[1].ends_with("_0_1"),
         "ids must embed choice/tool indexes: {call_ids:?}"
@@ -7057,7 +7060,10 @@ async fn test_provider_usage_u64_overflow_fails_closed_without_wrapped_total() {
         !gemini_out.contains("\"total_tokens\""),
         "must not publish wrapped totals: {gemini_out}"
     );
-    assert!(gemini_out.trim_end().ends_with("data: [DONE]"), "{gemini_out}");
+    assert!(
+        gemini_out.trim_end().ends_with("data: [DONE]"),
+        "{gemini_out}"
+    );
 
     // Anthropic path (shared overflow hardening).
     let anthropic = concat!(
