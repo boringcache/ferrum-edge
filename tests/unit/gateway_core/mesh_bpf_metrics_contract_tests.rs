@@ -329,6 +329,42 @@ fn pin_rotation_seed_preserves_cumulative_state() {
 }
 
 #[test]
+fn sock_ops_pin_publication_unpublishes_marker_before_dependents() {
+    let loader = include_str!("../../../src/ebpf/loader.rs");
+    let publication = loader
+        .split_once("fn pin_sock_ops_maps")
+        .expect("pin_sock_ops_maps definition")
+        .1
+        .split_once("fn pin_map_at")
+        .expect("pin_map_at follows publication")
+        .0;
+
+    let marker_unpublish = publication
+        .find("remove_pin_if_present(BPF_SOCK_OPS_EVENTS_PIN_PATH)?;")
+        .expect("old events commit marker must be unpublished");
+    let stats_publish = publication
+        .find("pin_map_at(bpf, BPF_MAP_SOCK_OPS_STATS")
+        .expect("stats publication");
+    let sockhash_publish = publication
+        .find("BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS,")
+        .expect("first-byte SockHash publication");
+    let marker_publish = publication
+        .rfind("pin_map_at(bpf, BPF_MAP_SOCK_OPS_EVENTS")
+        .expect("events commit-marker publication");
+
+    assert!(
+        marker_unpublish < stats_publish
+            && stats_publish < sockhash_publish
+            && sockhash_publish < marker_publish,
+        "events must be absent while dependent pins are replaced, then published last"
+    );
+    assert!(
+        loader.contains("Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(())"),
+        "a missing stale pin must not fail publication"
+    );
+}
+
+#[test]
 fn ringbuf_overrun_help_documents_reattach_seeding() {
     let text = render_with(BpfMetricsState::new());
     assert!(

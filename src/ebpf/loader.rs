@@ -902,10 +902,13 @@ fn pin_sock_ops_maps(bpf: &mut Ebpf) -> Result<(), String> {
             parent.display()
         ));
     }
-    // Publish the events ringbuf last: its inode is the consumer's generation
-    // commit marker. Replacing it first would let a concurrent re-open pair a
-    // new ringbuf with the previous stats/SockHash generation, so first-byte
-    // cleanup would target a map that the new producer does not use.
+    // The events ringbuf pin is the generation commit marker. Unpublish the old
+    // marker before touching either dependent pin, then publish the replacement
+    // marker only after stats and SockHash are ready. Unlinking preserves old
+    // consumers' already-open map fds while preventing a new consumer from
+    // retaining a mixed generation; every failure below leaves no visible
+    // marker for the partial generation.
+    remove_pin_if_present(BPF_SOCK_OPS_EVENTS_PIN_PATH)?;
     pin_map_at(bpf, BPF_MAP_SOCK_OPS_STATS, BPF_SOCK_OPS_STATS_PIN_PATH)?;
     pin_map_at(
         bpf,
@@ -919,18 +922,23 @@ fn pin_sock_ops_maps(bpf: &mut Ebpf) -> Result<(), String> {
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 fn pin_map_at(bpf: &mut Ebpf, map_name: &str, pin_path: &str) -> Result<(), String> {
     // If a stale pin exists (e.g. previous run did not clean up), remove
-    // it so the new map gets pinned fresh. Best-effort: missing path is
-    // fine, only surface real errors.
-    if std::path::Path::new(pin_path).exists()
-        && let Err(e) = fs::remove_file(pin_path)
-    {
-        return Err(format!("Failed to remove stale pin '{pin_path}': {e}"));
-    }
+    // it so the new map gets pinned fresh. Missing paths (including a
+    // concurrent disappearance) are benign; all other errors are fatal.
+    remove_pin_if_present(pin_path)?;
     let map = bpf
         .map_mut(map_name)
         .ok_or_else(|| format!("BPF map '{map_name}' not found"))?;
     map.pin(pin_path)
         .map_err(|e| format!("Failed to pin '{map_name}' at '{pin_path}': {e}"))
+}
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn remove_pin_if_present(pin_path: &str) -> Result<(), String> {
+    match fs::remove_file(pin_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Failed to remove stale pin '{pin_path}': {e}")),
+    }
 }
 
 /// Live-kernel verification (GAP-2M / connect-side datapath).
