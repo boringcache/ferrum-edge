@@ -434,10 +434,18 @@ YAML
 apply_mesh_config() {
   local context="$1" local_cluster="$2" local_td="$3" local_service="$4" local_region="$5" local_bundle="$6" remote_block="${7:-}"
   local peer_td="${8:-}" peer_bundle="${9:-}" authorities="" federated="" line
-  while IFS= read -r line; do [[ -n "$line" ]] && authorities+="        - $line"$'\n'; done <<<"$local_bundle"
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then
+      authorities="${authorities}        - ${line}"$'\n'
+    fi
+  done <<<"$local_bundle"
   if [[ -n "$peer_td" && -n "$peer_bundle" ]]; then
     federated="    federated:"$'\n'"      - trust_domain: $peer_td"$'\n'"        x509_authorities:"$'\n'
-    while IFS= read -r line; do [[ -n "$line" ]] && federated+="          - $line"$'\n'; done <<<"$peer_bundle"
+    while IFS= read -r line; do
+      if [[ -n "$line" ]]; then
+        federated="${federated}          - ${line}"$'\n'
+      fi
+    done <<<"$peer_bundle"
   fi
   kubectl --context "$context" -n "$NS" create configmap mesh-config --from-literal=mesh.yaml="$(cat <<YAML
 mesh:
