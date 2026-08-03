@@ -6,6 +6,8 @@ use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use ferrum_edge::plugins::api_chargeback_sink::probe_streaming_replay_path_swap_for_tests;
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, PEER_REPUBLISH_MARKER,
     QuotaEvictionReport, SnapshotAccumulator, SpoolCompression, SpoolFinalOwnership, SpoolFsFault,
@@ -21,16 +23,14 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     probe_compact_recovery_retry_for_tests, probe_empty_dead_letter_publish_for_tests,
     probe_shared_spool_batch_clone_for_tests, probe_streaming_replay_batch_range_errors_for_tests,
     publish_dead_letter_payload_for_tests, render_prometheus, render_status_json,
-    replay_spool_once_for_tests,
-    replay_spool_once_with_batch_size_for_tests, replay_spool_once_with_ceiling_for_tests,
-    serialize_json_each_row, serialize_json_each_row_projected, set_spool_write_hook_for_tests,
+    replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
+    replay_spool_once_with_ceiling_for_tests, serialize_json_each_row,
+    serialize_json_each_row_projected, set_spool_write_hook_for_tests,
     spool_artifact_byte_limit_for_tests, spool_claim_lease_secs_for_tests,
     spool_decompression_limit_for_tests, spool_split_worklist_max_entries_for_tests,
     spool_streaming_limits_for_tests, write_private_file_atomically_for_tests,
     write_private_file_atomically_with_fault_for_tests,
 };
-#[cfg(unix)]
-use ferrum_edge::plugins::api_chargeback_sink::probe_streaming_replay_path_swap_for_tests;
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
 use ferrum_edge::plugins::utils::byte_budget::{
     RetainedByteCeiling, probe_preallocated_payload_capacity_guard_for_tests,
@@ -1630,7 +1630,10 @@ impl SharedQuotaRaceGate {
                 .wait_timeout(parked, deadline.saturating_duration_since(now))
                 .expect("admission parked wait");
             parked = next;
-            assert!(!timeout.timed_out() || *parked, "first quota admission timed out");
+            assert!(
+                !timeout.timed_out() || *parked,
+                "first quota admission timed out"
+            );
         }
     }
 
@@ -1677,10 +1680,12 @@ impl Drop for ClearSharedQuotaRaceHook {
 #[test]
 fn replaced_namespace_coordination_inode_refuses_spool_mutation() {
     let temp = tempfile::tempdir().unwrap();
-    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a")
-        .unwrap();
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a").unwrap();
     let lock = spool.namespace_root_for_tests().join(".spool-quota.lock");
-    let displaced = spool.namespace_root_for_tests().join("displaced-quota-lock");
+    let displaced = spool
+        .namespace_root_for_tests()
+        .join("displaced-quota-lock");
     fs::rename(&lock, &displaced).unwrap();
     fs::write(&lock, b"").unwrap();
 
@@ -1696,8 +1701,8 @@ fn replaced_namespace_coordination_inode_refuses_spool_mutation() {
 #[test]
 fn hard_linked_namespace_coordination_inode_refuses_spool_mutation() {
     let temp = tempfile::tempdir().unwrap();
-    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a")
-        .unwrap();
+    let spool =
+        SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a").unwrap();
     let lock = spool.namespace_root_for_tests().join(".spool-quota.lock");
     let alias = spool.namespace_root_for_tests().join("quota-lock-alias");
     fs::hard_link(&lock, &alias).unwrap();
@@ -1766,8 +1771,14 @@ fn independent_managers_cannot_over_admit_ordinary_spool_writes() {
     first_writer.join().expect("first writer thread").unwrap();
     second_writer.join().expect("second writer thread").unwrap();
     let stats = first.scan_stats().unwrap();
-    assert_eq!(stats.files, 1, "the second admission must evict, not overlap");
-    assert!(stats.bytes <= encoded_len, "shared namespace exceeded quota: {stats:?}");
+    assert_eq!(
+        stats.files, 1,
+        "the second admission must evict, not overlap"
+    );
+    assert!(
+        stats.bytes <= encoded_len,
+        "shared namespace exceeded quota: {stats:?}"
+    );
     assert_eq!(ceiling.used(), 0);
 }
 
@@ -1848,14 +1859,26 @@ fn independent_managers_cannot_over_admit_streamed_dead_letter_appends() {
 
     let first_result = first_append.join().expect("first append thread");
     let second_result = second_append.join().expect("second append thread");
-    assert!(first_result.is_ok(), "first append failed: {first_result:?}");
+    assert!(
+        first_result.is_ok(),
+        "first append failed: {first_result:?}"
+    );
     let error = second_result.expect_err("second protected append must fail closed");
-    assert!(error.contains("cannot fit within spool.max_bytes"), "{error}");
+    assert!(
+        error.contains("cannot fit within spool.max_bytes"),
+        "{error}"
+    );
     assert!(claim_a.claim_path_for_tests().exists());
     assert!(claim_b.claim_path_for_tests().exists());
     let stats = first.scan_stats().unwrap();
-    assert_eq!(stats.files, 3, "two claims plus one dead-letter payload remain");
-    assert!(stats.bytes <= max_bytes, "streamed append exceeded quota: {stats:?}");
+    assert_eq!(
+        stats.files, 3,
+        "two claims plus one dead-letter payload remain"
+    );
+    assert!(
+        stats.bytes <= max_bytes,
+        "streamed append exceeded quota: {stats:?}"
+    );
     assert_eq!(ceiling.used(), 0);
 }
 
@@ -3392,8 +3415,7 @@ async fn dead_letter_payload_admits_each_append_before_exceeding_spool_quota() {
     let encoded = serialize_json_each_row(&[event.clone()]).unwrap();
     let max_bytes = encoded.len() as u64;
     let temp = tempfile::tempdir().unwrap();
-    let spool =
-        SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
     let source = spool.write_events(&[event]).unwrap();
     assert_eq!(fs::metadata(&source).unwrap().len(), max_bytes);
     let namespace_root = spool.namespace_root_for_tests().to_path_buf();
@@ -3407,9 +3429,7 @@ async fn dead_letter_payload_admits_each_append_before_exceeding_spool_quota() {
     let observed_for_hook = Arc::clone(&observed_temp_bytes);
     let _clear_hook = ClearSpoolWriteHookGuard;
     set_spool_write_hook_for_tests(Some(Arc::new(move |point, root| {
-        if point != SpoolWriteHookPoint::QuotaInventoryTaken
-            || root != namespace_root.as_path()
-        {
+        if point != SpoolWriteHookPoint::QuotaInventoryTaken || root != namespace_root.as_path() {
             return;
         }
         let temp_bytes = fs::read_dir(&source_parent)
@@ -3418,9 +3438,7 @@ async fn dead_letter_payload_admits_each_append_before_exceeding_spool_quota() {
             .find_map(|entry| {
                 let name = entry.file_name();
                 let name = name.to_str()?;
-                if name.starts_with(&format!("{payload_name}.write-"))
-                    && name.ends_with(".tmp")
-                {
+                if name.starts_with(&format!("{payload_name}.write-")) && name.ends_with(".tmp") {
                     entry.metadata().ok().map(|metadata| metadata.len())
                 } else {
                     None
@@ -7549,7 +7567,10 @@ fn streaming_replay_refuses_a_path_swap_after_bounded_preflight() {
     assert!(error.contains("changed file identity"), "{error}");
     assert!(!error.contains("validated-row"), "{error}");
     assert!(!error.contains("replaced-row"), "{error}");
-    assert_eq!(fs::read(&source).unwrap(), b"{\"event_id\":\"replaced-row!\"}\n");
+    assert_eq!(
+        fs::read(&source).unwrap(),
+        b"{\"event_id\":\"replaced-row!\"}\n"
+    );
     assert_eq!(ceiling.used(), 0);
 }
 

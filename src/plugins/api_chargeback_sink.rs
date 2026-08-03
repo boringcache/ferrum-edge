@@ -6277,9 +6277,7 @@ impl SpoolManager {
             pinned: file,
         };
         self.namespace_lock.set(anchor).map_err(|_| {
-            format!(
-                "{PLUGIN_NAME}: spool namespace coordination lock was initialized concurrently"
-            )
+            format!("{PLUGIN_NAME}: spool namespace coordination lock was initialized concurrently")
         })
     }
 
@@ -6297,9 +6295,7 @@ impl SpoolManager {
     /// Acquire the ownership-bound cross-process lock after `write_lock`.
     fn acquire_namespace_lock_locked(&self) -> Result<SpoolNamespaceFileGuard, String> {
         let anchor = self.namespace_lock.get().ok_or_else(|| {
-            format!(
-                "{PLUGIN_NAME}: spool namespace coordination lock is not initialized"
-            )
+            format!("{PLUGIN_NAME}: spool namespace coordination lock is not initialized")
         })?;
         self.validate_namespace_lock_path(anchor)?;
         let file = open_spool_coordination_file(&anchor.path, false)?;
@@ -8315,12 +8311,9 @@ impl DeadLetterPayloadWriter {
                 format!("{PLUGIN_NAME}: failed to write dead-letter row payload: {error}")
             })?;
             self.hasher.update(row);
-            self.byte_len = self
-                .byte_len
-                .checked_add(row.len() as u64)
-                .ok_or_else(|| {
-                    format!("{PLUGIN_NAME}: dead-letter payload byte count overflowed")
-                })?;
+            self.byte_len = self.byte_len.checked_add(row.len() as u64).ok_or_else(|| {
+                format!("{PLUGIN_NAME}: dead-letter payload byte count overflowed")
+            })?;
             self.rows = self.rows.checked_add(1).ok_or_else(|| {
                 format!("{PLUGIN_NAME}: dead-letter payload row count overflowed")
             })?;
@@ -8871,10 +8864,7 @@ fn open_spool_coordination_file(path: &Path, create: bool) -> Result<File, Strin
     })
 }
 
-fn validate_spool_coordination_file(
-    path: &Path,
-    file: &File,
-) -> Result<SpoolFileIdentity, String> {
+fn validate_spool_coordination_file(path: &Path, file: &File) -> Result<SpoolFileIdentity, String> {
     let mut metadata = file.metadata().map_err(|error| {
         format!(
             "{PLUGIN_NAME}: failed to stat spool namespace coordination lock '{}': {error}",
@@ -9782,16 +9772,14 @@ pub fn probe_streaming_replay_path_swap_for_tests(
     replacement: &Path,
     ceiling: &'static RetainedByteCeiling,
 ) -> Result<String, String> {
-    let mut preflight = StreamingSpoolReader::open(path, ceiling)
-        .map_err(SpoolDecodeError::into_message)?;
+    let mut preflight =
+        StreamingSpoolReader::open(path, ceiling).map_err(SpoolDecodeError::into_message)?;
     preflight
         .validate_to_end()
         .map_err(SpoolDecodeError::into_message)?;
     let validated_identity = preflight.identity();
     fs::rename(replacement, path).map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: failed to replace preflight path in replay identity probe: {error}"
-        )
+        format!("{PLUGIN_NAME}: failed to replace preflight path in replay identity probe: {error}")
     })?;
     drop(preflight);
     match StreamingSpoolReader::open_matching(path, ceiling, validated_identity) {
@@ -9845,9 +9833,7 @@ pub fn publish_dead_letter_payload_for_tests(
         .ceiling
         .try_acquire(SPOOL_INDEX_ENTRY_BYTES)
         .ok_or_else(|| {
-            format!(
-                "{PLUGIN_NAME}: dead-letter append probe could not reserve its row index"
-            )
+            format!("{PLUGIN_NAME}: dead-letter append probe could not reserve its row index")
         })?;
     let batch = StreamingReplayBatch {
         payload,
@@ -11051,13 +11037,7 @@ async fn replay_stream_batch(
             }
         }
     }
-    append_dead_letter_rows(
-        spool,
-        claim.path(),
-        batch,
-        &rejected_row_indices,
-        payload,
-    )?;
+    append_dead_letter_rows(spool, claim.path(), batch, &rejected_row_indices, payload)?;
     Ok(())
 }
 
