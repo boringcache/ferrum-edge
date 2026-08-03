@@ -3146,6 +3146,56 @@ fn backend_tls_sni_with_sibling_subset_upgrade_does_not_false_reject() {
 }
 
 #[test]
+fn backend_tls_sni_ignores_sibling_subset_target_port_policy() {
+    let mut upstream = subset_sni_upstream(
+        ResolvedSubsetTrafficPolicy {
+            tls: None,
+            passive_health_check: None,
+            h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
+            max_retries: Some(1),
+            http1_max_pending_requests: Some(1),
+        },
+        ResolvedSubsetTrafficPolicy {
+            tls: None,
+            passive_health_check: None,
+            h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+            max_retries: Some(3),
+            http1_max_pending_requests: Some(4),
+        },
+    );
+    upstream.targets[1].port = 8443;
+    upstream.port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
+            ..UpstreamPortOverride::default()
+        },
+    );
+    upstream.port_overrides.insert(
+        8443,
+        UpstreamPortOverride {
+            h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+            ..UpstreamPortOverride::default()
+        },
+    );
+
+    let mut proxy = make_proxy("p-v2-distinct-port", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::HttpsPool;
+    proxy.upstream_id = Some("sni-subset-upstream".into());
+    proxy.upstream_subset = Some("v2".into());
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+    config.normalize_fields();
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "v1's force-H1 target port must not reject proxy-wide SNI admission for selected subset v2"
+    );
+}
+
+#[test]
 fn backend_tls_sni_per_port_upgrade_clears_inherited_do_not_upgrade() {
     let mut upstream = make_upstream("sni-port-upstream");
     upstream.backend_tls_sni = Some("backend.mesh.internal".into());

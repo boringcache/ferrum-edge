@@ -1081,7 +1081,7 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
     let updated = build(
         Some(MeshConnectionPoolHttp {
             h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
-            max_retries: Some(7),
+            max_retries: Some(0),
             http1_max_pending_requests: Some(6),
             ..MeshConnectionPoolHttp::default()
         }),
@@ -1093,7 +1093,7 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
         }),
     );
     let updated_stable = inherited(&updated, "reviews-stable");
-    assert_eq!(updated_stable.max_retries, Some(7));
+    assert_eq!(updated_stable.max_retries, Some(0));
     assert_eq!(updated_stable.http1_max_pending_requests, Some(6));
     assert_eq!(stable.max_retries, Some(2), "old snapshot stays coherent");
 
@@ -1107,7 +1107,7 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
 }
 
 #[test]
-fn destination_rule_subset_http_zero_values_fail_closed_with_field_paths() {
+fn destination_rule_subset_zero_pending_fails_while_zero_retries_is_valid() {
     use ferrum_edge::modes::mesh::config::{MeshConnectionPoolHttp, MeshSubset};
 
     let mut config = GatewayConfig {
@@ -1143,8 +1143,11 @@ fn destination_rule_subset_http_zero_values_fail_closed_with_field_paths() {
         .expect_err("invalid subset HTTP caps must reject the whole snapshot")
         .to_string();
     assert!(error.contains("subsets[0]"));
-    assert!(error.contains("maxRetries must be positive"));
     assert!(error.contains("http1MaxPendingRequests must be positive"));
+    assert!(
+        !error.contains("maxRetries"),
+        "maxRetries=0 is an explicit disabling cap, not a validation error: {error}"
+    );
 }
 
 // `resolve_effective_proxy_for_target` is `pub(crate)`, so the per-field

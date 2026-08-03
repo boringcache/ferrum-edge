@@ -32,6 +32,7 @@ Current mesh HBONE/DNS perf status lives in
 | `WsDisconnectLogEntry` log schema | Implemented — [`docs/log_schema.md`](../log_schema.md) WebSocket disconnect family |
 | Mesh TLS-SNI L4 routing | Supported — VirtualService `tls[]` SNI passthrough (`sniHosts`); see [`docs/mesh_supported_matrix.md`](../mesh_supported_matrix.md) and `tests/integration/mesh_l7_routing_tests.rs` |
 | Remote-discovery JWT audience binding | Implemented — closed [#2475](https://github.com/ferrum-edge/ferrum-edge/issues/2475) |
+| Subset-scoped Istio HTTP connection-pool policy | Implemented by [#3547](https://github.com/ferrum-edge/ferrum-edge/pull/3547), resolving [#3228](https://github.com/ferrum-edge/ferrum-edge/issues/3228) / [#3240](https://github.com/ferrum-edge/ferrum-edge/issues/3240)–[#3242](https://github.com/ferrum-edge/ferrum-edge/issues/3242) |
 
 ## Live dedicated trackers (current backlog)
 

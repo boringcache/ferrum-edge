@@ -320,7 +320,7 @@ fn dr_connection_pool_http_h2_upgrade_policy() {
 /// Interpreted as a per-request retry-count CAP (an upper bound on
 /// `Proxy.retry.max_retries`), NOT Envoy's cluster-wide outstanding-retry
 /// budget. Never increases retries and never enables retries when the proxy has
-/// no retry policy. Zero/negative rejected at translate time.
+/// no retry policy. Zero disables an existing policy; negatives are rejected.
 #[test]
 fn dr_connection_pool_http_max_retries() {
     register_feature!(
@@ -380,7 +380,6 @@ fn dr_subset_connection_pool_http_combined() {
         category = CATEGORY,
         feature = "subsets[].trafficPolicy.connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests}",
         status = Status::Supported,
-        maturity = Maturity::Ga,
         notes = "Preserved per subset; runtime precedence is explicit port-level > selected subset > top-level. H1 admission is keyed by subset and retry caps never synthesize retry policy.",
     );
     let dr = translated(json!({

@@ -51637,6 +51637,28 @@ mod tests {
     }
 
     #[test]
+    fn cap_proxy_retry_selected_subset_zero_disables_existing_retries() {
+        let mut inner = (*proxy_with_max_retries_override(None)).clone();
+        inner.upstream_subset = Some("fragile".to_string());
+        inner.dispatch_port_overrides = None;
+        inner.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            max_retries: Some(0),
+            ..Default::default()
+        });
+        inner.retry = Some(crate::config::types::RetryConfig {
+            max_retries: 5,
+            ..Default::default()
+        });
+        let capped = cap_proxy_retry_for_target(Arc::new(inner), Some(&target_for_test(8080)));
+
+        assert_eq!(
+            capped.retry.as_ref().map(|retry| retry.max_retries),
+            Some(0),
+            "a selected subset's maxRetries=0 must disable the inherited retry budget"
+        );
+    }
+
+    #[test]
     fn cap_proxy_retry_selected_subset_cap_is_stable_across_target_rotation() {
         let mut inner = (*proxy_with_max_retries_override(None)).clone();
         inner.upstream_subset = Some("stable".to_string());

@@ -3061,6 +3061,32 @@ fn mesh_sd_policy_port(
         .map(|port| port.port)
 }
 
+/// Whether `target` is selectable for the named upstream subset. Admission
+/// paths use the same label containment rule as the load balancer so a policy
+/// attached only to a sibling subset cannot affect the selected destination.
+/// An unknown subset remains unfiltered here because reference validation
+/// reports that independent error; retaining every target also keeps the
+/// remaining admission checks fail-closed while errors are accumulated.
+fn upstream_target_selected_by_subset(
+    upstream: &Upstream,
+    selected_subset: Option<&str>,
+    target: &UpstreamTarget,
+) -> bool {
+    let subset = selected_subset.and_then(|subset_name| {
+        upstream
+            .subsets
+            .as_ref()
+            .and_then(|subsets| subsets.iter().find(|subset| subset.name == subset_name))
+    });
+    match subset {
+        Some(subset) => subset
+            .labels
+            .iter()
+            .all(|(key, value)| target.tags.get(key).is_some_and(|tag| tag == value)),
+        None => true,
+    }
+}
+
 /// Every mesh transport an upstream's selected targets require.
 ///
 /// Returns one [`MeshTransportConflict`] per selectable target that needs a mesh
@@ -3114,22 +3140,12 @@ fn upstream_required_mesh_transports(
         }];
     }
 
-    let subset = selected_subset.and_then(|subset_name| {
-        upstream
-            .subsets
-            .as_ref()
-            .and_then(|subsets| subsets.iter().find(|subset| subset.name == subset_name))
-    });
-    let target_selected = |target: &UpstreamTarget| match subset {
-        Some(subset) => subset
-            .labels
-            .iter()
-            .all(|(key, value)| target.tags.get(key).is_some_and(|tag| tag == value)),
-        None => true,
-    };
-
     let mut conflicts = Vec::new();
-    for target in upstream.targets.iter().filter(|t| target_selected(t)) {
+    for target in upstream
+        .targets
+        .iter()
+        .filter(|target| upstream_target_selected_by_subset(upstream, selected_subset, target))
+    {
         let transport = if crate::proxy::hbone_pool::target_hbone_enabled(target) {
             Some("mesh.hbone")
         } else if crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(target) {
@@ -3433,6 +3449,13 @@ fn policy_ports_for_proxy_wide_sni(proxy: &Proxy, upstream: Option<&Upstream>) -
         let mut ports: Vec<u16> = upstream
             .targets
             .iter()
+            .filter(|target| {
+                upstream_target_selected_by_subset(
+                    upstream,
+                    proxy.upstream_subset.as_deref(),
+                    target,
+                )
+            })
             .map(UpstreamTarget::dispatch_policy_port)
             .collect();
         ports.sort_unstable();
@@ -3493,6 +3516,7 @@ pub(crate) fn proxy_for_sni_direct_h2_admission(
     effective_retry: Option<RetryConfig>,
 ) -> Proxy {
     let mut admission = proxy_with_resolved_port_caps(proxy, upstream, selected_subset);
+    admission.upstream_subset = selected_subset.map(str::to_owned);
     admission.retry = effective_retry;
     admission.resolved_tls = BackendTlsConfig::from_upstream(upstream);
     if let Some(subset_name) = selected_subset

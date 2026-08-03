@@ -1317,8 +1317,8 @@ fn parse_keepalive_duration_seconds(
 /// `connectionPool.http.maxRetries` is a cluster-wide outstanding-retry
 /// concurrency budget; Ferrum's retry model is per-request, so the field is
 /// projected as a per-request retry-count CAP (see `docs/mesh.md` and
-/// `cap_proxy_retry_for_target`). It is still validated as a positive
-/// integer here (zero/negative rejected) like the other uint32 knobs.
+/// `cap_proxy_retry_for_target`). It is validated as a non-negative integer;
+/// zero explicitly disables an existing retry policy for the destination.
 ///
 /// `http1MaxPendingRequests` is honestly reinterpreted as a max-concurrent-
 /// in-flight-HTTP/1.1-requests cap, NOT Envoy's connection-pending-queue:
@@ -1362,13 +1362,12 @@ fn translate_connection_pool_http(
         Some(v) => translate_h2_upgrade_policy(object, v)?,
         None => None,
     };
-    // Reject zero/negative `maxRetries` (mirrors `http2MaxRequests`). A
-    // configured cap of 0 would be ambiguous against our per-request-cap
-    // interpretation (it would zero out an existing retry policy, which is
-    // not what an operator setting an Envoy outstanding-retry budget means);
-    // fail closed at translate time rather than silently disabling retries.
+    // `maxRetries: 0` is an explicit cap that disables an existing retry
+    // policy for this destination without synthesizing one. This is especially
+    // important at subset scope, where operators use zero to keep a fragile
+    // subset from inheriting the broader route's retry budget (#3241).
     let max_retries = match http.get("maxRetries") {
-        Some(v) => Some(translate_http_uint32(object, "maxRetries", v, false)?),
+        Some(v) => Some(translate_http_uint32(object, "maxRetries", v, true)?),
         None => None,
     };
 
@@ -1437,10 +1436,11 @@ fn translate_h2_upgrade_policy(
 
 /// Parse a uint32 `connectionPool.http.*` knob. Negative and non-integer
 /// values are always rejected. `allow_zero` controls the lower bound: most
-/// knobs (`http2MaxRequests`, `maxRetries`) reject `0` as ambiguous, but
-/// `maxRequestsPerConnection` accepts `0` as Istio's documented "unlimited"
-/// sentinel. The field is still deferred, but accepting `0` keeps validation
-/// compatible with Istio while status/warnings make the no-op visible.
+/// knobs (`http2MaxRequests`, `http1MaxPendingRequests`) reject `0`, while
+/// `maxRetries` accepts it as an explicit retry-disabling cap and
+/// `maxRequestsPerConnection` accepts it as Istio's documented "unlimited"
+/// sentinel. The latter field is still deferred, but accepting `0` keeps
+/// validation compatible with Istio while status/warnings make the no-op visible.
 fn translate_http_uint32(
     object: &K8sObject,
     field: &str,
@@ -17282,8 +17282,8 @@ extensionProviders:
     }
 
     #[test]
-    fn destination_rule_rejects_zero_max_retries() {
-        let err = translate_k8s_objects(
+    fn destination_rule_accepts_zero_max_retries_as_disabling_cap() {
+        let translation = translate_k8s_objects(
             &[object(
                 "DestinationRule",
                 serde_json::json!({
@@ -17295,11 +17295,14 @@ extensionProviders:
             )],
             options(),
         )
-        .expect_err("zero maxRetries must fail");
-        assert!(
-            err.to_string().contains("maxRetries must be positive"),
-            "unexpected: {err}"
-        );
+        .expect("zero maxRetries is an explicit disabling cap");
+        let mesh = translation.config.mesh.expect("mesh config");
+        let http = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .and_then(|policy| policy.connection_pool_http.as_ref())
+            .expect("HTTP connection-pool policy translated");
+        assert_eq!(http.max_retries, Some(0));
     }
 
     #[test]
@@ -17318,7 +17321,7 @@ extensionProviders:
         )
         .expect_err("negative maxRetries must fail");
         assert!(
-            err.to_string().contains("maxRetries must be positive")
+            err.to_string().contains("maxRetries must be non-negative")
                 && !err.to_string().contains("-1"),
             "unexpected: {err}"
         );

@@ -1975,8 +1975,8 @@ pub struct MeshConnectionPoolHttp {
     /// in `src/proxy/mod.rs`. When a proxy already carries a retry policy
     /// the effective `max_retries` becomes `min(existing, this)`; when no
     /// policy exists this field does NOT synthesize one (an Istio
-    /// `maxRetries` is a budget, not a retry-policy enabler). Always
-    /// positive when set (zero/negative rejected at translate time).
+    /// `maxRetries` is a budget, not a retry-policy enabler). Zero explicitly
+    /// disables an existing retry policy for the selected destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,
     /// Mapped from `http1MaxPendingRequests`. Honestly reinterpreted as the
@@ -3696,10 +3696,10 @@ fn validate_mesh_config_internal(
             );
         }
         // `http1MaxPendingRequests` is enforced by the limiter as a
-        // per-`(host, port, subset)` gate where `Some(0)` is hard-overflow;
-        // `maxRetries: 0` is likewise outside the translator's positive cap
-        // contract. Native/file/xDS slices bypass K8s translation, so apply the
-        // same field-specific validation here.
+        // per-`(host, port, subset)` gate where `Some(0)` is hard-overflow.
+        // Native/file/xDS slices bypass K8s translation, so apply the same
+        // field-specific validation here. (`maxRetries: 0` is valid and
+        // disables an existing retry policy for the destination.)
         // Walk every place a `connectionPool.http` block can ride a DR:
         // top-level `trafficPolicy`, per-port `portLevelSettings`, and each
         // `subsets[].trafficPolicy`.
@@ -3991,7 +3991,7 @@ fn validate_required_tls_path(context: String, value: Option<&str>, errors: &mut
 }
 
 /// Validate a DestinationRule `connectionPool.http` block from the native/file
-/// mesh slice path, matching the positive-value checks the K8s translator
+/// mesh slice path, matching the lower-bound checks the K8s translator
 /// (`translate_http_uint32`) enforces at parse time.
 ///
 /// `http1MaxPendingRequests` is load-bearing because the
@@ -3999,10 +3999,9 @@ fn validate_required_tls_path(context: String, value: Option<&str>, errors: &mut
 /// hard-overflow that sheds every HTTP/1.1 request, so an accidental `0` on a
 /// hand-authored native/file DR would silently blackhole all H1 traffic to the
 /// matched destination. The K8s translator rejects 0/negative; this keeps the
-/// native/file path equivalent. `maxRetries` uses the same positive-value
-/// contract as K8s translation; zero is rejected rather than ambiguously
-/// disabling an existing route retry policy. Negatives are already impossible
-/// because both fields deserialize as `u32`.
+/// native/file path equivalent. `maxRetries: 0` is valid and explicitly
+/// disables an existing retry policy for the selected destination; negatives
+/// are already impossible because both fields deserialize as `u32`.
 fn validate_dr_connection_pool_http(
     context: &str,
     policy: Option<&MeshTrafficPolicy>,
@@ -4014,11 +4013,6 @@ fn validate_dr_connection_pool_http(
     if http.http1_max_pending_requests == Some(0) {
         errors.push(format!(
             "{context}.connectionPool.http.http1MaxPendingRequests must be positive (0 would shed every HTTP/1.1 request)"
-        ));
-    }
-    if http.max_retries == Some(0) {
-        errors.push(format!(
-            "{context}.connectionPool.http.maxRetries must be positive (the field caps an existing retry policy and does not synthesize or disable one)"
         ));
     }
 }

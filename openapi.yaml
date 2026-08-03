@@ -10083,11 +10083,12 @@ components:
         max_retries:
           type: [integer, "null"]
           format: uint32
-          minimum: 1
+          minimum: 0
           readOnly: true
           description: >-
             Subset cap on an existing per-request retry policy, projected from
-            a mesh DestinationRule. It never enables retries; direct admin/file
+            a mesh DestinationRule. It never enables retries; zero disables an
+            existing policy for the selected destination. Direct admin/file
             configuration is rejected.
         http1_max_pending_requests:
           type: [integer, "null"]
