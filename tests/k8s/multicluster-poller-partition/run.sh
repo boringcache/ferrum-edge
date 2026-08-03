@@ -121,6 +121,7 @@ run_wait_predicate() {
     fresh_state) fresh_state "$@" ;;
     kubectl) kubectl "$@" ;;
     no_configured_state) no_configured_state "$@" ;;
+    projected_config_withdrawn) projected_config_withdrawn "$@" ;;
     proxy_activity_increased) proxy_activity_increased "$@" ;;
     state_matches) state_matches "$@" ;;
     traffic_not_found) traffic_not_found "$@" ;;
@@ -220,15 +221,8 @@ spire_bundle_b64der() {
 }
 
 mint_admin_jwt() {
-  python3 - "$ADMIN_SECRET" <<'PY'
-import base64, hashlib, hmac, json, sys, time, uuid
-secret=sys.argv[1].encode(); now=int(time.time())
-def enc(v): return base64.urlsafe_b64encode(json.dumps(v,separators=(",",":"),sort_keys=True).encode()).rstrip(b"=").decode()
-head=enc({"alg":"HS256","typ":"JWT"})
-body=enc({"iss":"ferrum-edge","sub":"poller-live","iat":now,"nbf":now-1,"exp":now+3600,"jti":str(uuid.uuid4()),"role":"admin"})
-data=f"{head}.{body}"; sig=base64.urlsafe_b64encode(hmac.new(secret,data.encode(),hashlib.sha256).digest()).rstrip(b"=").decode()
-print(f"{data}.{sig}")
-PY
+  python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
+    mint-admin-jwt "$ADMIN_SECRET"
 }
 
 create_clusters_and_fault_layer() {
@@ -251,7 +245,8 @@ create_clusters_and_fault_layer() {
   create_proxy "$FED_BA" "$FED_BA_PORT" "$NODE_A:32443"
   create_proxy "$DISC_BA" "$DISC_BA_PORT" "$NODE_A:32551"
   local count
-  count="$(curl -fsS "http://$TOXI_IP:8474/proxies" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))')"
+  count="$(curl -fsS "http://$TOXI_IP:8474/proxies" | \
+    python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py proxy-count)"
   [[ "$count" == 4 ]] || { echo "Toxiproxy fixture startup incomplete: $count/4 proxies" >&2; return 1; }
 }
 
@@ -330,10 +325,8 @@ apply_support_material() {
     --dry-run=client -o yaml | kubectl --context "$context" apply -f -
   bundle="$(spire_bundle_b64der "$context")"
   [[ -n "$bundle" ]] || { echo "empty SPIRE bundle for $cluster" >&2; return 1; }
-  python3 - "$td" "$bundle" > "$ARTIFACT_DIR/bundle-$cluster.json" <<'PY'
-import json,sys
-print(json.dumps({"trust_domain":sys.argv[1],"x509_authorities":sys.argv[2].splitlines(),"jwt_authorities":[]}))
-PY
+  python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
+    bundle-json "$td" "$bundle" > "$ARTIFACT_DIR/bundle-$cluster.json"
   kubectl --context "$context" -n "$NS" create configmap federation-bundle \
     --from-file=bundle.json="$ARTIFACT_DIR/bundle-$cluster.json" --dry-run=client -o yaml |
     kubectl --context "$context" apply -f -
@@ -435,35 +428,37 @@ metrics() {
 
 state_matches() {
   local context="$1" token="$2" peer="$3" discovered="$4" trust_source="$5" outbound="$6" inbound="$7"
-  admin_json "$context" "$token" | python3 -c '
-import json,sys
-peer,disc,source,outbound,inbound=sys.argv[1:]
-d=json.load(sys.stdin); rows=[r for r in d["configured"] if r["cluster_name"]==peer]
-ok=len(rows)==1 and rows[0]["discovered"]==(disc=="true") and rows[0]["trust_source"]==source and rows[0]["outbound_trust_active"]==(outbound=="true") and rows[0]["inbound_trust_active"]==(inbound=="true")
-raise SystemExit(0 if ok else 1)' "$peer" "$discovered" "$trust_source" "$outbound" "$inbound"
+  admin_json "$context" "$token" | \
+    python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
+      state-matches "$peer" "$discovered" "$trust_source" "$outbound" "$inbound"
 }
 
 no_configured_state() {
-  admin_json "$1" "$2" | python3 -c 'import json,sys; d=json.load(sys.stdin); raise SystemExit(0 if not d["configured"] and not d["discovered"] else 1)'
+  admin_json "$1" "$2" | \
+    python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
+      no-configured-state
 }
 
 traffic_once() {
-  local context="$1" service="$2" expected="$3"
-  kubectl --context "$context" -n "$NS" exec deploy/echo -c probe -- sh -c '
-    body="$(curl -sS -m 5 -o /tmp/body -w "%{http_code}" -H "Host: $1" http://127.0.0.1:15001/ || true)"
-    [ "$body" = 200 ] && grep -Fq "$2" /tmp/body
-  ' sh "$service.$NS.svc.cluster.local" "$expected"
+  local context="$1" service="$2" expected="$3" response status body
+  response="$(kubectl --context "$context" -n "$NS" exec deploy/echo -c probe -- \
+    curl -sS -m 5 -w $'\n%{http_code}' -H "Host: $service.$NS.svc.cluster.local" \
+      http://127.0.0.1:15001/)" || return 1
+  status="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  [[ "$status" == 200 && "$body" == *"$expected"* ]]
 }
 
 traffic_fails() { ! traffic_once "$1" "$2" "$3"; }
 
 traffic_not_found() {
-  local context="$1" service="$2"
-  kubectl --context "$context" -n "$NS" exec deploy/echo -c probe -- sh -c '
-    : >/tmp/body
-    status="$(curl -sS -m 5 -o /tmp/body -w "%{http_code}" -H "Host: $1" http://127.0.0.1:15001/ || true)"
-    [ "$status" = 404 ] && grep -Fq "Not Found" /tmp/body
-  ' sh "$service.$NS.svc.cluster.local"
+  local context="$1" service="$2" response status body
+  response="$(kubectl --context "$context" -n "$NS" exec deploy/echo -c probe -- \
+    curl -sS -m 5 -w $'\n%{http_code}' -H "Host: $service.$NS.svc.cluster.local" \
+      http://127.0.0.1:15001/)" || return 1
+  status="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  [[ "$status" == 404 && "$body" == *"Not Found"* ]]
 }
 
 metric_value() {
@@ -509,19 +504,17 @@ failure_counter_deltas_positive() {
 }
 
 ages_between() {
-  admin_json "$1" "$2" | python3 -c '
-import json,sys
-peer,low,high=sys.argv[1],int(sys.argv[2]),int(sys.argv[3]); d=json.load(sys.stdin); r=next(x for x in d["configured"] if x["cluster_name"]==peer); x=next(y for y in d["discovered"] if y["cluster_name"]==peer)
-raise SystemExit(0 if low <= r["trust_bundle_age_seconds"] < high and low <= x["age_seconds"] < high else 1)' "$3" "$4" "$5"
+  admin_json "$1" "$2" | \
+    python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
+      ages-between "$3" "$4" "$5"
 }
 
 fresh_state() { ages_between "$1" "$2" "$3" 0 5; }
 
 admin_ages() {
-  admin_json "$1" "$2" | python3 -c '
-import json,sys
-d=json.load(sys.stdin); peer=sys.argv[1]; r=next(x for x in d["configured"] if x["cluster_name"]==peer); e=next(x for x in d["discovered"] if x["cluster_name"]==peer)
-print(r["trust_bundle_age_seconds"],e["age_seconds"])' "$3"
+  admin_json "$1" "$2" | \
+    python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
+      admin-ages "$3"
 }
 
 ages_increased_below_stale() {
@@ -540,38 +533,25 @@ assert_metric_admin_parity() {
   local context="$1" token="$2" peer="$3" td="$4"
   local json_file="$RESULTS_DIR/parity.json" metrics_file="$RESULTS_DIR/parity.prom"
   admin_json "$context" "$token" > "$json_file"; metrics "$context" "$token" > "$metrics_file"
-  python3 - "$json_file" "$metrics_file" "$peer" "$td" <<'PY'
-import json,re,sys
-d=json.load(open(sys.argv[1])); text=open(sys.argv[2]).read(); peer,td=sys.argv[3:]
-r=next(x for x in d["configured"] if x["cluster_name"]==peer); e=next(x for x in d["discovered"] if x["cluster_name"]==peer)
-def metric(name, labels):
-  for line in text.splitlines():
-    if line.startswith(name+"{") and all(f'{k}="{v}"' in line for k,v in labels.items()): return float(line.rsplit(" ",1)[1])
-  raise SystemExit(f"missing {name}")
-fa=metric("ferrum_mesh_federation_bundle_age_seconds",{"trust_domain":td})
-ea=metric("ferrum_mesh_remote_discovery_endpoint_age_seconds",{"cluster":peer,"trust_domain":td})
-if abs(fa-r["trust_bundle_age_seconds"])>2 or abs(ea-e["age_seconds"])>2: raise SystemExit("admin/metric cache-age parity exceeded 2s")
-if 'endpoint="redacted"' not in text and "ferrum_mesh_federation_poll_failures_total" in text: raise SystemExit("federation endpoint label not redacted")
-if 'control_plane="redacted"' not in text and "ferrum_mesh_remote_discovery_poll_failures_total" in text: raise SystemExit("control-plane label not redacted")
-families={
- "ferrum_mesh_federation_poll_failures_total":f'trust_domain="{td}"',
- "ferrum_mesh_federation_bundle_age_seconds":f'trust_domain="{td}"',
- "ferrum_mesh_remote_discovery_poll_failures_total":f'cluster="{peer}"',
- "ferrum_mesh_remote_discovery_poll_successes_total":f'cluster="{peer}"',
- "ferrum_mesh_remote_discovery_endpoint_age_seconds":f'cluster="{peer}"',
+  python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
+    assert-metric-admin-parity "$json_file" "$metrics_file" "$peer" "$td"
 }
-for family,selector in families.items():
-  matches=[line for line in text.splitlines() if line.startswith(family+"{") and selector in line]
-  if len(matches)!=1: raise SystemExit(f"bounded cardinality violated for {family}: {len(matches)}")
-PY
+
+projected_config_withdrawn() {
+  local config
+  config="$(kubectl --context "$1" -n "$NS" exec deploy/echo -c signal -- \
+    cat /mesh/mesh.yaml)" || return 1
+  ! grep -q remote_clusters <<<"$config"
 }
 
 signal_reload() {
-  local context="$1"
-  wait_until "projected withdrawn mesh config" 30 kubectl --context "$context" -n "$NS" exec deploy/echo -c signal -- \
-    sh -c '! grep -q "remote_clusters" /mesh/mesh.yaml'
-  kubectl --context "$context" -n "$NS" exec deploy/echo -c signal -- sh -c \
-    'pid="$(pidof ferrum-edge)"; [ -n "$pid" ]; kill -HUP $pid'
+  local context="$1" pid
+  wait_until "projected withdrawn mesh config" 30 projected_config_withdrawn "$context"
+  pid="$(kubectl --context "$context" -n "$NS" exec deploy/echo -c signal -- \
+    pidof ferrum-edge)" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || { echo "invalid ferrum-edge pid" >&2; return 1; }
+  kubectl --context "$context" -n "$NS" exec deploy/echo -c signal -- \
+    kill -HUP "$pid"
 }
 
 deploy_topology() {
@@ -725,12 +705,9 @@ collect_diagnostics() {
     kubectl --context "$context" -n "$NS" logs deploy/echo -c ferrum-edge --tail=500 > "$RESULTS_DIR/cluster-$label-dp.log" 2>&1 || true
     kubectl --context "$context" -n "$NS" logs deploy/ferrum-cp -c ferrum-edge --tail=500 > "$RESULTS_DIR/cluster-$label-cp.log" 2>&1 || true
   done
-  curl -fsS "http://$TOXI_IP:8474/proxies" | python3 -c '
-import json,sys
-d=json.load(sys.stdin)
-for v in d.values():
-  v["upstream"]="redacted"; v["listen"]="redacted"
-print(json.dumps(d,indent=2,sort_keys=True))' > "$RESULTS_DIR/toxiproxy-redacted.json" 2>/dev/null || true
+  curl -fsS "http://$TOXI_IP:8474/proxies" | \
+    python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
+      redact-toxiproxy > "$RESULTS_DIR/toxiproxy-redacted.json" 2>/dev/null || true
 }
 
 main() {
