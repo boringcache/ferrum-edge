@@ -979,7 +979,7 @@ async fn ordinary_proxy_edit_preserves_unaffected_load_balancer_snapshot() {
         .iter_mut()
         .find(|proxy| proxy.id == "reviews-p")
         .expect("reviews proxy");
-    proxy.backend_read_timeout_ms = Some(7_500);
+    proxy.backend_read_timeout_ms = 7_500;
     proxy.updated_at += Duration::seconds(1);
     new_config.normalize_fields();
 
