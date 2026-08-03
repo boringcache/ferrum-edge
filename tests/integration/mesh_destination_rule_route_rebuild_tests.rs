@@ -315,6 +315,15 @@ fn prepared_mesh_sd_with_dr(stamp: chrono::DateTime<Utc>, idle_ms: u64) -> Gatew
         upstream.created_at = stamp;
         upstream.updated_at = stamp;
     }
+    // `prepare_gateway_config_for_mesh` also materializes reserved
+    // `__mesh-*` routes/upstreams. Production publishes those through the
+    // crate-private trusted mesh entrypoint, while this integration test must
+    // use the public validation path. Keep only the operator-authored SD pair
+    // under test so public validation does not reject unrelated reserved IDs.
+    prepared.proxies.retain(|proxy| proxy.id == "reviews-p");
+    prepared
+        .upstreams
+        .retain(|upstream| upstream.id == "reviews-u");
     remove_trusted_mesh_plugins_for_public_update_fixture(&mut prepared);
     prepared
 }
