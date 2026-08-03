@@ -196,7 +196,9 @@ impl MeshSliceDriftAdmitError {
             Self::EmptyNamespace => "mesh slice drift namespace must not be empty",
             Self::EmptyVersion => "mesh slice status version must not be empty",
             Self::VersionTooLong => "mesh slice status version exceeds the maximum length",
-            Self::UnknownNode => "no mesh slice drift session exists for this authenticated identity",
+            Self::UnknownNode => {
+                "no mesh slice drift session exists for this authenticated identity"
+            }
             Self::CardinalityExceeded => {
                 "mesh slice drift registry is at capacity; disconnect idle data planes or raise retention reaping"
             }
@@ -574,7 +576,14 @@ fn publish_entry(entry: &LiveEntry, now: DateTime<Utc>) -> MeshSliceDriftEntry {
         ),
     };
 
-    let convergence = classify(entry.connected, &desired, &sent, &acknowledged, &rejected, drift);
+    let convergence = classify(
+        entry.connected,
+        &desired,
+        &sent,
+        &acknowledged,
+        &rejected,
+        drift,
+    );
 
     MeshSliceDriftEntry {
         node_id: entry.node_id.clone(),
@@ -628,9 +637,7 @@ fn versions_differ(left: Option<&str>, right: Option<&str>) -> bool {
 }
 
 fn age_seconds(now: DateTime<Utc>, at: DateTime<Utc>) -> u64 {
-    now.signed_duration_since(at)
-        .num_seconds()
-        .max(0) as u64
+    now.signed_duration_since(at).num_seconds().max(0) as u64
 }
 
 fn validate_identity(node_id: &str) -> Result<&str, MeshSliceDriftAdmitError> {

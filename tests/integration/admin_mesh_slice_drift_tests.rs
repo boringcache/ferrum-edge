@@ -193,7 +193,10 @@ async fn slice_drift_admin_auth_and_ack_nack_convergence() {
         node_waypoint_capture_scoping: false,
     };
     assert!(
-        client.mesh_subscribe(tonic::Request::new(forged)).await.is_err(),
+        client
+            .mesh_subscribe(tonic::Request::new(forged))
+            .await
+            .is_err(),
         "JWT sub / node_id mismatch must fail closed"
     );
 

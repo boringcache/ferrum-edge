@@ -4607,7 +4607,9 @@ mod tests {
             &self,
             _request: Request<crate::grpc::proto::MeshSliceStatusReport>,
         ) -> Result<Response<crate::grpc::proto::MeshSliceStatusResponse>, Status> {
-            Ok(Response::new(crate::grpc::proto::MeshSliceStatusResponse {}))
+            Ok(Response::new(
+                crate::grpc::proto::MeshSliceStatusResponse {},
+            ))
         }
     }
 

@@ -714,9 +714,7 @@ impl MeshConfigSync for MeshGrpcServer {
                         err.field_name()
                     ))
                 })?;
-            let _ = self
-                .drift
-                .record_sent(&node_id, now, &initial_version, now);
+            let _ = self.drift.record_sent(&node_id, now, &initial_version, now);
         }
         self.registry.insert(MeshNodeInfo {
             node_id: node_id.clone(),
@@ -899,8 +897,11 @@ impl MeshConfigSync for MeshGrpcServer {
     ) -> Result<Response<MeshSliceStatusResponse>, Status> {
         // Status reports are local-mesh only. Remote-discovery tokens must not
         // mutate another cluster's drift registry.
-        let identity = match self.verify_jwt_metadata(request.metadata(), request.extensions(), false)
-        {
+        let identity = match self.verify_jwt_metadata(
+            request.metadata(),
+            request.extensions(),
+            false,
+        ) {
             Ok(identity) => identity,
             Err((status, audience_reason)) => {
                 if let Some(reason) = audience_reason {
@@ -939,13 +940,11 @@ impl MeshConfigSync for MeshGrpcServer {
                 MeshSliceDriftAdmitError::EmptyVersion
                 | MeshSliceDriftAdmitError::VersionTooLong
                 | MeshSliceDriftAdmitError::EmptyNodeId
-                | MeshSliceDriftAdmitError::EmptyNamespace => {
-                    Status::invalid_argument(format!(
-                        "{} (field={})",
-                        err.as_status_message(),
-                        err.field_name()
-                    ))
-                }
+                | MeshSliceDriftAdmitError::EmptyNamespace => Status::invalid_argument(format!(
+                    "{} (field={})",
+                    err.as_status_message(),
+                    err.field_name()
+                )),
                 MeshSliceDriftAdmitError::CardinalityExceeded => {
                     Status::resource_exhausted(err.as_status_message())
                 }

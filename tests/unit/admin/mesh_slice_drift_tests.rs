@@ -58,7 +58,10 @@ fn nack_reason_is_sanitized_and_marks_rejecting() {
     registry
         .open_session("dp-a", "ferrum", connected_at, Some("v1"))
         .unwrap();
-    let raw = format!("bad\nslice{}", "x".repeat(MESH_SLICE_DRIFT_MAX_REASON_CHARS + 8));
+    let raw = format!(
+        "bad\nslice{}",
+        "x".repeat(MESH_SLICE_DRIFT_MAX_REASON_CHARS + 8)
+    );
     registry
         .record_status("dp-a", "v1", Some(&raw), connected_at)
         .unwrap();
@@ -96,9 +99,7 @@ fn replacement_session_and_stale_disconnect_are_generation_safe() {
         None
     );
 
-    registry
-        .record_sent("dp-a", second, "v2", second)
-        .unwrap();
+    registry.record_sent("dp-a", second, "v2", second).unwrap();
     assert_eq!(
         registry.snapshot().data_planes[0]
             .sent
@@ -148,12 +149,7 @@ fn multiple_dps_and_cardinality_cap() {
             .unwrap();
     }
     let err = registry
-        .open_session(
-            "overflow",
-            "ferrum",
-            base + Duration::hours(1),
-            Some("v9"),
-        )
+        .open_session("overflow", "ferrum", base + Duration::hours(1), Some("v9"))
         .expect_err("full connected registry");
     assert_eq!(err, MeshSliceDriftAdmitError::CardinalityExceeded);
 
