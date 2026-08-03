@@ -26,8 +26,7 @@
 use crate::config::types::{
     AuthMode, BackendScheme, CircuitBreakerConfig, Consumer, DispatchKind, GatewayConfig,
     HealthCheckConfig, LoadBalancerAlgorithm, PluginAssociation, PluginConfig, PluginScope, Proxy,
-    ResponseBodyMode, RetryConfig, ServiceDiscoveryConfig, StreamMatchCriteria, Upstream,
-    UpstreamTarget,
+    ResponseBodyMode, RetryConfig, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
 use crate::config::validation_pipeline::{
     ConfigValidationRejection, ValidationAction, ValidationPipeline,
@@ -35,6 +34,7 @@ use crate::config::validation_pipeline::{
 };
 use crate::fips::approved::Sha256;
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
+use crate::proxy::stream_match::StreamMatchCriteria;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
