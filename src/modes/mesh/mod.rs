@@ -22227,6 +22227,7 @@ mod tests {
             waypoint_name: None,
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
             labels_ambiguous: false,
+            virtual_service_l4_proxies: Vec::new(),
             version: "test".to_string(),
             revision: None,
             workloads: Vec::new(),
