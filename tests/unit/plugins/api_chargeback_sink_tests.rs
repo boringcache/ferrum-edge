@@ -20,6 +20,7 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     probe_charge_body_materialization_with_projection_for_tests,
     probe_compact_recovery_retry_for_tests, probe_empty_dead_letter_publish_for_tests,
     probe_shared_spool_batch_clone_for_tests, probe_streaming_replay_batch_range_errors_for_tests,
+    probe_streaming_spool_reader_defensive_paths_for_tests,
     publish_dead_letter_payload_for_tests, render_prometheus, render_status_json,
     replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
     replay_spool_once_with_ceiling_for_tests, serialize_json_each_row,
@@ -7625,6 +7626,42 @@ fn streaming_replay_batch_range_validation_fails_closed() {
     assert!(empty.contains("empty batch range"), "{empty}");
     assert!(out_of_range.contains("out of range"), "{out_of_range}");
     assert!(inverted.contains("byte range is invalid"), "{inverted}");
+    assert_eq!(ceiling.used(), 0);
+}
+
+#[test]
+fn streaming_spool_reader_defensive_paths_fail_closed() {
+    let ceiling = leaked_chargeback_test_ceiling(64 * 1024);
+    let [
+        batch_overflow,
+        single_row,
+        payload_charge,
+        decoded_overflow,
+        buffer_range,
+        row_count,
+    ] = probe_streaming_spool_reader_defensive_paths_for_tests(ceiling)
+        .expect("streaming spool defensive probes must run");
+    assert!(
+        batch_overflow.contains("batch byte bound overflowed"),
+        "{batch_overflow}"
+    );
+    assert!(
+        single_row.contains("one row cannot fit the charged streaming batch"),
+        "{single_row}"
+    );
+    assert!(
+        payload_charge.contains("streaming spool batch violated its retained-byte bound"),
+        "{payload_charge}"
+    );
+    assert!(
+        decoded_overflow.contains("decoded byte count overflowed"),
+        "{decoded_overflow}"
+    );
+    assert!(
+        buffer_range.contains("invalid buffer range"),
+        "{buffer_range}"
+    );
+    assert!(row_count.contains("row count overflowed"), "{row_count}");
     assert_eq!(ceiling.used(), 0);
 }
 

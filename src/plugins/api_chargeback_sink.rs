@@ -9307,6 +9307,78 @@ fn validate_spool_coordination_file(path: &Path, file: &File) -> Result<SpoolFil
     Ok(file_identity)
 }
 
+/// Separator plus one row must fit in `usize` before a streaming batch grows.
+fn spool_replay_batch_row_charge(
+    separator: usize,
+    row_len: usize,
+) -> Result<usize, SpoolDecodeError> {
+    separator.checked_add(row_len).ok_or_else(|| {
+        SpoolDecodeError::Unreadable(format!(
+            "{PLUGIN_NAME}: spool replay batch byte bound overflowed"
+        ))
+    })
+}
+
+/// Refuse when the first row of a streaming batch cannot fit its charged body.
+fn spool_replay_refuse_oversized_first_row(
+    required: usize,
+    batch_bytes: usize,
+    body_len: usize,
+) -> Result<(), SpoolDecodeError> {
+    if required > batch_bytes.saturating_sub(body_len) {
+        return Err(SpoolDecodeError::CeilingExhausted(format!(
+            "{PLUGIN_NAME}: spool replay deferred: one row cannot fit the charged streaming batch"
+        )));
+    }
+    Ok(())
+}
+
+/// Attach the streaming batch body reservation after bounded assembly.
+fn charge_streaming_replay_batch_payload(
+    body: Vec<u8>,
+    body_reservation: ProcessByteReservation,
+) -> Result<ReservedPayload, SpoolDecodeError> {
+    ReservedPayload::from_preallocated_vec(body, body_reservation).map_err(|error| {
+        SpoolDecodeError::Unreadable(format!(
+            "{PLUGIN_NAME}: streaming spool batch violated its retained-byte bound: {}",
+            error.reason()
+        ))
+    })
+}
+
+/// Advance the decoded-byte counter without wrapping `u64`.
+fn spool_decoder_next_decoded_total(
+    decoded_bytes: u64,
+    consumed: u64,
+) -> Result<u64, SpoolDecodeError> {
+    decoded_bytes.checked_add(consumed).ok_or_else(|| {
+        SpoolDecodeError::Unreadable(format!(
+            "{PLUGIN_NAME}: spool decoded byte count overflowed"
+        ))
+    })
+}
+
+/// Slice one row's content out of the decoder's current input buffer.
+fn spool_decoder_row_content<'a>(
+    available: &'a [u8],
+    content_len: usize,
+) -> Result<&'a [u8], SpoolDecodeError> {
+    available.get(..content_len).ok_or_else(|| {
+        SpoolDecodeError::Unreadable(format!(
+            "{PLUGIN_NAME}: spool decoder returned an invalid buffer range"
+        ))
+    })
+}
+
+/// Increment the validated row count without wrapping `usize`.
+fn spool_decoder_next_row_count(row_count: usize) -> Result<usize, SpoolDecodeError> {
+    row_count.checked_add(1).ok_or_else(|| {
+        SpoolDecodeError::Unreadable(format!(
+            "{PLUGIN_NAME}: spool artifact row count overflowed"
+        ))
+    })
+}
+
 /// Charged streaming reader for one claimed spool artifact.
 ///
 /// No decoded artifact-wide buffer or row index exists. The only mutable row
@@ -9555,16 +9627,14 @@ impl StreamingSpoolReader {
                 break;
             }
             let separator = usize::from(!lines.is_empty());
-            let required = separator.checked_add(self.row.len()).ok_or_else(|| {
-                SpoolDecodeError::Unreadable(format!(
-                    "{PLUGIN_NAME}: spool replay batch byte bound overflowed"
-                ))
-            })?;
+            let required = spool_replay_batch_row_charge(separator, self.row.len())?;
             if required > self.batch_bytes.saturating_sub(body.len()) {
                 if lines.is_empty() {
-                    return Err(SpoolDecodeError::CeilingExhausted(format!(
-                        "{PLUGIN_NAME}: spool replay deferred: one row cannot fit the charged streaming batch"
-                    )));
+                    spool_replay_refuse_oversized_first_row(
+                        required,
+                        self.batch_bytes,
+                        body.len(),
+                    )?;
                 }
                 break;
             }
@@ -9582,13 +9652,7 @@ impl StreamingSpoolReader {
         if lines.is_empty() {
             return Ok(None);
         }
-        let payload =
-            ReservedPayload::from_preallocated_vec(body, body_reservation).map_err(|error| {
-                SpoolDecodeError::Unreadable(format!(
-                    "{PLUGIN_NAME}: streaming spool batch violated its retained-byte bound: {}",
-                    error.reason()
-                ))
-            })?;
+        let payload = charge_streaming_replay_batch_payload(body, body_reservation)?;
         Ok(Some(StreamingReplayBatch {
             payload,
             lines,
@@ -9615,13 +9679,7 @@ impl StreamingSpoolReader {
             let consumed = newline.map_or(available.len(), |offset| offset.saturating_add(1));
             let content_len = newline.unwrap_or(available.len());
             let next_decoded =
-                self.decoded_bytes
-                    .checked_add(consumed as u64)
-                    .ok_or_else(|| {
-                        SpoolDecodeError::Unreadable(format!(
-                            "{PLUGIN_NAME}: spool decoded byte count overflowed"
-                        ))
-                    })?;
+                spool_decoder_next_decoded_total(self.decoded_bytes, consumed as u64)?;
             if next_decoded > self.decoded_limit || next_decoded > SPOOL_MAX_ARTIFACT_BYTES {
                 return Err(SpoolDecodeError::Unreadable(format!(
                     "{PLUGIN_NAME}: spool artifact exceeds its hard decoded-byte bound"
@@ -9632,11 +9690,7 @@ impl StreamingSpoolReader {
                     "{PLUGIN_NAME}: spool artifact row exceeds the hard {SPOOL_MAX_ROW_BYTES}-byte bound"
                 )));
             }
-            let content = available.get(..content_len).ok_or_else(|| {
-                SpoolDecodeError::Unreadable(format!(
-                    "{PLUGIN_NAME}: spool decoder returned an invalid buffer range"
-                ))
-            })?;
+            let content = spool_decoder_row_content(available, content_len)?;
             self.row.extend_from_slice(content);
             self.reader.consume(consumed);
             self.decoded_bytes = next_decoded;
@@ -9686,11 +9740,7 @@ impl StreamingSpoolReader {
                 "{PLUGIN_NAME}: spool artifact contains malformed JSONEachRow"
             ))
         })?;
-        self.row_count = self.row_count.checked_add(1).ok_or_else(|| {
-            SpoolDecodeError::Unreadable(format!(
-                "{PLUGIN_NAME}: spool artifact row count overflowed"
-            ))
-        })?;
+        self.row_count = spool_decoder_next_row_count(self.row_count)?;
         self.row_ready = true;
         Ok(true)
     }
@@ -10066,6 +10116,55 @@ pub fn encode_zstd_declaring_content_size_for_tests(declared_size: u64) -> Vec<u
     let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0xE0];
     frame.extend_from_slice(&declared_size.to_le_bytes());
     frame
+}
+
+/// Fail-closed streaming spool-reader arithmetic and range probes for external
+/// tests. Returns the six defensive refusal diagnostics exercised by the
+/// extracted helpers that guard batch assembly and row decoding.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn probe_streaming_spool_reader_defensive_paths_for_tests(
+    ceiling: &'static RetainedByteCeiling,
+) -> Result<[String; 6], String> {
+    let batch_overflow = match spool_replay_batch_row_charge(1, usize::MAX) {
+        Err(SpoolDecodeError::Unreadable(message)) => message,
+        _ => return Err("batch row charge probe must overflow".into()),
+    };
+    let single_row = match spool_replay_refuse_oversized_first_row(64, 8, 0) {
+        Err(SpoolDecodeError::CeilingExhausted(message)) => message,
+        _ => return Err("single-row batch defer probe must refuse".into()),
+    };
+    let reservation = ceiling.try_acquire(8).ok_or_else(|| {
+        PayloadMaterializationError::CeilingExhausted
+            .reason()
+            .to_string()
+    })?;
+    let mut body = Vec::with_capacity(64);
+    body.extend_from_slice(b"probe");
+    let payload_charge = match charge_streaming_replay_batch_payload(body, reservation) {
+        Err(SpoolDecodeError::Unreadable(message)) => message,
+        _ => return Err("batch payload charge probe must refuse".into()),
+    };
+    let decoded_overflow = match spool_decoder_next_decoded_total(u64::MAX, 1) {
+        Err(SpoolDecodeError::Unreadable(message)) => message,
+        _ => return Err("decoded-byte total probe must overflow".into()),
+    };
+    let buffer_range = match spool_decoder_row_content(b"short", 16) {
+        Err(SpoolDecodeError::Unreadable(message)) => message,
+        _ => return Err("decoder buffer-range probe must refuse".into()),
+    };
+    let row_count = match spool_decoder_next_row_count(usize::MAX) {
+        Err(SpoolDecodeError::Unreadable(message)) => message,
+        _ => return Err("row-count probe must overflow".into()),
+    };
+    Ok([
+        batch_overflow,
+        single_row,
+        payload_charge,
+        decoded_overflow,
+        buffer_range,
+        row_count,
+    ])
 }
 
 /// Fail-closed `StreamingReplayBatch::body_range` probes for external tests.
