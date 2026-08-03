@@ -50,11 +50,7 @@ fn cross_namespace_workload(
     }
 }
 
-fn mesh_service(
-    namespace: &str,
-    name: &str,
-    workload_spiffe: Option<&str>,
-) -> MeshService {
+fn mesh_service(namespace: &str, name: &str, workload_spiffe: Option<&str>) -> MeshService {
     MeshService {
         name: name.to_string(),
         namespace: namespace.to_string(),
@@ -149,23 +145,28 @@ fn sidecar_narrowing_retains_cross_namespace_attached_local_inbound_service() {
         mesh: Some(Box::new(mesh)),
         ..GatewayConfig::default()
     };
-    let slice = MeshSlice::from_gateway_config(
-        &config,
-        enforced_slice_request("vms", spiffe, Some("wp")),
-    );
+    let slice =
+        MeshSlice::from_gateway_config(&config, enforced_slice_request("vms", spiffe, Some("wp")));
 
     assert!(
-        !slice.services.iter().any(|service| service.name == "reviews"),
+        !slice
+            .services
+            .iter()
+            .any(|service| service.name == "reviews"),
         "egress-narrowed services must not include the local attached service"
     );
     assert!(
-        slice.services.iter().any(|service| service.name == "checkout"),
+        slice
+            .services
+            .iter()
+            .any(|service| service.name == "checkout"),
         "egress-admitted services remain in the outbound view"
     );
     assert!(
-        slice.local_inbound_services.iter().any(|service| {
-            service.name == "reviews" && service.namespace == "prod"
-        }),
+        slice
+            .local_inbound_services
+            .iter()
+            .any(|service| { service.name == "reviews" && service.namespace == "prod" }),
         "local inbound must retain the authorized attached Service in its target namespace"
     );
     assert!(
@@ -200,7 +201,8 @@ fn shared_spiffe_same_service_name_different_attached_namespaces_is_ambiguous() 
         mesh: Some(Box::new(mesh)),
         ..GatewayConfig::default()
     };
-    let slice = MeshSlice::from_gateway_config(&config, enforced_slice_request("vms", spiffe, None));
+    let slice =
+        MeshSlice::from_gateway_config(&config, enforced_slice_request("vms", spiffe, None));
 
     assert_eq!(
         slice.local_inbound_workloads,
