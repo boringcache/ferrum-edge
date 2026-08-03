@@ -2107,6 +2107,39 @@ async fn grpc_channel_body_cancellation_preempts_queued_data_with_error() {
     drop(tx);
 }
 
+#[tokio::test]
+async fn grpc_channel_body_cancellation_stays_terminal_after_a_pending_poll() {
+    use http_body::Body;
+    use http_body_util::BodyExt;
+    use std::future::poll_fn;
+    use std::sync::atomic::Ordering;
+    use std::task::Poll;
+
+    let (tx, mut body, exceeded, cancelled, forwarded) = grpc_channel_body(64);
+    poll_fn(|cx| match std::pin::Pin::new(&mut body).poll_frame(cx) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(frame) => panic!("empty open channel unexpectedly yielded {frame:?}"),
+    })
+    .await;
+
+    cancelled.store(true, Ordering::Release);
+    tx.send(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+        b"queued-after-pending",
+    ))))
+    .await
+    .unwrap();
+
+    let error = body
+        .frame()
+        .await
+        .expect("cancellation frame")
+        .expect_err("published cancellation must preempt newly queued data");
+    assert!(error.to_string().contains("cancelled before downstream EOF"));
+    assert!(body.frame().await.is_none());
+    assert!(!exceeded.load(Ordering::Acquire));
+    assert_eq!(forwarded.load(Ordering::Relaxed), 0);
+}
+
 // ── gRPC mesh-transport dispatch classification (issue #2003) ───────────────
 //
 // The direct-dial gRPC pool must NEVER dispatch a mesh-transport-tagged target

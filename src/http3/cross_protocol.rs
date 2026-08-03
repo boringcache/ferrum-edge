@@ -162,12 +162,17 @@ pub struct CrossProtocolOutcome {
 /// trailers, or bounded-channel backpressure.
 struct H3RequestPumpShutdownGuard {
     shutdown: Option<Arc<tokio::sync::Notify>>,
+    backend_upload_cancelled: Arc<AtomicBool>,
 }
 
 impl H3RequestPumpShutdownGuard {
-    fn new(shutdown: Arc<tokio::sync::Notify>) -> Self {
+    fn new(
+        shutdown: Arc<tokio::sync::Notify>,
+        backend_upload_cancelled: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             shutdown: Some(shutdown),
+            backend_upload_cancelled,
         }
     }
 
@@ -179,6 +184,11 @@ impl H3RequestPumpShutdownGuard {
 impl Drop for H3RequestPumpShutdownGuard {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
+            // Publish cancellation before waking the pump. Otherwise hyper can
+            // poll DATA already queued by the pump in the notification-to-flag
+            // window and forward it after the owning bridge was cancelled.
+            self.backend_upload_cancelled
+                .store(true, Ordering::Release);
             shutdown.notify_one();
         }
     }
@@ -6039,7 +6049,10 @@ pub(crate) async fn dispatch_grpc_streaming(
         // RESET_STREAM(0x0) and makes clients log a spurious "Remote reset".
         crate::http3::stream_util::halt_request_body(&mut recv_half);
     });
-    let mut pump_shutdown_guard = H3RequestPumpShutdownGuard::new(Arc::clone(&pump_shutdown));
+    let mut pump_shutdown_guard = H3RequestPumpShutdownGuard::new(
+        Arc::clone(&pump_shutdown),
+        Arc::clone(&backend_upload_cancelled),
+    );
 
     // Dispatch with the channel-backed streaming body. No retry: the request
     // body is consumed on the wire. `hmap` already carries the canonical
@@ -6067,7 +6080,7 @@ pub(crate) async fn dispatch_grpc_streaming(
         &trusted_assertion_headers,
         effective_max_grpc_recv_size_bytes,
         Arc::clone(&body_size_exceeded),
-        backend_upload_cancelled,
+        Arc::clone(&backend_upload_cancelled),
         Arc::clone(&request_bytes_forwarded),
         None,
         ctx.grpc_deadline_at(),
@@ -6279,6 +6292,9 @@ pub(crate) async fn dispatch_grpc_streaming(
     // (the `?` is deferred until after this). `notify_one` stores a permit so
     // there is no lost wakeup, and the pump's data/abort sends are cancellable
     // (codex P1), so the join cannot hang on a full channel.
+    // Publish cancellation before waking the pump so the channel body cannot
+    // expose DATA that was already queued when response-side shutdown won.
+    backend_upload_cancelled.store(true, Ordering::Release);
     pump_shutdown.notify_one();
     let _ = pump.await;
     pump_shutdown_guard.disarm();
