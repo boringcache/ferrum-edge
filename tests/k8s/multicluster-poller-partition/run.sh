@@ -783,8 +783,6 @@ scenario_inflight_withdrawal() {
   # leaves enough time to synchronize discovery before withdrawing the peer.
   fed_failure_before="$(metric_uint_value "$CONTEXT_A" "$JWT_A" \
     ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"")"
-  disc_failure_before="$(metric_uint_value "$CONTEXT_A" "$JWT_A" \
-    ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"")"
   set_proxy "$FED_AB" false
   wait_for_metric_increase "federation poll failure boundary" 10 "$CONTEXT_A" "$JWT_A" \
     ferrum_mesh_federation_poll_failures_total "trust_domain=\"$TD_B\"" "$fed_failure_before"
@@ -796,6 +794,8 @@ scenario_inflight_withdrawal() {
   set_proxy "$FED_AB" true
   wait_for_proxy_activity "federation delayed response in flight" 10 "$FED_AB" "$fed_before"
 
+  disc_failure_before="$(metric_uint_value "$CONTEXT_A" "$JWT_A" \
+    ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"")"
   set_proxy "$DISC_AB" false
   wait_for_metric_increase "discovery poll failure boundary" 10 "$CONTEXT_A" "$JWT_A" \
     ferrum_mesh_remote_discovery_poll_failures_total "cluster=\"cluster-b\"" "$disc_failure_before"
