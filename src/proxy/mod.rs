@@ -44260,7 +44260,7 @@ mod tests {
         headers.insert("content-type".to_string(), "application/grpc".to_string());
         let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        let err = prepare_mesh_request_body(
+        let err = match prepare_mesh_request_body(
             ClientRequestBody::Buffered(BufferedClientRequestBody {
                 method: hyper::Method::POST,
                 headers: hyper::HeaderMap::new(),
@@ -44281,7 +44281,10 @@ mod tests {
             Some("127.0.0.1".to_string()),
         )
         .await
-        .expect_err("non-empty native trailers must fail closed before mesh dispatch");
+        {
+            Err(err) => err,
+            Ok(_) => panic!("non-empty native trailers must fail closed before mesh dispatch"),
+        };
 
         assert_eq!(err.status_code, 200, "gRPC refusal uses Trailers-Only HTTP 200");
         assert!(!err.connection_error);
@@ -44317,7 +44320,7 @@ mod tests {
         headers.insert("content-type".to_string(), "application/grpc".to_string());
         let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        let err = prepare_mesh_request_body(
+        let err = match prepare_mesh_request_body(
             ClientRequestBody::Buffered(BufferedClientRequestBody {
                 method: hyper::Method::POST,
                 headers: hyper::HeaderMap::new(),
@@ -44338,7 +44341,10 @@ mod tests {
             Some("127.0.0.1".to_string()),
         )
         .await
-        .expect_err("retry-enabled mesh path must still refuse native trailers");
+        {
+            Err(err) => err,
+            Ok(_) => panic!("retry-enabled mesh path must still refuse native trailers"),
+        };
 
         assert_eq!(err.status_code, 200);
         assert!(!err.connection_error);
@@ -44367,7 +44373,7 @@ mod tests {
             .insert("grpc_web.request_trailers".to_string(), staged);
         let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        let (mesh_body, retained) = prepare_mesh_request_body(
+        let (mesh_body, retained) = match prepare_mesh_request_body(
             ClientRequestBody::Buffered(BufferedClientRequestBody {
                 method: hyper::Method::POST,
                 headers: hyper::HeaderMap::new(),
@@ -44388,7 +44394,10 @@ mod tests {
             None,
         )
         .await
-        .expect("empty native trailers must not block staged gRPC-Web trailers");
+        {
+            Ok(prepared) => prepared,
+            Err(_) => panic!("empty native trailers must not block staged gRPC-Web trailers"),
+        };
 
         assert!(retained.is_none());
         let MeshClientRequestBody::Replayable {
