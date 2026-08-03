@@ -544,7 +544,11 @@ metric_file_value() {
 
 bounded_uint() {
   local value="$1" label="$2"
-  if [[ ! "$value" =~ ^[0-9]+$ || ${#value} -gt 18 ]]; then
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    echo "metric is not a bounded unsigned integer: $label" >&2
+    return 1
+  fi
+  if [[ "${#value}" -gt 18 ]]; then
     echo "metric is not a bounded unsigned integer: $label" >&2
     return 1
   fi
@@ -717,13 +721,13 @@ scenario_trust_expiry() {
   set_proxy "$FED_AB" false; set_proxy "$FED_BA" false
   # Trust and endpoint-discovery caches expire independently. Assert trust is
   # inactive here; the exact 404 checks below prove effective route removal.
-  wait_for_state "A trust stale eviction" 50 "$CONTEXT_A" "$JWT_A" cluster-b any none false false
-  wait_for_state "B trust stale eviction" 50 "$CONTEXT_B" "$JWT_B" cluster-a any none false false
+  wait_for_state "A trust stale eviction" 50 "$CONTEXT_A" "$JWT_A" cluster-b any blocked_pending_poll false false
+  wait_for_state "B trust stale eviction" 50 "$CONTEXT_B" "$JWT_B" cluster-a any blocked_pending_poll false false
   wait_for_not_found "A trust fail closed with no-route reason" 15 "$CONTEXT_A" echo-b
   wait_for_not_found "B trust fail closed with no-route reason" 15 "$CONTEXT_B" echo-a
   capture_boundary "$CONTEXT_A" "$JWT_A" poller.trust.expired_fail_closed_recomputed
   record multicluster_poller.trust.expired_fail_closed pass "trust-window-12s-bidirectional-404-Not-Found" "poller.trust.expired_fail_closed_recomputed.{json,prom}"
-  record multicluster_poller.trust.inbound_outbound_recomputed pass "trust-source=none-outbound=false-inbound=false-bidirectional-404-Not-Found" "poller.trust.expired_fail_closed_recomputed.json"
+  record multicluster_poller.trust.inbound_outbound_recomputed pass "trust-source=blocked_pending_poll-outbound=false-inbound=false-bidirectional-404-Not-Found" "poller.trust.expired_fail_closed_recomputed.json"
   set_proxy "$FED_AB" true; set_proxy "$FED_BA" true
   wait_for_state "A trust same-generation recovery" 60 "$CONTEXT_A" "$JWT_A" cluster-b true polled true true
   wait_for_state "B trust same-generation recovery" 60 "$CONTEXT_B" "$JWT_B" cluster-a true polled true true
