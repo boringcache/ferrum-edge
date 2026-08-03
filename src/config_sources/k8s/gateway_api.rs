@@ -9101,7 +9101,9 @@ mod tests {
             route.metadata.creation_timestamp = Some(format!("2026-01-{:02}T00:00:00Z", index + 1));
             grpc_routes.push(route);
         }
-        let grpc_objects: Vec<K8sObject> = std::iter::once(gateway).chain(grpc_routes).collect();
+        let grpc_objects: Vec<K8sObject> = std::iter::once(gateway.clone())
+            .chain(grpc_routes)
+            .collect();
         let grpc_acc = gateway_api_status_conflict_context(&grpc_objects, options());
         let grpc_conflicts = route_conflicts(&grpc_objects, &options(), Some(&grpc_acc));
         assert!(
