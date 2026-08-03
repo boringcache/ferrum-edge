@@ -2941,17 +2941,13 @@ fn classify_provider_content_encoding(
         }
     };
     if codings.len() > NORMALIZE_DECODE_LIMITS.max_codings {
-        return ProviderContentEncoding::Unsupported(
-            ProviderEncodingRejectReason::TooManyLayers,
-        );
+        return ProviderContentEncoding::Unsupported(ProviderEncodingRejectReason::TooManyLayers);
     }
     if codings.iter().all(|coding| coding == "identity") {
         return ProviderContentEncoding::Identity;
     }
     if codings.iter().any(|coding| coding == "identity") {
-        return ProviderContentEncoding::Unsupported(
-            ProviderEncodingRejectReason::MixedIdentity,
-        );
+        return ProviderContentEncoding::Unsupported(ProviderEncodingRejectReason::MixedIdentity);
     }
     // Supported tokens only: parse_content_codings already rejected anything
     // outside gzip / x-gzip / br / identity.

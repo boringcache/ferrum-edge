@@ -62,9 +62,7 @@ pub fn parse_content_codings(header: &str) -> Result<Vec<String>, String> {
         }
         if coding.contains(';') {
             // Fixed-cardinality: never interpolate the offending member.
-            return Err(
-                "content-encoding member contains unsupported parameters".to_string(),
-            );
+            return Err("content-encoding member contains unsupported parameters".to_string());
         }
         if !coding.is_ascii() || !is_http_token(coding) {
             return Err("content-encoding member is not a valid HTTP token".to_string());

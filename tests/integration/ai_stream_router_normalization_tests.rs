@@ -294,7 +294,9 @@ async fn unsupported_layered_coding_rejects_before_stream_fallback() {
         .after_proxy(&mut ctx, 200, &mut response_headers)
         .await;
     match result {
-        PluginResult::Reject { status_code, body, .. } => {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
             assert_eq!(status_code, 502);
             assert!(
                 !body.contains("zstd"),
