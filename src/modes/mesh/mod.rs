@@ -1602,79 +1602,148 @@ fn project_mesh_source_locality(
 /// Build the source-workload label map used by
 /// `localityLbSetting.failoverPriority` matching.
 ///
-/// Starts from the slice's effective workload labels, then overlays derived
-/// topology labels from the source workload's locality / network / cluster so
-/// Istio special keys (`topology.kubernetes.io/region`, …,
-/// `topology.istio.io/network`, `topology.istio.io/cluster`) resolve even when
-/// the operator did not also stamp them as ordinary workload labels.
+/// `MeshSlice.labels` (from `FERRUM_MESH_WORKLOAD_LABELS` / the CP request) is
+/// authoritative: compatible local workloads may only *enrich* missing keys.
+/// Same-SPIFFE Kubernetes replicas commonly diverge on subset labels
+/// (`version`, …); never overwrite a known slice label with a sibling's
+/// selector, and stamp derived topology only when every compatible candidate
+/// agrees on locality / network / cluster (fail closed otherwise).
 fn mesh_source_workload_labels(
     mesh_slice: &MeshSlice,
 ) -> std::collections::HashMap<String, String> {
     // Convert BTreeMap slice labels to HashMap for Upstream.source_labels.
     let mut labels: HashMap<String, String> = mesh_slice.labels.clone().into_iter().collect();
-    let source_workload = mesh_source_workload(mesh_slice);
-    let locality = source_workload
-        .and_then(|workload| workload.locality.as_deref())
-        .or_else(|| mesh_source_workload_locality(mesh_slice));
-    crate::config::types::merge_derived_topology_labels(
-        &mut labels,
-        locality,
-        source_workload.and_then(|workload| workload.network.as_deref()),
-        source_workload.and_then(|workload| workload.cluster.as_deref()),
-    );
-    // Prefer the authoritative SPIFFE-matched (or label-matched) workload's
-    // own selector labels over the possibly-intersected slice.labels map.
-    if let Some(workload) = source_workload {
-        for (key, value) in &workload.selector.labels {
-            labels.insert(key.clone(), value.clone());
+    let candidates = mesh_source_workload_candidates(mesh_slice);
+
+    if !candidates.is_empty() {
+        for (key, value) in consensus_additive_selector_labels(&candidates, &labels) {
+            // Never overwrite an authoritative slice label.
+            labels.entry(key).or_insert(value);
         }
-        // Re-apply derived topology AFTER workload labels so locality/network/
-        // cluster metadata wins over a stale operator-authored topology key
-        // that disagrees with the structured fields (matches Istio's preference
-        // for locality metadata on the well-known keys).
-        crate::config::types::merge_derived_topology_labels(
-            &mut labels,
-            workload.locality.as_deref(),
-            workload.network.as_deref(),
-            workload.cluster.as_deref(),
-        );
+        if let Some((locality, network, cluster)) = consensus_topology_fields(&candidates) {
+            // Structured locality/network/cluster metadata wins on the
+            // well-known topology keys when candidates unambiguously agree
+            // (Istio preference for locality metadata).
+            crate::config::types::merge_derived_topology_labels(
+                &mut labels,
+                locality,
+                network,
+                cluster,
+            );
+        }
+    } else if mesh_slice.workload_spiffe_id.is_none() {
+        // No-SPIFFE deployments: label-matched locality consensus may still
+        // supply topology keys. When SPIFFE is configured but candidates are
+        // empty/ambiguous, retain only authoritative slice labels — do not
+        // consult a first-match sibling for failoverPriority ranking.
+        let locality = mesh_source_workload_locality(mesh_slice);
+        crate::config::types::merge_derived_topology_labels(&mut labels, locality, None, None);
     }
     labels
 }
 
-fn mesh_source_workload(mesh_slice: &MeshSlice) -> Option<&crate::modes::mesh::config::Workload> {
-    let multi_cluster = mesh_slice.multi_cluster.as_ref();
-    if let Some(spiffe_id) = mesh_slice.workload_spiffe_id.as_deref() {
-        return mesh_slice.workloads.iter().find(|workload| {
-            workload.spiffe_id.as_str() == spiffe_id
-                && !crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster)
-        });
-    }
-    let mut matched: Option<&crate::modes::mesh::config::Workload> = None;
-    for workload in &mesh_slice.workloads {
-        if crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster) {
+/// Selector keys every candidate shares with the same value, excluding keys
+/// already defined by the authoritative source-label map.
+fn consensus_additive_selector_labels(
+    candidates: &[&crate::modes::mesh::config::Workload],
+    authoritative: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(first) = candidates.first() else {
+        return out;
+    };
+    for (key, value) in &first.selector.labels {
+        if authoritative.contains_key(key) {
             continue;
         }
-        if workload.namespace != mesh_slice.namespace {
-            continue;
-        }
-        let labels_match = mesh_slice.labels.iter().all(|(key, value)| {
+        let agreed = candidates[1..].iter().all(|workload| {
             workload
                 .selector
                 .labels
                 .get(key)
                 .is_some_and(|candidate| candidate == value)
         });
-        if !labels_match {
-            continue;
-        }
-        match matched {
-            None => matched = Some(workload),
-            Some(prev) if prev.spiffe_id == workload.spiffe_id => {}
-            Some(_) => return None,
+        if agreed {
+            out.insert(key.clone(), value.clone());
         }
     }
-    matched
+    out
+}
+
+/// Locality / network / cluster when every candidate contributes the same
+/// structured topology fields (including unanimous `None`).
+fn consensus_topology_fields<'a>(
+    candidates: &[&'a crate::modes::mesh::config::Workload],
+) -> Option<(Option<&'a str>, Option<&'a str>, Option<&'a str>)> {
+    let first = *candidates.first()?;
+    let locality = first.locality.as_deref();
+    let network = first.network.as_deref();
+    let cluster = first.cluster.as_deref();
+    let agreed = candidates[1..].iter().all(|workload| {
+        workload.locality.as_deref() == locality
+            && workload.network.as_deref() == network
+            && workload.cluster.as_deref() == cluster
+    });
+    agreed.then_some((locality, network, cluster))
+}
+
+/// Local workloads eligible to enrich `Upstream.source_labels` / topology.
+///
+/// Remote workloads are always excluded. With a configured SPIFFE id, only
+/// local workloads sharing that identity are considered, then narrowed by
+/// `MeshSlice.labels` when those labels identify a compatible subset. With no
+/// SPIFFE id, namespace-local workloads whose selector contains every slice
+/// label are considered (existing no-SPIFFE behavior).
+fn mesh_source_workload_candidates(
+    mesh_slice: &MeshSlice,
+) -> Vec<&crate::modes::mesh::config::Workload> {
+    let multi_cluster = mesh_slice.multi_cluster.as_ref();
+    let label_compatible = |workload: &crate::modes::mesh::config::Workload| {
+        mesh_slice.labels.iter().all(|(key, value)| {
+            workload
+                .selector
+                .labels
+                .get(key)
+                .is_some_and(|candidate| candidate == value)
+        })
+    };
+
+    if let Some(spiffe_id) = mesh_slice.workload_spiffe_id.as_deref() {
+        let spiffe_local: Vec<_> = mesh_slice
+            .workloads
+            .iter()
+            .filter(|workload| {
+                workload.spiffe_id.as_str() == spiffe_id
+                    && !crate::modes::mesh::multicluster::workload_is_remote(
+                        workload,
+                        multi_cluster,
+                    )
+            })
+            .collect();
+        if spiffe_local.is_empty() {
+            return Vec::new();
+        }
+        // Empty slice labels → full SPIFFE-local set (consensus may still fail
+        // closed). Non-empty labels require a compatible subset; incompatible
+        // siblings must not contribute arbitrary enrichment.
+        if mesh_slice.labels.is_empty() {
+            return spiffe_local;
+        }
+        return spiffe_local
+            .into_iter()
+            .filter(|workload| label_compatible(workload))
+            .collect();
+    }
+
+    mesh_slice
+        .workloads
+        .iter()
+        .filter(|workload| {
+            !crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster)
+                && workload.namespace == mesh_slice.namespace
+                && label_compatible(workload)
+        })
+        .collect()
 }
 
 fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
@@ -1688,18 +1757,29 @@ fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
     // workloads in BOTH resolution paths.
     let multi_cluster = mesh_slice.multi_cluster.as_ref();
 
-    // SPIFFE-matched workload is authoritative: if the configured workload
-    // identity matches a known LOCAL workload, that workload's locality is the
-    // answer — even when it is `None`. Falling through to the label-based
-    // heuristic here would pick up a different pod's metadata and silently
-    // disagree with the SPIFFE source of truth.
-    if let Some(spiffe_id) = mesh_slice.workload_spiffe_id.as_deref()
-        && let Some(workload) = mesh_slice.workloads.iter().find(|workload| {
+    // SPIFFE-matched LOCAL workloads are authoritative when present. Multiple
+    // same-SPIFFE replicas (common for a shared service-account identity) must
+    // agree on locality after `MeshSlice.labels` disambiguation — never pick
+    // the first sibling. Falling through to the label heuristic when a SPIFFE
+    // peer exists would also disagree with the SPIFFE source of truth.
+    if let Some(spiffe_id) = mesh_slice.workload_spiffe_id.as_deref() {
+        let has_spiffe_local = mesh_slice.workloads.iter().any(|workload| {
             workload.spiffe_id.as_str() == spiffe_id
                 && !crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster)
-        })
-    {
-        return workload.locality.as_deref();
+        });
+        if has_spiffe_local {
+            let candidates = mesh_source_workload_candidates(mesh_slice);
+            if candidates.is_empty() {
+                return None;
+            }
+            let locality = candidates[0].locality.as_deref();
+            let agreed = candidates[1..]
+                .iter()
+                .all(|workload| workload.locality.as_deref() == locality);
+            // Unanimous `None` is still authoritative (do not fall through).
+            return if agreed { locality } else { None };
+        }
+        // No local SPIFFE match: fall through to the label-based heuristic.
     }
 
     // Label-based fallback for native-discovery / non-SPIFFE deployments.
@@ -25006,6 +25086,246 @@ mod tests {
             Some("us-west/us-west-1/a"),
             "a remote replica sharing the local labels must not clear/override the local source \
              locality"
+        );
+    }
+
+    /// Same-SPIFFE replicas with divergent subset labels must not clobber
+    /// authoritative `MeshSlice.labels` (failoverPriority source map).
+    ///
+    /// These helpers are private to mesh projection (`project_mesh_source_locality`
+    /// / `mesh_source_workload_labels`), so coverage stays in this existing
+    /// source-module test block rather than widening a runtime API for `tests/`.
+    #[test]
+    fn mesh_source_workload_labels_preserves_authoritative_slice_version() {
+        let shared_spiffe =
+            SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews".to_string()).unwrap();
+
+        let mut v1 = workload("reviews-v1", "reviews");
+        v1.spiffe_id = shared_spiffe.clone();
+        v1.selector
+            .labels
+            .insert("version".to_string(), "v1".to_string());
+        v1.locality = Some("us-west/us-west-1/a".to_string());
+
+        let mut v2 = workload("reviews-v2", "reviews");
+        v2.spiffe_id = shared_spiffe.clone();
+        v2.selector
+            .labels
+            .insert("version".to_string(), "v2".to_string());
+        v2.locality = Some("us-west/us-west-1/a".to_string());
+
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([
+                ("app".to_string(), "reviews".to_string()),
+                ("version".to_string(), "v1".to_string()),
+            ]),
+            workload_spiffe_id: Some(shared_spiffe.as_str().to_string()),
+            waypoint_name: None,
+            // v2 first: a first-match bug would overwrite version=v1 with v2.
+            workloads: vec![v2, v1],
+            ..MeshSlice::default()
+        };
+
+        let labels = mesh_source_workload_labels(&slice);
+        assert_eq!(
+            labels.get("version").map(String::as_str),
+            Some("v1"),
+            "authoritative MeshSlice.labels version must not be overwritten by a same-SPIFFE sibling"
+        );
+        assert_eq!(labels.get("app").map(String::as_str), Some("reviews"));
+    }
+
+    #[test]
+    fn mesh_source_workload_labels_projection_order_independent() {
+        let shared_spiffe =
+            SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews".to_string()).unwrap();
+
+        let mut v1 = workload("reviews-v1", "reviews");
+        v1.spiffe_id = shared_spiffe.clone();
+        v1.selector
+            .labels
+            .insert("version".to_string(), "v1".to_string());
+        v1.locality = Some("us-west/us-west-1/a".to_string());
+        v1.network = Some("net-a".to_string());
+
+        let mut v2 = workload("reviews-v2", "reviews");
+        v2.spiffe_id = shared_spiffe.clone();
+        v2.selector
+            .labels
+            .insert("version".to_string(), "v2".to_string());
+        v2.locality = Some("us-west/us-west-1/b".to_string());
+        v2.network = Some("net-b".to_string());
+
+        let labels_base = BTreeMap::from([
+            ("app".to_string(), "reviews".to_string()),
+            ("version".to_string(), "v1".to_string()),
+        ]);
+        let spiffe = shared_spiffe.as_str().to_string();
+
+        let mut config_a = GatewayConfig::default();
+        config_a.upstreams.push(Upstream {
+            id: "reviews".to_string(),
+            namespace: "default".to_string(),
+            name: Some("reviews".to_string()),
+            targets: Vec::new(),
+            algorithm: LoadBalancerAlgorithm::RoundRobin,
+            hash_on: None,
+            hash_on_cookie_config: None,
+            health_checks: None,
+            service_discovery: None,
+            subsets: None,
+            port_overrides: HashMap::new(),
+            source_locality: None,
+            source_labels: Default::default(),
+            locality_lb_strict: false,
+            locality_lb_setting: None,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            backend_tls_sni: None,
+            backend_tls_san_allow_list: Vec::new(),
+            resolved_subset_tls: HashMap::new(),
+            dispatch_port_override_fallback: None,
+            api_spec_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        });
+        let mut config_b = config_a.clone();
+
+        let slice_a = MeshSlice {
+            namespace: "default".to_string(),
+            labels: labels_base.clone(),
+            workload_spiffe_id: Some(spiffe.clone()),
+            waypoint_name: None,
+            workloads: vec![v2.clone(), v1.clone()],
+            ..MeshSlice::default()
+        };
+        let slice_b = MeshSlice {
+            namespace: "default".to_string(),
+            labels: labels_base,
+            workload_spiffe_id: Some(spiffe),
+            waypoint_name: None,
+            workloads: vec![v1, v2],
+            ..MeshSlice::default()
+        };
+
+        project_mesh_source_locality(&mut config_a, &test_mesh_runtime_config(), &slice_a);
+        project_mesh_source_locality(&mut config_b, &test_mesh_runtime_config(), &slice_b);
+
+        assert_eq!(
+            config_a.upstreams[0].source_labels, config_b.upstreams[0].source_labels,
+            "input ordering must not change projected Upstream.source_labels"
+        );
+        assert_eq!(
+            config_a.upstreams[0]
+                .source_labels
+                .get("version")
+                .map(String::as_str),
+            Some("v1")
+        );
+    }
+
+    #[test]
+    fn mesh_source_workload_labels_unique_match_contributes_topology() {
+        let shared_spiffe =
+            SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews".to_string()).unwrap();
+
+        let mut v1 = workload("reviews-v1", "reviews");
+        v1.spiffe_id = shared_spiffe.clone();
+        v1.selector
+            .labels
+            .insert("version".to_string(), "v1".to_string());
+        v1.locality = Some("us-west/us-west-1/a".to_string());
+        v1.network = Some("net-a".to_string());
+        v1.cluster = Some("cluster-a".to_string());
+
+        let mut v2 = workload("reviews-v2", "reviews");
+        v2.spiffe_id = shared_spiffe.clone();
+        v2.selector
+            .labels
+            .insert("version".to_string(), "v2".to_string());
+        v2.locality = Some("eu-central/eu-central-1/b".to_string());
+        v2.network = Some("net-b".to_string());
+        v2.cluster = Some("cluster-b".to_string());
+
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([
+                ("app".to_string(), "reviews".to_string()),
+                ("version".to_string(), "v1".to_string()),
+            ]),
+            workload_spiffe_id: Some(shared_spiffe.as_str().to_string()),
+            waypoint_name: None,
+            workloads: vec![v2, v1],
+            ..MeshSlice::default()
+        };
+
+        let labels = mesh_source_workload_labels(&slice);
+        assert_eq!(
+            labels
+                .get("topology.kubernetes.io/region")
+                .map(String::as_str),
+            Some("us-west")
+        );
+        assert_eq!(
+            labels
+                .get("topology.kubernetes.io/zone")
+                .map(String::as_str),
+            Some("us-west-1")
+        );
+        assert_eq!(
+            labels.get("topology.istio.io/network").map(String::as_str),
+            Some("net-a")
+        );
+        assert_eq!(
+            labels.get("topology.istio.io/cluster").map(String::as_str),
+            Some("cluster-a")
+        );
+        assert_eq!(labels.get("version").map(String::as_str), Some("v1"));
+    }
+
+    #[test]
+    fn mesh_source_workload_labels_ambiguous_same_spiffe_topology_fail_closed() {
+        let shared_spiffe =
+            SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews".to_string()).unwrap();
+
+        let mut first = workload("reviews-a", "reviews");
+        first.spiffe_id = shared_spiffe.clone();
+        first.locality = Some("us-west/us-west-1/a".to_string());
+        first.network = Some("net-a".to_string());
+
+        let mut second = workload("reviews-b", "reviews");
+        second.spiffe_id = shared_spiffe.clone();
+        second.locality = Some("us-east/us-east-1/b".to_string());
+        second.network = Some("net-b".to_string());
+
+        // Slice labels match both (shared app only) — topology must not pick
+        // the first sibling.
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "reviews".to_string())]),
+            workload_spiffe_id: Some(shared_spiffe.as_str().to_string()),
+            waypoint_name: None,
+            workloads: vec![first, second],
+            ..MeshSlice::default()
+        };
+
+        let labels = mesh_source_workload_labels(&slice);
+        assert_eq!(labels.get("app").map(String::as_str), Some("reviews"));
+        assert!(
+            !labels.contains_key("topology.kubernetes.io/region"),
+            "ambiguous same-SPIFFE topology must not stamp derived region from the first sibling; got {labels:?}"
+        );
+        assert!(
+            !labels.contains_key("topology.istio.io/network"),
+            "ambiguous same-SPIFFE topology must not stamp derived network from the first sibling; got {labels:?}"
+        );
+        assert_eq!(
+            mesh_source_workload_locality(&slice),
+            None,
+            "ambiguous same-SPIFFE locality must fail closed"
         );
     }
 

@@ -17,14 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never silently degrades to another locality mode), and project the list onto
   mesh upstreams.
   Outbound/service-discovery targets stamp workload labels plus derived topology
-  metadata so endpoint matching does not silently broaden. The load balancer
-  precomputes deterministic priority tiers from source workload labels against
-  endpoint labels/locality (including `mesh.network`/`mesh.cluster` fallbacks),
-  uses non-truncating ranks, prefers the best healthy rank, and recomputes on
-  endpoint/locality/label reload. Istio-compatible activation keeps the ranks
-  inert until applicable upstream, per-port, or per-subset active/passive health
-  enables failover. An entirely empty source-label map creates no tiers; with a
-  non-empty map, individually missing labels compare as empty strings.
+  metadata so endpoint matching does not silently broaden. Source labels on
+  mesh upstreams keep authoritative `MeshSlice.labels` and fail closed when
+  same-SPIFFE local replicas disagree on enrichment or topology (no sibling
+  first-match overwrite). The load balancer precomputes deterministic priority
+  tiers from source workload labels against endpoint labels/locality (including
+  `mesh.network`/`mesh.cluster` fallbacks), uses non-truncating ranks, prefers
+  the best healthy rank, and recomputes on endpoint/locality/label reload.
+  Istio-compatible activation keeps the ranks inert until applicable upstream,
+  per-port, or per-subset active/passive health enables failover. An entirely
+  empty source-label map creates no tiers; with a non-empty map, individually
+  missing labels compare as empty strings.
   Duplicates are accepted as independent ordered steps with a key-only warning.
   FerrumAccepted status reports field-specific rejection diagnostics and an
   inactive-policy advisory when the applicable DestinationRule policy lacks

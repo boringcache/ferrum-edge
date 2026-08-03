@@ -1517,9 +1517,10 @@ pub struct Upstream {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_locality: Option<String>,
     /// Source-workload labels used by
-    /// `localityLbSetting.failoverPriority` key-only matching. Projected
-    /// from the selected mesh workload (plus derived topology labels from
-    /// source locality / network / cluster) at slice-apply time. Empty for
+    /// `localityLbSetting.failoverPriority` matching. Projected at slice-apply
+    /// from authoritative `MeshSlice.labels` (`FERRUM_MESH_WORKLOAD_LABELS` /
+    /// CP request), optionally enriched with unambiguous same-SPIFFE /
+    /// label-matched selector keys and derived topology metadata. Empty for
     /// non-mesh upstreams.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub source_labels: HashMap<String, String>,
@@ -8615,10 +8616,10 @@ impl Upstream {
 
         if !self.source_labels.is_empty() {
             errors.push(
-                "source_labels is projected from the mesh workload's \
-                 labels (and derived topology metadata) and cannot be set \
-                 directly via the admin API — set workload / pod labels \
-                 instead"
+                "source_labels is projected from authoritative mesh slice \
+                 labels (plus unambiguous derived topology metadata) and \
+                 cannot be set directly via the admin API — set \
+                 FERRUM_MESH_WORKLOAD_LABELS / workload labels instead"
                     .to_string(),
             );
         }

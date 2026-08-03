@@ -9904,8 +9904,10 @@ components:
             type: string
           description: >-
             Source workload labels used for DestinationRule
-            `localityLbSetting.failoverPriority` ranking, projected by mesh
-            slice apply. A direct operator value is rejected.
+            `localityLbSetting.failoverPriority` ranking. Projected by mesh
+            slice apply from authoritative slice workload labels, with
+            unambiguous derived topology enrichment only. A direct operator
+            value is rejected.
         locality_lb_setting:
           oneOf:
             - $ref: "#/components/schemas/UpstreamLocalityLbSetting"
