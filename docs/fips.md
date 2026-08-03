@@ -435,7 +435,7 @@ than being allowed to run outside the boundary:
 | ChaCha20-Poly1305, X25519 | not an approved AEAD / not an approved SP 800-56A scheme | AES-GCM suites, secp256r1 / secp384r1 |
 | RSA below 2048 bits; DSA, GOST, Ed25519/Ed448/X25519 certificates | SP 800-131A Rev. 2 / FIPS 186-5 | RSA 2048–8192, ECDSA P-256/P-384/P-521 |
 | Any peer-verification opt-out | an unauthenticated peer defeats the approved key exchange | pin the peer's CA (see the table in §"What FIPS mode enforces") |
-| **External secret providers** (`_VAULT`, `_AWS`, `_AZURE`, `_GCP`) | their SDKs resolve secrets over their own TLS stacks, which are not built from Ferrum's provider seam and are not selected by the `crypto-ring` / `fips` feature pair | the `_FILE` suffix, or a direct environment value, backed by an operator-validated delivery mechanism (mounted secret, init container, KMS-backed volume) |
+| **External secret providers** (`_VAULT`, `_AWS`, `_AZURE`, `_GCP`, and `vault://`, `aws://`, `azure://`, or `gcp://` TLS-material sources) | their SDKs resolve secrets over their own TLS stacks, which are not built from Ferrum's provider seam and are not selected by the `crypto-ring` / `fips` feature pair | a local file or direct value backed by an operator-validated delivery mechanism (mounted secret, init container, KMS-backed volume) |
 
 ### DTLS: why the whole transport is refused
 

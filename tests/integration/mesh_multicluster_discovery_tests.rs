@@ -49,6 +49,7 @@ fn workload(spiffe_id: &str, service: &str, addr: &str, locality: Option<&str>) 
         spiffe_id: spiffe(spiffe_id),
         selector: WorkloadSelector::default(),
         service_name: service.to_string(),
+        service_namespace: None,
         addresses: vec![addr.to_string()],
         ports: vec![WorkloadPort {
             port: 8080,

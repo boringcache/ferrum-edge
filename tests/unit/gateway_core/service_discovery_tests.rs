@@ -81,6 +81,7 @@ fn mesh_workload(id: &str, service_name: &str, address: &str, port: u16) -> Work
         spiffe_id: mesh_spiffe(id),
         selector: WorkloadSelector::default(),
         service_name: service_name.to_string(),
+        service_namespace: None,
         addresses: vec![address.to_string()],
         ports: vec![WorkloadPort {
             port,

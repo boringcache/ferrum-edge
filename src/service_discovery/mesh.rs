@@ -121,12 +121,18 @@ impl MeshServiceDiscoverer {
         workload: &Workload,
         matching_service_spiffe_ids: &HashSet<&str>,
     ) -> bool {
-        if workload.namespace != service.namespace {
+        if workload.attached_service_namespace() != service.namespace {
             return false;
         }
 
         if service.workloads.is_empty() {
-            return workload.service_name == service.name;
+            // Empty MeshService.workloads only admits same-namespace name
+            // matching. Cross-namespace attachments must carry an authoritative
+            // workloads[] membership (ReferenceGrant-backed on the K8s path, or
+            // explicit operator-authored refs on native/xDS) — a stamped
+            // service_namespace alone must never widen empty-list matching.
+            return workload.namespace == service.namespace
+                && workload.service_name == service.name;
         }
 
         if !service
@@ -551,7 +557,8 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
             .workloads
             .iter()
             .filter(|workload| {
-                workload.namespace == service.namespace && workload.service_name == service.name
+                workload.attached_service_namespace() == service.namespace
+                    && workload.service_name == service.name
             })
             .map(|workload| workload.spiffe_id.as_str())
             .collect();
@@ -903,6 +910,7 @@ mod tests {
             spiffe_id: spiffe(id),
             selector: WorkloadSelector::default(),
             service_name: service_name.to_string(),
+            service_namespace: None,
             addresses: addresses.into_iter().map(str::to_string).collect(),
             ports: ports
                 .into_iter()
@@ -1478,5 +1486,86 @@ mod tests {
             Some("cluster-a")
         );
         assert_eq!(tags.get("mesh.network").map(String::as_str), Some("net-a"));
+    }
+
+    #[tokio::test]
+    async fn cross_namespace_workload_entry_is_discovered_via_attached_service_namespace() {
+        let vm_id = "spiffe://cluster.local/ns/vms/sa/reviews-vm";
+        let mut vm = workload(vm_id, "reviews", vec!["10.9.0.5"], vec![9080]);
+        vm.namespace = "vms".to_string();
+        vm.service_namespace = Some("prod".to_string());
+        let mesh = MeshConfig {
+            services: vec![MeshService {
+                name: "reviews".to_string(),
+                namespace: "prod".to_string(),
+                ports: vec![ServicePort {
+                    port: 9080,
+                    protocol: AppProtocol::Http,
+                    name: Some("http".to_string()),
+                    target_port: None,
+                }],
+                workloads: vec![WorkloadRef {
+                    spiffe_id: spiffe(vm_id),
+                }],
+                protocol_overrides: HashMap::new(),
+                cluster_ips: Vec::new(),
+            }],
+            workloads: vec![vm],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "reviews".to_string(),
+            "prod".to_string(),
+            Some(9080),
+            1,
+            MeshSdTopology::Ambient,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].host, "10.9.0.5");
+        assert_eq!(targets[0].port, 9080);
+    }
+
+    #[tokio::test]
+    async fn empty_service_workloads_do_not_match_cross_namespace_service_namespace_stamp() {
+        // Confused-deputy guard: a stamped service_namespace alone must not
+        // attach through the empty MeshService.workloads name-match fallback.
+        let vm_id = "spiffe://cluster.local/ns/vms/sa/reviews-vm";
+        let mut vm = workload(vm_id, "reviews", vec!["10.9.0.5"], vec![9080]);
+        vm.namespace = "vms".to_string();
+        vm.service_namespace = Some("prod".to_string());
+        let mesh = MeshConfig {
+            services: vec![MeshService {
+                name: "reviews".to_string(),
+                namespace: "prod".to_string(),
+                ports: vec![ServicePort {
+                    port: 9080,
+                    protocol: AppProtocol::Http,
+                    name: Some("http".to_string()),
+                    target_port: None,
+                }],
+                workloads: Vec::new(),
+                protocol_overrides: HashMap::new(),
+                cluster_ips: Vec::new(),
+            }],
+            workloads: vec![vm],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "reviews".to_string(),
+            "prod".to_string(),
+            Some(9080),
+            1,
+            MeshSdTopology::Ambient,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+        assert!(
+            targets.is_empty(),
+            "empty workloads[] must not admit cross-namespace service_namespace stamps"
+        );
     }
 }

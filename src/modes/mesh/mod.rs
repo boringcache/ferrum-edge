@@ -2690,14 +2690,14 @@ pub(crate) fn matched_local_service_workloads<'a>(
     for workload_ref in &service.workloads {
         let has_matching_service_metadata = workloads.iter().any(|workload| {
             workload.spiffe_id == workload_ref.spiffe_id
-                && workload.namespace == service.namespace
+                && workload.attached_service_namespace() == service.namespace
                 && workload.service_name == service.name
         });
         let Some((workload_index, workload)) =
             workloads.iter().enumerate().find(|(idx, workload)| {
                 !used_workload_indices.contains(idx)
                     && workload.spiffe_id == workload_ref.spiffe_id
-                    && workload.namespace == service.namespace
+                    && workload.attached_service_namespace() == service.namespace
                     && (workload.service_name == service.name || !has_matching_service_metadata)
                     && !crate::modes::mesh::multicluster::workload_is_remote(
                         workload,
@@ -2747,7 +2747,7 @@ fn matched_remote_service_workloads<'a>(
     for workload_ref in &service.workloads {
         let has_matching_service_metadata = workloads.iter().any(|workload| {
             workload.spiffe_id == workload_ref.spiffe_id
-                && workload.namespace == service.namespace
+                && workload.attached_service_namespace() == service.namespace
                 && workload.service_name == service.name
         });
         // Collect EVERY not-yet-used remote workload this ref matches (one ref
@@ -2755,7 +2755,7 @@ fn matched_remote_service_workloads<'a>(
         for (workload_index, workload) in workloads.iter().enumerate() {
             if !used_workload_indices.contains(&workload_index)
                 && workload.spiffe_id == workload_ref.spiffe_id
-                && workload.namespace == service.namespace
+                && workload.attached_service_namespace() == service.namespace
                 && (workload.service_name == service.name || !has_matching_service_metadata)
                 && crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster)
             {
@@ -3982,7 +3982,7 @@ fn materialize_sidecar_inbound_proxies(
         // the Service. The backend targets the workload's own app port.
         for service in inbound_services.iter().filter(|s| {
             s.name == workload.service_name
-                && s.namespace == workload.namespace
+                && s.namespace == workload.attached_service_namespace()
                 // Require the Service to actually back the local workload. Other
                 // mesh resolution paths treat `MeshService.workloads[]` as the
                 // authoritative backing set, so a service whose refs omit this
@@ -11512,7 +11512,7 @@ fn selectable_inbound_peer_auth_ports(
         );
         for service in services.iter().filter(|service| {
             service.name == workload.service_name
-                && service.namespace == workload.namespace
+                && service.namespace == workload.attached_service_namespace()
                 && service
                     .workloads
                     .iter()
@@ -15832,6 +15832,7 @@ mod tests {
                 namespace: Some("default".to_string()),
             },
             service_name: name.to_string(),
+            service_namespace: None,
             addresses: Vec::new(),
             ports: vec![WorkloadPort {
                 port: 8080,
