@@ -1344,13 +1344,17 @@ async fn cni_status_kube_dependency_timeout_is_bounded() {
     let metrics = NodeAgentMetrics::default();
     let config = status_probe_config();
 
+    // The pinned future borrows the request across the virtual-time advances;
+    // keep the request alive for that entire scope rather than borrowing a
+    // statement-local temporary.
+    let request = status_rpc_request();
     let probe = apply_cni_request_with_kube_metadata_for_test(
         &mut backend,
         &pod_states,
         &config,
         &metrics,
         &client,
-        &status_rpc_request(),
+        &request,
     );
     tokio::pin!(probe);
 
