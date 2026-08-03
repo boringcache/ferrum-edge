@@ -2704,8 +2704,7 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
     // watcher-down snapshot below.
     let freshness_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < freshness_deadline {
-        let last_poll_after = fallback_health["database_polling"]
-            ["last_poll_completed_at"]
+        let last_poll_after = fallback_health["database_polling"]["last_poll_completed_at"]
             .as_str()
             .unwrap_or("");
         if !last_poll_after.is_empty() && last_poll_after != last_poll_before {
