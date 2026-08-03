@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, HashMap};
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, MeshConfig, MeshService, MeshSidecar, MeshSidecarEgress, MeshWaypointBinding,
-    MeshWaypointServiceRef, ServicePort, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
+    AppProtocol, MeshConfig, MeshService, MeshSidecar, MeshSidecarEgress, ServicePort, Workload,
+    WorkloadPort, WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 
@@ -111,7 +111,8 @@ fn enforced_slice_request(
 fn sidecar_narrowing_retains_cross_namespace_attached_local_inbound_service() {
     // WorkloadEntry identity stays in `vms` while the authorized Service lives in
     // `prod`. Egress narrowing drops `reviews` from `services`; the inbound-only
-    // view must still anchor the attached `prod/reviews` Service.
+    // view must still anchor the attached `prod/reviews` Service without requiring
+    // a service-waypoint subscription (which would strip egress-admitted peers).
     let spiffe = "spiffe://cluster.local/ns/vms/sa/reviews-vm";
     let workload = cross_namespace_workload(
         "vms",
@@ -121,15 +122,6 @@ fn sidecar_narrowing_retains_cross_namespace_attached_local_inbound_service() {
         HashMap::from([("app".to_string(), "reviews".to_string())]),
     );
     let mesh = MeshConfig {
-        waypoint_bindings: vec![MeshWaypointBinding {
-            name: "wp".to_string(),
-            namespace: "vms".to_string(),
-            waypoint_for: "service".to_string(),
-            services: vec![MeshWaypointServiceRef {
-                namespace: "prod".to_string(),
-                name: "reviews".to_string(),
-            }],
-        }],
         sidecars: vec![egress_narrowing_sidecar("vms")],
         workloads: vec![workload],
         services: vec![
@@ -146,7 +138,7 @@ fn sidecar_narrowing_retains_cross_namespace_attached_local_inbound_service() {
         ..GatewayConfig::default()
     };
     let slice =
-        MeshSlice::from_gateway_config(&config, enforced_slice_request("vms", spiffe, Some("wp")));
+        MeshSlice::from_gateway_config(&config, enforced_slice_request("vms", spiffe, None));
 
     assert!(
         !slice

@@ -1381,10 +1381,14 @@ pub(crate) fn service_key_from_host(
     cluster_domain: &str,
 ) -> Option<K8sServiceKey> {
     let host = normalized_service_host(host)?;
+    // Kubernetes DNS names and namespace defaults are matched case-insensitively;
+    // fold both so ReferenceGrant / inventory lookups stay fail-closed against the
+    // canonical lowercase Service identity rather than a cased DNS alias.
+    let default_namespace = default_namespace.trim().to_ascii_lowercase();
     let parts: Vec<&str> = host.split('.').collect();
     match parts.as_slice() {
-        [name] => K8sServiceKey::new(default_namespace.to_string(), (*name).to_string()),
-        [name, namespace] if *namespace == default_namespace => {
+        [name] => K8sServiceKey::new(default_namespace, (*name).to_string()),
+        [name, namespace] if *namespace == default_namespace.as_str() => {
             K8sServiceKey::new((*namespace).to_string(), (*name).to_string())
         }
         [_, _] => None,
@@ -1397,7 +1401,7 @@ pub(crate) fn service_key_from_host(
                 .trim()
                 .trim_end_matches('.')
                 .to_ascii_lowercase();
-            if suffix.eq_ignore_ascii_case(&cluster_domain) {
+            if suffix == cluster_domain {
                 K8sServiceKey::new((*namespace).to_string(), (*name).to_string())
             } else {
                 None
@@ -1420,7 +1424,10 @@ fn normalized_service_host(host: &str) -> Option<String> {
     if host.is_empty() || host.contains('*') {
         return None;
     }
-    Some(host.to_string())
+    // Kubernetes DNS names are case-insensitive; lowercase so Service key
+    // resolution is deterministic across host casing variants and matches
+    // lowercase ReferenceGrant / Service inventory identities.
+    Some(host.to_ascii_lowercase())
 }
 
 pub(crate) fn invalid_resource(
@@ -3145,7 +3152,7 @@ mod tests {
     }
 
     #[test]
-    fn service_key_from_host_preserves_service_and_namespace_case() {
+    fn service_key_from_host_normalizes_service_and_namespace_case() {
         assert_eq!(
             service_key_from_host(
                 "Reviews.Default.svc.cluster.local",
@@ -3153,12 +3160,21 @@ mod tests {
                 "cluster.local"
             ),
             Some(K8sServiceKey {
-                namespace: "Default".to_string(),
-                name: "Reviews".to_string(),
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
             })
         );
+        // After DNS case folding, same-namespace two-label shorthand matches.
         assert_eq!(
             service_key_from_host("reviews.Default", "default", "cluster.local"),
+            Some(K8sServiceKey {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            })
+        );
+        // Cross-namespace two-label forms remain rejected even after folding.
+        assert_eq!(
+            service_key_from_host("reviews.Prod", "default", "cluster.local"),
             None
         );
     }

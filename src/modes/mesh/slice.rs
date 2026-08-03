@@ -1147,17 +1147,17 @@ impl MeshSlice {
                 .iter()
                 .map(|w| (w.service_name.as_str(), w.attached_service_namespace()))
                 .collect();
+            // Local inbound services are the workload's own attached Service(s).
+            // Key by attached Service identity and do NOT apply subscription /
+            // service-waypoint namespace visibility here: a cross-namespace
+            // WorkloadEntry attachment is authorized upstream (ReferenceGrant),
+            // and gating on the identity/subscription namespace would drop the
+            // only valid inbound anchor (or force a service-waypoint workaround
+            // that then strips unrelated egress-admitted services).
             let services = mesh
                 .services
                 .iter()
-                .filter(|s| {
-                    local_keys.contains(&(s.name.as_str(), s.namespace.as_str()))
-                        && resource_namespace_visible(
-                            &service_waypoint_namespaces,
-                            &s.namespace,
-                            &namespace,
-                        )
-                })
+                .filter(|s| local_keys.contains(&(s.name.as_str(), s.namespace.as_str())))
                 .cloned()
                 .collect::<Vec<_>>();
             (local_workloads, services)

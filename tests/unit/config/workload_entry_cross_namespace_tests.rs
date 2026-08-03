@@ -374,6 +374,26 @@ fn reference_grant_withdrawal_removes_cross_namespace_association() {
 
 #[test]
 fn target_service_withdrawal_removes_cross_namespace_association() {
+    let authorized = [
+        service("reviews", "prod"),
+        reference_grant("vms", "prod", "reviews"),
+        workload_entry("vms", "reviews.prod.svc.cluster.local", "10.9.0.5"),
+    ];
+    let created = translate_k8s_objects(&authorized, options()).expect("authorized create");
+    assert!(
+        created
+            .config
+            .mesh
+            .as_ref()
+            .expect("mesh")
+            .workloads
+            .iter()
+            .any(|workload| {
+                workload.addresses.iter().any(|a| a == "10.9.0.5")
+                    && workload.service_namespace.as_deref() == Some("prod")
+            })
+    );
+
     let (withdrawn, skipped) = translate_k8s_objects_collecting_skips(
         &[
             reference_grant("vms", "prod", "reviews"),
@@ -390,17 +410,21 @@ fn target_service_withdrawal_removes_cross_namespace_association() {
         }),
         "{skipped:?}"
     );
-    let mesh = withdrawn.config.mesh.expect("mesh");
+    // With the target Service gone, the WorkloadEntry is skipped and the
+    // remaining ReferenceGrant does not populate mesh state. An empty overlay
+    // serializes as `None`, which is itself proof the association withdrew.
     assert!(
-        mesh.workloads
-            .iter()
-            .all(|workload| !workload.addresses.iter().any(|a| a == "10.9.0.5"))
-    );
-    assert!(
-        mesh.services
-            .iter()
-            .filter(|service| service.name == "reviews")
-            .all(|service| service.workloads.is_empty())
+        withdrawn.config.mesh.as_ref().is_none_or(|mesh| {
+            mesh.workloads
+                .iter()
+                .all(|workload| !workload.addresses.iter().any(|a| a == "10.9.0.5"))
+                && mesh
+                    .services
+                    .iter()
+                    .filter(|service| service.name == "reviews")
+                    .all(|service| service.workloads.is_empty())
+        }),
+        "target Service withdrawal must clear the cross-namespace association"
     );
 }
 
