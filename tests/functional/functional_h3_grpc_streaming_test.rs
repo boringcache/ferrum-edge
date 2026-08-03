@@ -366,6 +366,18 @@ async fn h3_grpc_streaming_forwards_sanitized_request_trailers() {
         "x-consumer-username",
         http::HeaderValue::from_static("forged"),
     );
+    request_trailers.insert(
+        "x-forwarded-for",
+        http::HeaderValue::from_static("203.0.113.44"),
+    );
+    request_trailers.insert(
+        "forwarded",
+        http::HeaderValue::from_static("for=203.0.113.45;proto=http"),
+    );
+    request_trailers.insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_static("Bearer forged-late-token"),
+    );
     stream
         .send_request_trailers(request_trailers)
         .await
@@ -400,8 +412,11 @@ async fn h3_grpc_streaming_forwards_sanitized_request_trailers() {
         request
             .trailers
             .iter()
-            .all(|(name, _)| name != "x-consumer-username"),
-        "client request trailers must not forge gateway assertions"
+            .all(|(name, _)| !matches!(
+                name.as_str(),
+                "x-consumer-username" | "x-forwarded-for" | "forwarded" | "authorization"
+            )),
+        "client request trailers must not restate credentials or forge gateway identity"
     );
 }
 

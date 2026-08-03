@@ -436,24 +436,47 @@ pub fn strip_backend_request_headers_for_grpc(headers: &mut http::HeaderMap) {
     headers.insert(http::header::TE, http::HeaderValue::from_static("trailers"));
 }
 
+/// Returns `true` for request-trailer names that may not cross a backend trust
+/// boundary.
+///
+/// Request trailers arrive after authentication, routing, forwarding-identity
+/// regeneration, and request-header plugins have already consumed the initial
+/// header block. They therefore must not restate credentials, gateway-owned
+/// assertions, forwarding identity, framing controls, or initial-only gRPC
+/// call parameters. `Forwarded` is rejected unconditionally because this late
+/// boundary has no route-level `add_forwarded_header` context and failing
+/// closed prevents protocol-path-dependent identity shape.
+#[inline]
+pub(crate) fn is_forbidden_backend_request_trailer_name(name: &str) -> bool {
+    is_backend_request_strip_header(name)
+        || is_proxy_owned_forwarding_header(name, true)
+        || name.starts_with("grpc-")
+        || name.starts_with("x-consumer-")
+        || name.starts_with("x-ferrum-")
+        || name.starts_with("x-path-param-")
+        || matches!(
+            name,
+            "proxy-authenticate"
+                | "content-type"
+                | "content-encoding"
+                | "host"
+                | "user-agent"
+                | "x-grpc-web"
+                | "authorization"
+                | "cookie"
+                | "x-api-key"
+                | "x-geo-country"
+        )
+}
+
 /// Sanitize client request trailers before forwarding them to a backend.
 ///
-/// Trailers arrive after the initial request-header boundary, so they must not
-/// be allowed to reintroduce hop-by-hop fields or client-forged gateway
-/// assertions that were removed from the initial header block. This helper is
-/// shared by the native H3 relay and the H3-to-H2 gRPC bridge so their trailing
-/// metadata boundary cannot drift.
+/// This helper is shared by the native H3 relay and the H3-to-H2 gRPC bridge
+/// so their late trust boundary cannot drift.
 pub(crate) fn sanitize_backend_request_trailers(trailers: &mut http::HeaderMap) {
     let strip: Vec<http::HeaderName> = trailers
         .keys()
-        .filter(|name| {
-            let name = name.as_str();
-            is_backend_request_strip_header(name)
-                || name == "x-consumer-username"
-                || name == "x-consumer-custom-id"
-                || name == "x-geo-country"
-                || name.starts_with("x-path-param-")
-        })
+        .filter(|name| is_forbidden_backend_request_trailer_name(name.as_str()))
         .cloned()
         .collect();
     for name in strip {
@@ -1921,6 +1944,33 @@ mod tests {
         assert!(!is_proxy_owned_forwarding_header("via", true));
         assert!(!is_proxy_owned_forwarding_header("authorization", true));
         assert!(!is_proxy_owned_forwarding_header("X-Forwarded", true));
+    }
+
+    #[test]
+    fn backend_request_trailer_boundary_strips_late_identity_and_credentials() {
+        for name in [
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-forwarded-host",
+            "forwarded",
+            "authorization",
+            "cookie",
+            "x-api-key",
+            "x-consumer-username",
+            "x-ferrum-internal",
+            "x-path-param-account",
+            "grpc-timeout",
+            "content-type",
+            "connection",
+        ] {
+            assert!(
+                is_forbidden_backend_request_trailer_name(name),
+                "late request trailer `{name}` must not cross the backend boundary"
+            );
+        }
+        assert!(!is_forbidden_backend_request_trailer_name(
+            "x-request-checksum"
+        ));
     }
 
     #[test]
