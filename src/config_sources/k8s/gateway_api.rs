@@ -9039,7 +9039,9 @@ mod tests {
         route
     }
 
-    fn cross_kind_route_conflicts_only(conflicts: &[GatewayApiRouteConflict]) -> Vec<&GatewayApiRouteConflict> {
+    fn cross_kind_route_conflicts_only(
+        conflicts: &[GatewayApiRouteConflict],
+    ) -> Vec<&GatewayApiRouteConflict> {
         conflicts
             .iter()
             .filter(|conflict| conflict.winner.kind != conflict.loser.kind)
@@ -9065,23 +9067,23 @@ mod tests {
         for index in 0..8 {
             let mut route = cross_kind_http_route(serde_json::json!({"name": "edge"}), None);
             route.metadata.name = format!("http-{index}");
-            route.metadata.creation_timestamp =
-                Some(format!("2026-01-{:02}T00:00:00Z", index + 1));
+            route.metadata.creation_timestamp = Some(format!("2026-01-{:02}T00:00:00Z", index + 1));
             http_routes.push(route);
         }
         let http_objects: Vec<K8sObject> = std::iter::once(gateway.clone())
             .chain(http_routes)
             .collect();
         let http_acc = super::gateway_api_status_conflict_context(&http_objects, options());
-        let http_conflicts =
-            route_conflicts(&http_objects, &options(), Some(&http_acc));
+        let http_conflicts = route_conflicts(&http_objects, &options(), Some(&http_acc));
         assert!(
             cross_kind_route_conflicts_only(&http_conflicts).is_empty(),
             "all-HTTP snapshots must not yield cross-kind conflicts: {:?}",
             http_conflicts
         );
         assert!(
-            http_conflicts.iter().any(|conflict| conflict.winner.kind == conflict.loser.kind),
+            http_conflicts
+                .iter()
+                .any(|conflict| conflict.winner.kind == conflict.loser.kind),
             "same-kind overlap must still be collected: {:?}",
             http_conflicts
         );
@@ -9093,23 +9095,21 @@ mod tests {
                 serde_json::json!({"method": format!("SayHello{index}")}),
             );
             route.metadata.name = format!("grpc-{index}");
-            route.metadata.creation_timestamp =
-                Some(format!("2026-01-{:02}T00:00:00Z", index + 1));
+            route.metadata.creation_timestamp = Some(format!("2026-01-{:02}T00:00:00Z", index + 1));
             grpc_routes.push(route);
         }
-        let grpc_objects: Vec<K8sObject> = std::iter::once(gateway)
-            .chain(grpc_routes)
-            .collect();
+        let grpc_objects: Vec<K8sObject> = std::iter::once(gateway).chain(grpc_routes).collect();
         let grpc_acc = super::gateway_api_status_conflict_context(&grpc_objects, options());
-        let grpc_conflicts =
-            route_conflicts(&grpc_objects, &options(), Some(&grpc_acc));
+        let grpc_conflicts = route_conflicts(&grpc_objects, &options(), Some(&grpc_acc));
         assert!(
             cross_kind_route_conflicts_only(&grpc_conflicts).is_empty(),
             "all-gRPC snapshots must not yield cross-kind conflicts: {:?}",
             grpc_conflicts
         );
         assert!(
-            grpc_conflicts.iter().any(|conflict| conflict.winner.kind == conflict.loser.kind),
+            grpc_conflicts
+                .iter()
+                .any(|conflict| conflict.winner.kind == conflict.loser.kind),
             "same-kind overlap must still be collected: {:?}",
             grpc_conflicts
         );
@@ -9121,8 +9121,7 @@ mod tests {
         );
         let mixed_objects = vec![gateway, http_route, grpc_route];
         let mixed_acc = super::gateway_api_status_conflict_context(&mixed_objects, options());
-        let mixed_conflicts =
-            route_conflicts(&mixed_objects, &options(), Some(&mixed_acc));
+        let mixed_conflicts = route_conflicts(&mixed_objects, &options(), Some(&mixed_acc));
         let cross_kind = cross_kind_route_conflicts_only(&mixed_conflicts);
         assert!(
             cross_kind
