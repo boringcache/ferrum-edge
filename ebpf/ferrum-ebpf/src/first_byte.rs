@@ -4,9 +4,9 @@
 //! a bounded sockhash. This SK_SKB stream parser runs only for those sockets,
 //! atomically consumes confirmed correlation evidence on the first non-empty
 //! receive buffer, and emits accept-to-first-byte latency. Userspace removes
-//! the socket from the sockhash after this parser and the paired verdict have
-//! returned. The verdict program always returns SK_PASS; no payload byte is
-//! read, copied, logged, or modified.
+//! the socket from the sockhash after a bounded grace period that lets this
+//! parser and the paired verdict return. The verdict program always returns
+//! SK_PASS; no payload byte is read, copied, logged, or modified.
 
 use aya_ebpf::EbpfContext;
 use aya_ebpf::helpers::{bpf_get_socket_cookie, bpf_ktime_get_ns};

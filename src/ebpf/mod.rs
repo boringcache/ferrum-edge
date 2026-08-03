@@ -98,8 +98,8 @@ pub const BPF_SOCK_OPS_EVENTS_PIN_PATH: &str = "/sys/fs/bpf/ferrum/sock_ops_even
 pub const BPF_SOCK_OPS_STATS_PIN_PATH: &str = "/sys/fs/bpf/ferrum/sock_ops_stats";
 
 /// Pinned path for the accepted-socket SockHash. The mesh-proxy ringbuf
-/// consumer removes an entry only after the first-byte parser/verdict callback
-/// has returned, avoiding callback-lock recursion inside the kernel.
+/// consumer removes an entry after a bounded userspace grace period, avoiding
+/// callback-lock recursion and the ringbuf-before-verdict completion race.
 pub const BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH: &str =
     "/sys/fs/bpf/ferrum/accept_first_byte_sockets";
 

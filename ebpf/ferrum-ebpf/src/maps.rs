@@ -183,8 +183,8 @@ pub static FERRUM_SOCK_OPS_CONNECT_TS: LruHashMap<u64, u64> =
 /// SK_SKB stream parser. A SOCKHASH gives the parser the actual accepted
 /// socket, so tuple, listener, and redirect-layer reuse cannot alias samples.
 /// The kernel removes closed sockets from a sockhash automatically; the BPF
-/// userspace ringbuf consumer deletes entries after first byte so removal never
-/// tries to stop an SK_SKB parser from inside its own callback.
+/// userspace ringbuf consumer deletes entries after first byte and a bounded
+/// grace period so removal never races an active SK_SKB callback.
 #[map]
 pub static FERRUM_ACCEPT_FIRST_BYTE_SOCKETS: SockHash<u64> =
     SockHash::with_max_entries(ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES, 0);

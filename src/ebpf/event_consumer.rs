@@ -16,8 +16,8 @@
 //!      draining all available records on each wakeup.
 //!   2. Decodes each record via [`SockOpsEvent::from_record_bytes`] and
 //!      hands it to [`SockOpsConsumer::handle_event`].
-//!   3. Removes a first-data socket from the pinned SockHash only after its
-//!      parser/verdict callback has returned.
+//!   3. Queues first-data SockHash removal behind a bounded grace period, so
+//!      ringbuf visibility cannot race the still-running parser/verdict callback.
 //!   4. Polls the per-CPU dropped-events counter
 //!      ([`BPF_SOCK_OPS_STATS_PIN_PATH`](crate::ebpf::BPF_SOCK_OPS_STATS_PIN_PATH))
 //!      after each drain. When the sum advances, the consumer is in an
@@ -281,8 +281,10 @@ pub fn seed_dropped_baseline(consumer: &SockOpsConsumer, dropped_total: u64) -> 
 /// stable Prometheus surface populated by the empty [`BpfMetricsState`].
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub mod production {
+    use std::collections::VecDeque;
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     use aya::maps::{Map, MapData, PerCpuArray, RingBuf, SockHash};
     use ferrum_ebpf_common::{SOCK_OPS_STATS_EVENTS_DROPPED, SockOpsRecord};
@@ -300,6 +302,8 @@ pub mod production {
     };
 
     static MALFORMED_SOCK_OPS_RECORD_WARNED: AtomicBool = AtomicBool::new(false);
+    const FIRST_BYTE_HOOK_REMOVAL_GRACE: Duration = Duration::from_millis(250);
+    const FIRST_BYTE_HOOK_CLEANUP_INTERVAL: Duration = Duration::from_millis(50);
 
     /// Run the consumer until the shutdown signal fires or an unrecoverable
     /// error is observed. Spawn via `tokio::spawn(run_pinned_consumer(...))`.
@@ -333,6 +337,7 @@ pub mod production {
         let mut last_dropped_total: u64 =
             seed_dropped_baseline(&consumer, read_dropped_total(&stats));
         let mut consecutive_drained: u32 = 0;
+        let mut pending_first_byte_removals = VecDeque::new();
 
         // Track the inode of the events pin so we can detect node-agent
         // restarts. When the node-agent re-attaches it pins a new ringbuf
@@ -356,6 +361,9 @@ pub mod production {
         let mut inode_check = tokio::time::interval(std::time::Duration::from_secs(30));
         inode_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         inode_check.tick().await; // consume the immediate first tick
+        let mut first_byte_cleanup = tokio::time::interval(FIRST_BYTE_HOOK_CLEANUP_INTERVAL);
+        first_byte_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        first_byte_cleanup.tick().await; // consume the immediate first tick
 
         loop {
             tokio::select! {
@@ -385,6 +393,7 @@ pub mod production {
                         drop(ring_buf);
                         drop(stats);
                         drop(first_byte_sockets);
+                        pending_first_byte_removals.clear();
                         match wait_for_pinned_maps(&mut shutdown_rx).await {
                             WaitOutcome::Found((new_rb, new_stats, new_first_byte_sockets)) => {
                                 ring_buf = new_rb;
@@ -419,11 +428,18 @@ pub mod production {
                         continue;
                     }
                 }
+                _ = first_byte_cleanup.tick() => {
+                    drain_due_first_byte_removals(
+                        &mut first_byte_sockets,
+                        &mut pending_first_byte_removals,
+                        Instant::now(),
+                    );
+                }
                 guard = async_fd.readable() => {
                     let mut guard = guard.map_err(|e| anyhow::anyhow!("SOCK_OPS AsyncFd readable failed: {e}"))?;
                     let events_handled = drain_ringbuf(
                         &mut ring_buf,
-                        &mut first_byte_sockets,
+                        &mut pending_first_byte_removals,
                         &consumer,
                     );
 
@@ -660,7 +676,7 @@ pub mod production {
     /// the kernel is still dropping events on another CPU).
     fn drain_ringbuf(
         ring_buf: &mut RingBuf<MapData>,
-        first_byte_sockets: &mut SockHash<MapData, u64>,
+        pending_first_byte_removals: &mut VecDeque<(Instant, u64)>,
         consumer: &SockOpsConsumer,
     ) -> u32 {
         let mut events_handled: u32 = 0;
@@ -680,12 +696,18 @@ pub mod production {
                         socket_cookie, ..
                     } = event
                     {
-                        // This runs in userspace only after the kernel parser
-                        // and paired verdict returned. Removing the SockHash
-                        // entry inside either callback would recurse from the
-                        // socket callback read lock into its write lock.
+                        // Ringbuf submission happens inside the stream parser,
+                        // so readiness does not prove that the parser and its
+                        // paired verdict have returned. Deleting immediately
+                        // can race the socket callback's read-side lock. Queue
+                        // removal behind a bounded grace period; correlation
+                        // state was already consumed in-kernel, so no duplicate
+                        // sample can be emitted while the hook remains attached.
                         if socket_cookie != 0 {
-                            let _ = first_byte_sockets.remove(&socket_cookie);
+                            pending_first_byte_removals.push_back((
+                                Instant::now() + FIRST_BYTE_HOOK_REMOVAL_GRACE,
+                                socket_cookie,
+                            ));
                         }
                     }
                     consumer.handle_event(event);
@@ -700,6 +722,19 @@ pub mod production {
             }
         }
         events_handled
+    }
+
+    fn drain_due_first_byte_removals(
+        first_byte_sockets: &mut SockHash<MapData, u64>,
+        pending: &mut VecDeque<(Instant, u64)>,
+        now: Instant,
+    ) {
+        while pending.front().is_some_and(|(deadline, _)| *deadline <= now) {
+            let Some((_, socket_cookie)) = pending.pop_front() else {
+                break;
+            };
+            let _ = first_byte_sockets.remove(&socket_cookie);
+        }
     }
 
     fn log_malformed_sock_ops_record(reason: &'static str, expected: usize, actual: usize) {
