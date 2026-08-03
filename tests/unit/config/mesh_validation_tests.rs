@@ -2808,7 +2808,11 @@ fn mesh_config_validate_rejects_malformed_failover_priority_entries() {
                     enabled: true,
                     distribute: Vec::new(),
                     failover: Vec::new(),
-                    failover_priority: vec!["=novalue".into(), " leading".into()],
+                    failover_priority: vec![
+                        "=novalue".into(),
+                        " leading".into(),
+                        "version=a=b".into(),
+                    ],
                 }),
                 ..MeshTrafficPolicy::default()
             }),
@@ -2825,6 +2829,10 @@ fn mesh_config_validate_rejects_malformed_failover_priority_entries() {
     assert!(
         errors.iter().any(|e| e.contains("failover_priority[1]")),
         "expected malformed failover_priority[1] rejection, got: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("failover_priority[2]")),
+        "expected multiple-equals failover_priority[2] rejection, got: {errors:?}"
     );
 }
 

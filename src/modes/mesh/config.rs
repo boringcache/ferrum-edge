@@ -1899,9 +1899,10 @@ pub struct MeshTrafficPolicy {
     /// present, the mesh apply layer projects this onto the resolved
     /// `Upstream.locality_lb_setting`; the load balancer then honours
     /// mutually exclusive `distribute` weights, `failover` region overrides,
-    /// or ordered `failover_priority` label tiers on top of (or instead of)
-    /// the existing priority-tier (exact/zone/region) preference. Old DPs
-    /// reading new slices see this as a no-op via the serde default.
+    /// or ordered `failover_priority` label tiers. Failover-priority tiers
+    /// replace the existing exact/zone/region preference only when applicable
+    /// active/passive health enables failover; otherwise they remain inert.
+    /// Old DPs reading new slices see this as a no-op via the serde default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality_lb_setting: Option<MeshLocalityLbSetting>,
     /// Cap on inflight backend TCP connections per target, mapped from
@@ -2142,8 +2143,9 @@ pub struct MeshConsistentHash {
 /// per-locality weights and ignores the priority-tier preference;
 /// otherwise `failover` (when configured) adds a fourth tier consulted
 /// after `region` and before the unfiltered fallback set. When
-/// `failover_priority` is set it replaces the default region/zone/subzone
-/// tiers with ordered workload-label priority tiers.
+/// `failover_priority` is set and applicable active/passive health enables
+/// failover, it replaces the default region/zone/subzone tiers with ordered
+/// workload-label priority tiers. Without that signal it is inert.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshLocalityLbSetting {
     /// When `false`, disables all locality preference (priority tier,
@@ -2161,9 +2163,9 @@ pub struct MeshLocalityLbSetting {
     /// target exists in the source's exact/zone/region tiers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failover: Vec<MeshLocalityFailover>,
-    /// Ordered Istio `failoverPriority` label keys (`key`) or
-    /// key/value overrides (`key=value`). Mutually exclusive with
-    /// `distribute` and `failover`.
+    /// Ordered Istio `failoverPriority` label keys (`key`) or key/value
+    /// overrides containing exactly one equals sign (`key=value`). Mutually
+    /// exclusive with `distribute` and `failover`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failover_priority: Vec<String>,
 }
@@ -3968,7 +3970,7 @@ fn validate_mesh_locality_lb_setting(
         else {
             errors.push(format!(
                 "{context}.failover_priority[{idx}]: must be a non-empty label key or key=value \
-                 entry without leading/trailing whitespace"
+                 entry with exactly one '=' and without leading/trailing whitespace"
             ));
             continue;
         };

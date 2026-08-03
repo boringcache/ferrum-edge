@@ -287,9 +287,10 @@ fn parse_failover_priority_entry_rejects_adversarial_shapes() {
         parse_failover_priority_entry("version"),
         Some(("version", None))
     );
+    assert!(parse_failover_priority_entry("version=a=b").is_none());
     assert_eq!(
-        parse_failover_priority_entry("version=a=b"),
-        Some(("version", Some("a=b")))
+        parse_failover_priority_entry("version="),
+        Some(("version", Some("")))
     );
     assert_eq!(
         parse_failover_priority_entry("topology.kubernetes.io/region"),

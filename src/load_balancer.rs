@@ -7,13 +7,14 @@ use crate::config::types::{
     FAILOVER_PRIORITY_LABEL_CLUSTER, FAILOVER_PRIORITY_LABEL_HOSTNAME,
     FAILOVER_PRIORITY_LABEL_NETWORK, FAILOVER_PRIORITY_LABEL_REGION,
     FAILOVER_PRIORITY_LABEL_SUBZONE, FAILOVER_PRIORITY_LABEL_ZONE, GatewayConfig,
-    LoadBalancerAlgorithm, LocalityPreference, Proxy, SubsetDefinition, Upstream,
-    UpstreamLocalityLbSetting, UpstreamPortOverride, UpstreamTarget, parse_failover_priority_entry,
+    HealthCheckConfig, LoadBalancerAlgorithm, LocalityPreference, Proxy, SubsetDefinition,
+    Upstream, UpstreamLocalityLbSetting, UpstreamPortOverride, UpstreamTarget,
+    parse_failover_priority_entry,
 };
 use crate::health_check::ProxyHealthState;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Fibonacci / golden-ratio hash for fast pseudo-random distribution of sequential counters.
 /// Maps sequential u64 inputs to well-distributed outputs across the full u64 range.
@@ -1196,6 +1197,7 @@ impl LoadBalancerCache {
                     upstream.hash_on.clone(),
                     upstream.subsets.as_deref(),
                     Some(&upstream.port_overrides),
+                    upstream.health_checks.as_ref(),
                     upstream.source_locality.as_deref(),
                     &upstream.source_labels,
                     upstream.locality_lb_setting.as_ref(),
@@ -1265,6 +1267,7 @@ impl LoadBalancerCache {
                     upstream.hash_on.clone(),
                     upstream.subsets.as_deref(),
                     Some(&upstream.port_overrides),
+                    upstream.health_checks.as_ref(),
                     upstream.source_locality.as_deref(),
                     &upstream.source_labels,
                     upstream.locality_lb_setting.as_ref(),
@@ -1350,6 +1353,7 @@ impl LoadBalancerCache {
             .as_deref()
             .map(|subsets| subsets.to_vec());
         let existing_port_overrides = existing_upstream.port_overrides.clone();
+        let existing_health_checks = existing_upstream.health_checks.clone();
         let existing_source_locality = existing_upstream.source_locality.clone();
         let existing_source_labels = existing_upstream.source_labels.clone();
         let existing_locality_lb_setting = existing_upstream.locality_lb_setting.clone();
@@ -1363,6 +1367,7 @@ impl LoadBalancerCache {
                 hash_on,
                 existing_subsets.as_deref(),
                 Some(&existing_port_overrides),
+                existing_health_checks.as_ref(),
                 existing_source_locality.as_deref(),
                 &existing_source_labels,
                 existing_locality_lb_setting.as_ref(),
@@ -1918,7 +1923,8 @@ fn retry_exclude_target_matches(target: &UpstreamTarget, exclude: &UpstreamTarge
 /// once at construction so the hot path stays branch-light: distribute is a
 /// candidate mask plus a weighted bucket pick, failover is one Vec index check
 /// inside the existing tier preference, and failover-priority is a precomputed
-/// per-target rank consulted instead of the default region/zone/subzone tiers.
+/// per-target rank consulted instead of the default region/zone/subzone tiers
+/// when the selection lane's active/passive health policy enables failover.
 fn build_locality_lb_state(
     setting: Option<&UpstreamLocalityLbSetting>,
     source_locality: Option<&str>,
@@ -1941,10 +1947,12 @@ fn build_locality_lb_state(
     }
 
     // failoverPriority replaces the default locality tiers entirely (Istio
-    // mutual exclusivity with distribute/failover). Precompute ranks even when
-    // source labels are empty — missing labels compare as "" on both sides,
-    // matching Istio's map lookup semantics.
-    if !setting.failover_priority.is_empty() {
+    // mutual exclusivity with distribute/failover). Istio returns before
+    // assigning priorities when the proxy/source label map is entirely empty;
+    // do the same so an absent source identity cannot manufacture a P0 tier.
+    // When the source map is non-empty, individual absent keys still compare as
+    // empty strings, matching Istio's map lookup behavior.
+    if !setting.failover_priority.is_empty() && !source_labels.is_empty() {
         let ranks =
             compute_failover_priority_ranks(&setting.failover_priority, source_labels, targets);
         return Some(LocalityLbState {
@@ -2147,9 +2155,9 @@ fn compute_failover_priority_ranks(
     failover_priority: &[String],
     source_labels: &HashMap<String, String>,
     targets: &[UpstreamTarget],
-) -> Vec<u8> {
+) -> Vec<usize> {
     let n = failover_priority.len();
-    let lowest = n.min(u8::MAX as usize) as u8;
+    let lowest = n;
     // Invalid residual entries must not silently match empty endpoint labels.
     // Admission rejects malformed entries; if any slip through, demote every
     // endpoint to the lowest tier instead of broadening selection.
@@ -2181,8 +2189,8 @@ fn compute_failover_priority_ranks(
     targets
         .iter()
         .map(|target| {
-            let mut priority: u8 = 0;
-            let mut adjust: u8 = 0;
+            let mut priority = 0usize;
+            let mut adjust = 0usize;
             for (j, (key, expected_value)) in expected.iter().enumerate() {
                 let endpoint_value = endpoint_failover_priority_label(target, key);
                 if endpoint_value == expected_value.as_str() {
@@ -2192,8 +2200,7 @@ fn compute_failover_priority_ranks(
                     adjust = lowest;
                     continue;
                 }
-                let matched_prefix = j.min(u8::MAX as usize) as u8;
-                priority = lowest.saturating_sub(matched_prefix);
+                priority = lowest.saturating_sub(j);
                 break;
             }
             priority.saturating_add(adjust)
@@ -2382,6 +2389,10 @@ pub struct LoadBalancer {
     /// strategy overrides the upstream strategy when that subset's effective
     /// algorithm is consistent hashing; non-hash subset lanes store `Ip`.
     subset_hash_on_strategies: HashMap<String, HashOnStrategy>,
+    /// Subsets with their own passive outlier-detection policy. Combined with
+    /// the upstream health signal when deciding whether failoverPriority is
+    /// active for a subset lane.
+    subset_failover_enabled: HashSet<String>,
     /// Smooth-WRR state isolated per subset so weighted routing in one subset
     /// cannot perturb the schedule of another subset.
     subset_wrr_state: HashMap<String, WrrLaneState>,
@@ -2401,6 +2412,10 @@ pub struct LoadBalancer {
     /// tier preference. Computed at construction so request-time work is
     /// limited to bitset masks and a small weighted bucket pick.
     locality_lb: Option<LocalityLbState>,
+    /// Whether upstream-level active or passive health is configured.
+    /// Istio applies failoverPriority only when failover is enabled by such a
+    /// signal; per-port and per-subset signals are layered at their lanes.
+    failover_enabled: bool,
     /// Strict local-first locality LB. Projected from
     /// `FERRUM_MESH_LOCALITY_LB_STRICT` onto mesh upstreams. When `true` and the
     /// upstream has no resolved source locality (`target_locality_ranks` empty),
@@ -2465,9 +2480,10 @@ struct LocalityLbState {
     failover_target_matches: Option<Vec<bool>>,
     /// Per-target Istio `failoverPriority` rank, index-aligned with
     /// `LoadBalancer.targets`. `0` is highest priority. `None` when
-    /// failoverPriority is not configured. When present, replaces the
-    /// default region/zone/subzone `target_locality_ranks` preference.
-    failover_priority_ranks: Option<Vec<u8>>,
+    /// failoverPriority is not configured or the source-label map is empty.
+    /// When present and failover is enabled for the selection lane, replaces
+    /// the default region/zone/subzone `target_locality_ranks` preference.
+    failover_priority_ranks: Option<Vec<usize>>,
 }
 
 #[derive(Debug)]
@@ -2493,6 +2509,9 @@ struct PortLbState {
     /// `LoadBalancer.locality_lb`. Pre-computed at cold path so the hot
     /// path stays branch-light.
     locality_lb: Option<LocalityLbState>,
+    /// Whether this port has an applicable active or passive health signal.
+    /// `failoverPriority` ranks stay inert when this is false.
+    failover_enabled: bool,
 }
 
 impl LoadBalancer {
@@ -2523,6 +2542,7 @@ impl LoadBalancer {
             subsets,
             None,
             None,
+            None,
             &HashMap::new(),
             None,
             false,
@@ -2539,6 +2559,7 @@ impl LoadBalancer {
         hash_on: Option<String>,
         subsets: Option<&[SubsetDefinition]>,
         port_overrides: Option<&HashMap<u16, UpstreamPortOverride>>,
+        health_checks: Option<&HealthCheckConfig>,
         source_locality: Option<&str>,
         source_labels: &HashMap<String, String>,
         locality_lb_setting: Option<&UpstreamLocalityLbSetting>,
@@ -2622,44 +2643,65 @@ impl LoadBalancer {
         // Pre-compute subset → target indices for O(1) subset routing.
         // A target belongs to a subset if its `tags` are a superset of the
         // subset's `labels` (every label key-value pair appears in tags).
-        let (subset_indices, subset_algorithms, subset_hash_on_strategies) =
-            if let Some(defs) = subsets {
-                let mut indices_map = HashMap::with_capacity(defs.len());
-                let mut algorithm_map = HashMap::with_capacity(defs.len());
-                let mut hash_on_map = HashMap::with_capacity(defs.len());
-                for def in defs {
-                    let mut indices = Vec::new();
-                    for (i, target) in targets.iter().enumerate() {
-                        let matches = def
-                            .labels
-                            .iter()
-                            .all(|(k, v)| target.tags.get(k).is_some_and(|tv| tv == v));
-                        if matches {
-                            indices.push(i);
-                        }
+        let (
+            subset_indices,
+            subset_algorithms,
+            subset_hash_on_strategies,
+            subset_failover_enabled,
+        ) = if let Some(defs) = subsets {
+            let mut indices_map = HashMap::with_capacity(defs.len());
+            let mut algorithm_map = HashMap::with_capacity(defs.len());
+            let mut hash_on_map = HashMap::with_capacity(defs.len());
+            let mut failover_set = HashSet::with_capacity(defs.len());
+            for def in defs {
+                let mut indices = Vec::new();
+                for (i, target) in targets.iter().enumerate() {
+                    let matches = def
+                        .labels
+                        .iter()
+                        .all(|(k, v)| target.tags.get(k).is_some_and(|tv| tv == v));
+                    if matches {
+                        indices.push(i);
                     }
-                    let effective_algorithm = def
-                        .traffic_policy
-                        .as_ref()
-                        .and_then(|policy| policy.load_balancer_algorithm)
-                        .unwrap_or(algorithm);
-                    let effective_hash_on =
-                        if effective_algorithm == LoadBalancerAlgorithm::ConsistentHashing {
-                            def.traffic_policy
-                                .as_ref()
-                                .and_then(|policy| policy.hash_on.as_deref())
-                                .or(hash_on.as_deref())
-                        } else {
-                            None
-                        };
-                    indices_map.insert(def.name.clone(), indices);
-                    algorithm_map.insert(def.name.clone(), effective_algorithm);
-                    hash_on_map.insert(def.name.clone(), HashOnStrategy::parse(effective_hash_on));
                 }
-                (indices_map, algorithm_map, hash_on_map)
-            } else {
-                (HashMap::new(), HashMap::new(), HashMap::new())
-            };
+                let effective_algorithm = def
+                    .traffic_policy
+                    .as_ref()
+                    .and_then(|policy| policy.load_balancer_algorithm)
+                    .unwrap_or(algorithm);
+                let effective_hash_on =
+                    if effective_algorithm == LoadBalancerAlgorithm::ConsistentHashing {
+                        def.traffic_policy
+                            .as_ref()
+                            .and_then(|policy| policy.hash_on.as_deref())
+                            .or(hash_on.as_deref())
+                    } else {
+                        None
+                    };
+                indices_map.insert(def.name.clone(), indices);
+                algorithm_map.insert(def.name.clone(), effective_algorithm);
+                hash_on_map.insert(def.name.clone(), HashOnStrategy::parse(effective_hash_on));
+                if def
+                    .traffic_policy
+                    .as_ref()
+                    .and_then(|policy| policy.passive_health_check.as_ref())
+                    .is_some()
+                {
+                    failover_set.insert(def.name.clone());
+                }
+            }
+            (indices_map, algorithm_map, hash_on_map, failover_set)
+        } else {
+            (
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashSet::new(),
+            )
+        };
+
+        let failover_enabled = health_checks
+            .is_some_and(|checks| checks.active.is_some() || checks.passive.is_some());
 
         let mut subset_wrr_state = HashMap::new();
         let mut subset_hash_rings = HashMap::new();
@@ -2741,6 +2783,8 @@ impl LoadBalancer {
                             .as_deref()
                             .map(|hash_on| HashOnStrategy::parse(Some(hash_on))),
                         locality_lb: port_locality_lb,
+                        failover_enabled: failover_enabled
+                            || override_config.passive_health_check.is_some(),
                     },
                 );
             }
@@ -2810,11 +2854,13 @@ impl LoadBalancer {
             subset_indices,
             subset_algorithms,
             subset_hash_on_strategies,
+            subset_failover_enabled,
             subset_wrr_state,
             subset_hash_rings,
             port_overrides: port_states,
             initial_dispatch_port_override,
             locality_lb,
+            failover_enabled,
             locality_lb_strict,
             locality_strict_widen_warned: AtomicBool::new(false),
             local_locality_mask,
@@ -3358,6 +3404,7 @@ impl LoadBalancer {
         candidates: &HealthBitset,
         scope: &HealthBitset,
         locality_lb: Option<&LocalityLbState>,
+        failover_enabled: bool,
     ) -> (HealthBitset, bool) {
         // [R5-2]/[R6-1]/[R6-2] Cross-cluster east-west GATEWAY targets are
         // ALWAYS-failover: they must never share round-robin with healthy local
@@ -3416,10 +3463,14 @@ impl LoadBalancer {
             // fallback.
         }
 
-        // failoverPriority replaces the default region/zone/subzone tiers.
+        // When failover is enabled, failoverPriority replaces the default
+        // region/zone/subzone tiers.
         // Prefer the lowest (best) healthy rank; when every ranked target is
         // unhealthy fall through to the residual candidate set.
-        if let Some(ranks) = locality_lb.and_then(|state| state.failover_priority_ranks.as_ref()) {
+        if failover_enabled
+            && let Some(ranks) =
+                locality_lb.and_then(|state| state.failover_priority_ranks.as_ref())
+        {
             return (
                 self.preferred_failover_priority_bitset(candidates, ranks),
                 false,
@@ -3487,24 +3538,26 @@ impl LoadBalancer {
     fn preferred_failover_priority_bitset(
         &self,
         candidates: &HealthBitset,
-        ranks: &[u8],
+        ranks: &[usize],
     ) -> HealthBitset {
-        let mut best_rank = u8::MAX;
+        let mut best_rank = usize::MAX;
         for idx in 0..self.targets.len() {
             if !candidates.contains(idx) {
                 continue;
             }
-            let rank = ranks.get(idx).copied().unwrap_or(u8::MAX);
+            let rank = ranks.get(idx).copied().unwrap_or(usize::MAX);
             if rank < best_rank {
                 best_rank = rank;
             }
         }
-        if best_rank == u8::MAX {
+        if best_rank == usize::MAX {
             return *candidates;
         }
         let mut preferred = HealthBitset::empty();
         for idx in 0..self.targets.len() {
-            if candidates.contains(idx) && ranks.get(idx).copied().unwrap_or(u8::MAX) == best_rank {
+            if candidates.contains(idx)
+                && ranks.get(idx).copied().unwrap_or(usize::MAX) == best_rank
+            {
                 preferred.set(idx);
             }
         }
@@ -3518,22 +3571,22 @@ impl LoadBalancer {
     fn preferred_failover_priority_candidates<'a>(
         &self,
         candidates: Vec<(usize, &'a Arc<UpstreamTarget>)>,
-        ranks: &[u8],
+        ranks: &[usize],
     ) -> Vec<(usize, &'a Arc<UpstreamTarget>)> {
-        let mut best_rank = u8::MAX;
+        let mut best_rank = usize::MAX;
         for (idx, _) in &candidates {
-            let rank = ranks.get(*idx).copied().unwrap_or(u8::MAX);
+            let rank = ranks.get(*idx).copied().unwrap_or(usize::MAX);
             if rank < best_rank {
                 best_rank = rank;
             }
         }
-        if best_rank == u8::MAX {
+        if best_rank == usize::MAX {
             return candidates;
         }
         let preferred: Vec<(usize, &'a Arc<UpstreamTarget>)> = candidates
             .iter()
             .copied()
-            .filter(|(idx, _)| ranks.get(*idx).copied().unwrap_or(u8::MAX) == best_rank)
+            .filter(|(idx, _)| ranks.get(*idx).copied().unwrap_or(usize::MAX) == best_rank)
             .collect();
         if preferred.is_empty() {
             candidates
@@ -3547,6 +3600,7 @@ impl LoadBalancer {
         candidates: Vec<(usize, &'a Arc<UpstreamTarget>)>,
         scope_indices: &[usize],
         locality_lb: Option<&LocalityLbState>,
+        failover_enabled: bool,
     ) -> (Vec<(usize, &'a Arc<UpstreamTarget>)>, bool) {
         // Mirror `preferred_locality_bitset` semantics on the Vec path so the
         // > 128-target fallback agrees with the bitset path. `scope_indices` is
@@ -3592,8 +3646,12 @@ impl LoadBalancer {
             }
         }
 
-        // failoverPriority replaces the default region/zone/subzone tiers.
-        if let Some(ranks) = locality_lb.and_then(|state| state.failover_priority_ranks.as_ref()) {
+        // When failover is enabled, failoverPriority replaces the default
+        // region/zone/subzone tiers.
+        if failover_enabled
+            && let Some(ranks) =
+                locality_lb.and_then(|state| state.failover_priority_ranks.as_ref())
+        {
             return (
                 self.preferred_failover_priority_candidates(candidates, ranks),
                 false,
@@ -3925,8 +3983,12 @@ impl LoadBalancer {
         let scope = HealthBitset::all(n);
         if healthy.is_empty() {
             // All targets unhealthy — degraded mode fallback using all targets.
-            let (all, _) =
-                self.preferred_locality_bitset(&scope, &scope, self.locality_lb.as_ref());
+            let (all, _) = self.preferred_locality_bitset(
+                &scope,
+                &scope,
+                self.locality_lb.as_ref(),
+                self.failover_enabled,
+            );
             return self
                 .select_with_bitset(ctx_key, &all)
                 .map(|target| TargetSelection {
@@ -3935,8 +3997,12 @@ impl LoadBalancer {
                 });
         }
 
-        let (healthy, degraded) =
-            self.preferred_locality_bitset(&healthy, &scope, self.locality_lb.as_ref());
+        let (healthy, degraded) = self.preferred_locality_bitset(
+            &healthy,
+            &scope,
+            self.locality_lb.as_ref(),
+            self.failover_enabled,
+        );
         self.select_with_bitset(ctx_key, &healthy)
             .map(|target| TargetSelection {
                 target,
@@ -3994,6 +4060,7 @@ impl LoadBalancer {
             &subset_healthy,
             &subset_scope,
             self.locality_lb.as_ref(),
+            self.failover_enabled_for_subset(subset_name),
         );
         self.select_with_bitset_using(
             ctx_key,
@@ -4039,8 +4106,12 @@ impl LoadBalancer {
 
         let port_scope = bitset_for_indices(&port_state.target_indices);
         if port_healthy.is_empty() {
-            let (all_port_targets, _) =
-                self.preferred_locality_bitset(&port_scope, &port_scope, port_locality);
+            let (all_port_targets, _) = self.preferred_locality_bitset(
+                &port_scope,
+                &port_scope,
+                port_locality,
+                port_state.failover_enabled,
+            );
             return self
                 .select_with_bitset_using(
                     ctx_key,
@@ -4057,8 +4128,12 @@ impl LoadBalancer {
                 });
         }
 
-        let (port_healthy, degraded) =
-            self.preferred_locality_bitset(&port_healthy, &port_scope, port_locality);
+        let (port_healthy, degraded) = self.preferred_locality_bitset(
+            &port_healthy,
+            &port_scope,
+            port_locality,
+            port_state.failover_enabled,
+        );
         self.select_with_bitset_using(
             ctx_key,
             &port_healthy,
@@ -4127,8 +4202,12 @@ impl LoadBalancer {
             .locality_lb
             .as_ref()
             .or(self.locality_lb.as_ref());
-        let (port_subset_healthy, degraded) =
-            self.preferred_locality_bitset(&port_subset_healthy, &intersection, port_locality);
+        let (port_subset_healthy, degraded) = self.preferred_locality_bitset(
+            &port_subset_healthy,
+            &intersection,
+            port_locality,
+            self.failover_enabled_for_port_subset(port_state, subset_name),
+        );
         self.select_with_bitset_using(
             ctx_key,
             &port_subset_healthy,
@@ -4168,6 +4247,7 @@ impl LoadBalancer {
             candidates,
             &port_state.target_indices,
             port_locality,
+            port_state.failover_enabled,
         );
 
         self.select_from_candidates_vec_using(
@@ -4207,8 +4287,12 @@ impl LoadBalancer {
             .locality_lb
             .as_ref()
             .or(self.locality_lb.as_ref());
-        let (candidates, degraded) =
-            self.preferred_locality_candidates(candidates, &intersection, port_locality);
+        let (candidates, degraded) = self.preferred_locality_candidates(
+            candidates,
+            &intersection,
+            port_locality,
+            self.failover_enabled_for_port_subset(port_state, subset_name),
+        );
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -4245,6 +4329,7 @@ impl LoadBalancer {
             subset_healthy,
             subset_indices,
             self.locality_lb.as_ref(),
+            self.failover_enabled_for_subset(subset_name),
         );
 
         self.select_from_candidates_vec_using(
@@ -4274,6 +4359,20 @@ impl LoadBalancer {
             .get(subset_name)
             .copied()
             .unwrap_or(self.algorithm)
+    }
+
+    #[inline]
+    fn failover_enabled_for_subset(&self, subset_name: &str) -> bool {
+        self.failover_enabled || self.subset_failover_enabled.contains(subset_name)
+    }
+
+    #[inline]
+    fn failover_enabled_for_port_subset(
+        &self,
+        port_state: &PortLbState,
+        subset_name: &str,
+    ) -> bool {
+        port_state.failover_enabled || self.failover_enabled_for_subset(subset_name)
     }
 
     #[inline]
@@ -4500,8 +4599,12 @@ impl LoadBalancer {
         let healthy = self.healthy_targets_vec(health);
         if healthy.is_empty() {
             let all: Vec<(usize, &Arc<UpstreamTarget>)> = self.targets.iter().enumerate().collect();
-            let (all, _) =
-                self.preferred_locality_candidates(all, &scope_indices, self.locality_lb.as_ref());
+            let (all, _) = self.preferred_locality_candidates(
+                all,
+                &scope_indices,
+                self.locality_lb.as_ref(),
+                self.failover_enabled,
+            );
             return self
                 .select_from_candidates_vec(ctx_key, &all)
                 .map(|target| TargetSelection {
@@ -4509,8 +4612,12 @@ impl LoadBalancer {
                     is_fallback: true,
                 });
         }
-        let (healthy, degraded) =
-            self.preferred_locality_candidates(healthy, &scope_indices, self.locality_lb.as_ref());
+        let (healthy, degraded) = self.preferred_locality_candidates(
+            healthy,
+            &scope_indices,
+            self.locality_lb.as_ref(),
+            self.failover_enabled,
+        );
         self.select_from_candidates_vec(ctx_key, &healthy)
             .map(|target| TargetSelection {
                 target,
@@ -4746,8 +4853,12 @@ impl LoadBalancer {
             return None;
         }
 
-        let (healthy, _) =
-            self.preferred_locality_bitset(&healthy, &scope, self.locality_lb.as_ref());
+        let (healthy, _) = self.preferred_locality_bitset(
+            &healthy,
+            &scope,
+            self.locality_lb.as_ref(),
+            self.failover_enabled,
+        );
         self.select_with_bitset(ctx_key, &healthy)
     }
 
@@ -4800,7 +4911,12 @@ impl LoadBalancer {
             return None;
         }
 
-        let (healthy, _) = self.preferred_locality_bitset(&healthy, &scope, port_locality);
+        let (healthy, _) = self.preferred_locality_bitset(
+            &healthy,
+            &scope,
+            port_locality,
+            port_state.failover_enabled,
+        );
         self.select_with_bitset_using(
             ctx_key,
             &healthy,
@@ -4869,6 +4985,7 @@ impl LoadBalancer {
             &subset_healthy,
             &strict_scope,
             self.locality_lb.as_ref(),
+            self.failover_enabled_for_subset(subset_name),
         );
         self.select_with_bitset_using(
             ctx_key,
@@ -4941,8 +5058,12 @@ impl LoadBalancer {
             .locality_lb
             .as_ref()
             .or(self.locality_lb.as_ref());
-        let (port_subset_healthy, _) =
-            self.preferred_locality_bitset(&port_subset_healthy, &strict_scope, port_locality);
+        let (port_subset_healthy, _) = self.preferred_locality_bitset(
+            &port_subset_healthy,
+            &strict_scope,
+            port_locality,
+            self.failover_enabled_for_port_subset(port_state, subset_name),
+        );
         self.select_with_bitset_using(
             ctx_key,
             &port_subset_healthy,
@@ -4980,8 +5101,12 @@ impl LoadBalancer {
             return None;
         }
 
-        let (healthy, _) =
-            self.preferred_locality_candidates(healthy, &scope_indices, self.locality_lb.as_ref());
+        let (healthy, _) = self.preferred_locality_candidates(
+            healthy,
+            &scope_indices,
+            self.locality_lb.as_ref(),
+            self.failover_enabled,
+        );
         self.select_from_candidates_vec(ctx_key, &healthy)
     }
 
@@ -5015,8 +5140,12 @@ impl LoadBalancer {
             .locality_lb
             .as_ref()
             .or(self.locality_lb.as_ref());
-        let (candidates, _) =
-            self.preferred_locality_candidates(candidates, &scope_indices, port_locality);
+        let (candidates, _) = self.preferred_locality_candidates(
+            candidates,
+            &scope_indices,
+            port_locality,
+            port_state.failover_enabled,
+        );
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -5060,8 +5189,12 @@ impl LoadBalancer {
             .locality_lb
             .as_ref()
             .or(self.locality_lb.as_ref());
-        let (candidates, _) =
-            self.preferred_locality_candidates(candidates, &strict_scope, port_locality);
+        let (candidates, _) = self.preferred_locality_candidates(
+            candidates,
+            &strict_scope,
+            port_locality,
+            self.failover_enabled_for_port_subset(port_state, subset_name),
+        );
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -5108,6 +5241,7 @@ impl LoadBalancer {
             subset_healthy,
             &strict_scope,
             self.locality_lb.as_ref(),
+            self.failover_enabled_for_subset(subset_name),
         );
 
         self.select_from_candidates_vec_using(
@@ -6278,6 +6412,7 @@ mod tests {
             None,
             None,
             Some(&port_overrides),
+            None,
             None,
             &HashMap::new(),
             None,

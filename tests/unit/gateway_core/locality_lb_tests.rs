@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::Utc;
 use dashmap::DashMap;
 use ferrum_edge::config::types::{
-    GatewayConfig, LoadBalancerAlgorithm, LocalityDistribute, LocalityFailover, SubsetDefinition,
-    Upstream, UpstreamLocalityLbSetting, UpstreamPortOverride, UpstreamTarget,
+    ActiveHealthCheck, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm,
+    LocalityDistribute, LocalityFailover, PassiveHealthCheck, SubsetDefinition,
+    SubsetTrafficPolicy, Upstream, UpstreamLocalityLbSetting, UpstreamPortOverride, UpstreamTarget,
 };
 use ferrum_edge::load_balancer::{HealthContext, LoadBalancerCache, target_key};
 
@@ -2175,6 +2176,13 @@ fn upstream_with_failover_priority(
     failover_priority: Vec<String>,
 ) -> Upstream {
     let mut up = make_upstream("u1", LoadBalancerAlgorithm::RoundRobin, None, targets);
+    // Istio only applies failoverPriority when locality failover is enabled.
+    // Default this positive-test helper to a passive health signal; tests for
+    // inert-without-health behavior clear it explicitly.
+    up.health_checks = Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck::default()),
+    });
     up.source_labels = source_labels;
     up.locality_lb_setting = Some(UpstreamLocalityLbSetting {
         enabled: true,
@@ -2186,7 +2194,7 @@ fn upstream_with_failover_priority(
 }
 
 #[test]
-fn failover_priority_prefers_full_label_match() {
+fn failover_priority_passive_health_prefers_full_label_match() {
     // Ordered keys: region then zone. Source is us-west / us-west-1.
     // Full match must win over region-only and no-match endpoints.
     let source_labels = HashMap::from([
@@ -2353,12 +2361,45 @@ fn failover_priority_key_value_overrides_source_labels() {
 }
 
 #[test]
-fn failover_priority_missing_labels_compare_as_empty() {
-    // Missing labels on both sides match (Istio map-lookup empty-string
-    // semantics). An endpoint that carries the key with a non-empty value
-    // mismatches and falls to a lower tier.
+fn failover_priority_empty_source_labels_do_not_manufacture_tiers() {
+    // Istio returns before applying failover priorities when the entire proxy
+    // label map is empty, even if the configured entry is a key=value override.
     let up = upstream_with_failover_priority(
         HashMap::new(),
+        vec![
+            labeled_target("match.local", None, &[("version", "v1")]),
+            labeled_target("other.local", None, &[("version", "v2")]),
+        ],
+        vec!["version=v1".to_string()],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let mut seen = HashSet::new();
+    for i in 0..30 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("empty-source-{i}"),
+            no_health(),
+        )
+        .expect("selected");
+        seen.insert(selection.target.host.clone());
+    }
+    assert_eq!(
+        seen.len(),
+        2,
+        "an empty source-label map must leave baseline selection unchanged — saw {seen:?}"
+    );
+}
+
+#[test]
+fn failover_priority_individually_missing_labels_compare_as_empty() {
+    // Missing labels on both sides match (Istio map-lookup empty-string
+    // semantics) once the source map itself is non-empty. An endpoint that
+    // carries the requested key with a non-empty value mismatches.
+    let up = upstream_with_failover_priority(
+        HashMap::from([("unrelated".to_string(), "present".to_string())]),
         vec![
             labeled_target("missing.local", None, &[]),
             labeled_target("present.local", None, &[("version", "v1")]),
@@ -2372,14 +2413,11 @@ fn failover_priority_missing_labels_compare_as_empty() {
             &snapshot,
             "ferrum",
             "u1",
-            &format!("miss-{i}"),
+            &format!("missing-entry-{i}"),
             no_health(),
         )
         .expect("selected");
-        assert_eq!(
-            selection.target.host, "missing.local",
-            "missing-on-both-sides must outrank a present-but-mismatched label"
-        );
+        assert_eq!(selection.target.host, "missing.local");
     }
 }
 
@@ -2651,22 +2689,243 @@ fn failover_priority_network_first_demotes_without_dropping_later_matches() {
 }
 
 #[test]
-fn failover_priority_key_equals_value_keeps_embedded_equals() {
-    let up = upstream_with_failover_priority(
-        HashMap::new(),
+fn failover_priority_without_health_signal_leaves_selection_unchanged() {
+    let mut up = upstream_with_failover_priority(
+        HashMap::from([("version".to_string(), "v1".to_string())]),
         vec![
-            labeled_target("match.local", None, &[("version", "a=b")]),
-            labeled_target("other.local", None, &[("version", "a")]),
+            labeled_target("v1.local", None, &[("version", "v1")]),
+            labeled_target("v2.local", None, &[("version", "v2")]),
         ],
-        vec!["version=a=b".to_string()],
+        vec!["version".to_string()],
+    );
+    up.health_checks = None;
+    up.source_locality = Some("us-west/us-west-1/a".to_string());
+    for target in &mut up.targets {
+        target.locality = Some("us-west/us-west-1/a".to_string());
+    }
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let mut seen = HashSet::new();
+    for i in 0..30 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("no-health-{i}"),
+            no_health(),
+        )
+        .expect("selected");
+        seen.insert(selection.target.host.clone());
+    }
+    assert_eq!(
+        seen.len(),
+        2,
+        "configured failoverPriority must be inert without a health/failover signal"
+    );
+}
+
+#[test]
+fn failover_priority_active_health_signal_enables_label_tiers() {
+    let mut up = upstream_with_failover_priority(
+        HashMap::from([("version".to_string(), "v1".to_string())]),
+        vec![
+            labeled_target("v1.local", None, &[("version", "v1")]),
+            labeled_target("v2.local", None, &[("version", "v2")]),
+        ],
+        vec!["version".to_string()],
+    );
+    up.health_checks = Some(HealthCheckConfig {
+        active: Some(ActiveHealthCheck::default()),
+        passive: None,
+    });
+    let snapshot = LoadBalancerCache::new(&config(up)).load();
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("active-health-{i}"),
+            no_health(),
+        )
+        .expect("selected");
+        assert_eq!(selection.target.host, "v1.local");
+    }
+}
+
+#[test]
+fn failover_priority_per_port_health_signal_is_scoped_to_that_port() {
+    let mut v1_9090 = target_on_port("v1-9090.local", 9090, None);
+    v1_9090
+        .tags
+        .insert("version".to_string(), "v1".to_string());
+    let mut v2_9090 = target_on_port("v2-9090.local", 9090, None);
+    v2_9090
+        .tags
+        .insert("version".to_string(), "v2".to_string());
+    let mut up = upstream_with_failover_priority(
+        HashMap::from([("version".to_string(), "v1".to_string())]),
+        vec![
+            labeled_target("v1-8080.local", None, &[("version", "v1")]),
+            labeled_target("v2-8080.local", None, &[("version", "v2")]),
+            v1_9090,
+            v2_9090,
+        ],
+        vec!["version".to_string()],
+    );
+    up.health_checks = None;
+    up.port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            passive_health_check: Some(PassiveHealthCheck::default()),
+            ..UpstreamPortOverride::default()
+        },
+    );
+    up.port_overrides
+        .insert(9090, UpstreamPortOverride::default());
+
+    let snapshot = LoadBalancerCache::new(&config(up)).load();
+    for i in 0..8 {
+        let selected = LoadBalancerCache::select_target_for_port_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("port-health-{i}"),
+            8080,
+            no_health(),
+        )
+        .expect("selected on health-enabled port");
+        assert_eq!(selected.target.host, "v1-8080.local");
+    }
+    let mut seen = HashSet::new();
+    for i in 0..30 {
+        let selected = LoadBalancerCache::select_target_for_port_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("port-no-health-{i}"),
+            9090,
+            no_health(),
+        )
+        .expect("selected on inert port");
+        seen.insert(selected.target.host.clone());
+    }
+    assert_eq!(seen.len(), 2, "health enablement must remain port-scoped");
+}
+
+#[test]
+fn failover_priority_subset_health_signal_enables_only_that_subset() {
+    let mut up = upstream_with_failover_priority(
+        HashMap::from([("version".to_string(), "v1".to_string())]),
+        vec![
+            labeled_target(
+                "stable-v1.local",
+                None,
+                &[("lane", "stable"), ("version", "v1")],
+            ),
+            labeled_target(
+                "stable-v2.local",
+                None,
+                &[("lane", "stable"), ("version", "v2")],
+            ),
+            labeled_target(
+                "canary-v1.local",
+                None,
+                &[("lane", "canary"), ("version", "v1")],
+            ),
+            labeled_target(
+                "canary-v2.local",
+                None,
+                &[("lane", "canary"), ("version", "v2")],
+            ),
+        ],
+        vec!["version".to_string()],
+    );
+    up.health_checks = None;
+    up.subsets = Some(vec![
+        SubsetDefinition {
+            name: "stable".to_string(),
+            labels: HashMap::from([("lane".to_string(), "stable".to_string())]),
+            traffic_policy: Some(SubsetTrafficPolicy {
+                load_balancer_algorithm: None,
+                hash_on: None,
+                tls: None,
+                connect_timeout_ms: None,
+                passive_health_check: Some(PassiveHealthCheck::default()),
+            }),
+        },
+        SubsetDefinition {
+            name: "canary".to_string(),
+            labels: HashMap::from([("lane".to_string(), "canary".to_string())]),
+            traffic_policy: None,
+        },
+    ]);
+    let snapshot = LoadBalancerCache::new(&config(up)).load();
+    for i in 0..8 {
+        let selected = LoadBalancerCache::select_target_subset_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("stable-{i}"),
+            "stable",
+            no_health(),
+        )
+        .expect("selected stable subset");
+        assert_eq!(selected.target.host, "stable-v1.local");
+    }
+    let mut seen = HashSet::new();
+    for i in 0..30 {
+        let selected = LoadBalancerCache::select_target_subset_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("canary-{i}"),
+            "canary",
+            no_health(),
+        )
+        .expect("selected canary subset");
+        seen.insert(selected.target.host.clone());
+    }
+    assert_eq!(seen.len(), 2, "subset health enablement must remain scoped");
+}
+
+#[test]
+fn failover_priority_more_than_255_components_preserves_distinct_ranks() {
+    let component_count = 257usize;
+    let priorities: Vec<String> = (0..component_count)
+        .map(|index| format!("label-{index}"))
+        .collect();
+    let source_labels: HashMap<String, String> = priorities
+        .iter()
+        .map(|key| (key.clone(), "match".to_string()))
+        .collect();
+    let mut higher_rank = labeled_target("higher.local", None, &[]);
+    let mut lower_rank = labeled_target("lower.local", None, &[]);
+    for key in &priorities {
+        higher_rank.tags.insert(key.clone(), "match".to_string());
+        lower_rank.tags.insert(key.clone(), "match".to_string());
+    }
+    higher_rank
+        .tags
+        .insert(priorities[255].clone(), "mismatch".to_string());
+    lower_rank
+        .tags
+        .insert(priorities[256].clone(), "mismatch".to_string());
+
+    let up = upstream_with_failover_priority(
+        source_labels,
+        vec![higher_rank, lower_rank],
+        priorities,
     );
     let selection = LoadBalancerCache::select_target_from(
         &LoadBalancerCache::new(&config(up)).load(),
         "ferrum",
         "u1",
-        "eq-embed",
+        "more-than-255",
         no_health(),
     )
     .expect("selected");
-    assert_eq!(selection.target.host, "match.local");
+    assert_eq!(
+        selection.target.host, "lower.local",
+        "component 257 must remain a distinct better rank than component 256"
+    );
 }

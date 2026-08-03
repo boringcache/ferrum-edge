@@ -1765,7 +1765,7 @@ fn translate_locality_lb_setting(
                     object,
                     format!(
                         "trafficPolicy.loadBalancer.localityLbSetting.failoverPriority[{idx}] \
-                         is not a valid label key or key=value entry"
+                         is not a valid label key or key=value entry with exactly one '='"
                     ),
                 ));
             };

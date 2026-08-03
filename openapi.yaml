@@ -10135,9 +10135,12 @@ components:
             type: string
           description: |
             Ordered Istio failoverPriority label keys (`key`) or key/value
-            overrides (`key=value`). Replaces default region/zone/subzone tiers
-            with label-match priority tiers. Mutually exclusive with distribute
-            and failover.
+            overrides containing exactly one equals sign (`key=value`). When an
+            applicable upstream, per-port, or per-subset active/passive health
+            policy enables failover, replaces default region/zone/subzone tiers
+            with label-match priority tiers; otherwise remains inert and leaves
+            baseline selection unchanged. An empty source-label map produces no
+            tiers. Mutually exclusive with distribute and failover.
 
     LocalityDistribute:
       type: object

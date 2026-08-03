@@ -1024,9 +1024,11 @@ fn default_weight() -> u32 {
 /// locality the load balancer uses per-locality weights and skips the
 /// priority-tier preference; otherwise `failover` (when configured)
 /// supplies a fourth tier consulted after `region` and before the
-/// unfiltered fallback set. When `failover_priority` is set it replaces
-/// the default region/zone/subzone tiers with ordered workload-label
-/// priority tiers (see [`Upstream::source_labels`] and target `tags`).
+/// unfiltered fallback set. When `failover_priority` is set and an effective
+/// active/passive health policy enables failover, it replaces the default
+/// region/zone/subzone tiers with ordered workload-label priority tiers (see
+/// [`Upstream::source_labels`] and target `tags`). Without an applicable health
+/// policy it is inert, matching Istio.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UpstreamLocalityLbSetting {
     #[serde(default = "default_true_locality_lb_enabled")]
@@ -1035,9 +1037,10 @@ pub struct UpstreamLocalityLbSetting {
     pub distribute: Vec<LocalityDistribute>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failover: Vec<LocalityFailover>,
-    /// Ordered Istio `failoverPriority` label keys (`key`) or
-    /// key/value overrides (`key=value`). Mutually exclusive with
-    /// `distribute` and `failover`.
+    /// Ordered Istio `failoverPriority` label keys (`key`) or key/value
+    /// overrides containing exactly one equals sign (`key=value`). Mutually
+    /// exclusive with `distribute` and `failover`; inert unless an applicable
+    /// active/passive health policy enables failover.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failover_priority: Vec<String>,
 }
@@ -1069,8 +1072,9 @@ pub const FAILOVER_PRIORITY_LABEL_HOSTNAME: &str = "kubernetes.io/hostname";
 /// Parse one Istio `failoverPriority` entry into `(key, optional_override_value)`.
 ///
 /// Entries are either a bare label key (`topology.kubernetes.io/region`) or
-/// `key=value`. The first `=` separates key from value so values may contain
-/// additional `=` characters. Empty keys are rejected.
+/// `key=value`. Istio recognizes an override only when splitting on `=` yields
+/// exactly two parts, so entries containing multiple `=` characters are
+/// rejected rather than silently reinterpreted. Empty keys are rejected.
 pub fn parse_failover_priority_entry(raw: &str) -> Option<(&str, Option<&str>)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed != raw {
@@ -1078,7 +1082,7 @@ pub fn parse_failover_priority_entry(raw: &str) -> Option<(&str, Option<&str>)> 
     }
     match trimmed.split_once('=') {
         Some((key, value)) => {
-            if key.is_empty() {
+            if key.is_empty() || value.contains('=') {
                 None
             } else {
                 Some((key, Some(value)))
@@ -1535,8 +1539,8 @@ pub struct Upstream {
     /// mesh apply layer from a matching `MeshDestinationRule`; `None` for
     /// hand-crafted upstreams. The load balancer reads this at construction
     /// time to honour weighted `distribute`, region-`failover`, and
-    /// label-ordered `failover_priority` overrides on top of (or instead of)
-    /// the priority-tier preference driven by `source_locality`.
+    /// health-gated label-ordered `failover_priority` overrides on top of (or
+    /// instead of) the priority-tier preference driven by `source_locality`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality_lb_setting: Option<UpstreamLocalityLbSetting>,
     /// Path to a PEM client certificate for mTLS with backend targets.

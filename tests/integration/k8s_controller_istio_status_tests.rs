@@ -711,3 +711,57 @@ fn destination_rule_deferred_fields_listed_in_detail() {
         "message should mention deferred fields, got: {message}"
     );
 }
+
+#[test]
+fn destination_rule_failover_priority_status_reflects_outlier_activation() {
+    let without_outlier = object(
+        "networking.istio.io/v1",
+        "DestinationRule",
+        "priority-inert",
+        json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failoverPriority": ["topology.kubernetes.io/region"]
+                    }
+                }
+            }
+        }),
+    );
+    let with_outlier = object(
+        "networking.istio.io/v1",
+        "DestinationRule",
+        "priority-active",
+        json!({
+            "host": "ratings.default.svc.cluster.local",
+            "trafficPolicy": {
+                "outlierDetection": {},
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failoverPriority": ["topology.kubernetes.io/region"]
+                    }
+                }
+            }
+        }),
+    );
+    let updates = plan_istio_status_updates(&[without_outlier, with_outlier], options());
+
+    let inert = update_for(&updates, "DestinationRule", "priority-inert");
+    let inert_fields = inert.ferrum_detail.as_ref().unwrap()["translation"]["deferred_fields"]
+        .as_array()
+        .expect("inactive policy advisory");
+    assert!(inert_fields.iter().any(|field| {
+        field
+            .as_str()
+            .is_some_and(|field| field.contains("accepted but inactive"))
+    }));
+
+    let active = update_for(&updates, "DestinationRule", "priority-active");
+    assert!(
+        active.ferrum_detail.as_ref().unwrap()["translation"]
+            .get("deferred_fields")
+            .is_none(),
+        "applicable outlierDetection must activate failoverPriority without an inactive advisory"
+    );
+}

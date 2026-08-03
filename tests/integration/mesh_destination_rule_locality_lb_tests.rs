@@ -416,18 +416,28 @@ fn k8s_translator_rejects_whitespace_failover_priority_entry() {
 }
 
 #[test]
-fn k8s_translator_accepts_key_equals_value_with_embedded_equals() {
-    let (_, setting) = translate_dr_locality(serde_json::json!({
-        "host": "reviews.default.svc.cluster.local",
-        "trafficPolicy": {
-            "loadBalancer": {
-                "localityLbSetting": {
-                    "failoverPriority": ["version=a=b"]
+fn k8s_translator_rejects_key_value_override_with_multiple_equals() {
+    let object = istio_object(
+        "DestinationRule",
+        "reviews",
+        serde_json::json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "loadBalancer": {
+                    "localityLbSetting": {
+                        "failoverPriority": ["version=a=b"]
+                    }
                 }
             }
-        }
-    }));
-    assert_eq!(setting.failover_priority, vec!["version=a=b".to_string()]);
+        }),
+    );
+    let err = translate_k8s_objects(&[object], k8s_options())
+        .expect_err("multiple-equals override must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("failoverPriority[0]") && msg.contains("not a valid label key"),
+        "expected multiple-equals fail-closed rejection, got: {msg}"
+    );
 }
 
 #[test]
