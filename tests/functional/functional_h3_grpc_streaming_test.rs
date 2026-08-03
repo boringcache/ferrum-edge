@@ -952,6 +952,10 @@ async fn h3_grpc_client_upload_cancellation_resets_backend_stream() {
         .expect("backend tls")
         .step(H2Step::ExpectHeaders(MatchHeaders::any()))
         .step(H2Step::ReadRequestData)
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "application/grpc".into()),
+        ]))
         .step(H2Step::ExpectReset(Duration::from_secs(10)))
         .spawn()
         .expect("spawn backend");
