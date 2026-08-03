@@ -226,6 +226,90 @@ async fn gzip_residual_encoding_repairs_headers_and_normalizes_stream() {
 }
 
 #[tokio::test]
+async fn layered_gzip_br_residual_encoding_normalizes_without_leaking_frames() {
+    let plugin = plugin();
+    let (mut ctx, _) = claim(&plugin).await;
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    response_headers.insert("content-encoding".to_string(), "gzip, br".to_string());
+    response_headers.insert("content-length".to_string(), "42".to_string());
+    response_headers.insert("content-digest".to_string(), "sha-256=:dead:".to_string());
+
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_stream_router.provider_content_encoding")
+            .map(String::as_str),
+        Some("gzip, br")
+    );
+    assert!(!response_headers.contains_key("content-encoding"));
+    assert!(!response_headers.contains_key("content-length"));
+    assert!(!response_headers.contains_key("content-digest"));
+
+    let mut gzipped = GzEncoder::new(Vec::new(), Compression::default());
+    gzipped.write_all(SSE.as_bytes()).unwrap();
+    let gzip_layer = gzipped.finish().unwrap();
+    let mut layered = Vec::new();
+    {
+        let mut encoder = brotli::CompressorWriter::new(&mut layered, 4096, 5, 22);
+        encoder.write_all(&gzip_layer).unwrap();
+    }
+
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("chain inspector");
+    match inspector.on_chunk(&layered).await {
+        ResponseStreamAction::Forward(b) => {
+            assert!(b.is_empty(), "must hold encoded chain frames until EOF")
+        }
+        other => panic!("unexpected mid-stream action: {other:?}"),
+    }
+    let mut out = Vec::new();
+    match inspector.on_end().await {
+        ResponseStreamAction::Forward(b) | ResponseStreamAction::Terminate(Some(b)) => {
+            out.extend_from_slice(&b)
+        }
+        ResponseStreamAction::Terminate(None) => {}
+    }
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("\"content\":\"integrated\""));
+    assert!(text.trim_end().ends_with("data: [DONE]"));
+    assert!(!text.contains("upstream_error"));
+}
+
+#[tokio::test]
+async fn unsupported_layered_coding_rejects_before_stream_fallback() {
+    let plugin = plugin();
+    let (mut ctx, _) = claim(&plugin).await;
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    response_headers.insert("content-encoding".to_string(), "gzip, zstd".to_string());
+    let result = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 502),
+        other => panic!("unsupported chain must reject before body fallback: {other:?}"),
+    }
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .is_some(),
+        "claim still owns normalization; forged residual encoding is absent"
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_stream_router.provider_content_encoding")
+    );
+}
+
+#[tokio::test]
 async fn premature_eof_buffered_path_surfaces_upstream_error() {
     let plugin = plugin();
     let (mut ctx, _) = claim(&plugin).await;

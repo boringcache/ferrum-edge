@@ -57,9 +57,10 @@
 //!   explicit provider `error`) before emitting a success-shaped terminal
 //!   sequence; premature EOF / malformed events fail closed with an
 //!   upstream-error SSE frame. Requests that will be normalized strip
-//!   `Accept-Encoding`, and residual `Content-Encoding` is decoded (gzip / br)
-//!   or rejected before SSE parsing so response headers describe identity
-//!   bytes.
+//!   `Accept-Encoding`, and residual `Content-Encoding` chains are decoded
+//!   (`gzip` / `x-gzip` / `br`, including stacked lists) in reverse application
+//!   order under shared bounded limits, or rejected fail-closed before SSE
+//!   parsing so response headers describe identity bytes.
 //! - `google_gemini`: config is accepted and validated but construction fails
 //!   with a clear "not yet implemented" error until the second phase lands.
 //!
@@ -203,7 +204,9 @@ use tracing::debug;
 use url::{Host, Url};
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
-use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
+use super::utils::content_encoding::{
+    DecodeLimits, decode_content_encoding, parse_content_codings,
+};
 use super::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
     ResponseStreamInspector, ResponseStreamInspectorStage,
@@ -319,9 +322,10 @@ const META_REQUEST_TRANSLATED: &str = "ai_stream_router.request_translated";
 /// `tool_use` for that generation, so it must not be disarmable by a later
 /// metadata write.
 const META_TOOL_CHOICE_NONE: &str = "ai_stream_router.tool_choice_none";
-/// Provider `Content-Encoding` that must be decoded before Anthropic SSE
+/// Provider `Content-Encoding` chain that must be decoded before Anthropic SSE
 /// normalization. Stamped in `after_proxy` before representation headers are
-/// repaired so both streaming and buffered normalizers see the same coding.
+/// repaired so both streaming and buffered normalizers see the same coding list
+/// (canonical application-order members joined with `", "`).
 ///
 /// Deliberately left in metadata and deliberately NOT authorization state
 /// (`GHSA-xhp5-hqj8-3mwg`): it is derived from the PROVIDER's own response
@@ -336,12 +340,27 @@ const META_PROVIDER_ENCODING: &str = "ai_stream_router.provider_content_encoding
 /// telling response plugins the request asked for a streaming response.
 const META_STREAMING_SHARED: &str = "ai_request_streaming";
 
-/// Bound decoding of residual provider content codings before SSE normalization.
+/// Bound decoding of residual provider content coding chains before SSE
+/// normalization. Absolute per-layer / aggregate ceilings match the streaming
+/// buffer caps; the 1024:1 ratio matches the shared compression pipeline so a
+/// tiny gzip/br bomb cannot spend the full absolute budget.
 const NORMALIZE_DECODE_LIMITS: DecodeLimits = DecodeLimits {
     max_decoded_bytes: 8 * 1024 * 1024,
     max_cumulative_bytes: 16 * 1024 * 1024,
     max_codings: 4,
-    max_amplification_ratio: 0,
+    max_amplification_ratio: 1024,
+};
+
+/// Compile-time proof that residual-decode ceilings stay finite and ordered:
+/// per-layer ≤ aggregate, layer count ≥ 1, and amplification is enabled.
+const _: () = {
+    assert!(NORMALIZE_DECODE_LIMITS.max_decoded_bytes > 0);
+    assert!(NORMALIZE_DECODE_LIMITS.max_cumulative_bytes > 0);
+    assert!(NORMALIZE_DECODE_LIMITS.max_codings > 0);
+    assert!(NORMALIZE_DECODE_LIMITS.max_amplification_ratio > 0);
+    assert!(
+        NORMALIZE_DECODE_LIMITS.max_decoded_bytes <= NORMALIZE_DECODE_LIMITS.max_cumulative_bytes
+    );
 };
 
 // ---------------------------------------------------------------------------
@@ -2594,11 +2613,7 @@ impl Plugin for AiStreamRouter {
             return None;
         }
         let encoding = ctx.metadata.get(META_PROVIDER_ENCODING).cloned();
-        Some(wrap_anthropic_normalizer(
-            model,
-            encoding.as_deref(),
-            tools_forbidden,
-        ))
+        Some(wrap_anthropic_normalizer(model, encoding, tools_forbidden))
     }
 
     async fn normalize_response_body_with_context(
@@ -2702,7 +2717,7 @@ impl Plugin for AiStreamRouter {
             }
             ProviderContentEncoding::Supported(coding) => {
                 ctx.metadata
-                    .insert(META_PROVIDER_ENCODING.to_string(), coding.to_string());
+                    .insert(META_PROVIDER_ENCODING.to_string(), coding);
                 repair_normalized_representation_headers(response_headers);
                 PluginResult::Continue
             }
@@ -2850,7 +2865,9 @@ fn content_encoding_value(headers: &HashMap<String, String>) -> Result<Option<&s
 
 enum ProviderContentEncoding {
     Identity,
-    Supported(&'static str),
+    /// Canonical `#content-coding` list in application order (e.g. `gzip`,
+    /// `gzip, br`). Decode undoes layers in reverse.
+    Supported(String),
     Unsupported(String),
 }
 
@@ -2862,48 +2879,27 @@ fn classify_provider_content_encoding(
         Ok(None) => return ProviderContentEncoding::Identity,
         Err(message) => return ProviderContentEncoding::Unsupported(message),
     };
-    let mut codings = Vec::new();
-    for part in raw.split(',') {
-        let coding = part.trim();
-        if coding.is_empty() {
-            return ProviderContentEncoding::Unsupported(
-                "content-encoding contains an empty coding".to_string(),
-            );
-        }
-        if coding.contains(';') {
-            return ProviderContentEncoding::Unsupported(format!(
-                "content-encoding coding '{coding}' contains unsupported parameters"
-            ));
-        }
-        let lower = coding.to_ascii_lowercase();
-        match lower.as_str() {
-            "identity" => {}
-            "gzip" | "br" => codings.push(lower),
-            other => {
-                return ProviderContentEncoding::Unsupported(format!(
-                    "unsupported content-encoding '{other}'"
-                ));
-            }
-        }
+    let codings = match parse_content_codings(raw) {
+        Ok(codings) => codings,
+        Err(message) => return ProviderContentEncoding::Unsupported(message),
+    };
+    if codings.len() > NORMALIZE_DECODE_LIMITS.max_codings {
+        return ProviderContentEncoding::Unsupported(format!(
+            "content-encoding has more than {} coding layers",
+            NORMALIZE_DECODE_LIMITS.max_codings
+        ));
     }
-    if codings.is_empty() {
-        ProviderContentEncoding::Identity
-    } else if codings.len() == 1 {
-        match codings[0].as_str() {
-            "gzip" => ProviderContentEncoding::Supported("gzip"),
-            "br" => ProviderContentEncoding::Supported("br"),
-            other => ProviderContentEncoding::Unsupported(format!(
-                "unsupported content-encoding '{other}'"
-            )),
-        }
-    } else {
-        // Multi-layer residual encodings are unusual for SSE and are rejected
-        // rather than partially decoded into a mislabeled stream.
-        ProviderContentEncoding::Unsupported(
-            "multi-layer content-encoding is not supported for Anthropic SSE normalization"
-                .to_string(),
-        )
+    if codings.iter().all(|coding| coding == "identity") {
+        return ProviderContentEncoding::Identity;
     }
+    if codings.iter().any(|coding| coding == "identity") {
+        return ProviderContentEncoding::Unsupported(
+            "identity content-encoding cannot be combined with other codings".to_string(),
+        );
+    }
+    // Supported tokens only: parse_content_codings already rejected anything
+    // outside gzip / x-gzip / br / identity.
+    ProviderContentEncoding::Supported(codings.join(", "))
 }
 
 /// Drop or rewrite representation metadata after Anthropic SSE is rewritten to
@@ -3016,17 +3012,26 @@ const BUFFERED_NORMALIZE_CHUNK_BYTES: usize = 16 * 1024;
 
 fn wrap_anthropic_normalizer(
     model: String,
-    encoding: Option<&str>,
+    encoding: Option<String>,
     tools_forbidden: bool,
 ) -> Box<dyn ResponseStreamInspector> {
     let inner = AnthropicSseNormalizer::new(model, tools_forbidden);
-    match encoding {
-        Some("gzip") => Box::new(ContentDecodingNormalizer::gzip(inner)),
-        Some("br") => Box::new(ContentDecodingNormalizer::brotli(inner)),
-        Some(other) => Box::new(ImmediateUpstreamErrorNormalizer::new(format!(
-            "unsupported content-encoding '{other}' for Anthropic SSE normalization"
-        ))),
-        None => Box::new(inner),
+    let Some(encoding) = encoding else {
+        return Box::new(inner);
+    };
+    // Re-validate the metadata stamp (or a forged value) with the same
+    // classifier `after_proxy` used. Unsupported / ambiguous chains fail closed
+    // immediately — never buffer opaque provider frames under a bad coding.
+    let mut probe = HashMap::with_capacity(1);
+    probe.insert("content-encoding".to_string(), encoding);
+    match classify_provider_content_encoding(&probe) {
+        ProviderContentEncoding::Supported(coding) => {
+            Box::new(ContentDecodingNormalizer::new(coding, inner))
+        }
+        ProviderContentEncoding::Identity => Box::new(inner),
+        ProviderContentEncoding::Unsupported(message) => {
+            Box::new(ImmediateUpstreamErrorNormalizer::new(message))
+        }
     }
 }
 
@@ -3965,29 +3970,26 @@ impl ResponseStreamInspector for AnthropicSseNormalizer {
     }
 }
 
-/// Decode residual provider content coding, then feed plaintext SSE into the
-/// Anthropic→OpenAI normalizer. Because a compressed stream's checksum/trailer
-/// is not trustworthy until EOF, this rare fallback buffers the encoded body
-/// within a strict cap before decoding. Normal requests strip Accept-Encoding
-/// and retain fully progressive identity SSE normalization.
+/// Decode residual provider content-coding chains, then feed plaintext SSE into
+/// the Anthropic→OpenAI normalizer. Because a compressed stream's
+/// checksum/trailer is not trustworthy until EOF — and intermediate layers of a
+/// stacked list cannot be validated until the outer coding is complete — this
+/// rare fallback buffers the encoded body within a strict cap before decoding
+/// in reverse application order. Encoded octets are never forwarded to the
+/// client; decode/limit failures emit an upstream-error SSE frame. Normal
+/// requests strip Accept-Encoding and retain fully progressive identity SSE
+/// normalization.
 struct ContentDecodingNormalizer {
-    encoding: &'static str,
+    /// Canonical `#content-coding` list in application order.
+    encoding: String,
     encoded: Vec<u8>,
     inner: AnthropicSseNormalizer,
 }
 
 impl ContentDecodingNormalizer {
-    fn gzip(inner: AnthropicSseNormalizer) -> Self {
+    fn new(encoding: String, inner: AnthropicSseNormalizer) -> Self {
         Self {
-            encoding: "gzip",
-            encoded: Vec::new(),
-            inner,
-        }
-    }
-
-    fn brotli(inner: AnthropicSseNormalizer) -> Self {
-        Self {
-            encoding: "br",
+            encoding,
             encoded: Vec::new(),
             inner,
         }
@@ -4017,12 +4019,17 @@ impl ResponseStreamInspector for ContentDecodingNormalizer {
                 .fail_decode("encoded Anthropic SSE size overflowed".to_string())
                 .await;
         };
+        // Cap the wire buffer at the aggregate decode budget so a hostile
+        // provider cannot pin more than the shared residual-decode ceiling
+        // before any layer runs.
         if next_len > NORMALIZE_DECODE_LIMITS.max_cumulative_bytes {
             return self
                 .fail_decode("encoded Anthropic SSE exceeds the streaming size limit".to_string())
                 .await;
         }
         self.encoded.extend_from_slice(chunk);
+        // Hold encoded frames until EOF+decode succeeds — never serve opaque
+        // provider octets as normalized AI output.
         ResponseStreamAction::Forward(Bytes::new())
     }
 
@@ -4030,11 +4037,16 @@ impl ResponseStreamInspector for ContentDecodingNormalizer {
         if self.inner.done_emitted {
             return ResponseStreamAction::Terminate(None);
         }
-        let decoded = match prepare_sse_bytes_for_normalization(&self.encoded, Some(self.encoding))
-        {
-            Ok(bytes) => bytes.into_owned(),
-            Err(message) => return self.fail_decode(message).await,
-        };
+        let decoded =
+            match prepare_sse_bytes_for_normalization(&self.encoded, Some(self.encoding.as_str())) {
+                Ok(bytes) => bytes.into_owned(),
+                Err(message) => return self.fail_decode(message).await,
+            };
+        // Encoded working set is spent; drop it before driving the plaintext
+        // normalizer so peak retention is decode output + normalized SSE, not
+        // also the original wire bytes.
+        self.encoded.clear();
+        self.encoded.shrink_to_fit();
         let mut out = Vec::new();
         if !decoded.is_empty() {
             match self.inner.on_chunk(&decoded).await {
