@@ -642,6 +642,16 @@ impl MeshSliceDriftRegistry {
         self.snapshot.load_full()
     }
 
+    /// Number of identities in the latest immutable registry snapshot.
+    pub fn len(&self) -> usize {
+        self.snapshot.load().summary.tracked
+    }
+
+    /// Whether the latest immutable registry snapshot tracks no identities.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     fn lock_state(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, RegistryState>, MeshSliceDriftAdmitError> {
