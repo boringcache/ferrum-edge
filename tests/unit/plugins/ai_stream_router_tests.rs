@@ -6632,6 +6632,315 @@ async fn test_gemini_rejects_malformed_tool_choice_at_claim() {
 }
 
 #[tokio::test]
+async fn test_gemini_rejects_unrepresentable_message_content_at_claim() {
+    let plugin = build(gemini_config());
+
+    // Mixed text + image must not silently flatten to text.
+    let mixed = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "caption"},
+                {"type": "image_url", "image_url": {"url": "https://example.invalid/x.png"}}
+            ]
+        }]
+    });
+    let mut ctx = post_ctx(&mixed);
+    let mut headers = json_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("invalid_request_error"), "{body}");
+            assert!(
+                body.contains("Gemini-representable") || body.contains("content"),
+                "{body}"
+            );
+            assert!(
+                !body.contains("example.invalid"),
+                "must not echo provider/client media urls: {body}"
+            );
+        }
+        other => panic!("mixed text+image must reject: {other:?}"),
+    }
+
+    // Malformed text part (non-string text) fails closed.
+    let malformed = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": 42}]
+        }]
+    });
+    let mut ctx = post_ctx(&malformed);
+    let mut headers = json_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("malformed") || body.contains("content"), "{body}");
+        }
+        other => panic!("malformed text part must reject: {other:?}"),
+    }
+
+    // System / developer non-text content must reject (not silently drop).
+    for role in ["system", "developer"] {
+        let body = json!({
+            "model": "gemini-1.5-flash",
+            "stream": true,
+            "messages": [
+                {
+                    "role": role,
+                    "content": [{"type": "image_url", "image_url": {"url": "https://example.invalid/sys.png"}}]
+                },
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 400, "{role}");
+                assert!(
+                    body.contains("Gemini-representable") || body.contains("content"),
+                    "{role}: {body}"
+                );
+                assert!(!body.contains("example.invalid"), "{role}: {body}");
+            }
+            other => panic!("{role} non-text must reject: {other:?}"),
+        }
+    }
+
+    // Intentional assistant null content with tool_calls remains representable.
+    let with_tools = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }]
+    });
+    let mut ctx = post_ctx(&with_tools);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn test_gemini_2xx_content_type_lifecycle_fail_closed() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    // Missing Content-Type on 2xx: after_proxy rejects; inspector/buffered fail closed.
+    {
+        let mut ctx = post_ctx(&body);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+        let mut resp_headers = HashMap::new();
+        let reject = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+        assert_eq!(reject_status(&reject), Some(502));
+        if let PluginResult::Reject { body, .. } = &reject {
+            assert!(body.contains("without a Content-Type"), "{body}");
+            assert!(body.contains("unsupported_content_type"), "{body}");
+            assert!(!body.contains("text/plain"), "{body}");
+        }
+
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, None)
+            .expect("missing Content-Type must install fail-closed inspector");
+        let mut collected = forwarded(inspector.on_chunk(b"raw-provider-bytes").await);
+        collected.extend_from_slice(&forwarded(inspector.on_end().await));
+        let out = String::from_utf8(collected).unwrap();
+        assert!(out.contains("upstream_error"), "{out}");
+        assert!(out.contains("without a Content-Type"), "{out}");
+        assert!(!out.contains("raw-provider-bytes"), "{out}");
+
+        let buffered = plugin
+            .normalize_response_body_with_context(&mut ctx, 200, b"raw-json", None, &resp_headers)
+            .await
+            .expect("buffered missing Content-Type must fail closed");
+        let buffered_out = String::from_utf8(buffered).unwrap();
+        assert!(buffered_out.contains("upstream_error"), "{buffered_out}");
+        assert!(
+            buffered_out.contains("without a Content-Type"),
+            "{buffered_out}"
+        );
+        assert!(!buffered_out.contains("raw-json"), "{buffered_out}");
+    }
+
+    // Unexpected Content-Type on 2xx.
+    {
+        let mut ctx = post_ctx(&body);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "text/plain".to_string());
+        let reject = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+        assert_eq!(reject_status(&reject), Some(502));
+        if let PluginResult::Reject { body, .. } = &reject {
+            assert!(body.contains("unexpected Content-Type"), "{body}");
+            // Fixed-cardinality: do not echo the provider media type.
+            assert!(!body.contains("text/plain"), "{body}");
+        }
+
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/plain"))
+            .expect("unexpected Content-Type must install fail-closed inspector");
+        let mut collected = forwarded(inspector.on_chunk(b"not-normalized").await);
+        collected.extend_from_slice(&forwarded(inspector.on_end().await));
+        let out = String::from_utf8(collected).unwrap();
+        assert!(out.contains("unexpected Content-Type"), "{out}");
+        assert!(!out.contains("not-normalized"), "{out}");
+        assert!(!out.contains("text/plain"), "{out}");
+    }
+
+    // Recognized media types remain accepted.
+    for content_type in ["text/event-stream", "application/json"] {
+        let mut ctx = post_ctx(&body);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), content_type.to_string());
+        assert!(
+            matches!(
+                plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+                PluginResult::Continue
+            ),
+            "{content_type}"
+        );
+        assert!(
+            plugin
+                .response_stream_inspector(&ctx, 200, Some(content_type))
+                .is_some(),
+            "{content_type}"
+        );
+    }
+
+    // Non-2xx provider error envelopes still pass through even without Content-Type.
+    {
+        let mut ctx = post_ctx(&body);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+        let mut resp_headers = HashMap::new();
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 400, &mut resp_headers).await,
+            PluginResult::Continue
+        ));
+        assert!(
+            plugin
+                .response_stream_inspector(&ctx, 400, None)
+                .is_none()
+        );
+        assert!(
+            plugin
+                .normalize_response_body_with_context(
+                    &mut ctx,
+                    400,
+                    b"{\"error\":\"x\"}",
+                    None,
+                    &resp_headers,
+                )
+                .await
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_gemini_malformed_candidate_fields_fail_closed() {
+    // Present-but-malformed index must not fall back to positional index.
+    let bad_index = concat!(
+        "data: {\"candidates\":[{\"index\":\"0\",\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, bad_index, "text/event-stream").await;
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(out.contains("malformed index"), "{out}");
+    assert!(!out.contains("\"content\":\"x\""), "{out}");
+    assert!(!out.contains("\"index\":\"0\""), "{out}");
+
+    // Present-but-malformed finishReason must not be treated as absent.
+    let bad_finish = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\"}]},\"finishReason\":1}]}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, bad_finish, "text/event-stream").await;
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(out.contains("malformed finishReason"), "{out}");
+    assert!(!out.contains("\"finish_reason\""), "{out}");
+
+    // Present-but-non-string role must not be treated as absent/model.
+    let bad_role = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":1,\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, bad_role, "text/event-stream").await;
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(out.contains("content role that was not model"), "{out}");
+    assert!(!out.contains("\"content\":\"x\""), "{out}");
+
+    // Representable text plus additional unrepresentable fields must fail closed.
+    let extra_fields = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"keep\",\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"QUJD\"}}]},\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, extra_fields, "text/event-stream").await;
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(
+        out.contains("unrepresentable additional fields"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("\"content\":\"keep\""),
+        "must not emit representable subset: {out}"
+    );
+    assert!(!out.contains("inlineData"), "{out}");
+    assert!(!out.contains("QUJD"), "{out}");
+
+    // Missing index still uses the documented positional fallback.
+    let missing_index = concat!(
+        "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"fallback\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, missing_index, "text/event-stream").await;
+    assert!(out.contains("\"content\":\"fallback\""), "{out}");
+    assert!(out.contains("\"index\":0"), "{out}");
+    assert!(!out.contains("upstream_error"), "{out}");
+
+    // Empty-object metadata-only exception remains accepted.
+    let empty_meta = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{},{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    let out = run_gemini_normalizer(4096, empty_meta, "text/event-stream").await;
+    assert!(out.contains("\"content\":\"ok\""), "{out}");
+    assert!(!out.contains("upstream_error"), "{out}");
+}
+
+#[tokio::test]
 async fn test_gemini_sse_normalized_to_openai_chunks() {
     let out = run_gemini_normalizer(4096, GEMINI_SSE, "text/event-stream").await;
     assert!(out.contains("chat.completion.chunk"), "{out}");

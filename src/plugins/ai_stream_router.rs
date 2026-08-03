@@ -63,13 +63,17 @@
 //! - `google_gemini`: OpenAI Chat Completions request is translated to the
 //!   Gemini/`streamGenerateContent` (Vertex-compatible) request body; native
 //!   Gemini SSE (`alt=sse`) and Vertex-compatible JSON array / object streams
-//!   are normalized to OpenAI `chat.completion.chunk` SSE. Content/role deltas,
+//!   are normalized to OpenAI `chat.completion.chunk` SSE. Message content is
+//!   closed-shape at claim (string or text-parts array only; mixed/non-text/
+//!   malformed parts reject with OpenAI-shaped `400`). Content/role deltas,
 //!   multi-candidate indexes, finish/terminal state, usage metadata, safety /
 //!   prompt blocks, function calls + args, and provider error envelopes are
 //!   mapped under the same bounded fail-closed policy as Anthropic. Every
 //!   candidate that emitted client-visible output must reach a terminal
 //!   `finishReason` before clean EOF; post-finish candidate data and
-//!   unrepresentable content parts fail closed. The model is URL-scoped via an
+//!   unrepresentable content parts fail closed. A claimed normalizing 2xx
+//!   response with a missing or unexpected `Content-Type` fails closed rather
+//!   than streaming raw provider bytes. The model is URL-scoped via an
 //!   optional `{model}` endpoint placeholder.
 //!
 //! ## Provider fallback is rejected, not stored
@@ -1112,6 +1116,45 @@ fn flatten_content_text(content: &Value) -> String {
     out
 }
 
+/// Closed Gemini-representable OpenAI message `content`.
+///
+/// Only a string or a closed array of valid text parts may be translated.
+/// Mixed text-plus-image/audio/unknown parts, malformed text parts, and
+/// non-array/non-string shapes fail closed rather than being silently reduced
+/// by [`flatten_content_text`]. Null content yields an empty string so callers
+/// can preserve intentional assistant null/empty content when tool calls are
+/// present.
+fn gemini_message_content_text(content: &Value) -> Result<String, String> {
+    if let Some(text) = content.as_str() {
+        return Ok(text.to_string());
+    }
+    if content.is_null() {
+        return Ok(String::new());
+    }
+    let parts = content
+        .as_array()
+        .ok_or_else(|| "content must be a string or text-parts array".to_string())?;
+    let mut out = String::new();
+    for (index, part) in parts.iter().enumerate() {
+        if part.get("type").and_then(Value::as_str) != Some("text") {
+            return Err(format!(
+                "content[{index}] is not a Gemini-representable text part"
+            ));
+        }
+        let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+            format!("content[{index}] text part is malformed")
+        })?;
+        if text.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(text);
+    }
+    Ok(out)
+}
+
 #[derive(Clone)]
 struct ParsedToolCall {
     id: String,
@@ -1870,6 +1913,8 @@ fn validate_gemini_translation(openai_body: &Value) -> Result<(), String> {
         let message = &messages[message_index];
         let role = message["role"].as_str().unwrap_or("");
         if is_system_role(role) {
+            gemini_message_content_text(&message["content"])
+                .map_err(|error| format!("messages[{message_index}] {error}"))?;
             message_index += 1;
             continue;
         }
@@ -1933,8 +1978,10 @@ fn validate_gemini_translation(openai_body: &Value) -> Result<(), String> {
         if let Some(call) = legacy_call {
             pending_legacy_by_name.insert(call.name.clone(), call.id.clone());
         }
-        let text = flatten_content_text(&message["content"]);
-        if role == "assistant" && text.is_empty() && tool_calls.is_empty() && !had_legacy {
+        let text = gemini_message_content_text(&message["content"])
+            .map_err(|error| format!("messages[{message_index}] {error}"))?;
+        let has_tool_representation = !tool_calls.is_empty() || had_legacy;
+        if role == "assistant" && text.is_empty() && !has_tool_representation {
             return Err(format!(
                 "messages[{message_index}] has no Gemini-representable content"
             ));
@@ -2063,13 +2110,17 @@ fn translate_to_gemini(openai_body: &Value) -> Result<Vec<u8>, String> {
         .ok_or_else(|| "request missing 'messages' array".to_string())?;
     validate_gemini_translation(openai_body)?;
 
-    let system_parts: Vec<Value> = messages
-        .iter()
-        .filter(|m| m["role"].as_str().is_some_and(is_system_role))
-        .map(|m| flatten_content_text(&m["content"]))
-        .filter(|s| !s.is_empty())
-        .map(|text| json!({ "text": text }))
-        .collect();
+    let mut system_parts = Vec::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        if !message["role"].as_str().is_some_and(is_system_role) {
+            continue;
+        }
+        let text = gemini_message_content_text(&message["content"])
+            .map_err(|error| format!("messages[{message_index}] {error}"))?;
+        if !text.is_empty() {
+            system_parts.push(json!({ "text": text }));
+        }
+    }
 
     let mut tool_names_by_id: HashMap<String, String> = HashMap::new();
     let mut pending_legacy_by_name: HashMap<String, String> = HashMap::new();
@@ -2157,7 +2208,8 @@ fn translate_to_gemini(openai_body: &Value) -> Result<Vec<u8>, String> {
         }
 
         let native_role = if role == "assistant" { "model" } else { role };
-        let text = flatten_content_text(&message["content"]);
+        let text = gemini_message_content_text(&message["content"])
+            .map_err(|error| format!("messages[{message_index}] {error}"))?;
         let mut parts = Vec::new();
         if !text.is_empty() {
             parts.push(json!({ "text": text }));
@@ -3091,8 +3143,18 @@ impl Plugin for AiStreamRouter {
         if !(200..300).contains(&response_status) {
             return None;
         }
-        if !is_normalizable_provider_stream(provider_type, content_type) {
-            return None;
+        match classify_provider_stream_media(provider_type, content_type) {
+            ProviderStreamMediaDecision::Normalize => {}
+            ProviderStreamMediaDecision::PassThrough => return None,
+            decision => {
+                let message = provider_stream_media_fail_closed_message(decision)
+                    .unwrap_or(
+                        "upstream provider returned a successful response unsuitable for stream normalization",
+                    );
+                return Some(Box::new(ImmediateUpstreamErrorNormalizer::new(
+                    message.to_string(),
+                )));
+            }
         }
         let encoding = ctx.metadata.get(META_PROVIDER_ENCODING).cloned();
         Some(wrap_provider_normalizer(
@@ -3134,8 +3196,17 @@ impl Plugin for AiStreamRouter {
         if !(200..300).contains(&response_status) {
             return None;
         }
-        if !is_normalizable_provider_stream(provider_type, content_type) {
-            return None;
+        match classify_provider_stream_media(provider_type, content_type) {
+            ProviderStreamMediaDecision::Normalize => {}
+            ProviderStreamMediaDecision::PassThrough => return None,
+            decision => {
+                let message = provider_stream_media_fail_closed_message(decision)
+                    .unwrap_or(
+                        "upstream provider returned a successful response unsuitable for stream normalization",
+                    );
+                let ceiling = ctx.retained_response_body_ceiling();
+                return bounded_upstream_sse_error_body(message, ceiling);
+            }
         }
         // Every replacement this normalizer produces is materialised inside a
         // sink bounded by this response's retained ceiling — the same size as
@@ -3208,8 +3279,21 @@ impl Plugin for AiStreamRouter {
             Some((_, provider)) => provider.provider_type,
             None => return PluginResult::Continue,
         };
-        if !is_normalizable_provider_stream(provider_type, content_type) {
-            return PluginResult::Continue;
+        match classify_provider_stream_media(provider_type, content_type) {
+            ProviderStreamMediaDecision::Normalize => {}
+            ProviderStreamMediaDecision::PassThrough => return PluginResult::Continue,
+            decision => {
+                let message = provider_stream_media_fail_closed_message(decision).unwrap_or(
+                    "Upstream provider returned a successful response unsuitable for stream normalization",
+                );
+                return openai_error_response(
+                    502,
+                    message,
+                    "upstream_error",
+                    None,
+                    Some("unsupported_content_type"),
+                );
+            }
         }
 
         match classify_provider_content_encoding(response_headers) {
@@ -3567,15 +3651,57 @@ fn wrap_provider_normalizer(
     }
 }
 
-fn is_normalizable_provider_stream(
+/// How a claimed normalizing provider response's `Content-Type` is handled.
+///
+/// Anthropic keeps the historical PassThrough posture when the response is not
+/// `text/event-stream`. Gemini must not stream raw 2xx provider bytes past the
+/// adapter when the media type is missing or unexpected: those cases fail
+/// closed through after_proxy / inspector / buffered normalization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderStreamMediaDecision {
+    Normalize,
+    PassThrough,
+    FailClosedMissingContentType,
+    FailClosedUnexpectedContentType,
+}
+
+fn classify_provider_stream_media(
     provider_type: ProviderType,
     content_type: Option<&str>,
-) -> bool {
+) -> ProviderStreamMediaDecision {
     match provider_type {
-        ProviderType::Anthropic => content_type.is_some_and(is_event_stream_content_type),
-        ProviderType::GoogleGemini => content_type
-            .is_some_and(|ct| is_event_stream_content_type(ct) || is_json_content_type(ct)),
-        ProviderType::OpenAi | ProviderType::OpenAiCompatible => false,
+        ProviderType::Anthropic => {
+            if content_type.is_some_and(is_event_stream_content_type) {
+                ProviderStreamMediaDecision::Normalize
+            } else {
+                ProviderStreamMediaDecision::PassThrough
+            }
+        }
+        ProviderType::GoogleGemini => match content_type {
+            Some(ct) if is_event_stream_content_type(ct) || is_json_content_type(ct) => {
+                ProviderStreamMediaDecision::Normalize
+            }
+            None => ProviderStreamMediaDecision::FailClosedMissingContentType,
+            Some(_) => ProviderStreamMediaDecision::FailClosedUnexpectedContentType,
+        },
+        ProviderType::OpenAi | ProviderType::OpenAiCompatible => {
+            ProviderStreamMediaDecision::PassThrough
+        }
+    }
+}
+
+/// Fixed-cardinality Content-Type diagnostics. Never echoes the provider header.
+fn provider_stream_media_fail_closed_message(
+    decision: ProviderStreamMediaDecision,
+) -> Option<&'static str> {
+    match decision {
+        ProviderStreamMediaDecision::FailClosedMissingContentType => Some(
+            "Upstream provider returned a successful response without a Content-Type suitable for Gemini stream normalization",
+        ),
+        ProviderStreamMediaDecision::FailClosedUnexpectedContentType => Some(
+            "Upstream provider returned a successful response with an unexpected Content-Type for Gemini stream normalization",
+        ),
+        ProviderStreamMediaDecision::Normalize | ProviderStreamMediaDecision::PassThrough => None,
     }
 }
 
@@ -5041,10 +5167,20 @@ impl GeminiStreamNormalizer {
                 self.finish(StreamTerminal::UpstreamFailure, out);
                 return true;
             };
-            let choice_index = candidate
-                .get("index")
-                .and_then(Value::as_u64)
-                .unwrap_or(fallback_index as u64);
+            let choice_index = match candidate.get("index") {
+                None => fallback_index as u64,
+                Some(value) => match value.as_u64() {
+                    Some(index) => index,
+                    None => {
+                        self.emit_upstream_error(
+                            "upstream provider sent a Gemini candidate with a malformed index; stream terminated",
+                            out,
+                        );
+                        self.finish(StreamTerminal::UpstreamFailure, out);
+                        return true;
+                    }
+                },
+            };
             if !seen_indexes.insert(choice_index) {
                 self.emit_upstream_error(
                     "upstream provider sent duplicate Gemini candidate indexes in one event; stream terminated",
@@ -5058,9 +5194,9 @@ impl GeminiStreamNormalizer {
                 return self.reject_post_finish_candidate(out);
             }
 
-            let finish_reason_raw = candidate.get("finishReason").and_then(Value::as_str);
-            let mapped_finish = match finish_reason_raw {
-                Some(finish) => match map_gemini_finish_reason(finish) {
+            let mapped_finish = match candidate.get("finishReason") {
+                None => None,
+                Some(Value::String(finish)) => match map_gemini_finish_reason(finish) {
                     Ok(mapped) => Some(mapped),
                     Err(message) => {
                         self.emit_upstream_error(message, out);
@@ -5068,7 +5204,14 @@ impl GeminiStreamNormalizer {
                         return true;
                     }
                 },
-                None => None,
+                Some(_) => {
+                    self.emit_upstream_error(
+                        "upstream provider sent a Gemini candidate with a malformed finishReason; stream terminated",
+                        out,
+                    );
+                    self.finish(StreamTerminal::UpstreamFailure, out);
+                    return true;
+                }
             };
 
             // Emit content/tool deltas before the finish chunk when present.
@@ -5118,9 +5261,10 @@ impl GeminiStreamNormalizer {
                 "upstream provider sent a Gemini candidate with a non-object content; stream terminated",
             );
         };
-        match content.get("role").and_then(Value::as_str) {
-            Some("model") | None => {}
-            _ => {
+        match content.get("role") {
+            None => {}
+            Some(Value::String(role)) if role == "model" => {}
+            Some(_) => {
                 return Err(
                     "upstream provider sent a Gemini candidate content role that was not model; stream terminated",
                 );
@@ -5140,6 +5284,11 @@ impl GeminiStreamNormalizer {
             };
             match (part_obj.get("text"), part_obj.get("functionCall")) {
                 (Some(text_value), None) => {
+                    if part_obj.len() != 1 {
+                        return Err(
+                            "upstream provider sent a Gemini content part with unrepresentable additional fields; stream terminated",
+                        );
+                    }
                     let Some(text) = text_value.as_str() else {
                         return Err(
                             "upstream provider sent a Gemini text part that was not a string; stream terminated",
@@ -5152,6 +5301,11 @@ impl GeminiStreamNormalizer {
                     self.write_chunk_line(choice_index, json!({ "content": text }), None, out);
                 }
                 (None, Some(function_call)) => {
+                    if part_obj.len() != 1 {
+                        return Err(
+                            "upstream provider sent a Gemini content part with unrepresentable additional fields; stream terminated",
+                        );
+                    }
                     if self.tools_forbidden {
                         return Err("upstream provider emitted tool use despite tool_choice none");
                     }
