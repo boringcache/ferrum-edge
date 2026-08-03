@@ -5882,6 +5882,7 @@ mod tests {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
             selector: WorkloadSelector::default(),
             service_name: "redis".to_string(),
+            service_namespace: None,
             addresses: vec!["10.0.0.7".to_string()],
             ports: vec![WorkloadPort {
                 port: 6380,
@@ -6007,6 +6008,7 @@ mod tests {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
             selector: WorkloadSelector::default(),
             service_name: "reviews".to_string(),
+            service_namespace: None,
             addresses: vec!["10.0.0.7".to_string()],
             ports: vec![WorkloadPort {
                 port: 18080,
@@ -6105,6 +6107,7 @@ mod tests {
             spiffe_id: SpiffeId::new(spiffe).unwrap(),
             selector: WorkloadSelector::default(),
             service_name: "shared".to_string(),
+            service_namespace: None,
             addresses: vec!["10.0.0.7".to_string()],
             ports: vec![WorkloadPort {
                 port: 18080,

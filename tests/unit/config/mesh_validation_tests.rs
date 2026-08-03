@@ -22,6 +22,7 @@ fn fresh_workload() -> Workload {
         spiffe_id: SpiffeId::from_parts(&td, "ns/svc/sa/api").unwrap(),
         selector: WorkloadSelector::default(),
         service_name: "api".into(),
+        service_namespace: None,
         addresses: Vec::new(),
         ports: vec![WorkloadPort {
             port: 8443,
@@ -1659,6 +1660,7 @@ fn gateway_config_validate_mesh_fields_dispatches() {
                 spiffe_id: SpiffeId::new("spiffe://other/ns/foo/sa/bar").unwrap(),
                 selector: WorkloadSelector::default(),
                 service_name: "x".into(),
+                service_namespace: None,
                 addresses: Vec::new(),
                 ports: Vec::new(),
                 trust_domain: TrustDomain::new("td").unwrap(),

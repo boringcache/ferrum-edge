@@ -961,12 +961,22 @@ where
             core::collect(&mut acc, object)?;
         } else if mesh_config::is_istio_mesh_config_map(&acc.options, object) {
             mesh_config::collect(&mut acc, object)?;
-        } else if acc.options.pod_discovery_enabled && object.kind == "WorkloadEntry" {
-            collect_explicit_workload_service(&mut acc, object);
         } else if acc.options.pod_discovery_enabled && object.kind == "ServiceEntry" {
             collect_explicit_service_entry_keys(&mut acc, object);
         } else if acc.options.pod_discovery_enabled && core::is_core_resource_kind(&object.kind) {
             core::collect(&mut acc, object)?;
+        }
+    }
+
+    // WorkloadEntry cross-namespace attachment admission depends on the full
+    // ReferenceGrant and Service indexes. Collect explicit-service ownership in
+    // a separate pass so informer/list order cannot make pod auto-discovery
+    // widen an otherwise identical accepted inventory.
+    if acc.options.pod_discovery_enabled {
+        for object in &included_objects {
+            if object.kind == "WorkloadEntry" && includes_object_namespace(&acc.options, object) {
+                collect_explicit_workload_service(&mut acc, object);
+            }
         }
     }
 
@@ -1269,15 +1279,86 @@ pub(crate) fn collect_service(
 
 fn collect_explicit_workload_service(acc: &mut K8sAccumulator, object: &K8sObject) {
     let service = string_field(&object.spec, "service").unwrap_or(&object.metadata.name);
-    if let Some(key) = service_key_from_host(
-        service,
-        &object.metadata.namespace,
-        &acc.options.cluster_domain,
-    )
-    .filter(|key| key.namespace == object.metadata.namespace)
-    {
+    // Only record services whose cross-namespace attachment would be accepted.
+    // A rejected WorkloadEntry must not suppress auto-derived Pod workloads.
+    if let Ok(Some(key)) = resolve_workload_entry_service_attachment(acc, object, service) {
         acc.record_explicit_workload_service(key);
     }
+}
+
+/// Resolve a WorkloadEntry `spec.service` host to an authoritative Service key.
+///
+/// - `Ok(None)` — host is not a Kubernetes Service DNS form (literal / ambiguous
+///   two-label DNS). Same-namespace behavior preserves the raw string as
+///   `service_name`.
+/// - `Ok(Some(key))` — same-namespace Service key, or an authorized
+///   cross-namespace key whose Service exists in the translated inventory.
+/// - `Err` — cross-namespace host that is unauthorized, missing, or otherwise
+///   fail-closed (never widens attachment).
+pub(crate) fn resolve_workload_entry_service_attachment(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+    service_raw: &str,
+) -> Result<Option<K8sServiceKey>, K8sTranslateError> {
+    let Some(key) = workload_entry_service_key_from_host(
+        service_raw,
+        &object.metadata.namespace,
+        &acc.options.cluster_domain,
+    ) else {
+        return Ok(None);
+    };
+
+    if key.namespace == object.metadata.namespace {
+        return Ok(Some(key));
+    }
+
+    // Cross-namespace associations require an explicit Gateway API ReferenceGrant
+    // in the *target* Service namespace permitting WorkloadEntry → Service, plus
+    // the Service itself in the translated inventory. Missing grant, missing
+    // Service, or malformed hosts fail closed and never attach.
+    let from_group = k8s_api_group(&object.api_version);
+    if !acc.reference_grant_allows(
+        &object.metadata.namespace,
+        from_group,
+        "WorkloadEntry",
+        &key.namespace,
+        "",
+        "Service",
+        Some(key.name.as_str()),
+    ) {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "WorkloadEntry.service '{service_raw}' references Service '{}/{}' across namespaces \
+                 (cross-namespace); a ReferenceGrant in namespace '{}' must permit from \
+                 WorkloadEntry in '{}' to Service '{}'",
+                key.namespace, key.name, key.namespace, object.metadata.namespace, key.name
+            ),
+        ));
+    }
+
+    if !acc.service_exists(&key.namespace, &key.name) {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "WorkloadEntry.service '{service_raw}' references Service '{}/{}' across namespaces \
+                 (cross-namespace) but that Service is not present in the translated inventory; \
+                 cross-namespace WorkloadEntry attachments require an authoritative target Service",
+                key.namespace, key.name
+            ),
+        ));
+    }
+
+    Ok(Some(key))
+}
+
+pub(crate) fn k8s_api_group(api_version: &str) -> &str {
+    // Core Kubernetes API versions such as "v1" have no slash; Gateway API
+    // represents that core group as the empty string in ReferenceGrant fields.
+    api_version
+        .split_once('/')
+        .map(|(group, _version)| group)
+        .unwrap_or_default()
 }
 
 fn collect_explicit_service_entry_keys(acc: &mut K8sAccumulator, object: &K8sObject) {
@@ -1300,10 +1381,14 @@ pub(crate) fn service_key_from_host(
     cluster_domain: &str,
 ) -> Option<K8sServiceKey> {
     let host = normalized_service_host(host)?;
+    // Kubernetes DNS names and namespace defaults are matched case-insensitively;
+    // fold both so ReferenceGrant / inventory lookups stay fail-closed against the
+    // canonical lowercase Service identity rather than a cased DNS alias.
+    let default_namespace = default_namespace.trim().to_ascii_lowercase();
     let parts: Vec<&str> = host.split('.').collect();
     match parts.as_slice() {
-        [name] => K8sServiceKey::new(default_namespace.to_string(), (*name).to_string()),
-        [name, namespace] if *namespace == default_namespace => {
+        [name] => K8sServiceKey::new(default_namespace, (*name).to_string()),
+        [name, namespace] if *namespace == default_namespace.as_str() => {
             K8sServiceKey::new((*namespace).to_string(), (*name).to_string())
         }
         [_, _] => None,
@@ -1316,7 +1401,7 @@ pub(crate) fn service_key_from_host(
                 .trim()
                 .trim_end_matches('.')
                 .to_ascii_lowercase();
-            if suffix.eq_ignore_ascii_case(&cluster_domain) {
+            if suffix == cluster_domain {
                 K8sServiceKey::new((*namespace).to_string(), (*name).to_string())
             } else {
                 None
@@ -1339,7 +1424,10 @@ fn normalized_service_host(host: &str) -> Option<String> {
     if host.is_empty() || host.contains('*') {
         return None;
     }
-    Some(host.to_string())
+    // Kubernetes DNS names are case-insensitive; lowercase so Service key
+    // resolution is deterministic across host casing variants and matches
+    // lowercase ReferenceGrant / Service inventory identities.
+    Some(host.to_ascii_lowercase())
 }
 
 pub(crate) fn invalid_resource(
@@ -3064,7 +3152,7 @@ mod tests {
     }
 
     #[test]
-    fn service_key_from_host_preserves_service_and_namespace_case() {
+    fn service_key_from_host_normalizes_service_and_namespace_case() {
         assert_eq!(
             service_key_from_host(
                 "Reviews.Default.svc.cluster.local",
@@ -3072,12 +3160,21 @@ mod tests {
                 "cluster.local"
             ),
             Some(K8sServiceKey {
-                namespace: "Default".to_string(),
-                name: "Reviews".to_string(),
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
             })
         );
+        // After DNS case folding, same-namespace two-label shorthand matches.
         assert_eq!(
             service_key_from_host("reviews.Default", "default", "cluster.local"),
+            Some(K8sServiceKey {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            })
+        );
+        // Cross-namespace two-label forms remain rejected even after folding.
+        assert_eq!(
+            service_key_from_host("reviews.Prod", "default", "cluster.local"),
             None
         );
     }

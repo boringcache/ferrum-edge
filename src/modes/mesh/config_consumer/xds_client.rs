@@ -4589,6 +4589,7 @@ mod tests {
                 namespace: Some("default".to_string()),
             },
             service_name: "api".to_string(),
+            service_namespace: None,
             addresses: vec!["10.0.0.5".to_string()],
             ports: vec![WorkloadPort {
                 port: 8080,

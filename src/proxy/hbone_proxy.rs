@@ -1686,6 +1686,7 @@ mod tests {
             spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
             selector: WorkloadSelector::default(),
             service_name: "app".to_string(),
+            service_namespace: None,
             addresses: vec!["10.1.2.3".to_string()],
             ports: vec![WorkloadPort {
                 port,

@@ -328,6 +328,7 @@ mod tests {
                     namespace: Some(namespace.to_string()),
                 },
                 service_name: service.to_string(),
+                service_namespace: None,
                 addresses: vec![address.to_string()],
                 ports: vec![WorkloadPort {
                     port: APP_PORT,

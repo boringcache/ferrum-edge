@@ -38,6 +38,7 @@ fn slice_with_one_service() -> MeshSlice {
             namespace: Some("default".to_string()),
         },
         service_name: "echo".to_string(),
+        service_namespace: None,
         addresses: vec!["10.0.0.1".to_string()],
         ports: vec![WorkloadPort {
             port: 8080,
