@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use ferrum_edge::admin::api_specs::external_refs::{
     ExternalDocumentLoader, ExternalRefEnvBudgets, ExternalRefEnvOrigins, ExternalRefEnvTimeouts,
-    contain_path, redact_reference, resource_uri_key, validate_external_ref_snapshot_pair,
+    LoadedExternalDocument, contain_path, redact_reference, resource_uri_key,
+    validate_external_ref_snapshot_pair,
 };
 use ferrum_edge::admin::api_specs::{
     DefaultExternalDocumentLoader, EffectiveExternalRefPolicy, ExternalRefProcessPolicy,
@@ -227,6 +228,70 @@ fn map_loader_resolves_external_path_item_and_schema_chain() {
     assert_eq!(
         config["operations"][0]["responses"]["200"]["application/json"]["required"],
         json!(["id"])
+    );
+}
+
+struct RedirectAliasLoader;
+
+impl ExternalDocumentLoader for RedirectAliasLoader {
+    fn load(
+        &self,
+        uri: &Url,
+        _policy: &EffectiveExternalRefPolicy,
+        _deadline: Instant,
+    ) -> Result<LoadedExternalDocument, ExtractError> {
+        assert_eq!(uri.as_str(), "https://schemas.example.com/start.json");
+        let root = json!({
+            "$anchor": "redirected",
+            "type": "object",
+            "required": ["through_redirect"],
+            "properties": {"through_redirect": {"type": "boolean"}}
+        });
+        Ok(LoadedExternalDocument {
+            canonical_uri: Url::parse("https://schemas.example.com/final.json").unwrap(),
+            content_digest: "redirected-document".to_string(),
+            format: "json",
+            raw_bytes: serde_json::to_vec(&root).unwrap(),
+            root,
+        })
+    }
+}
+
+#[test]
+fn redirected_request_uri_remains_a_resolver_alias() {
+    let spec = format!(
+        r##"{{
+  "openapi": "3.1.0",
+  "info": {{"title": "t", "version": "1"}},
+  "x-ferrum-validate": true,
+  "x-ferrum-external-refs": true,
+  "x-ferrum-proxy": {proxy},
+  "paths": {{
+    "/redirected": {{
+      "get": {{
+        "responses": {{
+          "200": {{
+            "description": "ok",
+            "content": {{
+              "application/json": {{
+                "schema": {{
+                  "$ref": "https://schemas.example.com/start.json#redirected"
+                }}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}"##,
+        proxy = proxy_block()
+    );
+
+    let config = extract_validator_ops(&spec, &process_enabled(None), &RedirectAliasLoader);
+    assert_eq!(
+        config["operations"][0]["responses"]["200"]["application/json"]["required"],
+        json!(["through_redirect"])
     );
 }
 

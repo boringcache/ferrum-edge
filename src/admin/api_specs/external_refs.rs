@@ -660,6 +660,9 @@ impl ExternalDocumentLoader for DefaultExternalDocumentLoader {
 }
 
 /// In-memory map loader for deterministic unit tests (no filesystem / network).
+// The binary target compiles this public library module privately and therefore
+// cannot observe its integration-test consumers.
+#[allow(dead_code)]
 #[derive(Default)]
 pub struct MapExternalDocumentLoader {
     pub docs: HashMap<String, Vec<u8>>,
@@ -785,16 +788,37 @@ pub fn load_external_documents(
         )?;
     }
 
-    let mut documents: Vec<ExternalRefSnapshotDocument> = loaded
-        .values()
-        .map(|doc| ExternalRefSnapshotDocument {
+    // Different admitted request URIs may redirect to the same canonical
+    // resource. Keep one deterministic snapshot entry for that resource, and
+    // fail closed if the aliases produced different content during admission.
+    let mut loaded_entries: Vec<_> = loaded.iter().collect();
+    loaded_entries.sort_unstable_by(|(left_key, left), (right_key, right)| {
+        resource_uri_key(&left.canonical_uri)
+            .cmp(&resource_uri_key(&right.canonical_uri))
+            .then_with(|| left_key.cmp(right_key))
+    });
+    let mut documents: Vec<ExternalRefSnapshotDocument> = Vec::with_capacity(loaded.len());
+    let mut previous_canonical: Option<String> = None;
+    let mut previous_digest: Option<&str> = None;
+    for (_, doc) in loaded_entries {
+        let canonical = resource_uri_key(&doc.canonical_uri);
+        if previous_canonical.as_deref() == Some(canonical.as_str()) {
+            if previous_digest != Some(doc.content_digest.as_str()) {
+                return Err(external_ref_error(
+                    "external $ref aliases resolved to inconsistent document content",
+                ));
+            }
+            continue;
+        }
+        previous_canonical = Some(canonical);
+        previous_digest = Some(doc.content_digest.as_str());
+        documents.push(ExternalRefSnapshotDocument {
             canonical_uri: snapshot_uri_identity(&doc.canonical_uri),
             content_digest: doc.content_digest.clone(),
             format: doc.format.to_string(),
             document: doc.root.clone(),
-        })
-        .collect();
-    documents.sort_by(|a, b| a.canonical_uri.cmp(&b.canonical_uri));
+        });
+    }
     let mut snapshot = ExternalRefSnapshot {
         policy_digest: policy.effective_policy_digest.clone(),
         root_document_base: snapshot_uri_identity(&policy.document_base),

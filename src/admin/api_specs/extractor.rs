@@ -335,6 +335,10 @@ pub fn autodetect_format(body: &[u8]) -> SpecFormat {
 ///
 /// `(bundle, metadata)` on success, or an [`ExtractError`] describing the
 /// first problem encountered.
+// The binary target compiles this public library module privately and uses the
+// policy-aware entry point directly; integration tests retain this compatibility
+// entry point for the default fail-closed behavior.
+#[allow(dead_code)]
 pub fn extract(
     body: &[u8],
     declared_format: Option<SpecFormat>,
@@ -2668,6 +2672,8 @@ struct LocalSchemaResolver {
 struct ResolverDocument {
     root: Value,
     base: Url,
+    /// Admitted request URIs that redirected to `base`.
+    aliases: Vec<String>,
     /// True when the document root itself is a Schema Object resource (schema-only files).
     root_is_schema: bool,
 }
@@ -2698,17 +2704,45 @@ impl LocalSchemaResolver {
         documents.push(ResolverDocument {
             root: root.clone(),
             base: document_base.clone(),
+            aliases: Vec::new(),
             root_is_schema: false,
         });
-        let mut external_list: Vec<&LoadedExternalDocument> = externals.values().collect();
-        external_list.sort_by_key(|doc| resource_uri_key(&doc.canonical_uri));
-        for ext in external_list {
+        let mut external_list: Vec<_> = externals.iter().collect();
+        external_list.sort_unstable_by(|(left_key, left), (right_key, right)| {
+            resource_uri_key(&left.canonical_uri)
+                .cmp(&resource_uri_key(&right.canonical_uri))
+                .then_with(|| left_key.cmp(right_key))
+        });
+        for (requested_key, ext) in external_list {
             let mut base = ext.canonical_uri.clone();
             base.set_fragment(None);
+            let canonical_key = resource_uri_key(&base);
+            if let Some(existing) = documents
+                .iter_mut()
+                .skip(1)
+                .find(|document| resource_uri_key(&document.base) == canonical_key)
+            {
+                if existing.root != ext.root {
+                    return Err(schema_reference_error(
+                        "external $ref aliases resolved to inconsistent document content",
+                    ));
+                }
+                if requested_key != &canonical_key
+                    && !existing.aliases.iter().any(|alias| alias == requested_key)
+                {
+                    existing.aliases.push(requested_key.clone());
+                }
+                continue;
+            }
             let root_is_schema = is_schema_only_document(&ext.root);
             documents.push(ResolverDocument {
                 root: ext.root.clone(),
                 base,
+                aliases: if requested_key == &canonical_key {
+                    Vec::new()
+                } else {
+                    vec![requested_key.clone()]
+                },
                 root_is_schema,
             });
         }
@@ -2746,14 +2780,13 @@ impl LocalSchemaResolver {
     fn index_owned_document(&mut self, doc_index: usize) -> Result<(), ExtractError> {
         self.indexing_doc = doc_index;
         let base = self.documents[doc_index].base.clone();
+        let aliases = self.documents[doc_index].aliases.clone();
         let root_is_schema = self.documents[doc_index].root_is_schema;
         let document_key = resource_uri_key(&base);
-        self.resource_roots.push(SchemaResourceRoot {
-            doc_index,
-            pointer: String::new(),
-            key: document_key,
-            base: base.clone(),
-        });
+        self.register_document_root(doc_index, document_key, &base)?;
+        for alias in aliases {
+            self.register_document_root(doc_index, alias, &base)?;
+        }
 
         // Temporarily take the root so indexing can borrow `&mut self` while
         // walking the owned Value.
@@ -2765,6 +2798,29 @@ impl LocalSchemaResolver {
         };
         self.documents[doc_index].root = root;
         result
+    }
+
+    fn register_document_root(
+        &mut self,
+        doc_index: usize,
+        key: String,
+        base: &Url,
+    ) -> Result<(), ExtractError> {
+        if let Some(existing) = self.resource_roots.iter().find(|root| root.key == key) {
+            if existing.doc_index != doc_index || !existing.pointer.is_empty() {
+                return Err(schema_reference_error(
+                    "external document URI resolves to multiple resources",
+                ));
+            }
+            return Ok(());
+        }
+        self.resource_roots.push(SchemaResourceRoot {
+            doc_index,
+            pointer: String::new(),
+            key,
+            base: base.clone(),
+        });
+        Ok(())
     }
 
     /// Walk OpenAPI Schema Object locations only (not the entire document tree).
@@ -3414,9 +3470,10 @@ impl LocalSchemaResolver {
             )));
         }
 
+        let anchor_resource_key = resource_uri_key(&resource_root_meta.base);
         let pointer = self
             .anchors
-            .get(&resource_key)
+            .get(&anchor_resource_key)
             .and_then(|anchors| anchors.get(&decoded_fragment))
             .ok_or_else(|| {
                 schema_reference_error(format!("unresolved internal $ref '{reference}'"))
